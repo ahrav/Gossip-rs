@@ -4,10 +4,13 @@
 //! that persists run and shard lifecycle state in etcd. It implements:
 //!
 //! - **Run management** (`create_run`, `register_shards`, `get_run`,
-//!   `get_run_progress`, `list_shards_into`, `collect_claim_candidates_into`)
+//!   `get_run_progress`, `list_shards_into`, `collect_claim_candidates_into`,
+//!   `complete_run`, `fail_run`, `cancel_run`)
 //! - **Shard hot path** (`acquire_and_restore_into`, `renew`, `checkpoint`)
-//! - **Shard lifecycle** (`split_replace`, `split_residual`)
+//! - **Shard lifecycle** (`split_replace`, `split_residual`, `unpark_shard`)
 //! - **Shard claiming** (via [`default_claim_next_available`])
+//! - **Cold-path maintenance** (`list_active_runs_into`,
+//!   `gc_stale_initializing_runs_into`)
 //!
 //! # Concurrency model
 //!
@@ -42,11 +45,12 @@
 //! # Idempotency
 //!
 //! Op-log-backed mutations (`checkpoint`, `complete`, `park_shard`,
-//! `split_replace`, `split_residual`, `register_shards`) carry an `OpId`
-//! and a payload hash. If a retry finds the operation already recorded in
-//! the shard's or run's op-log, it returns [`IdempotentOutcome::Replayed`]
-//! with the previously computed result, making these mutations safe to
-//! retry across network partitions.
+//! `split_replace`, `split_residual`, `register_shards`, terminal run
+//! transitions, and `unpark_shard`) carry an `OpId` and a payload hash.
+//! If a retry finds the operation already recorded in the shard's or run's
+//! op-log, it returns [`IdempotentOutcome::Replayed`] with the previously
+//! computed result, making these mutations safe to retry across network
+//! partitions.
 //!
 //! `acquire_and_restore_into` and `renew` do **not** use OpId-based
 //! idempotency. They rely on CAS fencing (lease + epoch checks) for
@@ -54,9 +58,9 @@
 //!
 //! # Unimplemented operations
 //!
-//! Operations not yet persisted (`complete`, `park_shard`, `complete_run`,
-//! `fail_run`, `cancel_run`, `unpark_shard`) panic with a descriptive
-//! message. They will be persisted as the coordination surface is extended.
+//! Operations not yet persisted (`complete`, `park_shard`) panic with a
+//! descriptive message. They remain fail-closed until their etcd
+//! transaction semantics are defined.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -69,7 +73,7 @@ use crate::codec::{
 use crate::config::{DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::keyspace::EtcdKeyspace;
-use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
+use etcd_client::{Compare, CompareOp, DeleteOptions, GetOptions, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::shard_spec::{
     ShardLimitScope, ShardSpecRef, SplitValidationError,
 };
@@ -83,15 +87,16 @@ use gossip_coordination::{
     ClaimError, CompleteError, CoordinationBackend, CreateRunError, CursorUpdate, DerivedShardKind,
     GetRunError, IdempotentOutcome, InitialShardInput, Lease, LeaseHolder, LogicalTime, OpId,
     OpKind, OpLogEntry, OpResult, ParkError, ParkReason, RegisterShardsError, RenewError,
-    RenewResult, RingBuffer, RunConfig, RunId, RunManagement, RunOpKind, RunOpLogEntry,
-    RunOpResult, RunProgress, RunRecord, RunStatus, RunTransitionError, ShardClaiming, ShardFilter,
-    ShardId, ShardKey, ShardRecord, ShardStatus, ShardSummary, SplitChildIds, SplitReplaceError,
-    SplitReplacePlan, SplitReplaceResult, SplitResidualError, SplitResidualPlan,
-    SplitResidualResult, TenantId, UnparkError, WorkerId, check_op_idempotency,
-    default_claim_next_available, derive_split_shard_id, hash_checkpoint_payload,
+    RenewResult, RingBuffer, RunConfig, RunId, RunManagement, RunOpIdConflict, RunOpKind,
+    RunOpLogEntry, RunOpResult, RunProgress, RunRecord, RunStatus, RunTransitionError,
+    ShardClaiming, ShardFilter, ShardId, ShardKey, ShardRecord, ShardStatus, ShardSummary,
+    SplitChildIds, SplitReplaceError, SplitReplacePlan, SplitReplaceResult, SplitResidualError,
+    SplitResidualPlan, SplitResidualResult, TenantId, UnparkError, WorkerId, check_op_idempotency,
+    default_claim_next_available, derive_split_shard_id, hash_cancel_run_payload,
+    hash_checkpoint_payload, hash_complete_run_payload, hash_fail_run_payload,
     hash_register_shards_payload, hash_split_replace_payload, hash_split_residual_payload,
-    split_replace_apply_parent, split_replace_validate_preconditions, split_residual_apply_parent,
-    split_residual_build_record, split_residual_check_replay,
+    hash_unpark_payload, split_replace_apply_parent, split_replace_validate_preconditions,
+    split_residual_apply_parent, split_residual_build_record, split_residual_check_replay,
     split_residual_validate_preconditions, validate_lease, validate_manifest,
 };
 
@@ -128,9 +133,17 @@ const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 const SHARD_RECORD_KEY_SEGMENT: &[u8] = b"/shards/";
 
 /// Snapshot of persisted shard counts used for shard-limit enforcement.
+///
+/// Both counters are computed from keys-only prefix scans at read time
+/// (no dedicated counter keys). The etcd backend reads from storage
+/// directly, so the counts already include any shard being operated on
+/// (unlike the in-memory backend, which temporarily removes the parent
+/// during split validation).
 #[derive(Clone, Copy, Debug, Default)]
 struct ShardCountSnapshot {
+    /// Shards under the requesting tenant's prefix.
     tenant: usize,
+    /// Shards across all tenants.
     total: usize,
 }
 
@@ -173,6 +186,11 @@ fn shard_limit_violation(
 
 /// Returns `true` when `key` is a shard record path rather than an owner or
 /// active-index key.
+///
+/// The shard-record key is the leaf under `…/shards/{hex}` with no further
+/// path segments. Owner keys (`…/shards/{hex}/owner`) and active-index
+/// keys (`…/shards_active/{hex}`) are excluded by checking that nothing
+/// follows the last `/shards/` segment except the 16-character hex shard ID.
 fn is_persisted_shard_record_key(key: &[u8]) -> bool {
     let Some(segment_pos) = key
         .windows(SHARD_RECORD_KEY_SEGMENT.len())
@@ -315,12 +333,67 @@ fn split_replace_replay_child_ids(
     ids
 }
 
+/// Parse a direct run-record or active-run key suffix into a [`RunId`].
+///
+/// Returns `None` when `key` is not an immediate child of `prefix` or the
+/// suffix is not a 16-character lowercase hex run ID.
+fn parse_direct_run_id_from_key(prefix: &str, key: &[u8]) -> Option<RunId> {
+    let suffix = key.strip_prefix(prefix.as_bytes())?;
+    if suffix.len() != 16 || suffix.contains(&b'/') {
+        return None;
+    }
+
+    let suffix = std::str::from_utf8(suffix).ok()?;
+    let raw = u64::from_str_radix(suffix, 16).ok()?;
+    Some(RunId::from_raw(raw))
+}
+
+/// Apply a terminal run transition (Done / Failed / Cancelled) and append
+/// an acknowledged op-log entry.
+///
+/// # Preconditions
+///
+/// The caller must verify that:
+/// - `target_status` is a terminal variant (`is_terminal() == true`).
+/// - `record.status` is not already terminal.
+/// - The transition from `record.status` to `target_status` is legal
+///   according to the run state machine.
+///
+/// All three are assert-guarded; violating any panics immediately.
+///
+/// # Effects
+///
+/// Sets the run status, records the completion timestamp, pushes an `Ack`
+/// op-log entry, and re-validates all record invariants.
+fn apply_terminal_run_transition(
+    record: &mut RunRecord,
+    now: LogicalTime,
+    target_status: RunStatus,
+    op_id: OpId,
+    op_kind: RunOpKind,
+    payload_hash: u64,
+) {
+    assert!(target_status.is_terminal());
+    assert!(!record.status.is_terminal());
+    record.assert_transition_legal(target_status);
+    record.status = target_status;
+    record.completed_at = Some(now);
+    record.op_log_push(RunOpLogEntry::new(
+        op_id,
+        op_kind,
+        payload_hash,
+        now,
+        RunOpResult::Ack,
+    ));
+    record.assert_invariants();
+}
+
 /// etcd-backed coordination backend.
 ///
-/// Persists run creation, shard registration, read-side queries, and the
-/// acquire/renew/checkpoint/split hot path directly in etcd. Remaining
-/// mutating operations (complete, park, run transitions, unpark) panic
-/// with a descriptive message until their persistence logic is implemented.
+/// Persists run creation, run lifecycle transitions, shard registration,
+/// read-side queries, and the acquire/renew/checkpoint/split/unpark surface
+/// directly in etcd. Only shard `complete` and `park_shard` remain fail-closed
+/// until their persistence logic is implemented.
 ///
 /// ## Threading model
 ///
@@ -809,13 +882,73 @@ impl EtcdCoordinator {
         Ok(out)
     }
 
-    /// Determine the effective observation time for a shard's status.
+    /// Prefix-scan direct run records under a tenant, skipping shard and
+    /// active-index descendants.
     ///
-    /// If the shard has a live owner at `now`, uses `now` directly. Otherwise,
-    /// falls back to the shard's persisted lease deadline (the last known
-    /// expiration). This ensures expired leases are visible as expired in
-    /// `ShardFilter` evaluations even when `now` predates the deadline
-    /// (e.g., when `LogicalTime` is not wall-clock-aligned).
+    /// Uses [`parse_direct_run_id_from_key`] to filter the prefix-range
+    /// response down to immediate `runs/{hex}` children, ignoring deeper
+    /// keys (`runs/{hex}/shards/…`, `runs_active/…`). Cross-validates that
+    /// each decoded record's tenant and run ID match the key path. Results
+    /// are sorted by raw run ID.
+    fn scan_tenant_runs(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<PersistedRun>, EtcdCoordinatorError> {
+        let prefix = self.keyspace.run_records_scan_prefix(tenant);
+        let response = self.etcd_get(
+            prefix.as_bytes().to_vec(),
+            Some(GetOptions::new().with_prefix()),
+        )?;
+
+        let mut out = Vec::new();
+        for kv in response.kvs() {
+            let Some(run_from_key) = parse_direct_run_id_from_key(&prefix, kv.key()) else {
+                continue;
+            };
+
+            let record =
+                decode_run_record(kv.value()).map_err(|source| EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source,
+                })?;
+
+            if record.tenant != tenant {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "RunRecord",
+                        detail: "run record tenant disagrees with keyspace tenant",
+                    },
+                });
+            }
+            if record.run != run_from_key {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "RunRecord",
+                        detail: "run record run id disagrees with key suffix",
+                    },
+                });
+            }
+
+            out.push(PersistedRun {
+                record,
+                mod_revision: kv.mod_revision(),
+            });
+        }
+
+        out.sort_unstable_by_key(|persisted| persisted.record.run.as_raw());
+        Ok(out)
+    }
+
+    /// Determine the effective observation time for `ShardFilter` evaluation.
+    ///
+    /// When a shard's owner is live at `now`, the observation time is `now`
+    /// itself. When the owner's etcd key has been deleted (TTL expiry or
+    /// explicit revocation), the shard's persisted lease deadline is used
+    /// instead. This guarantees that expired leases appear expired in
+    /// filter evaluations, even when the caller's `LogicalTime` value lags
+    /// behind the actual deadline (e.g., in unit tests or skewed clocks).
     fn visible_now(persisted: &PersistedShard, now: LogicalTime) -> LogicalTime {
         if persisted.owner_is_live_at(now) {
             now
@@ -826,16 +959,21 @@ impl EtcdCoordinator {
 
     /// Lightweight capacity hint using count-only and keys-only RPCs.
     ///
-    /// Returns the number of active shards without an owner key. Uses two
-    /// etcd RPCs with minimal data transfer (no shard record values decoded):
+    /// Returns an approximate count of active shards without an owner key,
+    /// suitable for `CapacityHint`. Uses two etcd RPCs with minimal data
+    /// transfer (no shard record values are decoded):
     ///
     /// 1. `count_only` on the `shards_active/` prefix → total active shards.
     /// 2. `keys_only` on the `shards/` prefix, counting `/owner` suffixes →
     ///    owned shard count.
     ///
-    /// `earliest_deadline` is always `None` because computing it would require
-    /// decoding shard record values, defeating the purpose. The facade's claim
-    /// path computes deadlines separately via `collect_claim_candidates_into`.
+    /// The result is approximate because the two RPCs are not transactional:
+    /// a concurrent acquire between them may cause a brief undercount or
+    /// overcount. This is acceptable for a capacity hint used in claim
+    /// scheduling.
+    ///
+    /// `earliest_deadline` is always `None` because computing it would
+    /// require decoding shard record values, defeating the purpose.
     fn count_available_lightweight(
         &self,
         tenant: TenantId,
@@ -908,6 +1046,223 @@ impl EtcdCoordinator {
         })
     }
 
+    /// List runs visible to workers by scanning only the active-run index.
+    ///
+    /// Initializing runs remain invisible until `register_shards` publishes
+    /// the corresponding active-run marker.
+    pub fn list_active_runs_into(
+        &self,
+        tenant: TenantId,
+        out: &mut Vec<RunId>,
+    ) -> Result<(), EtcdCoordinatorError> {
+        let mut prefix = self.keyspace.runs_active_prefix(tenant);
+        prefix.push('/');
+        let response = self.etcd_get(
+            prefix.as_bytes().to_vec(),
+            Some(GetOptions::new().with_prefix()),
+        )?;
+
+        out.clear();
+        for kv in response.kvs() {
+            if let Some(run) = parse_direct_run_id_from_key(&prefix, kv.key()) {
+                out.push(run);
+            }
+        }
+        out.sort_unstable_by_key(|run| run.as_raw());
+        Ok(())
+    }
+
+    /// Garbage-collect stale runs that never left `Initializing`.
+    ///
+    /// Scans all runs under `tenant`, retains those that are still
+    /// `Initializing` with `created_at < cutoff`, and attempts to delete
+    /// each one. Each candidate is deleted behind a single CAS transaction
+    /// guarded by the run revision and the absence of the active-run marker.
+    /// A concurrently activated run simply fails the compare and is skipped.
+    ///
+    /// Deletion is total: the run record, any shard records, and any
+    /// active-shard index entries are removed in a single transaction.
+    /// Successfully deleted run IDs are appended to `out`.
+    pub fn gc_stale_initializing_runs_into(
+        &mut self,
+        tenant: TenantId,
+        cutoff: LogicalTime,
+        out: &mut Vec<RunId>,
+    ) -> Result<(), EtcdCoordinatorError> {
+        let mut candidates = self.scan_tenant_runs(tenant)?;
+        candidates.retain(|persisted| {
+            persisted.record.status == RunStatus::Initializing
+                && persisted.record.created_at < cutoff
+        });
+        candidates.sort_by(|left, right| {
+            left.record
+                .created_at
+                .cmp(&right.record.created_at)
+                .then_with(|| left.record.run.as_raw().cmp(&right.record.run.as_raw()))
+        });
+
+        out.clear();
+        for persisted in candidates {
+            let run = persisted.record.run;
+            let run_key = self.keyspace.run_record_key(tenant, run);
+            let active_key = self.keyspace.run_active_index_key(tenant, run);
+            let shard_prefix = self.keyspace.shard_records_scan_prefix(tenant, run);
+            let mut active_shard_prefix = self.keyspace.shards_active_prefix(tenant, run);
+            active_shard_prefix.push('/');
+
+            let txn = Txn::new()
+                .when(vec![
+                    Self::compare_run_revision(run_key.clone(), persisted.mod_revision),
+                    Self::compare_absent(active_key.clone()),
+                ])
+                .and_then(vec![
+                    TxnOp::delete(run_key.into_bytes(), None),
+                    TxnOp::delete(active_key.into_bytes(), None),
+                    TxnOp::delete(
+                        shard_prefix.into_bytes(),
+                        Some(DeleteOptions::new().with_prefix()),
+                    ),
+                    TxnOp::delete(
+                        active_shard_prefix.into_bytes(),
+                        Some(DeleteOptions::new().with_prefix()),
+                    ),
+                ]);
+            let response = self.etcd_txn(txn)?;
+            if response.succeeded() {
+                out.push(run);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Shared optimistic-CAS implementation for terminal run transitions
+    /// (`complete_run`, `fail_run`, `cancel_run`).
+    ///
+    /// Each iteration:
+    /// 1. Loads the run record and checks idempotent replay.
+    /// 2. Validates status preconditions (e.g., `complete_run` requires
+    ///    `Active`; `cancel_run` accepts both `Active` and `Initializing`).
+    /// 3. Applies the terminal transition locally.
+    /// 4. Commits the updated run record and deletes the active-run index
+    ///    entry in a single CAS transaction.
+    ///
+    /// The active-run index guard adapts to the prior status: `Active` runs
+    /// require the index entry to exist (`compare_present`), while
+    /// `Initializing` runs require it to be absent (`compare_absent`). This
+    /// prevents cancelling a run that was concurrently activated between the
+    /// read and the write.
+    ///
+    /// On CAS exhaustion, re-reads the run to return the appropriate domain
+    /// error or confirm idempotent replay.
+    fn transition_run_terminal(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+        op_kind: RunOpKind,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+        let (target_status, payload_hash, require_active) = match op_kind {
+            RunOpKind::CompleteRun => (RunStatus::Done, hash_complete_run_payload(), true),
+            RunOpKind::FailRun => (RunStatus::Failed, hash_fail_run_payload(), true),
+            RunOpKind::CancelRun => (RunStatus::Cancelled, hash_cancel_run_payload(), false),
+            _ => unreachable!("transition_run_terminal only supports terminal run ops"),
+        };
+
+        for attempt in 0..self.config.optimistic_txn_retries() {
+            let persisted = match self.load_run_record(tenant, run) {
+                Ok(Some(run_record)) => run_record,
+                Ok(None) => return Err(RunTransitionError::RunNotFound),
+                Err(err) => self.fatal_storage_error("run_terminal.load_run", err),
+            };
+            let prior_status = persisted.record.status;
+            let mut record = persisted.record;
+
+            if record.tenant != tenant {
+                return Err(RunTransitionError::TenantMismatch { expected: tenant });
+            }
+            if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
+                assert_eq!(entry.kind(), op_kind);
+                return Ok(IdempotentOutcome::Replayed(()));
+            }
+            if record.status.is_terminal() {
+                return Err(RunTransitionError::RunTerminal {
+                    status: record.status,
+                });
+            }
+            if require_active && record.status != RunStatus::Active {
+                return Err(RunTransitionError::WrongStatus {
+                    status: record.status,
+                    target: target_status,
+                });
+            }
+
+            apply_terminal_run_transition(
+                &mut record,
+                now,
+                target_status,
+                op_id,
+                op_kind,
+                payload_hash,
+            );
+            let run_blob = encode_run_record(&record);
+            let run_key = self.keyspace.run_record_key(tenant, run);
+            let active_key = self.keyspace.run_active_index_key(tenant, run);
+            let mut compares = vec![Self::compare_run_revision(
+                run_key.clone(),
+                persisted.mod_revision,
+            )];
+            // Active runs must have an active-index entry (published during
+            // register_shards), while Initializing runs must not. This
+            // prevents cancelling a run that was concurrently activated.
+            match prior_status {
+                RunStatus::Active => compares.push(Self::compare_present(active_key.clone())),
+                RunStatus::Initializing => compares.push(Self::compare_absent(active_key.clone())),
+                RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled => {
+                    unreachable!("terminal statuses return early")
+                }
+            }
+
+            let txn = Txn::new().when(compares).and_then(vec![
+                TxnOp::put(run_key.into_bytes(), run_blob, None),
+                TxnOp::delete(active_key.into_bytes(), None),
+            ]);
+            let response = self
+                .etcd_txn(txn)
+                .unwrap_or_else(|err| self.fatal_storage_error("run_terminal.txn", err));
+            if response.succeeded() {
+                return Ok(IdempotentOutcome::Executed(()));
+            }
+            std::thread::sleep(cas_retry_delay(attempt));
+        }
+
+        let persisted = self.load_run_or_panic(tenant, run);
+        if persisted.record.tenant != tenant {
+            return Err(RunTransitionError::TenantMismatch { expected: tenant });
+        }
+        if let Some(entry) = persisted.record.check_op_idempotency(op_id, payload_hash)? {
+            assert_eq!(entry.kind(), op_kind);
+            return Ok(IdempotentOutcome::Replayed(()));
+        }
+        if persisted.record.status.is_terminal() {
+            return Err(RunTransitionError::RunTerminal {
+                status: persisted.record.status,
+            });
+        }
+        if require_active && persisted.record.status != RunStatus::Active {
+            return Err(RunTransitionError::WrongStatus {
+                status: persisted.record.status,
+                target: target_status,
+            });
+        }
+
+        self.fatal_storage_error(
+            "run_terminal.compare_retry_budget",
+            "compare contention did not converge",
+        )
+    }
+
     // -----------------------------------------------------------------------
     // etcd CAS guard helpers
     // -----------------------------------------------------------------------
@@ -932,6 +1287,11 @@ impl EtcdCoordinator {
     /// time, preventing double-registration.
     fn compare_absent(key: String) -> Compare {
         Compare::version(key, CompareOp::Equal, 0)
+    }
+
+    /// CAS guard: the key must already exist (etcd version > 0).
+    fn compare_present(key: String) -> Compare {
+        Compare::version(key, CompareOp::Greater, 0)
     }
 
     /// CAS guard: owner key must exist (version > 0) with the given value
@@ -1013,6 +1373,10 @@ impl EtcdCoordinator {
             .unwrap_or_else(|err| self.fatal_storage_error("register_shards.encode_shard", err)))
     }
 
+    /// Load the raw owner binding for a shard, returning the worker ID,
+    /// fence epoch, and etcd lease ID. Test-only: used to verify ownership
+    /// state in integration tests without going through the full
+    /// `load_shard_record` path.
     #[cfg(test)]
     pub(crate) fn test_load_owner_binding(
         &self,
@@ -1031,6 +1395,8 @@ impl EtcdCoordinator {
         Ok(Some((binding.worker, binding.fence, kv.lease())))
     }
 
+    /// Load a shard record and its backing slab, returning a `TestSlab`
+    /// wrapper for assertion-friendly field access. Test-only.
     #[cfg(test)]
     pub(crate) fn test_load_shard_snapshot(
         &self,
@@ -1045,6 +1411,38 @@ impl EtcdCoordinator {
             ))),
         }
     }
+
+    /// Overwrite a shard record in etcd, bypassing all CAS guards. Test-only:
+    /// allows integration tests to seed states not yet reachable through the
+    /// public API (e.g., `Parked` status while `park_shard` is unimplemented).
+    #[cfg(test)]
+    pub(crate) fn test_seed_shard_record(
+        &self,
+        record: &ShardRecord,
+        slab: &ByteSlab,
+    ) -> Result<(), EtcdCoordinatorError> {
+        // Test helpers overwrite the shard record in place so integration
+        // tests can seed states that are not otherwise reachable yet (for
+        // example, a parked shard while `park_shard` remains fail-closed).
+        let key = self
+            .keyspace
+            .shard_record_key(record.tenant, record.run, record.shard)
+            .into_bytes();
+        let value =
+            encode_shard_record(record, slab).map_err(|source| EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Put,
+                source,
+            })?;
+
+        let mut client = self.client.clone();
+        self.runtime
+            .block_on(client.put(key, value, None))
+            .map_err(|source| EtcdCoordinatorError::Etcd {
+                operation: EtcdOperation::Put,
+                source,
+            })?;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for EtcdCoordinator {
@@ -1054,13 +1452,34 @@ impl fmt::Debug for EtcdCoordinator {
             .field("namespace_prefix", &self.keyspace.prefix())
             .field(
                 "coordination_storage_mode",
-                &"persisted acquire/renew/checkpoint/split + run registration in etcd",
+                &"persisted acquire/renew/checkpoint/split/unpark + run lifecycle in etcd",
             )
             .finish()
     }
 }
 
 impl CoordinationBackend for EtcdCoordinator {
+    /// Atomically take ownership of a shard, restoring its persisted state
+    /// into `out`.
+    ///
+    /// Grants a new etcd lease, bumps the fence epoch, and commits both the
+    /// updated shard record and a new `/owner` key in a single CAS
+    /// transaction. On CAS failure (concurrent writer), retries with
+    /// exponential backoff up to `optimistic_txn_retries`.
+    ///
+    /// The previous owner's etcd lease (if any) is revoked best-effort after
+    /// a successful CAS. If the revocation fails, the old lease expires via
+    /// etcd's TTL mechanism.
+    ///
+    /// # Errors
+    ///
+    /// - [`AcquireError::ShardNotFound`] — shard key does not exist in etcd.
+    /// - [`AcquireError::ShardTerminal`] — shard is in a terminal status.
+    /// - [`AcquireError::AlreadyLeased`] — another owner's lease is still
+    ///   live at `now`.
+    /// - [`AcquireError::TenantMismatch`] — persisted tenant differs from
+    ///   the requested tenant.
+    /// - [`AcquireError::BackendError`] — etcd RPC failure.
     fn acquire_and_restore_into<'a>(
         &mut self,
         now: LogicalTime,
@@ -1132,6 +1551,10 @@ impl CoordinationBackend for EtcdCoordinator {
             let owner_key = self
                 .keyspace
                 .shard_owner_key(tenant, key.run(), key.shard());
+            // Guard against concurrent mutation: if an owner exists, require
+            // its value and etcd lease to match exactly (prevents a stale
+            // worker from racing). If no owner exists, require the key to
+            // still be absent.
             let mut compares = vec![Self::compare_shard_revision(
                 shard_record_key.clone(),
                 persisted.mod_revision,
@@ -1148,6 +1571,9 @@ impl CoordinationBackend for EtcdCoordinator {
                 compares.push(Self::compare_absent(owner_key.clone()));
             }
 
+            // The new owner key is attached to the freshly granted etcd
+            // lease so that etcd auto-deletes it on TTL expiry, signaling
+            // ownership loss to future readers.
             let txn = Txn::new().when(compares).and_then(vec![
                 TxnOp::put(shard_record_key.into_bytes(), shard_blob, None),
                 TxnOp::put(
@@ -1159,6 +1585,7 @@ impl CoordinationBackend for EtcdCoordinator {
             let response = match self.etcd_txn(txn) {
                 Ok(r) => r,
                 Err(err) => {
+                    // Clean up the pre-granted lease since we won't use it.
                     self.best_effort_revoke_lease(new_lease_id);
                     return Err(AcquireError::BackendError {
                         message: format!("acquire.txn: {err}"),
@@ -1171,6 +1598,8 @@ impl CoordinationBackend for EtcdCoordinator {
                 continue;
             }
 
+            // Revoke the previous owner's etcd lease so etcd can reclaim
+            // the old owner key immediately rather than waiting for TTL.
             if let Some(old_lease_id) = prior_lease_id {
                 self.best_effort_revoke_lease(old_lease_id);
             }
@@ -1246,6 +1675,22 @@ impl CoordinationBackend for EtcdCoordinator {
         )
     }
 
+    /// Extend a shard's logical lease deadline without changing ownership.
+    ///
+    /// Validates the presented lease (worker, fence epoch, deadline), then
+    /// CAS-updates the shard record with a new deadline computed from the
+    /// run's `lease_duration`. The etcd lease TTL is extended best-effort
+    /// via `keep_alive` after the CAS succeeds.
+    ///
+    /// Unlike `acquire_and_restore_into`, renew does **not** bump the fence
+    /// epoch or grant a new etcd lease — it reuses the existing owner binding.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenewError::StaleFence`] — the persisted owner binding does not
+    ///   match the presented lease's worker/fence.
+    /// - [`RenewError::ShardNotFound`] — shard does not exist in etcd.
+    /// - [`RenewError::BackendError`] — etcd RPC failure.
     fn renew(
         &mut self,
         now: LogicalTime,
@@ -1364,6 +1809,16 @@ impl CoordinationBackend for EtcdCoordinator {
         )
     }
 
+    /// Persist a new cursor position for an owned shard.
+    ///
+    /// Validates the lease, checks cursor monotonicity and bounds, then
+    /// CAS-updates the shard record with the new cursor and an op-log
+    /// entry. The owner key and its etcd lease are included as CAS
+    /// preconditions but are not modified.
+    ///
+    /// Idempotent: replays with the same `op_id` and matching payload hash
+    /// return [`IdempotentOutcome::Replayed`] without re-applying the
+    /// cursor update.
     fn checkpoint(
         &mut self,
         now: LogicalTime,
@@ -1480,6 +1935,10 @@ impl CoordinationBackend for EtcdCoordinator {
         )
     }
 
+    /// Mark a shard as completed with a final cursor position.
+    ///
+    /// **Not yet implemented** — panics unconditionally. Remains fail-closed
+    /// until the etcd transaction semantics for shard completion are defined.
     fn complete(
         &mut self,
         _now: LogicalTime,
@@ -1491,6 +1950,10 @@ impl CoordinationBackend for EtcdCoordinator {
         self.fail_unimplemented("complete")
     }
 
+    /// Park a shard (temporarily suspend processing) for the given reason.
+    ///
+    /// **Not yet implemented** — panics unconditionally. Remains fail-closed
+    /// until the etcd transaction semantics for shard parking are defined.
     fn park_shard(
         &mut self,
         _now: LogicalTime,
@@ -1502,6 +1965,26 @@ impl CoordinationBackend for EtcdCoordinator {
         self.fail_unimplemented("park_shard")
     }
 
+    /// Replace an owned shard with N child shards in a single atomic
+    /// transaction.
+    ///
+    /// The parent transitions to `ShardStatus::Split` (terminal), its owner
+    /// key and active-index entry are deleted, and each child is created as
+    /// an unowned `Active` shard with its own active-index entry. The child
+    /// IDs are deterministically derived from the parent identity, op_id,
+    /// and spawned index via BLAKE3.
+    ///
+    /// The CAS transaction guards:
+    /// - Parent shard record `mod_revision` (no concurrent mutation).
+    /// - Owner key presence, value, and etcd lease ID (ownership proof).
+    /// - Each child key absent (prevents double-creation and collision).
+    ///
+    /// On replay with the same `op_id`, recovers child IDs from the
+    /// parent's permanent `spawned` lineage list.
+    ///
+    /// If CAS retries exhaust and all preconditions still hold, probes
+    /// each derived child key for an existing record and returns
+    /// `DerivedIdCollision` if found.
     fn split_replace(
         &mut self,
         now: LogicalTime,
@@ -1677,6 +2160,9 @@ impl CoordinationBackend for EtcdCoordinator {
             ));
             compares.append(&mut child_absent_compares);
 
+            // Atomically: update parent to Split status, delete its owner
+            // and active-index keys, then create all child records and their
+            // active-index entries.
             let mut ops = Vec::with_capacity(3 + child_puts.len() + child_index_ops.len());
             ops.push(TxnOp::put(shard_record_key.into_bytes(), parent_blob, None));
             ops.push(TxnOp::delete(owner_key.into_bytes(), None));
@@ -1768,6 +2254,23 @@ impl CoordinationBackend for EtcdCoordinator {
         )
     }
 
+    /// Shrink an owned shard's key range and spawn a residual shard
+    /// covering the removed range.
+    ///
+    /// Unlike `split_replace`, the parent remains `Active` and retains its
+    /// owner binding. Only the parent's spec (key range) is narrowed and
+    /// a single new residual shard is created. The residual starts unowned
+    /// with an empty cursor.
+    ///
+    /// The CAS transaction guards:
+    /// - Parent shard record `mod_revision`.
+    /// - Owner key presence, value, and etcd lease ID.
+    /// - Residual key absent (prevents double-creation).
+    ///
+    /// On replay, the residual ID is recovered from the parent's `spawned`
+    /// lineage list (permanent, not bounded by the op-log). This means
+    /// replays succeed even after the op-log entry has been evicted by
+    /// subsequent operations.
     fn split_residual(
         &mut self,
         now: LogicalTime,
@@ -1997,6 +2500,12 @@ impl CoordinationBackend for EtcdCoordinator {
 }
 
 impl RunManagement for EtcdCoordinator {
+    /// Create a new run in `Initializing` status.
+    ///
+    /// Uses a single CAS transaction guarded by key absence to prevent
+    /// double-creation. No active-run index entry is published at this
+    /// stage — the run becomes visible to workers only after
+    /// `register_shards` transitions it to `Active`.
     fn create_run(
         &mut self,
         now: LogicalTime,
@@ -2038,6 +2547,21 @@ impl RunManagement for EtcdCoordinator {
         Err(CreateRunError::RunAlreadyExists { run })
     }
 
+    /// Atomically register root shards and activate the run.
+    ///
+    /// Performs all of the following in a single CAS transaction:
+    /// 1. Validates the run is `Initializing` and the manifest is valid.
+    /// 2. Checks shard-count limits (per-tenant and global).
+    /// 3. Creates each shard record and its active-index entry.
+    /// 4. Transitions the run to `Active`, records `root_shards`, and
+    ///    publishes the active-run index entry.
+    ///
+    /// The batch size is capped at `MAX_SHARDS_PER_ETCD_TXN` (41) due
+    /// to etcd's default `--max-txn-ops` limit of 128. Each shard
+    /// contributes 3 operations (compare-absent, put-record,
+    /// put-active-index), plus 3 fixed ops for the run record.
+    ///
+    /// Idempotent: replays return the shard IDs from the op-log.
     fn register_shards(
         &mut self,
         now: LogicalTime,
@@ -2209,6 +2733,8 @@ impl RunManagement for EtcdCoordinator {
         )
     }
 
+    /// Load a run record by exact key. Returns `GetRunError::RunNotFound` if
+    /// the key does not exist. Validates tenant consistency.
     fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError> {
         match self.load_run_record(tenant, run) {
             Ok(Some(persisted)) => {
@@ -2225,6 +2751,11 @@ impl RunManagement for EtcdCoordinator {
         }
     }
 
+    /// Compute aggregate progress across all shards in a run.
+    ///
+    /// Performs a full prefix scan of all shard records under the run,
+    /// observing each shard's status, ownership liveness, and cursor
+    /// position. This is an O(shards) read operation.
     fn get_run_progress(
         &self,
         now: LogicalTime,
@@ -2249,6 +2780,12 @@ impl RunManagement for EtcdCoordinator {
         Ok(progress)
     }
 
+    /// List shard summaries matching `filter`, sorted by key range start
+    /// then shard ID.
+    ///
+    /// Performs a full prefix scan, decodes all shard records, applies the
+    /// filter using `visible_now` for expired-lease visibility, and
+    /// collects matching summaries into `out`.
     fn list_shards_into(
         &self,
         now: LogicalTime,
@@ -2285,6 +2822,15 @@ impl RunManagement for EtcdCoordinator {
         Ok(())
     }
 
+    /// Collect shard IDs eligible for claiming (active and unowned at `now`).
+    ///
+    /// Returns the earliest lease deadline among owned shards, enabling
+    /// callers to schedule the next claim attempt. Active shards with a
+    /// live owner at `now` are excluded from candidates but contribute
+    /// their deadline to the returned minimum.
+    ///
+    /// The candidate list is sorted by shard ID for deterministic claim
+    /// ordering.
     fn collect_claim_candidates_into(
         &self,
         now: LogicalTime,
@@ -2321,48 +2867,254 @@ impl RunManagement for EtcdCoordinator {
         Ok(earliest_deadline)
     }
 
+    /// Transition an `Active` run to `Done`. Requires the active-run index
+    /// entry to exist.
     fn complete_run(
         &mut self,
-        _now: LogicalTime,
-        _tenant: TenantId,
-        _run: RunId,
-        _op_id: OpId,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
-        self.fail_unimplemented("complete_run")
+        self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CompleteRun)
     }
 
+    /// Transition an `Active` run to `Failed`. Requires the active-run
+    /// index entry to exist.
     fn fail_run(
         &mut self,
-        _now: LogicalTime,
-        _tenant: TenantId,
-        _run: RunId,
-        _op_id: OpId,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
-        self.fail_unimplemented("fail_run")
+        self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::FailRun)
     }
 
+    /// Transition an `Initializing` or `Active` run to `Cancelled`.
+    ///
+    /// Unlike `complete_run` and `fail_run`, this accepts `Initializing`
+    /// runs (which have no active-run index entry) as well as `Active`
+    /// runs. The CAS transaction adapts its index-key guard accordingly.
     fn cancel_run(
         &mut self,
-        _now: LogicalTime,
-        _tenant: TenantId,
-        _run: RunId,
-        _op_id: OpId,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
-        self.fail_unimplemented("cancel_run")
+        self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CancelRun)
     }
 
+    /// Re-activate a parked shard, making it available for claiming.
+    ///
+    /// Transitions the shard from `Parked` to `Active`, clears the park
+    /// reason, bumps the fence epoch, and publishes a new active-shard
+    /// index entry. No owner binding is created — the shard must be
+    /// explicitly acquired after unparking.
+    ///
+    /// The CAS transaction guards:
+    /// - Shard record `mod_revision` (no concurrent mutation).
+    /// - Run record `mod_revision` and active-run index presence (run
+    ///   must still be `Active`).
+    /// - Owner key absent (parked shards must not have an owner).
+    ///
+    /// Idempotent via op-log replay.
     fn unpark_shard(
         &mut self,
-        _now: LogicalTime,
-        _tenant: TenantId,
-        _key: ShardKey,
-        _op_id: OpId,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, UnparkError> {
-        self.fail_unimplemented("unpark_shard")
+        let payload_hash = hash_unpark_payload(&key);
+
+        for attempt in 0..self.config.optimistic_txn_retries() {
+            let persisted = match self.load_shard_record(tenant, key) {
+                Ok(Some(shard)) => shard,
+                Ok(None) => return Err(UnparkError::ShardNotFound),
+                Err(err) => self.fatal_storage_error("unpark.load_shard", err),
+            };
+
+            if persisted.record.tenant != tenant {
+                return Err(UnparkError::TenantMismatch { expected: tenant });
+            }
+
+            let persisted_run = self.load_run_or_panic(tenant, key.run());
+            if persisted_run.record.tenant != tenant {
+                return Err(UnparkError::TenantMismatch { expected: tenant });
+            }
+            if persisted_run.record.status.is_terminal() {
+                return Err(UnparkError::RunTerminal {
+                    status: persisted_run.record.status,
+                });
+            }
+            assert_eq!(
+                persisted_run.record.status,
+                RunStatus::Active,
+                "registered shard {:?} must belong to an active run",
+                key
+            );
+
+            let replay =
+                check_op_idempotency(&persisted.record, op_id, payload_hash).map_err(|err| {
+                    match err {
+                        gossip_coordination::CoordError::OpIdConflict {
+                            op_id,
+                            expected_hash,
+                            actual_hash,
+                        } => UnparkError::OpIdConflict(RunOpIdConflict {
+                            op_id,
+                            expected_hash,
+                            actual_hash,
+                        }),
+                        gossip_coordination::CoordError::ShardNotFound { .. }
+                        | gossip_coordination::CoordError::TenantMismatch { .. }
+                        | gossip_coordination::CoordError::StaleFence { .. }
+                        | gossip_coordination::CoordError::LeaseExpired { .. }
+                        | gossip_coordination::CoordError::ShardTerminal { .. }
+                        | gossip_coordination::CoordError::CursorRegression { .. }
+                        | gossip_coordination::CoordError::CursorOutOfBounds(_)
+                        | gossip_coordination::CoordError::CursorKeyTooLarge { .. }
+                        | gossip_coordination::CoordError::CursorTokenTooLarge { .. }
+                        | gossip_coordination::CoordError::SplitInvalid(_)
+                        | gossip_coordination::CoordError::CheckpointMissingKey => {
+                            unreachable!("check_op_idempotency only returns OpIdConflict")
+                        }
+                        _ => unreachable!("check_op_idempotency returned an unexpected error"),
+                    }
+                })?;
+            if replay.is_some() {
+                return Ok(IdempotentOutcome::Replayed(()));
+            }
+
+            if persisted.record.status != ShardStatus::Parked {
+                return Err(UnparkError::NotParked {
+                    status: persisted.record.status,
+                });
+            }
+
+            let mut persisted = persisted;
+            persisted.record.advance_fence();
+            persisted.record.park_reason = None;
+            persisted.record.status = ShardStatus::Active;
+            persisted.record.lease = None;
+            persisted.record.op_log_push(OpLogEntry::new(
+                op_id,
+                OpKind::Unpark,
+                OpResult::Completed,
+                payload_hash,
+                now,
+            ));
+            persisted.record.assert_invariants(&persisted.slab);
+            let shard_blob = encode_shard_record(&persisted.record, &persisted.slab)
+                .unwrap_or_else(|err| self.fatal_storage_error("unpark.encode_shard", err));
+
+            let shard_record_key = self
+                .keyspace
+                .shard_record_key(tenant, key.run(), key.shard());
+            let owner_key = self
+                .keyspace
+                .shard_owner_key(tenant, key.run(), key.shard());
+            let run_key = self.keyspace.run_record_key(tenant, key.run());
+            let run_active_key = self.keyspace.run_active_index_key(tenant, key.run());
+            let active_shard_key =
+                self.keyspace
+                    .shard_active_index_key(tenant, key.run(), key.shard());
+
+            let txn = Txn::new()
+                .when(vec![
+                    Self::compare_shard_revision(shard_record_key.clone(), persisted.mod_revision),
+                    Self::compare_run_revision(run_key, persisted_run.mod_revision),
+                    Self::compare_present(run_active_key),
+                    Self::compare_absent(owner_key.clone()),
+                ])
+                .and_then(vec![
+                    TxnOp::put(shard_record_key.into_bytes(), shard_blob, None),
+                    TxnOp::delete(owner_key.into_bytes(), None),
+                    TxnOp::put(active_shard_key.into_bytes(), Vec::<u8>::new(), None),
+                ]);
+            let response = self
+                .etcd_txn(txn)
+                .unwrap_or_else(|err| self.fatal_storage_error("unpark.txn", err));
+            if response.succeeded() {
+                return Ok(IdempotentOutcome::Executed(()));
+            }
+            std::thread::sleep(cas_retry_delay(attempt));
+        }
+
+        let persisted = self.load_shard_or_panic(tenant, key);
+        if persisted.record.tenant != tenant {
+            return Err(UnparkError::TenantMismatch { expected: tenant });
+        }
+        let persisted_run = self.load_run_or_panic(tenant, key.run());
+        if persisted_run.record.tenant != tenant {
+            return Err(UnparkError::TenantMismatch { expected: tenant });
+        }
+        if persisted_run.record.status.is_terminal() {
+            return Err(UnparkError::RunTerminal {
+                status: persisted_run.record.status,
+            });
+        }
+        assert_eq!(
+            persisted_run.record.status,
+            RunStatus::Active,
+            "registered shard {:?} must belong to an active run",
+            key
+        );
+
+        let replay = check_op_idempotency(&persisted.record, op_id, payload_hash).map_err(
+            |err| match err {
+                gossip_coordination::CoordError::OpIdConflict {
+                    op_id,
+                    expected_hash,
+                    actual_hash,
+                } => UnparkError::OpIdConflict(RunOpIdConflict {
+                    op_id,
+                    expected_hash,
+                    actual_hash,
+                }),
+                gossip_coordination::CoordError::ShardNotFound { .. }
+                | gossip_coordination::CoordError::TenantMismatch { .. }
+                | gossip_coordination::CoordError::StaleFence { .. }
+                | gossip_coordination::CoordError::LeaseExpired { .. }
+                | gossip_coordination::CoordError::ShardTerminal { .. }
+                | gossip_coordination::CoordError::CursorRegression { .. }
+                | gossip_coordination::CoordError::CursorOutOfBounds(_)
+                | gossip_coordination::CoordError::CursorKeyTooLarge { .. }
+                | gossip_coordination::CoordError::CursorTokenTooLarge { .. }
+                | gossip_coordination::CoordError::SplitInvalid(_)
+                | gossip_coordination::CoordError::CheckpointMissingKey => {
+                    unreachable!("check_op_idempotency only returns OpIdConflict")
+                }
+                _ => unreachable!("check_op_idempotency returned an unexpected error"),
+            },
+        )?;
+        if replay.is_some() {
+            return Ok(IdempotentOutcome::Replayed(()));
+        }
+        if persisted.record.status != ShardStatus::Parked {
+            return Err(UnparkError::NotParked {
+                status: persisted.record.status,
+            });
+        }
+
+        self.fatal_storage_error(
+            "unpark.compare_retry_budget",
+            "compare contention did not converge",
+        )
     }
 }
 
 impl ShardClaiming for EtcdCoordinator {
+    /// Claim the next available shard using the default round-robin
+    /// strategy.
+    ///
+    /// Delegates to [`default_claim_next_available`], passing a reusable
+    /// candidate buffer (`claim_candidates_scratch`) that is `mem::take`-ed
+    /// before the call and restored afterward. This avoids per-claim heap
+    /// allocation when the buffer capacity is already sufficient from a
+    /// prior call.
     fn claim_next_available<'a>(
         &mut self,
         now: LogicalTime,

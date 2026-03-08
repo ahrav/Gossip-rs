@@ -54,8 +54,8 @@ use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, Te
 use gossip_coordination::{
     AcquireError, AcquireScratch, CheckpointError, CoordinationBackend,
     DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, IdempotentOutcome,
-    InitialShardInput, RegisterShardsError, RunConfig, RunManagement, ShardLimitScope, ShardStatus,
-    SplitReplaceError, SplitResidualError, derive_split_shard_id,
+    InitialShardInput, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
+    ShardLimitScope, ShardStatus, SplitReplaceError, SplitResidualError, derive_split_shard_id,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -64,6 +64,7 @@ use rstest::rstest;
 // Config validation (pure, no etcd required)
 // ---------------------------------------------------------------------------
 
+/// Empty endpoint list must be rejected at construction time.
 #[test]
 fn config_rejects_empty_endpoint_list() {
     let error = EtcdCoordinatorConfig::new(Vec::<String>::new(), "/gossip/v1")
@@ -71,6 +72,7 @@ fn config_rejects_empty_endpoint_list() {
     assert!(matches!(error, EtcdCoordinatorConfigError::NoEndpoints));
 }
 
+/// An endpoint that becomes empty after whitespace trimming must be rejected.
 #[test]
 fn config_rejects_empty_endpoint_after_trimming() {
     let error = EtcdCoordinatorConfig::new(["   "], "/gossip/v1")
@@ -81,6 +83,7 @@ fn config_rejects_empty_endpoint_after_trimming() {
     ));
 }
 
+/// Blank namespace prefix (whitespace-only) must be rejected.
 #[test]
 fn config_rejects_empty_namespace_prefix() {
     let error = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "   ")
@@ -91,6 +94,7 @@ fn config_rejects_empty_namespace_prefix() {
     ));
 }
 
+/// Namespace prefix must begin with `/` to form a valid etcd key root.
 #[test]
 fn config_rejects_invalid_namespace_prefix() {
     let error = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "gossip/v1")
@@ -101,6 +105,7 @@ fn config_rejects_invalid_namespace_prefix() {
     ));
 }
 
+/// Trailing slash in namespace prefix would produce double-slashes in keys.
 #[test]
 fn config_rejects_namespace_prefix_with_trailing_slash() {
     let error = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1/")
@@ -111,6 +116,8 @@ fn config_rejects_namespace_prefix_with_trailing_slash() {
     ));
 }
 
+/// `localhost()` convenience constructor must produce stable default values
+/// that integration tests and local development depend on.
 #[test]
 fn localhost_config_uses_expected_defaults() {
     let config = EtcdCoordinatorConfig::localhost();
@@ -126,6 +133,7 @@ fn localhost_config_uses_expected_defaults() {
     assert_eq!(config.max_children_per_op(), 8);
 }
 
+/// CSV parsing trims whitespace and drops empty segments between delimiters.
 #[test]
 fn from_endpoints_csv_trims_and_filters_empty_items() {
     let config = EtcdCoordinatorConfig::from_endpoints_csv(
@@ -140,6 +148,8 @@ fn from_endpoints_csv_trims_and_filters_empty_items() {
     );
 }
 
+/// A CSV string containing only delimiters and whitespace must produce
+/// `NoEndpoints` (same as an empty list).
 #[test]
 fn from_endpoints_csv_with_all_empty_segments_returns_no_endpoints() {
     for input in [",", ",,,", "  ,  ,  "] {
@@ -153,6 +163,8 @@ fn from_endpoints_csv_with_all_empty_segments_returns_no_endpoints() {
     }
 }
 
+/// Trailing commas in the CSV produce empty segments that are silently
+/// dropped rather than treated as empty endpoints.
 #[test]
 fn from_endpoints_csv_drops_trailing_empty_segments() {
     let config = EtcdCoordinatorConfig::from_endpoints_csv("http://a:2379,,", "/gossip/v1")
@@ -160,6 +172,8 @@ fn from_endpoints_csv_drops_trailing_empty_segments() {
     assert_eq!(config.endpoints(), ["http://a:2379"]);
 }
 
+/// The bare `/` namespace places all keys directly under the root,
+/// producing paths like `/tenants/…` with no doubled slashes.
 #[test]
 fn config_accepts_root_namespace_slash() {
     let config = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/")
@@ -167,6 +181,8 @@ fn config_accepts_root_namespace_slash() {
     assert_eq!(config.namespace_prefix(), "/");
 }
 
+/// Custom tuning parameters (TTL, retry budget, child cap) pass through
+/// validation and are accessible via the config accessors.
 #[test]
 fn config_accepts_explicit_tuning_values() {
     let config =
@@ -177,6 +193,7 @@ fn config_accepts_explicit_tuning_values() {
     assert_eq!(config.max_children_per_op(), 12);
 }
 
+/// `with_shard_limits` overrides the default per-tenant and global caps.
 #[test]
 fn config_with_shard_limits_overrides_defaults() {
     let config = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1")
@@ -187,6 +204,7 @@ fn config_with_shard_limits_overrides_defaults() {
     assert_eq!(config.max_total_shards(), 34);
 }
 
+/// Zero TTL is invalid because etcd requires a positive lease duration.
 #[test]
 fn config_rejects_non_positive_owner_lease_ttl() {
     let error =
@@ -198,6 +216,8 @@ fn config_rejects_non_positive_owner_lease_ttl() {
     ));
 }
 
+/// Zero retries means every CAS operation gives up without attempting,
+/// which is never useful.
 #[test]
 fn config_rejects_zero_optimistic_txn_retries() {
     let error =
@@ -209,6 +229,7 @@ fn config_rejects_zero_optimistic_txn_retries() {
     ));
 }
 
+/// Zero per-tenant cap would prevent any shard registration.
 #[test]
 fn config_rejects_zero_max_shards_per_tenant() {
     let error = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1")
@@ -221,6 +242,7 @@ fn config_rejects_zero_max_shards_per_tenant() {
     ));
 }
 
+/// Zero global cap would prevent any shard registration.
 #[test]
 fn config_rejects_zero_max_total_shards() {
     let error = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1")
@@ -233,6 +255,7 @@ fn config_rejects_zero_max_total_shards() {
     ));
 }
 
+/// Zero child cap would prevent all split operations.
 #[test]
 fn config_rejects_zero_max_children_per_op() {
     let error =
@@ -244,6 +267,8 @@ fn config_rejects_zero_max_children_per_op() {
     ));
 }
 
+/// The per-backend child cap must not exceed the global `MAX_SPLIT_CHILDREN`
+/// constant to prevent generating transactions that exceed etcd op limits.
 #[test]
 fn config_rejects_max_children_per_op_above_global_limit() {
     let error =
@@ -262,10 +287,10 @@ fn config_rejects_max_children_per_op_above_global_limit() {
 // Debug output tests
 // ---------------------------------------------------------------------------
 
+/// Debug output must redact userinfo in endpoint URIs to prevent
+/// credential leakage in logs and error messages.
 #[test]
 fn config_debug_does_not_expose_raw_endpoint_credentials() {
-    // Endpoints with embedded credentials pass validation (only scheme is checked).
-    // Debug output must not leak the full URI including user:pass.
     let config = EtcdCoordinatorConfig::new(["http://admin:secret@etcd-0:2379"], "/gossip/v1")
         .expect("endpoint with userinfo should pass scheme-only validation");
 
@@ -280,6 +305,7 @@ fn config_debug_does_not_expose_raw_endpoint_credentials() {
     );
 }
 
+/// Endpoints without embedded credentials appear verbatim in Debug output.
 #[test]
 fn config_debug_shows_endpoints_without_credentials_normally() {
     let config = EtcdCoordinatorConfig::new(["http://etcd-0:2379"], "/gossip/v1")
@@ -292,6 +318,8 @@ fn config_debug_shows_endpoints_without_credentials_normally() {
     );
 }
 
+/// The `with_auth` password field is replaced with `[REDACTED]` in Debug
+/// output while the username remains visible for diagnostics.
 #[test]
 fn config_debug_redacts_auth_password() {
     let config = EtcdCoordinatorConfig::new(["http://etcd-0:2379"], "/gossip/v1")
@@ -313,6 +341,7 @@ fn config_debug_redacts_auth_password() {
     );
 }
 
+/// The `auth()` accessor returns the raw credentials, unlike Debug output.
 #[test]
 fn config_with_auth_exposes_credentials_via_accessor() {
     let config = EtcdCoordinatorConfig::new(["http://etcd-0:2379"], "/gossip/v1")
@@ -324,6 +353,7 @@ fn config_with_auth_exposes_credentials_via_accessor() {
     assert_eq!(pass, "password123");
 }
 
+/// Without `with_auth`, the auth accessor returns `None`.
 #[test]
 fn config_without_auth_returns_none() {
     let config =
@@ -336,6 +366,7 @@ fn config_without_auth_returns_none() {
 // URL scheme validation tests
 // ---------------------------------------------------------------------------
 
+/// Endpoints must use `http://` or `https://` — bare host:port is rejected.
 #[test]
 fn config_rejects_endpoint_without_http_scheme() {
     let error = EtcdCoordinatorConfig::new(["etcd-0:2379"], "/gossip/v1")
@@ -346,6 +377,7 @@ fn config_rejects_endpoint_without_http_scheme() {
     ));
 }
 
+/// Non-HTTP schemes (e.g., `ftp://`) are rejected.
 #[test]
 fn config_rejects_endpoint_with_ftp_scheme() {
     let error = EtcdCoordinatorConfig::new(["ftp://etcd-0:2379"], "/gossip/v1")
@@ -356,6 +388,7 @@ fn config_rejects_endpoint_with_ftp_scheme() {
     ));
 }
 
+/// `https://` endpoints are accepted for TLS-enabled clusters.
 #[test]
 fn config_accepts_https_endpoint() {
     let config = EtcdCoordinatorConfig::new(["https://etcd-0:2379"], "/gossip/v1")
@@ -363,6 +396,7 @@ fn config_accepts_https_endpoint() {
     assert_eq!(config.endpoints(), ["https://etcd-0:2379"]);
 }
 
+/// Scheme validation applies to every endpoint, not just the first.
 #[test]
 fn config_rejects_second_endpoint_with_bad_scheme() {
     let error = EtcdCoordinatorConfig::new(["http://etcd-0:2379", "etcd-1:2379"], "/gossip/v1")
@@ -373,21 +407,25 @@ fn config_rejects_second_endpoint_with_bad_scheme() {
     ));
 }
 
+/// `EtcdOperation::Connect` renders as lowercase `"connect"` in Display.
 #[test]
 fn etcd_operation_display_connect() {
     assert_eq!(EtcdOperation::Connect.to_string(), "connect");
 }
 
+/// `EtcdOperation::Status` renders as `"status"`.
 #[test]
 fn etcd_operation_display_status() {
     assert_eq!(EtcdOperation::Status.to_string(), "status");
 }
 
+/// `EtcdOperation::LeaseGrant` renders as `"lease_grant"`.
 #[test]
 fn etcd_operation_display_lease_grant() {
     assert_eq!(EtcdOperation::LeaseGrant.to_string(), "lease_grant");
 }
 
+/// The `Config` variant's Display includes context and the inner error.
 #[test]
 fn coordinator_error_display_wraps_config_error() {
     let inner = EtcdCoordinatorConfigError::NoEndpoints;
@@ -400,6 +438,8 @@ fn coordinator_error_display_wraps_config_error() {
     );
 }
 
+/// `Error::source()` on the `Config` variant downcasts to
+/// `EtcdCoordinatorConfigError`.
 #[test]
 fn coordinator_error_config_source_returns_inner() {
     use std::error::Error;
@@ -415,6 +455,7 @@ fn coordinator_error_config_source_returns_inner() {
     );
 }
 
+/// `Error::source()` on the `RuntimeBuild` variant downcasts to `io::Error`.
 #[test]
 fn coordinator_error_runtime_source_returns_inner() {
     use std::error::Error;
@@ -430,6 +471,7 @@ fn coordinator_error_runtime_source_returns_inner() {
     );
 }
 
+/// `From<EtcdCoordinatorConfigError>` produces the `Config` variant.
 #[test]
 fn config_error_converts_to_coordinator_error_via_from() {
     let config_err = EtcdCoordinatorConfigError::NoEndpoints;
@@ -441,6 +483,8 @@ fn config_error_converts_to_coordinator_error_via_from() {
 // Keyspace path construction (pure, no etcd required)
 // ---------------------------------------------------------------------------
 
+/// Golden-value test: verifies exact key paths for a representative
+/// (tenant, run, shard) tuple under the `/gossip/v1` namespace.
 #[test]
 fn keyspace_builds_expected_paths() {
     let tenant = TenantId::from_bytes([0xAB; 32]);
@@ -474,6 +518,7 @@ fn keyspace_builds_expected_paths() {
     );
 }
 
+/// The root `/` prefix must not produce double slashes in generated paths.
 #[test]
 fn keyspace_root_prefix_does_not_emit_double_slashes() {
     let tenant = TenantId::from_bytes([0x11; 32]);
@@ -668,6 +713,8 @@ fn run_records_scan_prefix_is_scan_safe() {
 // etcd integration tests (require running etcd, #[ignore])
 // ---------------------------------------------------------------------------
 
+/// A batch of 42 shards exceeds the per-transaction op limit (41) and must
+/// be rejected before writing to etcd.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
@@ -715,6 +762,9 @@ fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
     );
 }
 
+/// Registering shards for a second tenant that would push the global shard
+/// count above the configured cap must return `ShardLimitExceeded(Global)`.
+/// The existing shard from a different tenant counts toward the global total.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn register_shards_rejects_global_shard_limit_against_local_etcd() {
@@ -780,6 +830,8 @@ fn register_shards_rejects_global_shard_limit_against_local_etcd() {
     );
 }
 
+/// Smoke test: connect to etcd and verify that the status RPC returns a
+/// non-empty cluster version.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn connects_to_local_etcd_and_fetches_status() {
@@ -792,6 +844,10 @@ fn connects_to_local_etcd_and_fetches_status() {
     );
 }
 
+/// End-to-end happy path: create a run, register a shard, acquire it,
+/// checkpoint a cursor position, and renew the lease. Verifies that the
+/// owner binding, cursor state, and lease deadline are all persisted
+/// correctly across the full lifecycle.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
@@ -871,6 +927,10 @@ fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
     );
 }
 
+/// Full split_replace lifecycle: split a parent into two children, verify
+/// the parent transitions to `Split` status with no owner, verify both
+/// children are `Active` and claimable, and confirm idempotent replay
+/// returns the same child IDs.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_round_trip_against_local_etcd() {
@@ -959,6 +1019,10 @@ fn split_replace_round_trip_against_local_etcd() {
     assert_eq!(replay.as_ref().children, first.as_ref().children);
 }
 
+/// Splitting when the resulting child count would exceed the per-tenant
+/// shard limit must fail, even if the global limit has room. Sibling
+/// shards from a different run under the same tenant count toward the
+/// per-tenant total.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_per_tenant_shard_limit_against_local_etcd() {
@@ -1048,6 +1112,10 @@ fn split_replace_rejects_per_tenant_shard_limit_against_local_etcd() {
     );
 }
 
+/// Full split_residual lifecycle: narrow a parent's key range, create
+/// a residual shard covering the removed range, verify the parent stays
+/// `Active` with updated spec, verify the residual is claimable with an
+/// empty cursor, and confirm idempotent replay returns the same residual ID.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_round_trip_against_local_etcd() {
@@ -1140,6 +1208,9 @@ fn split_residual_round_trip_against_local_etcd() {
     assert_eq!(replay.as_ref().residual, first.as_ref().residual);
 }
 
+/// Residual split that would push the global shard count above the cap
+/// must fail with `ShardLimitExceeded(Global)`. A sibling shard from a
+/// different tenant fills the global quota.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_rejects_global_shard_limit_against_local_etcd() {
@@ -1225,6 +1296,343 @@ fn split_residual_rejects_global_shard_limit_against_local_etcd() {
             })
         ),
         "expected ShardLimitExceeded(Global), got {err:?}"
+    );
+}
+
+/// The active-run index controls worker-visible run discovery:
+/// - `Initializing` runs are invisible (no index entry).
+/// - `Active` runs appear after `register_shards` publishes the entry.
+/// - Terminal transitions (`complete`, `fail`, `cancel`) delete the entry.
+/// - `cancel_run` works for both `Initializing` and `Active` runs.
+///
+/// Also verifies idempotent replay of `cancel_run` and `complete_run`.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn active_run_index_hides_initializing_runs_and_unpublishes_terminal_runs() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run_initializing = RunId::from_raw(0x2000);
+    let run_active = RunId::from_raw(0x2001);
+    let run_cancel_initializing = RunId::from_raw(0x2002);
+    let run_cancel_active = RunId::from_raw(0x2003);
+    let mut active = Vec::new();
+
+    backend
+        .create_run(now(1), test_tenant(), run_initializing, config)
+        .expect("initializing run should be created");
+    backend
+        .list_active_runs_into(test_tenant(), &mut active)
+        .expect("active run listing should succeed");
+    assert!(active.is_empty(), "initializing runs must remain hidden");
+
+    backend
+        .create_run(now(2), test_tenant(), run_active, config)
+        .expect("active run should be created");
+    let active_manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x8100),
+        ShardSpecRef::new(b"a", b"m", b""),
+        CursorUpdate::initial(),
+    )];
+    let active_register = backend
+        .register_shards(
+            now(3),
+            test_tenant(),
+            run_active,
+            &active_manifest,
+            OpId::from_raw(1),
+        )
+        .expect("active run registration should succeed");
+    assert!(active_register.is_executed());
+    active.clear();
+    backend
+        .list_active_runs_into(test_tenant(), &mut active)
+        .expect("active run listing should succeed");
+    assert_eq!(active, vec![run_active]);
+
+    backend
+        .create_run(now(4), test_tenant(), run_cancel_initializing, config)
+        .expect("cancellable initializing run should be created");
+    let cancel_initializing = backend
+        .cancel_run(
+            now(5),
+            test_tenant(),
+            run_cancel_initializing,
+            OpId::from_raw(2),
+        )
+        .expect("initializing cancel should succeed");
+    assert!(cancel_initializing.is_executed());
+    let cancel_initializing_replay = backend
+        .cancel_run(
+            now(6),
+            test_tenant(),
+            run_cancel_initializing,
+            OpId::from_raw(2),
+        )
+        .expect("initializing cancel replay should succeed");
+    assert!(cancel_initializing_replay.is_replay());
+
+    backend
+        .create_run(now(7), test_tenant(), run_cancel_active, config)
+        .expect("cancellable active run should be created");
+    let cancel_active_manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x8101),
+        ShardSpecRef::new(b"m", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let cancel_active_register = backend
+        .register_shards(
+            now(8),
+            test_tenant(),
+            run_cancel_active,
+            &cancel_active_manifest,
+            OpId::from_raw(3),
+        )
+        .expect("active run registration should succeed");
+    assert!(cancel_active_register.is_executed());
+    active.clear();
+    backend
+        .list_active_runs_into(test_tenant(), &mut active)
+        .expect("active run listing should succeed");
+    assert_eq!(active, vec![run_active, run_cancel_active]);
+
+    let cancel_active = backend
+        .cancel_run(now(9), test_tenant(), run_cancel_active, OpId::from_raw(4))
+        .expect("active cancel should succeed");
+    assert!(cancel_active.is_executed());
+    active.clear();
+    backend
+        .list_active_runs_into(test_tenant(), &mut active)
+        .expect("active run listing should succeed");
+    assert_eq!(active, vec![run_active]);
+
+    let complete = backend
+        .complete_run(now(10), test_tenant(), run_active, OpId::from_raw(5))
+        .expect("complete_run should succeed");
+    assert!(complete.is_executed());
+    let complete_replay = backend
+        .complete_run(now(11), test_tenant(), run_active, OpId::from_raw(5))
+        .expect("complete_run replay should succeed");
+    assert!(complete_replay.is_replay());
+
+    active.clear();
+    backend
+        .list_active_runs_into(test_tenant(), &mut active)
+        .expect("active run listing should succeed");
+    assert!(
+        active.is_empty(),
+        "terminal runs must leave the active index"
+    );
+}
+
+/// `fail_run` transitions an active run to `Failed`, removes its
+/// active-run index entry, records the completion timestamp, and replays
+/// idempotently with the same op_id.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn fail_run_removes_active_index_and_replays_idempotently() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0x3001);
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+    let manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x8200),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let register = backend
+        .register_shards(now(2), test_tenant(), run, &manifest, OpId::from_raw(11))
+        .expect("register_shards should succeed");
+    assert!(register.is_executed());
+
+    let first = backend
+        .fail_run(now(3), test_tenant(), run, OpId::from_raw(12))
+        .expect("fail_run should succeed");
+    assert!(first.is_executed());
+    let replay = backend
+        .fail_run(now(4), test_tenant(), run, OpId::from_raw(12))
+        .expect("fail_run replay should succeed");
+    assert!(replay.is_replay());
+
+    let run_record = backend
+        .get_run(test_tenant(), run)
+        .expect("run lookup should succeed");
+    assert_eq!(run_record.status(), RunStatus::Failed);
+    assert_eq!(run_record.completed_at(), Some(now(3)));
+
+    let mut active = Vec::new();
+    backend
+        .list_active_runs_into(test_tenant(), &mut active)
+        .expect("active run listing should succeed");
+    assert!(active.is_empty(), "failed runs must leave the active index");
+}
+
+/// GC deletes only `Initializing` runs created before the cutoff time,
+/// leaving fresh initializing runs, active runs, and terminal runs intact.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn gc_stale_initializing_runs_deletes_only_old_orphans() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run_old = RunId::from_raw(0x4001);
+    let run_fresh = RunId::from_raw(0x4002);
+    let run_active = RunId::from_raw(0x4003);
+    let run_done = RunId::from_raw(0x4004);
+
+    backend
+        .create_run(now(1), test_tenant(), run_old, config)
+        .expect("old run should be created");
+    backend
+        .create_run(now(100), test_tenant(), run_fresh, config)
+        .expect("fresh run should be created");
+    backend
+        .create_run(now(2), test_tenant(), run_active, config)
+        .expect("active run should be created");
+    backend
+        .create_run(now(3), test_tenant(), run_done, config)
+        .expect("done run should be created");
+
+    let active_manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x8300),
+        ShardSpecRef::new(b"a", b"m", b""),
+        CursorUpdate::initial(),
+    )];
+    let active_register = backend
+        .register_shards(
+            now(4),
+            test_tenant(),
+            run_active,
+            &active_manifest,
+            OpId::from_raw(21),
+        )
+        .expect("active registration should succeed");
+    assert!(active_register.is_executed());
+
+    let done_manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x8301),
+        ShardSpecRef::new(b"m", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let done_register = backend
+        .register_shards(
+            now(5),
+            test_tenant(),
+            run_done,
+            &done_manifest,
+            OpId::from_raw(22),
+        )
+        .expect("done registration should succeed");
+    assert!(done_register.is_executed());
+    let done_complete = backend
+        .complete_run(now(6), test_tenant(), run_done, OpId::from_raw(23))
+        .expect("done completion should succeed");
+    assert!(done_complete.is_executed());
+
+    let mut deleted = Vec::new();
+    backend
+        .gc_stale_initializing_runs_into(test_tenant(), now(50), &mut deleted)
+        .expect("gc should succeed");
+    assert_eq!(deleted, vec![run_old]);
+
+    let old_lookup = backend.get_run(test_tenant(), run_old);
+    assert!(matches!(
+        old_lookup,
+        Err(gossip_coordination::GetRunError::RunNotFound)
+    ));
+
+    let fresh = backend
+        .get_run(test_tenant(), run_fresh)
+        .expect("fresh initializing run should remain");
+    assert_eq!(fresh.status(), RunStatus::Initializing);
+
+    let active_run = backend
+        .get_run(test_tenant(), run_active)
+        .expect("active run should remain");
+    assert_eq!(active_run.status(), RunStatus::Active);
+
+    let done_run = backend
+        .get_run(test_tenant(), run_done)
+        .expect("terminal run should remain");
+    assert_eq!(done_run.status(), RunStatus::Done);
+
+    let mut active = Vec::new();
+    backend
+        .list_active_runs_into(test_tenant(), &mut active)
+        .expect("active run listing should succeed");
+    assert_eq!(active, vec![run_active]);
+}
+
+/// Unpark a shard that was manually seeded as `Parked` (via
+/// `test_seed_shard_record`, since `park_shard` is unimplemented).
+/// Verifies: shard transitions to `Active`, fence epoch is bumped,
+/// owner binding is absent, cursor is preserved, park_reason is cleared,
+/// and the operation replays idempotently.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn unpark_seeded_parked_shard_round_trip_against_local_etcd() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0x5001);
+    let shard = ShardId::from_raw(0x8400);
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+    let manifest = [InitialShardInput::new(
+        shard,
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::new(b"k"),
+    )];
+    let register = backend
+        .register_shards(now(2), test_tenant(), run, &manifest, OpId::from_raw(31))
+        .expect("register_shards should succeed");
+    assert!(register.is_executed());
+
+    let key = ShardKey::new(run, shard);
+    let (mut parked, slab) = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed")
+        .expect("shard must exist");
+    let fence_before = parked.fence_epoch;
+    parked.status = ShardStatus::Parked;
+    parked.park_reason = Some(ParkReason::TooManyErrors);
+    parked.lease = None;
+    parked.assert_invariants(&slab);
+    backend
+        .test_seed_shard_record(&parked, &slab)
+        .expect("seed parked shard should succeed");
+
+    let first = backend
+        .unpark_shard(now(3), test_tenant(), key, OpId::from_raw(32))
+        .expect("unpark should succeed");
+    assert!(first.is_executed());
+    let replay = backend
+        .unpark_shard(now(4), test_tenant(), key, OpId::from_raw(32))
+        .expect("unpark replay should succeed");
+    assert!(replay.is_replay());
+
+    let (active, active_slab) = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed")
+        .expect("shard must exist");
+    assert_eq!(active.status, ShardStatus::Active);
+    assert!(
+        active.fence_epoch > fence_before,
+        "unpark must bump the fence"
+    );
+    assert!(active.lease.is_none(), "unparked shard must be unowned");
+    assert_eq!(active.park_reason, None);
+    assert_eq!(active.cursor.last_key(&active_slab), Some(b"k".as_slice()));
+    assert!(
+        backend
+            .test_load_owner_binding(test_tenant(), key)
+            .expect("owner lookup should succeed")
+            .is_none(),
+        "unpark should not create a new owner binding"
     );
 }
 
@@ -1401,10 +1809,10 @@ fn concurrent_acquire_second_worker_gets_already_leased() {
 
 /// A split plan whose child count exceeds the backend's `max_children_per_op`
 /// must be rejected with `BackendChildLimitExceeded` before any etcd writes.
+/// This is a pre-validation gate that runs before shared split validation.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_fanout_above_backend_cap() {
-    // Build a backend with max_children_per_op = 2.
     let mut backend = test_coordinator_with_tuning(60, 8, 2);
 
     let run_config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -1466,8 +1874,9 @@ fn split_replace_rejects_fanout_above_backend_cap() {
     );
 }
 
-/// Splitting an already-terminal (Split-status) shard must fail with
-/// `ShardTerminal`.
+/// After a successful split_replace, the parent is in terminal `Split`
+/// status. A second split with a different op_id must be rejected with
+/// `ShardTerminal` — only idempotent replay (same op_id) is allowed.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_terminal_shard() {
@@ -1541,8 +1950,9 @@ fn split_replace_rejects_terminal_shard() {
     );
 }
 
-/// A split attempt using a stale lease (superseded by a newer acquire) must
-/// fail with `StaleFence`.
+/// When worker A's lease deadline passes and worker B acquires the shard
+/// (bumping the fence epoch), worker A's original lease is stale. A split
+/// attempt using worker A's lease must fail with `StaleFence`.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_stale_fence() {
@@ -1618,10 +2028,14 @@ fn split_replace_rejects_stale_fence() {
 // Integration tests: derived-ID collision detection
 // ---------------------------------------------------------------------------
 
-/// When a derived child key already exists in etcd (e.g., from a prior run
-/// or an astronomically unlikely BLAKE3 collision), `split_replace` must
-/// return `SplitInvalid(DerivedIdCollision)` instead of panicking after
-/// exhausting CAS retries.
+/// When a derived child shard ID collides with an already-existing shard
+/// key in etcd, the CAS transaction fails on the `compare_absent` guard
+/// for every retry. After exhausting retries, the backend probes each
+/// derived child key and must return `DerivedIdCollision` rather than
+/// panicking.
+///
+/// This test simulates the collision by pre-registering a shard with the
+/// exact ID that `derive_split_shard_id` will compute.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_returns_collision_when_child_key_exists() {
@@ -1705,9 +2119,9 @@ fn split_replace_returns_collision_when_child_key_exists() {
     );
 }
 
-/// When the derived residual key already exists in etcd, `split_residual`
-/// must return `SplitInvalid(DerivedIdCollision)` instead of panicking
-/// after exhausting CAS retries.
+/// Same collision detection as `split_replace_returns_collision_when_child_key_exists`,
+/// but for the `split_residual` path. Pre-registers a shard with the
+/// derived residual ID and verifies `DerivedIdCollision` is returned.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_returns_collision_when_residual_key_exists() {
@@ -1797,10 +2211,12 @@ fn split_residual_returns_collision_when_residual_key_exists() {
     );
 }
 
-/// After the op-log entry for a `split_residual` has been evicted by
-/// subsequent operations, retrying with the same op_id must still return
-/// `Replayed` with the original residual ID. The fallback path scans the
-/// parent's permanent `spawned` lineage list rather than the bounded op-log.
+/// The shard op-log is a bounded FIFO (16 entries). After enough
+/// subsequent checkpoints evict the `split_residual` entry, retrying
+/// with the same op_id must still succeed via the fallback path:
+/// scanning the parent's permanent `spawned` lineage list to recover
+/// the derived residual ID. This verifies the two-tier replay
+/// mechanism (op-log first, spawned lineage second).
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_replay_via_spawned_after_oplog_eviction() {
@@ -1898,9 +2314,9 @@ fn split_residual_replay_via_spawned_after_oplog_eviction() {
     );
 }
 
-/// A split_replace plan whose child count exceeds `max_children_per_op = 1`
-/// must be rejected with `BackendChildLimitExceeded`, leaving the parent
-/// shard Active and its owner binding unchanged.
+/// With `max_children_per_op = 1`, any multi-child split plan is rejected.
+/// Verifies that the rejection is clean: the parent shard remains `Active`
+/// with the original owner binding unchanged (no partial mutation).
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_over_cap_max_children_per_op() {
