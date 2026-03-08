@@ -51,4 +51,7 @@ pub use error::{EtcdCoordinatorError, EtcdOperation};
 pub use keyspace::{EtcdKeyspace, EtcdKeyspaceError};
 
 #[cfg(test)]
+mod test_etcd;
+
+#[cfg(test)]
 mod tests;

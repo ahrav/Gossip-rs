@@ -27,7 +27,14 @@
 //! | **Terminate-run generator** | `try_gen_terminate_run` samples all seeded runs uniformly |
 
 use super::*;
+use crate::facade::ShardClaiming;
+use crate::run::{RunConfig, RunManagement, RunProgress, RunRecord, ShardFilter, ShardSummary};
+use crate::run_errors::{CreateRunError, GetRunError, RegisterShardsError};
+use crate::sim::backend::SimIntrospection;
+use crate::split_execution::{SplitReplaceResult, SplitResidualResult};
+use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::ShardSpec;
+use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
 use gossip_contracts::test_util::miri_proptest_config;
 use proptest::prelude::*;
 
@@ -68,6 +75,414 @@ fn ops_for_level(level: FaultLevel) -> (usize, usize) {
 }
 
 use crate::sim::test_util::arb_fault_level;
+
+#[derive(Debug, Clone, Copy)]
+enum InjectedSessionFault {
+    Complete,
+    SplitReplace,
+    SplitResidual,
+}
+
+struct FaultingSessionBackend {
+    inner: InMemoryCoordinator,
+    fault: InjectedSessionFault,
+}
+
+impl FaultingSessionBackend {
+    fn new(inner: InMemoryCoordinator, fault: InjectedSessionFault) -> Self {
+        Self { inner, fault }
+    }
+}
+
+impl crate::traits::CoordinationBackend for FaultingSessionBackend {
+    fn acquire_and_restore_into<'a>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        worker: WorkerId,
+        out: &'a mut AcquireScratch,
+    ) -> Result<crate::error::AcquireResultView<'a>, AcquireError> {
+        self.inner
+            .acquire_and_restore_into(now, tenant, key, worker, out)
+    }
+
+    fn renew(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+    ) -> Result<crate::error::RenewResult, RenewError> {
+        self.inner.renew(now, tenant, lease)
+    }
+
+    fn checkpoint(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        new_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CheckpointError> {
+        self.inner.checkpoint(now, tenant, lease, new_cursor, op_id)
+    }
+
+    fn complete(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        final_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CompleteError> {
+        if matches!(self.fault, InjectedSessionFault::Complete) {
+            return Err(CompleteError::BackendError {
+                message: "injected session backend fault".to_string(),
+            });
+        }
+        self.inner.complete(now, tenant, lease, final_cursor, op_id)
+    }
+
+    fn park_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        reason: ParkReason,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, ParkError> {
+        self.inner.park_shard(now, tenant, lease, reason, op_id)
+    }
+
+    fn split_replace(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitReplacePlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitReplaceResult>, crate::error::SplitReplaceError> {
+        if matches!(self.fault, InjectedSessionFault::SplitReplace) {
+            return Err(SplitError::BackendError {
+                message: "injected session backend fault".to_string(),
+            });
+        }
+        self.inner.split_replace(now, tenant, lease, plan, op_id)
+    }
+
+    fn split_residual(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitResidualPlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitResidualResult>, crate::error::SplitResidualError> {
+        if matches!(self.fault, InjectedSessionFault::SplitResidual) {
+            return Err(SplitError::BackendError {
+                message: "injected session backend fault".to_string(),
+            });
+        }
+        self.inner.split_residual(now, tenant, lease, plan, op_id)
+    }
+}
+
+impl RunManagement for FaultingSessionBackend {
+    fn create_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        config: RunConfig,
+    ) -> Result<RunRecord, CreateRunError> {
+        self.inner.create_run(now, tenant, run, config)
+    }
+
+    fn register_shards(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        shards: &[InitialShardInput<'_>],
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError> {
+        self.inner.register_shards(now, tenant, run, shards, op_id)
+    }
+
+    fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError> {
+        self.inner.get_run(tenant, run)
+    }
+
+    fn get_run_progress(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<RunProgress, GetRunError> {
+        self.inner.get_run_progress(now, tenant, run)
+    }
+
+    fn list_shards_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        filter: ShardFilter,
+        out: &mut Vec<ShardSummary>,
+    ) -> Result<(), GetRunError> {
+        self.inner.list_shards_into(now, tenant, run, filter, out)
+    }
+
+    fn collect_claim_candidates_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        candidates: &mut Vec<ShardId>,
+    ) -> Result<Option<LogicalTime>, GetRunError> {
+        self.inner
+            .collect_claim_candidates_into(now, tenant, run, candidates)
+    }
+
+    fn complete_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+        self.inner.complete_run(now, tenant, run, op_id)
+    }
+
+    fn fail_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+        self.inner.fail_run(now, tenant, run, op_id)
+    }
+
+    fn cancel_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+        self.inner.cancel_run(now, tenant, run, op_id)
+    }
+
+    fn unpark_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, UnparkError> {
+        self.inner.unpark_shard(now, tenant, key, op_id)
+    }
+}
+
+impl ShardClaiming for FaultingSessionBackend {
+    fn claim_next_available<'a>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        worker: WorkerId,
+        out: &'a mut AcquireScratch,
+    ) -> Result<crate::error::AcquireResultView<'a>, crate::facade::ClaimError> {
+        self.inner
+            .claim_next_available(now, tenant, run, worker, out)
+    }
+}
+
+impl SimIntrospection for FaultingSessionBackend {
+    type ShardIter<'a>
+        = <InMemoryCoordinator as SimIntrospection>::ShardIter<'a>
+    where
+        Self: 'a;
+    type RunIter<'a>
+        = <InMemoryCoordinator as SimIntrospection>::RunIter<'a>
+    where
+        Self: 'a;
+    type SpawnedIter<'a>
+        = <InMemoryCoordinator as SimIntrospection>::SpawnedIter<'a>
+    where
+        Self: 'a;
+
+    fn shards(&self) -> Self::ShardIter<'_> {
+        self.inner.shards()
+    }
+
+    fn runs(&self) -> Self::RunIter<'_> {
+        self.inner.runs()
+    }
+
+    fn shard_count(&self) -> usize {
+        self.inner.shard_count()
+    }
+
+    fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
+        self.inner.shard_lookup(tenant, key)
+    }
+
+    fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]> {
+        self.inner.cursor_last_key(record)
+    }
+
+    fn spec_bounds<'a>(&'a self, record: &'a ShardRecord) -> (&'a [u8], &'a [u8]) {
+        self.inner.spec_bounds(record)
+    }
+
+    fn validate_record_invariants(&self, record: &ShardRecord) -> Result<(), String> {
+        self.inner.validate_record_invariants(record)
+    }
+
+    fn spawned_children<'a>(&'a self, record: &'a ShardRecord) -> Self::SpawnedIter<'a> {
+        self.inner.spawned_children(record)
+    }
+
+    fn release_record_fields(&mut self, record: &mut ShardRecord) {
+        self.inner.release_record_fields(record);
+    }
+}
+
+fn wrap_faulting_session_backend(
+    sim: CoordinationSim,
+    fault: InjectedSessionFault,
+) -> CoordinationSim<FaultingSessionBackend> {
+    CoordinationSim {
+        context: sim.context,
+        coordinator: FaultingSessionBackend::new(sim.coordinator, fault),
+        workers: sim.workers,
+        fault_config: sim.fault_config,
+        checker: sim.checker,
+        shard_keys: sim.shard_keys,
+        active_shard_keys: sim.active_shard_keys,
+        tenant: sim.tenant,
+        ops_executed: sim.ops_executed,
+        stale_leases: sim.stale_leases,
+        last_checkpoint_ops: sim.last_checkpoint_ops,
+        run_shard_ids: sim.run_shard_ids,
+        admin_next_op: sim.admin_next_op,
+    }
+}
+
+fn seeded_session_sim_with_range(
+    seed: u64,
+    fault: InjectedSessionFault,
+    range_start: u8,
+    range_end: u8,
+) -> (CoordinationSim<FaultingSessionBackend>, WorkerId, ShardKey) {
+    let mut sim = CoordinationSim::new(seed, FaultLevel::SunnyDay);
+    let worker = WorkerId::from_raw(1);
+    let run = RunId::from_raw(1);
+    let shard = ShardId::from_raw(1);
+    let key = ShardKey::new(run, shard);
+
+    sim.add_worker(worker);
+
+    let start = [range_start];
+    let end = [range_end];
+    let spec = ShardSpecRef::with_range(&start, &end);
+    let record = ShardRecord::new_active(
+        sim.tenant,
+        run,
+        shard,
+        spec,
+        CursorSemantics::Completed,
+        sim.coordinator.slab_mut(),
+    )
+    .expect("single-byte shard spec should fit in the test slab");
+    sim.coordinator.seed_shard(record);
+    sim.shard_keys.push(key);
+    sim.active_shard_keys.push(key);
+    sim.run_shard_ids.entry(run).or_default().push(shard);
+    sim.seed_all_runs();
+    sim.context.advance(1);
+
+    (wrap_faulting_session_backend(sim, fault), worker, key)
+}
+
+fn predicted_session_terminal_action(
+    seed: u64,
+    range_lo: u8,
+    range_hi: u8,
+) -> SessionTerminalAction {
+    let mut context = SimContext::new(seed);
+    let num_checkpoints: u32 = context.rng().random_range(1..=3);
+
+    let range_wide_enough = range_hi.saturating_sub(range_lo) >= 2;
+    let terminal_action = match context.rng().random_range(0u32..10) {
+        0..2 => SessionTerminalAction::Park,
+        2..4 if range_wide_enough => SessionTerminalAction::SplitReplace,
+        4 if range_wide_enough => SessionTerminalAction::SplitResidualThenComplete,
+        _ => SessionTerminalAction::Complete,
+    };
+
+    let extra_ops = match terminal_action {
+        SessionTerminalAction::SplitResidualThenComplete => 2,
+        _ => 1,
+    };
+    let total_cursors = num_checkpoints as usize + extra_ops;
+    let mut cursors: Vec<Vec<u8>> = Vec::with_capacity(total_cursors);
+    let mut lo = range_lo;
+    for _ in 0..total_cursors {
+        if lo >= range_hi {
+            let byte = cursors
+                .last()
+                .and_then(|cursor| cursor.first().copied())
+                .unwrap_or(range_hi.saturating_sub(1));
+            cursors.push(vec![byte]);
+        } else {
+            let byte = context.rng().random_range(lo..range_hi);
+            cursors.push(vec![byte]);
+            lo = byte.saturating_add(1);
+        }
+    }
+
+    let split_replace_plan = if matches!(terminal_action, SessionTerminalAction::SplitReplace) {
+        precompute_split_replace_plan(context.rng(), range_lo, range_hi)
+    } else {
+        None
+    };
+
+    let split_residual_plan = if matches!(
+        terminal_action,
+        SessionTerminalAction::SplitResidualThenComplete
+    ) {
+        let last_cp_byte = cursors
+            .get(num_checkpoints.saturating_sub(1) as usize)
+            .and_then(|cursor| cursor.first().copied())
+            .unwrap_or(range_lo);
+        precompute_split_residual_plan(context.rng(), range_lo, range_hi, last_cp_byte)
+    } else {
+        None
+    };
+
+    match terminal_action {
+        SessionTerminalAction::SplitReplace if split_replace_plan.is_none() => {
+            SessionTerminalAction::Complete
+        }
+        SessionTerminalAction::SplitResidualThenComplete if split_residual_plan.is_none() => {
+            SessionTerminalAction::Complete
+        }
+        other => other,
+    }
+}
+
+fn find_seed_for_session_terminal_action(
+    range_lo: u8,
+    range_hi: u8,
+    predicate: impl Fn(SessionTerminalAction) -> bool,
+) -> u64 {
+    (0..10_000)
+        .find(|seed| predicate(predicted_session_terminal_action(*seed, range_lo, range_hi)))
+        .expect("expected at least one seed to produce the requested session terminal action")
+}
 
 // -- Cluster 1: no-violations property (replaces 5 tests) ----------------
 //
@@ -798,6 +1213,62 @@ fn mega_sim_exercises_unpark() {
 fn add_worker_rejects_id_zero() {
     let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
     sim.add_worker(WorkerId::from_raw(0));
+}
+
+#[test]
+#[should_panic(
+    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+)]
+fn session_lifecycle_panics_on_complete_backend_error() {
+    let seed = find_seed_for_session_terminal_action(b'a', b'b', |action| {
+        matches!(action, SessionTerminalAction::Complete)
+    });
+    let (mut sim, worker, key) =
+        seeded_session_sim_with_range(seed, InjectedSessionFault::Complete, b'a', b'b');
+
+    let _ = sim.exec_session_lifecycle(worker, key);
+}
+
+#[test]
+#[should_panic(
+    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+)]
+fn session_lifecycle_panics_on_split_replace_backend_error() {
+    let seed = find_seed_for_session_terminal_action(b'a', b'z', |action| {
+        matches!(action, SessionTerminalAction::SplitReplace)
+    });
+    let (mut sim, worker, key) =
+        seeded_session_sim_with_range(seed, InjectedSessionFault::SplitReplace, b'a', b'z');
+
+    let _ = sim.exec_session_lifecycle(worker, key);
+}
+
+#[test]
+#[should_panic(
+    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+)]
+fn session_lifecycle_panics_on_split_residual_backend_error() {
+    let seed = find_seed_for_session_terminal_action(b'a', b'z', |action| {
+        matches!(action, SessionTerminalAction::SplitResidualThenComplete)
+    });
+    let (mut sim, worker, key) =
+        seeded_session_sim_with_range(seed, InjectedSessionFault::SplitResidual, b'a', b'z');
+
+    let _ = sim.exec_session_lifecycle(worker, key);
+}
+
+#[test]
+#[should_panic(
+    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+)]
+fn session_lifecycle_panics_on_post_residual_complete_backend_error() {
+    let seed = find_seed_for_session_terminal_action(b'a', b'z', |action| {
+        matches!(action, SessionTerminalAction::SplitResidualThenComplete)
+    });
+    let (mut sim, worker, key) =
+        seeded_session_sim_with_range(seed, InjectedSessionFault::Complete, b'a', b'z');
+
+    let _ = sim.exec_session_lifecycle(worker, key);
 }
 
 /// Admin unpark succeeds on a shard previously held by worker 1 — no

@@ -728,6 +728,10 @@ pub enum CompleteError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Debug for CompleteError {
@@ -782,6 +786,10 @@ impl fmt::Debug for CompleteError {
                 .finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -820,6 +828,9 @@ impl fmt::Display for CompleteError {
             }
             Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }
@@ -972,6 +983,9 @@ pub enum SplitError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
+    /// Transient coordination backend I/O error (e.g. etcd unreachable).
+    /// Recoverable: the caller may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Debug for SplitError {
@@ -1008,6 +1022,10 @@ impl fmt::Debug for SplitError {
                 .finish(),
             Self::SplitInvalid(inner) => f.debug_tuple("SplitInvalid").field(inner).finish(),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -1046,6 +1064,9 @@ impl fmt::Display for SplitError {
             }
             Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }

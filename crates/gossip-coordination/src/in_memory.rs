@@ -110,21 +110,22 @@ use crate::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
 use crate::split_execution::{
-    DerivedShardKind, SplitReplaceResult, SplitResidualResult, derive_split_shard_id,
-    hash_checkpoint_payload, hash_complete_payload, hash_park_payload, hash_split_replace_payload,
-    hash_split_residual_payload,
+    DerivedShardKind, SplitChildIds, SplitChildOrder, SplitReplaceResult, SplitResidualResult,
+    derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload, hash_park_payload,
+    hash_split_replace_payload, hash_split_residual_payload, split_replace_apply_parent,
+    split_replace_validate_preconditions, split_residual_apply_parent, split_residual_build_record,
+    split_residual_check_replay, split_residual_validate_preconditions,
 };
 use crate::traits::CoordinationBackend;
 use crate::validation::{check_op_idempotency, validate_cursor_update_pooled, validate_lease};
 use gossip_contracts::coordination::cursor::CursorUpdate;
-use gossip_contracts::coordination::limits::{MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN};
+#[cfg(test)]
+use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
 use gossip_contracts::coordination::manifest::{InitialShardInput, validate_manifest};
-use gossip_contracts::coordination::shard_spec::{
-    ShardLimitScope, ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
-};
-use gossip_contracts::coordination::split::{
-    SplitReplaceChild, SplitReplacePlan, SplitResidualPlan,
-};
+use gossip_contracts::coordination::shard_spec::{ShardLimitScope, SplitValidationError};
+#[cfg(test)]
+use gossip_contracts::coordination::split::SplitReplaceChild;
+use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_stdx::{ByteSlab, RingBuffer};
 
@@ -1500,9 +1501,9 @@ impl CoordinationBackend for InMemoryCoordinator {
                 // Phase 2: Build residual record (allocates into slab).
                 let mut residual_record = split_residual_build_record(
                     parent,
-                    &plan,
                     tenant,
                     residual_id,
+                    &plan,
                     &mut coordinator.slab,
                 )?;
 
@@ -1520,8 +1521,8 @@ impl CoordinationBackend for InMemoryCoordinator {
 
                 if let Err(e) = split_residual_apply_parent(
                     parent,
-                    plan.parent_new_spec(),
                     residual_id,
+                    plan.parent_new_spec(),
                     op_id,
                     payload_hash,
                     now,
@@ -1562,184 +1563,6 @@ impl CoordinationBackend for InMemoryCoordinator {
 //    over their arguments.  Keeping them free of `self` makes this explicit
 //    and simplifies unit testing (no coordinator setup required).
 
-/// Fixed-capacity child-id scratch used by split-replace helpers.
-type SplitChildIds = gossip_stdx::InlineVec<ShardId, { MAX_SPLIT_CHILDREN }>;
-
-const _: () = assert!(MAX_SPLIT_CHILDREN <= u16::MAX as usize);
-
-/// Fixed-capacity sorted index scratch for `SplitReplacePlan::children()`.
-///
-/// Stores child indices sorted by `key_range_start` without allocating.
-/// The indirection (storing sorted indices rather than sorted children)
-/// avoids copying `SplitReplaceChild` values while still enabling
-/// contiguous-boundary validation in `key_range_start` order.
-#[derive(Clone, Copy)]
-struct SplitChildOrder {
-    len: usize,
-    indices: [u16; MAX_SPLIT_CHILDREN],
-}
-
-impl SplitChildOrder {
-    fn from_plan(plan: &SplitReplacePlan<'_>) -> Self {
-        let len = plan.children().len();
-        let mut indices = [0u16; MAX_SPLIT_CHILDREN];
-        for (i, slot) in indices.iter_mut().take(len).enumerate() {
-            *slot = u16::try_from(i).expect("split child index exceeds u16");
-        }
-        indices[..len].sort_by(|a, b| {
-            plan.children()[usize::from(*a)]
-                .spec()
-                .key_range_start()
-                .cmp(plan.children()[usize::from(*b)].spec().key_range_start())
-        });
-        // Defense-in-depth: `SplitReplacePlan::try_new` already enforces >= 2
-        // children at construction time; this assertion catches accidental
-        // bypass of constructor invariants.
-        assert!(len >= 2, "split_replace requires >= 2 children");
-        Self { len, indices }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    fn child<'a>(
-        &self,
-        plan: &'a SplitReplacePlan<'a>,
-        sorted_idx: usize,
-    ) -> &'a SplitReplaceChild<'a> {
-        &plan.children()[usize::from(self.indices[sorted_idx])]
-    }
-}
-
-/// Verify that the sorted children form a contiguous, non-overlapping
-/// partition of the parent's key range `[parent_start, parent_end)`.
-///
-/// Checks (all on pre-sorted children):
-///   1. At least 2 children exist.
-///   2. First child starts at `parent_start`.
-///   3. Last child ends at `parent_end`.
-///   4. Adjacent children share an exact boundary (no gaps, no overlaps).
-///   5. No child has an inverted range (`start >= end` for bounded ranges).
-fn split_replace_validate_coverage_sorted(
-    parent_start: &[u8],
-    parent_end: &[u8],
-    plan: &SplitReplacePlan<'_>,
-    sorted: &SplitChildOrder,
-) -> Result<(), SplitValidationError> {
-    if sorted.len() == 0 {
-        return Err(SplitValidationError::NoChildren);
-    }
-    if sorted.len() == 1 {
-        return Err(SplitValidationError::SingleChild);
-    }
-
-    let first = sorted.child(plan, 0).spec();
-    if first.key_range_start() != parent_start {
-        return Err(SplitValidationError::StartMismatch {
-            parent_start: parent_start.len(),
-            first_child_start: first.key_range_start().len(),
-        });
-    }
-
-    let last = sorted.child(plan, sorted.len() - 1).spec();
-    if last.key_range_end() != parent_end {
-        return Err(SplitValidationError::EndMismatch {
-            parent_end: parent_end.len(),
-            last_child_end: last.key_range_end().len(),
-        });
-    }
-
-    for i in 0..sorted.len() - 1 {
-        let child = sorted.child(plan, i).spec();
-        let next = sorted.child(plan, i + 1).spec();
-        if child.key_range_end() != next.key_range_start() {
-            return Err(SplitValidationError::BoundaryMismatch {
-                child_index: i,
-                next_child_index: i + 1,
-                child_end: child.key_range_end().len(),
-                next_child_start: next.key_range_start().len(),
-            });
-        }
-        if child.key_range_end().is_empty() {
-            return Err(SplitValidationError::OverlappingChild {
-                child_index: i,
-                next_child_index: i + 1,
-            });
-        }
-    }
-
-    for i in 0..sorted.len() {
-        let child = sorted.child(plan, i).spec();
-        if !child.key_range_start().is_empty()
-            && !child.key_range_end().is_empty()
-            && child.key_range_start() >= child.key_range_end()
-        {
-            return Err(SplitValidationError::InvertedChild { child_index: i });
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate split_replace preconditions: coverage and spawn-cap.
-///
-/// Sorts children, validates that they partition the parent's range, and
-/// checks the spawn-cap limit. Parent bounds are borrowed directly from the
-/// pooled parent spec, avoiding `to_spec()` materialization in this hot path.
-/// Returns sorted child-order scratch on success.
-fn split_replace_validate_preconditions<'a>(
-    parent: &ShardRecord,
-    plan: &'a SplitReplacePlan<'a>,
-    slab: &ByteSlab,
-) -> Result<SplitChildOrder, SplitReplaceError> {
-    let sorted = split_replace_sort_children(plan);
-
-    // Validate per-spec size limits before coverage checks. ShardSpecRef is
-    // intentionally unvalidated at construction; this gate prevents oversized
-    // specs from reaching AcquireScratch::write_spec's panicking asserts.
-    for i in 0..sorted.len() {
-        let child = sorted.child(plan, i);
-        if ShardSpec::validate_ref(child.spec()).is_err() {
-            return Err(SplitReplaceError::SplitInvalid(
-                SplitValidationError::InvalidChildSpec { child_index: i },
-            ));
-        }
-    }
-
-    split_replace_validate_coverage_sorted(
-        parent.spec.key_range_start(slab),
-        parent.spec.key_range_end(slab),
-        plan,
-        &sorted,
-    )
-    .map_err(SplitReplaceError::SplitInvalid)?;
-
-    // Spawn-cap guard: check BEFORE mutating parent.spawned.
-    if !parent.can_spawn(sorted.len()) {
-        return Err(SplitReplaceError::SplitInvalid(
-            SplitValidationError::SpawnLimitExceeded {
-                current: parent.spawned.len(),
-                additional: sorted.len(),
-                max: MAX_SPAWNED_PER_SHARD,
-            },
-        ));
-    }
-    Ok(sorted)
-}
-
-/// Sort plan children by `key_range_start` for deterministic ordering.
-///
-/// Callers may submit children in any order. Sorting ensures that the
-/// derived child IDs (which depend on index) are stable regardless of
-/// submission order, and that `split_replace_validate_coverage_sorted`
-/// sees children in the contiguous sequence it expects.
-fn split_replace_sort_children<'a>(plan: &'a SplitReplacePlan<'a>) -> SplitChildOrder {
-    SplitChildOrder::from_plan(plan)
-}
-
 /// Recompute child IDs for an idempotent replay.
 ///
 /// On replay, the op_log entry exists but the children are already in
@@ -1751,7 +1574,7 @@ fn split_replace_replay_child_ids(
     plan: &SplitReplacePlan<'_>,
     op_id: OpId,
 ) -> SplitChildIds {
-    let sorted = split_replace_sort_children(plan);
+    let sorted = SplitChildOrder::from_plan(plan);
     let n = sorted.len();
     // Parent is terminal (Split) after first execution, so spawned is
     // frozen. The children were the last N entries appended.
@@ -1877,297 +1700,6 @@ fn split_replace_insert_children(
         "child count mismatch after build",
     );
     Ok(child_ids)
-}
-
-/// Transition parent to terminal `Split` status.
-///
-/// The parent's lease is released (no worker owns a terminal shard) and
-/// child IDs are recorded in `spawned` for lineage tracking. Once in
-/// `Split` status, no further operations can push op-log entries, so the
-/// split_replace entry is **never evicted** — guaranteeing idempotent
-/// replay detection.
-fn split_replace_apply_parent(
-    parent: &mut ShardRecord,
-    child_ids: &[ShardId],
-    op_id: OpId,
-    payload_hash: u64,
-    now: LogicalTime,
-    slab: &mut ByteSlab,
-) -> Result<(), SplitReplaceError> {
-    assert!(!child_ids.is_empty(), "split_replace requires children");
-    debug_assert!(
-        parent.can_spawn(child_ids.len()),
-        "split_replace precondition violated: append would exceed spawn cap"
-    );
-
-    let (spawned_slot, spawned_len) = parent.spawned.allocate_appended_slot(child_ids, slab)?;
-    parent.assert_transition_legal(ShardStatus::Split);
-    parent.spawned.install_slot(spawned_slot, spawned_len, slab);
-    parent.status = ShardStatus::Split;
-    parent.lease = None;
-    parent.op_log_push(OpLogEntry::new(
-        op_id,
-        OpKind::SplitReplace,
-        OpResult::Completed,
-        payload_hash,
-        now,
-    ));
-    parent.assert_invariants(slab);
-    Ok(())
-}
-
-// ============================================================================
-// split_residual helpers
-// ============================================================================
-//
-// Extracted as free functions for the same borrow-splitting and purity
-// reasons as the split_replace helpers above.  Additionally,
-// `split_residual_check_replay` encapsulates the two-tier replay
-// detection logic (op-log + spawned probe) which is specific to
-// residual splits and would clutter the main method body.
-
-/// Search `parent.spawned` for a residual derived from the given `op_id`.
-///
-/// `spawned` is append-only: each derived split ID is pushed at the same
-/// index used in its derivation. This lets us probe replay candidates in a
-/// single pass without building a temporary set: for each current index `i`,
-/// derive `Residual(op_id, i)` and compare against `spawned[i]`.
-///
-/// Complexity: O(S·D) where S = `spawned.len()` and D = BLAKE3 hash cost
-/// (constant). At `MAX_SPAWNED_PER_SHARD` (1024), worst case is ~1024
-/// hash+compare steps and zero heap allocation.
-///
-/// Returns `None` if no match, meaning this is genuinely a new operation.
-fn find_replayed_residual(parent: &ShardRecord, op_id: OpId, slab: &ByteSlab) -> Option<ShardId> {
-    assert!(
-        parent.spawned.len() <= MAX_SPAWNED_PER_SHARD,
-        "spawned count {} exceeds bound {}",
-        parent.spawned.len(),
-        MAX_SPAWNED_PER_SHARD,
-    );
-    for (idx, spawned) in parent.spawned.iter(slab).enumerate() {
-        let candidate = derive_split_shard_id(
-            parent.run,
-            parent.shard,
-            op_id,
-            DerivedShardKind::Residual,
-            idx as u32,
-        );
-        if spawned == candidate {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Two-tier replay detection for `split_residual`.
-///
-/// Unlike `split_replace` (which makes the parent terminal, freezing its
-/// op-log), `split_residual` keeps the parent `Active`. Subsequent
-/// checkpoints can evict the split_residual op-log entry. To handle this:
-///
-/// 1. **Op-log check** (primary): if the entry is still present and the
-///    payload hash matches, return `Replayed`. If the hash differs, return
-///    `OpIdConflict`.
-/// 2. **Spawned probe** (defense-in-depth): if the op-log entry was evicted,
-///    scan `parent.spawned` for a residual derived from this `op_id`. The
-///    `spawned` vec is permanent (never evicted, bounded by
-///    `MAX_SPAWNED_PER_SHARD`).
-///
-/// The spawned check comes *after* the op-log check so that `OpIdConflict`
-/// (same op_id, different payload) is not masked.
-///
-/// Returns `Some(Replayed(..))` if replay detected, `None` to proceed.
-fn split_residual_check_replay(
-    parent: &ShardRecord,
-    op_id: OpId,
-    payload_hash: u64,
-    slab: &ByteSlab,
-) -> Result<Option<IdempotentOutcome<SplitResidualResult>>, SplitResidualError> {
-    if check_op_idempotency(parent, op_id, payload_hash)?.is_some() {
-        // Op-log hit. The residual is already in spawned; find it.
-        // An op-log hit means `split_residual_apply_parent` completed — the
-        // residual was pushed to `parent.spawned` before the op-log entry was
-        // written. If `find_replayed_residual` fails here, it indicates a
-        // logic bug (spawned was mutated without recording the residual).
-        let replayed = find_replayed_residual(parent, op_id, slab).expect(
-            "op-log hit for split_residual implies residual exists in parent.spawned; \
-             missing entry indicates a coordinator bug",
-        );
-        return Ok(Some(IdempotentOutcome::Replayed(SplitResidualResult {
-            residual: replayed,
-        })));
-    }
-
-    // Defense-in-depth: if op_log entry was evicted but residual was
-    // already created, detect via parent.spawned (permanent, never
-    // evicted). This check comes AFTER op-log miss to avoid masking
-    // OpIdConflict. MAX_SPAWNED_PER_SHARD bounds the search.
-    //
-    // NOTE(limitation): The spawned-probe tier cannot verify payload hash
-    // after op-log eviction. If a client replays op_id=X with a *different*
-    // plan after the op-log entry is evicted, this path returns Replayed
-    // (matching the original residual) instead of OpIdConflict. This is
-    // acceptable because: (1) eviction requires 16+ intervening ops,
-    // meaning the original execution is far in the past, (2) op_ids are
-    // CSPRNG-generated so accidental reuse is astronomically unlikely,
-    // (3) this is a reference implementation — production backends with
-    // durable op-logs don't have this window.
-    if let Some(existing) = find_replayed_residual(parent, op_id, slab) {
-        return Ok(Some(IdempotentOutcome::Replayed(SplitResidualResult {
-            residual: existing,
-        })));
-    }
-
-    Ok(None)
-}
-
-/// Validate all preconditions for a fresh `split_residual` execution.
-///
-/// Checks, in order: lease validity (tenant, fence, expiry), split
-/// coverage (new parent + residual must partition old parent's range),
-/// cursor bounds (parent's cursor must remain within the shrunk range),
-/// and spawn-cap (parent has not exceeded [`MAX_SPAWNED_PER_SHARD`]).
-/// Split coverage consumes borrowed parent bounds from the pooled parent
-/// record to keep validation allocation-free.
-fn split_residual_validate_preconditions(
-    now: LogicalTime,
-    tenant: TenantId,
-    lease: &Lease,
-    parent: &ShardRecord,
-    plan: &SplitResidualPlan<'_>,
-    slab: &ByteSlab,
-) -> Result<(), SplitResidualError> {
-    validate_lease(now, tenant, lease, parent)?;
-
-    // Validate per-spec size limits for both the new parent and residual specs.
-    if ShardSpec::validate_ref(plan.parent_new_spec()).is_err() {
-        return Err(SplitResidualError::SplitInvalid(
-            SplitValidationError::InvalidChildSpec { child_index: 0 },
-        ));
-    }
-    if ShardSpec::validate_ref(plan.residual_spec()).is_err() {
-        return Err(SplitResidualError::SplitInvalid(
-            SplitValidationError::InvalidChildSpec { child_index: 1 },
-        ));
-    }
-
-    validate_residual_split_bounds(
-        parent.spec.key_range_start(slab),
-        parent.spec.key_range_end(slab),
-        plan.parent_new_spec(),
-        plan.residual_spec(),
-    )
-    .map_err(SplitResidualError::SplitInvalid)?;
-    // Safety: shrinking the parent must not strand its existing cursor.
-    split_residual_validate_cursor_bounds(parent, plan, slab)?;
-    // Spawn-cap guard: check BEFORE mutating parent.spawned.
-    if !parent.can_spawn(1) {
-        return Err(SplitResidualError::SplitInvalid(
-            SplitValidationError::SpawnLimitExceeded {
-                current: parent.spawned.len(),
-                additional: 1,
-                max: MAX_SPAWNED_PER_SHARD,
-            },
-        ));
-    }
-    Ok(())
-}
-
-/// Verify the parent's cursor remains within the shrunk key range.
-///
-/// After a residual split, the parent keeps a subset of the original
-/// keyspace (typically a prefix, but the validation is position-agnostic).
-/// If the cursor's `last_key` falls outside the new range,
-/// the parent would violate cursor-bounds invariants (INV: `last_key ∈
-/// [spec.start, spec.end)`). This would strand progress — the worker
-/// could never advance past a key that's no longer in its range.
-fn split_residual_validate_cursor_bounds(
-    parent: &ShardRecord,
-    plan: &SplitResidualPlan<'_>,
-    slab: &ByteSlab,
-) -> Result<(), SplitResidualError> {
-    // Borrow pooled last_key directly and check against the proposed parent.
-    if let Some(k) = parent.cursor.last_key(slab)
-        && !plan.parent_new_spec().contains_key(k)
-    {
-        return Err(SplitResidualError::SplitInvalid(
-            gossip_contracts::coordination::shard_spec::SplitValidationError::ParentCursorOutOfBounds {
-                cursor: k.len(),
-                new_parent_start: plan.parent_new_spec().key_range_start().len(),
-                new_parent_end: plan.parent_new_spec().key_range_end().len(),
-            },
-        ));
-    }
-    Ok(())
-}
-
-/// Build the residual shard record (pure — no map mutation).
-///
-/// The residual starts with `CursorUpdate::initial()` because no work has been
-/// done in the residual's key range yet. It inherits `cursor_semantics`
-/// from the parent (run-level property) and records `parent.shard` as its
-/// lineage parent.
-fn split_residual_build_record(
-    parent: &ShardRecord,
-    plan: &SplitResidualPlan<'_>,
-    tenant: TenantId,
-    residual_id: ShardId,
-    slab: &mut ByteSlab,
-) -> Result<ShardRecord, SplitResidualError> {
-    assert!(residual_id.is_derived(), "residual must be derived");
-    ShardRecord::new_split_child(
-        tenant,
-        parent.run,
-        residual_id,
-        plan.residual_spec(),
-        CursorUpdate::initial(),
-        parent.cursor_semantics,
-        parent.shard,
-        slab,
-    )
-    .map_err(SplitResidualError::from)
-}
-
-/// Shrink parent's key range and record the residual in `spawned`.
-///
-/// Unlike `split_replace_apply_parent`, the parent **keeps its lease** —
-/// the worker continues processing the (now smaller) parent shard. The
-/// parent stays `Active`, which means subsequent ops can evict this
-/// op-log entry. That's acceptable because `find_replayed_residual`
-/// provides a secondary replay detection path via `spawned`.
-fn split_residual_apply_parent(
-    parent: &mut ShardRecord,
-    new_spec: ShardSpecRef<'_>,
-    residual_id: ShardId,
-    op_id: OpId,
-    payload_hash: u64,
-    now: LogicalTime,
-    slab: &mut ByteSlab,
-) -> Result<(), SplitResidualError> {
-    assert!(residual_id.is_derived(), "residual must be derived");
-    debug_assert!(
-        parent.can_spawn(1),
-        "split_residual precondition violated: append would exceed spawn cap"
-    );
-
-    let (spawned_slot, spawned_len) = parent
-        .spawned
-        .allocate_appended_slot(core::slice::from_ref(&residual_id), slab)?;
-    if let Err(err) = parent.spec.update_from_ref(new_spec, slab) {
-        slab.deallocate(spawned_slot);
-        return Err(SplitResidualError::from(err));
-    }
-    parent.spawned.install_slot(spawned_slot, spawned_len, slab);
-    parent.op_log_push(OpLogEntry::new(
-        op_id,
-        OpKind::SplitResidual,
-        OpResult::Completed,
-        payload_hash,
-        now,
-    ));
-    parent.assert_invariants(slab);
-    Ok(())
 }
 
 // ============================================================================

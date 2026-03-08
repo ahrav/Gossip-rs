@@ -43,6 +43,7 @@ gossip-frontier = { path = "crates/gossip-frontier" }
 # External dev/test dependencies
 rstest = "0.25"
 proptest = "1.6"
+testcontainers = { version = "0.27", features = ["blocking"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1.0"

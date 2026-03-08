@@ -423,6 +423,9 @@ impl From<CompleteError> for RejectionKind {
             CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
             CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,
             CompleteError::ResourceExhausted(_) => Self::ResourceExhausted,
+            CompleteError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }
@@ -451,6 +454,9 @@ impl From<SplitError> for RejectionKind {
             SplitError::ShardNotFound { .. } => Self::ShardNotFound,
             SplitError::TenantMismatch { .. } => Self::TenantMismatch,
             SplitError::ResourceExhausted(_) => Self::ResourceExhausted,
+            SplitError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }
@@ -2726,21 +2732,29 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 }
                 SessionTerminalAction::Complete => {
                     let terminal_update = CursorUpdate::with_last_key(&cursors[terminal_idx]);
-                    let is_terminal =
-                        match sess.complete(now, &terminal_update, op_ids[terminal_idx]) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                debug_assert!(
-                                    !matches!(
-                                        e,
-                                        CompleteError::TenantMismatch { .. }
-                                            | CompleteError::ShardNotFound { .. }
-                                    ),
-                                    "session complete hit impossible error: {e:?}"
-                                );
-                                false
-                            }
-                        };
+                    let is_terminal = match sess.complete(
+                        now,
+                        &terminal_update,
+                        op_ids[terminal_idx],
+                    ) {
+                        Ok(_) => true,
+                        Err(CompleteError::BackendError { message }) => {
+                            panic!(
+                                "simulation backend produced unexpected infrastructure error: {message}"
+                            )
+                        }
+                        Err(e) => {
+                            debug_assert!(
+                                !matches!(
+                                    e,
+                                    CompleteError::TenantMismatch { .. }
+                                        | CompleteError::ShardNotFound { .. }
+                                ),
+                                "session complete hit impossible error: {e:?}"
+                            );
+                            false
+                        }
+                    };
                     Ok(SessionOutcome {
                         lease,
                         is_terminal,
@@ -2782,6 +2796,11 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                                 checkpoints_rejected,
                                 split_children: children.iter().copied().collect(),
                             })
+                        }
+                        Err(SplitError::BackendError { message }) => {
+                            panic!(
+                                "simulation backend produced unexpected infrastructure error: {message}"
+                            )
                         }
                         Err(e) => {
                             debug_assert!(
@@ -2826,6 +2845,11 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     // split_residual is non-terminal (&mut self) — session stays active.
                     let split_ok = match sess.split_residual(now, plan, op_ids[terminal_idx]) {
                         Ok(_) => true,
+                        Err(SplitError::BackendError { message }) => {
+                            panic!(
+                                "simulation backend produced unexpected infrastructure error: {message}"
+                            )
+                        }
                         Err(e) => {
                             debug_assert!(
                                 !matches!(
@@ -2846,21 +2870,29 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         let complete_key = [complete_byte];
                         let complete_cursor = CursorUpdate::with_last_key(&complete_key);
                         let complete_update = complete_cursor;
-                        let is_terminal =
-                            match sess.complete(now, &complete_update, op_ids[complete_idx]) {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    debug_assert!(
-                                        !matches!(
-                                            e,
-                                            CompleteError::TenantMismatch { .. }
-                                                | CompleteError::ShardNotFound { .. }
-                                        ),
-                                        "session complete hit impossible error: {e:?}"
-                                    );
-                                    false
-                                }
-                            };
+                        let is_terminal = match sess.complete(
+                            now,
+                            &complete_update,
+                            op_ids[complete_idx],
+                        ) {
+                            Ok(_) => true,
+                            Err(CompleteError::BackendError { message }) => {
+                                panic!(
+                                    "simulation backend produced unexpected infrastructure error: {message}"
+                                )
+                            }
+                            Err(e) => {
+                                debug_assert!(
+                                    !matches!(
+                                        e,
+                                        CompleteError::TenantMismatch { .. }
+                                            | CompleteError::ShardNotFound { .. }
+                                    ),
+                                    "session complete hit impossible error: {e:?}"
+                                );
+                                false
+                            }
+                        };
                         let children: Vec<ShardId> = residual_id.into_iter().collect();
                         Ok(SessionOutcome {
                             lease,

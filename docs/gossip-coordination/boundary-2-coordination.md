@@ -17,12 +17,24 @@ It owns a real etcd client connection, a deterministic keyspace layout
 (`keyspace.rs`), and an explicit binary codec (`codec.rs`) for persisting
 coordination records. It persists `create_run`, `register_shards`,
 `get_run*` queries, `claim_next_available`, and the fenced
-`acquire_and_restore_into` / `renew` / `checkpoint` hot path directly in etcd.
+`acquire_and_restore_into` / `renew` / `checkpoint` / `split_replace` /
+`split_residual` hot path directly in etcd.
 Shard owner bindings live in separate etcd lease-backed keys so storage-layer
 liveness and logical lease deadlines are checked together before accepting
-progress updates. The remaining mutating operations (`complete`, `park_shard`,
-`split_*`, run terminal transitions, `unpark_shard`) fail closed until their
-persisted transaction shapes land.
+progress updates. `split_replace` also enforces a backend-local
+`max_children_per_op` cap so one atomic child publication stays bounded.
+Each `split_replace` transaction uses `3 + 2N` writes and `4 + N` compares
+(total `7 + 3N` txn-ops, where N = children). The default cap of 8 yields
+31 total ops; operators raising the cap must verify the total stays within
+the cluster's `--max-txn-ops` budget (etcd default 128).
+The etcd config also carries the same per-tenant and global shard ceilings
+used by the in-memory backend. The persisted backend enforces those limits
+before `register_shards`, `split_replace`, and `split_residual` by counting
+existing shard-record keys under the relevant etcd prefixes, then rejecting
+growth that would exceed the configured caps.
+The remaining mutating operations (`complete`, `park_shard`, run terminal
+transitions, `unpark_shard`) fail closed until their persisted transaction
+shapes land.
 
 The module provides seven core capabilities:
 
@@ -85,13 +97,13 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
-| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, and fenced acquire/renew/checkpoint |
-| `config.rs`       | Endpoint + namespace validation plus owner-lease TTL and optimistic retry tuning             |
+| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, and fenced acquire/renew/checkpoint/split |
+| `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, shard count limits, and bounded split fanout |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
 | `error.rs`        | etcd connection, codec, lease, and transaction error surfaces                                 |
-| `tests.rs`        | Config validation and etcd connectivity smoke tests                                           |
+| `tests.rs`        | Config validation, keyspace path invariants (proptest), and ignored etcd integration tests covering acquire/checkpoint/renew/split lifecycle, lease expiry, and contention |
 
 ---
 
@@ -742,9 +754,11 @@ for O(1) global limit checks.
 ### Shard count limits
 
 The coordinator enforces per-tenant and global shard count limits to prevent
-split-flooding (CWE-400). `check_shard_limits` runs before every split and
-shard registration, accounting for temporarily-removed records in the
-remove-mutate-restore pattern.
+split-flooding (CWE-400). The in-memory backend uses `check_shard_limits`
+before every split and shard registration, accounting for temporarily-removed
+records in the remove-mutate-restore pattern. The etcd backend enforces the
+same limits by counting persisted shard-record keys under the tenant subtree
+and the global tenant root before publishing new shard records.
 
 ---
 

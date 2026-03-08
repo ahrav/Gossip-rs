@@ -767,10 +767,18 @@ impl std::error::Error for ShardSpecInputError {}
 
 /// Opaque handle for a spec allocated in [`ShardArena`].
 ///
-/// Handles are slot + generation pairs. The generation prevents use-after-free:
-/// freeing a slot increments the generation, so stale handles pointing to the
-/// same slot index are detected and rejected by `view_spec`. Handles are `Copy`
-/// (cheap to pass around) but the underlying bytes live in the arena's slab.
+/// Handles are `(slot, generation, arena_id)` triples. Two safety mechanisms
+/// prevent use-after-free:
+///
+/// - **Generation guard**: Freeing a slot increments its generation counter.
+///   Stale handles carry the generation from allocation time, so
+///   [`ShardArena::try_view_spec`] detects the mismatch and returns `None`.
+/// - **Arena identity guard**: Each arena has a globally unique `arena_id`.
+///   A handle issued by arena A is rejected by arena B, preventing
+///   accidental cross-arena slot aliasing.
+///
+/// Handles are `Copy` and cheap to pass around; the underlying bytes live
+/// in the arena's slab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShardSpecHandle {
     /// Index into the arena's slot array.
@@ -834,8 +842,9 @@ pub struct ShardArena {
     /// generations prevent stale-handle access.
     slots: Vec<ArenaSlot>,
     /// LIFO stack of free slot indices. Popped on alloc, pushed on free.
-    /// Reverse order (highest index at bottom) gives deterministic
-    /// allocation order after [`clear`](Self::clear).
+    /// Initialized with highest index at the bottom so `pop()` yields
+    /// slot 0 first, giving deterministic allocation order after
+    /// construction and after [`clear`](Self::clear).
     free_slots: Vec<u32>,
     /// Unique identifier for this arena instance. Prevents cross-arena
     /// handle misuse (a handle from arena A is rejected by arena B).
@@ -990,6 +999,10 @@ impl ShardArena {
     /// - resets the slab in O(1) without resizing backing buffers,
     /// - invalidates all existing handles by bumping slot generations,
     /// - rebuilds the free-slot stack in deterministic order (slot 0 first).
+    ///
+    /// The final `reverse()` restores the LIFO ordering invariant: the
+    /// lowest-index slot sits at the top of the stack so `pop()` yields
+    /// slot 0 first, matching the initial construction order.
     pub fn clear(&mut self) {
         self.slab.clear();
         self.free_slots.clear();
@@ -1005,7 +1018,9 @@ impl ShardArena {
 
 impl Drop for ShardArena {
     fn drop(&mut self) {
-        // Ensures ByteSlab debug-drop sees zero live allocations.
+        // `ByteSlab` debug-asserts that all allocations are deallocated
+        // before it is dropped. `clear()` releases every occupied slot's
+        // slab allocation, satisfying that invariant.
         self.clear();
     }
 }
@@ -1014,12 +1029,13 @@ impl Drop for ShardArena {
 // Split Validation
 // ============================================================================
 
-/// Whether a shard limit breach is per-tenant or global.
+/// Scope discriminator for shard-count limit violations.
 ///
 /// Split operations check both per-tenant and global shard count ceilings
 /// before creating new children. This enum distinguishes which ceiling was
 /// hit, enabling callers to produce targeted error messages (e.g., "tenant
-/// X is at the limit" vs "system-wide limit reached").
+/// X is at the limit" vs "system-wide limit reached") and operators to
+/// tune the appropriate limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardLimitScope {
     /// Per-tenant shard count limit.
@@ -1077,9 +1093,9 @@ pub enum SplitValidationError {
     },
     /// Boundary mismatch (gap or overlap) between adjacent children.
     BoundaryMismatch {
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the child in the caller-provided children slice.
         child_index: usize,
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the adjacent child in the caller-provided children slice.
         next_child_index: usize,
         /// Length of `child_index`'s end key in bytes.
         child_end: usize,
@@ -1088,16 +1104,16 @@ pub enum SplitValidationError {
     },
     /// Child has inverted key range (start >= end).
     InvertedChild {
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the child in the caller-provided children slice.
         child_index: usize,
     },
 
     /// A non-last child has an unbounded end, causing it to overlap with
     /// subsequent children.
     OverlappingChild {
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the child in the caller-provided children slice.
         child_index: usize,
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the adjacent child in the caller-provided children slice.
         next_child_index: usize,
     },
 
@@ -1127,6 +1143,20 @@ pub enum SplitValidationError {
         additional: usize,
         /// Maximum allowed spawned children per shard.
         max: usize,
+    },
+
+    /// The backend-specific child fanout cap would be exceeded.
+    ///
+    /// This is distinct from
+    /// [`MAX_SPLIT_CHILDREN`](super::limits::MAX_SPLIT_CHILDREN): the
+    /// global contract limit bounds plan shape, while a concrete backend
+    /// may choose a stricter cap for a single atomic publication
+    /// operation.
+    BackendChildLimitExceeded {
+        /// Number of children requested by the split plan.
+        requested: usize,
+        /// Maximum children the backend accepts in one atomic operation.
+        backend_max: usize,
     },
 
     /// The split would exceed a shard count limit (per-tenant or global).
@@ -1221,6 +1251,13 @@ impl fmt::Display for SplitValidationError {
             } => write!(
                 f,
                 "spawn limit exceeded: {current} existing + {additional} new > {max} max",
+            ),
+            Self::BackendChildLimitExceeded {
+                requested,
+                backend_max,
+            } => write!(
+                f,
+                "backend child fanout exceeded: requested {requested} children, max {backend_max}",
             ),
             Self::ShardLimitExceeded {
                 current,
