@@ -78,12 +78,14 @@ The module provides seven core capabilities:
 
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
+| `lib.rs`          | Module root and public re-exports                                                            |
 | `backend.rs`      | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
 | `config.rs`       | Endpoint + namespace validation for etcd connectivity                                         |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records persisted to etcd                  |
-| `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
 | `error.rs`        | etcd connection/runtime error surfaces                                                        |
+| `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
+| `tests.rs`        | Config validation and etcd connectivity smoke tests                                           |
 
 ---
 

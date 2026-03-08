@@ -66,6 +66,20 @@ dir = "crates/gossip-connectors/src/"
 doc = "docs/gossip-contracts/boundary-5-persistence.md"
 dir = "crates/gossip-contracts/src/persistence/"
 
+# In-memory persistence reference implementation.
+[[scopes]]
+doc = "docs/gossip-contracts/boundary-5-persistence.md"
+dir = "crates/gossip-persistence-inmemory/src/"
+
+[[scopes]]
+doc = "docs/gossip-persistence-inmemory.md"
+dir = "crates/gossip-persistence-inmemory/src/"
+
+# Scanner runtime crate-level doc.
+[[scopes]]
+doc = "docs/gossip-scanner-runtime.md"
+dir = "crates/gossip-scanner-runtime/src/"
+
 # Scanner runtime integration.
 [[scopes]]
 doc = "docs/scanner-core-parity.md"

@@ -34,7 +34,7 @@ macros.
 | `types.rs`        | `TenantId`, `PolicyHash`, `TenantSecretKey`                                                                                   |
 | `canonical.rs`    | `CanonicalBytes` trait + primitive impls                                                                                      |
 | `hashing.rs`      | `domain_hasher`, `finalize_32`, `finalize_64`, `derive_from_cached`                           |
-| `domain.rs`       | 13 domain-separation constants + `ALL` registry                                                                               |
+| `domain.rs`       | 15 domain-separation constants + `ALL` registry                                                                               |
 | `item.rs`         | `ConnectorTag`, `ConnectorInstanceIdHash`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`, `IdentityInputError` |
 | `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId`, `ObservationId` + derivation fns                    |
 | `policy.rs`       | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                                                       |

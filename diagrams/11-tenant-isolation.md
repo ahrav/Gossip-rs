@@ -229,7 +229,7 @@ graph LR
         CLONE["Clone"]
         COPY["Copy"]
         CTEQ["ConstantTimeEq<br/>(via subtle crate --<br/>always examines all 32 bytes)"]
-        DEBUG["Debug<br/>(prints [REDACTED])"]
+        DEBUG["Debug<br/>(prints [redacted])"]
     end
 
     subgraph Forbidden ["Forbidden Traits"]
@@ -289,7 +289,7 @@ The allowed traits serve specific purposes:
   32 bytes regardless of whether the first byte matches or not. This prevents timing
   attacks where an attacker measures how long a comparison takes to determine how many
   leading bytes of the key they have guessed correctly.
-- **Debug**: Implemented manually to print `[REDACTED]` instead of the actual key bytes.
+- **Debug**: Implemented manually to print `[redacted]` instead of the actual key bytes.
   This allows TenantSecretKey to appear in debug output, error messages, and log
   statements without leaking key material.
 
@@ -373,7 +373,9 @@ file). However, all occurrences share the same **SecretHash** -- since SecretHas
 derived solely from TenantSecretKey and NormHash, it is independent of where the secret
 was found. The triage system groups findings by SecretHash (via a TriageGroupKey), so
 an operator marks a secret as "accepted" once and that decision automatically applies
-to every occurrence across all scanned files.
+to every occurrence across all scanned files. `TriageGroupKey` has a domain separation
+constant in `identity/domain.rs` (`TRIAGE_GROUP_KEY_V1`), and the concrete persistence
+type definition lives in the persistence contracts.
 
 ```mermaid
 %% Diagram: same-tenant-correlation

@@ -65,7 +65,7 @@ sequenceDiagram
     participant W2 as Worker 2 (new)
 
     Note over W1,CO: Normal operation
-    W1->>CO: acquire_and_restore(shard_1)
+    W1->>CO: acquire_and_restore_into(shard_1)
     CO-->>W1: Ok(token=5, cursor=page_3)
     W1->>W1: enumerate page_3, scan items,<br/>accumulate findings...
 
@@ -82,7 +82,7 @@ sequenceDiagram
     CO->>CO: Release shard_1 lease (Active, unleased)
 
     Note over CO,W2: New worker picks up the shard
-    W2->>CO: acquire_and_restore(shard_1)
+    W2->>CO: acquire_and_restore_into(shard_1)
     CO-->>W2: Ok(token=6, last_committed_cursor=page_3)
 
     Note over W2: Worker 2 resumes from page_3<br/>(the last COMMITTED cursor)
@@ -164,7 +164,7 @@ sequenceDiagram
 
         Note over CO: Coordination state fully rebuilt.
 
-        W->>CO: acquire_and_restore(shard_1)
+        W->>CO: acquire_and_restore_into(shard_1)
         CO-->>W: Ok(token=N+1, last_committed_cursor)
 
         Note over W: Worker resumes scanning<br/>from last committed cursor.
@@ -210,7 +210,7 @@ sequenceDiagram
     participant CO as Coordinator (B2)
     participant CN as Connector (B4)
 
-    W->>CO: acquire_and_restore(shard_1)
+    W->>CO: acquire_and_restore_into(shard_1)
     CO-->>W: Ok(token=5, cursor=page_3)
 
     W->>CN: enumerate(page_3)
@@ -236,7 +236,7 @@ sequenceDiagram
 
     Note over W,CO: ═══ PARTITION HEALS ═══
 
-    W->>CO: acquire_and_restore(shard_1)
+    W->>CO: acquire_and_restore_into(shard_1)
     Note over CO: Worker's old lease already expired.<br/>Grant new lease.
     CO-->>W: Ok(token=6, last_committed_cursor=page_3)
 
@@ -271,15 +271,15 @@ compared to the risk of inconsistency.
 
 When the failure is between the worker and the external data source (GitHub, S3,
 etc.) rather than between the worker and the coordinator, the retry-budget
-pattern contains the damage. The scan loop tracks consecutive failures for each
-shard session. After a configurable number of consecutive failures
-(`DEFAULT_MAX_TRANSIENT_RETRIES = 3`), the shard is parked with
+pattern contains the damage. The scan loop uses a `RetryBudget` that classifies
+errors via `BackendError` into `RetryableReason` and `PermanentReason` categories.
+After the retry budget is exhausted, the shard is parked with
 `ParkReason::TooManyErrors`, freeing the worker for other shards.
 
 > **Note:** The sequence diagram below shows a **target design** where a full
 > circuit breaker state machine (Closed/Open/HalfOpen) mediates connector calls.
-> The current implementation uses a simpler consecutive-failure counter in
-> `scan_loop.rs`. The parking outcome (`ParkReason::TooManyErrors`) is the same;
+> The current implementation uses a `RetryBudget` with `BackendError` classification
+> in `scanner-scheduler/src/scheduler/failure.rs`. The parking outcome (`ParkReason::TooManyErrors`) is the same;
 > the intermediate states (Open, HalfOpen, probe) are aspirational.
 
 The worker responds by parking the shard with a `ParkReason::TooManyErrors`
@@ -344,11 +344,17 @@ sequenceDiagram
     Note over W,SRC: Other connectors unaffected.<br/>Circuit breakers are per-source isolation.
 ```
 
-The circuit breaker pattern achieves two goals simultaneously. First, it
-**fails fast**: once the breaker opens, the worker does not waste time waiting
-for timeouts on a source that is known to be down. Second, it **minimizes blast
-radius**: the breaker is scoped to a single source. If GitHub is unreachable but
+The retry-budget pattern achieves two goals simultaneously. First, it
+**fails fast**: once the budget is exhausted, the worker stops retrying a source
+that is known to be unhealthy. Second, it **minimizes blast radius**: the budget
+is scoped to a single shard's connector interaction. If GitHub is unreachable but
 S3 is fine, workers can continue scanning S3 shards without interruption.
+
+> **Note:** The target design introduces a full circuit breaker state machine
+> (Closed → Open → HalfOpen) with cooldown and probe phases (shown in the
+> sequence diagram above). The current implementation achieves the same parking
+> outcome (`ParkReason::TooManyErrors`) via `RetryBudget` and `BackendError`
+> classification, without the intermediate Open/HalfOpen states.
 
 The parking mechanism ensures the shard is not lost. A parked shard retains its
 cursor position and can be unparked (an admin operation) or picked up by a

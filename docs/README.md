@@ -14,6 +14,8 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | Runtime / CLI work  | [gossip-scanner-runtime.md](gossip-scanner-runtime.md) → [gossip-scan-driver.md](gossip-scan-driver.md)                                                     |
 | Worker binary       | [gossip-worker.md](gossip-worker.md)                                                                                                                         |
 | CLI binary          | [scanner-rs-cli.md](scanner-rs-cli.md)                                                                                                                       |
+| Connector work      | [boundary-4-connectors.md](gossip-connectors/boundary-4-connectors.md)                                                                                       |
+| Persistence work    | [boundary-5-persistence.md](gossip-contracts/boundary-5-persistence.md)                                                                                       |
 | Shard algebra       | [shard-algebra.md](gossip-frontier/shard-algebra.md)                                                                                                        |
 | Data structures     | [gossip-stdx.md](gossip-stdx.md)                                                                                                                            |
 | Testing             | [simulation-harness.md](gossip-coordination/simulation-harness.md) → [counterexample-testing-unification.md](counterexample-testing-unification.md)         |
@@ -120,10 +122,11 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 
 ## 5. Persistence
 
-| Document                                                                   | Focus                     | Key Concepts                                                |
-| -------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------- |
-| [fs-persistence-pipeline.md](scanner-scheduler/fs-persistence-pipeline.md) | FS persistence write-side | StoreProducer trait, FsFindingRecord, loss accounting       |
-| [persistence-identity.md](gossip-contracts/persistence-identity.md)        | Identity contracts        | Key bootstrap, rule fingerprint, secret hash, normalization |
+| Document                                                                   | Focus                          | Key Concepts                                                    |
+| -------------------------------------------------------------------------- | ------------------------------ | --------------------------------------------------------------- |
+| [boundary-5-persistence.md](gossip-contracts/boundary-5-persistence.md)    | Persistence contracts          | DoneLedger, FindingsSink, PageCommit typestate, commit ordering |
+| [gossip-persistence-inmemory.md](gossip-persistence-inmemory.md)           | In-memory reference backend    | InMemoryDoneLedger, InMemoryFindingsSink, fault injection       |
+| [fs-persistence-pipeline.md](scanner-scheduler/fs-persistence-pipeline.md) | FS persistence write-side      | StoreProducer trait, FsFindingRecord, loss accounting            |
 
 ---
 
@@ -176,6 +179,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [scanner-rs-cli.md](scanner-rs-cli.md)                         | `crates/scanner-rs-cli/`         | Standalone CLI binary: argument parsing, output formats       |
 | [shard-algebra.md](gossip-frontier/shard-algebra.md)           | `crates/gossip-frontier/`        | Shard algebra: key encoding, range arithmetic, hint framing   |
 | [gossip-stdx.md](gossip-stdx.md)                               | `crates/gossip-stdx/`            | Shared data structures: ByteSlab, InlineVec, RingBuffer, TimingWheel, etc. |
+| [gossip-persistence-inmemory.md](gossip-persistence-inmemory.md) | `crates/gossip-persistence-inmemory/` | In-memory persistence reference backend: done-ledger, findings sink, fault injection |
 
 ---
 
@@ -226,7 +230,9 @@ Chart assets: [`assets/charts/`](assets/charts/) (scan-time, cold-warm-ratio, me
 | Understand coordination errors      | [coordination-error-model.md](gossip-coordination/coordination-error-model.md)                                                                                |
 | Understand scanner simulation       | [simulation-framework.md](scanner-scheduler/simulation-framework.md)                                                                                          |
 | Understand FS persistence           | [fs-persistence-pipeline.md](scanner-scheduler/fs-persistence-pipeline.md)                                                                                    |
-| Understand persistence identity     | [persistence-identity.md](gossip-contracts/persistence-identity.md)                                                                                           |
+| Work on connectors                  | [boundary-4-connectors.md](gossip-connectors/boundary-4-connectors.md)                                                                                        |
+| Work on persistence backends        | [boundary-5-persistence.md](gossip-contracts/boundary-5-persistence.md)                                                                                        |
+| Understand in-memory persistence    | [gossip-persistence-inmemory.md](gossip-persistence-inmemory.md)                                                                                               |
 | Measure scanner accuracy            | [eval-harness.md](eval-harness.md)                                                                                                                            |
 | Write simulation tests              | [simulation-harness.md](gossip-coordination/simulation-harness.md) → [counterexample-testing-unification.md](counterexample-testing-unification.md)           |
 | Run integration/property tests      | [scanner-engine-integration-tests.md](scanner-engine-integration-tests.md)                                                                                    |

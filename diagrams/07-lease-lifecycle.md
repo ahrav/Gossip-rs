@@ -45,8 +45,8 @@ sequenceDiagram
     participant CO as Coordinator
     participant BE as Backend
 
-    W->>WS: acquire_and_restore(run_id, worker_id)
-    WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
+    W->>WS: acquire_and_restore_into(run_id, worker_id)
+    WS->>CO: acquire_and_restore_into(tenant, run_id, worker_id)
 
     alt No idle shards available
         CO-->>WS: Err(NoneAvailable { earliest_deadline })
@@ -221,8 +221,8 @@ sequenceDiagram
     W->>WS: create WorkerSession(worker_id, tenant_id)
 
     Note over W,BE: Phase 2: Claim
-    W->>WS: acquire_and_restore(run_id, worker_id)
-    WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
+    W->>WS: acquire_and_restore_into(run_id, worker_id)
+    WS->>CO: acquire_and_restore_into(tenant, run_id, worker_id)
     CO-->>WS: AcquireResult { lease, snapshot, capacity }
     WS-->>W: AcquireResult { lease(token=42), snapshot, capacity }
 
@@ -249,8 +249,8 @@ sequenceDiagram
     WS-->>W: Ok
 
     Note over W,BE: Phase 5: Claim next shard
-    W->>WS: acquire_and_restore(run_id, worker_id)
-    WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
+    W->>WS: acquire_and_restore_into(run_id, worker_id)
+    WS->>CO: acquire_and_restore_into(tenant, run_id, worker_id)
     CO-->>WS: Err(NoneAvailable { earliest_deadline })
     WS-->>W: Err(NoneAvailable { earliest_deadline })
 
@@ -262,7 +262,7 @@ The lifecycle has a clean five-phase structure:
 1. **Connect.** The worker creates a `WorkerSession` binding its identity
    (worker ID and tenant ID) for all subsequent operations. No coordination
    state is allocated yet.
-2. **Claim.** The session calls `acquire_and_restore` to find and claim an idle shard.
+2. **Claim.** The session calls `acquire_and_restore_into` to find and claim an idle shard.
    If successful, the worker receives an `AcquireResult` containing the lease (with fencing
    token, key range, cursor position, and expiry time), a snapshot, and a `CapacityHint`.
 3. **Scan.** The worker iterates through pages, advancing the cursor after each
@@ -371,7 +371,7 @@ RPC -- "how many shards are available?" -- but this doubles coordination traffic
 during high-contention periods, exactly when the system can least afford it.
 
 The solution is **credit-based capacity piggybacking**, inspired by Breakwater
-(Cho et al., OSDI 2020). Every `acquire_and_restore` and `renew` response
+(Cho et al., OSDI 2020). Every `acquire_and_restore_into` and `renew` response
 already returns to the worker; the coordinator attaches a `CapacityHint` to
 these responses at zero additional RPC cost. The hint is computed atomically
 with the operation (inside the same critical section), so it reflects the
@@ -412,8 +412,8 @@ sequenceDiagram
     participant CO as Coordinator
 
     Note over W,CO: Acquire — capacity populated
-    W->>WS: acquire_and_restore(run_id, worker_id)
-    WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
+    W->>WS: acquire_and_restore_into(run_id, worker_id)
+    WS->>CO: acquire_and_restore_into(tenant, run_id, worker_id)
     CO->>CO: grant lease + count_available_for_run()
     CO-->>WS: AcquireResult { lease, snapshot, capacity }
     WS->>WS: cache capacity hint
@@ -434,16 +434,16 @@ sequenceDiagram
     WS-->>W: Ok (capacity unchanged)
 
     Note over W,CO: Claim failure — earliest_deadline for retry
-    W->>WS: acquire_and_restore(run_id, worker_id)
-    WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
+    W->>WS: acquire_and_restore_into(run_id, worker_id)
+    WS->>CO: acquire_and_restore_into(tenant, run_id, worker_id)
     CO-->>WS: Err(NoneAvailable { earliest_deadline })
     WS-->>W: Err — sleep until earliest_deadline
 ```
 
 The sequence above shows the **facade-level view**: `WorkerSession` delegates to
 `claim_next_available` (in `facade.rs`), which internally retries
-`acquire_and_restore` across candidate shards. The coordinator's
-`acquire_and_restore` returns `AcquireError::AlreadyLeased` for individual
+`acquire_and_restore_into` across candidate shards. The coordinator's
+`acquire_and_restore_into` returns `AcquireError::AlreadyLeased` for individual
 shards; the facade absorbs these and surfaces `ClaimError::NoneAvailable` when
 all candidates are exhausted.
 
@@ -506,16 +506,17 @@ candidates, it returns `ClaimError::NoneAvailable { earliest_deadline }`. The
 `earliest_deadline` value comes from one of two paths:
 
 1. **Primary path — candidates exist but all are leased.** The facade iterates
-   candidate shards and calls `acquire_and_restore` on each. Every
+   candidate shards and calls `acquire_and_restore_into` on each. Every
    `AcquireError::AlreadyLeased` rejection carries the shard's current lease
    deadline. The facade tracks the minimum across all rejections and surfaces it
    as `earliest_deadline`.
-2. **Secondary fast path — no unleased candidates at all.** When the initial
-   candidate query returns zero shards, the facade falls back to
-   `list_shards(ShardFilter::active())` and computes the minimum
-   `lease_deadline()` across all active shards in the run. This avoids returning
-   `None` (which signals "no active leases, stop retrying") when shards do exist
-   but are all leased.
+2. **Empty-candidate path — no unleased candidates.** When
+   `collect_claim_candidates_into` returns zero candidates, its return value
+   already includes the earliest lease deadline among Active-but-leased shards
+   (computed during the same single pass over the run's shard set). The facade
+   surfaces this deadline as `earliest_deadline` in `NoneAvailable`, avoiding
+   a separate query and ensuring callers can schedule a retry near the soonest
+   lease expiry even when no unleased shards were found.
 
 Workers use `earliest_deadline` to schedule their next claim attempt: sleeping
 until roughly that time avoids busy-spinning on a fully-leased run while still
@@ -555,7 +556,7 @@ but they are computed independently at different abstraction levels.
 | `crates/gossip-coordination/src/`                      | Coordination protocol (lease, fencing, session, facade, traits, record, error, etc.)         |
 | `crates/gossip-coordination/src/lease.rs`              | `Lease` and `LeaseHolder` types                                                              |
 | `crates/gossip-coordination/src/record.rs`             | `ShardRecord` with lease state and cursor position                                           |
-| `crates/gossip-coordination/src/traits.rs`             | `CoordinationBackend` trait defining `acquire_and_restore`, `checkpoint`, `complete`         |
+| `crates/gossip-coordination/src/traits.rs`             | `CoordinationBackend` trait defining `acquire_and_restore_into`, `checkpoint`, `complete`         |
 | `crates/gossip-coordination/src/error.rs`              | `CapacityHint`, `AcquireResultView`, `RenewResult` types                                     |
 | `crates/gossip-coordination/src/facade.rs`             | `ClaimError::NoneAvailable { earliest_deadline }`, `default_claim_next_available` retry loop |
 | `crates/gossip-coordination/src/session.rs`            | `WorkerSession` with `capacity` field and `capacity()` accessor                              |
