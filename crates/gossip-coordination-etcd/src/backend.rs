@@ -1835,7 +1835,11 @@ impl CoordinationBackend for EtcdCoordinator {
             let persisted = match self.load_shard_record(tenant, key) {
                 Ok(Some(shard)) => shard,
                 Ok(None) => return Err(SplitReplaceError::ShardNotFound { shard: key }),
-                Err(err) => self.fatal_storage_error("split_replace.load_shard", err),
+                Err(err) => {
+                    return Err(SplitReplaceError::BackendError {
+                        message: format!("split_replace.load_shard: {err}"),
+                    });
+                }
             };
 
             if persisted.record.tenant != tenant {
@@ -1897,7 +1901,9 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        self.fatal_storage_error("split_replace.preflight_child_absence", err)
+                        return Err(SplitReplaceError::BackendError {
+                            message: format!("split_replace.preflight_child_absence: {err}"),
+                        });
                     }
                 }
 

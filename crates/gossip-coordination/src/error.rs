@@ -728,6 +728,10 @@ pub enum CompleteError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Debug for CompleteError {
