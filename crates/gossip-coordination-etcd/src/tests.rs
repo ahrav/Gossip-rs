@@ -17,11 +17,12 @@
 //!
 //! 3. **etcd integration** — round-trip tests that connect to a local
 //!    etcd cluster. These are marked `#[ignore]` and require either
-//!    Docker running (testcontainers auto-provisions a `bitnami/etcd:3.5`
-//!    instance) or the `ETCD_ENDPOINTS` environment variable pointing to
-//!    a reachable cluster. They cover the full
-//!    acquire/checkpoint/renew/split lifecycle including idempotent
-//!    replay, lease expiry, and concurrent acquire contention.
+//!    Docker running (testcontainers auto-provisions
+//!    `quay.io/coreos/etcd:v3.5.15`) or the `ETCD_ENDPOINTS`
+//!    environment variable pointing to a reachable cluster. They cover
+//!    the full acquire/checkpoint/renew/split lifecycle, deterministic
+//!    split atomicity fault injection, idempotent replay, lease expiry,
+//!    and concurrent acquire contention.
 //!
 //! ## Running integration tests
 //!
@@ -40,7 +41,7 @@ use crate::test_etcd::{
 };
 use crate::{
     EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError, EtcdKeyspace,
-    EtcdKeyspaceError, EtcdOperation,
+    EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
 };
 use gossip_contracts::coordination::{
     CursorSemantics, CursorUpdate, ShardSpec, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
@@ -48,10 +49,11 @@ use gossip_contracts::coordination::{
 };
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
-    AcquireError, AcquireScratch, CheckpointError, CoordinationBackend,
+    AcquireError, AcquireScratch, ByteSlab, CheckpointError, CoordinationBackend,
     DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, IdempotentOutcome,
     InitialShardInput, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
-    ShardLimitScope, ShardStatus, SplitReplaceError, SplitResidualError, derive_split_shard_id,
+    ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError, SplitResidualError,
+    derive_split_shard_id,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -921,11 +923,11 @@ fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
         .expect("checkpoint should succeed");
     assert!(matches!(outcome, IdempotentOutcome::Executed(())));
 
-    let (shard, slab) = backend
+    let shard = backend
         .test_load_shard_snapshot(test_tenant(), key)
         .expect("shard lookup should succeed")
         .expect("shard must exist");
-    assert_eq!(shard.cursor.last_key(&slab), Some(b"m".as_slice()));
+    assert_eq!(shard.cursor.last_key(shard.slab()), Some(b"m".as_slice()));
 
     let renew = backend
         .renew(now(5), test_tenant(), &acquire.lease)
@@ -998,14 +1000,14 @@ fn split_replace_round_trip_against_local_etcd() {
     assert!(first.is_executed());
     assert_eq!(first.as_ref().children.len(), 2);
 
-    let (parent, parent_slab) = backend
+    let parent = backend
         .test_load_shard_snapshot(test_tenant(), key)
         .expect("parent lookup should succeed")
         .expect("parent must still exist");
     assert_eq!(parent.status, ShardStatus::Split);
     assert!(parent.lease.is_none());
     assert_eq!(parent.spawned.len(), 2);
-    let spawned: Vec<_> = parent.spawned.iter(&parent_slab).collect();
+    let spawned: Vec<_> = parent.spawned.iter(parent.slab()).collect();
     assert_eq!(spawned, first.as_ref().children.as_slice());
 
     assert!(
@@ -1020,11 +1022,14 @@ fn split_replace_round_trip_against_local_etcd() {
     backend
         .collect_claim_candidates_into(now(5), test_tenant(), test_run(), &mut candidates)
         .expect("claim candidate scan should succeed");
-    assert_eq!(candidates, first.as_ref().children.as_slice());
+    candidates.sort_unstable_by_key(|id| id.as_raw());
+    let mut expected_children = first.as_ref().children.as_slice().to_vec();
+    expected_children.sort_unstable_by_key(|id| id.as_raw());
+    assert_eq!(candidates, expected_children);
 
     for &child_id in &first.as_ref().children {
         let child_key = ShardKey::new(test_run(), child_id);
-        let (child, _slab) = backend
+        let child = backend
             .test_load_shard_snapshot(test_tenant(), child_key)
             .expect("child lookup should succeed")
             .expect("child must exist");
@@ -1190,17 +1195,17 @@ fn split_residual_round_trip_against_local_etcd() {
         .expect("split_residual should succeed");
     assert!(first.is_executed());
 
-    let (parent, parent_slab) = backend
+    let parent = backend
         .test_load_shard_snapshot(test_tenant(), key)
         .expect("parent lookup should succeed")
         .expect("parent must still exist");
     assert_eq!(parent.status, ShardStatus::Active);
-    assert_eq!(parent.spec.key_range_start(&parent_slab), b"a");
-    assert_eq!(parent.spec.key_range_end(&parent_slab), b"m");
-    assert_eq!(parent.cursor.last_key(&parent_slab), Some(b"f".as_slice()));
+    assert_eq!(parent.spec.key_range_start(parent.slab()), b"a");
+    assert_eq!(parent.spec.key_range_end(parent.slab()), b"m");
+    assert_eq!(parent.cursor.last_key(parent.slab()), Some(b"f".as_slice()));
     assert_eq!(parent.spawned.len(), 1);
     assert_eq!(
-        parent.spawned.iter(&parent_slab).next(),
+        parent.spawned.iter(parent.slab()).next(),
         Some(first.as_ref().residual)
     );
 
@@ -1211,15 +1216,24 @@ fn split_residual_round_trip_against_local_etcd() {
     assert_eq!(candidates, vec![first.as_ref().residual]);
 
     let residual_key = ShardKey::new(test_run(), first.as_ref().residual);
-    let (residual_record, residual_slab) = backend
+    let residual_record = backend
         .test_load_shard_snapshot(test_tenant(), residual_key)
         .expect("residual lookup should succeed")
         .expect("residual must exist");
     assert_eq!(residual_record.status, ShardStatus::Active);
     assert_eq!(residual_record.parent, Some(test_shard()));
-    assert_eq!(residual_record.spec.key_range_start(&residual_slab), b"m");
-    assert_eq!(residual_record.spec.key_range_end(&residual_slab), b"z");
-    assert_eq!(residual_record.cursor.last_key(&residual_slab), None);
+    assert_eq!(
+        residual_record.spec.key_range_start(residual_record.slab()),
+        b"m"
+    );
+    assert_eq!(
+        residual_record.spec.key_range_end(residual_record.slab()),
+        b"z"
+    );
+    assert_eq!(
+        residual_record.cursor.last_key(residual_record.slab()),
+        None
+    );
 
     let replay = backend
         .split_residual(now(7), test_tenant(), &acquire.lease, plan, op)
@@ -1613,7 +1627,7 @@ fn unpark_seeded_parked_shard_round_trip_against_local_etcd() {
     assert!(register.is_executed());
 
     let key = ShardKey::new(run, shard);
-    let (mut parked, slab) = backend
+    let mut parked = backend
         .test_load_shard_snapshot(test_tenant(), key)
         .expect("shard lookup should succeed")
         .expect("shard must exist");
@@ -1621,9 +1635,9 @@ fn unpark_seeded_parked_shard_round_trip_against_local_etcd() {
     parked.status = ShardStatus::Parked;
     parked.park_reason = Some(ParkReason::TooManyErrors);
     parked.lease = None;
-    parked.assert_invariants(&slab);
+    parked.assert_invariants(parked.slab());
     backend
-        .test_seed_shard_record(&parked, &slab)
+        .test_seed_shard_record(&parked, parked.slab())
         .expect("seed parked shard should succeed");
 
     let first = backend
@@ -1635,7 +1649,7 @@ fn unpark_seeded_parked_shard_round_trip_against_local_etcd() {
         .expect("unpark replay should succeed");
     assert!(replay.is_replay());
 
-    let (active, active_slab) = backend
+    let active = backend
         .test_load_shard_snapshot(test_tenant(), key)
         .expect("shard lookup should succeed")
         .expect("shard must exist");
@@ -1646,7 +1660,7 @@ fn unpark_seeded_parked_shard_round_trip_against_local_etcd() {
     );
     assert!(active.lease.is_none(), "unparked shard must be unowned");
     assert_eq!(active.park_reason, None);
-    assert_eq!(active.cursor.last_key(&active_slab), Some(b"k".as_slice()));
+    assert_eq!(active.cursor.last_key(active.slab()), Some(b"k".as_slice()));
     assert!(
         backend
             .test_load_owner_binding(test_tenant(), key)
@@ -1701,6 +1715,163 @@ fn now(t: u64) -> LogicalTime {
 // ---------------------------------------------------------------------------
 // Integration tests: error paths and contention
 // ---------------------------------------------------------------------------
+
+/// When worker A checkpoints and later loses ownership to worker B,
+/// a stale checkpoint from worker A must be rejected and leave the
+/// persisted cursor unchanged.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn stale_fence_checkpoint_rejected_after_reacquire() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let lease_a = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+        .expect("worker A acquire should succeed")
+        .lease;
+
+    let checkpoint = backend
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease_a,
+            &CursorUpdate::new(b"d"),
+            OpId::from_raw(100),
+        )
+        .expect("worker A checkpoint should succeed");
+    assert!(checkpoint.is_executed());
+
+    let reacquire_at = lease_a.deadline().as_raw() + 1;
+    let mut scratch_b = AcquireScratch::new();
+    let lease_b = backend
+        .acquire_and_restore_into(
+            now(reacquire_at),
+            test_tenant(),
+            key,
+            test_worker(2),
+            &mut scratch_b,
+        )
+        .expect("worker B reacquire should succeed")
+        .lease;
+    assert!(
+        lease_b.fence() > lease_a.fence(),
+        "ownership transfer must bump the fence"
+    );
+
+    let err = backend
+        .checkpoint(
+            now(reacquire_at + 1),
+            test_tenant(),
+            &lease_a,
+            &CursorUpdate::new(b"k"),
+            OpId::from_raw(101),
+        )
+        .expect_err("stale checkpoint should fail");
+    match err {
+        CheckpointError::StaleFence { presented, current } => {
+            assert_eq!(presented, lease_a.fence());
+            assert_eq!(current, lease_b.fence());
+        }
+        other => panic!("expected StaleFence, got {other:?}"),
+    }
+
+    let shard = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed")
+        .expect("shard must exist");
+    assert_eq!(shard.status, ShardStatus::Active);
+    assert_eq!(shard.cursor.last_key(shard.slab()), Some(b"d".as_slice()));
+
+    let owner = backend
+        .test_load_owner_binding(test_tenant(), key)
+        .expect("owner lookup should succeed")
+        .expect("owner binding must exist");
+    assert_eq!(owner.0, test_worker(2));
+    assert_eq!(owner.1, lease_b.fence());
+}
+
+/// Retrying `checkpoint` with the same `(op_id, payload)` must replay
+/// without appending a duplicate op-log entry.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn checkpoint_replay_remains_idempotent() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let lease = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed")
+        .lease;
+
+    let cursor = CursorUpdate::new(b"m");
+    let op = OpId::from_raw(100);
+    let first = backend
+        .checkpoint(now(4), test_tenant(), &lease, &cursor, op)
+        .expect("first checkpoint should succeed");
+    assert!(first.is_executed());
+
+    let replay = backend
+        .checkpoint(now(5), test_tenant(), &lease, &cursor, op)
+        .expect("checkpoint replay should succeed");
+    assert!(replay.is_replay());
+
+    let shard = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed")
+        .expect("shard must exist");
+    assert_eq!(shard.cursor.last_key(shard.slab()), Some(b"m".as_slice()));
+    let checkpoint_entries = shard
+        .op_log
+        .iter()
+        .filter(|entry| entry.op_id() == op)
+        .count();
+    assert_eq!(
+        checkpoint_entries, 1,
+        "replay must not duplicate op-log entries"
+    );
+}
 
 /// After the etcd lease expires (owner key auto-deleted), checkpoint must
 /// fail because the owner binding no longer matches the presented lease.
@@ -2044,6 +2215,93 @@ fn split_replace_rejects_stale_fence() {
     );
 }
 
+/// If the owner binding disappears after the split plan is computed but
+/// before the atomic `split_replace` transaction commits, the backend
+/// must publish no child records or active-index entries.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn split_replace_abort_does_not_publish_partial_children() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let lease = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed")
+        .lease;
+
+    let left = ShardSpec::with_range(b"a", b"m");
+    let right = ShardSpec::with_range(b"m", b"z");
+    let plan = SplitReplacePlan::try_new(vec![
+        SplitReplaceChild::new(left.as_ref(), CursorUpdate::initial()),
+        SplitReplaceChild::new(right.as_ref(), CursorUpdate::initial()),
+    ])
+    .expect("split plan should be valid");
+
+    let op = OpId::from_raw(700);
+    let child0 = derive_split_shard_id(test_run(), test_shard(), op, DerivedShardKind::Child, 0);
+    let child1 = derive_split_shard_id(test_run(), test_shard(), op, DerivedShardKind::Child, 1);
+
+    backend.test_arm_fault(EtcdTestFault::DropOwnerBeforeNextSplitReplaceTxn);
+    let err = backend
+        .split_replace(now(4), test_tenant(), &lease, plan, op)
+        .expect_err("fault-injected split_replace should fail");
+    assert!(matches!(err, SplitReplaceError::StaleFence { .. }));
+
+    let parent = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("parent lookup should succeed")
+        .expect("parent shard must exist");
+    assert_eq!(parent.status, ShardStatus::Active);
+    assert_eq!(parent.spec.key_range_start(parent.slab()), b"a");
+    assert_eq!(parent.spec.key_range_end(parent.slab()), b"z");
+    assert_eq!(parent.spawned.len(), 0);
+
+    assert!(
+        backend
+            .test_active_shard_index_exists(test_tenant(), key)
+            .expect("parent index lookup should succeed"),
+        "parent active-index must remain published"
+    );
+
+    for child in [child0, child1] {
+        let child_key = ShardKey::new(test_run(), child);
+        assert!(
+            backend
+                .test_load_shard_snapshot(test_tenant(), child_key)
+                .expect("child lookup should succeed")
+                .is_none(),
+            "child record must not be published on aborted split"
+        );
+        assert!(
+            !backend
+                .test_active_shard_index_exists(test_tenant(), child_key)
+                .expect("child index lookup should succeed"),
+            "child active-index must not be published on aborted split"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests: derived-ID collision detection
 // ---------------------------------------------------------------------------
@@ -2096,20 +2354,26 @@ fn split_replace_returns_collision_when_child_key_exists() {
     // Pre-register a shard with the collision ID so the key already
     // exists in etcd before the split is attempted.
     let collision_spec = ShardSpec::with_range(b"x", b"y");
-    let collision_manifest = [InitialShardInput::new(
+    let mut collision_slab = ByteSlab::with_capacity(1024);
+    let mut collision_record = ShardRecord::new_split_child(
+        test_tenant(),
+        test_run(),
         collision_id,
         collision_spec.as_ref(),
         CursorUpdate::initial(),
-    )];
-    let _ = backend
-        .register_shards(
-            now(3),
-            test_tenant(),
-            test_run(),
-            &collision_manifest,
-            OpId::from_raw(100),
-        )
-        .expect("collision shard registration should succeed");
+        CursorSemantics::Completed,
+        test_shard(),
+        &mut collision_slab,
+    )
+    .expect("collision shard seed should fit in slab");
+    backend
+        .test_seed_shard_record(&collision_record, &collision_slab)
+        .expect("collision shard seed should succeed");
+    backend
+        .test_seed_active_shard_index(test_tenant(), test_run(), collision_id)
+        .expect("collision active-index seed should succeed");
+    collision_record.deallocate_fields(&mut collision_slab);
+    collision_slab.clear();
 
     // Acquire the parent for splitting.
     let key = ShardKey::new(test_run(), test_shard());
@@ -2180,20 +2444,26 @@ fn split_residual_returns_collision_when_residual_key_exists() {
 
     // Pre-register a shard with the residual collision ID.
     let collision_spec = ShardSpec::with_range(b"x", b"y");
-    let collision_manifest = [InitialShardInput::new(
+    let mut collision_slab = ByteSlab::with_capacity(1024);
+    let mut collision_record = ShardRecord::new_split_child(
+        test_tenant(),
+        test_run(),
         collision_id,
         collision_spec.as_ref(),
         CursorUpdate::initial(),
-    )];
-    let _ = backend
-        .register_shards(
-            now(3),
-            test_tenant(),
-            test_run(),
-            &collision_manifest,
-            OpId::from_raw(100),
-        )
-        .expect("collision shard registration should succeed");
+        CursorSemantics::Completed,
+        test_shard(),
+        &mut collision_slab,
+    )
+    .expect("collision shard seed should fit in slab");
+    backend
+        .test_seed_shard_record(&collision_record, &collision_slab)
+        .expect("collision shard seed should succeed");
+    backend
+        .test_seed_active_shard_index(test_tenant(), test_run(), collision_id)
+        .expect("collision active-index seed should succeed");
+    collision_record.deallocate_fields(&mut collision_slab);
+    collision_slab.clear();
 
     // Acquire the parent and checkpoint it (split_residual requires a
     // cursor checkpoint).
@@ -2301,9 +2571,11 @@ fn split_residual_replay_via_spawned_after_oplog_eviction() {
 
     // Push 17 checkpoint operations with distinct OpIds to evict the
     // split_residual entry from the 16-entry FIFO op-log.
-    let mut key_byte = b'e';
     for i in 1..=17u64 {
-        let cursor_key = [key_byte];
+        let cursor_key = [
+            b'l',
+            u8::try_from(i).expect("checkpoint index must fit in u8"),
+        ];
         let _ = backend
             .checkpoint(
                 now(10 + i),
@@ -2313,9 +2585,6 @@ fn split_residual_replay_via_spawned_after_oplog_eviction() {
                 OpId::from_raw(300 + i),
             )
             .expect("eviction checkpoint should succeed");
-        if key_byte < b'l' {
-            key_byte += 1;
-        }
     }
 
     // Retry split_residual with the same op_id. The op-log entry is gone,
@@ -2331,6 +2600,100 @@ fn split_residual_replay_via_spawned_after_oplog_eviction() {
         replay.as_ref().residual,
         first.as_ref().residual,
         "replayed residual ID must match the original"
+    );
+}
+
+/// If the owner binding disappears after the residual split is planned but
+/// before the transaction commits, the parent state must remain unchanged
+/// and the residual shard must not be published.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn split_residual_abort_does_not_publish_partial_residual() {
+    let mut backend = test_coordinator();
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let lease = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed")
+        .lease;
+
+    let checkpoint = backend
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease,
+            &CursorUpdate::new(b"f"),
+            OpId::from_raw(710),
+        )
+        .expect("checkpoint should succeed");
+    assert!(checkpoint.is_executed());
+
+    let parent_new = ShardSpec::with_range(b"a", b"m");
+    let residual = ShardSpec::with_range(b"m", b"z");
+    let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref())
+        .expect("residual split plan should be valid");
+
+    let op = OpId::from_raw(711);
+    let residual_id =
+        derive_split_shard_id(test_run(), test_shard(), op, DerivedShardKind::Residual, 0);
+
+    backend.test_arm_fault(EtcdTestFault::DropOwnerBeforeNextSplitResidualTxn);
+    let err = backend
+        .split_residual(now(5), test_tenant(), &lease, plan, op)
+        .expect_err("fault-injected split_residual should fail");
+    assert!(matches!(err, SplitResidualError::StaleFence { .. }));
+
+    let parent = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("parent lookup should succeed")
+        .expect("parent shard must exist");
+    assert_eq!(parent.status, ShardStatus::Active);
+    assert_eq!(parent.spec.key_range_start(parent.slab()), b"a");
+    assert_eq!(parent.spec.key_range_end(parent.slab()), b"z");
+    assert_eq!(parent.cursor.last_key(parent.slab()), Some(b"f".as_slice()));
+    assert_eq!(parent.spawned.len(), 0);
+
+    assert!(
+        backend
+            .test_active_shard_index_exists(test_tenant(), key)
+            .expect("parent index lookup should succeed"),
+        "parent active-index must remain published"
+    );
+
+    let residual_key = ShardKey::new(test_run(), residual_id);
+    assert!(
+        backend
+            .test_load_shard_snapshot(test_tenant(), residual_key)
+            .expect("residual lookup should succeed")
+            .is_none(),
+        "residual record must not be published on aborted split"
+    );
+    assert!(
+        !backend
+            .test_active_shard_index_exists(test_tenant(), residual_key)
+            .expect("residual index lookup should succeed"),
+        "residual active-index must not be published on aborted split"
     );
 }
 
@@ -2400,7 +2763,7 @@ fn split_replace_rejects_over_cap_max_children_per_op() {
     );
 
     // Parent must still be Active with the original owner binding.
-    let (parent, _slab) = backend
+    let parent = backend
         .test_load_shard_snapshot(test_tenant(), key)
         .expect("parent lookup should succeed")
         .expect("parent must still exist");

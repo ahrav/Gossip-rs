@@ -17,7 +17,8 @@
 //! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client and a
 //!   single-threaded Tokio runtime, exposes health-check (`status()`), and
 //!   executes persisted coordination transactions for run lifecycle, shard
-//!   lifecycle, and cold-path maintenance.
+//!   lifecycle, and cold-path maintenance. Feature-gated test seeding and
+//!   fault-injection helpers live in `backend/test_support.rs`.
 //! - **`keyspace`** — Deterministic ASCII etcd path construction for runs,
 //!   shards, ownership leases, and active indexes. See the module docs for
 //!   the full key layout.
@@ -45,6 +46,8 @@ mod error;
 mod keyspace;
 
 pub use backend::EtcdCoordinator;
+#[cfg(any(test, feature = "test-support"))]
+pub use backend::{EtcdTestFault, EtcdTestShardSnapshot};
 pub use codec::{
     BlobKind, EtcdCodecError, OwnerLeaseValue, decode_owner_value, decode_run_record,
     decode_shard_record, encode_owner_value, encode_run_record, encode_shard_record,
