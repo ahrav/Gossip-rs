@@ -121,10 +121,13 @@ sequenceDiagram
             rect rgb(255, 240, 240)
                 note over W,P: Typestate-enforced durability ordering<br/>(PageCommit: AwaitingFindings → FindingsDurable → ItemDurable → CheckpointDurable)
                 W->>P: upsert_batch(findings) → wait FindingsCommitReceipt
+                P-->>W: FindingsCommitReceipt
                 W->>P: batch_upsert(done_ledger) → wait DoneLedgerCommitReceipt
+                P-->>W: DoneLedgerCommitReceipt
                 W->>C: checkpoint(now, cursor, op_id) → wait CheckpointCommitReceipt
                 Note over C: Op-log idempotency check + lease<br/>validation run inside checkpoint
-                P-->>W: PageCommitReceipt
+                C-->>W: CheckpointCommitReceipt
+                Note over W: Assemble PageCommitReceipt<br/>from the three stage receipts
             end
 
             deactivate W
@@ -267,7 +270,7 @@ this ordering at compile time. If any stage fails, the cursor is not advanced,
 so the page will be re-processed on retry.
 
 ```mermaid
-%% Diagram: atomic-commit-boundary
+%% Diagram: receipt-chained-commit-boundary
 graph LR
     INPUT["PageCommit&lt;AwaitingFindings&gt;<br/>━━━━━━━━━━━━━━<br/>findings[]<br/>done_records[]<br/>new_cursor"]
 
@@ -284,9 +287,9 @@ graph LR
     INPUT --> TX
     TX --> OUTPUT
 
-    F1["ROLLBACK<br/>Findings written,<br/>done-ledger fails"]
-    F2["ROLLBACK<br/>Done-ledger written,<br/>cursor fails"]
-    F3["ROLLBACK<br/>Write failures<br/>at any stage"]
+    F1["RETRY — cursor unadvanced<br/>Findings written,<br/>done-ledger fails"]
+    F2["RETRY — cursor unadvanced<br/>Done-ledger written,<br/>cursor checkpoint fails"]
+    F3["RETRY — cursor unadvanced<br/>Write failures<br/>at any stage"]
 
     S1 -.->|"failure"| F1
     S2 -.->|"failure"| F2
