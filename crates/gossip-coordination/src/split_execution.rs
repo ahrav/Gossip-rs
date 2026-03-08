@@ -388,6 +388,12 @@ impl SplitChildOrder {
     }
 
     #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
     pub fn child<'a>(
         &self,
         plan: &'a SplitReplacePlan<'a>,
