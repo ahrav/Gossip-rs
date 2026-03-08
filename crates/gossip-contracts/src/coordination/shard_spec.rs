@@ -1093,9 +1093,9 @@ pub enum SplitValidationError {
     },
     /// Boundary mismatch (gap or overlap) between adjacent children.
     BoundaryMismatch {
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the child in the caller-provided children slice.
         child_index: usize,
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the adjacent child in the caller-provided children slice.
         next_child_index: usize,
         /// Length of `child_index`'s end key in bytes.
         child_end: usize,
@@ -1104,16 +1104,16 @@ pub enum SplitValidationError {
     },
     /// Child has inverted key range (start >= end).
     InvertedChild {
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the child in the caller-provided children slice.
         child_index: usize,
     },
 
     /// A non-last child has an unbounded end, causing it to overlap with
     /// subsequent children.
     OverlappingChild {
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the child in the caller-provided children slice.
         child_index: usize,
-        /// Index in the coordinator's internal start-sorted child order.
+        /// Index of the adjacent child in the caller-provided children slice.
         next_child_index: usize,
     },
 
