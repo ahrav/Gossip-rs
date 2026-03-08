@@ -354,35 +354,30 @@ fn split_replace_replay_child_ids(
     ids
 }
 
+/// Extract a `u64` from the 16-character lowercase hex suffix
+/// immediately after `prefix` in `key`.
+fn parse_hex_u64_suffix(prefix: &str, key: &[u8]) -> Option<u64> {
+    let suffix = key.strip_prefix(prefix.as_bytes())?;
+    if suffix.len() != 16 || suffix.contains(&b'/') {
+        return None;
+    }
+    u64::from_str_radix(std::str::from_utf8(suffix).ok()?, 16).ok()
+}
+
 /// Parse a direct run-record or active-run key suffix into a [`RunId`].
 ///
 /// Returns `None` when `key` is not an immediate child of `prefix` or the
 /// suffix is not a 16-character lowercase hex run ID.
 fn parse_direct_run_id_from_key(prefix: &str, key: &[u8]) -> Option<RunId> {
-    let suffix = key.strip_prefix(prefix.as_bytes())?;
-    if suffix.len() != 16 || suffix.contains(&b'/') {
-        return None;
-    }
-
-    let suffix = std::str::from_utf8(suffix).ok()?;
-    let raw = u64::from_str_radix(suffix, 16).ok()?;
-    Some(RunId::from_raw(raw))
+    parse_hex_u64_suffix(prefix, key).map(RunId::from_raw)
 }
 
 /// Parse a shard-active-index key suffix into a [`ShardId`].
 ///
 /// Returns `None` when `key` is not an immediate child of `prefix` or the
-/// suffix is not a 16-character lowercase hex shard ID. Mirrors
-/// [`parse_direct_run_id_from_key`] for the shard-active index namespace.
+/// suffix is not a 16-character lowercase hex shard ID.
 fn parse_shard_id_from_index_key(prefix: &str, key: &[u8]) -> Option<ShardId> {
-    let suffix = key.strip_prefix(prefix.as_bytes())?;
-    if suffix.len() != 16 || suffix.contains(&b'/') {
-        return None;
-    }
-
-    let suffix = std::str::from_utf8(suffix).ok()?;
-    let raw = u64::from_str_radix(suffix, 16).ok()?;
-    Some(ShardId::from_raw(raw))
+    parse_hex_u64_suffix(prefix, key).map(ShardId::from_raw)
 }
 
 /// Extract a [`ShardId`] from a shard owner key.
@@ -1140,7 +1135,7 @@ impl EtcdCoordinator {
         prefix.push('/');
         let response = self.etcd_get(
             prefix.as_bytes().to_vec(),
-            Some(GetOptions::new().with_prefix()),
+            Some(GetOptions::new().with_prefix().with_keys_only()),
         )?;
 
         out.clear();
@@ -1795,6 +1790,7 @@ impl CoordinationBackend for EtcdCoordinator {
     ) -> Result<RenewResult, RenewError> {
         let key = lease.shard_key();
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
 
         self.cas_retry(
             |this, _attempt| {
@@ -1835,9 +1831,11 @@ impl CoordinationBackend for EtcdCoordinator {
                     .map_err(|err| RenewError::BackendError {
                         message: format!("renew.encode_shard: {err}"),
                     })?;
-                let owner_blob = persisted
-                    .expected_owner_value()
-                    .expect("validated owner must produce owner value");
+                let owner = persisted
+                    .owner
+                    .as_ref()
+                    .expect("validated owner must have binding");
+                encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
 
                 let shard_record_key =
                     this.keyspace
@@ -1851,7 +1849,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 )];
                 compares.extend(Self::compare_owner_present(
                     owner_key,
-                    owner_blob,
+                    owner_buf.clone(),
                     old_lease_id,
                 ));
 
@@ -1922,6 +1920,7 @@ impl CoordinationBackend for EtcdCoordinator {
         let key = lease.shard_key();
         let payload_hash = hash_checkpoint_payload(new_cursor);
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
 
         self.cas_retry(
             |this, _attempt| {
@@ -1969,14 +1968,12 @@ impl CoordinationBackend for EtcdCoordinator {
                     .map_err(|err| CheckpointError::BackendError {
                         message: format!("checkpoint.encode_shard: {err}"),
                     })?;
-                let owner_blob = persisted
-                    .expected_owner_value()
-                    .expect("validated owner must produce owner value");
-                let owner_lease_id = persisted
+                let owner = persisted
                     .owner
                     .as_ref()
-                    .expect("validated owner must have lease_id")
-                    .lease_id;
+                    .expect("validated owner must have binding");
+                encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
+                let owner_lease_id = owner.lease_id;
 
                 let shard_record_key =
                     this.keyspace
@@ -1990,7 +1987,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 )];
                 compares.extend(Self::compare_owner_present(
                     owner_key,
-                    owner_blob,
+                    owner_buf.clone(),
                     owner_lease_id,
                 ));
 
@@ -3098,6 +3095,7 @@ impl RunManagement for EtcdCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, UnparkError> {
         let payload_hash = hash_unpark_payload(&key);
+        let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
 
         self.cas_retry(
             |this, _attempt| {
@@ -3150,7 +3148,7 @@ impl RunManagement for EtcdCoordinator {
                     now,
                 ));
                 persisted.record.assert_invariants(&persisted.slab);
-                let shard_blob = encode_shard_record(&persisted.record, &persisted.slab)
+                encode_shard_record_into(&persisted.record, &persisted.slab, &mut shard_buf)
                     .unwrap_or_else(|err| this.fatal_storage_error("unpark.encode_shard", err));
 
                 let shard_record_key =
@@ -3176,7 +3174,7 @@ impl RunManagement for EtcdCoordinator {
                         Self::compare_absent(owner_key),
                     ])
                     .and_then(vec![
-                        TxnOp::put(shard_record_key.into_bytes(), shard_blob, None),
+                        TxnOp::put(shard_record_key.into_bytes(), shard_buf.clone(), None),
                         TxnOp::put(active_shard_key.into_bytes(), Vec::<u8>::new(), None),
                     ]);
                 let response = this

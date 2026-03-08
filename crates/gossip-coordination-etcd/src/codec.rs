@@ -87,6 +87,12 @@ const SHARD_ID_WIRE_SIZE: usize = 8;
 /// that happens to fit the remaining wire bytes.
 const MAX_ROOT_SHARDS: usize = 10_000;
 
+/// Absolute upper bound on shard IDs in a `RegisteredShards` result.
+/// Uses the root-shard ceiling for codec-level consistency; the
+/// operational limit (one etcd txn batch) is tighter but belongs
+/// in the backend layer.
+const MAX_REGISTERED_SHARDS: usize = MAX_ROOT_SHARDS;
+
 /// Blob discriminator embedded after the 2-byte version header.
 ///
 /// The decoder reads this byte to dispatch to the correct record parser.
@@ -786,6 +792,12 @@ impl OwnedRunOpResult {
         match decoder.read_u8()? {
             1 => {
                 let len = decoder.read_len()?;
+                if len > MAX_REGISTERED_SHARDS {
+                    return Err(EtcdCodecError::FieldTooLarge {
+                        actual: len,
+                        max: MAX_REGISTERED_SHARDS,
+                    });
+                }
                 if len > decoder.remaining() / SHARD_ID_WIRE_SIZE {
                     return Err(EtcdCodecError::InvariantViolation {
                         kind: "RunOpResult",

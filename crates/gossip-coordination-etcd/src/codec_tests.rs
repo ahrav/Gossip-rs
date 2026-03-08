@@ -1530,6 +1530,50 @@ fn decode_run_record_rejects_oversized_root_shards() {
     );
 }
 
+/// Crafted blob with a `RegisteredShards` op-log entry whose length prefix
+/// exceeds `MAX_REGISTERED_SHARDS` is rejected with `FieldTooLarge` before
+/// any allocation occurs.
+#[test]
+fn decode_run_record_rejects_oversized_registered_shards() {
+    let mut blob = Vec::new();
+    // -- header --
+    blob.extend_from_slice(b"v1");
+    blob.push(BlobKind::RunRecord as u8);
+    // -- run record fields --
+    blob.extend_from_slice(TenantId::from_bytes([0x99; 32]).as_bytes());
+    push_u64(&mut blob, RunId::from_raw(1).as_raw());
+    blob.push(CursorSemantics::Completed.as_u8());
+    push_u64(&mut blob, 30); // lease_duration
+    blob.push(0); // max_shard_retries absent
+    blob.push(RunStatus::Active.as_u8());
+    push_u64(&mut blob, LogicalTime::from_raw(5).as_raw()); // created_at
+    blob.push(0); // completed_at absent
+    push_u32(&mut blob, 0); // root_shards: empty
+    // -- op_log: 1 entry --
+    push_u32(&mut blob, 1);
+    // op_log[0]:
+    push_u64(&mut blob, OpId::from_raw(42).as_raw()); // op_id
+    blob.push(0); // kind = RegisterShards
+    push_u64(&mut blob, 0xDEAD); // payload_hash
+    push_u64(&mut blob, LogicalTime::from_raw(10).as_raw()); // executed_at
+    // result tag = RegisteredShards (1)
+    blob.push(1);
+    // length prefix = 1,000,000 (exceeds MAX_REGISTERED_SHARDS = 10,000)
+    push_u32(&mut blob, 1_000_000);
+
+    let error = decode_run_record(&blob).expect_err("oversized RegisteredShards must fail decode");
+    assert!(
+        matches!(
+            error,
+            EtcdCodecError::FieldTooLarge {
+                actual: 1_000_000,
+                max: 10_000,
+            }
+        ),
+        "expected FieldTooLarge for oversized RegisteredShards, got: {error:?}"
+    );
+}
+
 /// Verify: shard op_log timestamps are not checked for monotonicity.
 ///
 /// Encodes a shard record with out-of-order op_log timestamps. If this

@@ -32,9 +32,10 @@ used by the in-memory backend. The persisted backend enforces those limits
 before `register_shards`, `split_replace`, and `split_residual` by counting
 existing shard-record keys under the relevant etcd prefixes, then rejecting
 growth that would exceed the configured caps.
-The remaining mutating operations (`complete`, `park_shard`, run terminal
-transitions, `unpark_shard`) fail closed until their persisted transaction
-shapes land.
+The remaining mutating operations (`complete`, `park_shard`) fail closed
+until their persisted transaction semantics are defined. All `RunManagement`
+operations (run terminal transitions, `unpark_shard`, active-run listing,
+GC of stale initializing runs) are fully persisted.
 
 The module provides seven core capabilities:
 
@@ -97,7 +98,7 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
-| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, and fenced acquire/renew/checkpoint/split |
+| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, fenced acquire/renew/checkpoint/split, run terminal transitions, unpark, active-run listing, and GC of stale initializing runs |
 | `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, shard count limits, and bounded split fanout |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |

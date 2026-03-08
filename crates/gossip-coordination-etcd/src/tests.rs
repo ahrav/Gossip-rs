@@ -225,6 +225,27 @@ fn config_rejects_zero_optimistic_txn_retries() {
     ));
 }
 
+/// Excessive retry budget would cause CAS operations to block for minutes
+/// under contention.
+#[test]
+fn config_rejects_excessive_optimistic_txn_retries() {
+    let error = EtcdCoordinatorConfig::new_with_tuning(
+        ["http://127.0.0.1:2379"],
+        "/gossip/v1",
+        60,
+        10_000,
+        8,
+    )
+    .expect_err("excessive retry budget must fail");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::ExcessiveOptimisticTxnRetries {
+            requested: 10_000,
+            max: 64,
+        }
+    ));
+}
+
 /// Zero per-tenant cap would prevent any shard registration.
 #[test]
 fn config_rejects_zero_max_shards_per_tenant() {
