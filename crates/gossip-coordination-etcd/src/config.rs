@@ -255,7 +255,8 @@ impl EtcdCoordinatorConfig {
     /// - Namespace prefix must start with `/`, must not end with `/`
     ///   (unless it is exactly `"/"`), and must not contain `//`.
     /// - Owner lease TTL must be positive.
-    /// - Optimistic txn retries must be at least 1.
+    /// - Optimistic txn retries must be between 1 and
+    ///   `MAX_OPTIMISTIC_TXN_RETRIES` (inclusive).
     /// - Shard count limits must be positive.
     /// - Max children per split op must be between 1 and
     ///   `MAX_CHILDREN_PER_SPLIT_TXN` (etcd txn budget), and at most

@@ -219,7 +219,7 @@ impl fmt::Display for EtcdCodecError {
             Self::FieldTooLarge { actual, max } => {
                 write!(
                     f,
-                    "variable-length field too large: {actual} bytes exceeds {max}-byte limit"
+                    "variable-length field too large: {actual} exceeds limit of {max}"
                 )
             }
         }
@@ -266,16 +266,71 @@ pub fn encode_run_record(record: &RunRecord) -> Vec<u8> {
 /// retry loops where the encode runs on every iteration — the buffer
 /// retains its capacity across retries, avoiding repeated allocation and
 /// potential regrowth.
+///
+/// Unlike the allocating variant, this reads pooled fields directly from
+/// the slab as `&[u8]` slices and iterates spawned/op-log in place,
+/// avoiding the intermediate `OwnedShardRecord` and its 5-7 heap
+/// allocations.
 pub fn encode_shard_record_into(
     record: &ShardRecord,
     slab: &ByteSlab,
     buf: &mut Vec<u8>,
 ) -> Result<(), EtcdCodecError> {
-    let owned = OwnedShardRecord::from_record(record, slab);
     buf.clear();
     buf.extend_from_slice(VERSION_PREFIX_V1);
     buf.push(BlobKind::ShardRecord.as_u8());
-    owned.encode_into(buf)?;
+
+    // Identity.
+    put_tenant(buf, record.tenant);
+    put_u64(buf, record.run.as_raw());
+    put_u64(buf, record.shard.as_raw());
+
+    // Lifecycle.
+    put_u8(buf, record.status.as_u8());
+    put_opt_u8(buf, record.park_reason.map(ParkReason::as_u8));
+
+    // Spec fields — read directly from slab, no intermediate Vec.
+    put_bytes(buf, record.spec.key_range_start(slab));
+    put_bytes(buf, record.spec.key_range_end(slab));
+    put_bytes(buf, record.spec.metadata(slab));
+
+    // Cursor — read directly from slab.
+    put_opt_bytes(buf, record.cursor.last_key(slab));
+    put_opt_bytes(buf, record.cursor.token(slab));
+    put_u8(buf, record.cursor_semantics.as_u8());
+
+    // Lease — `Option<LeaseHolder>` guarantees owner and deadline are
+    // jointly present or absent, so the partial-state invariant violation
+    // that `OwnedShardRecord::encode_into` guards against is structurally
+    // impossible here.
+    match record.lease {
+        Some(lease) => {
+            put_bool(buf, true);
+            put_u64(buf, lease.owner().as_raw());
+            put_u64(buf, lease.deadline().as_raw());
+        }
+        None => put_bool(buf, false),
+    }
+
+    put_u64(buf, record.fence_epoch.as_raw());
+    put_opt_u64(buf, record.parent.map(|p| p.as_raw()));
+
+    // Spawned — iterate directly from slab, no collected Vec.
+    put_len(buf, record.spawned.len());
+    for shard in record.spawned.iter(slab) {
+        put_u64(buf, shard.as_raw());
+    }
+
+    // Op log — OpLogEntry fields are all scalars (Copy), no heap data.
+    put_len(buf, record.op_log.len());
+    for entry in record.op_log.iter() {
+        put_u64(buf, entry.op_id().as_raw());
+        put_u8(buf, entry.kind().as_u8());
+        put_u8(buf, entry.result().as_u8());
+        put_u64(buf, entry.payload_hash());
+        put_u64(buf, entry.executed_at().as_raw());
+    }
+
     Ok(())
 }
 
