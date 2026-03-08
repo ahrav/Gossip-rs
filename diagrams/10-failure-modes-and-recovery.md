@@ -87,7 +87,7 @@ sequenceDiagram
 
     Note over W2: Worker 2 resumes from page_3<br/>(the last COMMITTED cursor)
     W2->>W2: Re-processes interrupted page from page_3
-    W2->>CO: commit(shard_1, token=6, cursor=page_4, findings)
+    W2->>CO: checkpoint(shard_1, token=6, cursor=page_4)
     CO-->>W2: Ok(cursor advanced to page_4)
 
     rect rgb(220, 252, 231)
@@ -627,7 +627,6 @@ skipped.
 
 | Component                                                              | Path                                                                     |
 | :--------------------------------------------------------------------- | :----------------------------------------------------------------------- |
-| Design specification                                                   | `08-cross-cutting/03-failure-modes-and-recovery.md`                      |
 | Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/`                              |
 | Coordination protocol (lease, fencing, shard ops)                      | `crates/gossip-coordination/src/`                                        |
 | Connector module (circuit breaker, source abstraction)                 | `crates/gossip-contracts/src/connector/` and `crates/gossip-connectors/` |

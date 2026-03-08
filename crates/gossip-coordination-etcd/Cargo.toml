@@ -18,6 +18,7 @@ gossip-contracts.workspace = true
 gossip-stdx.workspace = true
 etcd-client = { version = "0.18", default-features = false }
 tokio = { version = "1", features = ["rt", "time", "sync", "net"] }
+tracing.workspace = true
 
 [dev-dependencies]
 gossip-coordination = { workspace = true, features = ["test-support"] }

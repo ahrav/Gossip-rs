@@ -24,6 +24,8 @@ use std::time::Duration;
 use gossip_contracts::coordination::limits::MAX_SPLIT_CHILDREN;
 use gossip_coordination::{DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS};
 
+use crate::backend::MAX_CHILDREN_PER_SPLIT_TXN;
+
 /// TCP connect timeout for the initial etcd client connection.
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -250,7 +252,9 @@ impl EtcdCoordinatorConfig {
     /// - Owner lease TTL must be positive.
     /// - Optimistic txn retries must be at least 1.
     /// - Shard count limits must be positive.
-    /// - Max children per split op must be between 1 and `MAX_SPLIT_CHILDREN`.
+    /// - Max children per split op must be between 1 and
+    ///   `MAX_CHILDREN_PER_SPLIT_TXN` (etcd txn budget), and at most
+    ///   `MAX_SPLIT_CHILDREN` (global contract limit).
     pub fn validate(&self) -> Result<(), EtcdCoordinatorConfigError> {
         if self.endpoints.is_empty() {
             return Err(EtcdCoordinatorConfigError::NoEndpoints);
@@ -291,6 +295,14 @@ impl EtcdCoordinatorConfig {
         }
         if self.max_children_per_op == 0 {
             return Err(EtcdCoordinatorConfigError::ZeroMaxChildrenPerOp);
+        }
+        if self.max_children_per_op > MAX_CHILDREN_PER_SPLIT_TXN {
+            return Err(
+                EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsEtcdTxnBudget {
+                    requested: self.max_children_per_op,
+                    max: MAX_CHILDREN_PER_SPLIT_TXN,
+                },
+            );
         }
         if self.max_children_per_op > MAX_SPLIT_CHILDREN {
             return Err(
@@ -436,6 +448,12 @@ pub enum EtcdCoordinatorConfigError {
     ZeroMaxTotalShards,
     /// `max_children_per_op` must be at least 1.
     ZeroMaxChildrenPerOp,
+    /// `max_children_per_op` would produce a `split_replace` transaction
+    /// exceeding etcd's default `--max-txn-ops` limit of 128.
+    ///
+    /// Each child adds 3 transaction entries (1 compare + 2 ops) to a
+    /// fixed overhead of 7, so the ceiling is `(128 - 7) / 3 = 40`.
+    MaxChildrenPerOpExceedsEtcdTxnBudget { requested: usize, max: usize },
     /// `max_children_per_op` cannot exceed the global split limit.
     MaxChildrenPerOpExceedsGlobalLimit { requested: usize, global_max: usize },
 }
@@ -468,6 +486,12 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             Self::ZeroMaxShardsPerTenant => f.write_str("max_shards_per_tenant must be > 0"),
             Self::ZeroMaxTotalShards => f.write_str("max_total_shards must be > 0"),
             Self::ZeroMaxChildrenPerOp => f.write_str("max_children_per_op must be > 0"),
+            Self::MaxChildrenPerOpExceedsEtcdTxnBudget { requested, max } => write!(
+                f,
+                "max_children_per_op ({requested}) exceeds etcd split-transaction budget ({max}); \
+                 each child adds 3 txn entries to a fixed overhead of 7, \
+                 capped at 128 total (etcd default --max-txn-ops)",
+            ),
             Self::MaxChildrenPerOpExceedsGlobalLimit {
                 requested,
                 global_max,

@@ -1335,6 +1335,7 @@ dependencies = [
  "rstest",
  "testcontainers",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
