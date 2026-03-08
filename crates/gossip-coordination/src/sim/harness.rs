@@ -2701,12 +2701,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 match sess.checkpoint(now, &update, op_ids[i]) {
                     Ok(_) => checkpoints_ok += 1,
                     Err(e) => {
+                        if matches!(e, CheckpointError::BackendError { .. }) {
+                            panic!(
+                                "simulation backend produced unexpected infrastructure error: {e:?}"
+                            );
+                        }
                         debug_assert!(
                             !matches!(
                                 e,
                                 CheckpointError::TenantMismatch { .. }
                                     | CheckpointError::ShardNotFound { .. }
-                                    | CheckpointError::BackendError { .. }
                             ),
                             "session checkpoint hit impossible error: {e:?}"
                         );
