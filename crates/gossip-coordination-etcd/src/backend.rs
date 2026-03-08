@@ -5,8 +5,8 @@
 //!
 //! - **Run management** (`create_run`, `register_shards`, `get_run`,
 //!   `get_run_progress`, `list_shards_into`, `collect_claim_candidates_into`)
-//! - **Shard hot path** (`acquire_and_restore_into`, `renew`, `checkpoint`,
-//!   `split_replace`, `split_residual`)
+//! - **Shard hot path** (`acquire_and_restore_into`, `renew`, `checkpoint`)
+//! - **Shard lifecycle** (`split_replace`, `split_residual`)
 //! - **Shard claiming** (via [`default_claim_next_available`])
 //!
 //! # Concurrency model
