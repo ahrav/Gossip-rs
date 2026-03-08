@@ -423,6 +423,9 @@ impl From<CompleteError> for RejectionKind {
             CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
             CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,
             CompleteError::ResourceExhausted(_) => Self::ResourceExhausted,
+            CompleteError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }

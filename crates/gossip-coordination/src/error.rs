@@ -786,6 +786,10 @@ impl fmt::Debug for CompleteError {
                 .finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -824,6 +828,9 @@ impl fmt::Display for CompleteError {
             }
             Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }
