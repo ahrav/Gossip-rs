@@ -381,6 +381,11 @@ pub enum AcquireError {
         current_owner: WorkerId,
         lease_deadline: LogicalTime,
     },
+
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 // Custom Debug: redacts `current_owner` to prevent worker identity
@@ -406,6 +411,10 @@ impl fmt::Debug for AcquireError {
                 .field("current_owner", &"<redacted>")
                 .field("lease_deadline", lease_deadline)
                 .finish(),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -423,6 +432,9 @@ impl fmt::Display for AcquireError {
             // Omit current_owner in Display output (redact worker identity).
             Self::AlreadyLeased { lease_deadline, .. } => {
                 write!(f, "shard already leased (deadline {lease_deadline:?})")
+            }
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
             }
         }
     }
@@ -459,6 +471,10 @@ pub enum RenewError {
         shard: ShardKey,
         status: ShardStatus,
     },
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Display for RenewError {
@@ -477,6 +493,9 @@ impl fmt::Display for RenewError {
             }
             Self::ShardTerminal { shard, status } => {
                 write!(f, "shard {shard:?} is terminal ({status})")
+            }
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
             }
         }
     }
@@ -540,6 +559,10 @@ pub enum CheckpointError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Debug for CheckpointError {
@@ -594,6 +617,10 @@ impl fmt::Debug for CheckpointError {
                 .finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -632,6 +659,9 @@ impl fmt::Display for CheckpointError {
             }
             Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }

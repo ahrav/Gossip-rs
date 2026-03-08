@@ -364,6 +364,9 @@ impl From<AcquireError> for RejectionKind {
             AcquireError::ShardNotFound { .. } => Self::ShardNotFound,
             AcquireError::TenantMismatch { .. } => Self::TenantMismatch,
             AcquireError::AlreadyLeased { .. } => Self::AlreadyLeased,
+            AcquireError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }
@@ -376,6 +379,9 @@ impl From<RenewError> for RejectionKind {
             RenewError::ShardTerminal { .. } => Self::TerminalState,
             RenewError::ShardNotFound { .. } => Self::ShardNotFound,
             RenewError::TenantMismatch { .. } => Self::TenantMismatch,
+            RenewError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }
@@ -395,6 +401,9 @@ impl From<CheckpointError> for RejectionKind {
             CheckpointError::TenantMismatch { .. } => Self::TenantMismatch,
             CheckpointError::CheckpointMissingKey => Self::CheckpointMissingKey,
             CheckpointError::ResourceExhausted(_) => Self::ResourceExhausted,
+            CheckpointError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }
@@ -1992,6 +2001,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             Err(ClaimError::TenantMismatch { .. }) => SimEvent::Rejected {
                 kind: RejectionKind::TenantMismatch,
             },
+            Err(ClaimError::BackendError { message }) => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 

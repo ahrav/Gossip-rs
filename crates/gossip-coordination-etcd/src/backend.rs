@@ -40,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
 
 use crate::codec::{
     EtcdCodecError, OwnerLeaseValue, decode_owner_value, decode_run_record, decode_shard_record,
@@ -78,6 +79,36 @@ const MAX_DECODE_SLAB_CAPACITY: usize = 256 * 1024;
 
 /// Floor capacity for slabs built during shard registration encoding.
 const DEFAULT_BUILD_SLAB_FLOOR: usize = 1024;
+
+/// Maximum shards per `register_shards` etcd transaction.
+///
+/// Derived from etcd's default `--max-txn-ops` limit of 128. Each shard
+/// generates 3 ops (compare-absent, put-record, put-active-index) plus 3
+/// fixed ops (compare-run-revision, put-run-record, put-run-active-index),
+/// giving `(128 - 3) / 3 = 41` as the maximum shard count.
+const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
+
+/// Compute a backoff delay for CAS retry loops.
+///
+/// Uses exponential backoff (5ms base, 2× per attempt, capped at 200ms)
+/// with ±50% jitter derived from the current system time's sub-second
+/// nanoseconds. Prevents thundering-herd contention when multiple workers
+/// race on the same shard.
+fn cas_retry_delay(attempt: usize) -> Duration {
+    let base_ms: u64 = 5;
+    let max_ms: u64 = 200;
+    let exp_ms = base_ms.saturating_mul(1u64 << attempt.min(6)).min(max_ms);
+
+    // ±50% jitter from sub-second nanoseconds (no RNG dependency).
+    let jitter_source = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .subsec_nanos();
+    let jitter_frac = (jitter_source % 1000) as f64 / 1000.0; // 0.0 .. 1.0
+    let jittered = (exp_ms as f64) * (0.5 + jitter_frac); // 50% .. 150%
+
+    Duration::from_micros((jittered * 1000.0) as u64)
+}
 
 /// A run record loaded from etcd, paired with its `mod_revision` for
 /// compare-and-swap transaction guards.
@@ -423,12 +454,68 @@ impl EtcdCoordinator {
             .map_err(|source| EtcdCoordinatorError::Codec { operation, source })
     }
 
+    /// Decode an owner-key KV pair, validating the non-zero lease invariant.
+    ///
+    /// Combines codec decoding with the structural check that every owner
+    /// key must be attached to a real etcd lease (lease ID > 0).
+    fn decode_owner_kv(
+        &self,
+        kv: &etcd_client::KeyValue,
+    ) -> Result<PersistedOwner, EtcdCoordinatorError> {
+        let binding = self.decode_owner_binding(EtcdOperation::Get, kv.value())?;
+        if kv.lease() == 0 {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "OwnerKey",
+                    detail: "owner key must be attached to a non-zero etcd lease",
+                },
+            });
+        }
+        Ok(PersistedOwner {
+            binding,
+            lease_id: kv.lease(),
+        })
+    }
+
+    /// Verify that a persisted owner binding is consistent with the shard
+    /// record's lease holder and fence epoch.
+    ///
+    /// Returns an invariant-violation error if the owner key exists but the
+    /// shard record has no lease, or if the worker/fence fields disagree.
+    fn validate_owner_consistency(
+        owner: &PersistedOwner,
+        record: &ShardRecord,
+    ) -> Result<(), EtcdCoordinatorError> {
+        let Some(holder) = record.lease() else {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "owner key exists but shard record lease is None",
+                },
+            });
+        };
+        if holder.owner() != owner.binding.worker || record.fence_epoch != owner.binding.fence {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "owner key binding disagrees with shard record lease or fence",
+                },
+            });
+        }
+        Ok(())
+    }
+
     /// Load a single shard record and its owner binding by exact key.
     ///
-    /// Issues both reads in a single etcd transaction so the shard record
-    /// and `/owner` key come from the same etcd revision. Cross-validates
-    /// the owner binding against the shard record's lease fields. Returns
-    /// `None` if the shard record key does not exist.
+    /// Uses a single prefix-range GET on the shard record key. Because
+    /// shard IDs are fixed-width 16-char hex and the only child key is
+    /// `/owner`, the prefix scan returns exactly the record KV and
+    /// (optionally) the owner KV — no false matches against other shard
+    /// IDs. Cross-validates the owner binding against the shard record's
+    /// lease fields. Returns `None` if the shard record key does not exist.
     ///
     /// # Errors
     ///
@@ -443,28 +530,26 @@ impl EtcdCoordinator {
         let shard_record_key = self
             .keyspace
             .shard_record_key(tenant, key.run(), key.shard());
-        let owner_key_str = self
-            .keyspace
-            .shard_owner_key(tenant, key.run(), key.shard());
 
-        // Read both keys in a single txn so they share one etcd revision.
-        let txn = Txn::new().and_then(vec![
-            TxnOp::get(shard_record_key.clone().into_bytes(), None),
-            TxnOp::get(owner_key_str.into_bytes(), None),
-        ]);
-        let txn_response = self.etcd_txn(txn)?;
-        let mut op_responses = txn_response.op_responses();
+        // Single prefix-range scan fetches both the shard record and its
+        // `/owner` child key in one etcd RPC.
+        let response = self.etcd_get(
+            shard_record_key.clone().into_bytes(),
+            Some(GetOptions::new().with_prefix()),
+        )?;
 
-        let shard_get = match op_responses.remove(0) {
-            etcd_client::TxnOpResponse::Get(resp) => resp,
-            _ => unreachable!("first txn op must be a Get"),
-        };
-        let owner_get = match op_responses.remove(0) {
-            etcd_client::TxnOpResponse::Get(resp) => resp,
-            _ => unreachable!("second txn op must be a Get"),
-        };
+        let mut record_kv: Option<&etcd_client::KeyValue> = None;
+        let mut owner_kv: Option<&etcd_client::KeyValue> = None;
 
-        let Some(kv) = shard_get.kvs().first() else {
+        for kv in response.kvs() {
+            if kv.key() == shard_record_key.as_bytes() {
+                record_kv = Some(kv);
+            } else if kv.key().ends_with(b"/owner") {
+                owner_kv = Some(kv);
+            }
+        }
+
+        let Some(kv) = record_kv else {
             return Ok(None);
         };
 
@@ -477,45 +562,13 @@ impl EtcdCoordinator {
         })?;
         let mod_revision = kv.mod_revision();
 
-        let owner = match owner_get.kvs().first() {
+        let owner = match owner_kv {
             None => None,
-            Some(owner_kv) => {
-                let binding = self.decode_owner_binding(EtcdOperation::Get, owner_kv.value())?;
-                if owner_kv.lease() == 0 {
-                    return Err(EtcdCoordinatorError::Codec {
-                        operation: EtcdOperation::Get,
-                        source: EtcdCodecError::InvariantViolation {
-                            kind: "OwnerKey",
-                            detail: "owner key must be attached to a non-zero etcd lease",
-                        },
-                    });
-                }
-                Some(PersistedOwner {
-                    binding,
-                    lease_id: owner_kv.lease(),
-                })
-            }
+            Some(okv) => Some(self.decode_owner_kv(okv)?),
         };
 
         if let Some(owner) = &owner {
-            let Some(holder) = record.lease() else {
-                return Err(EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source: EtcdCodecError::InvariantViolation {
-                        kind: "ShardRecord",
-                        detail: "owner key exists but shard record lease is None",
-                    },
-                });
-            };
-            if holder.owner() != owner.binding.worker || record.fence_epoch != owner.binding.fence {
-                return Err(EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source: EtcdCodecError::InvariantViolation {
-                        kind: "ShardRecord",
-                        detail: "owner key binding disagrees with shard record lease or fence",
-                    },
-                });
-            }
+            Self::validate_owner_consistency(owner, &record)?;
         }
 
         Ok(Some(PersistedShard {
@@ -551,23 +604,8 @@ impl EtcdCoordinator {
 
         for kv in response.kvs() {
             if kv.key().ends_with(b"/owner") {
-                let binding = self.decode_owner_binding(EtcdOperation::Get, kv.value())?;
-                if kv.lease() == 0 {
-                    return Err(EtcdCoordinatorError::Codec {
-                        operation: EtcdOperation::Get,
-                        source: EtcdCodecError::InvariantViolation {
-                            kind: "OwnerKey",
-                            detail: "owner key must be attached to a non-zero etcd lease",
-                        },
-                    });
-                }
-                owner_map.insert(
-                    kv.key().to_vec(),
-                    PersistedOwner {
-                        binding,
-                        lease_id: kv.lease(),
-                    },
-                );
+                let owner = self.decode_owner_kv(kv)?;
+                owner_map.insert(kv.key().to_vec(), owner);
             } else {
                 record_kvs.push((kv.key().to_vec(), kv.value().to_vec(), kv.mod_revision()));
             }
@@ -588,26 +626,7 @@ impl EtcdCoordinator {
             let owner = owner_map.remove(&owner_key);
 
             if let Some(owner) = &owner {
-                let Some(holder) = record.lease() else {
-                    return Err(EtcdCoordinatorError::Codec {
-                        operation: EtcdOperation::Get,
-                        source: EtcdCodecError::InvariantViolation {
-                            kind: "ShardRecord",
-                            detail: "owner key exists but shard record lease is None",
-                        },
-                    });
-                };
-                if holder.owner() != owner.binding.worker
-                    || record.fence_epoch != owner.binding.fence
-                {
-                    return Err(EtcdCoordinatorError::Codec {
-                        operation: EtcdOperation::Get,
-                        source: EtcdCodecError::InvariantViolation {
-                            kind: "ShardRecord",
-                            detail: "owner key binding disagrees with shard record lease or fence",
-                        },
-                    });
-                }
+                Self::validate_owner_consistency(owner, &record)?;
             }
 
             out.push(PersistedShard {
@@ -645,41 +664,47 @@ impl EtcdCoordinator {
         }
     }
 
-    /// Scan all shards for a run and compute a [`CapacityHint`] containing
-    /// the number of active shards without a live owner and the earliest
-    /// lease deadline among leased shards.
-    fn count_available_for_run(
+    /// Lightweight capacity hint using count-only and keys-only RPCs.
+    ///
+    /// Returns the number of active shards without an owner key. Uses two
+    /// etcd RPCs with minimal data transfer (no shard record values decoded):
+    ///
+    /// 1. `count_only` on the `shards_active/` prefix → total active shards.
+    /// 2. `keys_only` on the `shards/` prefix, counting `/owner` suffixes →
+    ///    owned shard count.
+    ///
+    /// `earliest_deadline` is always `None` because computing it would require
+    /// decoding shard record values, defeating the purpose. The facade's claim
+    /// path computes deadlines separately via `collect_claim_candidates_into`.
+    fn count_available_lightweight(
         &self,
-        now: LogicalTime,
         tenant: TenantId,
         run: RunId,
     ) -> Result<CapacityHint, EtcdCoordinatorError> {
-        let shards = self.scan_run_shards(tenant, run)?;
-        let mut available_count: u32 = 0;
-        let mut earliest_deadline: Option<LogicalTime> = None;
+        let active_prefix = self.keyspace.shards_active_prefix(tenant, run).into_bytes();
+        let active_response = self.etcd_get(
+            active_prefix,
+            Some(GetOptions::new().with_prefix().with_count_only()),
+        )?;
+        let total_active = active_response.count() as u32;
 
-        for shard in &shards {
-            if shard.record.status != ShardStatus::Active {
-                continue;
-            }
-
-            if shard.owner_is_live_at(now) {
-                let deadline = shard
-                    .record
-                    .lease_deadline()
-                    .expect("live owner must imply a logical lease deadline");
-                earliest_deadline = Some(match earliest_deadline {
-                    Some(prev) => core::cmp::min(prev, deadline),
-                    None => deadline,
-                });
-            } else {
-                available_count = available_count.saturating_add(1);
-            }
-        }
+        let shards_prefix = self
+            .keyspace
+            .shard_records_scan_prefix(tenant, run)
+            .into_bytes();
+        let keys_response = self.etcd_get(
+            shards_prefix,
+            Some(GetOptions::new().with_prefix().with_keys_only()),
+        )?;
+        let owned_count = keys_response
+            .kvs()
+            .iter()
+            .filter(|kv| kv.key().ends_with(b"/owner"))
+            .count() as u32;
 
         Ok(CapacityHint {
-            available_count,
-            earliest_deadline,
+            available_count: total_active.saturating_sub(owned_count),
+            earliest_deadline: None,
         })
     }
 
@@ -829,11 +854,15 @@ impl CoordinationBackend for EtcdCoordinator {
         worker: WorkerId,
         out: &'a mut AcquireScratch,
     ) -> Result<AcquireResultView<'a>, AcquireError> {
-        for _ in 0..self.config.optimistic_txn_retries() {
+        for attempt in 0..self.config.optimistic_txn_retries() {
             let persisted = match self.load_shard_record(tenant, key) {
                 Ok(Some(shard)) => shard,
                 Ok(None) => return Err(AcquireError::ShardNotFound { shard: key }),
-                Err(err) => self.fatal_storage_error("acquire.load_shard", err),
+                Err(err) => {
+                    return Err(AcquireError::BackendError {
+                        message: format!("acquire.load_shard: {err}"),
+                    });
+                }
             };
 
             if persisted.record.tenant != tenant {
@@ -863,9 +892,14 @@ impl CoordinationBackend for EtcdCoordinator {
             let new_deadline = now
                 .checked_add(lease_duration)
                 .unwrap_or(LogicalTime::from_raw(u64::MAX));
-            let grant = self
-                .etcd_lease_grant(self.config.owner_lease_ttl_secs())
-                .unwrap_or_else(|err| self.fatal_storage_error("acquire.lease_grant", err));
+            let grant = match self.etcd_lease_grant(self.config.owner_lease_ttl_secs()) {
+                Ok(g) => g,
+                Err(err) => {
+                    return Err(AcquireError::BackendError {
+                        message: format!("acquire.lease_grant: {err}"),
+                    });
+                }
+            };
             let new_lease_id = grant.id();
             let prior_lease_id = persisted.owner.as_ref().map(|owner| owner.lease_id);
 
@@ -904,11 +938,18 @@ impl CoordinationBackend for EtcdCoordinator {
                     Some(PutOptions::new().with_lease(new_lease_id)),
                 ),
             ]);
-            let response = self
-                .etcd_txn(txn)
-                .unwrap_or_else(|err| self.fatal_storage_error("acquire.txn", err));
+            let response = match self.etcd_txn(txn) {
+                Ok(r) => r,
+                Err(err) => {
+                    self.best_effort_revoke_lease(new_lease_id);
+                    return Err(AcquireError::BackendError {
+                        message: format!("acquire.txn: {err}"),
+                    });
+                }
+            };
             if !response.succeeded() {
                 self.best_effort_revoke_lease(new_lease_id);
+                std::thread::sleep(cas_retry_delay(attempt));
                 continue;
             }
 
@@ -916,9 +957,14 @@ impl CoordinationBackend for EtcdCoordinator {
                 self.best_effort_revoke_lease(old_lease_id);
             }
 
-            let capacity = self
-                .count_available_for_run(now, tenant, key.run())
-                .unwrap_or_else(|err| self.fatal_storage_error("acquire.capacity_hint", err));
+            let capacity = match self.count_available_lightweight(tenant, key.run()) {
+                Ok(c) => c,
+                Err(err) => {
+                    return Err(AcquireError::BackendError {
+                        message: format!("acquire.capacity_hint: {err}"),
+                    });
+                }
+            };
 
             let lease = Lease::new(
                 tenant,
@@ -989,11 +1035,15 @@ impl CoordinationBackend for EtcdCoordinator {
     ) -> Result<RenewResult, RenewError> {
         let key = lease.shard_key();
 
-        for _ in 0..self.config.optimistic_txn_retries() {
+        for attempt in 0..self.config.optimistic_txn_retries() {
             let persisted = match self.load_shard_record(tenant, key) {
                 Ok(Some(shard)) => shard,
                 Ok(None) => return Err(RenewError::ShardNotFound { shard: key }),
-                Err(err) => self.fatal_storage_error("renew.load_shard", err),
+                Err(err) => {
+                    return Err(RenewError::BackendError {
+                        message: format!("renew.load_shard: {err}"),
+                    });
+                }
             };
 
             validate_lease(now, tenant, lease, &persisted.record)?;
@@ -1015,16 +1065,6 @@ impl CoordinationBackend for EtcdCoordinator {
                 .as_ref()
                 .map(|owner| owner.lease_id)
                 .expect("validated owner must exist");
-            if self.etcd_lease_keep_alive_once(old_lease_id).is_err() {
-                // The etcd lease already expired (e.g., TTL fired between
-                // the owner-key read and this keep-alive call). This is a
-                // normal operational condition — treat it as a stale fence
-                // so the caller can re-acquire.
-                return Err(RenewError::StaleFence {
-                    presented: lease.fence(),
-                    current: persisted.record.fence_epoch,
-                });
-            }
 
             let mut persisted = persisted;
             persisted.record.lease = Some(LeaseHolder::new(lease.owner(), new_deadline));
@@ -1052,18 +1092,38 @@ impl CoordinationBackend for EtcdCoordinator {
                 shard_blob,
                 None,
             )]);
-            let response = self
-                .etcd_txn(txn)
-                .unwrap_or_else(|err| self.fatal_storage_error("renew.txn", err));
+            let response = match self.etcd_txn(txn) {
+                Ok(r) => r,
+                Err(err) => {
+                    return Err(RenewError::BackendError {
+                        message: format!("renew.txn: {err}"),
+                    });
+                }
+            };
             if response.succeeded() {
-                let capacity = self
-                    .count_available_for_run(now, tenant, key.run())
-                    .unwrap_or_else(|err| self.fatal_storage_error("renew.capacity_hint", err));
+                // Best-effort: extend the etcd lease TTL after the CAS
+                // succeeds. If the keep-alive fails (transport blip or the
+                // lease expired in the tiny window between CAS and this
+                // call), the CAS already committed the new deadline to the
+                // shard record. The next renew cycle will detect ownership
+                // loss via `owner_matches_lease` if the owner key was
+                // deleted. Returning an error here would lie about the
+                // outcome — the shard record IS updated.
+                let _ = self.etcd_lease_keep_alive_once(old_lease_id);
+                let capacity = match self.count_available_lightweight(tenant, key.run()) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        return Err(RenewError::BackendError {
+                            message: format!("renew.capacity_hint: {err}"),
+                        });
+                    }
+                };
                 return Ok(RenewResult {
                     new_deadline,
                     capacity,
                 });
             }
+            std::thread::sleep(cas_retry_delay(attempt));
         }
 
         let persisted = self.load_shard_or_panic(tenant, key);
@@ -1092,11 +1152,15 @@ impl CoordinationBackend for EtcdCoordinator {
         let key = lease.shard_key();
         let payload_hash = hash_checkpoint_payload(new_cursor);
 
-        for _ in 0..self.config.optimistic_txn_retries() {
+        for attempt in 0..self.config.optimistic_txn_retries() {
             let persisted = match self.load_shard_record(tenant, key) {
                 Ok(Some(shard)) => shard,
                 Ok(None) => return Err(CheckpointError::ShardNotFound { shard: key }),
-                Err(err) => self.fatal_storage_error("checkpoint.load_shard", err),
+                Err(err) => {
+                    return Err(CheckpointError::BackendError {
+                        message: format!("checkpoint.load_shard: {err}"),
+                    });
+                }
             };
 
             if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
@@ -1152,12 +1216,18 @@ impl CoordinationBackend for EtcdCoordinator {
                 shard_blob,
                 None,
             )]);
-            let response = self
-                .etcd_txn(txn)
-                .unwrap_or_else(|err| self.fatal_storage_error("checkpoint.txn", err));
+            let response = match self.etcd_txn(txn) {
+                Ok(r) => r,
+                Err(err) => {
+                    return Err(CheckpointError::BackendError {
+                        message: format!("checkpoint.txn: {err}"),
+                    });
+                }
+            };
             if response.succeeded() {
                 return Ok(IdempotentOutcome::Executed(()));
             }
+            std::thread::sleep(cas_retry_delay(attempt));
         }
 
         let persisted = self.load_shard_or_panic(tenant, key);
@@ -1250,9 +1320,14 @@ impl RunManagement for EtcdCoordinator {
         let txn = Txn::new()
             .when(vec![Self::compare_absent(key.clone())])
             .and_then(vec![TxnOp::put(key.into_bytes(), blob, None)]);
-        let response = self
-            .etcd_txn(txn)
-            .unwrap_or_else(|err| self.fatal_storage_error("create_run.txn", err));
+        let response = match self.etcd_txn(txn) {
+            Ok(r) => r,
+            Err(err) => {
+                return Err(CreateRunError::BackendError {
+                    message: format!("create_run.txn: {err}"),
+                });
+            }
+        };
         if response.succeeded() {
             return Ok(record);
         }
@@ -1268,13 +1343,23 @@ impl RunManagement for EtcdCoordinator {
         shards: &[InitialShardInput<'_>],
         op_id: OpId,
     ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError> {
+        if shards.len() > MAX_SHARDS_PER_ETCD_TXN {
+            return Err(RegisterShardsError::ResourceExhausted {
+                resource: "etcd_txn_ops",
+            });
+        }
+
         let payload_hash = hash_register_shards_payload(shards);
 
-        for _ in 0..self.config.optimistic_txn_retries() {
+        for attempt in 0..self.config.optimistic_txn_retries() {
             let persisted_run = match self.load_run_record(tenant, run) {
                 Ok(Some(run_record)) => run_record,
                 Ok(None) => return Err(RegisterShardsError::RunNotFound),
-                Err(err) => self.fatal_storage_error("register_shards.load_run", err),
+                Err(err) => {
+                    return Err(RegisterShardsError::BackendError {
+                        message: format!("register_shards.load_run: {err}"),
+                    });
+                }
             };
             let mut run_record = persisted_run.record;
 
@@ -1360,12 +1445,18 @@ impl RunManagement for EtcdCoordinator {
             ));
 
             let txn = Txn::new().when(compares).and_then(txn_ops);
-            let response = self
-                .etcd_txn(txn)
-                .unwrap_or_else(|err| self.fatal_storage_error("register_shards.txn", err));
+            let response = match self.etcd_txn(txn) {
+                Ok(r) => r,
+                Err(err) => {
+                    return Err(RegisterShardsError::BackendError {
+                        message: format!("register_shards.txn: {err}"),
+                    });
+                }
+            };
             if response.succeeded() {
                 return Ok(IdempotentOutcome::Executed(shard_ids));
             }
+            std::thread::sleep(cas_retry_delay(attempt));
         }
 
         let persisted_run = self.load_run_or_panic(tenant, run);
@@ -1407,7 +1498,9 @@ impl RunManagement for EtcdCoordinator {
                 }
             }
             Ok(None) => Err(GetRunError::RunNotFound),
-            Err(err) => self.fatal_storage_error("get_run.load", err),
+            Err(err) => Err(GetRunError::BackendError {
+                message: format!("get_run.load: {err}"),
+            }),
         }
     }
 
@@ -1418,9 +1511,11 @@ impl RunManagement for EtcdCoordinator {
         run: RunId,
     ) -> Result<RunProgress, GetRunError> {
         let _ = self.get_run(tenant, run)?;
-        let shards = self
-            .scan_run_shards(tenant, run)
-            .unwrap_or_else(|err| self.fatal_storage_error("get_run_progress.scan", err));
+        let shards =
+            self.scan_run_shards(tenant, run)
+                .map_err(|err| GetRunError::BackendError {
+                    message: format!("get_run_progress.scan: {err}"),
+                })?;
 
         let mut progress = RunProgress::default();
         for persisted in &shards {
@@ -1442,9 +1537,11 @@ impl RunManagement for EtcdCoordinator {
         out: &mut Vec<ShardSummary>,
     ) -> Result<(), GetRunError> {
         let _ = self.get_run(tenant, run)?;
-        let shards = self
-            .scan_run_shards(tenant, run)
-            .unwrap_or_else(|err| self.fatal_storage_error("list_shards_into.scan", err));
+        let shards =
+            self.scan_run_shards(tenant, run)
+                .map_err(|err| GetRunError::BackendError {
+                    message: format!("list_shards_into.scan: {err}"),
+                })?;
 
         out.clear();
         for persisted in &shards {
@@ -1475,9 +1572,11 @@ impl RunManagement for EtcdCoordinator {
         candidates: &mut Vec<ShardId>,
     ) -> Result<Option<LogicalTime>, GetRunError> {
         let _ = self.get_run(tenant, run)?;
-        let shards = self
-            .scan_run_shards(tenant, run)
-            .unwrap_or_else(|err| self.fatal_storage_error("collect_claim_candidates.scan", err));
+        let shards =
+            self.scan_run_shards(tenant, run)
+                .map_err(|err| GetRunError::BackendError {
+                    message: format!("collect_claim_candidates.scan: {err}"),
+                })?;
 
         candidates.clear();
         let mut earliest_deadline: Option<LogicalTime> = None;

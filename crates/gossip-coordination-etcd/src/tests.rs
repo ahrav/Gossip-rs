@@ -14,8 +14,8 @@ use crate::{
 use gossip_contracts::coordination::{CursorSemantics, CursorUpdate, ShardSpecRef};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
-    AcquireScratch, CoordinationBackend, IdempotentOutcome, InitialShardInput, RunConfig,
-    RunManagement,
+    AcquireScratch, CoordinationBackend, IdempotentOutcome, InitialShardInput, RegisterShardsError,
+    RunConfig, RunManagement,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -507,6 +507,60 @@ fn run_records_scan_prefix_is_scan_safe() {
     assert!(
         !runs_active.starts_with(&scan_prefix),
         "runs_active ({runs_active}) must not be matched by run_records_scan_prefix ({scan_prefix})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// register_shards txn size guard
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
+    let mut backend = local_backend();
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    // 42 shards exceed the MAX_SHARDS_PER_ETCD_TXN limit of 41.
+    let ranges: Vec<(String, String)> = (0..42u64)
+        .map(|i| (format!("{i:04}"), format!("{:04}", i + 1)))
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = ranges
+        .iter()
+        .enumerate()
+        .map(|(i, (start, end))| {
+            InitialShardInput::new(
+                ShardId::from_raw(i as u64 + 1),
+                ShardSpecRef::new(start.as_bytes(), end.as_bytes(), b""),
+                CursorUpdate::initial(),
+            )
+        })
+        .collect();
+
+    let err = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(99),
+        )
+        .expect_err("42 shards must exceed etcd txn op limit");
+
+    assert!(
+        matches!(
+            err,
+            RegisterShardsError::ResourceExhausted {
+                resource: "etcd_txn_ops"
+            }
+        ),
+        "expected ResourceExhausted(etcd_txn_ops), got {err:?}"
     );
 }
 

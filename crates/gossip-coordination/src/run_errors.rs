@@ -71,6 +71,10 @@ pub enum CreateRunError {
     GetRunFailed(GetRunError),
     /// A run with this `RunId` already exists with a different `RunConfig`.
     ConfigMismatch { run: RunId },
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Display for CreateRunError {
@@ -83,6 +87,9 @@ impl fmt::Display for CreateRunError {
             Self::ConfigMismatch { run } => {
                 write!(f, "run {run:?} exists with different config")
             }
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }
@@ -93,7 +100,9 @@ impl std::error::Error for CreateRunError {
             Self::InvalidConfig(e) => Some(e),
             Self::RegisterShardsFailed(e) => Some(e),
             Self::GetRunFailed(e) => Some(e),
-            _ => None,
+            Self::RunAlreadyExists { .. }
+            | Self::ConfigMismatch { .. }
+            | Self::BackendError { .. } => None,
         }
     }
 }
@@ -151,6 +160,10 @@ pub enum RegisterShardsError {
     /// Coordinator memory resources could not satisfy an allocation request.
     /// Recoverable: retry with a larger runtime memory budget.
     ResourceExhausted { resource: &'static str },
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Debug for RegisterShardsError {
@@ -183,6 +196,10 @@ impl fmt::Debug for RegisterShardsError {
                 .debug_struct("ResourceExhausted")
                 .field("resource", resource)
                 .finish(),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -212,6 +229,9 @@ impl fmt::Display for RegisterShardsError {
             }
             Self::ResourceExhausted { resource } => {
                 write!(f, "coordinator resource exhausted: {resource}")
+            }
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
             }
         }
     }
@@ -243,6 +263,10 @@ pub enum GetRunError {
     RunNotFound,
     /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
     TenantMismatch { expected: TenantId },
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Display for GetRunError {
@@ -251,6 +275,9 @@ impl fmt::Display for GetRunError {
             Self::RunNotFound => f.write_str("run not found"),
             Self::TenantMismatch { expected } => {
                 write!(f, "tenant mismatch (expected {expected:?})")
+            }
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
             }
         }
     }
