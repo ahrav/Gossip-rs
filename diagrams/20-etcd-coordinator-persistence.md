@@ -54,7 +54,7 @@ graph TB
     end
 
     subgraph traits_impl ["Trait Implementations (delegation)"]
-        CB["CoordinationBackend<br/>acquire, renew, checkpoint,<br/>complete, park, split_replace,<br/>split_residual"]
+        CB["CoordinationBackend<br/>acquire_and_restore_into, renew, checkpoint,<br/>complete, park, split_replace,<br/>split_residual"]
         RM["RunManagement<br/>create_run, register_shards,<br/>get_run, list_shards,<br/>complete/fail/cancel_run,<br/>unpark_shard"]
         SC["ShardClaiming<br/>claim_next_available"]
     end
@@ -411,7 +411,7 @@ backends. The three traits define the full coordination surface:
 graph TB
     subgraph traits ["Coordination Trait Hierarchy"]
         direction TB
-        CB_TRAIT["CoordinationBackend<br/>7 shard lifecycle methods:<br/>acquire, renew, checkpoint,<br/>complete, park, split_replace,<br/>split_residual"]
+        CB_TRAIT["CoordinationBackend<br/>7 shard lifecycle methods:<br/>acquire_and_restore_into, renew, checkpoint,<br/>complete, park, split_replace,<br/>split_residual"]
         RM_TRAIT["RunManagement<br/>10 run lifecycle methods:<br/>create/complete/fail/cancel run,<br/>register_shards, get_run,<br/>get_run_progress, list_shards,<br/>collect_claim_candidates, unpark"]
         SC_TRAIT["ShardClaiming<br/>1 method:<br/>claim_next_available"]
     end

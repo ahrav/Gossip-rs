@@ -30,7 +30,7 @@ against the code before declaring it correct or incorrect.
 
 ## Invocation
 
-```
+```text
 /doc-code-audit [<scope>] [--flags]
 ```
 
@@ -43,20 +43,20 @@ The scope determines which docs and code are audited. If omitted, defaults to
 
 | Scope | Diagrams | Docs | Source Directories |
 |-------|----------|------|--------------------|
-| `coordination` | 05, 06, 07 | `gossip-coordination/` | `gossip-contracts/src/coordination/`, `gossip-coordination/src/` |
-| `etcd` | 20 | `gossip-coordination/` | `gossip-coordination-etcd/src/` |
-| `persistence` | 08, 19 | `gossip-contracts/boundary-5-persistence.md`, `gossip-persistence-inmemory.md` | `gossip-contracts/src/persistence/`, `gossip-persistence-inmemory/src/` |
-| `identity` | 02, 03 | `gossip-contracts/boundary-1-identity-spine.md` | `gossip-contracts/src/identity/` |
-| `connectors` | 09, 14, 15, 16, 17, 18 | `gossip-connectors/boundary-4-connectors.md` | `gossip-contracts/src/connector/`, `gossip-connectors/src/` |
-| `shard-algebra` | 12, 13 | `gossip-contracts/boundary-3-shard-algebra.md`, `gossip-frontier/shard-algebra.md` | `gossip-frontier/src/` |
-| `scanning` | (none) | `scanner-engine/`, `scanner-scheduler/`, `scanner-git/` | `scanner-engine/src/`, `scanner-scheduler/src/`, `scanner-git/src/` |
-| `findings` | 19 (section 2) | `gossip-contracts/boundary-5-persistence.md` | `gossip-contracts/src/persistence/findings.rs` |
-| `done-ledger` | 19 (sections 3-4) | `gossip-contracts/boundary-5-persistence.md` | `gossip-contracts/src/persistence/done_ledger.rs` |
-| `overview` | 00, 01, 04, 10, 11 | `architecture-overview.md` | (cross-cutting) |
+| `coordination` | 05, 06, 07 | `docs/gossip-coordination/` | `crates/gossip-contracts/src/coordination/`, `crates/gossip-coordination/src/` |
+| `etcd` | 20 | `docs/gossip-coordination/` | `crates/gossip-coordination-etcd/src/` |
+| `persistence` | 08, 19 | `docs/gossip-contracts/boundary-5-persistence.md`, `docs/gossip-persistence-inmemory.md` | `crates/gossip-contracts/src/persistence/`, `crates/gossip-persistence-inmemory/src/` |
+| `identity` | 02, 03 | `docs/gossip-contracts/boundary-1-identity-spine.md` | `crates/gossip-contracts/src/identity/` |
+| `connectors` | 09, 14, 15, 16, 17, 18 | `docs/gossip-connectors/boundary-4-connectors.md` | `crates/gossip-contracts/src/connector/`, `crates/gossip-connectors/src/` |
+| `shard-algebra` | 12, 13 | `docs/gossip-contracts/boundary-3-shard-algebra.md`, `docs/gossip-frontier/shard-algebra.md` | `crates/gossip-frontier/src/` |
+| `scanning` | (none) | `docs/scanner-engine/`, `docs/scanner-scheduler/`, `docs/scanner-git/` | `crates/scanner-engine/src/`, `crates/scanner-scheduler/src/`, `crates/scanner-git/src/` |
+| `findings` | 19 (section 2) | `docs/gossip-contracts/boundary-5-persistence.md` | `crates/gossip-contracts/src/persistence/findings.rs` |
+| `done-ledger` | 19 (sections 3-4) | `docs/gossip-contracts/boundary-5-persistence.md` | `crates/gossip-contracts/src/persistence/done_ledger.rs` |
+| `overview` | 00, 01, 04, 10, 11 | `docs/architecture-overview.md` | (cross-cutting) |
 
 **File paths** — audit specific files directly:
 
-```
+```text
 /doc-code-audit diagrams/19-persistence-contracts.md diagrams/20-etcd-coordinator-persistence.md
 /doc-code-audit docs/gossip-coordination/boundary-2-coordination.md
 ```
@@ -80,14 +80,15 @@ Determine which documents and source files to audit.
 
 ### Incremental Mode (default)
 
-1. Find the last commit that touched any file in `diagrams/` or `docs/`:
+1. Find the merge-base with the target branch (or the last commit that touched
+   any file in `diagrams/` or `docs/` as fallback):
    ```bash
-   git log -1 --format='%H' -- diagrams/ docs/
+   git merge-base main HEAD 2>/dev/null || git log -1 --format='%H' -- diagrams/ docs/
    ```
 
-2. Find all `.rs` files changed since that commit:
+2. Find all `.rs` files changed since the merge-base:
    ```bash
-   git diff --name-only <last-docs-commit>..HEAD -- '*.rs'
+   git diff --name-only <merge-base>..HEAD -- '*.rs'
    ```
 
 3. Read `docs/scope-map.toml` and map each changed `.rs` file to its in-scope
@@ -101,7 +102,7 @@ Determine which documents and source files to audit.
 
 ### Full Mode
 
-1. Collect all files in `diagrams/` (excluding `00-README.md`).
+1. Collect all files in `diagrams/` (including `00-README.md`).
 2. Collect all `.md` files in `docs/` and its subdirectories (excluding
    `findings/`, `assets/`, and `README.md`).
 3. These are all the files to audit.
@@ -128,7 +129,7 @@ with `subagent_type=general`.
 Each agent receives this prompt with `{DOC_FILES}`, `{SOURCE_DIRS}`, and
 `{AUDIT_TYPE}` filled in:
 
-```
+```text
 You are a documentation-vs-code consistency auditor. Your job is to read each
 documentation file, extract every verifiable claim, and check it against the
 actual codebase. You are skeptical by default — assume nothing is correct
@@ -278,7 +279,7 @@ tool with `subagent_type=general`.
 
 ### Synthesizer Prompt
 
-```
+```text
 You are the Documentation Audit Synthesizer. Multiple audit agents have
 independently reviewed documentation files against the codebase. Your job is
 to merge their findings into one actionable report.
@@ -397,10 +398,10 @@ If the user wants fixes applied, offer to:
 
 The full mapping from domain scopes to source directories (for agent prompts):
 
-```
+```yaml
 coordination:
   diagrams: 05-shard-and-run-state-machines.md, 06-fencing-protocol.md, 07-lease-lifecycle.md
-  docs: docs/gossip-coordination/boundary-2-coordination.md, docs/gossip-coordination/coordination-testing.md
+  docs: docs/gossip-coordination/boundary-2-coordination.md, docs/gossip-coordination/coordination-testing.md, docs/gossip-coordination/simulation-harness.md
   source: crates/gossip-contracts/src/coordination/, crates/gossip-coordination/src/
 
 etcd:

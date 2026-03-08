@@ -142,9 +142,9 @@ graph LR
     worker -->|"depends on"| coordination
     cli -->|"depends on"| runtime
 
-    coordination -->|"depends on"| coordination_etcd
-    contracts -->|"depends on"| persistence_inmem
-    scanner_engine -->|"depends on"| integration_tests
+    coordination_etcd -->|"depends on"| coordination
+    persistence_inmem -->|"depends on"| contracts
+    integration_tests -->|"depends on"| scanner_engine
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
     style B3 fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
