@@ -299,22 +299,13 @@ fn split_replace_validate_preconditions<'a>(
         ));
     }
 
-    for sorted_idx in 0..sorted.len() {
-        let child = sorted.child(plan, sorted_idx);
-        if ShardSpec::validate_ref(child.spec()).is_err() {
-            return Err(SplitReplaceError::SplitInvalid(
-                SplitValidationError::InvalidChildSpec {
-                    child_index: sorted_idx,
-                },
-            ));
-        }
-    }
-
-    split_replace_validate_coverage_sorted(
+    let sorted_specs: Vec<ShardSpecRef<'_>> = (0..sorted.len())
+        .map(|i| sorted.child(plan, i).spec())
+        .collect();
+    validate_split_coverage_bounds(
         parent.spec.key_range_start(slab),
         parent.spec.key_range_end(slab),
-        plan,
-        &sorted,
+        &sorted_specs,
     )
     .map_err(SplitReplaceError::SplitInvalid)?;
 
