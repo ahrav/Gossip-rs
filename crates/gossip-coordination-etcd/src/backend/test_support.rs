@@ -346,6 +346,23 @@ impl EtcdCoordinator {
 }
 
 impl AsyncEtcdCoordinator {
+    /// Arm a one-shot fault injection hook for the next matching split
+    /// operation.
+    ///
+    /// The flag clears itself whether the next transaction succeeds or fails,
+    /// so tests must re-arm it before every independent fault scenario.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_arm_fault(&mut self, fault: EtcdTestFault) {
+        match fault {
+            EtcdTestFault::DropOwnerBeforeNextSplitReplaceTxn => {
+                self.test_faults.drop_owner_before_next_split_replace_txn = true;
+            }
+            EtcdTestFault::DropOwnerBeforeNextSplitResidualTxn => {
+                self.test_faults.drop_owner_before_next_split_residual_txn = true;
+            }
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     async fn etcd_delete(
         &self,

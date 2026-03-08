@@ -105,7 +105,11 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
-| `backend.rs`      | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core): persisted etcd implementation for run creation, shard registration, read queries, claim, fenced acquire/renew/checkpoint/split, run terminal transitions, unpark, active-run listing, and GC of stale initializing runs |
+| `backend.rs`      | Module root for the `backend/` directory; shared free functions (key comparison, CAS delay, shard capacity counting) |
+| `backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper with owned Tokio runtime) and `AsyncEtcdCoordinator` (async core): shared low-level etcd RPC wrappers, CAS retry logic, and data-access helpers (load/scan run and shard records) |
+| `backend/run_management.rs` | `RunManagement` and `AsyncRunManagement` impl: create/register/terminate runs, unpark shards, claim candidates |
+| `backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` impl: acquire/renew/checkpoint/split operations |
+| `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
 | `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, shard count limits, and bounded split fanout |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |

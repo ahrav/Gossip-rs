@@ -26,8 +26,10 @@
 //!   prefix, shard limits, tuning). Construction normalizes whitespace and
 //!   enforces keyspace prefix invariants.
 //! - **`backend`** — [`EtcdCoordinator`] and [`AsyncEtcdCoordinator`]:
-//!   the sync wrapper and async core respectively. Both implement the
-//!   full coordination trait surface (sync and async variants). Each wraps
+//!   the sync wrapper and async core respectively. Both implement most
+//!   coordination operations (sync and async variants); see the backend
+//!   module docs for per-operation coverage and any fail-closed stubs
+//!   (e.g., `complete` and `park_shard`). Each wraps
 //!   etcd RPC calls, health-check (`status()`), and persisted
 //!   coordination transactions for run lifecycle, shard lifecycle, and
 //!   cold-path maintenance. Feature-gated test seeding and fault-injection

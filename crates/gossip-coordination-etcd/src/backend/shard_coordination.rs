@@ -1142,6 +1142,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             .cas_retry(
                 |this, _attempt| {
                     Box::pin(async move {
+                        // Buffers are allocated per-retry because `Box::pin(async move {...})`
+                        // requires ownership — buffer reuse across retries would need wrapper
+                        // types. CAS retries are rare (0-2 under contention) and these are
+                        // small (2 KB + 32 B), dwarfed by etcd round-trip cost.
                         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
                         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
                         let persisted = match this.load_shard_record(tenant, key).await {
@@ -1195,17 +1199,17 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                         let new_fence = persisted.record.advance_fence();
                         persisted.record.lease = Some(LeaseHolder::new(worker, new_deadline));
                         persisted.record.assert_invariants(&persisted.slab);
-                        encode_shard_record_into(
+                        if let Err(e) = encode_shard_record_into(
                             &persisted.record,
                             &persisted.slab,
                             &mut shard_buf,
-                        )
-                        .map_err(|e| {
-                            AcquireError::BackendError(InfraError::corruption(
+                        ) {
+                            this.best_effort_revoke_lease(new_lease_id).await;
+                            return Err(AcquireError::BackendError(InfraError::corruption(
                                 "acquire.encode_shard",
                                 e,
-                            ))
-                        })?;
+                            )));
+                        }
                         encode_owner_value_into(worker, new_fence, &mut owner_buf);
                         let srk = this
                             .keyspace
@@ -1564,11 +1568,14 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         let key = lease.shard_key();
         let payload_hash = hash_split_replace_payload(&plan);
         let plan_children_len = plan.children().len();
+        let cap = self.config.max_children_per_op();
+        let mut child_puts: Vec<TxnOp> = Vec::with_capacity(cap);
+        let mut child_index_ops: Vec<TxnOp> = Vec::with_capacity(cap);
+        let mut child_absent_compares: Vec<Compare> = Vec::with_capacity(cap);
         for attempt_num in 0..self.config.optimistic_txn_retries() {
-            let cap = self.config.max_children_per_op();
-            let mut child_puts: Vec<TxnOp> = Vec::with_capacity(cap);
-            let mut child_index_ops: Vec<TxnOp> = Vec::with_capacity(cap);
-            let mut child_absent_compares: Vec<Compare> = Vec::with_capacity(cap);
+            child_puts.clear();
+            child_index_ops.clear();
+            child_absent_compares.clear();
             let persisted = match self.load_shard_record(tenant, key).await {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(SplitReplaceError::ShardNotFound { shard: key }),

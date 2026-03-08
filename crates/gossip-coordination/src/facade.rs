@@ -248,6 +248,9 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 56);
 ///   or all candidates lost to races).
 /// - [`ClaimError::RunNotFound`] — the run does not exist.
 /// - [`ClaimError::TenantMismatch`] — tenant isolation violation.
+/// - [`ClaimError::BackendError`] — the coordination backend
+///   encountered an infrastructure-level error. See [`InfraError`]
+///   for transient vs. corruption classification.
 pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     backend: &mut B,
     now: LogicalTime,
@@ -426,6 +429,8 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
     ///   not elapsed. Only returned by backends with per-worker rate
     ///   limiting (e.g., [`InMemoryCoordinator`] with a non-zero
     ///   cooldown interval).
+    /// - [`ClaimError::BackendError`] -- the coordination backend
+    ///   encountered an infrastructure error (transient or corruption).
     ///
     /// [`InMemoryCoordinator`]: crate::in_memory::InMemoryCoordinator
     fn claim_next_available<'a>(

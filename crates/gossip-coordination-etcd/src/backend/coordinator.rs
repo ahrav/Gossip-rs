@@ -286,7 +286,9 @@ impl EtcdCoordinator {
     }
 
     /// Load a single run record by exact key. Returns `None` if the key
-    /// does not exist in etcd.
+    /// does not exist in etcd. Cross-validates that the decoded record's
+    /// identity fields match the key-path parameters to detect data
+    /// corruption at the data-access layer.
     pub(super) fn load_run_record(
         &self,
         tenant: TenantId,
@@ -304,6 +306,25 @@ impl EtcdCoordinator {
                 source,
             })?;
 
+        if record.tenant != tenant {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "RunRecord",
+                    detail: "run record tenant disagrees with key-path tenant",
+                },
+            });
+        }
+        if record.run != run {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "RunRecord",
+                    detail: "run record run id disagrees with key-path run id",
+                },
+            });
+        }
+
         Ok(Some(PersistedRun {
             record,
             mod_revision: kv.mod_revision(),
@@ -317,13 +338,16 @@ impl EtcdCoordinator {
     /// `/owner`, the prefix scan returns exactly the record KV and
     /// (optionally) the owner KV — no false matches against other shard
     /// IDs. Cross-validates the owner binding against the shard record's
-    /// lease fields. Returns `None` if the shard record key does not exist.
+    /// lease fields and the decoded record's identity fields against the
+    /// key-path parameters to detect data corruption. Returns `None` if
+    /// the shard record key does not exist.
     ///
     /// # Errors
     ///
     /// Returns [`EtcdCoordinatorError::Codec`] with an invariant violation
     /// if the owner key exists but disagrees with the shard record's
-    /// lease holder or fence epoch.
+    /// lease holder or fence epoch, or if the decoded record's identity
+    /// fields disagree with the key-path parameters.
     pub(super) fn load_shard_record(
         &self,
         tenant: TenantId,
@@ -362,6 +386,35 @@ impl EtcdCoordinator {
                 source,
             }
         })?;
+
+        if record.tenant != tenant {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record tenant disagrees with key-path tenant",
+                },
+            });
+        }
+        if record.run != key.run() {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record run id disagrees with key-path run id",
+                },
+            });
+        }
+        if record.shard != key.shard() {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record shard id disagrees with key-path shard id",
+                },
+            });
+        }
+
         let mod_revision = kv.mod_revision();
 
         let owner = match owner_kv {
@@ -979,20 +1032,10 @@ impl fmt::Debug for EtcdCoordinator {
 /// Use [`EtcdCoordinator`] for a sync wrapper that owns a single-threaded
 /// runtime and delegates via `block_on`.
 ///
-/// ## Scratch allocation
-///
-/// `claim_candidates_scratch` is a reusable buffer for
-/// [`default_claim_next_available`](gossip_coordination::default_claim_next_available). It is `mem::take`-ed at the start of
-/// each claim and restored afterward, avoiding per-claim heap allocation
-/// in the common case where the buffer capacity is already sufficient.
 pub struct AsyncEtcdCoordinator {
     pub(super) config: EtcdCoordinatorConfig,
     pub(super) keyspace: EtcdKeyspace,
     pub(super) client: etcd_client::Client,
-    /// Reusable buffer for shard-claim candidate collection, avoiding
-    /// per-claim allocation. Used by the sync wrapper's `ShardClaiming` impl.
-    #[allow(dead_code)]
-    pub(super) claim_candidates_scratch: Vec<ShardId>,
     #[cfg(any(test, feature = "test-support"))]
     pub(super) test_faults: EtcdTestFaultState,
 }
@@ -1046,7 +1089,6 @@ impl AsyncEtcdCoordinator {
             config,
             keyspace,
             client,
-            claim_candidates_scratch: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             test_faults: EtcdTestFaultState::default(),
         })
@@ -1205,6 +1247,26 @@ impl AsyncEtcdCoordinator {
                 operation: EtcdOperation::Get,
                 source,
             })?;
+
+        if record.tenant != tenant {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "RunRecord",
+                    detail: "run record tenant disagrees with key-path tenant",
+                },
+            });
+        }
+        if record.run != run {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "RunRecord",
+                    detail: "run record run id disagrees with key-path run id",
+                },
+            });
+        }
+
         Ok(Some(PersistedRun {
             record,
             mod_revision: kv.mod_revision(),
@@ -1246,6 +1308,35 @@ impl AsyncEtcdCoordinator {
                 source,
             }
         })?;
+
+        if record.tenant != tenant {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record tenant disagrees with key-path tenant",
+                },
+            });
+        }
+        if record.run != key.run() {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record run id disagrees with key-path run id",
+                },
+            });
+        }
+        if record.shard != key.shard() {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record shard id disagrees with key-path shard id",
+                },
+            });
+        }
+
         let mod_revision = kv.mod_revision();
         let owner = match owner_kv {
             None => None,
