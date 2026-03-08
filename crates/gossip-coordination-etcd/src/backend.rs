@@ -2109,7 +2109,11 @@ impl CoordinationBackend for EtcdCoordinator {
                     ));
                 }
                 Ok(None) => {}
-                Err(err) => self.fatal_storage_error("split_residual.preflight_child_absence", err),
+                Err(err) => {
+                    return Err(SplitResidualError::BackendError {
+                        message: format!("split_residual.preflight_child_absence: {err}"),
+                    });
+                }
             }
 
             let mut residual_slab =
@@ -2189,9 +2193,14 @@ impl CoordinationBackend for EtcdCoordinator {
             ];
 
             let txn = Txn::new().when(compares).and_then(ops);
-            let response = self
-                .etcd_txn(txn)
-                .unwrap_or_else(|err| self.fatal_storage_error("split_residual.txn", err));
+            let response = match self.etcd_txn(txn) {
+                Ok(r) => r,
+                Err(err) => {
+                    return Err(SplitResidualError::BackendError {
+                        message: format!("split_residual.txn: {err}"),
+                    });
+                }
+            };
             if response.succeeded() {
                 return Ok(IdempotentOutcome::Executed(SplitResidualResult {
                     residual: residual_id,
