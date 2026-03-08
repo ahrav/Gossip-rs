@@ -53,7 +53,7 @@ fn collect_all(
     all
 }
 
-/// Collect all items from a connector via the trait entrypoint.
+/// Collect all items from a connector via the shard-based entrypoint.
 fn collect_all_via_shard(
     connector: &mut FilesystemConnector,
     shard: &ShardSpec,
@@ -1906,7 +1906,7 @@ fn consecutive_read_ranges_on_same_file_succeed() {
 }
 
 // ---------------------------------------------------------------
-// ShardSpec trait-method coverage
+// ShardSpec-based method coverage
 // ---------------------------------------------------------------
 
 #[test]
@@ -2010,7 +2010,7 @@ fn enumerate_page_via_shard_spec_one_sided_unbounded_resumes() {
 }
 
 #[test]
-fn enumerate_page_trait_and_range_paths_match_across_pages() {
+fn enumerate_page_shard_and_range_paths_match_across_pages() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
@@ -2018,49 +2018,49 @@ fn enumerate_page_trait_and_range_paths_match_across_pages() {
         ("d.txt", b"4"),
         ("e.txt", b"5"),
     ]);
-    let mut via_trait = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let mut via_shard = FilesystemConnector::new(dir.path()).with_tokens(true);
     let mut via_range = FilesystemConnector::new(dir.path()).with_tokens(true);
     let shard = ShardSpec::try_with_range(b"b.txt", b"z.txt").unwrap();
     let start = make_key(b"b.txt");
     let end = make_key(b"z.txt");
     let budgets = small_page_budgets(2);
 
-    let mut cursor_trait = Cursor::initial();
+    let mut cursor_shard = Cursor::initial();
     let mut cursor_range = Cursor::initial();
     loop {
-        let trait_page = via_trait
-            .enumerate_page(&shard, &cursor_trait, budgets)
-            .expect("trait enumerate_page");
+        let shard_page = via_shard
+            .enumerate_page(&shard, &cursor_shard, budgets)
+            .expect("shard enumerate_page");
         let range_page = via_range
             .enumerate_page_range(&start, &end, &cursor_range, budgets)
             .expect("range enumerate_page");
 
-        assert_eq!(trait_page.items().len(), range_page.items().len());
-        for (left, right) in trait_page.items().iter().zip(range_page.items()) {
+        assert_eq!(shard_page.items().len(), range_page.items().len());
+        for (left, right) in shard_page.items().iter().zip(range_page.items()) {
             assert_eq!(left.item_key(), right.item_key());
             assert_eq!(left.item_ref(), right.item_ref());
             assert_eq!(left.stable_item_id(), right.stable_item_id());
             assert_eq!(left.version(), right.version());
         }
         assert_eq!(
-            trait_page.next_cursor().last_key(),
+            shard_page.next_cursor().last_key(),
             range_page.next_cursor().last_key()
         );
         assert_eq!(
-            trait_page.next_cursor().token().map(TokenBytes::as_bytes),
+            shard_page.next_cursor().token().map(TokenBytes::as_bytes),
             range_page.next_cursor().token().map(TokenBytes::as_bytes)
         );
 
-        if trait_page.items().is_empty() {
+        if shard_page.items().is_empty() {
             break;
         }
-        cursor_trait = trait_page.next_cursor().clone();
+        cursor_shard = shard_page.next_cursor().clone();
         cursor_range = range_page.next_cursor().clone();
     }
 }
 
 #[test]
-fn trait_methods_reject_oversized_non_empty_bounds() {
+fn shard_methods_reject_oversized_non_empty_bounds() {
     let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
     let mut c = FilesystemConnector::new(dir.path());
 
@@ -2100,7 +2100,7 @@ fn trait_methods_reject_oversized_non_empty_bounds() {
 }
 
 #[test]
-fn trait_methods_accept_exact_max_size_bound() {
+fn shard_methods_accept_exact_max_size_bound() {
     let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
     let mut c = FilesystemConnector::new(dir.path());
 

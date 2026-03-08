@@ -989,6 +989,48 @@ fn trait_methods_accept_exact_max_size_bound() {
 // ---------------------------------------------------------------
 
 #[test]
+fn split_hints_cap_consistent_with_choose_split_point() {
+    // When caps().split_hints is true, choose_split_point must produce a
+    // non-None hint when given enough data to work with.
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+
+    // Verify the capability flag is true.
+    assert!(
+        c.caps().split_hints,
+        "InMemory connector should advertise split_hints"
+    );
+
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+
+    // Feed the estimator by walking a page first.
+    let budgets = default_budgets();
+    let cursor = Cursor::initial();
+    let _page = c
+        .enumerate_page_range(&start, &end, &cursor, budgets)
+        .unwrap();
+
+    // Now choose_split_point should produce a real hint, not Ok(None).
+    let split = c
+        .choose_split_point_range(&start, &end, &Cursor::initial())
+        .unwrap();
+    assert!(
+        split.is_some(),
+        "split_hints=true connector should produce a split hint after enumeration"
+    );
+}
+
+// ---------------------------------------------------------------
+// Degenerate split point
+// ---------------------------------------------------------------
+
+#[test]
 fn split_point_degenerate_first_item_heavy() {
     // First item holds >50% weight. Byte-weighted median exits on first
     // item (split_idx == start_idx), triggering the count-based fallback.

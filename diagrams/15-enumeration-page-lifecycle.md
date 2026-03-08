@@ -116,7 +116,7 @@ sequenceDiagram
   with optional token-based O(1) index resume. Token agreement is validated by checking
   that `items[token_idx - 1].key == cursor.last_key`; disagreement falls back to
   key-only resume.
-- **Budget enforcement** is connector-side advisory. The trait contract documents that
+- **Budget enforcement** is connector-side advisory. The method contract documents that
   callers must not assume compliance; the runtime orchestration layer is responsible for
   enforcement (truncation, backpressure, or termination).
 
@@ -392,7 +392,8 @@ truncate excess items, apply backpressure, or terminate a misbehaving connector.
 
 | Symbol | File | Role |
 |--------|------|------|
-| `ConnectorCapabilities` | `crates/gossip-contracts/src/connector/api.rs` | Capability flags; `enumerate_page`, `caps`, `choose_split_point` are inherent methods on each connector |
+| `ConnectorCapabilities` | `crates/gossip-contracts/src/connector/api.rs` | Feature flags: `seek_by_key`, `token_resume`, `range_read`, `split_hints` |
+| `FilesystemConnector::{caps, enumerate_page, choose_split_point}` | `crates/gossip-connectors/src/filesystem.rs` | Inherent methods: capability declaration, page enumeration, split-point selection |
 | `EnumerationPage` | `crates/gossip-contracts/src/connector/types.rs` | Page output: `items: Vec<ScanItem>`, `next_cursor: Cursor` |
 | `ScanItem` | `crates/gossip-contracts/src/connector/types.rs` | Per-item metadata: `ItemKey`, `ItemRef`, `StableItemId`, `VersionId`, optional hints |
 | `Cursor` | `crates/gossip-contracts/src/connector/types.rs` | Paging state: `last_key: Option<ItemKey>`, `token: Option<TokenBytes>` |
@@ -418,4 +419,3 @@ truncate excess items, apply backpressure, or terminate a misbehaving connector.
 | `page_slab_capacity` | `crates/gossip-connectors/src/common.rs` | Pre-size slab using ByteSlab size-class rounding |
 | `borrowed_shard_bound` | `crates/gossip-connectors/src/common.rs` | Validate shard bound: empty = unbounded, else ≤ `MAX_ITEM_KEY_SIZE` |
 | `FilesystemConnector` | `crates/gossip-connectors/src/filesystem.rs` | Concrete connector: streaming sorted DFS walk, `O_NOFOLLOW` read confinement |
-| `ConnectorCapabilities` | `crates/gossip-contracts/src/connector/api.rs` | Feature flags: `seek_by_key`, `token_resume`, `range_read`, `split_hints` |

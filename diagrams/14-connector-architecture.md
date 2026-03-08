@@ -49,7 +49,7 @@ graph TD
 
 - Enumeration (metadata traversal) and reading (payload I/O) are separate method groups because enumeration is metadata-bound while reading is bandwidth-bound. Orchestration applies independent retry and circuit-breaker policies per operation.
 - `choose_split_point` is provided by connectors that advertise `split_hints: true`. Only connectors with natural partition boundaries (tree objects, directory structure) implement it.
-- `read_range` returns `Err(ReadError::unsupported("range_read"))` for connectors without native random-access support.
+- Connectors without native random-access support must explicitly return `Err(ReadError::unsupported("range_read"))` from `read_range`. All three current connectors implement full range-read support.
 - `token_resume` is instance-configurable via `with_tokens(bool)` on each connector rather than hardcoded, because some test scenarios disable tokens to exercise key-only resume.
 
 See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for failure isolation per connector, [13-shard-algebra-types.md](./13-shard-algebra-types.md) for shard key encoding consumed by `enumerate_page`.
