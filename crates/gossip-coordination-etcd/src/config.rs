@@ -13,9 +13,12 @@
 //! | Connect timeout | 5 s | Fast failure for unreachable endpoints |
 //! | Owner lease TTL | 60 s | Wall-clock etcd lease for shard owner keys |
 //! | Optimistic txn retries | 8 | Bounds CAS retry loops on fenced mutations |
+//! | Max children per split op | 8 | Keeps split transactions comfortably below common etcd txn-op caps |
 
 use std::fmt;
 use std::time::Duration;
+
+use gossip_contracts::coordination::limits::MAX_SPLIT_CHILDREN;
 
 /// TCP connect timeout for the initial etcd client connection.
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,6 +32,10 @@ pub(crate) const DEFAULT_OWNER_LEASE_TTL_SECS: i64 = 60;
 /// a fenced etcd transaction before giving up and returning an error.
 pub(crate) const DEFAULT_OPTIMISTIC_TXN_RETRIES: usize = 8;
 
+/// Default cap on the number of children published in a single split
+/// transaction.
+pub(crate) const DEFAULT_MAX_CHILDREN_PER_OP: usize = 8;
+
 /// Validated configuration for the etcd coordination backend.
 ///
 /// A complete config carries both connection settings and persistence-tuning
@@ -41,12 +48,17 @@ pub(crate) const DEFAULT_OPTIMISTIC_TXN_RETRIES: usize = 8;
 ///   owner keys.
 /// - **Optimistic txn retries** bounds compare-and-retry loops around fenced
 ///   mutations.
+/// - **Max children per split op** bounds the fanout of one atomic
+///   `split_replace` publication. Raising it also raises the transaction
+///   write count (`3 + 2 * children`), so operators must keep it within
+///   their cluster's txn-op budget.
 #[derive(Clone)]
 pub struct EtcdCoordinatorConfig {
     endpoints: Vec<String>,
     namespace_prefix: String,
     owner_lease_ttl_secs: i64,
     optimistic_txn_retries: usize,
+    max_children_per_op: usize,
     /// Optional username/password pair for etcd authentication.
     auth: Option<(String, String)>,
     /// Optional TLS configuration for encrypted etcd connections.
@@ -54,8 +66,16 @@ pub struct EtcdCoordinatorConfig {
     tls: Option<etcd_client::TlsOptions>,
 }
 
+/// Custom `Debug` implementation that redacts sensitive fields.
+///
+/// - Endpoint URIs with embedded `user:password@host` credentials are
+///   replaced with `***@host` to prevent credential leakage in logs.
+/// - The `auth` password field is printed as `[REDACTED]`.
+/// - TLS configuration is shown as `[configured]` when present.
 impl fmt::Debug for EtcdCoordinatorConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Replace `user:password@host` with `***@host`, preserving the
+        // scheme prefix and hostname for diagnostic usefulness.
         fn redact_endpoint(endpoint: &str) -> String {
             if let Some(scheme_end) = endpoint.find("://") {
                 let authority_start = scheme_end + 3;
@@ -73,7 +93,8 @@ impl fmt::Debug for EtcdCoordinatorConfig {
         s.field("endpoints", &redacted)
             .field("namespace_prefix", &self.namespace_prefix)
             .field("owner_lease_ttl_secs", &self.owner_lease_ttl_secs)
-            .field("optimistic_txn_retries", &self.optimistic_txn_retries);
+            .field("optimistic_txn_retries", &self.optimistic_txn_retries)
+            .field("max_children_per_op", &self.max_children_per_op);
         if let Some((user, _)) = &self.auth {
             s.field("auth_user", user);
             s.field("auth_password", &"[REDACTED]");
@@ -90,6 +111,7 @@ impl EtcdCoordinatorConfig {
     /// Defaults:
     /// - `owner_lease_ttl_secs = 60`
     /// - `optimistic_txn_retries = 8`
+    /// - `max_children_per_op = 8`
     pub fn new<I, S>(
         endpoints: I,
         namespace_prefix: impl Into<String>,
@@ -103,16 +125,22 @@ impl EtcdCoordinatorConfig {
             namespace_prefix,
             DEFAULT_OWNER_LEASE_TTL_SECS,
             DEFAULT_OPTIMISTIC_TXN_RETRIES,
+            DEFAULT_MAX_CHILDREN_PER_OP,
         )
     }
 
     /// Create a validated configuration with explicit persistence-tuning
     /// values.
+    ///
+    /// Use this when the defaults are unsuitable — e.g., shorter TTLs for
+    /// integration tests, higher retry budgets for high-contention
+    /// environments, or wider fanout for large split operations.
     pub fn new_with_tuning<I, S>(
         endpoints: I,
         namespace_prefix: impl Into<String>,
         owner_lease_ttl_secs: i64,
         optimistic_txn_retries: usize,
+        max_children_per_op: usize,
     ) -> Result<Self, EtcdCoordinatorConfigError>
     where
         I: IntoIterator<Item = S>,
@@ -130,6 +158,7 @@ impl EtcdCoordinatorConfig {
             namespace_prefix,
             owner_lease_ttl_secs,
             optimistic_txn_retries,
+            max_children_per_op,
             auth: None,
             #[cfg(feature = "tls")]
             tls: None,
@@ -149,6 +178,10 @@ impl EtcdCoordinatorConfig {
 
     /// Parse a comma-separated endpoint string with default tuning knobs.
     ///
+    /// Intended for consumption of environment variables and config file
+    /// values where multiple endpoints are expressed as a single string
+    /// (e.g. `ETCD_ENDPOINTS="http://a:2379,http://b:2379"`).
+    ///
     /// Empty segments (e.g., trailing commas) are silently filtered out.
     /// Each remaining segment is trimmed of surrounding whitespace.
     pub fn from_endpoints_csv(
@@ -160,6 +193,7 @@ impl EtcdCoordinatorConfig {
             namespace_prefix,
             DEFAULT_OWNER_LEASE_TTL_SECS,
             DEFAULT_OPTIMISTIC_TXN_RETRIES,
+            DEFAULT_MAX_CHILDREN_PER_OP,
         )
     }
 
@@ -170,6 +204,7 @@ impl EtcdCoordinatorConfig {
         namespace_prefix: impl Into<String>,
         owner_lease_ttl_secs: i64,
         optimistic_txn_retries: usize,
+        max_children_per_op: usize,
     ) -> Result<Self, EtcdCoordinatorConfigError> {
         let endpoints = endpoints_csv
             .split(',')
@@ -182,6 +217,7 @@ impl EtcdCoordinatorConfig {
             namespace_prefix,
             owner_lease_ttl_secs,
             optimistic_txn_retries,
+            max_children_per_op,
         )
     }
 
@@ -195,6 +231,7 @@ impl EtcdCoordinatorConfig {
     ///   (unless it is exactly `"/"`), and must not contain `//`.
     /// - Owner lease TTL must be positive.
     /// - Optimistic txn retries must be at least 1.
+    /// - Max children per split op must be between 1 and `MAX_SPLIT_CHILDREN`.
     pub fn validate(&self) -> Result<(), EtcdCoordinatorConfigError> {
         if self.endpoints.is_empty() {
             return Err(EtcdCoordinatorConfigError::NoEndpoints);
@@ -227,6 +264,17 @@ impl EtcdCoordinatorConfig {
         if self.optimistic_txn_retries == 0 {
             return Err(EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries);
         }
+        if self.max_children_per_op == 0 {
+            return Err(EtcdCoordinatorConfigError::ZeroMaxChildrenPerOp);
+        }
+        if self.max_children_per_op > MAX_SPLIT_CHILDREN {
+            return Err(
+                EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsGlobalLimit {
+                    requested: self.max_children_per_op,
+                    global_max: MAX_SPLIT_CHILDREN,
+                },
+            );
+        }
 
         Ok(())
     }
@@ -254,6 +302,17 @@ impl EtcdCoordinatorConfig {
     #[must_use]
     pub fn optimistic_txn_retries(&self) -> usize {
         self.optimistic_txn_retries
+    }
+
+    /// Maximum children the backend will publish in one atomic split
+    /// operation.
+    ///
+    /// Higher values increase the `split_replace` transaction write count
+    /// as `3 + 2 * children`, so callers must keep this within the etcd
+    /// cluster's configured txn-op budget.
+    #[must_use]
+    pub fn max_children_per_op(&self) -> usize {
+        self.max_children_per_op
     }
 
     /// Optional authentication credentials (username, password).
@@ -319,6 +378,10 @@ pub enum EtcdCoordinatorConfigError {
     NonPositiveOwnerLeaseTtl,
     /// `optimistic_txn_retries` must be at least 1.
     ZeroOptimisticTxnRetries,
+    /// `max_children_per_op` must be at least 1.
+    ZeroMaxChildrenPerOp,
+    /// `max_children_per_op` cannot exceed the global split limit.
+    MaxChildrenPerOpExceedsGlobalLimit { requested: usize, global_max: usize },
 }
 
 impl fmt::Display for EtcdCoordinatorConfigError {
@@ -346,6 +409,14 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             }
             Self::NonPositiveOwnerLeaseTtl => f.write_str("owner_lease_ttl_secs must be > 0"),
             Self::ZeroOptimisticTxnRetries => f.write_str("optimistic_txn_retries must be > 0"),
+            Self::ZeroMaxChildrenPerOp => f.write_str("max_children_per_op must be > 0"),
+            Self::MaxChildrenPerOpExceedsGlobalLimit {
+                requested,
+                global_max,
+            } => write!(
+                f,
+                "max_children_per_op ({requested}) exceeds global MAX_SPLIT_CHILDREN ({global_max})",
+            ),
         }
     }
 }

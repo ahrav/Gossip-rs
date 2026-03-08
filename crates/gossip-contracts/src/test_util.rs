@@ -140,6 +140,15 @@ impl TestSlab {
     pub fn new() -> Self {
         Self(gossip_stdx::ByteSlab::with_capacity(64 * 1024))
     }
+
+    /// Wrap an existing slab in the test drop guard.
+    ///
+    /// This keeps test-only snapshot helpers from tripping the slab leak
+    /// detector when callers inspect pooled records without manually
+    /// deallocating every field first.
+    pub fn from_slab(slab: gossip_stdx::ByteSlab) -> Self {
+        Self(slab)
+    }
 }
 
 impl Default for TestSlab {

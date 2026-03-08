@@ -1,9 +1,42 @@
 //! Tests for the etcd coordination backend.
 //!
-//! These cover three layers:
-//! - config validation (pure, deterministic)
-//! - keyspace path construction
-//! - etcd integration (requires local etcd, `#[ignore]`)
+//! ## Test layers
+//!
+//! Tests are organized in three tiers of increasing infrastructure
+//! requirements:
+//!
+//! 1. **Config validation** — pure, deterministic unit tests that verify
+//!    `EtcdCoordinatorConfig` rejects invalid parameters and accepts valid
+//!    ones. No network, no etcd. Includes credential redaction tests for
+//!    the custom `Debug` impl.
+//!
+//! 2. **Keyspace path construction** — deterministic tests that verify
+//!    `EtcdKeyspace` produces correct, collision-free etcd key paths.
+//!    Includes proptest-based structural invariant checks (prefix
+//!    containment, scan isolation, fixed-width hex encoding).
+//!
+//! 3. **etcd integration** — round-trip tests that connect to a local
+//!    etcd cluster. These are marked `#[ignore]` and require either a
+//!    running etcd at `http://127.0.0.1:2379` or the `ETCD_ENDPOINTS`
+//!    environment variable pointing to a reachable cluster. They cover
+//!    the full acquire/checkpoint/renew/split lifecycle including
+//!    idempotent replay, lease expiry, and concurrent acquire contention.
+//!
+//! ## Running integration tests
+//!
+//! ```bash
+//! # Start a local etcd (e.g., via Docker):
+//! docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.21 \
+//!   /usr/local/bin/etcd --advertise-client-urls http://0.0.0.0:2379 \
+//!   --listen-client-urls http://0.0.0.0:2379
+//!
+//! # Run all etcd integration tests:
+//! cargo test -p gossip-coordination-etcd -- --ignored
+//!
+//! # Or point to a custom cluster:
+//! ETCD_ENDPOINTS="http://10.0.0.1:2379,http://10.0.0.2:2379" \
+//!   cargo test -p gossip-coordination-etcd -- --ignored
+//! ```
 
 use std::env;
 
@@ -11,14 +44,21 @@ use crate::{
     EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
     EtcdKeyspace, EtcdKeyspaceError, EtcdOperation,
 };
-use gossip_contracts::coordination::{CursorSemantics, CursorUpdate, ShardSpecRef};
+use gossip_contracts::coordination::{
+    CursorSemantics, CursorUpdate, ShardSpec, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
+    SplitResidualPlan,
+};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
     AcquireError, AcquireScratch, CheckpointError, CoordinationBackend, IdempotentOutcome,
-    InitialShardInput, RegisterShardsError, RunConfig, RunManagement,
+    InitialShardInput, RegisterShardsError, RunConfig, RunManagement, ShardStatus,
 };
 use proptest::prelude::*;
 use rstest::rstest;
+
+// ---------------------------------------------------------------------------
+// Config validation (pure, no etcd required)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn config_rejects_empty_endpoint_list() {
@@ -74,6 +114,7 @@ fn localhost_config_uses_expected_defaults() {
     assert_eq!(config.namespace_prefix(), "/gossip/v1");
     assert_eq!(config.owner_lease_ttl_secs(), 60);
     assert_eq!(config.optimistic_txn_retries(), 8);
+    assert_eq!(config.max_children_per_op(), 8);
 }
 
 #[test]
@@ -120,16 +161,17 @@ fn config_accepts_root_namespace_slash() {
 #[test]
 fn config_accepts_explicit_tuning_values() {
     let config =
-        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 90, 16)
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 90, 16, 12)
             .expect("explicit tuning should pass validation");
     assert_eq!(config.owner_lease_ttl_secs(), 90);
     assert_eq!(config.optimistic_txn_retries(), 16);
+    assert_eq!(config.max_children_per_op(), 12);
 }
 
 #[test]
 fn config_rejects_non_positive_owner_lease_ttl() {
     let error =
-        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 0, 8)
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 0, 8, 8)
             .expect_err("non-positive owner lease ttl must fail validation");
     assert!(matches!(
         error,
@@ -140,11 +182,36 @@ fn config_rejects_non_positive_owner_lease_ttl() {
 #[test]
 fn config_rejects_zero_optimistic_txn_retries() {
     let error =
-        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 0)
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 0, 8)
             .expect_err("zero retry budget must fail validation");
     assert!(matches!(
         error,
         EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries
+    ));
+}
+
+#[test]
+fn config_rejects_zero_max_children_per_op() {
+    let error =
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 0)
+            .expect_err("zero max_children_per_op must fail validation");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::ZeroMaxChildrenPerOp
+    ));
+}
+
+#[test]
+fn config_rejects_max_children_per_op_above_global_limit() {
+    let error =
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 257)
+            .expect_err("max_children_per_op above MAX_SPLIT_CHILDREN must fail validation");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsGlobalLimit {
+            requested: 257,
+            global_max: 256,
+        }
     ));
 }
 
@@ -326,6 +393,10 @@ fn config_error_converts_to_coordinator_error_via_from() {
     let coord_err: EtcdCoordinatorError = config_err.into();
     assert!(matches!(coord_err, EtcdCoordinatorError::Config(_)));
 }
+
+// ---------------------------------------------------------------------------
+// Keyspace path construction (pure, no etcd required)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn keyspace_builds_expected_paths() {
@@ -551,7 +622,7 @@ fn run_records_scan_prefix_is_scan_safe() {
 }
 
 // ---------------------------------------------------------------------------
-// register_shards txn size guard
+// etcd integration tests (require running etcd, #[ignore])
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -698,6 +769,202 @@ fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
     );
 }
 
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn split_replace_round_trip_against_local_etcd() {
+    let mut backend = local_backend("/gossip/tests/split-replace");
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let register = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+    assert!(register.is_executed());
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let acquire = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed");
+
+    let left = ShardSpec::with_range(b"a", b"m");
+    let right = ShardSpec::with_range(b"m", b"z");
+    let plan = SplitReplacePlan::try_new(vec![
+        SplitReplaceChild::new(left.as_ref(), CursorUpdate::initial()),
+        SplitReplaceChild::new(right.as_ref(), CursorUpdate::initial()),
+    ])
+    .expect("split plan should be valid");
+
+    let op = OpId::from_raw(200);
+    let first = backend
+        .split_replace(now(4), test_tenant(), &acquire.lease, plan.clone(), op)
+        .expect("split_replace should succeed");
+    assert!(first.is_executed());
+    assert_eq!(first.as_ref().children.len(), 2);
+
+    let (parent, parent_slab) = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("parent lookup should succeed")
+        .expect("parent must still exist");
+    assert_eq!(parent.status, ShardStatus::Split);
+    assert!(parent.lease.is_none());
+    assert_eq!(parent.spawned.len(), 2);
+    let spawned: Vec<_> = parent.spawned.iter(&parent_slab).collect();
+    assert_eq!(spawned, first.as_ref().children.as_slice());
+
+    assert!(
+        backend
+            .test_load_owner_binding(test_tenant(), key)
+            .expect("owner lookup should succeed")
+            .is_none(),
+        "split parent must not retain an owner key"
+    );
+
+    let mut candidates = Vec::new();
+    backend
+        .collect_claim_candidates_into(now(5), test_tenant(), test_run(), &mut candidates)
+        .expect("claim candidate scan should succeed");
+    assert_eq!(candidates, first.as_ref().children.as_slice());
+
+    for &child_id in &first.as_ref().children {
+        let child_key = ShardKey::new(test_run(), child_id);
+        let (child, _slab) = backend
+            .test_load_shard_snapshot(test_tenant(), child_key)
+            .expect("child lookup should succeed")
+            .expect("child must exist");
+        assert_eq!(child.status, ShardStatus::Active);
+        assert_eq!(child.parent, Some(test_shard()));
+    }
+
+    let replay = backend
+        .split_replace(now(6), test_tenant(), &acquire.lease, plan, op)
+        .expect("split_replace replay should succeed");
+    assert!(replay.is_replay());
+    assert_eq!(replay.as_ref().children, first.as_ref().children);
+}
+
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn split_residual_round_trip_against_local_etcd() {
+    let mut backend = local_backend("/gossip/tests/split-residual");
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let register = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+    assert!(register.is_executed());
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let acquire = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed");
+
+    let checkpoint = backend
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &acquire.lease,
+            &CursorUpdate::new(b"f"),
+            OpId::from_raw(100),
+        )
+        .expect("checkpoint should succeed");
+    assert!(checkpoint.is_executed());
+
+    let parent_new = ShardSpec::with_range(b"a", b"m");
+    let residual = ShardSpec::with_range(b"m", b"z");
+    let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref())
+        .expect("residual split plan should be valid");
+
+    let op = OpId::from_raw(201);
+    let first = backend
+        .split_residual(now(5), test_tenant(), &acquire.lease, plan.clone(), op)
+        .expect("split_residual should succeed");
+    assert!(first.is_executed());
+
+    let (parent, parent_slab) = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("parent lookup should succeed")
+        .expect("parent must still exist");
+    assert_eq!(parent.status, ShardStatus::Active);
+    assert_eq!(parent.spec.key_range_start(&parent_slab), b"a");
+    assert_eq!(parent.spec.key_range_end(&parent_slab), b"m");
+    assert_eq!(parent.cursor.last_key(&parent_slab), Some(b"f".as_slice()));
+    assert_eq!(parent.spawned.len(), 1);
+    assert_eq!(
+        parent.spawned.iter(&parent_slab).next(),
+        Some(first.as_ref().residual)
+    );
+
+    let mut candidates = Vec::new();
+    backend
+        .collect_claim_candidates_into(now(6), test_tenant(), test_run(), &mut candidates)
+        .expect("claim candidate scan should succeed");
+    assert_eq!(candidates, vec![first.as_ref().residual]);
+
+    let residual_key = ShardKey::new(test_run(), first.as_ref().residual);
+    let (residual_record, residual_slab) = backend
+        .test_load_shard_snapshot(test_tenant(), residual_key)
+        .expect("residual lookup should succeed")
+        .expect("residual must exist");
+    assert_eq!(residual_record.status, ShardStatus::Active);
+    assert_eq!(residual_record.parent, Some(test_shard()));
+    assert_eq!(residual_record.spec.key_range_start(&residual_slab), b"m");
+    assert_eq!(residual_record.spec.key_range_end(&residual_slab), b"z");
+    assert_eq!(residual_record.cursor.last_key(&residual_slab), None);
+
+    let replay = backend
+        .split_residual(now(7), test_tenant(), &acquire.lease, plan, op)
+        .expect("split_residual replay should succeed");
+    assert!(replay.is_replay());
+    assert_eq!(replay.as_ref().residual, first.as_ref().residual);
+}
+
+// ---------------------------------------------------------------------------
+// Test fixture helpers
+// ---------------------------------------------------------------------------
+//
+// Deterministic identity constructors and backend builders shared by all
+// integration tests. Each integration test uses a unique namespace prefix
+// to avoid cross-test interference when running against the same etcd
+// cluster.
+
+/// Read etcd endpoints from `ETCD_ENDPOINTS` or fall back to localhost.
 fn test_endpoints() -> String {
     env::var("ETCD_ENDPOINTS")
         .ok()
@@ -712,6 +979,7 @@ fn test_endpoints() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:2379".to_owned())
 }
 
+/// Connect to etcd with default tuning and the given namespace prefix.
 fn local_backend(namespace: &str) -> EtcdCoordinator {
     let config = EtcdCoordinatorConfig::from_endpoints_csv(&test_endpoints(), namespace)
         .expect("test endpoint configuration should be valid");
@@ -719,11 +987,13 @@ fn local_backend(namespace: &str) -> EtcdCoordinator {
     EtcdCoordinator::connect(config).expect("local etcd should be reachable")
 }
 
+/// Connect to etcd with a custom owner-lease TTL (for lease-expiry tests).
 fn local_backend_with_ttl(namespace: &str, ttl_secs: i64) -> EtcdCoordinator {
     let config = EtcdCoordinatorConfig::from_endpoints_csv_with_tuning(
         &test_endpoints(),
         namespace,
         ttl_secs,
+        8,
         8,
     )
     .expect("test endpoint configuration should be valid");
@@ -731,22 +1001,27 @@ fn local_backend_with_ttl(namespace: &str, ttl_secs: i64) -> EtcdCoordinator {
     EtcdCoordinator::connect(config).expect("local etcd should be reachable")
 }
 
+/// Stable tenant identity used across all tests.
 fn test_tenant() -> TenantId {
     TenantId::from_bytes([0x11; 32])
 }
 
+/// Stable run identity used across all tests.
 fn test_run() -> RunId {
     RunId::from_raw(0x0102_0304_0506_0708)
 }
 
+/// Stable shard identity used across all tests.
 fn test_shard() -> ShardId {
     ShardId::from_raw(0x0000_0000_0000_0011)
 }
 
+/// Create a worker identity from a raw integer.
 fn test_worker(id: u64) -> WorkerId {
     WorkerId::from_raw(id)
 }
 
+/// Create a logical timestamp from a raw integer.
 fn now(t: u64) -> LogicalTime {
     LogicalTime::from_raw(t)
 }

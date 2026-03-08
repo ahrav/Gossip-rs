@@ -17,12 +17,17 @@ It owns a real etcd client connection, a deterministic keyspace layout
 (`keyspace.rs`), and an explicit binary codec (`codec.rs`) for persisting
 coordination records. It persists `create_run`, `register_shards`,
 `get_run*` queries, `claim_next_available`, and the fenced
-`acquire_and_restore_into` / `renew` / `checkpoint` hot path directly in etcd.
+`acquire_and_restore_into` / `renew` / `checkpoint` / `split_replace` /
+`split_residual` hot path directly in etcd.
 Shard owner bindings live in separate etcd lease-backed keys so storage-layer
 liveness and logical lease deadlines are checked together before accepting
-progress updates. The remaining mutating operations (`complete`, `park_shard`,
-`split_*`, run terminal transitions, `unpark_shard`) fail closed until their
-persisted transaction shapes land.
+progress updates. `split_replace` also enforces a backend-local
+`max_children_per_op` cap so one atomic child publication stays bounded.
+Operators that raise this cap must provision enough etcd txn-op budget for
+the larger `split_replace` write set.
+The remaining mutating operations (`complete`, `park_shard`, run terminal
+transitions, `unpark_shard`) fail closed until their persisted transaction
+shapes land.
 
 The module provides seven core capabilities:
 
@@ -85,8 +90,8 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
-| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, and fenced acquire/renew/checkpoint |
-| `config.rs`       | Endpoint + namespace validation plus owner-lease TTL and optimistic retry tuning             |
+| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, and fenced acquire/renew/checkpoint/split |
+| `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, and bounded split fanout |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
