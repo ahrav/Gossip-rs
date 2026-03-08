@@ -2289,6 +2289,8 @@ impl CoordinationBackend for EtcdCoordinator {
                 ops.append(&mut child_puts);
                 ops.append(&mut child_index_ops);
 
+                this.inject_split_replace_fault_if_armed(tenant, key);
+
                 let txn = Txn::new().when(compares).and_then(ops);
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
@@ -2550,6 +2552,8 @@ impl CoordinationBackend for EtcdCoordinator {
                         None,
                     ),
                 ];
+
+                this.inject_split_residual_fault_if_armed(tenant, key);
 
                 let txn = Txn::new().when(compares).and_then(ops);
                 let response = match this.etcd_txn(txn) {
