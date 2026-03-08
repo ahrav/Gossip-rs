@@ -1,26 +1,30 @@
 //! etcd-backed coordination backend for shard and run lifecycle management.
 //!
 //! This crate provides [`EtcdCoordinator`], which implements the coordination
-//! trait surface against persisted etcd state. It uses etcd transactions for
-//! fenced hot-path mutations and real etcd leases for ephemeral shard-owner
-//! bindings.
+//! trait surface ([`CoordinationBackend`], [`RunManagement`],
+//! [`ShardClaiming`]) against persisted etcd state. It uses etcd transactions
+//! for fenced hot-path mutations, publishes worker-visible active-run/shard
+//! indexes, garbage-collects stale partially created runs, and uses real etcd
+//! leases for ephemeral shard-owner bindings.
 //!
 //! # Architecture
 //!
 //! The crate is structured in five internal modules:
 //!
 //! - **`config`** — Validated connection parameters (endpoints, namespace
-//!   prefix). Construction normalizes whitespace and enforces keyspace
-//!   prefix invariants.
-//! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client, exposes
-//!   health-check (`status()`), and executes persisted coordination
-//!   transactions.
-//! - **`keyspace`** — Deterministic ASCII etcd path construction for
-//!   runs, shards, ownership leases, and active indexes.
-//! - **`codec`** — Explicit binary encoding (v1 wire format) for coordination
-//!   records and shard-owner bindings persisted to etcd.
+//!   prefix, shard limits, tuning). Construction normalizes whitespace and
+//!   enforces keyspace prefix invariants.
+//! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client and a
+//!   single-threaded Tokio runtime, exposes health-check (`status()`), and
+//!   executes persisted coordination transactions for run lifecycle, shard
+//!   lifecycle, and cold-path maintenance.
+//! - **`keyspace`** — Deterministic ASCII etcd path construction for runs,
+//!   shards, ownership leases, and active indexes. See the module docs for
+//!   the full key layout.
+//! - **`codec`** — Explicit binary encoding for coordination records and
+//!   shard-owner bindings persisted to etcd.
 //! - **`error`** — Unified error types covering configuration validation,
-//!   Tokio runtime creation, and etcd client failures.
+//!   Tokio runtime creation, codec failures, and etcd RPC errors.
 //!
 //! # Build requirements
 //!
@@ -31,7 +35,6 @@
 //! [`CoordinationBackend`]: gossip_coordination::CoordinationBackend
 //! [`RunManagement`]: gossip_coordination::RunManagement
 //! [`ShardClaiming`]: gossip_coordination::ShardClaiming
-//! [`InMemoryCoordinator`]: gossip_coordination::InMemoryCoordinator
 
 #![forbid(unsafe_code)]
 
