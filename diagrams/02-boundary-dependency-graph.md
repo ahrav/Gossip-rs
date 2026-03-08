@@ -58,7 +58,7 @@ graph TB
     B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId,<br/>JobId, ShardKey"| B1
     B3 -->|"ShardId, MAX_KEY_SIZE<br/>(shard identity &amp;<br/>key-range ceiling)"| B1
     B4 -->|"ConnectorTag, ConnectorInstanceIdHash,<br/>ItemIdentityKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
-    B5 -->|"FindingId, OccurrenceId,<br/>ObservationId, DoneLedgerKey,<br/>OvidHash, TriageGroupKey,<br/>TenantId, PolicyHash,<br/>SecretHash, FenceEpoch,<br/>RunId, ShardId"| B1
+    B5 -->|"FindingId, OccurrenceId,<br/>ObservationId,<br/>TenantId, PolicyHash,<br/>SecretHash, FenceEpoch,<br/>RunId, ShardId"| B1
 
     B2 -->|"ShardSpec, KeyEncoding<br/>(shard range types<br/>for split operations)"| B3
     B4 -->|"ShardSpec<br/>(shard range bounds<br/>for enumeration)"| B3
@@ -80,9 +80,12 @@ edge is the widest, reflecting the fact that persistence must reference nearly
 every content-addressed identity type for done-ledger keys, finding records, and
 occurrence records.
 
-Note: `DoneLedgerKey` and `OvidHash` are fully defined types exported from
-`identity/mod.rs`. `TriageGroupKey` has a domain separation constant registered
-in `identity/domain.rs`.
+Note: `DoneLedgerKey` and `OvidHash` are defined within the B5 persistence
+module (`persistence/done_ledger.rs` and `persistence/ovid.rs` respectively).
+They consume B1 identity types (`TenantId`, `PolicyHash`, `StableItemId`) but
+are not re-exported from `identity/`. The domain-separation constants for their
+derivation (`DONE_LEDGER_KEY_V1`, `OVID_V1`) are registered in
+`identity/domain.rs`.
 
 ---
 
