@@ -1,9 +1,7 @@
 //! Deterministic filesystem-backed connector (Unix-only).
 //!
-//! This module provides [`FilesystemConnector`], an implementation of
-//! [`gossip_contracts::connector::EnumerationConnector`] and
-//! [`gossip_contracts::connector::ReadConnector`] that serves pages directly
-//! from a resumable sorted DFS walk.
+//! This module provides [`FilesystemConnector`], which implements enumeration
+//! and read operations, serving pages directly from a resumable sorted DFS walk.
 //!
 //! # Streaming serving model
 //!
@@ -96,9 +94,8 @@ use std::{
 
 use gossip_contracts::{
     connector::{
-        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, MAX_TOKEN_SIZE, ReadConnector, ReadError, ScanItem,
-        TokenBytes, ToxicDigest, VersionId,
+        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationPage, ItemKey, ItemRef,
+        MAX_TOKEN_SIZE, ReadError, ScanItem, TokenBytes, ToxicDigest, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorInstanceIdHash, ObjectVersionId, StableItemId},
@@ -1046,11 +1043,12 @@ impl FilesystemConnector {
 }
 
 // ---------------------------------------------------------------------------
-// EnumerationConnector impl
+// Enumeration and read operations (inherent methods)
 // ---------------------------------------------------------------------------
 
-impl EnumerationConnector for FilesystemConnector {
-    fn caps(&self) -> ConnectorCapabilities {
+impl FilesystemConnector {
+    /// Advertise connector capabilities used by orchestration planning.
+    pub fn caps(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             seek_by_key: true,
             token_resume: self.emit_tokens,
@@ -1061,7 +1059,7 @@ impl EnumerationConnector for FilesystemConnector {
 
     /// Shard bounds are validated allocation-free via the internal
     /// `borrowed_shard_bound` helper (`[]` means unbounded; oversize is permanent).
-    fn enumerate_page(
+    pub fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
@@ -1072,7 +1070,8 @@ impl EnumerationConnector for FilesystemConnector {
         self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
-    fn choose_split_point(
+    /// Split-point hint for dynamic shard subdivision.
+    pub fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
@@ -1082,17 +1081,11 @@ impl EnumerationConnector for FilesystemConnector {
         let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
         self.choose_split_point_bounds(start, end, cursor, budgets.deadline())
     }
-}
 
-// ---------------------------------------------------------------------------
-// ReadConnector impl
-// ---------------------------------------------------------------------------
-
-impl ReadConnector for FilesystemConnector {
     /// Budget enforcement is left to the runtime layer (which wraps the
     /// returned reader in a bounded adapter), consistent with the advisory
-    /// budget contract in [`ReadConnector`].
-    fn open(
+    /// budget contract.
+    pub fn open(
         &mut self,
         item_ref: &ItemRef,
         _budgets: Budgets,
@@ -1103,7 +1096,7 @@ impl ReadConnector for FilesystemConnector {
         Ok(Box::new(file))
     }
 
-    fn read_range(
+    pub fn read_range(
         &mut self,
         item_ref: &ItemRef,
         offset: u64,

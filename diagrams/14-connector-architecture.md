@@ -6,29 +6,23 @@ This document diagrams the B4 Connector boundary: trait contracts, core value ty
 
 ---
 
-## 1. Connector Trait Hierarchy
+## 1. Connector Method Surface
 
-The connector contract separates enumeration (metadata traversal) from reading (payload I/O) so orchestration can compose and scale them independently. `ConnectorInstance` is a pure bound alias — a convenience supertrait with no methods of its own.
-
-Each concrete connector advertises its capabilities via `ConnectorCapabilities`, a four-flag struct that orchestration reads at registration time. All three connectors support `seek_by_key`, `range_read`, and `split_hints`; `token_resume` is configurable per instance.
+Each concrete connector exposes enumeration and read operations as inherent methods (not trait dispatch). All three connectors share the same method signatures and advertise capabilities via `ConnectorCapabilities`, a four-flag struct that orchestration reads at registration time. All three connectors support `seek_by_key`, `range_read`, and `split_hints`; `token_resume` is configurable per instance.
 
 ```mermaid
-%% Diagram: connector-trait-hierarchy
+%% Diagram: connector-method-surface
 graph TD
-    subgraph Traits["Connector Trait Contracts"]
-        CI["<b>ConnectorInstance</b><br/>supertrait: EnumerationConnector + ReadConnector<br/><i>blanket impl for T: Enum + Read + ?Sized</i>"]
-        EC["<b>EnumerationConnector</b><br/>caps() → ConnectorCapabilities<br/>enumerate_page(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;EnumerationPage, EnumerateError&gt;<br/>choose_split_point(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
-        RC["<b>ReadConnector</b><br/>open(&mut, &ItemRef, Budgets)<br/>  → Result&lt;Box&lt;dyn Read + Send&gt;, ReadError&gt;<br/>read_range(&mut, &ItemRef, u64, &mut [u8], Budgets)<br/>  → Result&lt;usize, ReadError&gt;"]
-    end
-
-    CI -->|requires| EC
-    CI -->|requires| RC
-
     subgraph Caps["ConnectorCapabilities"]
         CC["<b>ConnectorCapabilities</b><br/>seek_by_key: bool<br/>token_resume: bool<br/>range_read: bool<br/>split_hints: bool"]
     end
 
-    EC -->|"caps() returns"| CC
+    subgraph Methods["Inherent Method Surface"]
+        EM["<b>Enumeration Methods</b><br/>caps() → ConnectorCapabilities<br/>enumerate_page(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;EnumerationPage, EnumerateError&gt;<br/>choose_split_point(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
+        RM["<b>Read Methods</b><br/>open(&mut, &ItemRef, Budgets)<br/>  → Result&lt;Box&lt;dyn Read + Send&gt;, ReadError&gt;<br/>read_range(&mut, &ItemRef, u64, &mut [u8], Budgets)<br/>  → Result&lt;usize, ReadError&gt;"]
+    end
+
+    EM -->|"caps() returns"| CC
 
     subgraph Connectors["Concrete Implementations"]
         FS["<b>FilesystemConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
@@ -36,14 +30,16 @@ graph TD
         MEM["<b>InMemoryDeterministicConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
     end
 
-    FS -->|impl| CI
-    GIT -->|impl| CI
-    MEM -->|impl| CI
+    FS -->|provides| EM
+    FS -->|provides| RM
+    GIT -->|provides| EM
+    GIT -->|provides| RM
+    MEM -->|provides| EM
+    MEM -->|provides| RM
 
-    style CI fill:#EF4444,stroke:#991B1B,color:#fff
-    style EC fill:#FEE2E2,stroke:#991B1B
-    style RC fill:#FEE2E2,stroke:#991B1B
     style CC fill:#FEE2E2,stroke:#991B1B
+    style EM fill:#FEE2E2,stroke:#991B1B
+    style RM fill:#FEE2E2,stroke:#991B1B
     style FS fill:#FEE2E2,stroke:#991B1B
     style GIT fill:#FEE2E2,stroke:#991B1B
     style MEM fill:#FEE2E2,stroke:#991B1B
@@ -51,9 +47,9 @@ graph TD
 
 **Key design decisions:**
 
-- `EnumerationConnector` and `ReadConnector` are separate traits because enumeration is metadata-bound while reading is bandwidth-bound. Orchestration applies independent retry and circuit-breaker policies per operation.
-- `choose_split_point` defaults to `Ok(None)` with a `debug_assert!` catching capability misadvertisement. Only connectors with `split_hints: true` override it.
-- `read_range` defaults to `Err(ReadError::unsupported("range_read"))`. Connectors without native random-access keep this default.
+- Enumeration (metadata traversal) and reading (payload I/O) are separate method groups because enumeration is metadata-bound while reading is bandwidth-bound. Orchestration applies independent retry and circuit-breaker policies per operation.
+- `choose_split_point` is provided by connectors that advertise `split_hints: true`. Only connectors with natural partition boundaries (tree objects, directory structure) implement it.
+- `read_range` returns `Err(ReadError::unsupported("range_read"))` for connectors without native random-access support.
 - `token_resume` is instance-configurable via `with_tokens(bool)` on each connector rather than hardcoded, because some test scenarios disable tokens to exercise key-only resume.
 
 See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for failure isolation per connector, [13-shard-algebra-types.md](./13-shard-algebra-types.md) for shard key encoding consumed by `enumerate_page`.
@@ -271,7 +267,7 @@ See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for how classified er
 
 | Crate | File | Key Types / Functions |
 |-------|------|----------------------|
-| `gossip-contracts` | `crates/gossip-contracts/src/connector/api.rs` | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`, `EnumerationConnector`, `ReadConnector`, `ConnectorInstance` |
+| `gossip-contracts` | `crates/gossip-contracts/src/connector/api.rs` | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/types.rs` | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `ScanItem`, `EnumerationPage`, `Budgets`, `ConnectorInputError`, `ContentHints`, `Location`, `VersionId`, `PooledByteSlab` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/mod.rs` | Module structure and re-exports |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/page_validator.rs` | `PageValidationError`, `PageValidationViolation`, `ToxicDigest`, `validate_page` |

@@ -383,9 +383,9 @@ Source: `crates/gossip-frontier/src/builder.rs:1-60,183-776`
 ## 6. Connector Enumeration Lifecycle
 
 Connectors (B4) use `ShardSpec` range bounds from B3 to enumerate items within a
-shard's key range. The `EnumerationConnector` trait defines the contract: a single
-`enumerate_page` method for both initial and resume requests (distinguished by cursor
-state), and optional split point selection.
+shard's key range. Each connector exposes `enumerate_page` and `choose_split_point`
+as inherent methods: a single `enumerate_page` call serves both initial and resume
+requests (distinguished by cursor state), with optional split point selection.
 
 ```mermaid
 %% Diagram: connector-enumeration-lifecycle
@@ -560,6 +560,6 @@ Source: `crates/gossip-frontier/src/hint.rs:961-1025`
 | `crates/gossip-frontier/src/key_encoding.rs`             | `KeyEncoding` trait, `PathKey`, `ManifestRowKey`, `KeyBuf`, `prefix_successor()`, `byte_midpoint()`, `key_successor()` |
 | `crates/gossip-frontier/src/hint.rs`                     | `ShardHint`, `ShardMetadata`, `MetadataBuf`, `ShardSpecScratch`, `propagate_hint_on_split()`, `HintPropagationError`   |
 | `crates/gossip-frontier/src/builder.rs`                  | `PreallocShardBuilder`, `split_range_by_boundaries()`                                                                  |
-| `crates/gossip-contracts/src/connector/api.rs`           | `EnumerationConnector`, `ConnectorCapabilities`, `choose_split_point()`                                                |
+| `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`, `choose_split_point()` (inherent method on each connector)                                    |
 | `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` enumeration and split point selection                                                            |
 | `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` enumeration and split point selection                                                 |

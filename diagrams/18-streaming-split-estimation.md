@@ -298,7 +298,7 @@ selection, but they differ in how they feed observations into it.
 ```mermaid
 %% Diagram: connector-integration
 graph TD
-    subgraph Trait ["B4: EnumerationConnector trait"]
+    subgraph Trait ["B4: Connector inherent methods"]
         CSP_TRAIT["choose_split_point(&mut self, shard, cursor, budgets)<br/>→ Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
     end
 

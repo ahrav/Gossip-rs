@@ -1269,7 +1269,7 @@ fn caps_reflect_token_setting() {
 }
 
 // ---------------------------------------------------------------
-// Unit tests — ReadConnector::open
+// Unit tests — open
 // ---------------------------------------------------------------
 
 #[test]
@@ -1291,7 +1291,7 @@ fn open_reads_full_content() {
 }
 
 // ---------------------------------------------------------------
-// Unit tests — ReadConnector::read_range
+// Unit tests — read_range
 // ---------------------------------------------------------------
 
 #[test]
@@ -3502,7 +3502,7 @@ fn open_without_prior_enumerate_triggers_lazy_indexing() {
     let mut c = FilesystemConnector::new(dir.path());
 
     // A valid ItemRef that exists on disk should succeed even without
-    // prior enumeration — lazy root setup satisfies the ReadConnector
+    // prior enumeration — lazy root setup satisfies the read
     // affinity contract for compatible instances.
     let item_ref = ItemRef::try_from_slice(b"file.txt").unwrap();
     let mut reader = match c.open(&item_ref, default_budgets()) {
@@ -3881,7 +3881,7 @@ fn compatible_instance_reads_item_ref_from_another_instance() {
     let item_ref = page.items()[0].item_ref().clone();
 
     // Instance B: fresh connector over the same root, never enumerated.
-    // The ReadConnector contract allows compatible instances to read
+    // The read contract allows compatible instances to read
     // ItemRefs from each other.
     let mut b = FilesystemConnector::new(dir.path());
     let mut reader = match b.open(&item_ref, default_budgets()) {

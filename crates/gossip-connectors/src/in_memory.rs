@@ -1,10 +1,10 @@
 //! Deterministic in-memory connector for test and harness use.
 //!
-//! This module provides [`InMemoryDeterministicConnector`], an implementation of
-//! [`EnumerationConnector`] and [`ReadConnector`] that keeps all data in memory
-//! and guarantees bit-identical enumeration across runs for the same input set.
-//! It is designed for environments where reproducibility matters more than source
-//! realism: unit tests, conformance harnesses, and simulation workloads.
+//! This module provides [`InMemoryDeterministicConnector`], which implements
+//! enumeration and read operations keeping all data in memory. It guarantees
+//! bit-identical enumeration across runs for the same input set. Designed for
+//! environments where reproducibility matters more than source realism: unit
+//! tests, conformance harnesses, and simulation workloads.
 //!
 //! # Algorithm
 //!
@@ -83,8 +83,8 @@ use std::{io, sync::Arc};
 
 use gossip_contracts::{
     connector::{
-        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
+        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationPage, ItemKey, ItemRef,
+        ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorInstanceIdHash, ConnectorTag, ObjectVersionId, StableItemId},
@@ -97,7 +97,7 @@ use crate::common::{self, borrowed_shard_bound, derive_stable_item_id, parse_u64
 pub struct MemItem {
     /// Item key used for lexicographic ordering and cursor progression.
     pub key: ItemKey,
-    /// Immutable payload returned by [`ReadConnector`] operations.
+    /// Immutable payload returned by read operations.
     ///
     /// Wrapped in `Arc` to keep fixture duplication cheap.
     pub bytes: Arc<[u8]>,
@@ -128,7 +128,7 @@ impl MemItem {
 struct PreparedItem {
     /// Sorted item key for ordering and cursor progression.
     key: ItemKey,
-    /// Immutable payload bytes for [`ReadConnector`] operations.
+    /// Immutable payload bytes for read operations.
     bytes: Arc<[u8]>,
     /// Big-endian `u64` index into the sorted item array.
     item_ref: ItemRef,
@@ -461,8 +461,9 @@ impl InMemoryDeterministicConnector {
     }
 }
 
-impl EnumerationConnector for InMemoryDeterministicConnector {
-    fn caps(&self) -> ConnectorCapabilities {
+impl InMemoryDeterministicConnector {
+    /// Advertise connector capabilities used by orchestration planning.
+    pub fn caps(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             seek_by_key: true,
             token_resume: self.emit_tokens,
@@ -474,7 +475,7 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
     /// Shard bounds are validated allocation-free via the internal
     /// `borrowed_shard_bound` helper:
     /// empty means unbounded, oversize bounds are permanent input errors.
-    fn enumerate_page(
+    pub fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
@@ -485,9 +486,9 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
-    /// Budgets are accepted for trait conformance but not consumed: split-point
-    /// selection is a metadata-only operation with no I/O or time-bounded work.
-    fn choose_split_point(
+    /// Budgets are accepted but not consumed: split-point selection is a
+    /// metadata-only operation with no I/O or time-bounded work.
+    pub fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
@@ -497,18 +498,14 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
         self.choose_split_point_bounds(start, end, cursor)
     }
-}
 
-impl ReadConnector for InMemoryDeterministicConnector {
     /// Returns a reader over the full item content.
     ///
     /// Budget enforcement is left to the runtime layer (which wraps the
     /// returned reader in a bounded adapter), consistent with the advisory
-    /// budget contract in [`ReadConnector`]. This matches [`read_range`]
+    /// budget contract. This matches [`read_range`](Self::read_range)
     /// semantics, which also does not reject items based on total size.
-    ///
-    /// [`read_range`]: ReadConnector::read_range
-    fn open(
+    pub fn open(
         &mut self,
         item_ref: &ItemRef,
         _budgets: Budgets,
@@ -519,7 +516,7 @@ impl ReadConnector for InMemoryDeterministicConnector {
 
     /// Clamps the copy length to `min(dst.len(), max_bytes, available)` so
     /// the budget acts as an additional upper bound on bytes returned.
-    fn read_range(
+    pub fn read_range(
         &mut self,
         item_ref: &ItemRef,
         offset: u64,

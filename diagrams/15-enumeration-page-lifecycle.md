@@ -1,15 +1,15 @@
 # Enumeration Page Lifecycle
 
 The enumeration page is the fundamental unit of connector-to-coordinator communication.
-Each call to `EnumerationConnector::enumerate_page` transforms a `(ShardSpec, Cursor,
+Each call to `enumerate_page` (an inherent method on each connector) transforms a `(ShardSpec, Cursor,
 Budgets)` triple into an `EnumerationPage` containing validated `ScanItem`s and a
 continuation `Cursor`. This document traces that transformation through bound resolution,
 data-source walking, pooled page assembly, and 9-check validation.
 
 The lifecycle spans two crates:
 
-- **`gossip-contracts`** defines the trait contract (`EnumerationConnector`), the value
-  types (`Cursor`, `EnumerationPage`, `ScanItem`, `Budgets`), and the validation surface
+- **`gossip-contracts`** defines the value types (`Cursor`, `EnumerationPage`, `ScanItem`,
+  `Budgets`), capability flags (`ConnectorCapabilities`), and the validation surface
   (`validate_page`, `validate_page_range`).
 - **`gossip-connectors`** provides the shared implementation machinery (`common.rs`) and
   concrete connectors (`filesystem.rs`, `git.rs`, `in_memory.rs`).
@@ -35,7 +35,7 @@ are common to all connector implementations — only the data-source walking ste
 %% Diagram: single-page-enumeration-flow
 sequenceDiagram
     participant Caller as Caller<br/>(Scan Loop)
-    participant EC as EnumerationConnector<br/>::enumerate_page
+    participant EC as Connector<br/>::enumerate_page
     participant RB as resolve_page_bounds<br/>(common.rs)
     participant KR as key_resume_start<br/>+ cursor_token_index<br/>(common.rs)
     participant DS as Data Source<br/>(WalkState / entries)
@@ -368,7 +368,7 @@ flowchart TD
 unrepresentable at the type level. The deadline field (`Option<Instant>`) is optional;
 `None` means no time limit.
 
-**Budget enforcement is advisory at the trait layer.** The `EnumerationConnector` trait
+**Budget enforcement is advisory at the connector layer.** The `enumerate_page` method
 documents that connectors *should* honor budgets, but callers *must not* assume
 compliance. The runtime orchestration layer is responsible for enforcement: it may
 truncate excess items, apply backpressure, or terminate a misbehaving connector.
@@ -392,7 +392,7 @@ truncate excess items, apply backpressure, or terminate a misbehaving connector.
 
 | Symbol | File | Role |
 |--------|------|------|
-| `EnumerationConnector` | `crates/gossip-contracts/src/connector/api.rs` | Trait contract: `enumerate_page`, `caps`, `choose_split_point` |
+| `ConnectorCapabilities` | `crates/gossip-contracts/src/connector/api.rs` | Capability flags; `enumerate_page`, `caps`, `choose_split_point` are inherent methods on each connector |
 | `EnumerationPage` | `crates/gossip-contracts/src/connector/types.rs` | Page output: `items: Vec<ScanItem>`, `next_cursor: Cursor` |
 | `ScanItem` | `crates/gossip-contracts/src/connector/types.rs` | Per-item metadata: `ItemKey`, `ItemRef`, `StableItemId`, `VersionId`, optional hints |
 | `Cursor` | `crates/gossip-contracts/src/connector/types.rs` | Paging state: `last_key: Option<ItemKey>`, `token: Option<TokenBytes>` |

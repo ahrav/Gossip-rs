@@ -136,7 +136,6 @@ fn parse_git_cli_config_supports_extended_flags() {
         "--execution-mode=connector".into(),
         "--max-items=12".into(),
         "--max-bytes=4096".into(),
-        "--x-pack-exec-workers=9".into(),
         "--workers".into(),
         "2".into(),
         "--decode-depth".into(),
@@ -191,19 +190,6 @@ fn parse_git_cli_config_supports_extended_flags() {
             git_engine_chunk_mb: Some(4),
         }
     );
-}
-
-#[test]
-fn parse_git_x_pack_exec_workers_sets_workers_when_public_workers_missing() {
-    let cfg = parse_args_from([
-        "scan".into(),
-        "git".into(),
-        "--repo=/tmp/repo".into(),
-        "--x-pack-exec-workers=7".into(),
-    ])
-    .expect("parse git config");
-
-    assert_eq!(cfg.workers, Some(7));
 }
 
 #[test]
