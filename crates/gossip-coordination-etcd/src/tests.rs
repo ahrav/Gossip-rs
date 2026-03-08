@@ -557,7 +557,7 @@ fn run_records_scan_prefix_is_scan_safe() {
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
-    let mut backend = local_backend();
+    let mut backend = local_backend("/gossip/tests/register-batch-limit");
     backend
         .test_clear_namespace()
         .expect("namespace cleanup should succeed");
@@ -607,7 +607,7 @@ fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn connects_to_local_etcd_and_fetches_status() {
-    let backend = local_backend();
+    let backend = local_backend("/gossip/tests/status");
     let status = backend.status().expect("status call should succeed");
 
     assert!(
@@ -619,7 +619,7 @@ fn connects_to_local_etcd_and_fetches_status() {
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
-    let mut backend = local_backend();
+    let mut backend = local_backend("/gossip/tests/acquire-checkpoint-renew");
     backend
         .test_clear_namespace()
         .expect("namespace cleanup should succeed");
@@ -712,17 +712,17 @@ fn test_endpoints() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:2379".to_owned())
 }
 
-fn local_backend() -> EtcdCoordinator {
-    let config = EtcdCoordinatorConfig::from_endpoints_csv(&test_endpoints(), "/gossip/v1")
+fn local_backend(namespace: &str) -> EtcdCoordinator {
+    let config = EtcdCoordinatorConfig::from_endpoints_csv(&test_endpoints(), namespace)
         .expect("test endpoint configuration should be valid");
 
     EtcdCoordinator::connect(config).expect("local etcd should be reachable")
 }
 
-fn local_backend_with_ttl(ttl_secs: i64) -> EtcdCoordinator {
+fn local_backend_with_ttl(namespace: &str, ttl_secs: i64) -> EtcdCoordinator {
     let config = EtcdCoordinatorConfig::from_endpoints_csv_with_tuning(
         &test_endpoints(),
-        "/gossip/v1",
+        namespace,
         ttl_secs,
         8,
     )
@@ -763,7 +763,7 @@ fn lease_expiry_rejects_stale_checkpoint() {
     // Use a short owner-lease TTL so the etcd lease expires quickly.
     // etcd enforces a minimum TTL of ~5s in most configurations.
     let ttl_secs = 5;
-    let mut backend = local_backend_with_ttl(ttl_secs);
+    let mut backend = local_backend_with_ttl("/gossip/tests/lease-expiry", ttl_secs);
     backend
         .test_clear_namespace()
         .expect("namespace cleanup should succeed");
@@ -819,7 +819,7 @@ fn lease_expiry_rejects_stale_checkpoint() {
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn concurrent_acquire_second_worker_gets_already_leased() {
-    let mut backend = local_backend();
+    let mut backend = local_backend("/gossip/tests/concurrent-acquire");
     backend
         .test_clear_namespace()
         .expect("namespace cleanup should succeed");

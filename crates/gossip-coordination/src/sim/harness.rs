@@ -2700,6 +2700,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                                 e,
                                 CheckpointError::TenantMismatch { .. }
                                     | CheckpointError::ShardNotFound { .. }
+                                    | CheckpointError::BackendError { .. }
                             ),
                             "session checkpoint hit impossible error: {e:?}"
                         );

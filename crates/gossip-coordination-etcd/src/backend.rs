@@ -977,14 +977,15 @@ impl CoordinationBackend for EtcdCoordinator {
                 self.best_effort_revoke_lease(old_lease_id);
             }
 
-            let capacity = match self.count_available_lightweight(tenant, key.run()) {
-                Ok(c) => c,
-                Err(err) => {
-                    return Err(AcquireError::BackendError {
-                        message: format!("acquire.capacity_hint: {err}"),
-                    });
-                }
-            };
+            // Best-effort: read capacity after the CAS succeeds. If the
+            // hint read fails (transport blip, leader election), degrade
+            // to a conservative zero-available hint rather than returning
+            // an error — the shard record and owner key are already
+            // committed, so reporting failure would lie about ownership
+            // and can strand the shard behind the new lease.
+            let capacity = self
+                .count_available_lightweight(tenant, key.run())
+                .unwrap_or(CapacityHint::ZERO);
 
             let lease = Lease::new(
                 tenant,
@@ -1134,14 +1135,14 @@ impl CoordinationBackend for EtcdCoordinator {
                 // deleted. Returning an error here would lie about the
                 // outcome — the shard record IS updated.
                 let _ = self.etcd_lease_keep_alive_once(old_lease_id);
-                let capacity = match self.count_available_lightweight(tenant, key.run()) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        return Err(RenewError::BackendError {
-                            message: format!("renew.capacity_hint: {err}"),
-                        });
-                    }
-                };
+                // Best-effort: read capacity after the CAS succeeds. If
+                // the hint read fails, degrade to a conservative
+                // zero-available hint — the new deadline is already
+                // persisted, so returning an error would misreport the
+                // outcome and cause callers to drop work.
+                let capacity = self
+                    .count_available_lightweight(tenant, key.run())
+                    .unwrap_or(CapacityHint::ZERO);
                 return Ok(RenewResult {
                     new_deadline,
                     capacity,
