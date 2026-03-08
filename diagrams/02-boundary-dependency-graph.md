@@ -55,10 +55,10 @@ graph TB
     B4["<b>B4: Connector</b><br/>Enumeration, reading, circuit breaker,<br/>page validation, scan stats"]
     B5["<b>B5: Persistence</b><br/>Done-ledger, findings sink,<br/>commit protocol, typestate machine"]
 
-    B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId"| B1
+    B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId,<br/>JobId, ShardKey"| B1
     B3 -->|"ShardId, MAX_KEY_SIZE<br/>(shard identity &amp;<br/>key-range ceiling)"| B1
-    B4 -->|"ConnectorTag, ItemIdentityKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
-    B5 -->|"FindingId, OccurrenceId,<br/>DoneLedgerKey, OvidHash,<br/>TriageGroupKey, TenantId,<br/>PolicyHash, SecretHash"| B1
+    B4 -->|"ConnectorTag, ConnectorInstanceIdHash,<br/>ItemIdentityKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
+    B5 -->|"FindingId, OccurrenceId,<br/>ObservationId, DoneLedgerKey,<br/>OvidHash, TriageGroupKey,<br/>TenantId, PolicyHash,<br/>SecretHash, FenceEpoch,<br/>RunId, ShardId"| B1
 
     B2 -->|"ShardSpec, KeyEncoding<br/>(shard range types<br/>for split operations)"| B3
     B4 -->|"ShardSpec<br/>(shard range bounds<br/>for enumeration)"| B3
@@ -80,11 +80,9 @@ edge is the widest, reflecting the fact that persistence must reference nearly
 every content-addressed identity type for done-ledger keys, finding records, and
 occurrence records.
 
-Note that `DoneLedgerKey`, `OvidHash`, and `TriageGroupKey` in the B5→B1 edge are
-currently domain separation tag constants (registered in `identity/domain.rs` as
-`DONE_LEDGER_KEY_V1`, `OVID_V1`, `TRIAGE_GROUP_KEY_V1`). The corresponding struct
-definitions are pending — these types will be fully defined when the durable
-persistence backend is implemented.
+Note: `DoneLedgerKey` and `OvidHash` are fully defined types exported from
+`identity/mod.rs`. `TriageGroupKey` has a domain separation constant registered
+in `identity/domain.rs`.
 
 ---
 
@@ -127,11 +125,11 @@ graph TD
     end
 
     B3 -->|"ShardId, MAX_KEY_SIZE"| B1
-    B2 -->|"TenantId, ShardId,<br/>FenceEpoch, ..."| B1
+    B2 -->|"TenantId, ShardId,<br/>FenceEpoch, JobId, ..."| B1
     B2 -->|"ShardSpec"| B3
-    B4 -->|"ConnectorTag,<br/>ItemIdentityKey, ..."| B1
+    B4 -->|"ConnectorTag,<br/>ConnectorInstanceIdHash, ..."| B1
     B4 -->|"ShardSpec"| B3
-    B5 -->|"FindingId, OvidHash,<br/>DoneLedgerKey, ..."| B1
+    B5 -->|"FindingId, ObservationId,<br/>DoneLedgerKey, ..."| B1
     B5 -->|"Cursor, ShardStatus,<br/>ParkReason"| B2
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF

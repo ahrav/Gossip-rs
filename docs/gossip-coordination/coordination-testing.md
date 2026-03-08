@@ -23,7 +23,9 @@ tests alongside the shared protocol suite: configuration/keyspace/codec tests
 stay local and deterministic, while ignored local-etcd integration coverage
 verifies `EtcdCoordinator::connect()` + `status()` and the persisted
 `create_run -> register_shards -> acquire -> checkpoint -> renew` path against
-a real etcd. Protocol conformance, scenario, and simulation coverage still use
+a real etcd. The binary codec (`codec.rs`) has dedicated round-trip fuzz
+targets and proptest coverage for `ShardRecord` serialization in `codec_tests.rs`.
+Protocol conformance, scenario, and simulation coverage still use
 `InMemoryCoordinator` for the full mutation surface because the etcd backend
 currently fails closed for terminal, split, and unpark transitions that do not
 yet have persisted transaction shapes.

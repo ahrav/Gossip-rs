@@ -351,4 +351,5 @@ The backend's enforcement strategy is layered:
 | `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend` trait defining all shard operations                                    |
 | `crates/gossip-coordination/src/error.rs`  | `CoordError`, `AcquireError`, `CompleteError`, `SplitError`, `ParkError`                     |
 | `crates/gossip-coordination/src/lease.rs`  | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`                                               |
-| `crates/gossip-coordination/src/split.rs`  | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()`                           |
+| `crates/gossip-contracts/src/coordination/split.rs`  | `SplitReplacePlan`, `SplitResidualPlan`                                              |
+| `crates/gossip-coordination/src/split_execution.rs`  | `derive_split_shard_id()` and split execution logic                                  |

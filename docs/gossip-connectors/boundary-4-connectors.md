@@ -48,7 +48,7 @@ The crate provides four core capabilities:
 
 | File             | Role                                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------------------- |
-| `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `GitConnector`, `MemItem`, `path_buf_from_bytes`, `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG` |
+| `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `GitConnector`, `MemItem`, `path_buf_from_bytes`, `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG` |
 | `common.rs`      | Shared utilities: binary search, identity derivation, split-point selection, pooled page assembly, I/O error classification, path conversion |
 | `in_memory.rs`   | `InMemoryDeterministicConnector` -- deterministic in-memory fixture                                           |
 | `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |
@@ -509,12 +509,13 @@ Each connector type carries a domain-separating `ConnectorTag` constant
 that ensures `StableItemId` derivations are disjoint across connector
 types:
 
-| Constant                   | Value       | Used by                 |
-| -------------------------- | ----------- | ----------------------- |
-| `FILESYSTEM_CONNECTOR_TAG` | `"fslocal"` | `FilesystemConnector`   |
-| `GIT_CONNECTOR_TAG`        | `"gitlocal"`| `GitConnector`          |
+| Constant                   | Value       | Used by                            |
+| -------------------------- | ----------- | ---------------------------------- |
+| `FILESYSTEM_CONNECTOR_TAG` | `"fslocal"` | `FilesystemConnector`              |
+| `GIT_CONNECTOR_TAG`        | `"gitlocal"`| `GitConnector`                     |
+| `IN_MEMORY_CONNECTOR_TAG`  | `"inmem"`   | `InMemoryDeterministicConnector`   |
 
-Both constants are defined via `ConnectorTag::from_ascii` and re-exported
+All three constants are defined via `ConnectorTag::from_ascii` and re-exported
 from the crate root.
 
 ### Public utility: `path_buf_from_bytes`
@@ -656,83 +657,19 @@ across thread boundaries:
 
 ---
 
-## 9. Scan Loop Integration
+## 9. Scan Execution Path
 
-> **Status: Aspirational** — The subsections below titled "Loop structure",
-> "Key scan-loop invariants", "Current scope", and "Retry and failure
-> handling" describe a planned `gossip-scan-pipeline` crate and its
-> `run_scan_loop` API which have **not been implemented**. The constants
-> `DEFAULT_MAX_TRANSIENT_RETRIES` and `DEFAULT_RENEW_AT_FRACTION` do not
-> exist in the codebase. The `connector-pipeline` feature flag referenced
-> elsewhere does not exist in any `Cargo.toml`.
->
-> The **current** scan execution path is:
->
-> - **`gossip-scan-driver`** — defines `ScanDriver::run()` and
->   `ScanSourceFactory` traits
->   (`crates/gossip-scan-driver/src/lib.rs`).
-> - **`gossip-connectors::scan_driver`** — provides
->   `FilesystemScanSourceFactory`, `GitScanSourceFactory`, and
->   `InMemoryScanSourceFactory`
->   (`crates/gossip-connectors/src/scan_driver.rs`).
-> - **`gossip-scanner-runtime`** — provides `scan_fs()` and `scan_git()`
->   top-level entry points
->   (`crates/gossip-scanner-runtime/src/lib.rs`).
+Scan execution flows through three crates that compose connectors with
+the scanner engine and coordination layer:
 
-The following describes the **planned** page-level scan loop that would
-drive one shard from its current cursor to completion by repeatedly calling
-`EnumerationConnector::enumerate_page` and validating each page via
-`validate_page` before checkpointing progress through the coordination
-backend. None of the functions or constants below exist yet.
-
-### Loop structure (planned)
-
-```text
-pre-loop: bridge ShardSpec + Cursor from coordination domain
-    │
-    ▼
-enumerate_page(spec, cursor, budgets)
-    │
-    ├─ Ok(page) ──► validate_page ──► process_page_hook? ──► checkpoint ──► renew? ──► loop
-    ├─ Err(retryable) ──► retry budget ──► park TooManyErrors
-    └─ Err(permanent) ──► park (heuristic reason)
-```
-
-### Key scan-loop invariants (planned)
-
-- **SL1 -- Validate-before-persist:** pages are always validated before
-  any checkpoint or complete call.
-- **SL2 -- Consecutive retry accounting:** transient-failure counter
-  resets to zero after every successful `enumerate_page`. The planned
-  budget is `DEFAULT_MAX_TRANSIENT_RETRIES = 3` (not yet defined).
-- **SL3 -- Poisoned state never retried:** invalid spec bytes,
-  unconvertible cursors, and failed validations are parked `Poisoned`
-  immediately.
-- **SL7 -- Renewal-after-checkpoint ordering:** lease renewal is
-  attempted only after successful checkpoint, preserving forward progress.
-- **SL8 -- Process-before-persist ordering:** when using a page hook,
-  non-empty pages are processed after validation and before checkpoint.
-  Hook failure aborts without persisting cursor progress for that page.
-
-### Current scope (planned)
-
-The planned default APIs (`run_scan_loop`, `run_scan_loop_with_policy`)
-would advance coordination cursor state only. They would **not** perform
-item reads, detection fan-out, or finding derivation.
-
-The planned hook-enabled APIs (`run_scan_loop_with_page_processor`,
-`run_scan_loop_with_policy_and_page_processor`) would inject non-empty
-page processing before checkpoint for shadow-mode integration and
-adapter composition.
-
-### Retry and failure handling (planned)
-
-The planned retry model is a simple consecutive-failure counter (not a
-circuit breaker). When `transient_failures >= max_transient_retries`,
-the shard would be parked with `ParkReason::TooManyErrors`. Permanent
-errors would be parked with a heuristic-classified `ParkReason`. Lease
-renewal would use `DEFAULT_RENEW_AT_FRACTION = 0.5` (half-life trigger).
-Neither constant exists in the codebase yet.
+- **`gossip-scan-driver`** (`crates/gossip-scan-driver/src/lib.rs`) --
+  defines `ScanDriver::run()` and `ScanSourceFactory` traits.
+- **`gossip-connectors::scan_driver`** (`crates/gossip-connectors/src/scan_driver.rs`) --
+  provides `FilesystemScanSourceFactory`, `GitScanSourceFactory`, and
+  `InMemoryScanSourceFactory` (see Section 8a).
+- **`gossip-scanner-runtime`** (`crates/gossip-scanner-runtime/src/lib.rs`) --
+  provides `scan_fs()` and `scan_git()` top-level entry points that
+  compose driver execution with engine and event infrastructure.
 
 ---
 

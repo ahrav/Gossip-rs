@@ -481,7 +481,7 @@ The `SummaryEvent.status` field is set to `"partial"` when
 
 | Document                                                               | Relevance                                                      |
 | ---------------------------------------------------------------------- | -------------------------------------------------------------- |
-| [persistence-identity.md](../gossip-contracts/persistence-identity.md) | Identity contracts (RuleFingerprint, SecretHash, OccurrenceId) |
+| [boundary-1-identity-spine.md](../gossip-contracts/boundary-1-identity-spine.md) | Identity derivation chain (FindingId, SecretHash, OccurrenceId) |
 | [pipeline-flow.md](../pipeline-flow.md)                                | FS pipeline stages and buffer lifecycle                        |
 | [scheduler-engine-abstraction.md](scheduler-engine-abstraction.md)     | FindingWithHashRecord trait, EngineScratch changes             |
 | [scheduler-engine-impl.md](scheduler-engine-impl.md)                   | Real engine adapter, drain_findings_with_hashes                |

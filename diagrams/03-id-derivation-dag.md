@@ -1,6 +1,6 @@
 # ID Derivation DAG
 
-The identity system in Gossip defines 15 types organized into a directed acyclic graph (DAG) of derivations. Unlike a tree, many derived types have multiple inputs -- for example, `FindingId` depends on four separate upstream types simultaneously. Every derivation uses BLAKE3 with an explicit domain-separation constant so that the same raw bytes fed to different derivation functions produce cryptographically independent outputs.
+The identity system in Gossip defines 19 types organized into a directed acyclic graph (DAG) of derivations. Unlike a tree, many derived types have multiple inputs -- for example, `FindingId` depends on four separate upstream types simultaneously. Every derivation uses BLAKE3 with an explicit domain-separation constant so that the same raw bytes fed to different derivation functions produce cryptographically independent outputs.
 
 Three invariants govern the entire DAG:
 
@@ -10,12 +10,12 @@ Three invariants govern the entire DAG:
 
 ---
 
-## 1. Full 15-Type DAG
+## 1. Full 19-Type DAG
 
-The complete identity hierarchy shows how five root types (requiring no derivation) flow through intermediate structures into six derived 32-byte identifiers and one policy hash. The graph is a DAG because several derived types consume outputs from multiple independent roots.
+The complete identity hierarchy shows how five root types (requiring no derivation) flow through intermediate structures into eight derived 32-byte identifiers and one policy hash. The graph is a DAG because several derived types consume outputs from multiple independent roots.
 
 ```mermaid
-%% Diagram: full-15-type-dag
+%% Diagram: full-19-type-dag
 graph TD
     subgraph Roots ["Root Types (no derivation)"]
         TenantId["TenantId<br/><i>32B</i>"]
@@ -27,6 +27,7 @@ graph TD
 
     subgraph ItemIdentity ["Item Identity"]
         locator["locator<br/><i>Vec&lt;u8&gt;</i>"]
+        ConnectorInstanceIdHash["ConnectorInstanceIdHash<br/><i>32B</i>"]
         ItemIdentityKey["ItemIdentityKey<br/><i>variable</i>"]
         StableItemId["StableItemId<br/><i>32B</i>"]
         version_bytes["version_bytes"]
@@ -49,6 +50,11 @@ graph TD
         OccurrenceId["OccurrenceId<br/><i>32B</i>"]
     end
 
+    subgraph ObservationIdentity ["Observation Identity"]
+        ObservationIdInputs["ObservationIdInputs<br/><i>96B struct</i>"]
+        ObservationId["ObservationId<br/><i>32B</i>"]
+    end
+
     subgraph PolicyIdentity ["Policy Identity"]
         policy_hash_version["policy_hash_version<br/><i>u32</i>"]
         id_hash_mode["id_hash_mode<br/><i>u8</i>"]
@@ -60,6 +66,7 @@ graph TD
 
     %% Item chain
     ConnectorTag --> ItemIdentityKey
+    ConnectorInstanceIdHash --> ItemIdentityKey
     locator --> ItemIdentityKey
     ItemIdentityKey -->|"ITEM_ID_V1"| StableItemId
     version_bytes -->|"OBJECT_VERSION_V1"| ObjectVersionId
@@ -82,6 +89,12 @@ graph TD
     byte_length --> OccurrenceIdInputs
     OccurrenceIdInputs -->|"OCCURRENCE_ID_V1"| OccurrenceId
 
+    %% Observation chain
+    TenantId --> ObservationIdInputs
+    PolicyHash --> ObservationIdInputs
+    OccurrenceId --> ObservationIdInputs
+    ObservationIdInputs -->|"OBSERVATION_ID_V1"| ObservationId
+
     %% Policy chain
     policy_hash_version --> PolicyHashInputs
     id_hash_mode --> PolicyHashInputs
@@ -102,11 +115,14 @@ graph TD
     style FindingId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
     style OccurrenceId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
     style PolicyHash fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
+    style ConnectorInstanceIdHash fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
+    style ObservationId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
 
     style ItemIdentityKey fill:#F3F4F6,stroke:#374151,color:#374151
     style FindingIdInputs fill:#F3F4F6,stroke:#374151,color:#374151
     style OccurrenceIdInputs fill:#F3F4F6,stroke:#374151,color:#374151
     style PolicyHashInputs fill:#F3F4F6,stroke:#374151,color:#374151
+    style ObservationIdInputs fill:#F3F4F6,stroke:#374151,color:#374151
 
     style locator fill:#F3F4F6,stroke:#374151,color:#374151
     style version_bytes fill:#F3F4F6,stroke:#374151,color:#374151
@@ -121,8 +137,8 @@ graph TD
 Key observations about the full DAG:
 
 - **Five root types** require no derivation: `TenantId`, `TenantSecretKey`, `ConnectorTag`, `RuleFingerprint`, and `NormHash`.
-- **Six derived 32-byte types** are produced via BLAKE3: `StableItemId`, `ObjectVersionId`, `SecretHash`, `FindingId`, `OccurrenceId`, and `PolicyHash`.
-- **Three input structs** (`FindingIdInputs`, `OccurrenceIdInputs`, `PolicyHashInputs`) aggregate multiple fields before hashing, and `ItemIdentityKey` serves the same aggregation role for item identity.
+- **Eight derived 32-byte types** are produced via BLAKE3: `StableItemId`, `ObjectVersionId`, `SecretHash`, `FindingId`, `OccurrenceId`, `PolicyHash`, `ConnectorInstanceIdHash`, and `ObservationId`.
+- **Four input structs** (`FindingIdInputs`, `OccurrenceIdInputs`, `ObservationIdInputs`, `PolicyHashInputs`) aggregate multiple fields before hashing, and `ItemIdentityKey` serves the same aggregation role for item identity.
 - Every edge labeled with a domain constant (e.g., `FINDING_ID_V1`) represents a BLAKE3 derive-key invocation, except `SECRET_HASH_V1` which uses BLAKE3 keyed mode.
 
 ---
@@ -138,10 +154,14 @@ The item identity chain answers "what was scanned?" independently of who scanned
 graph LR
     ConnectorTag["ConnectorTag<br/>(8B, fixed)"]
     locator["locator<br/>(Vec&lt;u8&gt;, variable)"]
-    ItemIdentityKey["ItemIdentityKey<br/>(8B + len-prefixed locator)"]
+    instance_bytes["instance_bytes<br/>(variable)"]
+    ConnectorInstanceIdHash["ConnectorInstanceIdHash<br/>(32B)"]
+    ItemIdentityKey["ItemIdentityKey<br/>(8B tag + 32B instance + len-prefixed locator)"]
     StableItemId["StableItemId<br/>(32B)"]
 
+    instance_bytes -->|"BLAKE3 derive-key<br/>CONNECTOR_INSTANCE_ID_V1"| ConnectorInstanceIdHash
     ConnectorTag --> ItemIdentityKey
+    ConnectorInstanceIdHash --> ItemIdentityKey
     locator --> ItemIdentityKey
     ItemIdentityKey -->|"BLAKE3 derive-key<br/>ITEM_ID_V1"| StableItemId
 
@@ -152,13 +172,15 @@ graph LR
 
     style ConnectorTag fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
     style locator fill:#F3F4F6,stroke:#374151,color:#374151
+    style instance_bytes fill:#F3F4F6,stroke:#374151,color:#374151
     style version_bytes fill:#F3F4F6,stroke:#374151,color:#374151
+    style ConnectorInstanceIdHash fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
     style ItemIdentityKey fill:#F3F4F6,stroke:#374151,color:#374151
     style StableItemId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
     style ObjectVersionId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
 ```
 
-The `ConnectorTag` (8 bytes, null-padded ASCII) prevents cross-source collisions: a GitHub file at `org/repo/path.txt` and a GitLab file at the same locator hash to different `StableItemId` values. The `ItemIdentityKey` canonical encoding writes the fixed-width tag followed by a length-prefixed locator, ensuring unambiguous serialization (INV-S01). The domain constant `"gossip/item-id/v1"` isolates this derivation from all others (INV-S02).
+The `ConnectorTag` (8 bytes, null-padded ASCII) prevents cross-source collisions: a GitHub file at `org/repo/path.txt` and a GitLab file at the same locator hash to different `StableItemId` values. The `ConnectorInstanceIdHash` (32 bytes, derived from variable-length instance ID bytes via BLAKE3 derive-key with `CONNECTOR_INSTANCE_ID_V1`) prevents cross-instance collisions: two installations of the same connector scanning the same locator produce different `StableItemId` values. The `ItemIdentityKey` canonical encoding writes the fixed-width tag (8B) followed by the fixed-width instance hash (32B) followed by a length-prefixed locator, ensuring unambiguous serialization (INV-S01). The domain constant `"gossip/item-id/v1"` isolates this derivation from all others (INV-S02).
 
 `StableItemId` and `ObjectVersionId` are independent derivations with distinct BLAKE3 domain separators. Both are consumed downstream -- `StableItemId` in `FindingId` and `ObjectVersionId` in `OccurrenceId` -- but neither depends on the other.
 
@@ -325,6 +347,40 @@ This two-level design means operators never need to re-triage findings just beca
 
 ---
 
+## 7. Observation Identity Chain
+
+The observation identity chain answers "which policy detected this occurrence?" It enables the system to distinguish two policies detecting the same occurrence without changing the underlying `FindingId` or `OccurrenceId` derivations.
+
+```mermaid
+%% Diagram: observation-identity-chain
+graph TD
+    TenantId["TenantId<br/>(32B)"]
+    PolicyHash["PolicyHash<br/>(32B)"]
+    OccurrenceId["OccurrenceId<br/>(32B)"]
+
+    ObservationIdInputs["ObservationIdInputs<br/>(3 x 32 = 96B)"]
+
+    ObservationId["ObservationId<br/>(32B)"]
+
+    TenantId --> ObservationIdInputs
+    PolicyHash --> ObservationIdInputs
+    OccurrenceId --> ObservationIdInputs
+
+    ObservationIdInputs -->|"BLAKE3 derive-key<br/>OBSERVATION_ID_V1"| ObservationId
+
+    style TenantId fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
+    style PolicyHash fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
+    style OccurrenceId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
+    style ObservationIdInputs fill:#F3F4F6,stroke:#374151,color:#374151
+    style ObservationId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
+```
+
+`ObservationIdInputs` is a fixed-width struct (3 x 32 = 96 bytes). The `derive_observation_id()` function uses a cached BLAKE3 derive-key hasher with domain constant `"gossip/observation/v1"` (INV-S01, INV-S02).
+
+Because `PolicyHash` is included, a policy change (new rules, changed hash mode) produces new `ObservationId` values for existing occurrences. This lets the persistence layer track "policy A saw occurrence O" independently from "policy B saw occurrence O" — enabling accurate policy-versioned observation records without changing the version-stable `FindingId`.
+
+---
+
 ## Cross-References
 
 | Concept                                                                         | Related Section                                                           |
@@ -344,8 +400,8 @@ This two-level design means operators never need to re-triage findings just beca
 
 | File                                              | Purpose                                                                                                                                   |
 | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/gossip-contracts/src/identity/finding.rs` | `SecretHash`, `FindingId`, `OccurrenceId` types and derivation functions (`key_secret_hash`, `derive_finding_id`, `derive_occurrence_id`) |
-| `crates/gossip-contracts/src/identity/item.rs`    | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId` types and derivation                                                 |
+| `crates/gossip-contracts/src/identity/finding.rs` | `SecretHash`, `FindingId`, `OccurrenceId`, `ObservationId`, `ObservationIdInputs` types and derivation functions (`key_secret_hash`, `derive_finding_id`, `derive_occurrence_id`, `derive_observation_id`) |
+| `crates/gossip-contracts/src/identity/item.rs`    | `ConnectorTag`, `ConnectorInstanceIdHash`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId` types and derivation                                                 |
 | `crates/gossip-contracts/src/identity/policy.rs`  | `PolicyHashInputs`, `IdHashMode`, `compute_policy_hash` derivation                                                                        |
 | `crates/gossip-contracts/src/identity/types.rs`   | Root types: `TenantId`, `TenantSecretKey`, `PolicyHash`                                                                                   |
 | `crates/gossip-contracts/src/identity/domain.rs`  | All domain-separation constants (`ITEM_ID_V1`, `FINDING_ID_V1`, etc.)                                                                     |

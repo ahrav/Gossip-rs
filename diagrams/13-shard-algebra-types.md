@@ -465,7 +465,7 @@ flowchart TD
         P_VALIDATE["Validate child bounds<br/>within prefix range"]
         P_CHECK{"Bounds<br/>valid?"}
         P_DEMOTE["Return ShardHint::Range<br/>(demote from Prefix)"]
-        P_ERR["HintPropagationError::<br/>PrefixBoundaryViolation"]
+        P_ERR["HintPropagationError::<br/>InvalidPrefixBoundary"]
 
         P_VALIDATE --> P_CHECK
         P_CHECK -->|"Yes"| P_DEMOTE
@@ -476,17 +476,21 @@ flowchart TD
         M_DECODE["Decode child_start and<br/>child_end as ManifestRowKey"]
         M_ID{"manifest_id<br/>matches parent?"}
         M_ROWS{"Row bounds within<br/>[start_row, end_row)?"}
+        M_EMPTY{"start_row &lt;<br/>end_row?"}
         M_NARROW["Return narrowed<br/>ShardHint::Manifest"]
         M_ERR_ID["HintPropagationError::<br/>ManifestIdMismatch"]
         M_ERR_BOUND["HintPropagationError::<br/>InvalidManifestBoundary"]
         M_ERR_DECODE["HintPropagationError::<br/>InvalidManifestBoundary"]
+        M_ERR_EMPTY["HintPropagationError::<br/>EmptyManifestRange"]
 
         M_DECODE -->|"Ok"| M_ID
         M_DECODE -->|"Decode fails"| M_ERR_DECODE
         M_ID -->|"Yes"| M_ROWS
         M_ID -->|"No"| M_ERR_ID
-        M_ROWS -->|"Yes"| M_NARROW
+        M_ROWS -->|"Yes"| M_EMPTY
         M_ROWS -->|"No"| M_ERR_BOUND
+        M_EMPTY -->|"Yes"| M_NARROW
+        M_EMPTY -->|"No"| M_ERR_EMPTY
     end
 
     MATCH -->|"Range"| R_OUT
@@ -512,6 +516,8 @@ flowchart TD
     style M_ERR_ID fill:#FEE2E2,stroke:#991B1B,stroke-width:1px,color:#991B1B
     style M_ERR_BOUND fill:#FEE2E2,stroke:#991B1B,stroke-width:1px,color:#991B1B
     style M_ERR_DECODE fill:#FEE2E2,stroke:#991B1B,stroke-width:1px,color:#991B1B
+    style M_EMPTY fill:#FFF7ED,stroke:#9A3412,stroke-width:1px,color:#9A3412
+    style M_ERR_EMPTY fill:#FEE2E2,stroke:#991B1B,stroke-width:1px,color:#991B1B
 ```
 
 Propagation rules per variant:
@@ -520,11 +526,15 @@ Propagation rules per variant:
 | :----------- | :------------------------------------------------------------------------------------ | :--------------------- |
 | **Range**    | None                                                                                  | `Range` (pass-through) |
 | **Prefix**   | `child_start ≥ prefix`, `child_end ≤ prefix_successor(prefix)`                        | `Range` (demote)       |
-| **Manifest** | Decode child keys as `ManifestRowKey`, verify `manifest_id` match and row containment | Narrowed `Manifest`    |
+| **Manifest** | Decode child keys as `ManifestRowKey`, verify `manifest_id` match, row containment, and non-empty range | Narrowed `Manifest`    |
 
 The Prefix → Range demotion is intentional: after splitting, child ranges are
 expressed as raw byte bounds, not prefix bounds. The prefix structure is no longer
 meaningful at the child level.
+
+The Manifest path additionally rejects splits that would produce a child hint with
+zero rows (`start_row >= end_row`) via `EmptyManifestRange { start_row, end_row }`.
+This prevents degenerate manifest shards that have no work to enumerate.
 
 Source: `crates/gossip-frontier/src/hint.rs:961-1025`
 

@@ -2,9 +2,9 @@
 
 > **Implementation status: Design Target.** The circuit breaker types described below
 > (`CircuitBreakerState`, `CircuitConfig`) do **not** exist in compiled source code. The
-> current retry mechanism is a consecutive-failure counter in the scan loop
-> (`scan_loop.rs:131`, `DEFAULT_MAX_TRANSIENT_RETRIES = 3`). This document describes the
-> target design for a future circuit breaker implementation.
+> current retry mechanism uses a `RetryBudget` with `BackendError` classification
+> (`RetryableReason` / `PermanentReason`) in `scanner-scheduler/src/scheduler/failure.rs`.
+> This document describes the target design for a future circuit breaker implementation.
 
 The circuit breaker is a fault-isolation mechanism in the **B4 Connector** boundary that
 prevents cascading failures when external data sources become unavailable. The core
@@ -384,6 +384,6 @@ them.
 - **Connector design doc**: `docs/gossip-connectors/boundary-4-connectors.md`
 - **Connector module**: `crates/gossip-connectors/`
 - **Connector trait**: `crates/gossip-contracts/src/connector/`
-- **Scan loop retry logic**: `crates/gossip-scan-pipeline/src/scan_loop.rs`
+- **Retry budget and error classification**: `crates/scanner-scheduler/src/scheduler/failure.rs`
 - **Coordination backend**: `crates/gossip-coordination/src/traits.rs`
 - **Park reason types**: `crates/gossip-coordination/src/record.rs`
