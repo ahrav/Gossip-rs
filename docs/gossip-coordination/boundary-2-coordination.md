@@ -32,8 +32,8 @@ used by the in-memory backend. The persisted backend enforces those limits
 before `register_shards`, `split_replace`, and `split_residual` by counting
 existing shard-record keys under the relevant etcd prefixes, then rejecting
 growth that would exceed the configured caps.
-The remaining mutating operations (`complete` and `park_shard`) still fail
-closed until their persisted transaction shapes land.
+The remaining shard-level mutating operations (`complete` and `park_shard`)
+still fail closed until their persisted transaction shapes land.
 
 The module provides seven core capabilities:
 

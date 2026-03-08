@@ -2369,6 +2369,9 @@ fn split_replace_returns_collision_when_child_key_exists() {
     backend
         .test_seed_shard_record(&collision_record, &collision_slab)
         .expect("collision shard seed should succeed");
+    backend
+        .test_seed_active_shard_index(test_tenant(), test_run(), collision_id)
+        .expect("collision active-index seed should succeed");
     collision_record.deallocate_fields(&mut collision_slab);
     collision_slab.clear();
 
@@ -2456,6 +2459,9 @@ fn split_residual_returns_collision_when_residual_key_exists() {
     backend
         .test_seed_shard_record(&collision_record, &collision_slab)
         .expect("collision shard seed should succeed");
+    backend
+        .test_seed_active_shard_index(test_tenant(), test_run(), collision_id)
+        .expect("collision active-index seed should succeed");
     collision_record.deallocate_fields(&mut collision_slab);
     collision_slab.clear();
 

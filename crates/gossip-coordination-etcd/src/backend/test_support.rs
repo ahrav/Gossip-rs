@@ -165,10 +165,19 @@ impl EtcdCoordinator {
     }
 
     /// Delete every key under this coordinator's namespace prefix.
+    ///
+    /// Appends a trailing `/` to the stored prefix before issuing the
+    /// range-delete so that etcd's `with_prefix()` only matches keys
+    /// nested under this namespace — without the separator, prefix
+    /// `/foo/v1` would also match `/foo/v10/...`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_clear_namespace(&self) -> Result<(), EtcdCoordinatorError> {
+        let mut bounded = self.keyspace.prefix().to_owned();
+        if !bounded.ends_with('/') {
+            bounded.push('/');
+        }
         self.etcd_delete(
-            self.keyspace.prefix().as_bytes().to_vec(),
+            bounded.into_bytes(),
             Some(DeleteOptions::new().with_prefix()),
         )?;
         Ok(())
