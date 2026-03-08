@@ -193,7 +193,7 @@ pub struct SplitResidualResult {
 /// bits of entropy. Birthday collision probability reaches ~50% at
 /// ~2^31.5 derived IDs. This is acceptable for coordination use cases
 /// where the total number of derived shards per run is bounded by
-/// [`MAX_SPAWNED_PER_SHARD`](gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD) × shard count.
+/// [`MAX_SPAWNED_PER_SHARD`] × shard count.
 ///
 /// ## Caller Responsibility
 ///
@@ -387,6 +387,7 @@ impl SplitChildOrder {
         self.len
     }
 
+    /// Always `false` — `from_plan` enforces `len >= 2`.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {

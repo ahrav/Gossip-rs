@@ -55,9 +55,11 @@ pub(crate) const DEFAULT_MAX_CHILDREN_PER_OP: usize = 8;
 /// - **Shard count limits** cap persisted shard growth per tenant and across
 ///   the whole backend.
 /// - **Max children per split op** bounds the fanout of one atomic
-///   `split_replace` publication. Raising it also raises the transaction
-///   write count (`3 + 2 * children`), so operators must keep it within
-///   their cluster's txn-op budget.
+///   `split_replace` publication. Raising it also raises the total
+///   etcd txn-op count: writes = `3 + 2N`, compares = `4 + N`,
+///   total = `7 + 3N` where N = children. The default 8 yields 31
+///   total ops; operators raising the cap must verify against their
+///   cluster's `--max-txn-ops` (default 128).
 #[derive(Clone)]
 pub struct EtcdCoordinatorConfig {
     endpoints: Vec<String>,
@@ -342,9 +344,9 @@ impl EtcdCoordinatorConfig {
     /// Maximum children the backend will publish in one atomic split
     /// operation.
     ///
-    /// Higher values increase the `split_replace` transaction write count
-    /// as `3 + 2 * children`, so callers must keep this within the etcd
-    /// cluster's configured txn-op budget.
+    /// Higher values increase the total `split_replace` etcd txn-op count:
+    /// writes = `3 + 2N`, compares = `4 + N`, total = `7 + 3N`.
+    /// Operators must keep this within the cluster's `--max-txn-ops`.
     #[must_use]
     pub fn max_children_per_op(&self) -> usize {
         self.max_children_per_op

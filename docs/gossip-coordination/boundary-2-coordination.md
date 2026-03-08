@@ -23,13 +23,15 @@ Shard owner bindings live in separate etcd lease-backed keys so storage-layer
 liveness and logical lease deadlines are checked together before accepting
 progress updates. `split_replace` also enforces a backend-local
 `max_children_per_op` cap so one atomic child publication stays bounded.
+Each `split_replace` transaction uses `3 + 2N` writes and `4 + N` compares
+(total `7 + 3N` txn-ops, where N = children). The default cap of 8 yields
+31 total ops; operators raising the cap must verify the total stays within
+the cluster's `--max-txn-ops` budget (etcd default 128).
 The etcd config also carries the same per-tenant and global shard ceilings
 used by the in-memory backend. The persisted backend enforces those limits
 before `register_shards`, `split_replace`, and `split_residual` by counting
 existing shard-record keys under the relevant etcd prefixes, then rejecting
-growth that would exceed the configured caps. Operators that raise
-`max_children_per_op` must provision enough etcd txn-op budget for the
-larger `split_replace` write set.
+growth that would exceed the configured caps.
 The remaining mutating operations (`complete`, `park_shard`, run terminal
 transitions, `unpark_shard`) fail closed until their persisted transaction
 shapes land.
