@@ -1431,6 +1431,12 @@ impl CoordinationBackend for EtcdCoordinator {
         let key = lease.shard_key();
         let payload_hash = hash_split_replace_payload(&plan);
 
+        // Pre-allocate Vecs outside the retry loop; cleared per iteration.
+        let cap = self.config.max_children_per_op();
+        let mut child_puts: Vec<TxnOp> = Vec::with_capacity(cap);
+        let mut child_index_ops: Vec<TxnOp> = Vec::with_capacity(cap);
+        let mut child_absent_compares: Vec<Compare> = Vec::with_capacity(cap);
+
         for attempt in 0..self.config.optimistic_txn_retries() {
             let persisted = match self.load_shard_record(tenant, key) {
                 Ok(Some(shard)) => shard,
@@ -1485,9 +1491,9 @@ impl CoordinationBackend for EtcdCoordinator {
             )?;
 
             let mut child_ids = SplitChildIds::new();
-            let mut child_puts = Vec::with_capacity(sorted.len());
-            let mut child_index_ops = Vec::with_capacity(sorted.len());
-            let mut child_absent_compares = Vec::with_capacity(sorted.len());
+            child_puts.clear();
+            child_index_ops.clear();
+            child_absent_compares.clear();
 
             for sorted_index in 0..sorted.len() {
                 let child = sorted.child(&plan, sorted_index);
