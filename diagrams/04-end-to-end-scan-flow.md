@@ -275,14 +275,14 @@ green nodes entirely — it builds a single assignment and runs it directly.
 | Component                                                          | Path                                                |
 | ------------------------------------------------------------------ | --------------------------------------------------- |
 | CLI entry point and dispatch                                       | `crates/scanner-rs-cli/src/main.rs`                 |
-| Runtime core (`execute_assignment_with_config`, `driver_for_assignment`) | `crates/gossip-scanner-runtime/src/lib.rs:704-749`  |
-| Distributed worker loop (`run_worker`)                             | `crates/gossip-scanner-runtime/src/distributed.rs:120-183` |
-| `DistributedCoordinator` trait                                     | `crates/gossip-scanner-runtime/src/distributed.rs:36-54` |
-| `ScanDriver` trait and `Assignment`                                | `crates/gossip-scan-driver/src/lib.rs:126-509`      |
-| `CommitSink` trait and `NoOpCommitSink`                            | `crates/gossip-scan-driver/src/lib.rs:418-449`      |
-| `DurableCommitSink` (identity derivation)                          | `crates/gossip-scanner-runtime/src/commit_sink.rs:36-171` |
+| Runtime core (`execute_assignment_with_config`, `driver_for_assignment`) | `crates/gossip-scanner-runtime/src/lib.rs`  |
+| Distributed worker loop (`run_worker`)                             | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| `DistributedCoordinator` trait                                     | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| `ScanDriver` trait and `Assignment`                                | `crates/gossip-scan-driver/src/lib.rs`      |
+| `CommitSink` trait and `NoOpCommitSink`                            | `crates/gossip-scan-driver/src/lib.rs`      |
+| `DurableCommitSink` (identity derivation)                          | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
 | `FsScanDriver` / `GitScanDriver` / `InMemoryScanDriver`           | `crates/gossip-connectors/src/scan_driver.rs`       |
-| `parallel_scan_dir` (filesystem detection backend)                 | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs:555` |
-| `run_git_scan` (git detection backend)                             | `crates/scanner-git/src/runner.rs:1004`             |
-| `CoordinationEventRecorder` trait                                  | `crates/gossip-scanner-runtime/src/coordination_sink.rs:110-119` |
-| `EventOutput` trait                                                | `crates/scanner-scheduler/src/events.rs:95-98`      |
+| `parallel_scan_dir` (filesystem detection backend)                 | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
+| `run_git_scan` (git detection backend)                             | `crates/scanner-git/src/runner.rs`             |
+| `CoordinationEventRecorder` trait                                  | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
+| `EventOutput` trait                                                | `crates/scanner-scheduler/src/events.rs`      |

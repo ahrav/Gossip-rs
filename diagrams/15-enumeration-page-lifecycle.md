@@ -222,10 +222,10 @@ Connector page assembly converts raw byte slices from the data source into poole
 `ItemKey`/`ItemRef` wrappers backed by a shared `PooledByteSlab`. Two assembly paths
 exist, selected based on whether the connector's key bytes and ref bytes are identical.
 
-The filesystem connector uses the shared-slot path because `ItemRef` bytes are
-identical-by-construction to `ItemKey` bytes (both are the encoded relative path). The
-git and in-memory connectors use the two-slot path because their `ItemRef` bytes differ
-from key bytes (e.g., blob OID vs tree path).
+The filesystem and git connectors use the shared-slot path because their
+`ItemRef` bytes are identical-by-construction to `ItemKey` bytes (both use the
+same key encoding). The in-memory connector uses the two-slot path because its
+`ItemRef` bytes may differ from key bytes.
 
 ```mermaid
 %% Diagram: page-assembly-paths

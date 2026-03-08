@@ -505,38 +505,38 @@ direction) rather than open→stat.
 
 | Type / Function                | Location                                              | Purpose                                                         |
 | ------------------------------ | ----------------------------------------------------- | --------------------------------------------------------------- |
-| `FilesystemConnector`          | `crates/gossip-connectors/src/filesystem.rs:283`      | Top-level connector struct; owns walk state, root fd, estimator |
-| `WalkState`                    | `crates/gossip-connectors/src/filesystem.rs:258`      | Resumable DFS traversal state: stack, path buffer, cursor data  |
-| `WalkFrame`                    | `crates/gossip-connectors/src/filesystem.rs:190`      | Single DFS stack frame: component, depth, sorted entries, index |
-| `BufferedDirEntry`             | `crates/gossip-connectors/src/filesystem.rs:180`      | Name + file type pair for one directory entry                   |
-| `FileEntry`                    | `crates/gossip-connectors/src/filesystem.rs:162`      | Internal staging type: key, stable ID, version, size            |
-| `WalkToken`                    | `crates/gossip-connectors/src/filesystem.rs:230`      | Serialized DFS stack checkpoint for cursor resume               |
-| `WalkTokenFrame`               | `crates/gossip-connectors/src/filesystem.rs:234`      | Per-frame component bytes + consumed child count                |
-| `WalkQuery`                    | `crates/gossip-connectors/src/filesystem.rs:207`      | Borrowed per-call parameters: root, bounds, deadline, limits    |
-| `WalkWarning`                  | `crates/gossip-connectors/src/filesystem.rs:130`      | Non-fatal walk diagnostic with redacted path digest             |
-| `WalkState::new`               | `crates/gossip-connectors/src/filesystem.rs:1516`     | Create fresh walk from root directory                           |
-| `WalkState::from_token`        | `crates/gossip-connectors/src/filesystem.rs:1571`     | Restore walk state from serialized token                        |
-| `WalkState::next_file`         | `crates/gossip-connectors/src/filesystem.rs:1728`     | Core traversal: produce next file in sorted DFS order           |
-| `WalkState::poll_frame`        | `crates/gossip-connectors/src/filesystem.rs:1706`     | Pop next entry from frame with deadline cadence                 |
-| `should_skip_subtree`          | `crates/gossip-connectors/src/filesystem.rs:1407`     | Shard-range subtree pruning predicate                           |
-| `prefix_successor`             | `crates/gossip-connectors/src/filesystem.rs:1385`     | Lexicographic next prefix for pruning bound computation         |
-| `cmp_with_trailing_sep`        | `crates/gossip-connectors/src/filesystem.rs:1194`     | Git tree-order comparison with virtual trailing `/`             |
-| `cmp_dir_entry`                | `crates/gossip-connectors/src/filesystem.rs:1206`     | Entry sort comparator using `cmp_with_trailing_sep`             |
-| `read_dir_sorted_entries`      | `crates/gossip-connectors/src/filesystem.rs:1437`     | Buffer, sort, and cap one directory's entries                   |
-| `fast_forward_frame_entries`   | `crates/gossip-connectors/src/filesystem.rs:1499`     | Skip past consumed entries during token restore                 |
-| `WalkToken::encode_from_state` | `crates/gossip-connectors/src/filesystem.rs:1321`     | Two-pass serialization of DFS stack to token bytes              |
-| `WalkToken::decode_bytes`      | `crates/gossip-connectors/src/filesystem.rs:1270`     | Validated deserialization with traversal-attack rejection        |
-| `encode_rel_path`              | `crates/gossip-connectors/src/filesystem.rs:2026`     | Relative path → `/`-separated byte key                          |
-| `derive_fs_version_id`         | `crates/gossip-connectors/src/filesystem.rs:2068`     | Metadata-based weak version ID (mtime, size, ino, dev)          |
-| `open_beneath_root`            | `crates/gossip-connectors/src/filesystem.rs:946`      | Component-by-component `openat + O_NOFOLLOW` read path          |
-| `open_dir_fd`                  | `crates/gossip-connectors/src/filesystem.rs:2089`     | Open directory fd with `O_DIRECTORY + O_CLOEXEC`                |
-| `clear_nonblock`               | `crates/gossip-connectors/src/filesystem.rs:2120`     | Remove `O_NONBLOCK` after regular-file validation               |
-| `verify_root_identity`         | `crates/gossip-connectors/src/filesystem.rs:2186`     | fstat-based root `(dev, ino)` verification                      |
-| `intersect_key_bounds`         | `crates/gossip-connectors/src/filesystem.rs:1220`     | Merge request + connector key-range bounds                      |
-| `enumerate_page_bounds`        | `crates/gossip-connectors/src/filesystem.rs:737`      | Core page loop: walk → filter → assemble → cursor               |
-| `align_walk_to_cursor`         | `crates/gossip-connectors/src/filesystem.rs:593`      | Token restore → key-only fallback cursor alignment              |
+| `FilesystemConnector`          | `crates/gossip-connectors/src/filesystem.rs`      | Top-level connector struct; owns walk state, root fd, estimator |
+| `WalkState`                    | `crates/gossip-connectors/src/filesystem.rs`      | Resumable DFS traversal state: stack, path buffer, cursor data  |
+| `WalkFrame`                    | `crates/gossip-connectors/src/filesystem.rs`      | Single DFS stack frame: component, depth, sorted entries, index |
+| `BufferedDirEntry`             | `crates/gossip-connectors/src/filesystem.rs`      | Name + file type pair for one directory entry                   |
+| `FileEntry`                    | `crates/gossip-connectors/src/filesystem.rs`      | Internal staging type: key, stable ID, version, size            |
+| `WalkToken`                    | `crates/gossip-connectors/src/filesystem.rs`      | Serialized DFS stack checkpoint for cursor resume               |
+| `WalkTokenFrame`               | `crates/gossip-connectors/src/filesystem.rs`      | Per-frame component bytes + consumed child count                |
+| `WalkQuery`                    | `crates/gossip-connectors/src/filesystem.rs`      | Borrowed per-call parameters: root, bounds, deadline, limits    |
+| `WalkWarning`                  | `crates/gossip-connectors/src/filesystem.rs`      | Non-fatal walk diagnostic with redacted path digest             |
+| `WalkState::new`               | `crates/gossip-connectors/src/filesystem.rs`     | Create fresh walk from root directory                           |
+| `WalkState::from_token`        | `crates/gossip-connectors/src/filesystem.rs`     | Restore walk state from serialized token                        |
+| `WalkState::next_file`         | `crates/gossip-connectors/src/filesystem.rs`     | Core traversal: produce next file in sorted DFS order           |
+| `WalkState::poll_frame`        | `crates/gossip-connectors/src/filesystem.rs`     | Pop next entry from frame with deadline cadence                 |
+| `should_skip_subtree`          | `crates/gossip-connectors/src/filesystem.rs`     | Shard-range subtree pruning predicate                           |
+| `prefix_successor`             | `crates/gossip-connectors/src/filesystem.rs`     | Lexicographic next prefix for pruning bound computation         |
+| `cmp_with_trailing_sep`        | `crates/gossip-connectors/src/filesystem.rs`     | Git tree-order comparison with virtual trailing `/`             |
+| `cmp_dir_entry`                | `crates/gossip-connectors/src/filesystem.rs`     | Entry sort comparator using `cmp_with_trailing_sep`             |
+| `read_dir_sorted_entries`      | `crates/gossip-connectors/src/filesystem.rs`     | Buffer, sort, and cap one directory's entries                   |
+| `fast_forward_frame_entries`   | `crates/gossip-connectors/src/filesystem.rs`     | Skip past consumed entries during token restore                 |
+| `WalkToken::encode_from_state` | `crates/gossip-connectors/src/filesystem.rs`     | Two-pass serialization of DFS stack to token bytes              |
+| `WalkToken::decode_bytes`      | `crates/gossip-connectors/src/filesystem.rs`     | Validated deserialization with traversal-attack rejection        |
+| `encode_rel_path`              | `crates/gossip-connectors/src/filesystem.rs`     | Relative path → `/`-separated byte key                          |
+| `derive_fs_version_id`         | `crates/gossip-connectors/src/filesystem.rs`     | Metadata-based weak version ID (mtime, size, ino, dev)          |
+| `open_beneath_root`            | `crates/gossip-connectors/src/filesystem.rs`      | Component-by-component `openat + O_NOFOLLOW` read path          |
+| `open_dir_fd`                  | `crates/gossip-connectors/src/filesystem.rs`     | Open directory fd with `O_DIRECTORY + O_CLOEXEC`                |
+| `clear_nonblock`               | `crates/gossip-connectors/src/filesystem.rs`     | Remove `O_NONBLOCK` after regular-file validation               |
+| `verify_root_identity`         | `crates/gossip-connectors/src/filesystem.rs`     | fstat-based root `(dev, ino)` verification                      |
+| `intersect_key_bounds`         | `crates/gossip-connectors/src/filesystem.rs`     | Merge request + connector key-range bounds                      |
+| `enumerate_page_bounds`        | `crates/gossip-connectors/src/filesystem.rs`      | Core page loop: walk → filter → assemble → cursor               |
+| `align_walk_to_cursor`         | `crates/gossip-connectors/src/filesystem.rs`      | Token restore → key-only fallback cursor alignment              |
 | `StreamingSplitEstimator`      | `crates/gossip-connectors/src/split_estimator.rs`     | Reservoir-sampled split-point estimation fed during walk         |
-| `DEADLINE_CHECK_INTERVAL`      | `crates/gossip-connectors/src/filesystem.rs:1138`     | Entries between deadline polls (512)                             |
-| `MAX_ENTRIES_PER_DIR`          | `crates/gossip-connectors/src/filesystem.rs:1145`     | Per-directory buffer cap (500,000)                               |
-| `WALK_TOKEN_VERSION`           | `crates/gossip-connectors/src/filesystem.rs:219`      | Current token format version byte (`0x01`)                       |
+| `DEADLINE_CHECK_INTERVAL`      | `crates/gossip-connectors/src/filesystem.rs`     | Entries between deadline polls (512)                             |
+| `MAX_ENTRIES_PER_DIR`          | `crates/gossip-connectors/src/filesystem.rs`     | Per-directory buffer cap (500,000)                               |
+| `WALK_TOKEN_VERSION`           | `crates/gossip-connectors/src/filesystem.rs`      | Current token format version byte (`0x01`)                       |
 | `MAX_TOKEN_SIZE`               | `crates/gossip-contracts/src/connector/`              | Upper bound on serialized token bytes                            |
