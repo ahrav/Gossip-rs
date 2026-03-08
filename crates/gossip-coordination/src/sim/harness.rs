@@ -451,6 +451,9 @@ impl From<SplitError> for RejectionKind {
             SplitError::ShardNotFound { .. } => Self::ShardNotFound,
             SplitError::TenantMismatch { .. } => Self::TenantMismatch,
             SplitError::ResourceExhausted(_) => Self::ResourceExhausted,
+            SplitError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }
