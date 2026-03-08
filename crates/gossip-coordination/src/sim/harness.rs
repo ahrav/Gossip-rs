@@ -364,8 +364,8 @@ impl From<AcquireError> for RejectionKind {
             AcquireError::ShardNotFound { .. } => Self::ShardNotFound,
             AcquireError::TenantMismatch { .. } => Self::TenantMismatch,
             AcquireError::AlreadyLeased { .. } => Self::AlreadyLeased,
-            AcquireError::BackendError { message } => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            AcquireError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -379,8 +379,8 @@ impl From<RenewError> for RejectionKind {
             RenewError::ShardTerminal { .. } => Self::TerminalState,
             RenewError::ShardNotFound { .. } => Self::ShardNotFound,
             RenewError::TenantMismatch { .. } => Self::TenantMismatch,
-            RenewError::BackendError { message } => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            RenewError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -401,8 +401,8 @@ impl From<CheckpointError> for RejectionKind {
             CheckpointError::TenantMismatch { .. } => Self::TenantMismatch,
             CheckpointError::CheckpointMissingKey => Self::CheckpointMissingKey,
             CheckpointError::ResourceExhausted(_) => Self::ResourceExhausted,
-            CheckpointError::BackendError { message } => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            CheckpointError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -423,8 +423,8 @@ impl From<CompleteError> for RejectionKind {
             CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
             CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,
             CompleteError::ResourceExhausted(_) => Self::ResourceExhausted,
-            CompleteError::BackendError { message } => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            CompleteError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -454,8 +454,8 @@ impl From<SplitError> for RejectionKind {
             SplitError::ShardNotFound { .. } => Self::ShardNotFound,
             SplitError::TenantMismatch { .. } => Self::TenantMismatch,
             SplitError::ResourceExhausted(_) => Self::ResourceExhausted,
-            SplitError::BackendError { message } => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            SplitError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -469,8 +469,8 @@ impl From<UnparkError> for RejectionKind {
             UnparkError::RunTerminal { .. } => Self::TerminalState,
             UnparkError::NotParked { .. } => Self::NotParked,
             UnparkError::OpIdConflict(_) => Self::OpIdConflict,
-            UnparkError::BackendError { message } => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            UnparkError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -484,8 +484,8 @@ impl From<RunTransitionError> for RejectionKind {
             RunTransitionError::RunTerminal { .. } => Self::TerminalState,
             RunTransitionError::WrongStatus { .. } => Self::WrongRunStatus,
             RunTransitionError::OpIdConflict(_) => Self::OpIdConflict,
-            RunTransitionError::BackendError { message } => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            RunTransitionError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -2013,8 +2013,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             Err(ClaimError::TenantMismatch { .. }) => SimEvent::Rejected {
                 kind: RejectionKind::TenantMismatch,
             },
-            Err(ClaimError::BackendError { message }) => {
-                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            Err(ClaimError::BackendError(infra)) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
             }
         }
     }
@@ -2707,7 +2707,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 match sess.checkpoint(now, &update, op_ids[i]) {
                     Ok(_) => checkpoints_ok += 1,
                     Err(e) => {
-                        if matches!(e, CheckpointError::BackendError { .. }) {
+                        if matches!(e, CheckpointError::BackendError(..)) {
                             panic!(
                                 "simulation backend produced unexpected infrastructure error: {e:?}"
                             );
@@ -2748,9 +2748,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         op_ids[terminal_idx],
                     ) {
                         Ok(_) => true,
-                        Err(CompleteError::BackendError { message }) => {
+                        Err(CompleteError::BackendError(infra)) => {
                             panic!(
-                                "simulation backend produced unexpected infrastructure error: {message}"
+                                "simulation backend produced unexpected infrastructure error: {infra}"
                             )
                         }
                         Err(e) => {
@@ -2807,9 +2807,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                                 split_children: children.iter().copied().collect(),
                             })
                         }
-                        Err(SplitError::BackendError { message }) => {
+                        Err(SplitError::BackendError(infra)) => {
                             panic!(
-                                "simulation backend produced unexpected infrastructure error: {message}"
+                                "simulation backend produced unexpected infrastructure error: {infra}"
                             )
                         }
                         Err(e) => {
@@ -2855,9 +2855,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     // split_residual is non-terminal (&mut self) — session stays active.
                     let split_ok = match sess.split_residual(now, plan, op_ids[terminal_idx]) {
                         Ok(_) => true,
-                        Err(SplitError::BackendError { message }) => {
+                        Err(SplitError::BackendError(infra)) => {
                             panic!(
-                                "simulation backend produced unexpected infrastructure error: {message}"
+                                "simulation backend produced unexpected infrastructure error: {infra}"
                             )
                         }
                         Err(e) => {
@@ -2886,9 +2886,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                             op_ids[complete_idx],
                         ) {
                             Ok(_) => true,
-                            Err(CompleteError::BackendError { message }) => {
+                            Err(CompleteError::BackendError(infra)) => {
                                 panic!(
-                                    "simulation backend produced unexpected infrastructure error: {message}"
+                                    "simulation backend produced unexpected infrastructure error: {infra}"
                                 )
                             }
                             Err(e) => {

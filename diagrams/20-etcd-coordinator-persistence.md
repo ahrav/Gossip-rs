@@ -26,12 +26,21 @@ persistence layer:
 
 ## 1. Backend Architecture
 
-`EtcdCoordinator` directly persists all coordination state to etcd using
-optimistic CAS (compare-and-swap) transactions. Each mutating operation reads
-the current record, validates preconditions locally, builds a CAS transaction
-conditioned on the record's `mod_revision`, and retries with jittered
-exponential backoff on CAS failure. There is no in-process delegation layer —
-the etcd cluster is the single source of truth.
+The etcd coordination backend has two entrypoints:
+
+- **`EtcdCoordinator`** — sync wrapper that owns a single-threaded Tokio
+  runtime. Wraps each etcd RPC in `block_on()`. Use when no async runtime
+  is available.
+- **`AsyncEtcdCoordinator`** — async core that implements
+  `AsyncCoordinationBackend` and `AsyncRunManagement`. Callers provide
+  their own async runtime. Use inside existing Tokio tasks.
+
+Both directly persist all coordination state to etcd using optimistic CAS
+(compare-and-swap) transactions. Each mutating operation reads the current
+record, validates preconditions locally, builds a CAS transaction conditioned
+on the record's `mod_revision`, and retries with jittered exponential backoff
+on CAS failure. There is no in-process delegation layer — the etcd cluster is
+the single source of truth.
 
 Shard ownership uses a dual-key design: a persistent shard record (keyed under
 `/shards/{id}`) and an ephemeral `/owner` key with an etcd lease TTL. When the
@@ -41,16 +50,23 @@ owner key, making the shard eligible for re-acquisition.
 ```mermaid
 %% Diagram: etcd-backend-architecture
 graph TB
-    subgraph caller ["Caller (Scanner Runtime)"]
-        SR["Coordination trait callers<br/>Sync &amp;mut self methods"]
+    subgraph caller ["Callers"]
+        SR_SYNC["Sync callers<br/>&amp;mut self methods"]
+        SR_ASYNC["Async callers<br/>async fn methods"]
     end
 
-    subgraph etcd_coord ["EtcdCoordinator"]
+    subgraph sync_coord ["EtcdCoordinator (sync wrapper)"]
         CONFIG["EtcdCoordinatorConfig<br/>endpoints: Vec&lt;String&gt;<br/>namespace_prefix: String"]
         KS["EtcdKeyspace<br/>Deterministic key builder<br/>rooted at namespace prefix"]
         RT["tokio::runtime::Runtime<br/>Current-thread, sync-async bridge"]
-        CLIENT["etcd_client::Client<br/>Live gRPC connection"]
         SCRATCH["claim_candidates_scratch<br/>Reusable Vec&lt;ShardId&gt; buffer"]
+    end
+
+    subgraph async_coord ["AsyncEtcdCoordinator (async core)"]
+        A_CONFIG["EtcdCoordinatorConfig"]
+        A_KS["EtcdKeyspace"]
+        A_CLIENT["etcd_client::Client<br/>Live gRPC connection"]
+        A_SCRATCH["claim_candidates_scratch"]
     end
 
     subgraph bridge ["Sync-Async Bridge Helpers"]
@@ -66,18 +82,25 @@ graph TB
         ETCD["etcd v3 gRPC API<br/>CAS transactions, lease TTL,<br/>prefix scans"]
     end
 
-    SR --> etcd_coord
+    SR_SYNC --> sync_coord
+    SR_ASYNC --> async_coord
     CONFIG --> KS
     RT -->|"block_on()"| bridge
     bridge -->|"client.get/txn/lease_*"| ETCD
+    A_CLIENT -->|"direct async calls"| ETCD
 
-    style SR fill:#F3F4F6,stroke:#374151,color:#374151
+    style SR_SYNC fill:#F3F4F6,stroke:#374151,color:#374151
+    style SR_ASYNC fill:#F3F4F6,stroke:#374151,color:#374151
 
     style CONFIG fill:#DCFCE7,stroke:#166534,color:#166534
     style KS fill:#DCFCE7,stroke:#166534,color:#166534
     style RT fill:#F3F4F6,stroke:#374151,color:#374151
-    style CLIENT fill:#F3F4F6,stroke:#374151,color:#374151
     style SCRATCH fill:#F3F4F6,stroke:#374151,color:#374151
+
+    style A_CONFIG fill:#DCFCE7,stroke:#166534,color:#166534
+    style A_KS fill:#DCFCE7,stroke:#166534,color:#166534
+    style A_CLIENT fill:#F3F4F6,stroke:#374151,color:#374151
+    style A_SCRATCH fill:#F3F4F6,stroke:#374151,color:#374151
 
     style GET fill:#DCFCE7,stroke:#166534,color:#166534
     style TXN fill:#DCFCE7,stroke:#166534,color:#166534
@@ -90,7 +113,8 @@ graph TB
 
 ### Connection lifecycle
 
-`EtcdCoordinator::connect()` performs a two-phase fail-fast initialization:
+Both `EtcdCoordinator::connect()` and `AsyncEtcdCoordinator::connect()`
+perform a two-phase fail-fast initialization:
 
 | Phase | Action | Error |
 |:---|:---|:---|
@@ -98,15 +122,20 @@ graph TB
 | 2. Status probe | Round-trips a maintenance `Status` RPC to confirm reachability | `EtcdCoordinatorError::Etcd { Status }` |
 
 On success the caller holds a validated config, a live etcd connection, and
-a `EtcdKeyspace` for deterministic key generation. A `debug_assert!` prevents
-nested `block_on` calls by verifying no Tokio runtime is already active.
+a `EtcdKeyspace` for deterministic key generation. `EtcdCoordinator::connect()`
+asserts that no Tokio runtime is already active (nested `block_on` panics).
+`AsyncEtcdCoordinator::connect()` requires an existing async context.
 
 ### Sync-async bridge
 
-The coordination traits are synchronous. The etcd client is async (tonic/gRPC).
-A private current-thread Tokio runtime bridges the gap via `block_on()`. A
-`debug_assert!` guard prevents calling trait methods from within an active Tokio
+The sync coordination traits (`CoordinationBackend`, `RunManagement`) are
+synchronous. The etcd client is async (tonic/gRPC). `EtcdCoordinator` bridges
+the gap with a private current-thread Tokio runtime via `block_on()`. An
+assertion guard prevents calling trait methods from within an active Tokio
 async context (nested `block_on` panics).
+
+`AsyncEtcdCoordinator` bypasses this bridge entirely — its methods are native
+`async fn` and callers provide their own runtime.
 
 ---
 
@@ -404,24 +433,32 @@ Config `Debug` output redacts credentials from endpoint URIs, showing
 ## 5. Integration with Coordination Traits
 
 The etcd backend plugs into the same trait hierarchy used by all coordination
-backends. The three traits define the full coordination surface:
+backends. The sync traits define the traditional surface; the async traits
+provide the same semantics for I/O-bound contexts:
 
 ```mermaid
 %% Diagram: etcd-trait-integration
 graph TB
-    subgraph traits ["Coordination Trait Hierarchy"]
+    subgraph sync_traits ["Sync Coordination Traits"]
         direction TB
         CB_TRAIT["CoordinationBackend<br/>7 shard lifecycle methods:<br/>acquire_and_restore_into, renew, checkpoint,<br/>complete, park, split_replace,<br/>split_residual"]
         RM_TRAIT["RunManagement<br/>10 run lifecycle methods:<br/>create/complete/fail/cancel run,<br/>register_shards, get_run,<br/>get_run_progress, list_shards,<br/>collect_claim_candidates, unpark"]
         SC_TRAIT["ShardClaiming<br/>1 method:<br/>claim_next_available"]
     end
 
-    subgraph backends ["Coordination Backends"]
-        INMEM_BACK["InMemoryCoordinator<br/>(reference implementation)"]
-        ETCD_BACK["EtcdCoordinator<br/>(etcd-backed, direct persistence)"]
+    subgraph async_traits ["Async Coordination Traits"]
+        direction TB
+        ACB_TRAIT["AsyncCoordinationBackend<br/>7 async fn shard lifecycle methods<br/>(same semantics as sync)"]
+        ARM_TRAIT["AsyncRunManagement<br/>10 async fn run lifecycle methods<br/>(same semantics as sync)"]
     end
 
-    subgraph etcd_modules ["EtcdCoordinator Modules"]
+    subgraph backends ["Coordination Backends"]
+        INMEM_BACK["InMemoryCoordinator<br/>(reference implementation)"]
+        ETCD_BACK["EtcdCoordinator<br/>(sync wrapper, block_on bridge)"]
+        ASYNC_ETCD_BACK["AsyncEtcdCoordinator<br/>(async core, native futures)"]
+    end
+
+    subgraph etcd_modules ["Shared etcd Modules"]
         MOD_CONFIG["config.rs<br/>Endpoint + prefix validation<br/>Credential redaction"]
         MOD_KS["keyspace.rs<br/>Deterministic key paths<br/>Buffer-reuse API"]
         MOD_CODEC["codec.rs<br/>Binary encode/decode<br/>Staged slab rollback"]
@@ -445,18 +482,27 @@ graph TB
     ETCD_BACK -.->|"implements"| RM_TRAIT
     ETCD_BACK -.->|"implements"| SC_TRAIT
 
+    ASYNC_ETCD_BACK -.->|"implements"| ACB_TRAIT
+    ASYNC_ETCD_BACK -.->|"implements"| ARM_TRAIT
+
     ETCD_BACK --> MOD_CONFIG
-    ETCD_BACK --> MOD_KS
-    ETCD_BACK --> MOD_CODEC
-    ETCD_BACK --> MOD_ERR
     ETCD_BACK --> MOD_BACK
+    ASYNC_ETCD_BACK --> MOD_CONFIG
+    ASYNC_ETCD_BACK --> MOD_BACK
+
+    MOD_BACK --> MOD_KS
+    MOD_BACK --> MOD_CODEC
+    MOD_BACK --> MOD_ERR
 
     style CB_TRAIT fill:#22C55E,stroke:#166534,color:#FFF
     style RM_TRAIT fill:#22C55E,stroke:#166534,color:#FFF
     style SC_TRAIT fill:#22C55E,stroke:#166534,color:#FFF
+    style ACB_TRAIT fill:#22C55E,stroke:#166534,color:#FFF
+    style ARM_TRAIT fill:#22C55E,stroke:#166534,color:#FFF
 
     style INMEM_BACK fill:#DCFCE7,stroke:#166534,color:#166534
     style ETCD_BACK fill:#22C55E,stroke:#166534,color:#FFF
+    style ASYNC_ETCD_BACK fill:#22C55E,stroke:#166534,color:#FFF
 
     style MOD_CONFIG fill:#DCFCE7,stroke:#166534,color:#166534
     style MOD_KS fill:#DCFCE7,stroke:#166534,color:#166534
@@ -479,7 +525,7 @@ graph TB
 | `keyspace.rs` | Complete | Deterministic paths, buffer-reuse API, scan isolation |
 | `codec.rs` | Complete | Binary encode/decode, staged rollback, fuzz-tested |
 | `error.rs` | Complete | Full error hierarchy with operation labels |
-| `backend.rs` | Mostly complete | Direct etcd persistence via CAS transactions; `complete` and `park_shard` not yet implemented |
+| `backend.rs` | Mostly complete | Direct etcd persistence via CAS transactions for both `EtcdCoordinator` (sync) and `AsyncEtcdCoordinator` (async); `complete` and `park_shard` not yet implemented in either entrypoint |
 
 The keyspace and codec are shared infrastructure used by the CAS transaction
 logic in `backend.rs`. Operations that are not yet implemented panic with
@@ -508,7 +554,7 @@ them.
 | File | Purpose |
 |:---|:---|
 | `crates/gossip-coordination-etcd/src/lib.rs` | Crate root, public re-exports |
-| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` struct, CAS transaction logic, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), CAS transaction logic, sync-async bridge |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |
@@ -516,5 +562,5 @@ them.
 | `crates/gossip-coordination-etcd/src/tests.rs` | Config, keyspace, property tests, integration test |
 | `crates/gossip-coordination-etcd/src/codec_tests.rs` | Codec round-trip and error-case tests |
 | `crates/gossip-coordination-etcd/fuzz/fuzz_targets/` | 4 libfuzzer targets for decode/round-trip |
-| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend`, `RunManagement`, `ShardClaiming` trait definitions |
+| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend`, `AsyncCoordinationBackend`, `RunManagement`, `AsyncRunManagement`, `ShardClaiming` trait definitions |
 | `crates/gossip-coordination/src/in_memory.rs` | `InMemoryCoordinator` reference implementation |

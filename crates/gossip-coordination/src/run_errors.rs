@@ -25,6 +25,7 @@
 
 use std::fmt;
 
+use crate::error::InfraError;
 use crate::record::ShardStatus;
 use crate::run::{RunConfigError, RunOpIdConflict, RunStatus};
 use gossip_contracts::coordination::manifest::ManifestValidationError;
@@ -71,10 +72,9 @@ pub enum CreateRunError {
     GetRunFailed(GetRunError),
     /// A run with this `RunId` already exists with a different `RunConfig`.
     ConfigMismatch { run: RunId },
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Display for CreateRunError {
@@ -87,8 +87,8 @@ impl fmt::Display for CreateRunError {
             Self::ConfigMismatch { run } => {
                 write!(f, "run {run:?} exists with different config")
             }
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
@@ -100,9 +100,8 @@ impl std::error::Error for CreateRunError {
             Self::InvalidConfig(e) => Some(e),
             Self::RegisterShardsFailed(e) => Some(e),
             Self::GetRunFailed(e) => Some(e),
-            Self::RunAlreadyExists { .. }
-            | Self::ConfigMismatch { .. }
-            | Self::BackendError { .. } => None,
+            Self::RunAlreadyExists { .. } | Self::ConfigMismatch { .. } => None,
+            Self::BackendError(infra) => Some(infra),
         }
     }
 }
@@ -160,10 +159,9 @@ pub enum RegisterShardsError {
     /// Coordinator memory resources could not satisfy an allocation request.
     /// Recoverable: retry with a larger runtime memory budget.
     ResourceExhausted { resource: &'static str },
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Debug for RegisterShardsError {
@@ -196,10 +194,7 @@ impl fmt::Debug for RegisterShardsError {
                 .debug_struct("ResourceExhausted")
                 .field("resource", resource)
                 .finish(),
-            Self::BackendError { message } => f
-                .debug_struct("BackendError")
-                .field("message", message)
-                .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -230,8 +225,8 @@ impl fmt::Display for RegisterShardsError {
             Self::ResourceExhausted { resource } => {
                 write!(f, "coordinator resource exhausted: {resource}")
             }
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
@@ -241,6 +236,7 @@ impl std::error::Error for RegisterShardsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ManifestInvalid(e) => Some(e),
+            Self::BackendError(infra) => Some(infra),
             _ => None,
         }
     }
@@ -263,10 +259,9 @@ pub enum GetRunError {
     RunNotFound,
     /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
     TenantMismatch { expected: TenantId },
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Display for GetRunError {
@@ -276,14 +271,21 @@ impl fmt::Display for GetRunError {
             Self::TenantMismatch { expected } => {
                 write!(f, "tenant mismatch (expected {expected:?})")
             }
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for GetRunError {}
+impl std::error::Error for GetRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 // ============================================================================
 // RunTransitionError
@@ -320,10 +322,9 @@ pub enum RunTransitionError {
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
     /// to prevent external access to raw hash values (hash redaction).
     OpIdConflict(RunOpIdConflict),
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Debug for RunTransitionError {
@@ -344,10 +345,7 @@ impl fmt::Debug for RunTransitionError {
                 .field("target", target)
                 .finish(),
             Self::OpIdConflict(c) => c.fmt(f),
-            Self::BackendError { message } => f
-                .debug_struct("BackendError")
-                .field("message", message)
-                .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -374,14 +372,21 @@ impl fmt::Display for RunTransitionError {
                 ),
             },
             Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for RunTransitionError {}
+impl std::error::Error for RunTransitionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 impl_from_run_op_id_conflict!(RunTransitionError);
 
@@ -407,10 +412,9 @@ pub enum UnparkError {
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
     /// to prevent external access to raw hash values (hash redaction).
     OpIdConflict(RunOpIdConflict),
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Debug for UnparkError {
@@ -429,10 +433,7 @@ impl fmt::Debug for UnparkError {
                 f.debug_struct("NotParked").field("status", status).finish()
             }
             Self::OpIdConflict(c) => c.fmt(f),
-            Self::BackendError { message } => f
-                .debug_struct("BackendError")
-                .field("message", message)
-                .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -451,14 +452,21 @@ impl fmt::Display for UnparkError {
                 write!(f, "shard is not parked (status: {status})")
             }
             Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for UnparkError {}
+impl std::error::Error for UnparkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 impl_from_run_op_id_conflict!(UnparkError);
 
@@ -488,7 +496,7 @@ mod tests {
         }
     }
 
-    // -- SEC-1: No actual tenant in any TenantMismatch --
+    // -- No actual tenant in any TenantMismatch (tenant isolation) --
 
     #[rstest]
     #[case::register_shards(RegisterShardsError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
@@ -506,7 +514,7 @@ mod tests {
         );
     }
 
-    // -- SEC-6: OpIdConflict Debug redacts hashes --
+    // -- OpIdConflict Debug redacts hashes (prevents oracle attacks) --
 
     #[rstest]
     #[case::register_shards(format!("{:?}", RegisterShardsError::OpIdConflict(test_conflict())))]
@@ -527,7 +535,7 @@ mod tests {
         );
     }
 
-    // -- SEC-6: OpIdConflict Display does not leak hashes --
+    // -- OpIdConflict Display does not leak hashes --
 
     #[rstest]
     #[case::register_shards(RegisterShardsError::OpIdConflict(test_conflict()).to_string())]
@@ -631,14 +639,14 @@ mod tests {
     #[case::transition_wrong_status_done(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Done }.to_string())]
     #[case::transition_wrong_status_failed(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Failed }.to_string())]
     #[case::transition_op_id_conflict(RunTransitionError::OpIdConflict(test_conflict()).to_string())]
-    #[case::transition_backend_error(RunTransitionError::BackendError { message: "test".into() }.to_string())]
+    #[case::transition_backend_error(RunTransitionError::BackendError(InfraError::transient("test_op", "test")).to_string())]
     // UnparkError
     #[case::unpark_not_found(UnparkError::ShardNotFound.to_string())]
     #[case::unpark_tenant_mismatch(UnparkError::TenantMismatch { expected: test_tenant() }.to_string())]
     #[case::unpark_run_terminal(UnparkError::RunTerminal { status: RunStatus::Cancelled }.to_string())]
     #[case::unpark_not_parked(UnparkError::NotParked { status: ShardStatus::Active }.to_string())]
     #[case::unpark_op_id_conflict(UnparkError::OpIdConflict(test_conflict()).to_string())]
-    #[case::unpark_backend_error(UnparkError::BackendError { message: "test".into() }.to_string())]
+    #[case::unpark_backend_error(UnparkError::BackendError(InfraError::transient("test_op", "test")).to_string())]
     fn all_variants_display_non_empty(#[case] display: String) {
         assert!(!display.is_empty(), "variant has empty Display: {display}");
     }

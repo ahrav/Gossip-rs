@@ -37,7 +37,7 @@
 
 use std::fmt;
 
-use crate::error::{AcquireError, AcquireResultView, AcquireScratch};
+use crate::error::{AcquireError, AcquireResultView, AcquireScratch, InfraError};
 use crate::run::RunManagement;
 use crate::run_errors::GetRunError;
 use crate::traits::CoordinationBackend;
@@ -106,10 +106,9 @@ pub enum ClaimError {
     /// from flooding the coordinator across multiple runs. Only
     /// successful claims trigger cooldown; failed claims do not.
     Throttled { retry_after: LogicalTime },
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 /// Human-readable formatting for logging and error display chains.
@@ -139,14 +138,21 @@ impl fmt::Display for ClaimError {
                     "claim throttled: worker in cooldown (retry after {retry_after:?})"
                 )
             }
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for ClaimError {}
+impl std::error::Error for ClaimError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 /// Maps run-lookup errors into claim errors.
 ///
@@ -159,7 +165,7 @@ impl From<GetRunError> for ClaimError {
         match e {
             GetRunError::RunNotFound => Self::RunNotFound,
             GetRunError::TenantMismatch { expected } => Self::TenantMismatch { expected },
-            GetRunError::BackendError { message } => Self::BackendError { message },
+            GetRunError::BackendError(infra) => Self::BackendError(infra),
         }
     }
 }
@@ -327,10 +333,10 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                 // other candidates would hit the same mismatch.
                 return Err(ClaimError::TenantMismatch { expected });
             }
-            Err(AcquireError::BackendError { message }) => {
+            Err(AcquireError::BackendError(infra)) => {
                 // Infrastructure error — fail immediately; retrying
                 // other candidates is unlikely to succeed.
-                return Err(ClaimError::BackendError { message });
+                return Err(ClaimError::BackendError(infra));
             }
         }
     };
@@ -451,18 +457,18 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
 ///
 /// ```rust,ignore
 /// fn run_orchestrator<B: CoordinationFacade>(backend: &mut B) {
-///     // Phase 1: Setup -- create run and register its shard manifest.
+///     // Setup: create run and register its shard manifest.
 ///     // The run transitions Initializing -> Active on register_shards.
 ///     backend.create_run(now, tenant, run_id, config)?;
 ///     backend.register_shards(now, tenant, run_id, shards, op_id)?;
 ///
-///     // Phase 2: Processing -- each worker claims a shard, processes
+///     // Processing: each worker claims a shard, processes
 ///     // it with periodic checkpoints, and marks it complete.
 ///     let result = backend.claim_next_available(now, tenant, run_id, worker)?;
 ///     backend.checkpoint(now, tenant, &result.lease, cursor, op_id)?;
 ///     backend.complete(now, tenant, &result.lease, final_cursor, op_id)?;
 ///
-///     // Phase 3: Finalization -- once all shards are Done, the
+///     // Finalization: once all shards are Done, the
 ///     // orchestrator marks the run as Done (terminal).
 ///     backend.complete_run(now, tenant, run_id, op_id)?;
 /// }

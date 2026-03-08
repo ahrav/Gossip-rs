@@ -4,9 +4,9 @@
 //! surfaces out of the production backend implementation while still sharing
 //! the same private storage/runtime helpers.
 
-use super::EtcdCoordinator;
 #[cfg(any(test, feature = "test-support"))]
 use super::PersistedShard;
+use super::{AsyncEtcdCoordinator, EtcdCoordinator};
 #[cfg(any(test, feature = "test-support"))]
 use crate::codec::{encode_run_record, encode_shard_record};
 #[cfg(any(test, feature = "test-support"))]
@@ -238,7 +238,7 @@ impl EtcdCoordinator {
         let Some(kv) = response.kvs().first() else {
             return Ok(None);
         };
-        let binding = self.decode_owner_binding(EtcdOperation::Get, kv.value())?;
+        let binding = super::decode_owner_binding(EtcdOperation::Get, kv.value())?;
         Ok(Some((binding.worker, binding.fence, kv.lease())))
     }
 
@@ -319,13 +319,13 @@ impl EtcdCoordinator {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn inject_split_replace_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
         self.maybe_drop_owner_before_split_replace_txn(tenant, key)
-            .unwrap_or_else(|err| self.fatal_storage_error("split_replace.inject_fault", err));
+            .unwrap_or_else(|err| super::fatal_storage_error("split_replace.inject_fault", err));
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn inject_split_residual_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
         self.maybe_drop_owner_before_split_residual_txn(tenant, key)
-            .unwrap_or_else(|err| self.fatal_storage_error("split_residual.inject_fault", err));
+            .unwrap_or_else(|err| super::fatal_storage_error("split_residual.inject_fault", err));
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
@@ -338,6 +338,97 @@ impl EtcdCoordinator {
 
     #[cfg(not(any(test, feature = "test-support")))]
     pub(super) fn inject_split_residual_fault_if_armed(
+        &mut self,
+        _tenant: TenantId,
+        _key: ShardKey,
+    ) {
+    }
+}
+
+impl AsyncEtcdCoordinator {
+    #[cfg(any(test, feature = "test-support"))]
+    async fn etcd_delete(
+        &self,
+        key: Vec<u8>,
+        options: Option<etcd_client::DeleteOptions>,
+    ) -> Result<etcd_client::DeleteResponse, crate::error::EtcdCoordinatorError> {
+        let mut client = self.client.clone();
+        client.delete(key, options).await.map_err(|source| {
+            crate::error::EtcdCoordinatorError::Etcd {
+                operation: crate::error::EtcdOperation::Delete,
+                source,
+            }
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn maybe_drop_owner_before_split_replace_txn(
+        &mut self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<(), crate::error::EtcdCoordinatorError> {
+        if !self.test_faults.drop_owner_before_next_split_replace_txn {
+            return Ok(());
+        }
+        self.test_faults.drop_owner_before_next_split_replace_txn = false;
+        let owner_key = self
+            .keyspace
+            .shard_owner_key(tenant, key.run(), key.shard())
+            .into_bytes();
+        self.etcd_delete(owner_key, None).await?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn maybe_drop_owner_before_split_residual_txn(
+        &mut self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<(), crate::error::EtcdCoordinatorError> {
+        if !self.test_faults.drop_owner_before_next_split_residual_txn {
+            return Ok(());
+        }
+        self.test_faults.drop_owner_before_next_split_residual_txn = false;
+        let owner_key = self
+            .keyspace
+            .shard_owner_key(tenant, key.run(), key.shard())
+            .into_bytes();
+        self.etcd_delete(owner_key, None).await?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) async fn inject_split_replace_fault_if_armed(
+        &mut self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) {
+        self.maybe_drop_owner_before_split_replace_txn(tenant, key)
+            .await
+            .unwrap_or_else(|err| super::fatal_storage_error("split_replace.inject_fault", err));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) async fn inject_split_residual_fault_if_armed(
+        &mut self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) {
+        self.maybe_drop_owner_before_split_residual_txn(tenant, key)
+            .await
+            .unwrap_or_else(|err| super::fatal_storage_error("split_residual.inject_fault", err));
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub(super) async fn inject_split_replace_fault_if_armed(
+        &mut self,
+        _tenant: TenantId,
+        _key: ShardKey,
+    ) {
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub(super) async fn inject_split_residual_fault_if_armed(
         &mut self,
         _tenant: TenantId,
         _key: ShardKey,

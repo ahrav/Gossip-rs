@@ -1,11 +1,22 @@
 //! etcd-backed coordination backend for shard and run lifecycle management.
 //!
-//! This crate provides [`EtcdCoordinator`], which implements the coordination
-//! trait surface ([`CoordinationBackend`], [`RunManagement`],
-//! [`ShardClaiming`]) against persisted etcd state. It uses etcd transactions
-//! for fenced hot-path mutations, publishes worker-visible active-run/shard
-//! indexes, garbage-collects stale partially created runs, and uses real etcd
-//! leases for ephemeral shard-owner bindings.
+//! This crate provides two entrypoints:
+//!
+//! - [`EtcdCoordinator`] — sync wrapper that owns a single-threaded Tokio
+//!   runtime. Implements [`CoordinationBackend`], [`RunManagement`], and
+//!   [`ShardClaiming`] by wrapping etcd RPCs in `block_on`.
+//!   Use this when no async runtime is available.
+//! - [`AsyncEtcdCoordinator`] — async core that implements
+//!   [`AsyncCoordinationBackend`] and [`AsyncRunManagement`]. Use this
+//!   when an async runtime is already available (e.g., inside a Tokio task).
+//!
+//! Both share the same coordination logic and static helpers, with the
+//! only difference being their execution model.
+//!
+//! Both use etcd transactions for fenced hot-path mutations, publish
+//! worker-visible active-run/shard indexes, garbage-collect stale
+//! partially created runs, and use real etcd leases for ephemeral
+//! shard-owner bindings.
 //!
 //! # Architecture
 //!
@@ -14,11 +25,13 @@
 //! - **`config`** — Validated connection parameters (endpoints, namespace
 //!   prefix, shard limits, tuning). Construction normalizes whitespace and
 //!   enforces keyspace prefix invariants.
-//! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client and a
-//!   single-threaded Tokio runtime, exposes health-check (`status()`), and
-//!   executes persisted coordination transactions for run lifecycle, shard
-//!   lifecycle, and cold-path maintenance. Feature-gated test seeding and
-//!   fault-injection helpers live in `backend/test_support.rs`.
+//! - **`backend`** — [`EtcdCoordinator`] and [`AsyncEtcdCoordinator`]:
+//!   the sync wrapper and async core respectively. Both implement the
+//!   full coordination trait surface (sync and async variants). Each wraps
+//!   etcd RPC calls, health-check (`status()`), and persisted
+//!   coordination transactions for run lifecycle, shard lifecycle, and
+//!   cold-path maintenance. Feature-gated test seeding and fault-injection
+//!   helpers live in `backend/test_support.rs`.
 //! - **`keyspace`** — Deterministic ASCII etcd path construction for runs,
 //!   shards, ownership leases, and active indexes. See the module docs for
 //!   the full key layout.
@@ -34,7 +47,9 @@
 //! variable pointing to its binary).
 //!
 //! [`CoordinationBackend`]: gossip_coordination::CoordinationBackend
+//! [`AsyncCoordinationBackend`]: gossip_coordination::AsyncCoordinationBackend
 //! [`RunManagement`]: gossip_coordination::RunManagement
+//! [`AsyncRunManagement`]: gossip_coordination::AsyncRunManagement
 //! [`ShardClaiming`]: gossip_coordination::ShardClaiming
 
 #![forbid(unsafe_code)]
@@ -45,7 +60,7 @@ mod config;
 mod error;
 mod keyspace;
 
-pub use backend::EtcdCoordinator;
+pub use backend::{AsyncEtcdCoordinator, EtcdCoordinator};
 #[cfg(any(test, feature = "test-support"))]
 pub use backend::{EtcdTestFault, EtcdTestShardSnapshot};
 pub use codec::{

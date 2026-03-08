@@ -21,6 +21,7 @@
 //! | [`RunProgress`] | Aggregated shard status counts for observability |
 //! | [`ShardFilter`] / [`ShardSummary`] | Querying and summarizing shard state within a run |
 //! | [`RunManagement`] | Admin trait for run lifecycle + shard unparking |
+//! | [`AsyncRunManagement`] | Async variant of `RunManagement` for I/O-bound backends |
 //!
 //! ## Idempotency
 //!
@@ -443,7 +444,7 @@ pub struct RunOpIdConflict {
     pub actual_hash: u64,
 }
 
-// Custom Debug: redact hashes per SEC-6.
+// Custom Debug: redact hashes to prevent oracle attacks on payload hashing.
 impl fmt::Debug for RunOpIdConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RunOpIdConflict")
@@ -1811,6 +1812,153 @@ pub trait RunManagement {
     /// - [`UnparkError::NotParked`] — shard is not in Parked status.
     /// - [`UnparkError::OpIdConflict`] — `op_id` reused with different payload.
     fn unpark_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, UnparkError>;
+}
+
+// ============================================================================
+// AsyncRunManagement — async counterpart for I/O-bound backends
+// ============================================================================
+
+/// Async variant of [`RunManagement`] for backends that perform real I/O.
+///
+/// The semantic contract is identical to [`RunManagement`]. See that
+/// trait's documentation for the full lifecycle, idempotency guarantees,
+/// and error conditions.
+///
+/// ## When to use which trait
+///
+/// | Trait | Use case |
+/// |-------|----------|
+/// | [`RunManagement`] | In-memory backends, deterministic simulation, sync contexts |
+/// | [`AsyncRunManagement`] | Production backends with network-attached storage (etcd, FoundationDB, PostgreSQL) |
+///
+/// ## Default implementations
+///
+/// `create_run_with_shards` has a default implementation that composes
+/// the async `create_run`, `register_shards`, and `get_run` primitives,
+/// mirroring the sync default. Production backends should override with
+/// a transactional implementation to avoid partial-creation races under
+/// concurrent callers.
+#[allow(async_fn_in_trait)]
+pub trait AsyncRunManagement {
+    /// Async version of [`RunManagement::create_run`].
+    async fn create_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        config: RunConfig,
+    ) -> Result<RunRecord, CreateRunError>;
+
+    /// Async version of [`RunManagement::register_shards`].
+    async fn register_shards(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        shards: &[InitialShardInput<'_>],
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError>;
+
+    /// Async version of [`RunManagement::create_run_with_shards`].
+    ///
+    /// Default implementation composes `create_run` + `register_shards` +
+    /// `get_run`. Not atomic: a crash between steps may leave a run in
+    /// `Initializing` without registered shards. Production backends
+    /// should override with a transactional implementation.
+    async fn create_run_with_shards(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        config: RunConfig,
+        shards: &[InitialShardInput<'_>],
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<RunRecord>, CreateRunError> {
+        match self.create_run(now, tenant, run, config).await {
+            Ok(_) => {}
+            Err(CreateRunError::RunAlreadyExists { .. }) => {
+                let existing = self.get_run(tenant, run).await?;
+                if existing.config != config {
+                    return Err(CreateRunError::ConfigMismatch { run });
+                }
+            }
+            Err(e) => return Err(e),
+        }
+
+        let outcome = self
+            .register_shards(now, tenant, run, shards, op_id)
+            .await?;
+
+        let record = self.get_run(tenant, run).await?;
+
+        Ok(outcome.map(|_| record))
+    }
+
+    /// Async version of [`RunManagement::get_run`].
+    async fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError>;
+
+    /// Async version of [`RunManagement::get_run_progress`].
+    async fn get_run_progress(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<RunProgress, GetRunError>;
+
+    /// Async version of [`RunManagement::list_shards_into`].
+    async fn list_shards_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        filter: ShardFilter,
+        out: &mut Vec<ShardSummary>,
+    ) -> Result<(), GetRunError>;
+
+    /// Async version of [`RunManagement::collect_claim_candidates_into`].
+    async fn collect_claim_candidates_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        candidates: &mut Vec<ShardId>,
+    ) -> Result<Option<LogicalTime>, GetRunError>;
+
+    /// Async version of [`RunManagement::complete_run`].
+    async fn complete_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
+
+    /// Async version of [`RunManagement::fail_run`].
+    async fn fail_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
+
+    /// Async version of [`RunManagement::cancel_run`].
+    async fn cancel_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
+
+    /// Async version of [`RunManagement::unpark_shard`].
+    async fn unpark_shard(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,

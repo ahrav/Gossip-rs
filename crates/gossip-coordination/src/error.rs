@@ -3,12 +3,20 @@
 //!
 //! ## Architecture
 //!
-//! [`CoordError`] is the shared building block. Each coordination operation
-//! has a dedicated error type ([`CheckpointError`], [`CompleteError`], etc.)
-//! that accepts only the [`CoordError`] variants semantically valid for that
-//! operation. This gives callers precise `match` arms: a [`CheckpointError`]
-//! can never produce `AlreadyLeased`, and a [`RenewError`] can never produce
+//! [`CoordError`] is the shared building block for shard-level protocol
+//! errors. Each coordination operation has a dedicated error type
+//! ([`CheckpointError`], [`CompleteError`], etc.) that accepts only the
+//! [`CoordError`] variants semantically valid for that operation. This
+//! gives callers precise `match` arms: a [`CheckpointError`] can never
+//! produce `AlreadyLeased`, and a [`RenewError`] can never produce
 //! `OpIdConflict`.
+//!
+//! [`InfraError`] represents infrastructure-level failures from coordination
+//! backends (network timeouts, storage corruption). It is backend-agnostic
+//! and classifies errors as either [`Transient`](InfraError::Transient)
+//! (retryable) or [`Corruption`](InfraError::Corruption) (permanent).
+//! Every operation-specific error type carries a `BackendError(InfraError)`
+//! variant for surfacing infrastructure failures alongside protocol errors.
 //!
 //! The tradeoff is boilerplate `From<CoordError>` impls -- one per operation
 //! error type -- which are finite and mechanical.
@@ -88,6 +96,99 @@ use gossip_contracts::coordination::shard_spec::{
 use gossip_contracts::identity::{
     FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId,
 };
+
+// ============================================================================
+// InfraError -- typed infrastructure error for coordination backends
+// ============================================================================
+
+/// Structured infrastructure error for coordination backends.
+///
+/// Typed variants allow callers to programmatically distinguish transient
+/// I/O failures from permanent data corruption without parsing strings.
+///
+/// Backend-agnostic: contains no etcd-specific or backend-specific types.
+/// The `operation` field identifies the failing step as a human-readable
+/// label (e.g., `"acquire.load_shard"`, `"renew.txn"`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InfraError {
+    /// Transient infrastructure failure — the operation may succeed on retry
+    /// after backoff.
+    ///
+    /// Covers network timeouts, gRPC failures, unavailable storage nodes,
+    /// and CAS retry budget exhaustion.
+    Transient {
+        /// What was being attempted (e.g., `"acquire.load_shard"`).
+        operation: String,
+        /// Human-readable description from the underlying I/O layer.
+        message: String,
+    },
+
+    /// Permanent data corruption — the stored state is inconsistent and
+    /// retrying will not help. Requires operator investigation.
+    ///
+    /// Covers codec decode failures, op-log invariant violations (e.g.,
+    /// kind mismatches on idempotent replay), and missing records that
+    /// the protocol requires to exist.
+    Corruption {
+        /// What was being attempted when corruption was detected.
+        operation: String,
+        /// Details about the inconsistency.
+        message: String,
+    },
+}
+
+impl InfraError {
+    /// Create a transient infrastructure error.
+    pub fn transient(operation: impl Into<String>, message: impl fmt::Display) -> Self {
+        Self::Transient {
+            operation: operation.into(),
+            message: message.to_string(),
+        }
+    }
+
+    /// Create a corruption error.
+    pub fn corruption(operation: impl Into<String>, message: impl fmt::Display) -> Self {
+        Self::Corruption {
+            operation: operation.into(),
+            message: message.to_string(),
+        }
+    }
+
+    /// Whether this error is transient (retrying may succeed).
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient { .. })
+    }
+
+    /// Whether this error indicates permanent data corruption.
+    #[must_use]
+    pub fn is_corruption(&self) -> bool {
+        matches!(self, Self::Corruption { .. })
+    }
+
+    /// The operation label describing what was being attempted.
+    #[must_use]
+    pub fn operation(&self) -> &str {
+        match self {
+            Self::Transient { operation, .. } | Self::Corruption { operation, .. } => operation,
+        }
+    }
+}
+
+impl fmt::Display for InfraError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transient { operation, message } => {
+                write!(f, "[transient] {operation}: {message}")
+            }
+            Self::Corruption { operation, message } => {
+                write!(f, "[corruption] {operation}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InfraError {}
 
 // ============================================================================
 // CoordError -- shared error building blocks
@@ -384,10 +485,9 @@ pub enum AcquireError {
         lease_deadline: LogicalTime,
     },
 
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 // Custom Debug: redacts `current_owner` to prevent worker identity
@@ -413,10 +513,7 @@ impl fmt::Debug for AcquireError {
                 .field("current_owner", &"<redacted>")
                 .field("lease_deadline", lease_deadline)
                 .finish(),
-            Self::BackendError { message } => f
-                .debug_struct("BackendError")
-                .field("message", message)
-                .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -435,14 +532,21 @@ impl fmt::Display for AcquireError {
             Self::AlreadyLeased { lease_deadline, .. } => {
                 write!(f, "shard already leased (deadline {lease_deadline:?})")
             }
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for AcquireError {}
+impl std::error::Error for AcquireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 /// Error from `renew`.
 ///
@@ -473,10 +577,9 @@ pub enum RenewError {
         shard: ShardKey,
         status: ShardStatus,
     },
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Display for RenewError {
@@ -496,14 +599,21 @@ impl fmt::Display for RenewError {
             Self::ShardTerminal { shard, status } => {
                 write!(f, "shard {shard:?} is terminal ({status})")
             }
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for RenewError {}
+impl std::error::Error for RenewError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 /// Error from `checkpoint`.
 ///
@@ -561,10 +671,9 @@ pub enum CheckpointError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Debug for CheckpointError {
@@ -619,10 +728,7 @@ impl fmt::Debug for CheckpointError {
                 .finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
-            Self::BackendError { message } => f
-                .debug_struct("BackendError")
-                .field("message", message)
-                .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -661,14 +767,21 @@ impl fmt::Display for CheckpointError {
             }
             Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for CheckpointError {}
+impl std::error::Error for CheckpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 impl From<SlabFull> for CheckpointError {
     fn from(e: SlabFull) -> Self {
@@ -730,10 +843,9 @@ pub enum CompleteError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
-    /// The coordination backend encountered a transient infrastructure
-    /// error (e.g., network timeout, storage unavailability). The caller
-    /// may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Debug for CompleteError {
@@ -788,10 +900,7 @@ impl fmt::Debug for CompleteError {
                 .finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
-            Self::BackendError { message } => f
-                .debug_struct("BackendError")
-                .field("message", message)
-                .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -830,14 +939,21 @@ impl fmt::Display for CompleteError {
             }
             Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
 }
 
-impl std::error::Error for CompleteError {}
+impl std::error::Error for CompleteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 impl From<SlabFull> for CompleteError {
     fn from(e: SlabFull) -> Self {
@@ -985,9 +1101,9 @@ pub enum SplitError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
-    /// Transient coordination backend I/O error (e.g. etcd unreachable).
-    /// Recoverable: the caller may retry after a backoff.
-    BackendError { message: String },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Debug for SplitError {
@@ -1024,10 +1140,7 @@ impl fmt::Debug for SplitError {
                 .finish(),
             Self::SplitInvalid(inner) => f.debug_tuple("SplitInvalid").field(inner).finish(),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
-            Self::BackendError { message } => f
-                .debug_struct("BackendError")
-                .field("message", message)
-                .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -1066,8 +1179,8 @@ impl fmt::Display for SplitError {
             }
             Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
-            Self::BackendError { message } => {
-                write!(f, "coordination backend error: {message}")
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
             }
         }
     }
@@ -1077,6 +1190,7 @@ impl std::error::Error for SplitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SplitInvalid(inner) => Some(inner),
+            Self::BackendError(infra) => Some(infra),
             _ => None,
         }
     }
