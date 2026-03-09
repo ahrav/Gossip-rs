@@ -40,6 +40,7 @@ io-uring = "0.6"
 [features]
 default = []
 kani = []
+loom = ["dep:loom", "gossip-stdx/loom"]
 perf-stats = ["scanner-engine/perf-stats"]
 stats = ["perf-stats", "scanner-engine/stats"]
 b64-stats = ["stats", "scanner-engine/b64-stats"]
