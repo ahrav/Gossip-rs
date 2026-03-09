@@ -586,6 +586,8 @@ fn keyspace_typed_keys_preserve_kind_and_relationships() {
     let keyspace = EtcdKeyspace::new("/gossip/v1").expect("valid keyspace prefix");
     let shard_key = keyspace.shard_record_key(tenant, run, shard);
     let owner_key = shard_key.owner_key();
+    let shard_active_key = keyspace.shard_active_index_key(tenant, run, shard);
+    let run_key = keyspace.run_record_key(tenant, run);
 
     assert_eq!(
         owner_key.as_str(),
@@ -598,6 +600,38 @@ fn keyspace_typed_keys_preserve_kind_and_relationships() {
     assert_eq!(
         PersistedShardSubtreeKey::classify(owner_key.as_bytes()),
         Some(PersistedShardSubtreeKey::Owner)
+    );
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(shard_active_key.as_bytes()),
+        None
+    );
+    assert_eq!(PersistedShardSubtreeKey::classify(run_key.as_bytes()), None);
+}
+
+/// Uppercase hex segments are rejected to preserve canonical lowercase keys.
+#[test]
+fn keyspace_rejects_uppercase_hex_suffixes() {
+    let tenant = TenantId::from_bytes([0xAB; 32]);
+    let run = RunId::from_raw(0x0123_4567_89ab_cdef);
+    let keyspace = EtcdKeyspace::new("/gossip/v1").expect("valid keyspace prefix");
+
+    let run_prefix = keyspace.run_records_scan_prefix(tenant);
+    let run_key_upper = format!("{run_prefix}00000000000000AA");
+    assert_eq!(
+        crate::RunRecordKey::parse_direct_run_id(&run_prefix, run_key_upper.as_bytes()),
+        None
+    );
+
+    let shard_prefix = keyspace.shard_records_scan_prefix(tenant, run);
+    let shard_record_upper = format!("{shard_prefix}00000000000000AA");
+    let shard_owner_upper = format!("{shard_prefix}00000000000000AA/owner");
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(shard_record_upper.as_bytes()),
+        None
+    );
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(shard_owner_upper.as_bytes()),
+        None
     );
 }
 

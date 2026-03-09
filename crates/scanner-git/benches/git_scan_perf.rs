@@ -185,6 +185,12 @@ fn parse_args() -> Option<BenchConfig> {
         }
     }
 
+    if next_is_repo {
+        eprintln!("missing value for --repo");
+        print_usage(&exe);
+        std::process::exit(2);
+    }
+
     let repo = repo?;
 
     Some(BenchConfig {

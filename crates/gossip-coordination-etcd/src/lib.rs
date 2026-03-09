@@ -36,7 +36,8 @@
 //!   helpers live in `backend/test_support.rs`.
 //! - **`keyspace`** — Deterministic ASCII etcd path construction plus typed
 //!   exact-key wrappers for runs, shards, ownership leases, and active
-//!   indexes. See the module docs for the full key layout.
+//!   indexes. See [`EtcdKeyspace`] and the exported key wrapper types for
+//!   the full key layout.
 //! - **`codec`** — Explicit binary encoding for coordination records and
 //!   shard-owner bindings persisted to etcd.
 //! - **`error`** — Unified error types covering configuration validation,

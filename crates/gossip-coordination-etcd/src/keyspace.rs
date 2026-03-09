@@ -188,7 +188,7 @@ macro_rules! impl_exact_key {
 
         impl EtcdKey for $name {
             fn into_bytes(self) -> Vec<u8> {
-                self.into_bytes()
+                String::from(self).into_bytes()
             }
         }
     };
@@ -757,6 +757,12 @@ fn parse_direct_hex_u64_child(prefix: &[u8], key: &[u8]) -> Option<u64> {
 
 fn parse_hex_u64_suffix_bytes(suffix: &[u8]) -> Option<u64> {
     if suffix.len() != 16 {
+        return None;
+    }
+    if !suffix
+        .iter()
+        .all(|&byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return None;
     }
     let suffix = std::str::from_utf8(suffix).ok()?;

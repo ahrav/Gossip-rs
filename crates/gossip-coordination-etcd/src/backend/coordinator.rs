@@ -13,7 +13,8 @@ use crate::config::{DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::keyspace::EtcdKeyspace;
 use crate::keyspace::{
-    PersistedShardSubtreeKey, RunActiveIndexKey, RunRecordKey, ShardOwnerKey, ShardRecordKey,
+    PersistedShardSubtreeKey, RunActiveIndexKey, RunRecordKey, ShardActiveIndexKey, ShardOwnerKey,
+    ShardRecordKey,
 };
 
 use super::{
@@ -505,6 +506,9 @@ impl EtcdCoordinator {
                     record_kvs.push((record_key, kv.value().to_vec(), kv.mod_revision()));
                 }
                 None => {
+                    // Fail closed when an unknown key appears inside the
+                    // persisted shard subtree: this keyspace is schema-bound
+                    // and mixed-version readers must upgrade in lockstep.
                     return Err(EtcdCoordinatorError::Codec {
                         operation: EtcdOperation::Get,
                         source: EtcdCodecError::InvariantViolation {
@@ -526,15 +530,25 @@ impl EtcdCoordinator {
                 }
             })?;
 
-            // Defense-in-depth: verify record identity matches the scan
-            // prefix. The prefix constrains etcd results, but a corrupt
-            // record could embed mismatched tenant/run fields.
+            // Defense-in-depth: verify decoded payload identity matches
+            // the scanned key path. The prefix constrains etcd results,
+            // but corrupt data can still encode mismatched tenant/run/shard.
             if record.tenant != tenant || record.run != run {
                 return Err(EtcdCoordinatorError::Codec {
                     operation: EtcdOperation::Get,
                     source: EtcdCodecError::InvariantViolation {
                         kind: "ShardRecord",
                         detail: "shard record identity disagrees with scan prefix",
+                    },
+                });
+            }
+            let expected_key = self.keyspace.shard_record_key(tenant, run, record.shard);
+            if record_key != expected_key {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "ShardRecord",
+                        detail: "shard record shard id disagrees with key path",
                     },
                 });
             }
@@ -660,19 +674,18 @@ impl EtcdCoordinator {
             u32::MAX
         });
 
-        let shards_prefix = self
-            .keyspace
-            .shard_records_scan_prefix(tenant, run)
-            .into_bytes();
+        let shards_prefix = self.keyspace.shard_records_scan_prefix(tenant, run);
         let keys_response = self.etcd_get(
-            shards_prefix,
+            shards_prefix.as_bytes().to_vec(),
             Some(GetOptions::new().with_prefix().with_keys_only()),
         )?;
         let owned_count = u32::try_from(
             keys_response
                 .kvs()
                 .iter()
-                .filter(|kv| ShardOwnerKey::from_encoded_key(kv.key()).is_some())
+                .filter(|kv| {
+                    ShardOwnerKey::parse_owned_shard(shards_prefix.as_bytes(), kv.key()).is_some()
+                })
                 .count(),
         )
         .unwrap_or(u32::MAX);
@@ -696,13 +709,15 @@ impl EtcdCoordinator {
         prefix: String,
     ) -> Result<usize, EtcdCoordinatorError> {
         let response = self.etcd_get(
-            prefix.into_bytes(),
+            prefix.as_bytes().to_vec(),
             Some(GetOptions::new().with_prefix().with_keys_only()),
         )?;
         Ok(response
             .kvs()
             .iter()
-            .filter(|kv| ShardRecordKey::from_encoded_key(kv.key()).is_some())
+            // `parse_direct_shard_id` accepts only direct `{hex}` children.
+            // This excludes `/owner` keys and deeper descendants.
+            .filter(|kv| ShardActiveIndexKey::parse_direct_shard_id(&prefix, kv.key()).is_some())
             .count())
     }
 
@@ -1417,6 +1432,9 @@ impl AsyncEtcdCoordinator {
                     record_kvs.push((record_key, kv.value().to_vec(), kv.mod_revision()));
                 }
                 None => {
+                    // Fail closed when an unknown key appears inside the
+                    // persisted shard subtree: this keyspace is schema-bound
+                    // and mixed-version readers must upgrade in lockstep.
                     return Err(EtcdCoordinatorError::Codec {
                         operation: EtcdOperation::Get,
                         source: EtcdCodecError::InvariantViolation {
@@ -1437,15 +1455,25 @@ impl AsyncEtcdCoordinator {
                     source,
                 }
             })?;
-            // Defense-in-depth: verify record identity matches the scan
-            // prefix. The prefix constrains etcd results, but a corrupt
-            // record could embed mismatched tenant/run fields.
+            // Defense-in-depth: verify decoded payload identity matches
+            // the scanned key path. The prefix constrains etcd results,
+            // but corrupt data can still encode mismatched tenant/run/shard.
             if record.tenant != tenant || record.run != run {
                 return Err(EtcdCoordinatorError::Codec {
                     operation: EtcdOperation::Get,
                     source: EtcdCodecError::InvariantViolation {
                         kind: "ShardRecord",
                         detail: "shard record identity disagrees with scan prefix",
+                    },
+                });
+            }
+            let expected_key = self.keyspace.shard_record_key(tenant, run, record.shard);
+            if record_key != expected_key {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "ShardRecord",
+                        detail: "shard record shard id disagrees with key path",
                     },
                 });
             }
@@ -1479,14 +1507,16 @@ impl AsyncEtcdCoordinator {
     ) -> Result<usize, EtcdCoordinatorError> {
         let response = self
             .etcd_get(
-                prefix.into_bytes(),
+                prefix.as_bytes().to_vec(),
                 Some(GetOptions::new().with_prefix().with_keys_only()),
             )
             .await?;
         Ok(response
             .kvs()
             .iter()
-            .filter(|kv| ShardRecordKey::from_encoded_key(kv.key()).is_some())
+            // `parse_direct_shard_id` accepts only direct `{hex}` children.
+            // This excludes `/owner` keys and deeper descendants.
+            .filter(|kv| ShardActiveIndexKey::parse_direct_shard_id(&prefix, kv.key()).is_some())
             .count())
     }
 
@@ -1523,13 +1553,10 @@ impl AsyncEtcdCoordinator {
             );
             u32::MAX
         });
-        let shards_prefix = self
-            .keyspace
-            .shard_records_scan_prefix(tenant, run)
-            .into_bytes();
+        let shards_prefix = self.keyspace.shard_records_scan_prefix(tenant, run);
         let keys_response = self
             .etcd_get(
-                shards_prefix,
+                shards_prefix.as_bytes().to_vec(),
                 Some(GetOptions::new().with_prefix().with_keys_only()),
             )
             .await?;
@@ -1537,7 +1564,9 @@ impl AsyncEtcdCoordinator {
             keys_response
                 .kvs()
                 .iter()
-                .filter(|kv| ShardOwnerKey::from_encoded_key(kv.key()).is_some())
+                .filter(|kv| {
+                    ShardOwnerKey::parse_owned_shard(shards_prefix.as_bytes(), kv.key()).is_some()
+                })
                 .count(),
         )
         .unwrap_or(u32::MAX);
