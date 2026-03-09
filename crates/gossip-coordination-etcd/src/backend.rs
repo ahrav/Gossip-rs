@@ -72,13 +72,14 @@ use gossip_contracts::coordination::shard_spec::{ShardLimitScope, ShardSpecRef};
 use gossip_coordination::{
     ByteSlab, CursorSemantics, CursorUpdate, InitialShardInput, Lease, LogicalTime, OpId,
     RegisterShardsError, RunId, RunOpKind, RunOpLogEntry, RunOpResult, RunRecord, RunStatus,
-    ShardId, ShardRecord, SplitChildIds, TenantId,
+    ShardRecord, SplitChildIds, TenantId,
 };
 
 use crate::codec::{
     EtcdCodecError, OwnerLeaseValue, decode_owner_value, encode_owner_value, encode_shard_record,
 };
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
+use crate::keyspace::{EtcdKey, RunRecordKey, ShardOwnerKey, ShardRecordKey};
 
 mod coordinator;
 mod run_management;
@@ -128,9 +129,6 @@ const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 /// owner-version, owner-value, owner-lease) and 3 ops (put-parent,
 /// delete-owner, delete-active-index), giving `(128 - 7) / 3 = 40`.
 pub(crate) const MAX_CHILDREN_PER_SPLIT_TXN: usize = 40;
-
-/// Marker segment that appears exactly once in persisted shard record keys.
-const SHARD_RECORD_KEY_SEGMENT: &[u8] = b"/shards/";
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -282,25 +280,6 @@ pub(crate) fn shard_limit_violation(
     None
 }
 
-/// Returns `true` when `key` is a shard record path rather than an owner or
-/// active-index key.
-///
-/// The shard-record key is the leaf under `…/shards/{hex}` with no further
-/// path segments. Owner keys (`…/shards/{hex}/owner`) and active-index
-/// keys (`…/shards_active/{hex}`) are excluded by checking that nothing
-/// follows the last `/shards/` segment except a single path component
-/// (no further `/` separators).
-fn is_persisted_shard_record_key(key: &[u8]) -> bool {
-    let Some(segment_pos) = key
-        .windows(SHARD_RECORD_KEY_SEGMENT.len())
-        .rposition(|window| window == SHARD_RECORD_KEY_SEGMENT)
-    else {
-        return false;
-    };
-
-    !key[segment_pos + SHARD_RECORD_KEY_SEGMENT.len()..].contains(&b'/')
-}
-
 /// Compute a backoff delay for CAS retry loops.
 ///
 /// Uses exponential backoff (5 ms base, 2× per attempt, capped at 200 ms)
@@ -355,47 +334,6 @@ fn split_replace_replay_child_ids(
 
     debug_assert_eq!(ids.len(), plan_len);
     ids
-}
-
-/// Extract a `u64` from the 16-character lowercase hex suffix
-/// immediately after `prefix` in `key`.
-fn parse_hex_u64_suffix(prefix: &str, key: &[u8]) -> Option<u64> {
-    let suffix = key.strip_prefix(prefix.as_bytes())?;
-    if suffix.len() != 16 || suffix.contains(&b'/') {
-        return None;
-    }
-    u64::from_str_radix(std::str::from_utf8(suffix).ok()?, 16).ok()
-}
-
-/// Parse a direct run-record or active-run key suffix into a [`RunId`].
-///
-/// Returns `None` when `key` is not an immediate child of `prefix` or the
-/// suffix is not a 16-character lowercase hex run ID.
-fn parse_direct_run_id_from_key(prefix: &str, key: &[u8]) -> Option<RunId> {
-    parse_hex_u64_suffix(prefix, key).map(RunId::from_raw)
-}
-
-/// Parse a shard-active-index key suffix into a [`ShardId`].
-///
-/// Returns `None` when `key` is not an immediate child of `prefix` or the
-/// suffix is not a 16-character lowercase hex shard ID.
-fn parse_shard_id_from_index_key(prefix: &str, key: &[u8]) -> Option<ShardId> {
-    parse_hex_u64_suffix(prefix, key).map(ShardId::from_raw)
-}
-
-/// Extract a [`ShardId`] from a shard owner key.
-///
-/// Owner keys have the form `{shards_scan_prefix}{16-char hex}/owner`.
-/// Returns `None` if the key does not match this pattern.
-fn parse_owned_shard_from_key(shards_scan_prefix: &[u8], key: &[u8]) -> Option<ShardId> {
-    let suffix = key.strip_prefix(shards_scan_prefix)?;
-    let shard_hex = suffix.strip_suffix(b"/owner")?;
-    if shard_hex.len() != 16 {
-        return None;
-    }
-    let hex = std::str::from_utf8(shard_hex).ok()?;
-    let raw = u64::from_str_radix(hex, 16).ok()?;
-    Some(ShardId::from_raw(raw))
 }
 
 /// Apply a terminal run transition (Done / Failed / Cancelled) and append
@@ -608,12 +546,12 @@ fn map_etcd_err(
 // -- CAS guard helpers --
 
 /// CAS guard: shard record key has not been modified since `mod_revision`.
-fn compare_shard_revision(shard_record_key: String, mod_revision: i64) -> Compare {
+fn compare_shard_revision(shard_record_key: ShardRecordKey, mod_revision: i64) -> Compare {
     Compare::mod_revision(shard_record_key, CompareOp::Equal, mod_revision)
 }
 
 /// CAS guard: run record key has not been modified since `mod_revision`.
-fn compare_run_revision(run_record_key: String, mod_revision: i64) -> Compare {
+fn compare_run_revision(run_record_key: RunRecordKey, mod_revision: i64) -> Compare {
     Compare::mod_revision(run_record_key, CompareOp::Equal, mod_revision)
 }
 
@@ -621,13 +559,13 @@ fn compare_run_revision(run_record_key: String, mod_revision: i64) -> Compare {
 ///
 /// Used to ensure a shard or run record is being created for the first
 /// time, preventing double-registration.
-fn compare_absent(key: String) -> Compare {
-    Compare::version(key, CompareOp::Equal, 0)
+fn compare_absent<K: EtcdKey>(key: K) -> Compare {
+    Compare::version(key.into_bytes(), CompareOp::Equal, 0)
 }
 
 /// CAS guard: the key must already exist (etcd version > 0).
-fn compare_present(key: String) -> Compare {
-    Compare::version(key, CompareOp::Greater, 0)
+fn compare_present<K: EtcdKey>(key: K) -> Compare {
+    Compare::version(key.into_bytes(), CompareOp::Greater, 0)
 }
 
 /// CAS guard: owner key must exist (version > 0) with the given value
@@ -637,7 +575,11 @@ fn compare_present(key: String) -> Compare {
 /// lease identity. The lease check prevents a stale worker from
 /// passing the value guard after another worker reuses the same
 /// worker ID + fence epoch with a different etcd lease.
-fn compare_owner_present(owner_key: String, owner_value: Vec<u8>, lease_id: i64) -> [Compare; 3] {
+fn compare_owner_present(
+    owner_key: ShardOwnerKey,
+    owner_value: Vec<u8>,
+    lease_id: i64,
+) -> [Compare; 3] {
     [
         Compare::version(owner_key.clone(), CompareOp::Greater, 0),
         Compare::value(owner_key.clone(), CompareOp::Equal, owner_value),

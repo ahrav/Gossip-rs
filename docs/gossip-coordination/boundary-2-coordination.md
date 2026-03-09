@@ -18,7 +18,8 @@ single-threaded Tokio runtime) and `AsyncEtcdCoordinator` (async core
 for callers that already have a runtime). Both share the same coordination
 logic, static helpers, and validation code.
 The backend owns a real etcd client connection, a deterministic keyspace
-layout (`keyspace.rs`), and an explicit binary codec (`codec.rs`) for
+layout with typed exact-key wrappers (`keyspace.rs`), and an explicit binary
+codec (`codec.rs`) for
 persisting coordination records. It persists `create_run`, `register_shards`,
 `get_run*` queries, `claim_next_available`, and the fenced
 `acquire_and_restore_into` / `renew` / `checkpoint` / `split_replace` /
@@ -111,7 +112,7 @@ The module provides seven core capabilities:
 | `backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` impl: acquire/renew/checkpoint/split operations |
 | `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
 | `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, shard count limits, and bounded split fanout |
-| `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
+| `keyspace.rs`     | Deterministic ASCII etcd path construction plus typed exact-key wrappers for run/shard records, ownership, and active indexes |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
 | `error.rs`        | etcd connection, codec, lease, and transaction error surfaces                                 |

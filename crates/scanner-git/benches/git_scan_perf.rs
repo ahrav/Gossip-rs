@@ -4,6 +4,10 @@
 //!   cargo bench --bench git_scan_perf -- --repo <path> [--iters N] [--warmup N]
 //!       [--pin-core N] [--x-merge all|first-parent] [--anchors manual|derived]
 //!
+//! When no repository is provided, the benchmark exits successfully after
+//! printing a skip message. This keeps `cargo test --all-targets --all-features`
+//! usable in workspaces that do not carry a benchmark fixture checkout.
+//!
 //! Warmup iterations are discarded; the summary reports median and MAD.
 
 use std::env;
@@ -80,7 +84,7 @@ fn mad(values: &[u64], median_val: u64) -> u64 {
     median(&mut deviations)
 }
 
-fn parse_args() -> BenchConfig {
+fn parse_args() -> Option<BenchConfig> {
     let mut args = env::args_os();
     let exe = args.next().unwrap_or_else(|| "git_scan_perf".into());
 
@@ -181,12 +185,15 @@ fn parse_args() -> BenchConfig {
         }
     }
 
-    let Some(repo) = repo else {
+    if next_is_repo {
+        eprintln!("missing value for --repo");
         print_usage(&exe);
         std::process::exit(2);
-    };
+    }
 
-    BenchConfig {
+    let repo = repo?;
+
+    Some(BenchConfig {
         repo,
         iters: iters.max(1),
         warmup,
@@ -194,7 +201,7 @@ fn parse_args() -> BenchConfig {
         merge_mode,
         anchor_mode,
         max_transform_depth,
-    }
+    })
 }
 
 fn print_usage(exe: &std::ffi::OsStr) {
@@ -277,7 +284,10 @@ fn pin_to_core(core: Option<usize>) -> PinStatus {
 }
 
 fn main() {
-    let cfg = parse_args();
+    let Some(cfg) = parse_args() else {
+        eprintln!("git_scan_perf: skipped (no repository provided)");
+        return;
+    };
 
     let pin_status = pin_to_core(cfg.pin_core);
 

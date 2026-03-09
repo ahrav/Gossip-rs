@@ -12,11 +12,9 @@ use gossip_coordination::{
 };
 
 use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
-use super::{
-    CasOutcome, MAX_SHARDS_PER_ETCD_TXN, cas_retry_delay, parse_owned_shard_from_key,
-    parse_shard_id_from_index_key, shard_limit_violation,
-};
+use super::{CasOutcome, MAX_SHARDS_PER_ETCD_TXN, cas_retry_delay, shard_limit_violation};
 use crate::codec::{encode_run_record, encode_shard_record_into};
+use crate::keyspace::{ShardActiveIndexKey, ShardOwnerKey};
 
 impl RunManagement for EtcdCoordinator {
     /// Create a new run in `Initializing` status.
@@ -402,7 +400,7 @@ impl RunManagement for EtcdCoordinator {
         let active_ids: Vec<ShardId> = active_resp
             .kvs()
             .iter()
-            .filter_map(|kv| parse_shard_id_from_index_key(&active_prefix, kv.key()))
+            .filter_map(|kv| ShardActiveIndexKey::parse_direct_shard_id(&active_prefix, kv.key()))
             .collect();
 
         if active_ids.is_empty() {
@@ -428,7 +426,7 @@ impl RunManagement for EtcdCoordinator {
         let owned_ids: HashSet<ShardId> = keys_resp
             .kvs()
             .iter()
-            .filter_map(|kv| parse_owned_shard_from_key(shards_prefix.as_bytes(), kv.key()))
+            .filter_map(|kv| ShardOwnerKey::parse_owned_shard(shards_prefix.as_bytes(), kv.key()))
             .collect();
 
         candidates.clear();
@@ -1006,7 +1004,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         let active_ids: Vec<ShardId> = active_resp
             .kvs()
             .iter()
-            .filter_map(|kv| parse_shard_id_from_index_key(&active_prefix, kv.key()))
+            .filter_map(|kv| ShardActiveIndexKey::parse_direct_shard_id(&active_prefix, kv.key()))
             .collect();
         if active_ids.is_empty() {
             candidates.clear();
@@ -1028,7 +1026,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         let owned_ids: HashSet<ShardId> = keys_resp
             .kvs()
             .iter()
-            .filter_map(|kv| parse_owned_shard_from_key(shards_prefix.as_bytes(), kv.key()))
+            .filter_map(|kv| ShardOwnerKey::parse_owned_shard(shards_prefix.as_bytes(), kv.key()))
             .collect();
         candidates.clear();
         for id in &active_ids {

@@ -35,6 +35,7 @@
 //!   cargo test -p gossip-coordination-etcd -- --ignored
 //! ```
 
+use crate::keyspace::PersistedShardSubtreeKey;
 use crate::test_etcd::{
     test_coordinator, test_coordinator_with_limits, test_coordinator_with_ttl,
     test_coordinator_with_tuning,
@@ -536,23 +537,23 @@ fn keyspace_builds_expected_paths() {
 
     let keyspace = EtcdKeyspace::new("/gossip/v1").expect("valid keyspace prefix");
     assert_eq!(
-        keyspace.run_record_key(tenant, run),
+        keyspace.run_record_key(tenant, run).as_str(),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef"
     );
     assert_eq!(
-        keyspace.shard_record_key(tenant, run, shard),
+        keyspace.shard_record_key(tenant, run, shard).as_str(),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards/8000000000000042"
     );
     assert_eq!(
-        keyspace.shard_owner_key(tenant, run, shard),
+        keyspace.shard_owner_key(tenant, run, shard).as_str(),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards/8000000000000042/owner"
     );
     assert_eq!(
-        keyspace.run_active_index_key(tenant, run),
+        keyspace.run_active_index_key(tenant, run).as_str(),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs_active/0123456789abcdef"
     );
     assert_eq!(
-        keyspace.shard_active_index_key(tenant, run, shard),
+        keyspace.shard_active_index_key(tenant, run, shard).as_str(),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards_active/8000000000000042"
     );
     assert_eq!(
@@ -569,10 +570,69 @@ fn keyspace_root_prefix_does_not_emit_double_slashes() {
     let keyspace = EtcdKeyspace::new("/").expect("root prefix should be valid");
 
     assert_eq!(
-        keyspace.run_record_key(tenant, run),
+        keyspace.run_record_key(tenant, run).as_str(),
         "/tenants/1111111111111111111111111111111111111111111111111111111111111111/runs/0000000000000042"
     );
     assert_eq!(keyspace.tenants_prefix(), "/tenants");
+}
+
+/// Typed key wrappers preserve their etcd path and classify persisted keys.
+#[test]
+fn keyspace_typed_keys_preserve_kind_and_relationships() {
+    let tenant = TenantId::from_bytes([0xAB; 32]);
+    let run = RunId::from_raw(0x0123_4567_89ab_cdef);
+    let shard = ShardId::from_raw(0x8000_0000_0000_0042);
+
+    let keyspace = EtcdKeyspace::new("/gossip/v1").expect("valid keyspace prefix");
+    let shard_key = keyspace.shard_record_key(tenant, run, shard);
+    let owner_key = shard_key.owner_key();
+    let shard_active_key = keyspace.shard_active_index_key(tenant, run, shard);
+    let run_key = keyspace.run_record_key(tenant, run);
+
+    assert_eq!(
+        owner_key.as_str(),
+        keyspace.shard_owner_key(tenant, run, shard).as_str()
+    );
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(shard_key.as_bytes()),
+        Some(PersistedShardSubtreeKey::Record)
+    );
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(owner_key.as_bytes()),
+        Some(PersistedShardSubtreeKey::Owner)
+    );
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(shard_active_key.as_bytes()),
+        None
+    );
+    assert_eq!(PersistedShardSubtreeKey::classify(run_key.as_bytes()), None);
+}
+
+/// Uppercase hex segments are rejected to preserve canonical lowercase keys.
+#[test]
+fn keyspace_rejects_uppercase_hex_suffixes() {
+    let tenant = TenantId::from_bytes([0xAB; 32]);
+    let run = RunId::from_raw(0x0123_4567_89ab_cdef);
+    let keyspace = EtcdKeyspace::new("/gossip/v1").expect("valid keyspace prefix");
+
+    let run_prefix = keyspace.run_records_scan_prefix(tenant);
+    let run_key_upper = format!("{run_prefix}00000000000000AA");
+    assert_eq!(
+        crate::RunRecordKey::parse_direct_run_id(&run_prefix, run_key_upper.as_bytes()),
+        None
+    );
+
+    let shard_prefix = keyspace.shard_records_scan_prefix(tenant, run);
+    let shard_record_upper = format!("{shard_prefix}00000000000000AA");
+    let shard_owner_upper = format!("{shard_prefix}00000000000000AA/owner");
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(shard_record_upper.as_bytes()),
+        None
+    );
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(shard_owner_upper.as_bytes()),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -643,9 +703,18 @@ proptest! {
         let shard_active = ks.shard_active_index_key(tenant, run, shard);
 
         let all_keys = [
-            &tenants, &tenant_pfx, &runs, &run_key, &shards_pfx, &scan_pfx,
-            &shard_key, &owner_key, &runs_active, &run_active,
-            &shards_active, &shard_active,
+            tenants.as_str(),
+            tenant_pfx.as_str(),
+            runs.as_str(),
+            run_key.as_str(),
+            shards_pfx.as_str(),
+            scan_pfx.as_str(),
+            shard_key.as_str(),
+            owner_key.as_str(),
+            runs_active.as_str(),
+            run_active.as_str(),
+            shards_active.as_str(),
+            shard_active.as_str(),
         ];
 
         for key in &all_keys {
@@ -666,11 +735,11 @@ proptest! {
         // Hierarchical containment: each child starts with its parent.
         prop_assert!(tenant_pfx.starts_with(&tenants));
         prop_assert!(runs.starts_with(&tenant_pfx));
-        prop_assert!(run_key.starts_with(&runs));
-        prop_assert!(shards_pfx.starts_with(&run_key));
-        prop_assert!(shard_key.starts_with(&shards_pfx));
-        prop_assert!(owner_key.starts_with(&shard_key));
-        prop_assert!(owner_key.ends_with("/owner"));
+        prop_assert!(run_key.as_str().starts_with(&runs));
+        prop_assert!(shards_pfx.starts_with(run_key.as_str()));
+        prop_assert!(shard_key.as_str().starts_with(&shards_pfx));
+        prop_assert!(owner_key.as_str().starts_with(shard_key.as_str()));
+        prop_assert!(owner_key.as_str().ends_with("/owner"));
 
         // Scan prefix ends with trailing slash.
         prop_assert!(scan_pfx.ends_with('/'));
@@ -678,23 +747,23 @@ proptest! {
 
         // Active-index keys live under tenant, not under runs/.
         prop_assert!(runs_active.starts_with(&tenant_pfx));
-        prop_assert!(run_active.starts_with(&runs_active));
+        prop_assert!(run_active.as_str().starts_with(&runs_active));
         prop_assert!(runs_active.contains("/runs_active"));
 
         // Scan isolation: run_records_scan_prefix must NOT match
         // runs_active keys (the trailing slash prevents this).
         let run_scan_pfx = ks.run_records_scan_prefix(tenant);
         prop_assert!(run_scan_pfx.ends_with('/'));
-        prop_assert!(!run_active.starts_with(&run_scan_pfx));
+        prop_assert!(!run_active.as_str().starts_with(&run_scan_pfx));
 
         // Active-shard index keys are siblings of shards/, not children.
-        prop_assert!(shards_active.starts_with(&run_key));
-        prop_assert!(shard_active.starts_with(&shards_active));
+        prop_assert!(shards_active.starts_with(run_key.as_str()));
+        prop_assert!(shard_active.as_str().starts_with(&shards_active));
         prop_assert!(shards_active.contains("/shards_active"));
 
         // Scan isolation: shard_records_scan_prefix must NOT match
         // shards_active keys (the trailing slash prevents this).
-        prop_assert!(!shard_active.starts_with(&scan_pfx));
+        prop_assert!(!shard_active.as_str().starts_with(&scan_pfx));
 
         // Hex encoding: tenant segment is 64 hex chars, run/shard are 16.
         let tenant_segment = tenant_pfx
@@ -704,12 +773,14 @@ proptest! {
         prop_assert!(tenant_segment.chars().all(|c| c.is_ascii_hexdigit()));
 
         let run_segment = run_key
+            .as_str()
             .strip_prefix(&format!("{}/", runs))
             .unwrap_or("");
         prop_assert_eq!(run_segment.len(), 16);
         prop_assert!(run_segment.chars().all(|c| c.is_ascii_hexdigit()));
 
         let shard_segment = shard_key
+            .as_str()
             .strip_prefix(&format!("{}/", shards_pfx))
             .unwrap_or("");
         prop_assert_eq!(shard_segment.len(), 16);
