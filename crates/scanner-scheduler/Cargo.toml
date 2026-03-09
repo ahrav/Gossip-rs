@@ -32,6 +32,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+loom = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
