@@ -197,11 +197,14 @@ impl EtcdCoordinator {
         mut attempt: impl FnMut(&mut Self, usize) -> Result<CasOutcome<T>, E>,
         on_exhaustion: impl FnOnce(&mut Self) -> Result<T, E>,
     ) -> Result<T, E> {
-        for attempt_num in 0..self.config.optimistic_txn_retries() {
+        let max_retries = self.config.optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
             match attempt(self, attempt_num)? {
                 CasOutcome::Committed(val) => return Ok(val),
                 CasOutcome::RetryNeeded => {
-                    std::thread::sleep(cas_retry_delay(attempt_num));
+                    if attempt_num + 1 < max_retries {
+                        std::thread::sleep(cas_retry_delay(attempt_num));
+                    }
                 }
             }
         }
@@ -488,6 +491,19 @@ impl EtcdCoordinator {
                     source,
                 }
             })?;
+
+            // Defense-in-depth: verify record identity matches the scan
+            // prefix. The prefix constrains etcd results, but a corrupt
+            // record could embed mismatched tenant/run fields.
+            if record.tenant != tenant || record.run != run {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "ShardRecord",
+                        detail: "shard record identity disagrees with scan prefix",
+                    },
+                });
+            }
 
             let mut owner_key = record_key.clone();
             owner_key.extend_from_slice(b"/owner");
@@ -1358,6 +1374,18 @@ impl AsyncEtcdCoordinator {
                     source,
                 }
             })?;
+            // Defense-in-depth: verify record identity matches the scan
+            // prefix. The prefix constrains etcd results, but a corrupt
+            // record could embed mismatched tenant/run fields.
+            if record.tenant != tenant || record.run != run {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "ShardRecord",
+                        detail: "shard record identity disagrees with scan prefix",
+                    },
+                });
+            }
             let mut owner_key = record_key.clone();
             owner_key.extend_from_slice(b"/owner");
             let owner = owner_map.remove(&owner_key);

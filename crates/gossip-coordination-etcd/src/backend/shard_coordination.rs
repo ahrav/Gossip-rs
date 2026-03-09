@@ -1331,7 +1331,8 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         let key = lease.shard_key();
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
-        for attempt_num in 0..self.config.optimistic_txn_retries() {
+        let max_retries = self.config.optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
             shard_buf.clear();
             owner_buf.clear();
             let persisted = match self.load_shard_record(tenant, key).await {
@@ -1413,7 +1414,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     capacity,
                 });
             }
-            tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            if attempt_num + 1 < max_retries {
+                tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            }
         }
         // Exhaustion.
         let persisted = self.load_shard_or_panic(tenant, key).await;
@@ -1442,7 +1445,8 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         let payload_hash = hash_checkpoint_payload(new_cursor);
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
-        for attempt_num in 0..self.config.optimistic_txn_retries() {
+        let max_retries = self.config.optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
             shard_buf.clear();
             owner_buf.clear();
             let persisted = match self.load_shard_record(tenant, key).await {
@@ -1527,7 +1531,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             if response.succeeded() {
                 return Ok(IdempotentOutcome::Executed(()));
             }
-            tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            if attempt_num + 1 < max_retries {
+                tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            }
         }
         // Exhaustion.
         let persisted = self.load_shard_or_panic(tenant, key).await;
@@ -1584,7 +1590,8 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         let mut child_puts: Vec<TxnOp> = Vec::with_capacity(cap);
         let mut child_index_ops: Vec<TxnOp> = Vec::with_capacity(cap);
         let mut child_absent_compares: Vec<Compare> = Vec::with_capacity(cap);
-        for attempt_num in 0..self.config.optimistic_txn_retries() {
+        let max_retries = self.config.optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
             child_puts.clear();
             child_index_ops.clear();
             child_absent_compares.clear();
@@ -1761,7 +1768,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     children: child_ids,
                 }));
             }
-            tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            if attempt_num + 1 < max_retries {
+                tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            }
         }
         // Exhaustion: re-read and diagnose.
         let persisted = self.load_shard_or_panic(tenant, key).await;
@@ -1831,7 +1840,8 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
     ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
         let key = lease.shard_key();
         let payload_hash = hash_split_residual_payload(&plan);
-        for attempt_num in 0..self.config.optimistic_txn_retries() {
+        let max_retries = self.config.optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
             let persisted = match self.load_shard_record(tenant, key).await {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(SplitResidualError::ShardNotFound { shard: key }),
@@ -1982,7 +1992,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     residual: residual_id,
                 }));
             }
-            tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            if attempt_num + 1 < max_retries {
+                tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            }
         }
         // Exhaustion: re-read and diagnose.
         let persisted = self.load_shard_or_panic(tenant, key).await;
