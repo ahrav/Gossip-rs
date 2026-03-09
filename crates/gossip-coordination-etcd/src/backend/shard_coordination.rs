@@ -668,13 +668,14 @@ impl CoordinationBackend for EtcdCoordinator {
                         err,
                     ))
                 })?;
-                // The persisted count already includes the parent shard (it is
-                // still stored in etcd). After split, the parent becomes terminal
-                // (Split status) while N children are created, so the net growth
-                // in live shards is N - 1, not N.
+                // The persisted count includes the parent shard (still in etcd).
+                // After split the parent becomes terminal (Split status) and
+                // stays in storage while N children are created, so the total
+                // stored record count grows by N. Use N (child count) as
+                // `additional`, matching the in-memory backend's accounting.
                 if let Some(limit) = shard_limit_violation(
                     counts,
-                    sorted.len().saturating_sub(1),
+                    sorted.len(),
                     this.config.max_shards_per_tenant(),
                     this.config.max_total_shards(),
                 ) {
@@ -1645,7 +1646,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             })?;
             if let Some(limit) = shard_limit_violation(
                 counts,
-                sorted.len().saturating_sub(1),
+                sorted.len(),
                 self.config.max_shards_per_tenant(),
                 self.config.max_total_shards(),
             ) {

@@ -10,8 +10,7 @@
 use gossip_contracts::coordination::shard_spec::ShardLimitScope;
 
 /// Snapshot of shard counts used for shard-limit validation.
-#[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShardCountSnapshot {
     /// Shards under the requesting tenant's namespace.
     pub tenant: usize,
