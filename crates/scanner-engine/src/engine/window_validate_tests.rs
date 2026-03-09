@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::{confidence, AnchorPolicy, FileId, RuleSpec, ValidatorKind};
+use crate::api::{AnchorPolicy, FileId, RuleSpec, ValidatorKind, confidence};
 use crate::demo::demo_tuning;
 use crate::engine::rule_repr::NO_GATE;
 use regex::bytes::Regex;

@@ -1,7 +1,7 @@
-use super::{normalize_root_hint_end_for_dedup, CachelineBoundary, ScanScratch};
+use super::{CachelineBoundary, ScanScratch, normalize_root_hint_end_for_dedup};
 use crate::api::{
-    DecodeStep, FileId, FindingRec, RuleSpec, StepId, TransformConfig, TransformId, Tuning,
-    Utf16Endianness, STEP_ROOT,
+    DecodeStep, FileId, FindingRec, RuleSpec, STEP_ROOT, StepId, TransformConfig, TransformId,
+    Tuning, Utf16Endianness,
 };
 use crate::engine::Engine;
 use regex::bytes::Regex;
@@ -487,7 +487,7 @@ fn same_scan_raw_does_not_replace_transform_finding() {
 
 #[test]
 fn pack_rule_id_at_max_boundary() {
-    use super::{pack_rule_id_with_variant, DEDUP_RULE_ID_BITS, DEDUP_RULE_ID_MAX};
+    use super::{DEDUP_RULE_ID_BITS, DEDUP_RULE_ID_MAX, pack_rule_id_with_variant};
 
     // Exactly at DEDUP_RULE_ID_MAX should succeed.
     let packed = pack_rule_id_with_variant(DEDUP_RULE_ID_MAX, 0);
@@ -502,7 +502,7 @@ fn pack_rule_id_at_max_boundary() {
 #[test]
 #[should_panic(expected = "rule_id exceeds 24-bit dedup budget")]
 fn pack_rule_id_overflow_panics() {
-    use super::{pack_rule_id_with_variant, DEDUP_RULE_ID_MAX};
+    use super::{DEDUP_RULE_ID_MAX, pack_rule_id_with_variant};
 
     pack_rule_id_with_variant(DEDUP_RULE_ID_MAX + 1, 0);
 }

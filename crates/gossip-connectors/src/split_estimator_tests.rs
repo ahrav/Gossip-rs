@@ -15,7 +15,7 @@
 
 use proptest::prelude::*;
 
-use super::{Sample, StreamingSplitEstimator, MIN_SAMPLE_CAP};
+use super::{MIN_SAMPLE_CAP, Sample, StreamingSplitEstimator};
 
 const SMALL_SAMPLE_CAP: usize = MIN_SAMPLE_CAP;
 const MEDIUM_SAMPLE_CAP: usize = 512;
@@ -589,7 +589,7 @@ fn observe_advances_rank_mark_only_when_rank_cadence_fires_alone() {
 
 #[test]
 fn compaction_realigns_marks_to_the_doubled_stride_grid() {
-    use super::{align_to_stride, Sample};
+    use super::{Sample, align_to_stride};
 
     let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     estimator.rank_stride = 2;
@@ -723,7 +723,7 @@ fn interpolated_position_edge_cases() {
 
 #[test]
 fn nearest_by_rank_in_range_single_element() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     let samples = vec![Sample::new(42, 0, &key_for_index(0))];
     assert_eq!(
@@ -740,7 +740,7 @@ fn nearest_by_rank_in_range_single_element() {
 
 #[test]
 fn nearest_by_rank_in_range_selects_closest() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     let samples: Vec<Sample> = (0..10)
         .map(|i| Sample::new(i * 10, 0, &key_for_index(i as usize)))
@@ -771,7 +771,7 @@ fn nearest_by_rank_in_range_selects_closest() {
 
 #[test]
 fn nearest_by_rank_in_range_tie_breaks_to_earlier() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     // Two samples equidistant from target.
     let samples = vec![
@@ -790,7 +790,7 @@ fn nearest_by_rank_in_range_tie_breaks_to_earlier() {
 #[test]
 #[should_panic]
 fn nearest_by_rank_in_range_panics_on_invalid_bounds() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     let samples = vec![
         Sample::new(0, 0, &key_for_index(0)),
@@ -804,7 +804,7 @@ fn nearest_by_rank_in_range_panics_on_invalid_bounds() {
 /// field remains identical.
 #[test]
 fn compact_samples_noop_when_cap_equals_len() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let original: Vec<Sample> = (0..10)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -825,7 +825,7 @@ fn compact_samples_noop_when_cap_equals_len() {
 /// monotonicity invariants must still hold in this most-constrained case.
 #[test]
 fn compact_samples_evicts_exactly_one_when_cap_is_len_minus_one() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let n = 20usize;
     let mut samples: Vec<Sample> = (0..n)
@@ -838,14 +838,16 @@ fn compact_samples_evicts_exactly_one_when_cap_is_len_minus_one() {
     assert_eq!(samples.first().unwrap().rank, 0);
     assert_eq!(samples.last().unwrap().rank, (n - 1) as u64);
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
-    assert!(samples
-        .windows(2)
-        .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position));
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
+    );
 }
 
 #[test]
 fn compact_samples_preserves_endpoints_and_monotonicity() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -863,14 +865,16 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
     // Ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
     // Bytes non-decreasing.
-    assert!(samples
-        .windows(2)
-        .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position));
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
+    );
 }
 
 #[test]
 fn compact_samples_keeps_exact_indices_selected_for_compaction() {
-    use super::{compact_samples, selected_sample_indices, Sample};
+    use super::{Sample, compact_samples, selected_sample_indices};
 
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| {
@@ -914,7 +918,7 @@ fn compact_samples_keeps_exact_indices_selected_for_compaction() {
 /// last sample), not the first plateau entry.
 #[test]
 fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 20 samples: first 12 have distinct increasing byte positions,
     // last 8 all share the same recorded byte position (plateau).
@@ -948,16 +952,18 @@ fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
     // Ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
     // Byte positions non-decreasing (plateau means equal is expected).
-    assert!(samples
-        .windows(2)
-        .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position));
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
+    );
 }
 
 /// Compacting to 2 retains only the first and last sample, with strictly
 /// increasing ranks.
 #[test]
 fn compact_samples_cap_two_preserves_first_and_last() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..10)
         .map(|i| Sample::new(i as u64, (i as u64) * 50, &key_for_index(i)))
@@ -983,7 +989,7 @@ fn compact_samples_cap_two_preserves_first_and_last() {
 /// expected picks are indices 0, 4, 9, 14, 19 (i.e. `i * 19 / 4`).
 #[test]
 fn compact_samples_all_identical_byte_positions_uses_index_spacing() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| Sample::new(i as u64, 0, &key_for_index(i)))
@@ -1000,7 +1006,7 @@ fn compact_samples_all_identical_byte_positions_uses_index_spacing() {
 /// and approximately uniform rank spacing.
 #[test]
 fn compact_samples_typical_half_reduction() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..512)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -1015,9 +1021,11 @@ fn compact_samples_typical_half_reduction() {
     // Monotonicity: ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
     // Byte positions non-decreasing.
-    assert!(samples
-        .windows(2)
-        .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position));
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
+    );
 
     // Approximate uniform spacing: average rank gap should be close to 2.
     let gaps: Vec<u64> = samples.windows(2).map(|w| w[1].rank - w[0].rank).collect();
@@ -1032,7 +1040,7 @@ fn compact_samples_typical_half_reduction() {
 /// the actual last sample after compaction.
 #[test]
 fn saturated_tail_preserves_last_sample() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| {
@@ -1067,7 +1075,7 @@ fn saturated_tail_preserves_last_sample() {
 /// observation), not the first.
 #[test]
 fn compact_to_single_slot_keeps_last_sample() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..5)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -1091,7 +1099,7 @@ fn compact_to_single_slot_keeps_last_sample() {
 /// Empty sample vec is a no-op: `compact_samples` returns immediately.
 #[test]
 fn compact_samples_empty_vec_is_noop() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = vec![];
     compact_samples(&mut samples, 10);
@@ -1101,7 +1109,7 @@ fn compact_samples_empty_vec_is_noop() {
 /// Single-element vec is preserved unchanged when cap >= 1.
 #[test]
 fn compact_samples_single_element_preserved() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples = vec![Sample::new(0, 42, &key_for_index(0))];
     compact_samples(&mut samples, 10);
@@ -1113,7 +1121,7 @@ fn compact_samples_single_element_preserved() {
 /// When len == cap, no compaction is needed — identity operation.
 #[test]
 fn compact_samples_at_cap_is_identity() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let original: Vec<Sample> = (0..10)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -1541,7 +1549,7 @@ proptest! {
 /// Compaction must spread picks within the mid-stream plateau by rank.
 #[test]
 fn plateau_redistribution_spreads_picks_across_mid_stream_plateau() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 200 samples: 10 with a narrow byte range (0..9), 180 sharing the same
     // recorded byte position (the plateau), 10 resuming above the plateau.
@@ -1594,7 +1602,7 @@ fn plateau_redistribution_spreads_picks_across_mid_stream_plateau() {
 /// independently.
 #[test]
 fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 100 samples: 10 at bytes=0, 40 at bytes=500, 40 at bytes=1000,
     // 10 with increasing bytes above 1000.
@@ -1670,7 +1678,7 @@ fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
 /// strict ordering.
 #[test]
 fn plateau_of_two_samples_is_handled() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 20 samples, with indices 9 and 10 sharing a byte-position plateau.
     let mut samples: Vec<Sample> = (0..20)
@@ -1722,7 +1730,7 @@ fn plateau_of_two_samples_is_handled() {
 /// `floor` for the next pick becomes 6, exceeding `eff_end`=5.
 #[test]
 fn plateau_with_rank_gap_preserves_strict_ordering() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples = vec![
         Sample::new(0, 0, &key_for_index(0)),
@@ -1749,7 +1757,7 @@ fn plateau_with_rank_gap_preserves_strict_ordering() {
 /// cascade can push picks past eff_end without the ceiling constraint.
 #[test]
 fn plateau_redistribution_clamps_to_effective_range() {
-    use super::{redistribute_plateau_picks, Sample, SampleAxis};
+    use super::{Sample, SampleAxis, redistribute_plateau_picks};
 
     // 6 samples: 1 non-plateau, 4 plateau (tight fit), 1 non-plateau.
     // The plateau has ranks 1,2,3,1000 — a big gap that causes
@@ -1789,7 +1797,7 @@ fn plateau_redistribution_clamps_to_effective_range() {
 /// plateau by rank and preserves monotonicity.
 #[test]
 fn plateau_redistribution_spreads_picks_across_leading_plateau() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 30 samples: first 15 at recorded byte position = 0 (the plateau),
     // then 15 with increasing byte positions.
@@ -1847,7 +1855,7 @@ fn plateau_redistribution_spreads_picks_across_leading_plateau() {
 /// non-endpoint plateau cluster, so the function must be a no-op.
 #[test]
 fn redistribute_plateau_picks_early_return_for_small_pick_arrays() {
-    use super::{redistribute_plateau_picks, Sample, SampleAxis};
+    use super::{Sample, SampleAxis, redistribute_plateau_picks};
 
     let samples: Vec<Sample> = (0..10)
         .map(|i| Sample::new(i as u64, 500, &key_for_index(i)))
@@ -1875,7 +1883,7 @@ fn redistribute_plateau_picks_early_return_for_small_pick_arrays() {
 /// plateau's leading edge.
 #[test]
 fn plateau_redistribution_spreads_picks_across_trailing_plateau() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let shared_bytes = 1500u64;
     let mut samples: Vec<Sample> = (0..30)

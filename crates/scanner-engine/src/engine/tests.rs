@@ -12,7 +12,7 @@ use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, extract_secre
 use super::hit_pool::{HitAccPool, SpanU32};
 #[cfg(feature = "stdx-proptest")]
 use super::rule_repr::EntropyCompiled;
-use super::rule_repr::{utf16be_bytes, utf16le_bytes, PackedPatterns, Variant};
+use super::rule_repr::{PackedPatterns, Variant, utf16be_bytes, utf16le_bytes};
 #[cfg(feature = "stdx-proptest")]
 use super::scratch::EntropyScratch;
 #[cfg(feature = "stdx-proptest")]
@@ -26,28 +26,28 @@ use super::transform::{
 use super::transform::{decode_to_vec, find_base64_spans_into};
 #[cfg(feature = "stdx-proptest")]
 use super::vectorscan_prefilter::{
-    build_stream_match_ctx, gate_match_callback, stream_match_callback, VsStreamMatchCtx,
-    VsStreamWindow,
+    VsStreamMatchCtx, VsStreamWindow, build_stream_match_ctx, gate_match_callback,
+    stream_match_callback,
 };
-use crate::api::confidence;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::api::OfflineVerdict;
 use crate::api::Tuning;
+use crate::api::confidence;
 use crate::api::{
     AnchorPolicy, CharClassSpec, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate,
-    LocalContextSpec, OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode,
-    Utf16Endianness, ValidatorKind, STEP_ROOT,
+    LocalContextSpec, OfflineValidationSpec, RuleSpec, STEP_ROOT, TransformConfig, TransformId,
+    TransformMode, Utf16Endianness, ValidatorKind,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
-use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
+use crate::regex2anchor::{AnchorDeriveConfig, TriggerPlan, compile_trigger_plan};
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::scratch_memory::ScratchVec;
-use crate::tiger_harness::{
-    check_oracle_covered, correctness_engine, load_regressions_from_dir, scan_chunked_records,
-    scan_one_chunk_records, ChunkPlan,
-};
 #[cfg(all(test, feature = "stdx-proptest"))]
-use crate::tiger_harness::{maybe_write_regression, ChunkPattern};
+use crate::tiger_harness::{ChunkPattern, maybe_write_regression};
+use crate::tiger_harness::{
+    ChunkPlan, check_oracle_covered, correctness_engine, load_regressions_from_dir,
+    scan_chunked_records, scan_one_chunk_records,
+};
 #[cfg(feature = "stdx-proptest")]
 use memchr::memmem;
 #[cfg(feature = "stdx-proptest")]
@@ -899,9 +899,10 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
         unpack_patterns(suppressor_gate),
         vec![b"EXAMPLE".to_vec(), b"DUMMY_TOKEN".to_vec()]
     );
-    assert!(eng
-        .value_suppressor_gate(super::rule_repr::NO_GATE)
-        .is_none());
+    assert!(
+        eng.value_suppressor_gate(super::rule_repr::NO_GATE)
+            .is_none()
+    );
 }
 
 #[test]
@@ -6141,7 +6142,7 @@ fn build_valid_crc_token() -> Vec<u8> {
 fn build_invalid_crc_token() -> Vec<u8> {
     let prefix = b"tok_";
     let payload = b"XYzw5678"; // 8 bytes
-                               // Use a deliberately wrong CRC (correct CRC + 1).
+    // Use a deliberately wrong CRC (correct CRC + 1).
     let wrong_crc = crc32fast::hash(payload).wrapping_add(1);
     let mut checksum = [0u8; 6];
     base62_encode_u32_test(wrong_crc, &mut checksum);
