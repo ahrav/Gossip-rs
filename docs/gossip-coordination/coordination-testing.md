@@ -22,15 +22,16 @@ The etcd scaffold in `crates/gossip-coordination-etcd/` adds backend-specific
 tests alongside the shared protocol suite: configuration/keyspace/codec tests
 stay local and deterministic, while ignored local-etcd integration coverage
 auto-provisions `quay.io/coreos/etcd:v3.5.15` via testcontainers (or reuses
-`ETCD_ENDPOINTS`) and verifies `EtcdCoordinator::connect()` + `status()`,
-persisted run creation/registration, acquire/checkpoint/renew, unpark, split
-round trips, shard-limit rejection paths, derived-ID collision handling,
-and deterministic split-atomicity aborts via test-only owner-drop fault
-injection. The binary codec (`codec.rs`) has dedicated round-trip fuzz targets
-and proptest coverage for `ShardRecord` serialization in `codec_tests.rs`.
-Protocol conformance, scenario, and simulation coverage still use
-`InMemoryCoordinator` for the full mutation surface because shard `complete`
-and `park_shard` remain fail-closed in the etcd backend.
+`ETCD_ENDPOINTS`) and verifies `EtcdCoordinator::connect()` /
+`AsyncEtcdCoordinator::connect()` + `status()`, persisted run
+creation/registration, acquire/checkpoint/renew, unpark, split round trips,
+shard-limit rejection paths, derived-ID collision handling, and deterministic
+split-atomicity aborts via test-only owner-drop fault injection. The binary
+codec (`codec.rs`) has dedicated round-trip fuzz targets and proptest coverage
+for `ShardRecord` serialization in `codec_tests.rs`. Protocol conformance,
+scenario, and simulation coverage still use `InMemoryCoordinator` for the full
+mutation surface because shard `complete` and `park_shard` remain fail-closed
+in the etcd backend.
 
 ## Allocation Policy Scope (Tiered)
 

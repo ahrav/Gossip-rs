@@ -1,9 +1,16 @@
-//! The coordination trait: the operation contract that all backends
+//! The coordination traits: the operation contract that all backends
 //! (in-memory, FoundationDB, PostgreSQL, deterministic simulator)
 //! must implement.
 //!
-//! This module contains a single item — [`CoordinationBackend`] — which
-//! defines the semantic contract for seven shard lifecycle operations.
+//! This module contains two traits:
+//!
+//! - [`CoordinationBackend`] — the synchronous contract for seven shard
+//!   lifecycle operations. Used by in-memory backends and the deterministic
+//!   simulator (no async runtime needed).
+//! - [`AsyncCoordinationBackend`] — the async counterpart for I/O-bound
+//!   backends (etcd, FoundationDB, PostgreSQL). Identical semantics,
+//!   different execution model (methods return futures).
+//!
 //! See [`super::session::WorkerSession`] for the ergonomic caller wrapper,
 //! and [`super::in_memory::InMemoryCoordinator`] for the reference backend.
 //!
@@ -587,6 +594,112 @@ pub trait CoordinationBackend {
     /// and the multi-record mutation (steps 4-9) as a single conditional
     /// transaction. See trait-level *Production Backend Requirements*.
     fn split_residual(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitResidualPlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError>;
+}
+
+// ============================================================================
+// AsyncCoordinationBackend — async counterpart for I/O-bound backends
+// ============================================================================
+
+/// Async variant of [`CoordinationBackend`] for backends that perform
+/// real I/O (network RPCs, disk reads) and benefit from non-blocking
+/// execution.
+///
+/// The semantic contract is identical to [`CoordinationBackend`] — every
+/// method has the same preconditions, postconditions, idempotency
+/// guarantees, and error surface. The only difference is the execution
+/// model: methods return futures instead of blocking the caller.
+///
+/// ## When to use which trait
+///
+/// | Trait | Use case |
+/// |-------|----------|
+/// | [`CoordinationBackend`] | In-memory backends, deterministic simulation, any context without an async runtime |
+/// | [`AsyncCoordinationBackend`] | Production backends with network-attached storage (etcd, FoundationDB, PostgreSQL) |
+///
+/// ## Interop
+///
+/// A sync wrapper can bridge the two by owning a Tokio runtime and
+/// calling `runtime.block_on(...)` around individual async I/O
+/// operations. The etcd backend (`EtcdCoordinator`) uses this
+/// approach for its low-level RPC calls.
+///
+/// ## Send bounds
+///
+/// Native `async fn` in traits does not impose `Send` on the returned
+/// future. Callers that need `Send` futures (e.g., to spawn on a
+/// multi-threaded runtime) should use concrete types rather than
+/// `dyn AsyncCoordinationBackend`.
+#[allow(async_fn_in_trait)]
+pub trait AsyncCoordinationBackend {
+    /// Async version of [`CoordinationBackend::acquire_and_restore_into`].
+    ///
+    /// See that method's documentation for the full semantic contract.
+    async fn acquire_and_restore_into<'a>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        worker: WorkerId,
+        out: &'a mut AcquireScratch,
+    ) -> Result<AcquireResultView<'a>, AcquireError>;
+
+    /// Async version of [`CoordinationBackend::renew`].
+    async fn renew(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+    ) -> Result<RenewResult, RenewError>;
+
+    /// Async version of [`CoordinationBackend::checkpoint`].
+    async fn checkpoint(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        new_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CheckpointError>;
+
+    /// Async version of [`CoordinationBackend::complete`].
+    async fn complete(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        final_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CompleteError>;
+
+    /// Async version of [`CoordinationBackend::park_shard`].
+    async fn park_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        reason: ParkReason,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, ParkError>;
+
+    /// Async version of [`CoordinationBackend::split_replace`].
+    async fn split_replace(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitReplacePlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError>;
+
+    /// Async version of [`CoordinationBackend::split_residual`].
+    async fn split_residual(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,

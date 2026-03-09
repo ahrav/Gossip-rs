@@ -7,15 +7,19 @@ lease-based ownership, and bounded idempotent operations for the gossip-rs
 secret scanner. The shared data model (shard spec, cursor, pooled wrappers,
 manifest validation, split-replace planning core) lives in
 `crates/gossip-contracts/src/coordination/`, and the protocol layer
-(traits, state machine, InMemoryCoordinator, sim harness)
-lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
+(traits, state machine, InMemoryCoordinator, sim harness, async trait
+variants) lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 (Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
 `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
 
 The durable backend lives in `crates/gossip-coordination-etcd/`.
-It owns a real etcd client connection, a deterministic keyspace layout
-(`keyspace.rs`), and an explicit binary codec (`codec.rs`) for persisting
-coordination records. It persists `create_run`, `register_shards`,
+It provides two entrypoints: `EtcdCoordinator` (sync wrapper owning a
+single-threaded Tokio runtime) and `AsyncEtcdCoordinator` (async core
+for callers that already have a runtime). Both share the same coordination
+logic, static helpers, and validation code.
+The backend owns a real etcd client connection, a deterministic keyspace
+layout (`keyspace.rs`), and an explicit binary codec (`codec.rs`) for
+persisting coordination records. It persists `create_run`, `register_shards`,
 `get_run*` queries, `claim_next_available`, and the fenced
 `acquire_and_restore_into` / `renew` / `checkpoint` / `split_replace` /
 `split_residual` hot path directly in etcd.
@@ -34,11 +38,11 @@ existing shard-record keys under the relevant etcd prefixes, then rejecting
 growth that would exceed the configured caps.
 The remaining mutating operations (`complete`, `park_shard`) fail closed
 until their persisted transaction semantics are defined. All `RunManagement`
-trait operations (run terminal transitions, `unpark_shard`) are fully
-persisted. The etcd backend also exposes backend-specific helpers for
-active-run listing and GC of stale initializing runs (see `backend.rs`
-file table below); these are inherent methods on `EtcdCoordinator`, not
-part of the `RunManagement` trait surface.
+(and `AsyncRunManagement`) trait operations (run terminal transitions,
+`unpark_shard`) are fully persisted. The etcd backend also exposes
+backend-specific helpers for active-run listing and GC of stale initializing
+runs (see `backend.rs` file table below); these are inherent methods on
+`EtcdCoordinator`, not part of the trait surfaces.
 
 The module provides seven core capabilities:
 
@@ -71,13 +75,13 @@ The module provides seven core capabilities:
 
 | File                 | Role                                                                                             |
 | -------------------- | ------------------------------------------------------------------------------------------------ |
-| `traits.rs`          | `CoordinationBackend` trait -- the semantic contract for all backends                            |
+| `traits.rs`          | `CoordinationBackend` and `AsyncCoordinationBackend` traits -- the semantic contract for all backends (sync and async variants) |
 | `record.rs`          | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshotView`                                  |
-| `run.rs`             | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait                                     |
+| `run.rs`             | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` and `AsyncRunManagement` traits            |
 | `split_execution.rs` | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types     |
 | `in_memory.rs`       | In-memory reference implementation (executable spec)                                             |
 | `lease.rs`           | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`                                       |
-| `error.rs`           | Shared `CoordError` and `IdempotentOutcome`                                                      |
+| `error.rs`           | Shared `CoordError`, `InfraError` (typed infrastructure errors), and `IdempotentOutcome`          |
 | `run_errors.rs`      | Run-management error types                                                                       |
 | `validation.rs`      | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency`                        |
 | `events.rs`          | `EventCollector`, `EventKind`, `StateTransitionEvent`                                            |
@@ -101,13 +105,16 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
-| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, fenced acquire/renew/checkpoint/split, run terminal transitions, unpark, active-run listing, and GC of stale initializing runs |
+| `backend.rs`      | Module root for the `backend/` directory; shared free functions (key comparison, CAS delay, shard capacity counting) |
+| `backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper with owned Tokio runtime) and `AsyncEtcdCoordinator` (async core): shared low-level etcd RPC wrappers, CAS retry logic, data-access helpers (load/scan run and shard records), and inherent methods (`list_active_runs_into`, `gc_stale_initializing_runs_into`) |
+| `backend/run_management.rs` | `RunManagement` and `AsyncRunManagement` impl: create/register/terminate runs, unpark shards, claim candidates |
+| `backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` impl: acquire/renew/checkpoint/split operations |
+| `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
 | `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, shard count limits, and bounded split fanout |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
 | `error.rs`        | etcd connection, codec, lease, and transaction error surfaces                                 |
-| `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
 | `tests.rs`        | Config validation, keyspace path invariants (proptest), and ignored etcd integration tests covering acquire/checkpoint/renew/split lifecycle, unpark, collision/limit paths, fault-injected split atomicity, lease expiry, and contention |
 
 ---
@@ -316,7 +323,8 @@ Run creation is a two-phase process (D2.20):
 ### RunManagement trait
 
 `RunManagement` is a separate trait from `CoordinationBackend` (D2.22). It
-defines run-level and admin operations:
+defines run-level and admin operations. `AsyncRunManagement` provides an
+identical async counterpart for I/O-bound backends:
 
 | Method             | Description                           | Idempotent? | Lease-gated? |
 | ------------------ | ------------------------------------- | :---------: | :----------: |
@@ -505,7 +513,10 @@ failing operation was not persisted), but the root cause must be investigated.
 ## 8. CoordinationBackend Contract
 
 The core trait with 7 operations that every backend (in-memory, FoundationDB,
-PostgreSQL, deterministic simulator) must implement:
+PostgreSQL, deterministic simulator) must implement. An async counterpart,
+`AsyncCoordinationBackend`, provides identical semantics with `async fn`
+methods for I/O-bound backends (etcd, FoundationDB, PostgreSQL) that benefit
+from non-blocking execution:
 
 | Operation                  | Signature (simplified)                                     |  Terminal?   | Idempotent? | Lease-gated? |
 | -------------------------- | ---------------------------------------------------------- | :----------: | :---------: | :----------: |
@@ -650,7 +661,7 @@ half-open `[start, end)` byte-key ranges.
 | D2.10 | Derived shard IDs have bit 63 set                                                 |
 | D2.11 | ShardRecord is self-contained (no back-references to RunConfig)                   |
 | D2.12 | ShardSnapshotView includes status, spec, cursor, cursor_semantics, parent, spawned; excludes lease, fence, op_log, tenant, park_reason |
-| D2.13 | Trait is synchronous (returns `Result`, not futures)                              |
+| D2.13 | Sync trait is the primary contract (`Result`, not futures); `AsyncCoordinationBackend` and `AsyncRunManagement` provide async counterparts for I/O-bound backends |
 | D2.14 | Lease-gated operations take `(TenantId, Lease)`                                   |
 | D2.15 | `acquire_and_restore_into` is the only non-lease operation                        |
 | D2.16 | Error types are operation-specific enums via `From<CoordError>`                   |
@@ -668,6 +679,23 @@ half-open `[start, end)` byte-key ranges.
 ---
 
 ## 11. Error Architecture
+
+### InfraError
+
+`InfraError` represents backend-agnostic infrastructure failures from
+coordination backends. It classifies errors into two variants:
+
+| Variant | Retryable? | Meaning |
+| --- | :---: | --- |
+| `Transient { operation, message }` | Yes | Network timeouts, gRPC failures, CAS retry budget exhausted |
+| `Corruption { operation, message }` | No | Codec decode failures, op-log kind mismatches, missing records |
+
+The `operation` field identifies the failing step as a human-readable label
+(e.g., `"acquire.load_shard"`, `"renew.txn"`). Every operation-specific
+error type carries a `BackendError(InfraError)` variant for surfacing
+infrastructure failures alongside protocol errors. `InfraError` implements
+`std::error::Error` and is returned via `Error::source()` for error chain
+traversal.
 
 ### CoordError
 

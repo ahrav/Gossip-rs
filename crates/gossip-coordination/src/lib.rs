@@ -93,8 +93,8 @@ pub use gossip_contracts::coordination::{
 
 pub use error::{
     AcquireError, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError, CompleteError,
-    CoordError, CursorOutOfBoundsDetail, FixedBuf, IdempotentOutcome, ParkError, RenewError,
-    RenewResult, ShardSnapshotView, SplitError, SplitReplaceError, SplitResidualError,
+    CoordError, CursorOutOfBoundsDetail, FixedBuf, IdempotentOutcome, InfraError, ParkError,
+    RenewError, RenewResult, ShardSnapshotView, SplitError, SplitReplaceError, SplitResidualError,
 };
 pub use events::{EventCollector, EventKind, RedactedKey, StateTransitionEvent};
 pub use facade::{ClaimError, CoordinationFacade, ShardClaiming, default_claim_next_available};
@@ -102,10 +102,11 @@ pub use in_memory::InMemoryCoordinator;
 pub use lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 pub use record::{ParkReason, ShardRecord, ShardStatus};
 pub use run::{
-    RunConfig, RunConfigError, RunManagement, RunOpIdConflict, RunOpKind, RunOpLogEntry,
-    RunOpResult, RunProgress, RunRecord, RunStatus, RunTerminalEvaluation, ShardFilter,
-    ShardSummary, evaluate_run_terminal, hash_cancel_run_payload, hash_complete_run_payload,
-    hash_fail_run_payload, hash_register_shards_payload, hash_unpark_payload,
+    AsyncRunManagement, RunConfig, RunConfigError, RunManagement, RunOpIdConflict, RunOpKind,
+    RunOpLogEntry, RunOpResult, RunProgress, RunRecord, RunStatus, RunTerminalEvaluation,
+    ShardFilter, ShardSummary, evaluate_run_terminal, hash_cancel_run_payload,
+    hash_complete_run_payload, hash_fail_run_payload, hash_register_shards_payload,
+    hash_unpark_payload,
 };
 pub use run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
@@ -119,7 +120,7 @@ pub use split_execution::{
     split_residual_build_record, split_residual_check_replay,
     split_residual_validate_cursor_bounds, split_residual_validate_preconditions,
 };
-pub use traits::CoordinationBackend;
+pub use traits::{AsyncCoordinationBackend, CoordinationBackend};
 pub use validation::{check_op_idempotency, validate_lease};
 
 // Re-export split planner core from contracts for ergonomic call sites.

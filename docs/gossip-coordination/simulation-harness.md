@@ -10,11 +10,13 @@ source-specific execution backends. The simulation harness remains focused on
 coordination correctness and intentionally does not depend on scanner-engine
 or scheduler internals.
 
-Persistence note: `crates/gossip-coordination-etcd/` currently owns a real etcd
-client for connectivity checks but still delegates protocol semantics to
-`InMemoryCoordinator`. Deterministic simulation therefore continues to model the
-reference backend directly until the etcd implementation replaces delegation
-with real transactional writes.
+Persistence note: `crates/gossip-coordination-etcd/` provides two entrypoints —
+`EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core) —
+both persisting coordination state directly to etcd via CAS transactions.
+Deterministic simulation continues to model the `InMemoryCoordinator` reference
+backend because the sim harness requires synchronous `&mut self` control over
+logical time and fault injection, which the in-memory backend provides without
+I/O or async runtime dependencies.
 
 ## Architecture
 

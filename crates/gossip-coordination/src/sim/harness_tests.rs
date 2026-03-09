@@ -27,6 +27,7 @@
 //! | **Terminate-run generator** | `try_gen_terminate_run` samples all seeded runs uniformly |
 
 use super::*;
+use crate::error::InfraError;
 use crate::facade::ShardClaiming;
 use crate::run::{RunConfig, RunManagement, RunProgress, RunRecord, ShardFilter, ShardSummary};
 use crate::run_errors::{CreateRunError, GetRunError, RegisterShardsError};
@@ -136,9 +137,10 @@ impl crate::traits::CoordinationBackend for FaultingSessionBackend {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteError> {
         if matches!(self.fault, InjectedSessionFault::Complete) {
-            return Err(CompleteError::BackendError {
-                message: "injected session backend fault".to_string(),
-            });
+            return Err(CompleteError::BackendError(InfraError::transient(
+                "injected_fault",
+                "injected session backend fault",
+            )));
         }
         self.inner.complete(now, tenant, lease, final_cursor, op_id)
     }
@@ -163,9 +165,10 @@ impl crate::traits::CoordinationBackend for FaultingSessionBackend {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitReplaceResult>, crate::error::SplitReplaceError> {
         if matches!(self.fault, InjectedSessionFault::SplitReplace) {
-            return Err(SplitError::BackendError {
-                message: "injected session backend fault".to_string(),
-            });
+            return Err(SplitError::BackendError(InfraError::transient(
+                "injected_fault",
+                "injected session backend fault",
+            )));
         }
         self.inner.split_replace(now, tenant, lease, plan, op_id)
     }
@@ -179,9 +182,10 @@ impl crate::traits::CoordinationBackend for FaultingSessionBackend {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitResidualResult>, crate::error::SplitResidualError> {
         if matches!(self.fault, InjectedSessionFault::SplitResidual) {
-            return Err(SplitError::BackendError {
-                message: "injected session backend fault".to_string(),
-            });
+            return Err(SplitError::BackendError(InfraError::transient(
+                "injected_fault",
+                "injected session backend fault",
+            )));
         }
         self.inner.split_residual(now, tenant, lease, plan, op_id)
     }
@@ -1217,7 +1221,7 @@ fn add_worker_rejects_id_zero() {
 
 #[test]
 #[should_panic(
-    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+    expected = "simulation backend produced unexpected infrastructure error: [transient] injected_fault: injected session backend fault"
 )]
 fn session_lifecycle_panics_on_complete_backend_error() {
     let seed = find_seed_for_session_terminal_action(b'a', b'b', |action| {
@@ -1231,7 +1235,7 @@ fn session_lifecycle_panics_on_complete_backend_error() {
 
 #[test]
 #[should_panic(
-    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+    expected = "simulation backend produced unexpected infrastructure error: [transient] injected_fault: injected session backend fault"
 )]
 fn session_lifecycle_panics_on_split_replace_backend_error() {
     let seed = find_seed_for_session_terminal_action(b'a', b'z', |action| {
@@ -1245,7 +1249,7 @@ fn session_lifecycle_panics_on_split_replace_backend_error() {
 
 #[test]
 #[should_panic(
-    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+    expected = "simulation backend produced unexpected infrastructure error: [transient] injected_fault: injected session backend fault"
 )]
 fn session_lifecycle_panics_on_split_residual_backend_error() {
     let seed = find_seed_for_session_terminal_action(b'a', b'z', |action| {
@@ -1259,7 +1263,7 @@ fn session_lifecycle_panics_on_split_residual_backend_error() {
 
 #[test]
 #[should_panic(
-    expected = "simulation backend produced unexpected infrastructure error: injected session backend fault"
+    expected = "simulation backend produced unexpected infrastructure error: [transient] injected_fault: injected session backend fault"
 )]
 fn session_lifecycle_panics_on_post_residual_complete_backend_error() {
     let seed = find_seed_for_session_terminal_action(b'a', b'z', |action| {
