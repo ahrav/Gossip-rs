@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::{AnchorPolicy, FileId, RuleSpec, ValidatorKind, confidence};
+use crate::api::{confidence, AnchorPolicy, FileId, RuleSpec, ValidatorKind};
 use crate::demo::demo_tuning;
 use crate::engine::rule_repr::NO_GATE;
 use regex::bytes::Regex;
@@ -387,7 +387,7 @@ fn min_confidence_threshold_allows_finding_at_threshold() {
     );
 }
 
-#[cfg(feature = "perf-stats")]
+#[cfg(all(feature = "perf-stats", debug_assertions))]
 #[test]
 fn confidence_suppressed_counter_increments_and_resets() {
     // A rule with min_confidence=1 and no keyword/entropy gates: all findings

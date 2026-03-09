@@ -18,8 +18,8 @@
 //! - Allocation failures and invalid layouts are reported via
 //!   `ScratchMemoryError`.
 
-use std::alloc::{Layout, alloc, dealloc};
-use std::mem::{MaybeUninit, align_of, size_of};
+use std::alloc::{alloc, dealloc, Layout};
+use std::mem::{align_of, size_of, MaybeUninit};
 use std::ptr::NonNull;
 
 /// Minimum alignment for scratch allocations.
@@ -482,6 +482,7 @@ mod tests {
         assert!(vec.is_empty());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "scratch vec capacity exceeded")]
     fn scratch_vec_push_overflow_panics() {
@@ -490,6 +491,7 @@ mod tests {
         vec.push(2);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "scratch vec capacity exceeded")]
     fn scratch_vec_extend_from_slice_overflow() {
@@ -545,8 +547,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // Miri-targeted: drop tracking for unsafe paths.
     // -----------------------------------------------------------------------
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[derive(Clone)]
     struct DropTracker(Arc<AtomicUsize>);
@@ -601,7 +603,7 @@ mod tests {
         {
             let mut drain = vec.drain();
             let _first = drain.next(); // takes ownership of 1
-            // Drain::drop should drop the remaining 3.
+                                       // Drain::drop should drop the remaining 3.
         }
         // 1 still alive in _first? No, _first is dropped at end of block too.
         assert_eq!(drops.load(Ordering::Relaxed), 4);
