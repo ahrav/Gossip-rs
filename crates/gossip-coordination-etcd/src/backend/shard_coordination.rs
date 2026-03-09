@@ -17,7 +17,44 @@ use gossip_coordination::{
 use crate::codec::{encode_owner_value_into, encode_shard_record, encode_shard_record_into};
 
 use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
-use super::{CasOutcome, cas_retry_delay, shard_limit_violation, split_replace_replay_child_ids};
+use super::{
+    CasOutcome, PersistedShard, cas_retry_delay, shard_limit_violation,
+    split_replace_replay_child_ids,
+};
+
+/// Project a persisted shard record into the caller's [`AcquireScratch`]
+/// buffer and build the [`AcquireResultView`].
+///
+/// Shared by both sync and async `acquire_and_restore_into` to keep the
+/// snapshot projection logic in a single place.
+fn build_acquire_result<'a>(
+    out: &'a mut AcquireScratch,
+    persisted: &PersistedShard,
+    lease: Lease,
+    capacity: CapacityHint,
+) -> AcquireResultView<'a> {
+    out.reset();
+    out.write_spec(
+        persisted.record.spec.key_range_start(&persisted.slab),
+        persisted.record.spec.key_range_end(&persisted.slab),
+        persisted.record.spec.metadata(&persisted.slab),
+    );
+    out.write_cursor(
+        persisted.record.cursor.last_key(&persisted.slab),
+        persisted.record.cursor.token(&persisted.slab),
+    );
+    out.write_spawned_iter(persisted.record.spawned.iter(&persisted.slab));
+    let snapshot = out.view(
+        persisted.record.status,
+        persisted.record.cursor_semantics,
+        persisted.record.parent,
+    );
+    AcquireResultView {
+        lease,
+        snapshot,
+        capacity,
+    }
+}
 
 impl CoordinationBackend for EtcdCoordinator {
     /// Atomically take ownership of a shard, restoring its persisted state
@@ -40,7 +77,9 @@ impl CoordinationBackend for EtcdCoordinator {
     ///   live at `now`.
     /// - [`AcquireError::TenantMismatch`] — persisted tenant differs from
     ///   the requested tenant.
-    /// - [`AcquireError::BackendError`] — etcd RPC failure.
+    /// - [`AcquireError::BackendError`] — etcd RPC failure, local encode
+    ///   error, or corruption detected by internal validation (e.g., codec
+    ///   or keyspace invariant violation).
     fn acquire_and_restore_into<'a>(
         &mut self,
         now: LogicalTime,
@@ -217,28 +256,7 @@ impl CoordinationBackend for EtcdCoordinator {
             },
         )?;
 
-        out.reset();
-        out.write_spec(
-            persisted.record.spec.key_range_start(&persisted.slab),
-            persisted.record.spec.key_range_end(&persisted.slab),
-            persisted.record.spec.metadata(&persisted.slab),
-        );
-        out.write_cursor(
-            persisted.record.cursor.last_key(&persisted.slab),
-            persisted.record.cursor.token(&persisted.slab),
-        );
-        out.write_spawned_iter(persisted.record.spawned.iter(&persisted.slab));
-        let snapshot = out.view(
-            persisted.record.status,
-            persisted.record.cursor_semantics,
-            persisted.record.parent,
-        );
-
-        Ok(AcquireResultView {
-            lease,
-            snapshot,
-            capacity,
-        })
+        Ok(build_acquire_result(out, &persisted, lease, capacity))
     }
 
     /// Extend a shard's logical lease deadline without changing ownership.
@@ -256,7 +274,8 @@ impl CoordinationBackend for EtcdCoordinator {
     /// - [`RenewError::StaleFence`] — the persisted owner binding does not
     ///   match the presented lease's worker/fence.
     /// - [`RenewError::ShardNotFound`] — shard does not exist in etcd.
-    /// - [`RenewError::BackendError`] — etcd RPC failure.
+    /// - [`RenewError::BackendError`] — etcd RPC failure, local encode
+    ///   error, or corruption detected by internal validation.
     fn renew(
         &mut self,
         now: LogicalTime,
@@ -1299,27 +1318,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 },
             )
             .await?;
-        out.reset();
-        out.write_spec(
-            persisted.record.spec.key_range_start(&persisted.slab),
-            persisted.record.spec.key_range_end(&persisted.slab),
-            persisted.record.spec.metadata(&persisted.slab),
-        );
-        out.write_cursor(
-            persisted.record.cursor.last_key(&persisted.slab),
-            persisted.record.cursor.token(&persisted.slab),
-        );
-        out.write_spawned_iter(persisted.record.spawned.iter(&persisted.slab));
-        let snapshot = out.view(
-            persisted.record.status,
-            persisted.record.cursor_semantics,
-            persisted.record.parent,
-        );
-        Ok(AcquireResultView {
-            lease,
-            snapshot,
-            capacity,
-        })
+        Ok(build_acquire_result(out, &persisted, lease, capacity))
     }
 
     async fn renew(

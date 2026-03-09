@@ -1530,11 +1530,14 @@ impl AsyncEtcdCoordinator {
             Box<dyn std::future::Future<Output = Result<T, E>> + '_>,
         >,
     ) -> Result<T, E> {
-        for attempt_num in 0..self.config.optimistic_txn_retries() {
+        let max_retries = self.config.optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
             match attempt(self, attempt_num).await? {
                 CasOutcome::Committed(val) => return Ok(val),
                 CasOutcome::RetryNeeded => {
-                    tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+                    if attempt_num + 1 < max_retries {
+                        tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+                    }
                 }
             }
         }
