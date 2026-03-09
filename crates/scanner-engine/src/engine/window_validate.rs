@@ -601,12 +601,13 @@ fn compute_confidence_score(
 }
 
 /// Returns `true` when `staged` already contains a finding with the same
-/// rule, span, and root-hint coordinates — i.e. the candidate is a duplicate
-/// produced by overlapping VS prefilter windows that decode to the same region.
+/// rule, step, span, and root-hint coordinates — i.e. the candidate is a
+/// duplicate produced by overlapping VS prefilter windows that decode to the
+/// same region.
 ///
-/// `step_id` is intentionally excluded from the comparison: raw and transform
-/// findings at identical coordinates must both be staged because downstream
-/// `replace_same_scan_duplicate` resolves raw-vs-transform priority.
+/// `step_id` is included so that UTF-16 LE and BE findings with identical
+/// span coordinates are not falsely collapsed — they carry different decode
+/// steps and must survive as distinct findings.
 ///
 /// This is staging-local dedup only. Global cross-window dedup happens in
 /// `push_finding_with_drop_hint` → `replace_same_scan_duplicate`.
@@ -619,9 +620,11 @@ fn is_staging_duplicate(
     span_end: u32,
     root_hint_start: u64,
     root_hint_end: u64,
+    step_id: StepId,
 ) -> bool {
     staged.iter().any(|f| {
         f.rule_id == rule_id
+            && f.step_id == step_id
             && f.span_start == span_start
             && f.span_end == span_end
             && f.root_hint_start == root_hint_start
@@ -1335,6 +1338,7 @@ impl Engine {
                     span_in_buf.end as u32,
                     root_hint_start,
                     root_hint_end,
+                    step_id,
                 ) {
                     return;
                 }
@@ -1611,6 +1615,7 @@ impl Engine {
                     secret_end as u32,
                     root_hint_start,
                     root_hint_end,
+                    utf16_step_id,
                 ) {
                     return;
                 }

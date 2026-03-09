@@ -22,6 +22,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(
 
 [dependencies]
 crossbeam-utils = "0.8"
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

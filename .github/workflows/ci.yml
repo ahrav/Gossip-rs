@@ -271,6 +271,7 @@ jobs:
         -Zmiri-strict-provenance
         -Zmiri-symbolic-alignment-check
         -Zmiri-preemption-rate=0.1
+        -Zmiri-isolation-error=warn
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
@@ -368,12 +369,12 @@ jobs:
       - name: Loom — gossip-stdx (8 tests)
         run: >-
           RUSTFLAGS="--cfg loom" cargo test --lib
-          -p gossip-stdx -- loom_tests
+          -p gossip-stdx --features loom -- loom_tests
 
       - name: Loom — scanner-scheduler (4 tests)
         run: >-
           RUSTFLAGS="--cfg loom" cargo test --lib
-          -p scanner-scheduler -- loom_tests
+          -p scanner-scheduler --features loom -- loom_tests
 
   # ── ASAN (nightly only) ─────────────────────────────────────────────
   asan:

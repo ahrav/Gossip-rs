@@ -2302,43 +2302,49 @@ fn oracle_archive_outcomes(
             });
         }
 
-        match root.outcome {
-            ArchiveEnd::Skipped(reason) => {
-                let idx = reason.as_usize();
-                if root.stats.archive_skip_reasons[idx] == 0 || root.stats.archives_skipped == 0 {
-                    return Err(FailureReport {
-                        kind: FailureKind::OracleMismatch,
-                        message: format!(
-                            "archive skip reason not recorded for {:?}: {:?}",
-                            root_path, reason
-                        ),
-                        step,
-                    });
+        // Stat-counter oracle checks are only meaningful when recording is
+        // enabled (debug builds with perf-stats feature). In release builds
+        // the counters are zero-initialised stubs.
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            match root.outcome {
+                ArchiveEnd::Skipped(reason) => {
+                    let idx = reason.as_usize();
+                    if root.stats.archive_skip_reasons[idx] == 0 || root.stats.archives_skipped == 0
+                    {
+                        return Err(FailureReport {
+                            kind: FailureKind::OracleMismatch,
+                            message: format!(
+                                "archive skip reason not recorded for {:?}: {:?}",
+                                root_path, reason
+                            ),
+                            step,
+                        });
+                    }
                 }
-            }
-            ArchiveEnd::Partial(reason) => {
-                let idx = reason.as_usize();
-                if root.stats.partial_reasons[idx] == 0 || root.stats.archives_partial == 0 {
-                    return Err(FailureReport {
-                        kind: FailureKind::OracleMismatch,
-                        message: format!(
-                            "archive partial reason not recorded for {:?}: {:?}",
-                            root_path, reason
-                        ),
-                        step,
-                    });
+                ArchiveEnd::Partial(reason) => {
+                    let idx = reason.as_usize();
+                    if root.stats.partial_reasons[idx] == 0 || root.stats.archives_partial == 0 {
+                        return Err(FailureReport {
+                            kind: FailureKind::OracleMismatch,
+                            message: format!(
+                                "archive partial reason not recorded for {:?}: {:?}",
+                                root_path, reason
+                            ),
+                            step,
+                        });
+                    }
                 }
+                ArchiveEnd::Scanned => {}
             }
-            ArchiveEnd::Scanned => {}
-        }
 
-        let entry_skip_total: u64 = root.stats.entry_skip_reasons.iter().sum();
-        if root.stats.entries_skipped > 0 && entry_skip_total == 0 {
-            return Err(FailureReport {
-                kind: FailureKind::OracleMismatch,
-                message: format!("entry skip reasons missing for {:?}", root_path),
-                step,
-            });
+            let entry_skip_total: u64 = root.stats.entry_skip_reasons.iter().sum();
+            if root.stats.entries_skipped > 0 && entry_skip_total == 0 {
+                return Err(FailureReport {
+                    kind: FailureKind::OracleMismatch,
+                    message: format!("entry skip reasons missing for {:?}", root_path),
+                    step,
+                });
+            }
         }
     }
 

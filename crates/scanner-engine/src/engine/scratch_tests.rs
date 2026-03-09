@@ -233,6 +233,7 @@ fn cross_chunk_dedupe_tracks_candidates_beyond_emit_cap() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "overflows the 24-bit field")]
 fn dedup_rejects_rule_ids_that_overlap_variant_bits() {

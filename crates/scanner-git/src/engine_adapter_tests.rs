@@ -1200,6 +1200,7 @@ fn commit_meta_carries_correct_oid_and_timestamp() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "AtomicBitSet bit_length")]
 fn mismatched_bitset_and_graph_panics_in_debug() {

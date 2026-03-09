@@ -482,6 +482,7 @@ mod tests {
         assert!(vec.is_empty());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "scratch vec capacity exceeded")]
     fn scratch_vec_push_overflow_panics() {
@@ -490,6 +491,7 @@ mod tests {
         vec.push(2);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "scratch vec capacity exceeded")]
     fn scratch_vec_extend_from_slice_overflow() {

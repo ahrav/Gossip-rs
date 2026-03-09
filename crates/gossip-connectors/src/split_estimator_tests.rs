@@ -786,6 +786,7 @@ fn nearest_by_rank_in_range_tie_breaks_to_earlier() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[should_panic]
 fn nearest_by_rank_in_range_panics_on_invalid_bounds() {
