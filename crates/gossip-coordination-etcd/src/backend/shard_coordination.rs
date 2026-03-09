@@ -9,18 +9,16 @@ use gossip_coordination::{
     ShardStatus, SplitChildIds, SplitReplaceError, SplitReplacePlan, SplitReplaceResult,
     SplitResidualError, SplitResidualPlan, SplitResidualResult, TenantId, WorkerId,
     check_op_idempotency, derive_split_shard_id, hash_checkpoint_payload,
-    hash_split_replace_payload, hash_split_residual_payload, split_replace_apply_parent,
-    split_replace_validate_preconditions, split_residual_apply_parent, split_residual_build_record,
-    split_residual_check_replay, split_residual_validate_preconditions, validate_lease,
+    hash_split_replace_payload, hash_split_residual_payload, shard_limit_violation,
+    split_replace_apply_parent, split_replace_validate_preconditions, split_residual_apply_parent,
+    split_residual_build_record, split_residual_check_replay,
+    split_residual_validate_preconditions, validate_lease,
 };
 
 use crate::codec::{encode_owner_value_into, encode_shard_record, encode_shard_record_into};
 
 use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
-use super::{
-    CasOutcome, PersistedShard, cas_retry_delay, shard_limit_violation,
-    split_replace_replay_child_ids,
-};
+use super::{CasOutcome, PersistedShard, cas_retry_delay, split_replace_replay_child_ids};
 
 /// Project a persisted shard record into the caller's [`AcquireScratch`]
 /// buffer and build the [`AcquireResultView`].

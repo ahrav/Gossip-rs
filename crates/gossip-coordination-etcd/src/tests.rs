@@ -2893,7 +2893,7 @@ fn split_replace_rejects_over_cap_max_children_per_op() {
 /// that should still permit the split.
 #[test]
 fn shard_limit_split_replace_off_by_one_with_parent_in_count() {
-    use crate::backend::{ShardCountSnapshot, shard_limit_violation};
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 2;
 
@@ -2934,7 +2934,7 @@ fn shard_limit_split_replace_off_by_one_with_parent_in_count() {
 /// Verify the same off-by-one manifests on the global shard limit path.
 #[test]
 fn shard_limit_split_replace_off_by_one_global_limit() {
-    use crate::backend::{ShardCountSnapshot, shard_limit_violation};
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 3;
     let max_per_tenant: usize = 1000; // high enough to never trigger

@@ -43,7 +43,7 @@ use crate::test_fixtures::{
     test_split_replace_plan, test_split_residual_plan, test_tenant, test_worker,
 };
 use gossip_contracts::coordination::cursor::CursorUpdate;
-use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardLimitScope, ShardSpec};
 use gossip_contracts::identity::FenceEpoch;
 use gossip_stdx::RingBuffer;
 
