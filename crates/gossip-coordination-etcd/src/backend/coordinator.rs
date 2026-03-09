@@ -4,7 +4,7 @@ use std::fmt;
 use etcd_client::{DeleteOptions, GetOptions, Txn, TxnOp};
 use gossip_coordination::{
     CapacityHint, IdempotentOutcome, InfraError, LogicalTime, OpId, RunId, RunOpKind, RunStatus,
-    RunTransitionError, ShardId, ShardKey, TenantId, hash_cancel_run_payload,
+    RunTransitionError, ShardCountSnapshot, ShardId, ShardKey, TenantId, hash_cancel_run_payload,
     hash_complete_run_payload, hash_fail_run_payload,
 };
 
@@ -17,10 +17,9 @@ use crate::keyspace::{
 };
 
 use super::{
-    CasOutcome, PersistedOwner, PersistedRun, PersistedShard, ShardCountSnapshot,
-    apply_terminal_run_transition, cas_retry_delay, compare_absent, compare_present,
-    compare_run_revision, decode_owner_kv, fatal_storage_error, make_decode_slab,
-    validate_owner_consistency,
+    CasOutcome, PersistedOwner, PersistedRun, PersistedShard, apply_terminal_run_transition,
+    cas_retry_delay, compare_absent, compare_present, compare_run_revision, decode_owner_kv,
+    fatal_storage_error, make_decode_slab, validate_owner_consistency,
 };
 
 #[cfg(any(test, feature = "test-support"))]

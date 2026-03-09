@@ -8,11 +8,11 @@ use gossip_coordination::{
     RunOpLogEntry, RunOpResult, RunProgress, RunRecord, RunStatus, RunTransitionError,
     ShardClaiming, ShardFilter, ShardId, ShardKey, ShardStatus, ShardSummary, TenantId,
     UnparkError, WorkerId, check_op_idempotency, default_claim_next_available,
-    hash_register_shards_payload, hash_unpark_payload, validate_manifest,
+    hash_register_shards_payload, hash_unpark_payload, shard_limit_violation, validate_manifest,
 };
 
 use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
-use super::{CasOutcome, MAX_SHARDS_PER_ETCD_TXN, cas_retry_delay, shard_limit_violation};
+use super::{CasOutcome, MAX_SHARDS_PER_ETCD_TXN, cas_retry_delay};
 use crate::codec::{encode_run_record, encode_shard_record_into};
 use crate::keyspace::{ShardActiveIndexKey, ShardOwnerKey};
 

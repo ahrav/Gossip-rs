@@ -109,6 +109,7 @@ use crate::run::{
 use crate::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
+use crate::shard_limits::{ShardCountSnapshot, shard_limit_violation};
 use crate::split_execution::{
     DerivedShardKind, SplitChildIds, SplitChildOrder, SplitReplaceResult, SplitResidualResult,
     derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload, hash_park_payload,
@@ -122,7 +123,7 @@ use gossip_contracts::coordination::cursor::CursorUpdate;
 #[cfg(test)]
 use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
 use gossip_contracts::coordination::manifest::{InitialShardInput, validate_manifest};
-use gossip_contracts::coordination::shard_spec::{ShardLimitScope, SplitValidationError};
+use gossip_contracts::coordination::shard_spec::SplitValidationError;
 #[cfg(test)]
 use gossip_contracts::coordination::split::SplitReplaceChild;
 use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
@@ -897,29 +898,28 @@ impl InMemoryCoordinator {
         additional: usize,
         temporarily_removed: usize,
     ) -> Result<(), SplitValidationError> {
-        // Per-tenant limit: O(1) via inner map len().
-        let tenant_count = self
-            .shards
-            .get(&tenant)
-            .map_or(0, |m| m.len())
-            .saturating_add(temporarily_removed);
-        if tenant_count.saturating_add(additional) > self.max_shards_per_tenant {
-            return Err(SplitValidationError::ShardLimitExceeded {
-                current: tenant_count,
-                additional,
-                max: self.max_shards_per_tenant,
-                scope: ShardLimitScope::PerTenant,
-            });
-        }
+        let counts = ShardCountSnapshot {
+            // Per-tenant limit uses O(1) inner-map cardinality.
+            tenant: self
+                .shards
+                .get(&tenant)
+                .map_or(0, |m| m.len())
+                .saturating_add(temporarily_removed),
+            // Global limit uses the maintained O(1) counter.
+            total: self.total_shard_count.saturating_add(temporarily_removed),
+        };
 
-        // Global limit: O(1) via maintained counter.
-        let total_count = self.total_shard_count.saturating_add(temporarily_removed);
-        if total_count.saturating_add(additional) > self.max_total_shards {
+        if let Some(limit) = shard_limit_violation(
+            counts,
+            additional,
+            self.max_shards_per_tenant,
+            self.max_total_shards,
+        ) {
             return Err(SplitValidationError::ShardLimitExceeded {
-                current: total_count,
-                additional,
-                max: self.max_total_shards,
-                scope: ShardLimitScope::Global,
+                current: limit.current,
+                additional: limit.additional,
+                max: limit.max,
+                scope: limit.scope,
             });
         }
 

@@ -68,7 +68,7 @@ use std::fmt;
 use std::time::Duration;
 
 use etcd_client::{Compare, CompareOp};
-use gossip_contracts::coordination::shard_spec::{ShardLimitScope, ShardSpecRef};
+use gossip_contracts::coordination::shard_spec::ShardSpecRef;
 use gossip_coordination::{
     ByteSlab, CursorSemantics, CursorUpdate, InitialShardInput, Lease, LogicalTime, OpId,
     RegisterShardsError, RunId, RunOpKind, RunOpLogEntry, RunOpResult, RunRecord, RunStatus,
@@ -129,35 +129,6 @@ const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 /// owner-version, owner-value, owner-lease) and 3 ops (put-parent,
 /// delete-owner, delete-active-index), giving `(128 - 7) / 3 = 40`.
 pub(crate) const MAX_CHILDREN_PER_SPLIT_TXN: usize = 40;
-
-// ---------------------------------------------------------------------------
-// Shared types
-// ---------------------------------------------------------------------------
-
-/// Snapshot of persisted shard counts used for shard-limit enforcement.
-///
-/// Both counters are computed from keys-only prefix scans at read time
-/// (no dedicated counter keys). The etcd backend reads from storage
-/// directly, so the counts already include any shard being operated on
-/// (unlike the in-memory backend, which temporarily removes the parent
-/// during split validation).
-#[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
-pub(crate) struct ShardCountSnapshot {
-    /// Shards under the requesting tenant's prefix.
-    pub(crate) tenant: usize,
-    /// Shards across all tenants.
-    pub(crate) total: usize,
-}
-
-/// Details for the first shard-limit violation detected in a growth check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ShardLimitViolation {
-    pub(crate) current: usize,
-    pub(crate) additional: usize,
-    pub(crate) max: usize,
-    pub(crate) scope: ShardLimitScope,
-}
 
 /// Outcome of a single CAS attempt within a retry loop.
 enum CasOutcome<T> {
@@ -251,34 +222,6 @@ impl Drop for PersistedShard {
 // ---------------------------------------------------------------------------
 // Free functions — key parsing, CAS delay, terminal transitions
 // ---------------------------------------------------------------------------
-
-/// Returns the first shard-count ceiling that `additional` would exceed.
-pub(crate) fn shard_limit_violation(
-    counts: ShardCountSnapshot,
-    additional: usize,
-    max_shards_per_tenant: usize,
-    max_total_shards: usize,
-) -> Option<ShardLimitViolation> {
-    if counts.tenant.saturating_add(additional) > max_shards_per_tenant {
-        return Some(ShardLimitViolation {
-            current: counts.tenant,
-            additional,
-            max: max_shards_per_tenant,
-            scope: ShardLimitScope::PerTenant,
-        });
-    }
-
-    if counts.total.saturating_add(additional) > max_total_shards {
-        return Some(ShardLimitViolation {
-            current: counts.total,
-            additional,
-            max: max_total_shards,
-            scope: ShardLimitScope::Global,
-        });
-    }
-
-    None
-}
 
 /// Compute a backoff delay for CAS retry loops.
 ///

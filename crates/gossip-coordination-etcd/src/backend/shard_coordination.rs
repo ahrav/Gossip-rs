@@ -9,18 +9,16 @@ use gossip_coordination::{
     ShardStatus, SplitChildIds, SplitReplaceError, SplitReplacePlan, SplitReplaceResult,
     SplitResidualError, SplitResidualPlan, SplitResidualResult, TenantId, WorkerId,
     check_op_idempotency, derive_split_shard_id, hash_checkpoint_payload,
-    hash_split_replace_payload, hash_split_residual_payload, split_replace_apply_parent,
-    split_replace_validate_preconditions, split_residual_apply_parent, split_residual_build_record,
-    split_residual_check_replay, split_residual_validate_preconditions, validate_lease,
+    hash_split_replace_payload, hash_split_residual_payload, shard_limit_violation,
+    split_replace_apply_parent, split_replace_validate_preconditions, split_residual_apply_parent,
+    split_residual_build_record, split_residual_check_replay,
+    split_residual_validate_preconditions, validate_lease,
 };
 
 use crate::codec::{encode_owner_value_into, encode_shard_record, encode_shard_record_into};
 
 use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
-use super::{
-    CasOutcome, PersistedShard, cas_retry_delay, shard_limit_violation,
-    split_replace_replay_child_ids,
-};
+use super::{CasOutcome, PersistedShard, cas_retry_delay, split_replace_replay_child_ids};
 
 /// Project a persisted shard record into the caller's [`AcquireScratch`]
 /// buffer and build the [`AcquireResultView`].
@@ -670,13 +668,14 @@ impl CoordinationBackend for EtcdCoordinator {
                         err,
                     ))
                 })?;
-                // The persisted count already includes the parent shard (it is
-                // still stored in etcd). After split, the parent becomes terminal
-                // (Split status) while N children are created, so the net growth
-                // in live shards is N - 1, not N.
+                // The persisted count includes the parent shard (still in etcd).
+                // After split the parent becomes terminal (Split status) and
+                // stays in storage while N children are created, so the total
+                // stored record count grows by N. Use N (child count) as
+                // `additional`, matching the in-memory backend's accounting.
                 if let Some(limit) = shard_limit_violation(
                     counts,
-                    sorted.len().saturating_sub(1),
+                    sorted.len(),
                     this.config.max_shards_per_tenant(),
                     this.config.max_total_shards(),
                 ) {
@@ -1647,7 +1646,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             })?;
             if let Some(limit) = shard_limit_violation(
                 counts,
-                sorted.len().saturating_sub(1),
+                sorted.len(),
                 self.config.max_shards_per_tenant(),
                 self.config.max_total_shards(),
             ) {

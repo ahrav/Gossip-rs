@@ -36,6 +36,7 @@ pub mod record;
 pub mod run;
 pub mod run_errors;
 pub mod session;
+pub mod shard_limits;
 pub mod split_execution;
 pub mod traits;
 pub mod validation;
@@ -112,6 +113,7 @@ pub use run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
 pub use session::WorkerSession;
+pub use shard_limits::{ShardCountSnapshot, ShardLimitViolation, shard_limit_violation};
 pub use split_execution::{
     DerivedShardKind, SplitChildIds, SplitChildOrder, SplitReplaceResult, SplitResidualResult,
     derive_split_shard_id, find_replayed_residual, hash_checkpoint_payload, hash_complete_payload,
