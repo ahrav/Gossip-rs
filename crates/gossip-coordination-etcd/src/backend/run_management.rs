@@ -12,7 +12,7 @@ use gossip_coordination::{
 };
 
 use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
-use super::{CasOutcome, MAX_SHARDS_PER_ETCD_TXN, cas_retry_delay};
+use super::{CasOutcome, MAX_SHARDS_PER_ETCD_TXN, TxnBuilder, cas_retry_delay};
 use crate::codec::{encode_run_record, encode_shard_record_into};
 use crate::keyspace::{ShardActiveIndexKey, ShardOwnerKey};
 
@@ -46,22 +46,15 @@ impl RunManagement for EtcdCoordinator {
 
         let key = self.keyspace.run_record_key(tenant, run);
         let blob = encode_run_record(&record);
-        let txn = Txn::new()
-            .when(vec![super::compare_absent(key.clone())])
-            .and_then(vec![TxnOp::put(key.into_bytes(), blob, None)]);
-        let response = match self.etcd_txn(txn) {
-            Ok(r) => r,
-            Err(err) => {
-                return Err(CreateRunError::BackendError(super::map_etcd_err(
-                    "create_run.txn",
-                    err,
-                )));
-            }
-        };
-        if response.succeeded() {
-            return Ok(record);
+        let mut txn = TxnBuilder::new();
+        txn.compare(super::compare_absent(key.clone()))
+            .put(key.into_bytes(), blob);
+        let outcome = txn.execute(self, record).map_err(|err| {
+            CreateRunError::BackendError(super::map_etcd_err("create_run.txn", err))
+        })?;
+        if let CasOutcome::Committed(created) = outcome {
+            return Ok(created);
         }
-
         Err(CreateRunError::RunAlreadyExists { run })
     }
 
@@ -210,30 +203,19 @@ impl RunManagement for EtcdCoordinator {
                 run_record.assert_invariants();
                 let run_blob = encode_run_record(&run_record);
 
-                txn_ops.insert(0, TxnOp::put(run_key.into_bytes(), run_blob, None));
                 let run_active_key = this.keyspace.run_active_index_key(tenant, run);
-                txn_ops.push(TxnOp::put(
-                    run_active_key.into_bytes(),
-                    Vec::<u8>::new(),
-                    None,
-                ));
-
-                let txn = Txn::new().when(compares).and_then(txn_ops);
-                let response = match this.etcd_txn(txn) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        return Err(RegisterShardsError::BackendError(super::map_etcd_err(
+                let mut txn = TxnBuilder::new();
+                txn.compare_all(compares)
+                    .put(run_key.into_bytes(), run_blob)
+                    .ops(txn_ops)
+                    .put(run_active_key.into_bytes(), Vec::<u8>::new());
+                txn.execute(this, IdempotentOutcome::Executed(shard_ids))
+                    .map_err(|err| {
+                        RegisterShardsError::BackendError(super::map_etcd_err(
                             "register_shards.txn",
                             err,
-                        )));
-                    }
-                };
-                if response.succeeded() {
-                    return Ok(CasOutcome::Committed(IdempotentOutcome::Executed(
-                        shard_ids,
-                    )));
-                }
-                Ok(CasOutcome::RetryNeeded)
+                        ))
+                    })
             },
             |this| {
                 let persisted_run = this.load_run_or_panic(tenant, run);
@@ -741,20 +723,14 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         record.assert_invariants();
         let key = self.keyspace.run_record_key(tenant, run);
         let blob = encode_run_record(&record);
-        let txn = Txn::new()
-            .when(vec![super::compare_absent(key.clone())])
-            .and_then(vec![TxnOp::put(key.into_bytes(), blob, None)]);
-        let response = match self.etcd_txn(txn).await {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(CreateRunError::BackendError(super::map_etcd_err(
-                    "create_run.txn",
-                    e,
-                )));
-            }
-        };
-        if response.succeeded() {
-            return Ok(record);
+        let mut txn = TxnBuilder::new();
+        txn.compare(super::compare_absent(key.clone()))
+            .put(key.into_bytes(), blob);
+        let outcome = txn.execute_async(self, record).await.map_err(|err| {
+            CreateRunError::BackendError(super::map_etcd_err("create_run.txn", err))
+        })?;
+        if let CasOutcome::Committed(created) = outcome {
+            return Ok(created);
         }
         Err(CreateRunError::RunAlreadyExists { run })
     }
@@ -869,21 +845,23 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             ));
             run_record.assert_invariants();
             let run_blob = encode_run_record(&run_record);
-            txn_ops.insert(0, TxnOp::put(run_key.into_bytes(), run_blob, None));
             let rak = self.keyspace.run_active_index_key(tenant, run);
-            txn_ops.push(TxnOp::put(rak.into_bytes(), Vec::<u8>::new(), None));
-            let txn = Txn::new().when(compares).and_then(txn_ops);
-            let response = match self.etcd_txn(txn).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(RegisterShardsError::BackendError(super::map_etcd_err(
+            let mut txn = TxnBuilder::new();
+            txn.compare_all(compares)
+                .put(run_key.into_bytes(), run_blob)
+                .ops(txn_ops)
+                .put(rak.into_bytes(), Vec::<u8>::new());
+            let outcome = txn
+                .execute_async(self, IdempotentOutcome::Executed(shard_ids))
+                .await
+                .map_err(|err| {
+                    RegisterShardsError::BackendError(super::map_etcd_err(
                         "register_shards.txn",
-                        e,
-                    )));
-                }
-            };
-            if response.succeeded() {
-                return Ok(IdempotentOutcome::Executed(shard_ids));
+                        err,
+                    ))
+                })?;
+            if let CasOutcome::Committed(result) = outcome {
+                return Ok(result);
             }
             tokio::time::sleep(cas_retry_delay(attempt_num)).await;
         }

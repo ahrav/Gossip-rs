@@ -67,7 +67,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use etcd_client::{Compare, CompareOp};
+use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::shard_spec::ShardSpecRef;
 use gossip_coordination::{
     ByteSlab, CursorSemantics, CursorUpdate, InitialShardInput, Lease, LogicalTime, OpId,
@@ -136,6 +136,69 @@ enum CasOutcome<T> {
     Committed(T),
     /// CAS precondition failed; caller should retry after backoff.
     RetryNeeded,
+}
+
+/// Thin builder for etcd CAS transactions used by coordination mutations.
+///
+/// This keeps compare/op assembly explicit at call sites while removing
+/// repeated `Txn::new().when(...).and_then(...)` boilerplate.
+#[derive(Default)]
+struct TxnBuilder {
+    compares: Vec<Compare>,
+    success_ops: Vec<TxnOp>,
+}
+
+impl TxnBuilder {
+    /// Create an empty transaction builder.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a single compare clause.
+    fn compare(&mut self, compare: Compare) -> &mut Self {
+        self.compares.push(compare);
+        self
+    }
+
+    /// Add multiple compare clauses.
+    fn compare_all(&mut self, compares: impl IntoIterator<Item = Compare>) -> &mut Self {
+        self.compares.extend(compares);
+        self
+    }
+
+    /// Add a put operation without options.
+    fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> &mut Self {
+        self.success_ops.push(TxnOp::put(key, value, None));
+        self
+    }
+
+    /// Add a put operation with explicit options.
+    fn put_with_options(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        options: PutOptions,
+    ) -> &mut Self {
+        self.success_ops.push(TxnOp::put(key, value, Some(options)));
+        self
+    }
+
+    /// Add a delete operation without options.
+    fn delete(&mut self, key: impl Into<Vec<u8>>) -> &mut Self {
+        self.success_ops.push(TxnOp::delete(key, None));
+        self
+    }
+
+    /// Add multiple already-constructed transaction operations.
+    fn ops(&mut self, ops: impl IntoIterator<Item = TxnOp>) -> &mut Self {
+        self.success_ops.extend(ops);
+        self
+    }
+
+    /// Build the etcd transaction.
+    fn build(self) -> Txn {
+        Txn::new().when(self.compares).and_then(self.success_ops)
+    }
 }
 
 /// A run record loaded from etcd, paired with its `mod_revision` for
