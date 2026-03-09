@@ -13,8 +13,7 @@ use crate::config::{DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::keyspace::EtcdKeyspace;
 use crate::keyspace::{
-    PersistedShardSubtreeKey, RunActiveIndexKey, RunRecordKey, ShardActiveIndexKey, ShardOwnerKey,
-    ShardRecordKey,
+    PersistedShardSubtreeKey, RunActiveIndexKey, RunRecordKey, ShardOwnerKey, ShardRecordKey,
 };
 
 use super::{
@@ -715,9 +714,12 @@ impl EtcdCoordinator {
         Ok(response
             .kvs()
             .iter()
-            // `parse_direct_shard_id` accepts only direct `{hex}` children.
-            // This excludes `/owner` keys and deeper descendants.
-            .filter(|kv| ShardActiveIndexKey::parse_direct_shard_id(&prefix, kv.key()).is_some())
+            // Persisted shard records are nested under `.../runs/{run}/shards/{hex}`.
+            // Count only record keys and skip owner keys.
+            .filter(|kv| {
+                PersistedShardSubtreeKey::classify(kv.key())
+                    == Some(PersistedShardSubtreeKey::Record)
+            })
             .count())
     }
 
@@ -1514,9 +1516,12 @@ impl AsyncEtcdCoordinator {
         Ok(response
             .kvs()
             .iter()
-            // `parse_direct_shard_id` accepts only direct `{hex}` children.
-            // This excludes `/owner` keys and deeper descendants.
-            .filter(|kv| ShardActiveIndexKey::parse_direct_shard_id(&prefix, kv.key()).is_some())
+            // Persisted shard records are nested under `.../runs/{run}/shards/{hex}`.
+            // Count only record keys and skip owner keys.
+            .filter(|kv| {
+                PersistedShardSubtreeKey::classify(kv.key())
+                    == Some(PersistedShardSubtreeKey::Record)
+            })
             .count())
     }
 
