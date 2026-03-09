@@ -601,19 +601,16 @@ fn compute_confidence_score(
 }
 
 /// Returns `true` when `staged` already contains a finding with the same
-/// rule, span, and root-hint coordinates — i.e. the candidate is a duplicate
-/// produced by overlapping VS prefilter windows that decode to the same region.
-///
-/// `step_id` is intentionally excluded from the comparison: raw and transform
-/// findings at identical coordinates must both be staged because downstream
-/// `replace_same_scan_duplicate` resolves raw-vs-transform priority.
-///
-/// This is staging-local dedup only. Global cross-window dedup happens in
-/// `push_finding_with_drop_hint` → `replace_same_scan_duplicate`.
+/// rule, step, span, and root-hint coordinates — i.e. the candidate is a
+/// duplicate produced by overlapping VS prefilter windows that decode to the
+/// same region.
 ///
 /// `step_id` is included so that UTF-16 LE and BE findings with identical
 /// span coordinates are not falsely collapsed — they carry different decode
 /// steps and must survive as distinct findings.
+///
+/// This is staging-local dedup only. Global cross-window dedup happens in
+/// `push_finding_with_drop_hint` → `replace_same_scan_duplicate`.
 ///
 /// O(n) scan over `staged`, bounded by `max_findings_per_chunk`.
 fn is_staging_duplicate(
