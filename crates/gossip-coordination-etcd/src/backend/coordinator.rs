@@ -82,6 +82,12 @@ impl EtcdCoordinator {
     pub fn connect(config: EtcdCoordinatorConfig) -> Result<Self, EtcdCoordinatorError> {
         config.validate()?;
 
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "EtcdCoordinator::connect() must not be called from within an \
+             active Tokio runtime — use AsyncEtcdCoordinator::connect() instead"
+        );
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -98,12 +104,6 @@ impl EtcdCoordinator {
         if let Some(tls) = config.tls().cloned() {
             connect_opts = connect_opts.with_tls(tls);
         }
-
-        assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "EtcdCoordinator::connect() must not be called from within an \
-             active Tokio runtime — use AsyncEtcdCoordinator::connect() instead"
-        );
 
         let mut client = runtime
             .block_on(etcd_client::Client::connect(endpoints, Some(connect_opts)))
