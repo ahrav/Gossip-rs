@@ -108,7 +108,7 @@ fn build_fixture_small(capacity: usize, runner: &mut TestRunner) -> Fixture<Smal
     for i in 0..capacity {
         let key = key_strategy.new_tree(runner).unwrap().current();
         // Ensure uniqueness by combining with index
-        let unique_key = key.wrapping_add(i as u64 * 0x9E3779B97F4A7C15);
+        let unique_key = key.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15));
         present_keys.push(unique_key);
         values.push(SmallValue {
             key: unique_key,
@@ -120,7 +120,8 @@ fn build_fixture_small(capacity: usize, runner: &mut TestRunner) -> Fixture<Smal
     let absent_keys: Vec<u64> = (0..capacity)
         .map(|i| {
             let key = key_strategy.new_tree(runner).unwrap().current();
-            key.wrapping_add((capacity + i) as u64 * 0xC6A4A7935BD1E995) | (1u64 << 63)
+            key.wrapping_add(((capacity + i) as u64).wrapping_mul(0xC6A4A7935BD1E995))
+                | (1u64 << 63)
         })
         .collect();
 
@@ -139,7 +140,7 @@ fn build_fixture_large(capacity: usize, runner: &mut TestRunner) -> Fixture<Larg
 
     for i in 0..capacity {
         let key = key_strategy.new_tree(runner).unwrap().current();
-        let unique_key = key.wrapping_add(i as u64 * 0x9E3779B97F4A7C15);
+        let unique_key = key.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15));
         present_keys.push(unique_key);
         values.push(LargeValue {
             key: unique_key,
@@ -150,7 +151,8 @@ fn build_fixture_large(capacity: usize, runner: &mut TestRunner) -> Fixture<Larg
     let absent_keys: Vec<u64> = (0..capacity)
         .map(|i| {
             let key = key_strategy.new_tree(runner).unwrap().current();
-            key.wrapping_add((capacity + i) as u64 * 0xC6A4A7935BD1E995) | (1u64 << 63)
+            key.wrapping_add(((capacity + i) as u64).wrapping_mul(0xC6A4A7935BD1E995))
+                | (1u64 << 63)
         })
         .collect();
 

@@ -34,9 +34,9 @@
 //!   coordination transactions for run lifecycle, shard lifecycle, and
 //!   cold-path maintenance. Feature-gated test seeding and fault-injection
 //!   helpers live in `backend/test_support.rs`.
-//! - **`keyspace`** — Deterministic ASCII etcd path construction for runs,
-//!   shards, ownership leases, and active indexes. See the module docs for
-//!   the full key layout.
+//! - **`keyspace`** — Deterministic ASCII etcd path construction plus typed
+//!   exact-key wrappers for runs, shards, ownership leases, and active
+//!   indexes. See the module docs for the full key layout.
 //! - **`codec`** — Explicit binary encoding for coordination records and
 //!   shard-owner bindings persisted to etcd.
 //! - **`error`** — Unified error types covering configuration validation,
@@ -71,7 +71,10 @@ pub use codec::{
 };
 pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 pub use error::{EtcdCoordinatorError, EtcdOperation};
-pub use keyspace::{EtcdKeyspace, EtcdKeyspaceError};
+pub use keyspace::{
+    EtcdKeyspace, EtcdKeyspaceError, RunActiveIndexKey, RunRecordKey, ShardActiveIndexKey,
+    ShardOwnerKey, ShardRecordKey,
+};
 
 #[cfg(test)]
 mod test_etcd;

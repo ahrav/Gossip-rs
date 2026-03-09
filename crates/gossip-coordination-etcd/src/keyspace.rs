@@ -47,8 +47,9 @@
 //! Every key method has a corresponding `_into` variant that appends into a
 //! caller-owned `&mut String` without clearing it first. This allows hot-path
 //! callers to reuse a single buffer across multiple key constructions,
-//! avoiding per-call heap allocation. The convenience methods (returning
-//! `String`) delegate to their `_into` counterparts internally.
+//! avoiding per-call heap allocation. Exact-key convenience methods return
+//! typed wrappers such as [`RunRecordKey`] and [`ShardOwnerKey`], while
+//! prefix-scan helpers continue to return `String`.
 
 use std::fmt;
 use std::fmt::Write;
@@ -94,6 +95,195 @@ impl fmt::Display for EtcdKeyspaceError {
 
 impl std::error::Error for EtcdKeyspaceError {}
 
+mod private {
+    pub trait Sealed {}
+}
+
+/// Exact etcd key path for a run record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RunRecordKey(String);
+
+/// Exact etcd key path for a shard record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShardRecordKey(String);
+
+/// Exact etcd key path for a shard ownership record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShardOwnerKey(String);
+
+/// Exact etcd key path for an active-run index entry.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RunActiveIndexKey(String);
+
+/// Exact etcd key path for an active-shard index entry.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShardActiveIndexKey(String);
+
+/// Marker for the persisted key kinds found under the `shards/` subtree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PersistedShardSubtreeKey {
+    Record,
+    Owner,
+}
+
+/// Internal trait for typed exact-key wrappers accepted by CAS helpers.
+pub(crate) trait EtcdKey: private::Sealed + Clone {
+    fn into_bytes(self) -> Vec<u8>;
+}
+
+macro_rules! impl_exact_key {
+    ($name:ident) => {
+        impl $name {
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            #[must_use]
+            pub fn as_bytes(&self) -> &[u8] {
+                self.0.as_bytes()
+            }
+
+            #[must_use]
+            pub fn into_bytes(self) -> Vec<u8> {
+                self.0.into_bytes()
+            }
+
+            pub(crate) fn from_string(key: String) -> Self {
+                Self(key)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl AsRef<[u8]> for $name {
+            fn as_ref(&self) -> &[u8] {
+                self.as_bytes()
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl From<$name> for Vec<u8> {
+            fn from(value: $name) -> Self {
+                value.0.into_bytes()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl private::Sealed for $name {}
+
+        impl EtcdKey for $name {
+            fn into_bytes(self) -> Vec<u8> {
+                self.into_bytes()
+            }
+        }
+    };
+}
+
+impl_exact_key!(RunRecordKey);
+impl_exact_key!(ShardRecordKey);
+impl_exact_key!(ShardOwnerKey);
+impl_exact_key!(RunActiveIndexKey);
+impl_exact_key!(ShardActiveIndexKey);
+
+impl ShardRecordKey {
+    /// Returns the owner key stored under this shard record key.
+    #[must_use]
+    pub fn owner_key(&self) -> ShardOwnerKey {
+        let mut key = self.0.clone();
+        key.push_str("/owner");
+        ShardOwnerKey::from_string(key)
+    }
+
+    /// Converts this shard record key into its `/owner` child key.
+    #[must_use]
+    pub fn into_owner_key(mut self) -> ShardOwnerKey {
+        self.0.push_str("/owner");
+        ShardOwnerKey::from_string(self.0)
+    }
+
+    pub(crate) fn from_encoded_key(key: &[u8]) -> Option<Self> {
+        if PersistedShardSubtreeKey::classify(key) != Some(PersistedShardSubtreeKey::Record) {
+            return None;
+        }
+        let key = std::str::from_utf8(key).ok()?;
+        Some(Self::from_string(key.to_owned()))
+    }
+}
+
+impl ShardOwnerKey {
+    pub(crate) fn from_encoded_key(key: &[u8]) -> Option<Self> {
+        if PersistedShardSubtreeKey::classify(key) != Some(PersistedShardSubtreeKey::Owner) {
+            return None;
+        }
+        let key = std::str::from_utf8(key).ok()?;
+        Some(Self::from_string(key.to_owned()))
+    }
+
+    /// Parse the owned shard ID from an owner key under `shards_scan_prefix`.
+    pub(crate) fn parse_owned_shard(shards_scan_prefix: &[u8], key: &[u8]) -> Option<ShardId> {
+        let suffix = key.strip_prefix(shards_scan_prefix)?;
+        let shard_hex = suffix.strip_suffix(b"/owner")?;
+        parse_hex_u64_suffix_bytes(shard_hex).map(ShardId::from_raw)
+    }
+}
+
+impl RunRecordKey {
+    /// Parse the run ID of a direct child under `prefix`.
+    pub(crate) fn parse_direct_run_id(prefix: &str, key: &[u8]) -> Option<RunId> {
+        parse_direct_hex_u64_child(prefix.as_bytes(), key).map(RunId::from_raw)
+    }
+}
+
+impl RunActiveIndexKey {
+    /// Parse the run ID of a direct child under `prefix`.
+    pub(crate) fn parse_direct_run_id(prefix: &str, key: &[u8]) -> Option<RunId> {
+        parse_direct_hex_u64_child(prefix.as_bytes(), key).map(RunId::from_raw)
+    }
+}
+
+impl ShardActiveIndexKey {
+    /// Parse the shard ID of a direct child under `prefix`.
+    pub(crate) fn parse_direct_shard_id(prefix: &str, key: &[u8]) -> Option<ShardId> {
+        parse_direct_hex_u64_child(prefix.as_bytes(), key).map(ShardId::from_raw)
+    }
+}
+
+impl PersistedShardSubtreeKey {
+    /// Classify a persisted key read from a `.../shards/` subtree.
+    #[must_use]
+    pub fn classify(key: &[u8]) -> Option<Self> {
+        const SHARD_RECORD_KEY_SEGMENT: &[u8] = b"/shards/";
+
+        let segment_pos = key
+            .windows(SHARD_RECORD_KEY_SEGMENT.len())
+            .rposition(|window| window == SHARD_RECORD_KEY_SEGMENT)?;
+        let suffix = &key[segment_pos + SHARD_RECORD_KEY_SEGMENT.len()..];
+
+        if parse_hex_u64_suffix_bytes(suffix).is_some() {
+            Some(Self::Record)
+        } else {
+            let owner_suffix = suffix.strip_suffix(b"/owner")?;
+            parse_hex_u64_suffix_bytes(owner_suffix)?;
+            Some(Self::Owner)
+        }
+    }
+}
+
 /// Deterministic builder for the etcd coordination key layout.
 ///
 /// Constructed once from a validated namespace prefix (e.g. `/gossip/v1`)
@@ -105,7 +295,7 @@ impl std::error::Error for EtcdKeyspaceError {}
 ///
 /// - The stored prefix always starts with `/` and never ends with `/`
 ///   (unless it is exactly `"/"`).
-/// - Every public method returns a fully-formed absolute etcd key
+/// - Every public method returns a fully-formed absolute etcd path
 ///   containing no double-slash sequences.
 ///
 /// # Examples
@@ -118,7 +308,7 @@ impl std::error::Error for EtcdKeyspaceError {}
 /// let r = RunId::from_raw(0x42);
 ///
 /// // Exact key for a run record:
-/// assert!(ks.run_record_key(t, r).starts_with("/gossip/v1/tenants/"));
+/// assert!(ks.run_record_key(t, r).as_str().starts_with("/gossip/v1/tenants/"));
 ///
 /// // Scan prefix for all shard records under that run:
 /// assert!(ks.shard_records_scan_prefix(t, r).ends_with("/shards/"));
@@ -285,10 +475,10 @@ impl EtcdKeyspace {
     /// `run_hex` is the 16-character zero-padded lowercase hex encoding of
     /// the `u64` [`RunId`].
     #[must_use]
-    pub fn run_record_key(&self, tenant: TenantId, run: RunId) -> String {
+    pub fn run_record_key(&self, tenant: TenantId, run: RunId) -> RunRecordKey {
         let mut buf = String::new();
         self.run_record_key_into(&mut buf, tenant, run);
-        buf
+        RunRecordKey::from_string(buf)
     }
 
     // -----------------------------------------------------------------------
@@ -370,10 +560,10 @@ impl EtcdKeyspace {
     /// `shard_hex` is the 16-character zero-padded lowercase hex encoding
     /// of the `u64` [`ShardId`].
     #[must_use]
-    pub fn shard_record_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> String {
+    pub fn shard_record_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> ShardRecordKey {
         let mut buf = String::new();
         self.shard_record_key_into(&mut buf, tenant, run, shard);
-        buf
+        ShardRecordKey::from_string(buf)
     }
 
     /// Exact key for shard ownership:
@@ -399,10 +589,10 @@ impl EtcdKeyspace {
     /// Stored as a child of the shard record key so a delete on the shard
     /// record key prefix also removes the ownership key.
     #[must_use]
-    pub fn shard_owner_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> String {
+    pub fn shard_owner_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> ShardOwnerKey {
         let mut buf = String::new();
         self.shard_owner_key_into(&mut buf, tenant, run, shard);
-        buf
+        ShardOwnerKey::from_string(buf)
     }
 
     // -----------------------------------------------------------------------
@@ -448,10 +638,10 @@ impl EtcdKeyspace {
     /// Exact key for an active-run index entry:
     /// `{prefix}/tenants/{tenant_hex}/runs_active/{run_hex}`.
     #[must_use]
-    pub fn run_active_index_key(&self, tenant: TenantId, run: RunId) -> String {
+    pub fn run_active_index_key(&self, tenant: TenantId, run: RunId) -> RunActiveIndexKey {
         let mut buf = String::new();
         self.run_active_index_key_into(&mut buf, tenant, run);
-        buf
+        RunActiveIndexKey::from_string(buf)
     }
 
     /// Scan prefix for active-shard index entries under a run:
@@ -497,10 +687,15 @@ impl EtcdKeyspace {
     /// Exact key for an active-shard index entry:
     /// `{run_record_key}/shards_active/{shard_hex}`.
     #[must_use]
-    pub fn shard_active_index_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> String {
+    pub fn shard_active_index_key(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+        shard: ShardId,
+    ) -> ShardActiveIndexKey {
         let mut buf = String::new();
         self.shard_active_index_key_into(&mut buf, tenant, run, shard);
-        buf
+        ShardActiveIndexKey::from_string(buf)
     }
 
     /// Appends `suffix` to the prefix with a `/` separator.
@@ -553,4 +748,17 @@ fn encode_hex_into(buf: &mut String, bytes: &[u8]) {
         buf.push(LUT[(byte >> 4) as usize] as char);
         buf.push(LUT[(byte & 0x0f) as usize] as char);
     }
+}
+
+fn parse_direct_hex_u64_child(prefix: &[u8], key: &[u8]) -> Option<u64> {
+    let suffix = key.strip_prefix(prefix)?;
+    parse_hex_u64_suffix_bytes(suffix)
+}
+
+fn parse_hex_u64_suffix_bytes(suffix: &[u8]) -> Option<u64> {
+    if suffix.len() != 16 {
+        return None;
+    }
+    let suffix = std::str::from_utf8(suffix).ok()?;
+    u64::from_str_radix(suffix, 16).ok()
 }

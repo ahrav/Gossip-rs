@@ -7,6 +7,11 @@
 //! Default repos (if present):
 //!   ../gitleaks ../tigerbeetle ../trufflehog
 //!
+//! When no repos are provided and none of the defaults exist, the benchmark
+//! exits successfully after printing a skip message. This keeps
+//! `cargo test --all-targets --all-features` usable in workspaces that do not
+//! carry those external checkouts.
+//!
 //! The benchmark compares three hash strategies used (or proposed) for
 //! open-addressed OID tables:
 //! - `fnv1a64` (baseline historical choice)
@@ -164,12 +169,6 @@ fn parse_args() -> (Vec<PathBuf>, Config) {
         }
     }
 
-    if repos.is_empty() {
-        eprintln!("no repositories provided and no default repositories found");
-        print_usage();
-        std::process::exit(2);
-    }
-
     (
         repos,
         Config {
@@ -187,6 +186,12 @@ fn print_usage() {
 
 fn main() {
     let (repos, config) = parse_args();
+    if repos.is_empty() {
+        eprintln!(
+            "oid_hash_quality: skipped (no repositories provided and no default repositories found)"
+        );
+        return;
+    }
 
     let strategies = [
         HashStrategy {
