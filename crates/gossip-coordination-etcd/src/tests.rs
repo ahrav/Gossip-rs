@@ -50,11 +50,11 @@ use gossip_contracts::coordination::{
 };
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
-    derive_split_shard_id, AcquireError, AcquireScratch, ByteSlab, CheckpointError,
-    CoordinationBackend, DerivedShardKind, IdempotentOutcome, InitialShardInput, ParkReason,
-    RegisterShardsError, RunConfig, RunManagement, RunStatus, RunTransitionError, ShardLimitScope,
-    ShardRecord, ShardStatus, SplitReplaceError, SplitResidualError, UnparkError,
-    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS,
+    AcquireError, AcquireScratch, ByteSlab, CheckpointError, CoordinationBackend,
+    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, IdempotentOutcome,
+    InitialShardInput, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
+    RunTransitionError, ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError,
+    SplitResidualError, UnparkError, derive_split_shard_id,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -2894,7 +2894,7 @@ fn split_replace_rejects_over_cap_max_children_per_op() {
 /// Post-split stored count = 10 + 2 = 12 > 11, so the split is rejected.
 #[test]
 fn shard_limit_split_replace_uses_full_child_count() {
-    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot};
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 2;
     let max_per_tenant: usize = 11;
@@ -2920,7 +2920,7 @@ fn shard_limit_split_replace_uses_full_child_count() {
 /// Post-split stored count = 49 + 3 = 52 > 51, so the split is rejected.
 #[test]
 fn shard_limit_split_replace_uses_full_child_count_global() {
-    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot};
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 3;
     let max_per_tenant: usize = 1000;
