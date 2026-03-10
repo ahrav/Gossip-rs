@@ -260,8 +260,11 @@ impl DoneLedger for DoneLedgerPg {
         let mut tx = client.transaction()?;
         let stmt = tx.prepare(UPSERT_SQL)?;
 
-        for record in &merged {
-            upsert_record(&mut tx, &stmt, record)?;
+        for (idx, record) in merged.iter().enumerate() {
+            upsert_record(&mut tx, &stmt, record).map_err(|e| DoneLedgerPgError::UpsertFailed {
+                index: idx,
+                source: Box::new(e),
+            })?;
         }
 
         tx.commit()?;
@@ -303,6 +306,15 @@ fn dedupe_and_validate(
             .validate()
             .map_err(|source| DoneLedgerPgError::InvalidRecord { index, source })?;
 
+        let prov = record.provenance();
+        if prov.started_at().as_raw() > prov.finished_at().as_raw() {
+            return Err(DoneLedgerPgError::ProvenanceInvalid {
+                index,
+                started_at: prov.started_at().as_raw(),
+                finished_at: prov.finished_at().as_raw(),
+            });
+        }
+
         match merged.entry(record.key()) {
             Entry::Vacant(slot) => {
                 order.push(record.key());
@@ -325,9 +337,10 @@ fn dedupe_and_validate(
 
     let mut deduped = Vec::with_capacity(order.len());
     for key in order {
-        if let Some(record) = merged.remove(&key) {
-            deduped.push(record);
-        }
+        let record = merged
+            .remove(&key)
+            .expect("order vec and merged map are populated from the same input");
+        deduped.push(record);
     }
 
     Ok(deduped)

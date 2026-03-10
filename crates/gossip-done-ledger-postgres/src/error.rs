@@ -245,6 +245,18 @@ pub enum DoneLedgerPgError {
     InvalidMergedRecord { source: PersistenceInputError },
     /// Rust ↔ SQL conversion failed.
     Conversion(DoneLedgerPgConversionError),
+    /// Provenance timestamps violate the `finished_at >= started_at` ordering
+    /// invariant, which would be rejected by the database CHECK constraint.
+    ProvenanceInvalid {
+        index: usize,
+        started_at: u64,
+        finished_at: u64,
+    },
+    /// A single-row upsert within a batch transaction failed.
+    UpsertFailed {
+        index: usize,
+        source: Box<DoneLedgerPgError>,
+    },
     /// Persisted row failed decode-time contract validation.
     PersistedRecordInvalid {
         context: &'static str,
@@ -255,7 +267,20 @@ pub enum DoneLedgerPgError {
 impl fmt::Display for DoneLedgerPgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Postgres(source) => write!(f, "postgres done-ledger operation failed: {source}"),
+            Self::Postgres(source) => {
+                if let Some(db_err) = source.as_db_error() {
+                    write!(
+                        f,
+                        "postgres done-ledger operation failed: {} ({})",
+                        db_err.severity(),
+                        db_err.code().code()
+                    )
+                } else {
+                    // IO/connection errors may embed connection strings — redact details.
+                    // Full diagnostics remain available via `Error::source()`.
+                    write!(f, "postgres done-ledger connection/protocol error")
+                }
+            }
             Self::Migration(source) => write!(f, "postgres done-ledger migration failed: {source}"),
             Self::MutexPoisoned => f.write_str("postgres done-ledger client mutex is poisoned"),
             Self::BatchTooLarge {
@@ -275,6 +300,17 @@ impl fmt::Display for DoneLedgerPgError {
                     "merged done-ledger record violates contract invariants: {source}"
                 )
             }
+            Self::ProvenanceInvalid {
+                index,
+                started_at,
+                finished_at,
+            } => write!(
+                f,
+                "record at index {index}: started_at ({started_at}) exceeds finished_at ({finished_at})"
+            ),
+            Self::UpsertFailed { index, source } => {
+                write!(f, "upsert failed at record index {index}: {source}")
+            }
             Self::Conversion(source) => {
                 write!(f, "postgres done-ledger conversion failed: {source}")
             }
@@ -293,7 +329,10 @@ impl Error for DoneLedgerPgError {
         match self {
             Self::Postgres(source) => Some(source),
             Self::Migration(source) => Some(source),
-            Self::MutexPoisoned | Self::BatchTooLarge { .. } => None,
+            Self::UpsertFailed { source, .. } => Some(source),
+            Self::MutexPoisoned | Self::BatchTooLarge { .. } | Self::ProvenanceInvalid { .. } => {
+                None
+            }
             Self::InvalidRecord { source, .. }
             | Self::InvalidMergedRecord { source }
             | Self::PersistedRecordInvalid { source, .. } => Some(source),
