@@ -20,7 +20,7 @@ CREATE TABLE done_ledger_entries (
 
     -- Ordered / monotonic fields.
     bytes_scanned  BIGINT   NOT NULL CHECK (bytes_scanned >= 0),
-    findings_count BIGINT   NOT NULL CHECK (findings_count BETWEEN 0 AND 4294967295),
+    findings_count INTEGER  NOT NULL CHECK (findings_count >= 0),
     fence_epoch    BIGINT   NOT NULL CHECK (fence_epoch >= 0),
     started_at     BIGINT   NOT NULL CHECK (started_at >= 0),
     finished_at    BIGINT   NOT NULL CHECK (finished_at >= started_at),

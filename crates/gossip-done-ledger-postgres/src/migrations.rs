@@ -28,8 +28,14 @@
 //! transaction: either every migration succeeds or the entire batch rolls
 //! back.
 //!
+//! Because migrations execute inside one transaction, migration SQL must not
+//! use commands that require running outside a transaction block (for example
+//! `CREATE INDEX CONCURRENTLY`).
+//!
 //! [`MIGRATION_ADVISORY_LOCK_KEY`]: crate::schema::MIGRATION_ADVISORY_LOCK_KEY
 //! [`DoneLedgerPgMigrationError::ChecksumMismatch`]: crate::DoneLedgerPgMigrationError::ChecksumMismatch
+
+use std::time::Duration;
 
 use blake3::Hash;
 use postgres::{Client, Transaction};
@@ -163,6 +169,9 @@ pub fn connect_and_apply_migrations(
     Ok(client)
 }
 
+/// Default cap for DDL lock acquisition during migrations.
+const DEFAULT_MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Apply all crate-embedded migrations inside a single advisory-locked
 /// transaction.
 ///
@@ -175,7 +184,7 @@ pub fn connect_and_apply_migrations(
 /// Returns an error if any migration SQL fails or if a checksum mismatch
 /// is detected for an already-applied migration.
 pub fn apply_all_migrations(client: &mut Client) -> Result<(), DoneLedgerPgMigrationError> {
-    apply_migrations(client, MIGRATIONS)
+    apply_migrations(client, MIGRATIONS, DEFAULT_MIGRATION_LOCK_TIMEOUT)
 }
 
 /// Apply a caller-supplied migration slice inside a single advisory-locked
@@ -185,6 +194,12 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), DoneLedgerPgMigra
 /// here with the crate-level [`MIGRATIONS`] slice. The separate parameter
 /// allows tests to supply custom migration sets without mutating the global
 /// constant.
+///
+/// `lock_timeout` caps how long DDL statements wait for conflicting table-level
+/// locks. The timeout is formatted as integer seconds in the `SET LOCAL
+/// lock_timeout` statement, so sub-second precision is truncated. A zero
+/// duration disables the timeout (Postgres interprets `'0s'` as "wait
+/// indefinitely").
 ///
 /// ## Transaction protocol
 ///
@@ -202,6 +217,7 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), DoneLedgerPgMigra
 pub fn apply_migrations(
     client: &mut Client,
     migrations: &[EmbeddedMigration],
+    lock_timeout: Duration,
 ) -> Result<(), DoneLedgerPgMigrationError> {
     let mut tx = client
         .transaction()
@@ -225,7 +241,8 @@ pub fn apply_migrations(
     // the timeout to this transaction only.  Set *after* the advisory
     // lock so the timeout applies only to DDL, not to the advisory
     // lock wait itself.
-    tx.batch_execute("SET LOCAL lock_timeout = '5s'")
+    let timeout_secs = lock_timeout.as_secs();
+    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_secs}s'"))
         .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
     tx.batch_execute(&create_migrations_table_sql())
@@ -236,6 +253,9 @@ pub fn apply_migrations(
     Ok(())
 }
 
+/// Iterate through a migration slice within an already-locked transaction,
+/// applying or verifying each in order. Pre-builds the SQL strings once
+/// so they are reused across migrations.
 fn apply_migration_set(
     tx: &mut Transaction<'_>,
     migrations: &[EmbeddedMigration],
@@ -454,7 +474,7 @@ mod tests {
         // golden value here.
         let expected: &[(&str, &str)] = &[(
             "0001_done_ledger_entries",
-            "2c6a36c62f0c6f8e66e6d7c71b00b49a13c61f3a4f02c4c384960e0a9f539dd5",
+            "d3fa0005a34d48934210df493a5ad56e3e524c9aff33d8498b9fd16bf50cf3b9",
         )];
 
         assert_eq!(

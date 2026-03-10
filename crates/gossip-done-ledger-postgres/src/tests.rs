@@ -3,9 +3,38 @@
 //! All tests in this module require a running PostgreSQL instance (either via
 //! Docker/testcontainers or an external `POSTGRES_TEST_URL`). They are marked
 //! `#[ignore]` so that `cargo test` without Docker skips them cleanly.
+//!
+//! ## Test categories
+//!
+//! - **Migration runner** — idempotence, checksum-mismatch detection, and
+//!   concurrent advisory-lock serialisation.
+//! - **`DoneLedger` backend behavior** — conformance suite, positional
+//!   alignment of `batch_get`, and duplicate-key merge in `batch_upsert`.
+//! - **Schema constraint enforcement** — verifies that SQL `CHECK`
+//!   constraints reject invalid status values, negative counters,
+//!   wrong-length `BYTEA` columns, and shape-inconsistent rows.
+//!
+//! ## Running
+//!
+//! ```bash
+//! # With Docker:
+//! cargo test -p gossip-done-ledger-postgres -- --ignored
+//!
+//! # With a pre-existing database:
+//! POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
+//!   cargo test -p gossip-done-ledger-postgres -- --ignored
+//! ```
 
 use crate::test_postgres::{test_client, test_client_bare};
-use crate::{DoneLedgerPgMigrationError, apply_all_migrations, apply_migrations};
+use crate::{DoneLedgerPg, DoneLedgerPgMigrationError, apply_all_migrations, apply_migrations};
+use gossip_contracts::{
+    identity::{FenceEpoch, LogicalTime, RunId, ShardId},
+    persistence::{
+        CommitHandle, DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
+        DoneLedgerRecord, DoneLedgerStatus, run_done_ledger_conformance,
+    },
+    test_util::{ovid, policy, tenant},
+};
 
 // ── Migration runner ────────────────────────────────────────────────────
 
@@ -49,7 +78,7 @@ fn checksum_mismatch_is_detected() {
         "SELECT 1; -- tampered",
     )];
 
-    let err = apply_migrations(&mut client, &tampered)
+    let err = apply_migrations(&mut client, &tampered, std::time::Duration::from_secs(5))
         .expect_err("tampered migration should produce ChecksumMismatch");
 
     match err {
@@ -99,6 +128,191 @@ fn concurrent_migrations_both_succeed() {
     t2.join()
         .expect("thread 2 panicked")
         .expect("thread 2 migration failed");
+}
+
+// ── DoneLedger backend behavior ───────────────────────────────────────────
+
+fn provenance(
+    run_id: u64,
+    shard_id: u64,
+    fence_epoch: u64,
+    started_at: u64,
+    finished_at: u64,
+) -> DoneLedgerProvenance {
+    DoneLedgerProvenance::new(
+        RunId::from_raw(run_id),
+        ShardId::from_raw(shard_id),
+        FenceEpoch::from_raw(fence_epoch),
+        LogicalTime::from_raw(started_at),
+        LogicalTime::from_raw(finished_at),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors the done-ledger durable row shape"
+)]
+fn done_record(
+    tenant_seed: u8,
+    policy_seed: u8,
+    ovid_seed: u8,
+    status: DoneLedgerStatus,
+    bytes_scanned: u64,
+    findings_count: u32,
+    run_id: u64,
+    shard_id: u64,
+    fence_epoch: u64,
+    started_at: u64,
+    finished_at: u64,
+    error_code: Option<&str>,
+) -> DoneLedgerRecord {
+    DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(tenant(tenant_seed), policy(policy_seed), ovid(ovid_seed)),
+        status,
+        bytes_scanned,
+        findings_count,
+        provenance(run_id, shard_id, fence_epoch, started_at, finished_at),
+        error_code.map(|code| {
+            DoneLedgerErrorCode::try_new(code).expect("test error code should be valid")
+        }),
+    )
+    .expect("test record should satisfy construction invariants")
+}
+
+#[test]
+#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+fn done_ledger_backend_passes_conformance_suite() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before conformance");
+
+    let checks = run_done_ledger_conformance(&backend)
+        .unwrap_or_else(|err| panic!("done-ledger conformance failed: {err}"));
+    assert_eq!(checks, 4);
+}
+
+#[test]
+#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+fn batch_get_preserves_positional_alignment_with_duplicates() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    let record_one = done_record(
+        1,
+        2,
+        11,
+        DoneLedgerStatus::ScannedClean,
+        100,
+        0,
+        1,
+        1,
+        1,
+        10,
+        20,
+        None,
+    );
+    let record_two = done_record(
+        1,
+        2,
+        12,
+        DoneLedgerStatus::ScannedWithFindings,
+        250,
+        2,
+        2,
+        2,
+        2,
+        15,
+        30,
+        None,
+    );
+    backend
+        .batch_upsert(&[record_one.clone(), record_two.clone()])
+        .expect("upsert should succeed")
+        .wait()
+        .expect("commit should succeed");
+
+    let absent = ovid(99);
+    let fetched = backend
+        .batch_get(
+            tenant(1),
+            policy(2),
+            &[
+                record_two.key().ovid_hash(),
+                absent,
+                record_one.key().ovid_hash(),
+                record_two.key().ovid_hash(),
+            ],
+        )
+        .expect("batch_get should succeed");
+
+    assert_eq!(fetched.len(), 4);
+    assert_eq!(fetched[0].as_ref(), Some(&record_two));
+    assert_eq!(fetched[1], None);
+    assert_eq!(fetched[2].as_ref(), Some(&record_one));
+    assert_eq!(fetched[3].as_ref(), Some(&record_two));
+}
+
+#[test]
+#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+fn batch_upsert_merges_duplicate_keys_before_persist() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    let failed = done_record(
+        3,
+        4,
+        21,
+        DoneLedgerStatus::FailedRetryable,
+        900,
+        8,
+        10,
+        11,
+        12,
+        100,
+        200,
+        Some("RETRY"),
+    );
+    let scanned = done_record(
+        3,
+        4,
+        21,
+        DoneLedgerStatus::ScannedWithFindings,
+        200,
+        1,
+        20,
+        21,
+        22,
+        110,
+        250,
+        None,
+    );
+
+    let receipt = backend
+        .batch_upsert(&[failed, scanned.clone()])
+        .expect("upsert should succeed")
+        .wait()
+        .expect("commit should succeed");
+    assert_eq!(receipt.record_count(), 1);
+    assert_eq!(receipt.scanned_count(), 1);
+    assert_eq!(receipt.findings_count(), 8);
+
+    let fetched = backend
+        .batch_get(tenant(3), policy(4), &[ovid(21)])
+        .expect("batch_get should succeed");
+    let merged = fetched[0]
+        .as_ref()
+        .expect("row should exist after successful upsert");
+
+    assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
+    assert_eq!(merged.bytes_scanned(), 900);
+    assert_eq!(merged.findings_count(), 8);
+    assert_eq!(merged.error_code(), None);
+    assert_eq!(merged.provenance(), scanned.provenance());
 }
 
 // ── Schema constraint enforcement ───────────────────────────────────────
@@ -187,7 +401,7 @@ struct RowOverrides {
     ovid_hash: Option<Vec<u8>>,
     status: Option<i16>,
     bytes_scanned: Option<i64>,
-    findings_count: Option<i64>,
+    findings_count: Option<i32>,
     fence_epoch: Option<i64>,
     started_at: Option<i64>,
     finished_at: Option<i64>,

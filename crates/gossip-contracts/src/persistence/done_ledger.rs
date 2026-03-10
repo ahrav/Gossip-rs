@@ -563,32 +563,90 @@ impl DoneLedgerRecord {
         }
         Ok(())
     }
+}
 
-    /// Merge this record with an existing one, returning the record whose
-    /// status dominates according to the [`DoneLedgerStatus`] lattice.
-    ///
-    /// Backends call `incoming.merge_with(&existing_row)` instead of
-    /// reimplementing the lattice merge logic.
-    ///
-    /// # Debug-mode invariant
-    ///
-    /// Both records must share the same [`DoneLedgerKey`]. A mismatch triggers
-    /// a `debug_assert` panic in debug builds. In release builds the check is
-    /// elided — callers are expected to have queried by key before merging.
-    #[must_use]
-    pub fn merge_with(self, existing: &DoneLedgerRecord) -> Self {
-        debug_assert_eq!(
-            self.key, existing.key,
-            "merge_with requires matching keys: self={:?}, existing={:?}",
-            self.key, existing.key
-        );
-        let merged_status = self.status.merge(existing.status);
-        if merged_status == self.status {
-            self
-        } else {
-            existing.clone()
+/// Merge two done-ledger records sharing the same key using lattice rules.
+///
+/// This is the canonical merge function that all backends must use during
+/// upsert when a row already exists. It guarantees identical merge semantics
+/// regardless of backend (in-memory, PostgreSQL, etc.).
+///
+/// # Merge rules
+///
+/// 1. **Status** — lattice join via [`DoneLedgerStatus::merge`]. Status never
+///    regresses: `scanned` dominates `failed`, which dominates `skipped`.
+/// 2. **`bytes_scanned`** — non-regressing maximum of both records.
+/// 3. **`findings_count`** — status-aware:
+///    - `ScannedClean`: forced to 0.
+///    - `ScannedWithFindings`: `max(existing, incoming)`, clamped to `>= 1`.
+///    - Otherwise: `max(existing, incoming)`.
+/// 4. **Provenance** (`run_id`, `shard_id`, `fence_epoch`, timestamps) —
+///    winner chosen by highest status rank, then latest `finished_at`,
+///    then latest `started_at`. Ties preserve `existing`.
+/// 5. **`error_code`** — cleared when merged status is scanned; otherwise
+///    taken from the provenance winner, falling back to the loser.
+///
+/// # Debug-mode invariant
+///
+/// Both records must share the same [`DoneLedgerKey`]. A mismatch triggers
+/// a `debug_assert` panic in debug builds. In release builds the check is
+/// elided — callers are expected to have queried by key before merging.
+///
+/// # Errors
+///
+/// Returns [`PersistenceInputError`] if the merged fields violate
+/// [`DoneLedgerRecord::try_new`] construction invariants. This should be
+/// unreachable because the lattice join can only raise the status, never
+/// lower it, and `max()` on metrics preserves consistency.
+pub fn merge_done_ledger_records(
+    existing: &DoneLedgerRecord,
+    incoming: &DoneLedgerRecord,
+) -> Result<DoneLedgerRecord, PersistenceInputError> {
+    debug_assert_eq!(
+        existing.key, incoming.key,
+        "merge_done_ledger_records requires matching keys: existing={:?}, incoming={:?}",
+        existing.key, incoming.key
+    );
+
+    let merged_status = existing.status.merge(incoming.status);
+    let bytes_scanned = existing.bytes_scanned.max(incoming.bytes_scanned);
+    let findings_count = match merged_status {
+        DoneLedgerStatus::ScannedClean => 0,
+        DoneLedgerStatus::ScannedWithFindings => {
+            existing.findings_count.max(incoming.findings_count).max(1)
         }
-    }
+        _ => existing.findings_count.max(incoming.findings_count),
+    };
+
+    // Determine which record's provenance to trust for non-metric fields.
+    let choose_incoming = incoming.status.rank() > existing.status.rank()
+        || (incoming.status.rank() == existing.status.rank()
+            && incoming.provenance.finished_at() > existing.provenance.finished_at())
+        || (incoming.status.rank() == existing.status.rank()
+            && incoming.provenance.finished_at() == existing.provenance.finished_at()
+            && incoming.provenance.started_at() > existing.provenance.started_at());
+
+    let chosen = if choose_incoming { incoming } else { existing };
+    let fallback = if choose_incoming { existing } else { incoming };
+
+    // Success absorbs prior error codes; otherwise prefer the winner's code.
+    let error_code = if merged_status.is_scanned() {
+        None
+    } else {
+        chosen
+            .error_code
+            .clone()
+            .or_else(|| fallback.error_code.clone())
+    };
+
+    DoneLedgerRecord::try_new(
+        existing.key,
+        merged_status,
+        bytes_scanned,
+        findings_count,
+        chosen.provenance,
+        error_code,
+    )
 }
 
 /// Backend-neutral trait for a durable done-ledger store.

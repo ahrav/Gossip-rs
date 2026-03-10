@@ -8,7 +8,7 @@
 > (`crates/gossip-coordination/src/traits.rs`). The in-memory reference
 > backend lives in `gossip-persistence-inmemory`
 > (see [gossip-persistence-inmemory.md](../gossip-persistence-inmemory.md)).
-> PostgreSQL done-ledger schema and migration scaffolding lives in
+> PostgreSQL done-ledger backend, schema, migrations, and conversion helpers live in
 > `gossip-done-ledger-postgres`
 > (`crates/gossip-done-ledger-postgres/src/`).
 
@@ -124,7 +124,7 @@ Non-negotiables (project-wide):
 
 | Crate | Scope | Notes |
 |------|-------|-------|
-| `gossip-done-ledger-postgres` | Done-ledger table schema, embedded migrations, and `u64`/`BIGINT` conversion helpers | Applies forward-only migrations with checksum verification and transaction-scoped advisory locking. Backend crates can reuse this crate for durable schema setup and Postgres type mapping. |
+| `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits, applies forward-only migrations with checksum verification and advisory locking, and documents that transaction-scoped migrations cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). |
 
 ---
 
