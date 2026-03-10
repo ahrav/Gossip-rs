@@ -8,6 +8,9 @@
 > (`crates/gossip-coordination/src/traits.rs`). The in-memory reference
 > backend lives in `gossip-persistence-inmemory`
 > (see [gossip-persistence-inmemory.md](../gossip-persistence-inmemory.md)).
+> PostgreSQL done-ledger schema and migration scaffolding lives in
+> `gossip-done-ledger-postgres`
+> (`crates/gossip-done-ledger-postgres/src/`).
 
 Boundary 5 defines the persistence contracts for three subsystems:
 
@@ -113,6 +116,12 @@ Non-negotiables (project-wide):
 | `InMemoryFindingsSink` | `FindingsSink` | `HashMap`-backed reference implementation with three-layer upsert, referential integrity checks, and configurable commit timing. Thread-safe via internal `Mutex`. Lives in `gossip-persistence-inmemory` crate. Passes `run_conformance`. |
 | `FindingsConformanceProbe` | (test-only trait) | Test-only read-side probe for observing durable findings state. The production `FindingsSink` API is write-only; this trait adds a narrow read surface so the conformance harness can snapshot row counts and prove replay does not duplicate rows. Backend crates implement this on their test double or integration-test wrapper. |
 | `run_conformance` | (harness entry point) | Backend-agnostic conformance harness (`persistence::conformance` module) that verifies done-ledger idempotency and lattice merge, findings idempotency and referential integrity, and sensitive-type `Debug` redaction. Returns a `PersistenceConformanceReport` on success. |
+
+### Backend scaffolds
+
+| Crate | Scope | Notes |
+|------|-------|-------|
+| `gossip-done-ledger-postgres` | Done-ledger table schema, embedded migrations, and `u64`/`BIGINT` conversion helpers | Applies forward-only migrations with checksum verification and transaction-scoped advisory locking. Backend crates can reuse this crate for durable schema setup and Postgres type mapping. |
 
 ---
 

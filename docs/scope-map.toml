@@ -72,6 +72,10 @@ doc = "docs/gossip-contracts/boundary-5-persistence.md"
 dir = "crates/gossip-persistence-inmemory/src/"
 
 [[scopes]]
+doc = "docs/gossip-contracts/boundary-5-persistence.md"
+dir = "crates/gossip-done-ledger-postgres/src/"
+
+[[scopes]]
 doc = "docs/gossip-persistence-inmemory.md"
 dir = "crates/gossip-persistence-inmemory/src/"
 
