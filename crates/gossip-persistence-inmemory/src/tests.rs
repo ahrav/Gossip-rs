@@ -745,7 +745,11 @@ fn done_ledger_intra_batch_duplicate_keys_merge_correctly() {
         .unwrap()
         .wait()
         .unwrap();
-    assert_eq!(receipt.record_count(), 2);
+    assert_eq!(
+        receipt.record_count(),
+        1,
+        "distinct keys, not raw input length"
+    );
 
     let stored = store.get_record(first.key()).unwrap().unwrap();
     assert_eq!(stored.status(), ScannedClean);

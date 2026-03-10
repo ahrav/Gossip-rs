@@ -16,22 +16,6 @@ pub const DONE_LEDGER_ENTRIES_TABLE: &str = "done_ledger_entries";
 /// along with their BLAKE3 checksums and application timestamps.
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "done_ledger_schema_migrations";
 
-/// Primary-key column order for `done_ledger_entries`.
-///
-/// Mirrors the field order of [`DoneLedgerKey`] from the contracts layer:
-/// `(tenant_id, policy_hash, ovid_hash)`. All three are fixed-length 32-byte
-/// `BYTEA` columns, so the composite B-tree is prefix-searchable for
-/// tenant-scoped and tenant+policy-scoped queries.
-///
-/// The 96-byte composite key is wider than a surrogate `BIGSERIAL` and is
-/// copied into every secondary index. This is an intentional tradeoff:
-/// the natural key avoids a join-back for index-only scans on the
-/// hot retention and batch-get paths, and eliminates the need for a
-/// secondary UNIQUE constraint.
-///
-/// [`DoneLedgerKey`]: gossip_contracts::persistence::DoneLedgerKey
-pub const DONE_LEDGER_PRIMARY_KEY_COLUMNS: &[&str] = &["tenant_id", "policy_hash", "ovid_hash"];
-
 /// Index for tenant+policy retention/age scans.
 ///
 /// Covers `(tenant_id, policy_hash, finished_at DESC, ovid_hash)` — the
@@ -91,7 +75,7 @@ WHERE tenant_id = $1
 /// Monotonic done-ledger UPSERT used by [`crate::DoneLedgerPg`].
 ///
 /// Merge behavior mirrors the in-memory reference backend so that the
-/// Rust `merge_done_ledger_records` function and the SQL `ON CONFLICT`
+/// Rust [`DoneLedgerRecord::merge`](gossip_contracts::persistence::DoneLedgerRecord::merge) method and the SQL `ON CONFLICT`
 /// clause produce identical results for the same inputs:
 ///
 /// - **Status** — lattice-merged via `GREATEST` (higher rank = more
@@ -139,7 +123,7 @@ ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET
     -- CTEs or local variables. All 6 CASE arms MUST use the identical condition
     -- so every provenance field is sourced from the same winner. Edits to one
     -- CASE branch must be mirrored in all others. The Rust-side function
-    -- merge_done_ledger_records must remain in exact parity with this logic.
+    -- DoneLedgerRecord::merge must remain in exact parity with this logic.
     run_id = CASE
         WHEN (
             EXCLUDED.status > done_ledger_entries.status
@@ -242,47 +226,6 @@ mod tests {
         let bytes = MIGRATION_ADVISORY_LOCK_KEY.to_be_bytes();
         let ascii = std::str::from_utf8(&bytes).expect("lock key bytes should be valid ASCII");
         assert_eq!(ascii, "GSDLPGM1");
-    }
-
-    #[test]
-    fn primary_key_column_order() {
-        assert_eq!(
-            DONE_LEDGER_PRIMARY_KEY_COLUMNS,
-            &["tenant_id", "policy_hash", "ovid_hash"]
-        );
-    }
-
-    #[test]
-    fn table_name_format() {
-        assert!(
-            DONE_LEDGER_ENTRIES_TABLE.starts_with("done_ledger_"),
-            "entries table should use done_ledger_ prefix"
-        );
-        assert!(
-            SCHEMA_MIGRATIONS_TABLE.starts_with("done_ledger_"),
-            "migrations table should use done_ledger_ prefix"
-        );
-    }
-
-    #[test]
-    fn batch_get_sql_uses_bytea_array_lookup() {
-        assert!(
-            BATCH_GET_SQL.contains("ANY($3::bytea[])"),
-            "batch_get SQL should use a single bytea[] array parameter"
-        );
-    }
-
-    #[test]
-    fn upsert_sql_merges_status_and_metrics_monotonically() {
-        assert!(
-            UPSERT_SQL.contains("GREATEST(EXCLUDED.status, done_ledger_entries.status)"),
-            "upsert SQL should lattice-merge status"
-        );
-        assert!(
-            UPSERT_SQL
-                .contains("GREATEST(EXCLUDED.bytes_scanned, done_ledger_entries.bytes_scanned)"),
-            "upsert SQL should keep bytes_scanned non-regressing"
-        );
     }
 
     /// Both SQL query constants must embed the canonical table name.

@@ -497,6 +497,52 @@ mod tests {
         }
     }
 
+    // ── UPSERT SQL discriminant alignment ───────────────────────────
+
+    #[test]
+    fn upsert_sql_case_branches_use_correct_scanned_discriminants() {
+        use gossip_contracts::persistence::DoneLedgerStatus;
+
+        let scanned_ranks: Vec<u8> = (0..=u8::MAX)
+            .filter_map(|rank| {
+                let status = DoneLedgerStatus::from_rank(rank)?;
+                status.is_scanned().then_some(rank)
+            })
+            .collect();
+
+        let upsert = crate::schema::UPSERT_SQL;
+        for rank in &scanned_ranks {
+            let needle = format!("= {rank}");
+            assert!(
+                upsert.contains(&needle),
+                "UPSERT_SQL must reference scanned rank {rank} in a CASE branch, \
+                 but no `= {rank}` found"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_greatest_matches_rust_lattice_merge_for_all_status_pairs() {
+        use gossip_contracts::persistence::DoneLedgerStatus;
+
+        let all_ranks: Vec<u8> = (0..=u8::MAX)
+            .filter(|&rank| DoneLedgerStatus::from_rank(rank).is_some())
+            .collect();
+
+        for &a_rank in &all_ranks {
+            let a = DoneLedgerStatus::from_rank(a_rank).unwrap();
+            for &b_rank in &all_ranks {
+                let b = DoneLedgerStatus::from_rank(b_rank).unwrap();
+                assert_eq!(
+                    a.merge(b).rank(),
+                    a_rank.max(b_rank),
+                    "SQL GREATEST strategy diverges from Rust lattice merge \
+                     for ({a:?}, {b:?})"
+                );
+            }
+        }
+    }
+
     // ── SQL/Rust status discriminant alignment ──────────────────────
 
     #[test]

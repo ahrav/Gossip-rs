@@ -265,7 +265,7 @@ fn validate_enforces_cross_field_invariants(
 }
 
 // ---------------------------------------------------------------------------
-// merge_done_ledger_records
+// DoneLedgerRecord::merge
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -279,10 +279,10 @@ fn merge_scanned_dominates_failed() {
         DoneLedgerRecord::try_new(key, ScannedClean, 1024, 0, make_provenance(), None).unwrap();
 
     // ScannedClean dominates FailedRetryable regardless of argument order.
-    let merged = merge_done_ledger_records(&failure, &success).unwrap();
+    let merged = failure.merge(&success).unwrap();
     assert_eq!(merged.status(), ScannedClean);
 
-    let merged = merge_done_ledger_records(&success, &failure).unwrap();
+    let merged = success.merge(&failure).unwrap();
     assert_eq!(merged.status(), ScannedClean);
 }
 
@@ -302,7 +302,7 @@ fn merge_takes_max_bytes_scanned() {
     let b = DoneLedgerRecord::try_new(key, ScannedWithFindings, 1_000, 1, make_provenance(), None)
         .unwrap();
 
-    let merged = merge_done_ledger_records(&a, &b).unwrap();
+    let merged = a.merge(&b).unwrap();
     assert_eq!(merged.bytes_scanned(), 9_000);
     assert_eq!(
         merged.error_code(),
@@ -320,7 +320,7 @@ fn merge_findings_count_is_status_aware() {
     let a = DoneLedgerRecord::try_new(key, FailedRetryable, 0, 5, make_provenance(), Some(code))
         .unwrap();
     let b = DoneLedgerRecord::try_new(key, ScannedClean, 0, 0, make_provenance(), None).unwrap();
-    let merged = merge_done_ledger_records(&a, &b).unwrap();
+    let merged = a.merge(&b).unwrap();
     assert_eq!(merged.findings_count(), 0);
 
     // ScannedWithFindings clamps to >= 1.
@@ -328,7 +328,7 @@ fn merge_findings_count_is_status_aware() {
         DoneLedgerRecord::try_new(key, ScannedWithFindings, 0, 3, make_provenance(), None).unwrap();
     let d =
         DoneLedgerRecord::try_new(key, ScannedWithFindings, 0, 7, make_provenance(), None).unwrap();
-    let merged = merge_done_ledger_records(&c, &d).unwrap();
+    let merged = c.merge(&d).unwrap();
     assert_eq!(merged.findings_count(), 7);
 }
 
@@ -365,14 +365,14 @@ fn merge_equal_rank_prefers_newer_finished_then_started() {
     )
     .unwrap();
 
-    let merged = merge_done_ledger_records(&a, &b).unwrap();
+    let merged = a.merge(&b).unwrap();
     assert_eq!(merged.provenance(), prov_newer_finished);
     assert_eq!(merged.error_code(), Some(&code_b));
 }
 
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "merge_done_ledger_records requires matching keys")]
+#[should_panic(expected = "DoneLedgerRecord::merge requires matching keys")]
 fn merge_different_keys_panics_in_debug() {
     let key_a = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
     let key_b = DoneLedgerKey::new(tenant(9), policy(8), ovid(7));
@@ -381,7 +381,87 @@ fn merge_different_keys_panics_in_debug() {
     let b =
         DoneLedgerRecord::try_new(key_b, ScannedClean, 200, 0, make_provenance(), None).unwrap();
 
-    let _ = merge_done_ledger_records(&a, &b);
+    let _ = a.merge(&b);
+}
+
+#[test]
+fn merge_fail_then_scan_preserves_metrics_and_provenance() {
+    let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+    let code = DoneLedgerErrorCode::try_new("IO_TIMEOUT").unwrap();
+    let prov_fail = DoneLedgerProvenance::new(
+        RunId::from_raw(10),
+        ShardId::from_raw(11),
+        FenceEpoch::from_raw(12),
+        LogicalTime::from_raw(100),
+        LogicalTime::from_raw(200),
+    );
+    let prov_scan = DoneLedgerProvenance::new(
+        RunId::from_raw(20),
+        ShardId::from_raw(21),
+        FenceEpoch::from_raw(22),
+        LogicalTime::from_raw(150),
+        LogicalTime::from_raw(250),
+    );
+
+    let failed =
+        DoneLedgerRecord::try_new(key, FailedRetryable, 9_000, 7, prov_fail, Some(code)).unwrap();
+    let scanned =
+        DoneLedgerRecord::try_new(key, ScannedWithFindings, 1_000, 1, prov_scan, None).unwrap();
+
+    let merged = failed.merge(&scanned).unwrap();
+    assert_eq!(merged.status(), ScannedWithFindings);
+    assert_eq!(merged.bytes_scanned(), 9_000);
+    assert_eq!(merged.findings_count(), 7);
+    assert_eq!(
+        merged.provenance(),
+        prov_scan,
+        "higher status wins provenance"
+    );
+    assert_eq!(
+        merged.error_code(),
+        None,
+        "scanned status clears error code"
+    );
+}
+
+#[test]
+fn merge_scan_then_fail_keeps_scanned_metrics_and_provenance() {
+    let key = DoneLedgerKey::new(tenant(4), policy(5), ovid(6));
+    let code = DoneLedgerErrorCode::try_new("PERM_DENY").unwrap();
+    let prov_scan = DoneLedgerProvenance::new(
+        RunId::from_raw(30),
+        ShardId::from_raw(31),
+        FenceEpoch::from_raw(32),
+        LogicalTime::from_raw(100),
+        LogicalTime::from_raw(500),
+    );
+    let prov_fail = DoneLedgerProvenance::new(
+        RunId::from_raw(40),
+        ShardId::from_raw(41),
+        FenceEpoch::from_raw(42),
+        LogicalTime::from_raw(110),
+        LogicalTime::from_raw(120),
+    );
+
+    let scanned =
+        DoneLedgerRecord::try_new(key, ScannedWithFindings, 2_000, 2, prov_scan, None).unwrap();
+    let failed =
+        DoneLedgerRecord::try_new(key, FailedPermanent, 8_000, 5, prov_fail, Some(code)).unwrap();
+
+    let merged = scanned.merge(&failed).unwrap();
+    assert_eq!(merged.status(), ScannedWithFindings);
+    assert_eq!(merged.bytes_scanned(), 8_000);
+    assert_eq!(merged.findings_count(), 5);
+    assert_eq!(
+        merged.provenance(),
+        prov_scan,
+        "higher status wins provenance"
+    );
+    assert_eq!(
+        merged.error_code(),
+        None,
+        "scanned status clears error code"
+    );
 }
 
 // ---------------------------------------------------------------------------

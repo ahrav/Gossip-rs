@@ -9,7 +9,7 @@ use gossip_contracts::{
     identity::TenantId,
     persistence::{
         CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerRecord,
-        OvidHash, merge_done_ledger_records,
+        OvidHash,
     },
 };
 
@@ -53,27 +53,43 @@ impl StoreBackend for DoneLedgerBackend {
             });
         }
 
+        // Deduplicate within the batch so receipt counts reflect distinct
+        // keys, matching the PG backend's `build_receipt` semantics.
+        let mut by_key: HashMap<DoneLedgerKey, DoneLedgerRecord> =
+            HashMap::with_capacity(payload.records.len());
         for record in &payload.records {
             let key = record.key();
-            match durable.rows.get(&key) {
+            match by_key.get(&key) {
                 Some(existing) => {
-                    let merged = merge_done_ledger_records(existing, record)?;
-                    durable.rows.insert(key, merged);
+                    let merged = existing.merge(record)?;
+                    by_key.insert(key, merged);
                 }
                 None => {
-                    durable.rows.insert(key, record.clone());
+                    by_key.insert(key, record.clone());
+                }
+            }
+        }
+
+        // Apply deduplicated batch to durable state.
+        for (key, record) in &by_key {
+            match durable.rows.get(key) {
+                Some(existing) => {
+                    let merged = existing.merge(record)?;
+                    durable.rows.insert(*key, merged);
+                }
+                None => {
+                    durable.rows.insert(*key, record.clone());
                 }
             }
         }
 
         let receipt = DoneLedgerCommitReceipt::new(
-            payload.records.len() as u64,
-            payload
-                .records
-                .iter()
+            by_key.len() as u64,
+            by_key
+                .values()
                 .filter(|record| record.status().is_scanned())
                 .count() as u64,
-            payload.records.iter().fold(0u64, |acc, record| {
+            by_key.values().fold(0u64, |acc, record| {
                 acc.saturating_add(record.findings_count() as u64)
             }),
         );
