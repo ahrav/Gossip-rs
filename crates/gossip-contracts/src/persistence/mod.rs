@@ -27,6 +27,9 @@
 //! implementors to verify correctness against the contract surface:
 //!
 //! - `run_conformance` executes done-ledger, findings, and redaction checks.
+//! - `run_done_ledger_conformance` executes only the done-ledger checks and is
+//!   available from `gossip_contracts::persistence` for backends that have not
+//!   implemented findings persistence yet.
 //! - `FindingsConformanceProbe` keeps findings replay/idempotency verification
 //!   out of the production `FindingsSink` trait surface.
 //! - External backend crates can depend on this public module in integration
@@ -93,7 +96,8 @@ pub use commit::{
 };
 pub use conformance::{
     DurableFindingsCounts, FindingsConformanceProbe, PersistenceConformanceError,
-    PersistenceConformanceReport, run_conformance,
+    PersistenceConformanceReport, run_conformance, run_done_ledger_conformance,
+    run_findings_conformance, run_redaction_conformance,
 };
 pub use done_ledger::{
     DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
