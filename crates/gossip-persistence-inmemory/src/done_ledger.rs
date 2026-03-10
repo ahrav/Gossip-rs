@@ -9,7 +9,7 @@ use gossip_contracts::{
     identity::TenantId,
     persistence::{
         CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerRecord,
-        OvidHash,
+        OvidHash, PersistenceInputError,
     },
 };
 
@@ -51,6 +51,22 @@ impl StoreBackend for DoneLedgerBackend {
             return Err(InMemoryPersistenceError::InjectedCommitFailure {
                 store: InMemoryStoreKind::DoneLedger,
             });
+        }
+
+        // Validate each record before mutation, matching the PG backend's
+        // `dedupe_and_validate` contract: cross-field invariants plus
+        // provenance temporal ordering.
+        for record in &payload.records {
+            record.validate()?;
+
+            let prov = record.provenance();
+            if prov.started_at().as_raw() > prov.finished_at().as_raw() {
+                return Err(PersistenceInputError::ProvenanceOrdering {
+                    started_at: prov.started_at().as_raw(),
+                    finished_at: prov.finished_at().as_raw(),
+                }
+                .into());
+            }
         }
 
         // Deduplicate within the batch so receipt counts reflect distinct
