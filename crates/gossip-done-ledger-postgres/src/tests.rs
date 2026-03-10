@@ -78,7 +78,7 @@ fn checksum_mismatch_is_detected() {
         "SELECT 1; -- tampered",
     )];
 
-    let err = apply_migrations(&mut client, &tampered)
+    let err = apply_migrations(&mut client, &tampered, std::time::Duration::from_secs(5))
         .expect_err("tampered migration should produce ChecksumMismatch");
 
     match err {
@@ -401,7 +401,7 @@ struct RowOverrides {
     ovid_hash: Option<Vec<u8>>,
     status: Option<i16>,
     bytes_scanned: Option<i64>,
-    findings_count: Option<i64>,
+    findings_count: Option<i32>,
     fence_epoch: Option<i64>,
     started_at: Option<i64>,
     finished_at: Option<i64>,

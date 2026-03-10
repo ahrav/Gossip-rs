@@ -56,8 +56,9 @@
 //! The crate uses the synchronous [`postgres`] client. Synchronous I/O keeps
 //! durable-before-return semantics straightforward and avoids coupling the
 //! migration surface to a specific async runtime. Convenience constructors
-//! use `NoTls`; production callers should pass a TLS-configured client through
-//! [`DoneLedgerPg::from_client`].
+//! (`connect`, `connect_and_migrate`) use `NoTls` and are gated behind the
+//! `test-utils` feature; production callers should pass a TLS-configured
+//! client through [`DoneLedgerPg::from_client`].
 //!
 //! [`DoneLedger`]: gossip_contracts::persistence::DoneLedger
 //! [`postgres`]: https://docs.rs/postgres

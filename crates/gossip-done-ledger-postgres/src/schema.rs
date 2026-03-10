@@ -23,6 +23,12 @@ pub const SCHEMA_MIGRATIONS_TABLE: &str = "done_ledger_schema_migrations";
 /// `BYTEA` columns, so the composite B-tree is prefix-searchable for
 /// tenant-scoped and tenant+policy-scoped queries.
 ///
+/// The 96-byte composite key is wider than a surrogate `BIGSERIAL` and is
+/// copied into every secondary index. This is an intentional tradeoff:
+/// the natural key avoids a join-back for index-only scans on the
+/// hot retention and batch-get paths, and eliminates the need for a
+/// secondary UNIQUE constraint.
+///
 /// [`DoneLedgerKey`]: gossip_contracts::persistence::DoneLedgerKey
 pub const DONE_LEDGER_PRIMARY_KEY_COLUMNS: &[&str] = &["tenant_id", "policy_hash", "ovid_hash"];
 
@@ -128,6 +134,12 @@ ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET
             GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count, 1)
         ELSE GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count)
     END,
+    -- Provenance-winner predicate (status rank > finished_at > started_at) is
+    -- repeated per column because ON CONFLICT DO UPDATE SET does not support
+    -- CTEs or local variables. All 6 CASE arms MUST use the identical condition
+    -- so every provenance field is sourced from the same winner. Edits to one
+    -- CASE branch must be mirrored in all others. The Rust-side function
+    -- merge_done_ledger_records must remain in exact parity with this logic.
     run_id = CASE
         WHEN (
             EXCLUDED.status > done_ledger_entries.status

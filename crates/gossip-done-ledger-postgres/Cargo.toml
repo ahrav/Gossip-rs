@@ -10,10 +10,10 @@ description = "PostgreSQL done-ledger backend and migrations for gossip-rs"
 [lib]
 
 [features]
-## Exposes `connect_and_apply_migrations` (plaintext NoTls convenience
-## wrapper). Enable in integration tests and local dev only — production
-## callers should construct their own `Client` with TLS and call
-## `apply_all_migrations` directly.
+## Exposes plaintext NoTls convenience helpers: `connect_and_apply_migrations`,
+## `DoneLedgerPg::connect`, and `DoneLedgerPg::connect_and_migrate`.
+## Enable in integration tests and local dev only — production callers should
+## construct their own `Client` with TLS and use `DoneLedgerPg::from_client`.
 test-utils = []
 
 [dependencies]

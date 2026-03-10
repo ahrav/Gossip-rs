@@ -9,7 +9,7 @@ use gossip_contracts::{
     identity::TenantId,
     persistence::{
         CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerRecord,
-        DoneLedgerStatus, OvidHash,
+        OvidHash, merge_done_ledger_records,
     },
 };
 
@@ -318,83 +318,4 @@ impl DoneLedger for InMemoryDoneLedger {
         let handle = self.core.submit(payload)?;
         Ok(InMemoryDoneLedgerHandle { handle })
     }
-}
-
-// ---------------------------------------------------------------------------
-// Merge helper
-// ---------------------------------------------------------------------------
-
-/// Merge two done-ledger records for the same key, producing the dominant row.
-///
-/// # Merge algorithm
-///
-/// 1. **Status**: lattice join via [`DoneLedgerStatus::merge`] — the higher
-///    rank wins, ensuring scanned states can never be downgraded.
-/// 2. **Metrics**: `bytes_scanned` takes the max (monotonically increasing).
-///    `findings_count` is status-aware: forced to 0 for `ScannedClean`,
-///    forced to at least 1 for `ScannedWithFindings`, and max for other
-///    statuses.
-/// 3. **Provenance winner**: the record whose provenance is "freshest" is
-///    chosen as the source of `provenance`, `error_code`, and display
-///    metadata. Tie-breaking order:
-///    - Higher status rank wins outright.
-///    - Equal rank: later `finished_at` wins.
-///    - Equal rank and `finished_at`: later `started_at` wins.
-///    - Otherwise: keep `existing` (stable under no-op replays).
-/// 4. **Error code**: cleared if the merged status is scanned (success
-///    absorbs prior errors). Otherwise taken from the provenance winner,
-///    falling back to the loser if the winner has none.
-///
-/// # Errors
-///
-/// Returns an error if the merged fields violate `DoneLedgerRecord`
-/// construction invariants. This should be unreachable because the lattice
-/// join can only raise the status, never lower it, and `max()` on metrics
-/// preserves consistency.
-///
-/// [`DoneLedgerStatus::merge`]: gossip_contracts::persistence::DoneLedgerStatus::merge
-fn merge_done_ledger_records(
-    existing: &DoneLedgerRecord,
-    incoming: &DoneLedgerRecord,
-) -> Result<DoneLedgerRecord, InMemoryPersistenceError> {
-    let merged_status = existing.status().merge(incoming.status());
-    let bytes_scanned = existing.bytes_scanned().max(incoming.bytes_scanned());
-    let findings_count = match merged_status {
-        DoneLedgerStatus::ScannedClean => 0,
-        DoneLedgerStatus::ScannedWithFindings => existing
-            .findings_count()
-            .max(incoming.findings_count())
-            .max(1),
-        _ => existing.findings_count().max(incoming.findings_count()),
-    };
-
-    // Determine which record's provenance to trust for non-metric fields.
-    let choose_incoming = incoming.status().rank() > existing.status().rank()
-        || (incoming.status().rank() == existing.status().rank()
-            && incoming.provenance().finished_at() > existing.provenance().finished_at())
-        || (incoming.status().rank() == existing.status().rank()
-            && incoming.provenance().finished_at() == existing.provenance().finished_at()
-            && incoming.provenance().started_at() > existing.provenance().started_at());
-
-    let chosen = if choose_incoming { incoming } else { existing };
-    let fallback = if choose_incoming { existing } else { incoming };
-
-    // Success absorbs prior error codes; otherwise prefer the winner's code.
-    let error_code = if merged_status.is_scanned() {
-        None
-    } else {
-        chosen
-            .error_code()
-            .cloned()
-            .or_else(|| fallback.error_code().cloned())
-    };
-
-    Ok(DoneLedgerRecord::try_new(
-        existing.key(),
-        merged_status,
-        bytes_scanned,
-        findings_count,
-        chosen.provenance(),
-        error_code,
-    )?)
 }

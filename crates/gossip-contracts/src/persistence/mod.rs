@@ -101,7 +101,7 @@ pub use conformance::{
 };
 pub use done_ledger::{
     DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-    DoneLedgerStatus, MAX_DONE_LEDGER_ERROR_CODE_SIZE,
+    DoneLedgerStatus, MAX_DONE_LEDGER_ERROR_CODE_SIZE, merge_done_ledger_records,
 };
 pub use error::PersistenceInputError;
 pub use findings::{

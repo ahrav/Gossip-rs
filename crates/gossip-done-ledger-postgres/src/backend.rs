@@ -37,10 +37,12 @@ use gossip_contracts::{
     persistence::{
         DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey,
         DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, OvidHash,
-        RECOMMENDED_MAX_BATCH_SIZE, ReadyCommitHandle,
+        RECOMMENDED_MAX_BATCH_SIZE, ReadyCommitHandle, merge_done_ledger_records,
     },
 };
-use postgres::{Client, NoTls, Row, Transaction};
+#[cfg(feature = "test-utils")]
+use postgres::NoTls;
+use postgres::{Client, Row, Transaction};
 
 use crate::{
     error::{DoneLedgerPgConversionError, DoneLedgerPgError},
@@ -56,16 +58,24 @@ use crate::{
 ///
 /// Internally wraps a `postgres::Client` in `Arc<Mutex<_>>` so that clones
 /// share the same connection and callers can use `DoneLedgerPg` from
-/// multiple threads. The mutex serialises all database access; callers
-/// that need connection-level parallelism should create multiple instances.
+/// multiple threads.
+///
+/// # Concurrency
+///
+/// The mutex serialises **all** database access through a single connection.
+/// Concurrent `batch_get` / `batch_upsert` calls block on the mutex, so
+/// throughput is limited to one operation at a time. Callers that need
+/// connection-level parallelism should create multiple `DoneLedgerPg`
+/// instances (each with its own `Client`) or front them with a connection
+/// pool.
 ///
 /// # Construction
 ///
-/// | Constructor | TLS | Migrations | Use case |
-/// |---|---|---|---|
-/// | [`connect`](Self::connect) | `NoTls` | No | Quick local / test setup |
-/// | [`connect_and_migrate`](Self::connect_and_migrate) | `NoTls` | Yes | Local dev with auto-schema |
-/// | [`from_client`](Self::from_client) | Caller-chosen | No | Production (TLS, pooling) |
+/// | Constructor | TLS | Migrations | Feature gate | Use case |
+/// |---|---|---|---|---|
+/// | [`connect`](Self::connect) | `NoTls` | No | `test-utils` | Quick local / test setup |
+/// | [`connect_and_migrate`](Self::connect_and_migrate) | `NoTls` | Yes | `test-utils` | Local dev with auto-schema |
+/// | [`from_client`](Self::from_client) | Caller-chosen | No | *(always)* | Production (TLS, pooling) |
 ///
 /// After calling `from_client`, use [`apply_migrations`](Self::apply_migrations)
 /// to run schema migrations if needed.
@@ -77,12 +87,16 @@ pub struct DoneLedgerPg {
 impl DoneLedgerPg {
     /// Connect to PostgreSQL without applying migrations.
     ///
-    /// Uses `NoTls` — see the [construction table](Self) for guidance on
-    /// when to use this vs. [`from_client`](Self::from_client).
+    /// Uses `NoTls` — intended for local development and integration tests
+    /// only. Production callers should construct a TLS-enabled
+    /// [`Client`](postgres::Client) and use [`from_client`](Self::from_client).
+    ///
+    /// Requires the `test-utils` feature.
     ///
     /// # Errors
     ///
     /// Returns [`DoneLedgerPgError::Postgres`] on connection failure.
+    #[cfg(feature = "test-utils")]
     pub fn connect(database_url: &str) -> Result<Self, DoneLedgerPgError> {
         let client = Client::connect(database_url, NoTls)?;
         Ok(Self::from_client(client))
@@ -91,12 +105,16 @@ impl DoneLedgerPg {
     /// Connect to PostgreSQL and apply crate-embedded migrations.
     ///
     /// Equivalent to [`connect`](Self::connect) followed by
-    /// [`apply_migrations`](Self::apply_migrations). Uses `NoTls`.
+    /// [`apply_migrations`](Self::apply_migrations). Uses `NoTls` —
+    /// intended for local development and integration tests only.
+    ///
+    /// Requires the `test-utils` feature.
     ///
     /// # Errors
     ///
     /// Returns [`DoneLedgerPgError::Postgres`] on connection failure or
     /// [`DoneLedgerPgError::Migration`] if schema migration fails.
+    #[cfg(feature = "test-utils")]
     pub fn connect_and_migrate(database_url: &str) -> Result<Self, DoneLedgerPgError> {
         let client = Client::connect(database_url, NoTls)?;
         let backend = Self::from_client(client);
@@ -199,18 +217,16 @@ impl DoneLedger for DoneLedgerPg {
             return Ok(Vec::new());
         }
 
-        let requested_ovids: Vec<Vec<u8>> = ovid_hashes
+        let requested_ovids: Vec<&[u8]> = ovid_hashes
             .iter()
-            .map(|hash| hash.as_bytes().to_vec())
+            .map(|hash| hash.as_bytes().as_slice())
             .collect();
         let tenant_bytes: &[u8] = tenant_id.as_bytes();
         let policy_bytes: &[u8] = policy_hash.as_bytes();
 
         let mut client = self.lock_client()?;
-        let rows = client.query(
-            BATCH_GET_SQL,
-            &[&tenant_bytes, &policy_bytes, &requested_ovids],
-        )?;
+        let stmt = client.prepare(BATCH_GET_SQL)?;
+        let rows = client.query(&stmt, &[&tenant_bytes, &policy_bytes, &requested_ovids])?;
 
         let mut by_ovid = HashMap::with_capacity(rows.len());
         for row in rows {
@@ -242,9 +258,10 @@ impl DoneLedger for DoneLedgerPg {
         let merged = dedupe_and_validate(records)?;
         let mut client = self.lock_client()?;
         let mut tx = client.transaction()?;
+        let stmt = tx.prepare(UPSERT_SQL)?;
 
         for record in &merged {
-            upsert_record(&mut tx, record)?;
+            upsert_record(&mut tx, &stmt, record)?;
         }
 
         tx.commit()?;
@@ -292,7 +309,8 @@ fn dedupe_and_validate(
                 slot.insert(record.clone());
             }
             Entry::Occupied(mut slot) => {
-                let merged_record = merge_done_ledger_records(slot.get(), record)?;
+                let merged_record = merge_done_ledger_records(slot.get(), record)
+                    .map_err(|source| DoneLedgerPgError::InvalidMergedRecord { source })?;
                 // Defensive: verify merged output satisfies the same cross-field
                 // invariants that individual inputs were validated against.
                 // The merge logic already maintains these, but this guard
@@ -324,6 +342,7 @@ fn dedupe_and_validate(
 /// the distinction.
 fn upsert_record(
     tx: &mut Transaction<'_>,
+    stmt: &postgres::Statement,
     record: &DoneLedgerRecord,
 ) -> Result<(), DoneLedgerPgError> {
     let key = record.key();
@@ -335,7 +354,7 @@ fn upsert_record(
     let status = i16::from(record.status().rank());
     let bytes_scanned = u64_to_pg_bigint_checked(record.bytes_scanned(), "bytes_scanned")
         .map_err(DoneLedgerPgConversionError::from)?;
-    let findings_count = i64::from(record.findings_count());
+    let findings_count = record.findings_count() as i32;
     let run_id = u64_to_pg_bigint_bits(provenance.run_id().as_raw());
     let shard_id = u64_to_pg_bigint_bits(provenance.shard_id().as_raw());
     let fence_epoch = u64_to_pg_bigint_checked(provenance.fence_epoch().as_raw(), "fence_epoch")
@@ -350,7 +369,7 @@ fn upsert_record(
     let ovid_bytes: &[u8] = ovid_hash.as_bytes();
 
     tx.execute(
-        UPSERT_SQL,
+        stmt,
         &[
             &tenant_bytes,
             &policy_bytes,
@@ -380,6 +399,11 @@ fn upsert_record(
 /// Any failure at any layer produces `DoneLedgerPgError::PersistedRecordInvalid`
 /// or `DoneLedgerPgError::Conversion`, indicating data corruption or
 /// schema drift.
+///
+/// Each BYTEA column allocates a `Vec<u8>` (the `postgres` crate's return
+/// type for `row.get`). This is a WARM-path cost accepted for simplicity;
+/// a custom `FromSql<[u8; 32]>` impl would eliminate 3 allocations per row
+/// if profiling shows this is material.
 fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
     let tenant_id = TenantId::from_bytes(decode_fixed_32(row.get("tenant_id"), "tenant_id")?);
     let policy_hash =
@@ -395,10 +419,10 @@ fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
     let bytes_scanned = pg_bigint_nonnegative_to_u64(row.get("bytes_scanned"), "bytes_scanned")
         .map_err(DoneLedgerPgConversionError::from)?;
 
-    let findings_count_raw: i64 = row.get("findings_count");
+    let findings_count_raw: i32 = row.get("findings_count");
     let findings_count = u32::try_from(findings_count_raw).map_err(|_| {
         DoneLedgerPgConversionError::FindingsCountOutOfRange {
-            value: findings_count_raw,
+            value: i64::from(findings_count_raw),
         }
     })?;
 
@@ -463,75 +487,14 @@ fn decode_fixed_32(bytes: Vec<u8>, field: &'static str) -> Result<[u8; 32], Done
     })
 }
 
-/// Merge two records for the same key using the done-ledger lattice rules.
-///
-/// This mirrors the in-memory reference implementation so that duplicate
-/// records inside a single submitted batch behave identically to sequential
-/// writes over time. The merge rules are:
-///
-/// - **Status**: lattice join — `scanned` dominates `skipped`, which
-///   dominates `failed`. Status never regresses.
-/// - **`bytes_scanned`**: non-regressing maximum.
-/// - **`findings_count`**: status-aware — forced to 0 for `ScannedClean`,
-///   clamped to `>= 1` for `ScannedWithFindings`, otherwise max.
-/// - **Provenance** (`run_id`, `shard_id`, `fence_epoch`, timestamps):
-///   winner chosen by highest status rank, then latest `finished_at`,
-///   then latest `started_at`.
-/// - **`error_code`**: cleared when merged status is scanned; otherwise
-///   taken from the provenance winner, falling back to the loser.
-fn merge_done_ledger_records(
-    existing: &DoneLedgerRecord,
-    incoming: &DoneLedgerRecord,
-) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
-    let merged_status = existing.status().merge(incoming.status());
-    let bytes_scanned = existing.bytes_scanned().max(incoming.bytes_scanned());
-    let findings_count = match merged_status {
-        DoneLedgerStatus::ScannedClean => 0,
-        DoneLedgerStatus::ScannedWithFindings => existing
-            .findings_count()
-            .max(incoming.findings_count())
-            .max(1),
-        _ => existing.findings_count().max(incoming.findings_count()),
-    };
-
-    let choose_incoming = incoming.status().rank() > existing.status().rank()
-        || (incoming.status().rank() == existing.status().rank()
-            && incoming.provenance().finished_at() > existing.provenance().finished_at())
-        || (incoming.status().rank() == existing.status().rank()
-            && incoming.provenance().finished_at() == existing.provenance().finished_at()
-            && incoming.provenance().started_at() > existing.provenance().started_at());
-
-    let chosen = if choose_incoming { incoming } else { existing };
-    let fallback = if choose_incoming { existing } else { incoming };
-
-    let error_code = if merged_status.is_scanned() {
-        None
-    } else {
-        chosen
-            .error_code()
-            .cloned()
-            .or_else(|| fallback.error_code().cloned())
-    };
-
-    DoneLedgerRecord::try_new(
-        existing.key(),
-        merged_status,
-        bytes_scanned,
-        findings_count,
-        chosen.provenance(),
-        error_code,
-    )
-    .map_err(|source| DoneLedgerPgError::InvalidMergedRecord { source })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_and_validate, merge_done_ledger_records};
+    use super::dedupe_and_validate;
     use gossip_contracts::{
         identity::{FenceEpoch, LogicalTime, RunId, ShardId},
         persistence::{
             DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-            DoneLedgerStatus,
+            DoneLedgerStatus, merge_done_ledger_records,
         },
         test_util::{ovid, policy, tenant},
     };
