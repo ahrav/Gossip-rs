@@ -50,11 +50,11 @@ use gossip_contracts::coordination::{
 };
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
-    AcquireError, AcquireScratch, ByteSlab, CheckpointError, CoordinationBackend,
-    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, IdempotentOutcome,
-    InitialShardInput, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
-    RunTransitionError, ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError,
-    SplitResidualError, UnparkError, derive_split_shard_id,
+    derive_split_shard_id, AcquireError, AcquireScratch, ByteSlab, CheckpointError,
+    CoordinationBackend, DerivedShardKind, IdempotentOutcome, InitialShardInput, ParkReason,
+    RegisterShardsError, RunConfig, RunManagement, RunStatus, RunTransitionError, ShardLimitScope,
+    ShardRecord, ShardStatus, SplitReplaceError, SplitResidualError, UnparkError,
+    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -2884,57 +2884,60 @@ fn split_replace_rejects_over_cap_max_children_per_op() {
 // shard_limit_violation unit tests (pure, no etcd required)
 // ---------------------------------------------------------------------------
 
-/// split_replace retires the parent (terminal Split status) and creates N
-/// children. The persisted count from the prefix scan includes the parent,
-/// so the net growth is N - 1 (the parent slot is reclaimed). Passing
-/// `num_children.saturating_sub(1)` to `shard_limit_violation` must allow a
-/// split that lands exactly at the per-tenant ceiling.
+/// Both backends count ALL persisted shard records (including terminal
+/// Split-status parents). After split_replace the parent record stays
+/// in storage and N children are added, so the total stored count grows
+/// by N. The `additional` argument to `shard_limit_violation` must be N
+/// (child count), matching the in-memory backend's accounting.
+///
+/// Scenario: 10 persisted records (including parent), max=11, 2-way split.
+/// Post-split stored count = 10 + 2 = 12 > 11, so the split is rejected.
 #[test]
-fn shard_limit_split_replace_accounts_for_parent_in_tenant_count() {
-    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
+fn shard_limit_split_replace_uses_full_child_count() {
+    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot};
 
     let num_children: usize = 2;
-    // 10 persisted shards (including the parent). A 2-way split retires
-    // the parent and creates 2 children: net delta = +1, post-split = 11.
+    let max_per_tenant: usize = 11;
+    let max_total: usize = 100;
+
     let counts = ShardCountSnapshot {
         tenant: 10,
         total: 10,
     };
-    let result = shard_limit_violation(
-        counts,
-        num_children.saturating_sub(1),
-        11, // max_per_tenant — exactly at limit post-split
-        100,
-    );
-    assert!(
-        result.is_none(),
-        "split landing exactly at the tenant limit must be allowed"
-    );
+
+    // Post-split stored count = 10 + 2 = 12 > 11, must reject.
+    let v = shard_limit_violation(counts, num_children, max_per_tenant, max_total)
+        .expect("additional=N (child count) must reject when post-split stored count exceeds max");
+    assert_eq!(v.current, 10);
+    assert_eq!(v.additional, num_children);
+    assert_eq!(v.max, max_per_tenant);
+    assert_eq!(v.scope, ShardLimitScope::PerTenant);
 }
 
-/// Same parent-accounting logic as the per-tenant test, but verified against
-/// the global shard ceiling.
+/// Global-limit variant of the full-child-count test.
+///
+/// Scenario: 49 persisted records, max_total=51, 3-way split.
+/// Post-split stored count = 49 + 3 = 52 > 51, so the split is rejected.
 #[test]
-fn shard_limit_split_replace_accounts_for_parent_in_global_count() {
-    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
+fn shard_limit_split_replace_uses_full_child_count_global() {
+    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot};
 
     let num_children: usize = 3;
-    // 49 persisted shards (including the parent). A 3-way split retires
-    // the parent and creates 3 children: net delta = +2, post-split = 51.
+    let max_per_tenant: usize = 1000;
+    let max_total: usize = 51;
+
     let counts = ShardCountSnapshot {
         tenant: 49,
         total: 49,
     };
-    let result = shard_limit_violation(
-        counts,
-        num_children.saturating_sub(1),
-        1000, // high per-tenant limit — won't trigger
-        51,   // max_total — exactly at limit post-split
+
+    let v = shard_limit_violation(counts, num_children, max_per_tenant, max_total).expect(
+        "additional=N (child count) must reject when post-split stored count exceeds global max",
     );
-    assert!(
-        result.is_none(),
-        "split landing exactly at the global limit must be allowed"
-    );
+    assert_eq!(v.current, 49);
+    assert_eq!(v.additional, num_children);
+    assert_eq!(v.max, max_total);
+    assert_eq!(v.scope, ShardLimitScope::Global);
 }
 
 // ---------------------------------------------------------------------------

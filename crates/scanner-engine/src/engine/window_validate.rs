@@ -74,8 +74,8 @@
 //! [`extract_secret_span_locs_raw`]: super::helpers::extract_secret_span_locs_raw
 
 use crate::api::{
-    DecodeStep, FileId, FindingRec, LocalContextSpec, STEP_ROOT, StepId, Utf16Endianness,
-    confidence,
+    confidence, DecodeStep, FileId, FindingRec, LocalContextSpec, StepId, Utf16Endianness,
+    STEP_ROOT,
 };
 use memchr::memmem;
 use regex::bytes::CaptureLocations;
@@ -83,9 +83,9 @@ use std::ops::Range;
 
 use super::core::Engine;
 use super::helpers::{
-    EntropyGateOutcome, contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf,
-    decode_utf16le_to_buf, entropy_gate_outcome, extract_secret_span_locs_raw,
-    map_utf16_decoded_offset,
+    contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
+    entropy_gate_outcome, extract_secret_span_locs_raw, map_utf16_decoded_offset,
+    EntropyGateOutcome,
 };
 use super::rule_repr::{
     CharClassCompiled, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns,
@@ -601,8 +601,9 @@ fn compute_confidence_score(
 }
 
 /// Returns `true` when `staged` already contains a finding with the same
-/// rule, span, and root-hint coordinates — i.e. the candidate is a duplicate
-/// produced by overlapping VS prefilter windows that decode to the same region.
+/// rule, step, span, and root-hint coordinates — i.e. the candidate is a
+/// duplicate produced by overlapping VS prefilter windows that decode to the
+/// same region.
 ///
 /// `step_id` is included so that UTF-16 LE and BE findings with identical
 /// span coordinates are not falsely collapsed — they carry different decode
