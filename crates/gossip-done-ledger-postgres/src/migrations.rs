@@ -497,6 +497,69 @@ mod tests {
         }
     }
 
+    // ── UPSERT SQL discriminant alignment ───────────────────────────
+
+    #[test]
+    fn upsert_sql_case_branches_use_correct_scanned_discriminants() {
+        use gossip_contracts::persistence::DoneLedgerStatus;
+
+        let scanned_ranks: Vec<u8> = (0..=u8::MAX)
+            .filter_map(|rank| {
+                let status = DoneLedgerStatus::from_rank(rank)?;
+                status.is_scanned().then_some(rank)
+            })
+            .collect();
+
+        let upsert = crate::schema::UPSERT_SQL;
+        for rank in &scanned_ranks {
+            let needle = format!("= {rank}");
+            assert!(
+                upsert.contains(&needle),
+                "UPSERT_SQL must reference scanned rank {rank} in a CASE branch, \
+                 but no `= {rank}` found"
+            );
+        }
+    }
+
+    /// Verify that the Rust lattice merge is equivalent to `max(rank)` for
+    /// all status pairs, which is the semantic contract that lets the SQL
+    /// `GREATEST(EXCLUDED.status, done_ledger_entries.status)` expression
+    /// produce identical results.
+    #[test]
+    fn rust_status_merge_is_equivalent_to_max_on_ranks() {
+        use gossip_contracts::persistence::DoneLedgerStatus;
+
+        let all_ranks: Vec<u8> = (0..=u8::MAX)
+            .filter(|&rank| DoneLedgerStatus::from_rank(rank).is_some())
+            .collect();
+
+        for &a_rank in &all_ranks {
+            let a = DoneLedgerStatus::from_rank(a_rank).unwrap();
+            for &b_rank in &all_ranks {
+                let b = DoneLedgerStatus::from_rank(b_rank).unwrap();
+                assert_eq!(
+                    a.merge(b).rank(),
+                    a_rank.max(b_rank),
+                    "Rust lattice merge must equal max(rank) for ({a:?}, {b:?})"
+                );
+            }
+        }
+    }
+
+    /// Guard that `UPSERT_SQL` uses `GREATEST` for the status merge column.
+    /// Without this, the Rust-side max-on-ranks equivalence (tested above)
+    /// would not be enough — someone could change the SQL to use a different
+    /// expression without breaking the Rust test.
+    #[test]
+    fn upsert_sql_uses_greatest_for_status_merge() {
+        let upsert = crate::schema::UPSERT_SQL;
+        assert!(
+            upsert.contains("GREATEST(EXCLUDED.status, done_ledger_entries.status)"),
+            "UPSERT_SQL must merge status via GREATEST(EXCLUDED.status, \
+             done_ledger_entries.status)"
+        );
+    }
+
     // ── SQL/Rust status discriminant alignment ──────────────────────
 
     #[test]

@@ -45,6 +45,8 @@ pub enum PersistenceInputError {
     },
     /// Records in the batch belong to different tenants.
     InconsistentTenant,
+    /// Provenance timestamps are out of order (`started_at > finished_at`).
+    ProvenanceOrdering { started_at: u64, finished_at: u64 },
 }
 
 impl fmt::Display for PersistenceInputError {
@@ -89,6 +91,13 @@ impl fmt::Display for PersistenceInputError {
             Self::InconsistentTenant => {
                 write!(f, "records in the batch belong to different tenants")
             }
+            Self::ProvenanceOrdering {
+                started_at,
+                finished_at,
+            } => write!(
+                f,
+                "provenance started_at ({started_at}) must not exceed finished_at ({finished_at})"
+            ),
         }
     }
 }

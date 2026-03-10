@@ -184,11 +184,12 @@ impl CommitReceipt for FindingsCommitReceipt {}
 
 /// Durable acknowledgement for a done-ledger upsert.
 ///
-/// `record_count` is the total number of done-ledger rows committed.
+/// `record_count` is the number of **distinct keys** in the committed batch
+/// (duplicate keys within a single submission are merged before counting).
 /// `scanned_count` is the subset whose status reached a terminal scanned
 /// state (as defined by [`DoneLedgerStatus`](super::DoneLedgerStatus)).
 /// `findings_count` is the aggregate number of findings referenced across
-/// all committed rows.
+/// all committed rows (after per-key deduplication).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DoneLedgerCommitReceipt {
     record_count: u64,
@@ -208,7 +209,7 @@ impl DoneLedgerCommitReceipt {
         }
     }
 
-    /// Number of done-ledger rows durably acknowledged by this receipt.
+    /// Number of distinct done-ledger keys durably acknowledged by this receipt.
     #[inline]
     #[must_use]
     pub const fn record_count(self) -> u64 {

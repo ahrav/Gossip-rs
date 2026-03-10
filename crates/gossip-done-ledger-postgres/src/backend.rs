@@ -29,7 +29,6 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     fmt,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
 };
 
 use gossip_contracts::{
@@ -37,7 +36,7 @@ use gossip_contracts::{
     persistence::{
         DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey,
         DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, OvidHash,
-        RECOMMENDED_MAX_BATCH_SIZE, ReadyCommitHandle, merge_done_ledger_records,
+        RECOMMENDED_MAX_BATCH_SIZE, ReadyCommitHandle,
     },
 };
 #[cfg(feature = "test-utils")]
@@ -152,22 +151,6 @@ impl DoneLedgerPg {
         Ok(())
     }
 
-    /// Validate the current connection by executing a simple query within
-    /// the given `timeout`.
-    ///
-    /// Useful for health-check endpoints or connection-pool keep-alive
-    /// probes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DoneLedgerPgError::Postgres`] if the query times out or
-    /// the connection is broken.
-    pub fn validate_connection(&self, timeout: Duration) -> Result<(), DoneLedgerPgError> {
-        let mut client = self.lock_client()?;
-        client.is_valid(timeout)?;
-        Ok(())
-    }
-
     /// Remove all rows from the done-ledger table.
     ///
     /// This helper is intended for crate-local integration tests.
@@ -183,6 +166,11 @@ impl DoneLedgerPg {
 
     /// Acquire the internal mutex, returning `MutexPoisoned` if a prior
     /// holder panicked.
+    ///
+    /// Poisoning is treated as terminal because the connection's internal
+    /// state (prepared statements, transaction nesting) is indeterminate
+    /// after a panic during SQL execution. Attempting to reuse a
+    /// potentially half-committed connection risks silent data corruption.
     fn lock_client(&self) -> Result<MutexGuard<'_, Client>, DoneLedgerPgError> {
         self.client
             .lock()
@@ -292,7 +280,7 @@ fn build_receipt(records: &[DoneLedgerRecord]) -> DoneLedgerCommitReceipt {
 /// Validate each input record and merge duplicate keys before SQL mutation.
 ///
 /// The first occurrence of each key establishes output order. Later duplicates
-/// are folded into that slot via [`merge_done_ledger_records`], so persistence
+/// are folded into that slot via [`DoneLedgerRecord::merge`], so persistence
 /// writes at most one row per key for the submitted batch.
 fn dedupe_and_validate(
     records: &[DoneLedgerRecord],
@@ -321,7 +309,9 @@ fn dedupe_and_validate(
                 slot.insert(record.clone());
             }
             Entry::Occupied(mut slot) => {
-                let merged_record = merge_done_ledger_records(slot.get(), record)
+                let merged_record = slot
+                    .get()
+                    .merge(record)
                     .map_err(|source| DoneLedgerPgError::InvalidMergedRecord { source })?;
                 // Defensive: verify merged output satisfies the same cross-field
                 // invariants that individual inputs were validated against.
@@ -512,7 +502,7 @@ mod tests {
         identity::{FenceEpoch, LogicalTime, RunId, ShardId},
         persistence::{
             DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-            DoneLedgerStatus, merge_done_ledger_records,
+            DoneLedgerStatus,
         },
         test_util::{ovid, policy, tenant},
     };
@@ -537,7 +527,7 @@ mod tests {
         clippy::too_many_arguments,
         reason = "test helper mirrors the flat done-ledger row shape"
     )]
-    fn record(
+    fn done_record(
         tenant_seed: u8,
         policy_seed: u8,
         ovid_seed: u8,
@@ -565,148 +555,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_fail_then_scan_preserves_metrics_and_clears_error_code() {
-        let failed = record(
-            1,
-            2,
-            3,
-            DoneLedgerStatus::FailedRetryable,
-            9_000,
-            7,
-            10,
-            11,
-            12,
-            100,
-            200,
-            Some("IO_TIMEOUT"),
-        );
-        let scanned = record(
-            1,
-            2,
-            3,
-            DoneLedgerStatus::ScannedWithFindings,
-            1_000,
-            1,
-            20,
-            21,
-            22,
-            150,
-            250,
-            None,
-        );
-
-        let merged = merge_done_ledger_records(&failed, &scanned)
-            .expect("merge should preserve done-ledger invariants");
-
-        assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
-        assert_eq!(merged.bytes_scanned(), 9_000);
-        assert_eq!(merged.findings_count(), 7);
-        assert_eq!(merged.provenance(), scanned.provenance());
-        assert_eq!(merged.error_code(), None);
-    }
-
-    #[test]
-    fn merge_scan_then_fail_keeps_scanned_status() {
-        let scanned = record(
-            4,
-            5,
-            6,
-            DoneLedgerStatus::ScannedWithFindings,
-            2_000,
-            2,
-            30,
-            31,
-            32,
-            100,
-            500,
-            None,
-        );
-        let failed = record(
-            4,
-            5,
-            6,
-            DoneLedgerStatus::FailedPermanent,
-            8_000,
-            5,
-            40,
-            41,
-            42,
-            110,
-            120,
-            Some("PERM_DENY"),
-        );
-
-        let merged = merge_done_ledger_records(&scanned, &failed)
-            .expect("merge should preserve done-ledger invariants");
-
-        assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
-        assert_eq!(merged.bytes_scanned(), 8_000);
-        assert_eq!(merged.findings_count(), 5);
-        assert_eq!(merged.provenance(), scanned.provenance());
-        assert_eq!(merged.error_code(), None);
-    }
-
-    #[test]
-    fn merge_equal_rank_prefers_newer_finished_then_started_time() {
-        let existing = record(
-            7,
-            8,
-            9,
-            DoneLedgerStatus::FailedPermanent,
-            100,
-            3,
-            50,
-            51,
-            52,
-            100,
-            200,
-            Some("OLD"),
-        );
-
-        let newer_finished = record(
-            7,
-            8,
-            9,
-            DoneLedgerStatus::FailedPermanent,
-            90,
-            1,
-            60,
-            61,
-            62,
-            80,
-            300,
-            Some("NEW_FINISHED"),
-        );
-
-        let merged = merge_done_ledger_records(&existing, &newer_finished)
-            .expect("merge should keep equal-rank freshness ordering");
-        assert_eq!(merged.provenance(), newer_finished.provenance());
-        assert_eq!(merged.error_code(), newer_finished.error_code());
-
-        let newer_started = record(
-            7,
-            8,
-            9,
-            DoneLedgerStatus::FailedPermanent,
-            95,
-            2,
-            70,
-            71,
-            72,
-            150,
-            200,
-            Some("NEW_STARTED"),
-        );
-
-        let merged = merge_done_ledger_records(&existing, &newer_started)
-            .expect("merge should use started_at as equal-finished tie-break");
-        assert_eq!(merged.provenance(), newer_started.provenance());
-        assert_eq!(merged.error_code(), newer_started.error_code());
-    }
-
-    #[test]
     fn dedupe_and_validate_merges_duplicate_keys_in_submission_order() {
-        let key_a_failed = record(
+        let key_a_failed = done_record(
             1,
             1,
             1,
@@ -720,7 +570,7 @@ mod tests {
             20,
             Some("A"),
         );
-        let key_b_scanned = record(
+        let key_b_scanned = done_record(
             1,
             1,
             2,
@@ -734,7 +584,7 @@ mod tests {
             21,
             None,
         );
-        let key_a_scanned = record(
+        let key_a_scanned = done_record(
             1,
             1,
             1,
