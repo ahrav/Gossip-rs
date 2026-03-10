@@ -1,0 +1,27 @@
+[package]
+name = "gossip-done-ledger-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "PostgreSQL done-ledger backend and migrations for gossip-rs"
+
+[lib]
+
+[features]
+## Exposes `connect_and_apply_migrations` (plaintext NoTls convenience
+## wrapper). Enable in integration tests and local dev only — production
+## callers should construct their own `Client` with TLS and call
+## `apply_all_migrations` directly.
+test-utils = []
+
+[dependencies]
+gossip-contracts.workspace = true
+postgres = "0.19"
+blake3 = "1.8"
+
+[dev-dependencies]
+testcontainers.workspace = true
+proptest.workspace = true
+gossip-contracts = { workspace = true, features = ["test-support"] }
