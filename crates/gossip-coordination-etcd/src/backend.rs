@@ -217,7 +217,18 @@ impl TxnBuilder {
     }
 
     /// Build the etcd transaction.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics if no compare clauses were added. An empty compare set
+    /// produces an unconditional transaction — always a logic error in
+    /// CAS-guarded coordination code.
     fn build(self) -> Txn {
+        debug_assert!(
+            !self.compares.is_empty(),
+            "TxnBuilder::build called with no compare clauses — \
+             this produces an unconditional transaction"
+        );
         Txn::new().when(self.compares).and_then(self.success_ops)
     }
 }
