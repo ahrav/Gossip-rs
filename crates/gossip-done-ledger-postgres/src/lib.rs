@@ -66,7 +66,7 @@ pub mod migrations;
 pub mod schema;
 pub mod types;
 
-pub use error::DoneLedgerPgMigrationError;
+pub use error::{DoneLedgerPgMigrationError, MigrationOperation};
 #[cfg(feature = "test-utils")]
 pub use migrations::connect_and_apply_migrations;
 pub use migrations::{EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations};

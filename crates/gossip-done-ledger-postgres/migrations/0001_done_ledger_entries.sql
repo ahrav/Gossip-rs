@@ -38,7 +38,8 @@ CREATE TABLE done_ledger_entries (
     CONSTRAINT done_ledger_entries_error_code_size_ck
         CHECK (error_code IS NULL OR octet_length(error_code) BETWEEN 1 AND 128),
 
-    -- Enforce DoneLedgerRecord::validate() shape constraints.
+    -- Status-specific shape: scanned rows require matching findings_count
+    -- and no error_code; failure/skip rows require error_code.
     CONSTRAINT done_ledger_entries_status_shape_ck
         CHECK (
             (status = 10 AND findings_count = 0 AND error_code IS NULL)

@@ -35,7 +35,7 @@ use blake3::Hash;
 use postgres::{Client, Transaction};
 
 use crate::{
-    DoneLedgerPgMigrationError,
+    DoneLedgerPgMigrationError, MigrationOperation,
     schema::{MIGRATION_ADVISORY_LOCK_KEY, SCHEMA_MIGRATIONS_TABLE},
 };
 
@@ -157,7 +157,8 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[EmbeddedMigration::new(
 pub fn connect_and_apply_migrations(
     database_url: &str,
 ) -> Result<Client, DoneLedgerPgMigrationError> {
-    let mut client = Client::connect(database_url, postgres::NoTls)?;
+    let mut client = Client::connect(database_url, postgres::NoTls)
+        .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::Connect, e))?;
     apply_all_migrations(&mut client)?;
     Ok(client)
 }
@@ -202,7 +203,9 @@ pub fn apply_migrations(
     client: &mut Client,
     migrations: &[EmbeddedMigration],
 ) -> Result<(), DoneLedgerPgMigrationError> {
-    let mut tx = client.transaction()?;
+    let mut tx = client
+        .transaction()
+        .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
     // Serialize all concurrent migration runners.  Advisory locks are
     // purely in-memory (no table dependency), so this works even during
@@ -212,7 +215,8 @@ pub fn apply_migrations(
     tx.query_one(
         "SELECT pg_advisory_xact_lock($1)",
         &[&MIGRATION_ADVISORY_LOCK_KEY],
-    )?;
+    )
+    .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::AdvisoryLock, e))?;
 
     // Cap how long DDL statements wait for conflicting locks.  Without
     // this, a future migration that issues ALTER TABLE / CREATE INDEX
@@ -221,11 +225,14 @@ pub fn apply_migrations(
     // the timeout to this transaction only.  Set *after* the advisory
     // lock so the timeout applies only to DDL, not to the advisory
     // lock wait itself.
-    tx.batch_execute("SET LOCAL lock_timeout = '5s'")?;
+    tx.batch_execute("SET LOCAL lock_timeout = '5s'")
+        .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
-    tx.batch_execute(&create_migrations_table_sql())?;
+    tx.batch_execute(&create_migrations_table_sql())
+        .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::HistoryTable, e))?;
     apply_migration_set(&mut tx, migrations)?;
-    tx.commit()?;
+    tx.commit()
+        .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::Commit, e))?;
     Ok(())
 }
 
@@ -233,8 +240,10 @@ fn apply_migration_set(
     tx: &mut Transaction<'_>,
     migrations: &[EmbeddedMigration],
 ) -> Result<(), DoneLedgerPgMigrationError> {
+    let select_sql = select_migration_checksum_sql();
+    let insert_sql = insert_migration_sql();
     for migration in migrations.iter().copied() {
-        apply_or_verify_migration(tx, migration)?;
+        apply_or_verify_migration(tx, migration, &select_sql, &insert_sql)?;
     }
     Ok(())
 }
@@ -245,11 +254,14 @@ fn apply_migration_set(
 fn apply_or_verify_migration(
     tx: &mut Transaction<'_>,
     migration: EmbeddedMigration,
+    select_sql: &str,
+    insert_sql: &str,
 ) -> Result<(), DoneLedgerPgMigrationError> {
     let expected_checksum = migration.checksum();
     let version = migration.version();
-    let select_sql = select_migration_checksum_sql();
-    let row = tx.query_opt(&select_sql, &[&version])?;
+    let row = tx.query_opt(select_sql, &[&version]).map_err(|e| {
+        DoneLedgerPgMigrationError::postgres(MigrationOperation::RecordMigration, e)
+    })?;
 
     if let Some(row) = row {
         // Migration already applied — verify the embedded SQL has not changed.
@@ -259,16 +271,20 @@ fn apply_or_verify_migration(
     }
 
     // First application: execute the SQL and record its checksum.
-    tx.batch_execute(migration.sql())?;
+    tx.batch_execute(migration.sql())
+        .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::ApplyMigration, e))?;
     let checksum_bytes: &[u8] = expected_checksum.as_bytes();
-    let insert_sql = insert_migration_sql();
-    tx.execute(&insert_sql, &[&version, &checksum_bytes])?;
+    tx.execute(insert_sql, &[&version, &checksum_bytes])
+        .map_err(|e| {
+            DoneLedgerPgMigrationError::postgres(MigrationOperation::RecordMigration, e)
+        })?;
     Ok(())
 }
 
 /// Compare the BLAKE3 digest stored in the history table against the digest
-/// of the embedded SQL. Returns `Ok(())` on match, or a `ChecksumMismatch`
-/// error with both digests rendered as hex for diagnostic output.
+/// of the embedded SQL. Returns `Ok(())` on match, `CorruptedHistoryRecord`
+/// if the stored blob is not exactly 32 bytes, or `ChecksumMismatch` if it
+/// is 32 bytes but differs from the expected digest.
 fn verify_stored_checksum(
     version: &'static str,
     expected_checksum: Hash,
@@ -278,31 +294,29 @@ fn verify_stored_checksum(
         return Ok(());
     }
 
+    let found_array: [u8; 32] = found_checksum.try_into().map_err(|_| {
+        DoneLedgerPgMigrationError::CorruptedHistoryRecord {
+            version,
+            found_len: found_checksum.len(),
+        }
+    })?;
+
     Err(DoneLedgerPgMigrationError::ChecksumMismatch {
         version,
         expected_hex: expected_checksum.to_hex().to_string(),
-        found_hex: encode_hex(found_checksum),
+        found_hex: Hash::from_bytes(found_array).to_hex().to_string(),
     })
-}
-
-/// Lowercase hex encoding for arbitrary byte slices. Used to render the
-/// database-side checksum in error messages (the embedded-side checksum
-/// uses `blake3::Hash::to_hex` directly).
-///
-/// Kept as a manual implementation to avoid adding a `hex` crate
-/// dependency for a single error-path call site.
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DoneLedgerPgMigrationError, EmbeddedMigration, verify_stored_checksum};
+    use std::collections::HashSet;
+
+    use super::{
+        DoneLedgerPgMigrationError, EmbeddedMigration, MIGRATIONS, verify_stored_checksum,
+    };
+
+    // ── verify_stored_checksum ──────────────────────────────────────
 
     #[test]
     fn checksum_verification_accepts_matching_bytes() {
@@ -335,30 +349,57 @@ mod tests {
                 assert_eq!(found_hex.len(), 64);
                 assert_ne!(expected_hex, found_hex);
             }
-            DoneLedgerPgMigrationError::Postgres(err) => {
-                panic!("unexpected Postgres error variant: {err}");
-            }
+            other => panic!("expected ChecksumMismatch, got: {other}"),
         }
     }
 
-    // ── encode_hex ──────────────────────────────────────────────────
-
-    use super::encode_hex;
-
     #[test]
-    fn encode_hex_produces_lowercase() {
-        assert_eq!(encode_hex(&[0x0a, 0xff, 0x00]), "0aff00");
+    fn corrupted_history_record_on_short_blob() {
+        let migration = EmbeddedMigration::new("0001", "SELECT 1;");
+        let checksum = migration.checksum();
+
+        let error = verify_stored_checksum(migration.version(), checksum, &[0u8; 31])
+            .expect_err("31-byte blob must produce CorruptedHistoryRecord");
+
+        match error {
+            DoneLedgerPgMigrationError::CorruptedHistoryRecord { version, found_len } => {
+                assert_eq!(version, "0001");
+                assert_eq!(found_len, 31);
+            }
+            other => panic!("expected CorruptedHistoryRecord, got: {other}"),
+        }
     }
 
     #[test]
-    fn encode_hex_boundary_bytes() {
-        assert_eq!(encode_hex(&[0x00]), "00");
-        assert_eq!(encode_hex(&[0xff]), "ff");
+    fn corrupted_history_record_on_long_blob() {
+        let migration = EmbeddedMigration::new("0001", "SELECT 1;");
+        let checksum = migration.checksum();
+
+        let error = verify_stored_checksum(migration.version(), checksum, &[0u8; 33])
+            .expect_err("33-byte blob must produce CorruptedHistoryRecord");
+
+        match error {
+            DoneLedgerPgMigrationError::CorruptedHistoryRecord { found_len, .. } => {
+                assert_eq!(found_len, 33);
+            }
+            other => panic!("expected CorruptedHistoryRecord, got: {other}"),
+        }
     }
 
     #[test]
-    fn encode_hex_empty_input() {
-        assert_eq!(encode_hex(&[]), "");
+    fn corrupted_history_record_on_empty_blob() {
+        let migration = EmbeddedMigration::new("0001", "SELECT 1;");
+        let checksum = migration.checksum();
+
+        let error = verify_stored_checksum(migration.version(), checksum, &[])
+            .expect_err("empty blob must produce CorruptedHistoryRecord");
+
+        match error {
+            DoneLedgerPgMigrationError::CorruptedHistoryRecord { found_len, .. } => {
+                assert_eq!(found_len, 0);
+            }
+            other => panic!("expected CorruptedHistoryRecord, got: {other}"),
+        }
     }
 
     // ── checksum properties ─────────────────────────────────────────
@@ -380,5 +421,95 @@ mod tests {
         let a = EmbeddedMigration::new("0001", "SELECT 1;");
         let b = EmbeddedMigration::new("0001", "SELECT 2;");
         assert_ne!(a.checksum(), b.checksum());
+    }
+
+    // ── MIGRATIONS array integrity ─────────────────────────────────
+
+    #[test]
+    fn migrations_have_unique_versions_and_nonempty_sql() {
+        assert!(!MIGRATIONS.is_empty(), "MIGRATIONS must not be empty");
+
+        let mut seen = HashSet::new();
+        for m in MIGRATIONS {
+            assert!(
+                !m.version().is_empty(),
+                "migration version must not be empty"
+            );
+            assert!(!m.sql().is_empty(), "migration SQL must not be empty");
+            assert!(
+                seen.insert(m.version()),
+                "duplicate migration version: {}",
+                m.version()
+            );
+            // Checksum must be computable (not panic) and 32 bytes.
+            assert_eq!(m.checksum().as_bytes().len(), 32);
+        }
+    }
+
+    #[test]
+    fn migration_checksums_are_stable() {
+        // Golden-value test: pin the BLAKE3 hex for each migration.
+        // If a migration's SQL changes, this test will fail, forcing
+        // the author to acknowledge the checksum change and update the
+        // golden value here.
+        let expected: &[(&str, &str)] = &[(
+            "0001_done_ledger_entries",
+            "2c6a36c62f0c6f8e66e6d7c71b00b49a13c61f3a4f02c4c384960e0a9f539dd5",
+        )];
+
+        for (version, golden_hex) in expected {
+            let m = MIGRATIONS
+                .iter()
+                .find(|m| m.version() == *version)
+                .unwrap_or_else(|| panic!("migration {version} not found in MIGRATIONS"));
+            let actual_hex = m.checksum().to_hex().to_string();
+            assert_eq!(
+                actual_hex, *golden_hex,
+                "checksum changed for migration {version} — if this is intentional, \
+                 update the golden value"
+            );
+        }
+    }
+
+    // ── SQL/Rust status discriminant alignment ──────────────────────
+
+    #[test]
+    fn sql_status_discriminants_match_rust_enum() {
+        use gossip_contracts::persistence::DoneLedgerStatus;
+
+        // These are the exact discriminant values used in the SQL CHECK
+        // constraint: `status IN (1, 2, 3, 10, 11)`.
+        let sql_discriminants: &[u8] = &[1, 2, 3, 10, 11];
+
+        // Every SQL discriminant must round-trip through from_rank.
+        for &rank in sql_discriminants {
+            assert!(
+                DoneLedgerStatus::from_rank(rank).is_some(),
+                "SQL discriminant {rank} has no matching DoneLedgerStatus variant"
+            );
+        }
+
+        // Every Rust variant must appear in the SQL set.
+        let all_variants = [
+            DoneLedgerStatus::FailedRetryable,
+            DoneLedgerStatus::FailedPermanent,
+            DoneLedgerStatus::Skipped,
+            DoneLedgerStatus::ScannedClean,
+            DoneLedgerStatus::ScannedWithFindings,
+        ];
+        for variant in &all_variants {
+            assert!(
+                sql_discriminants.contains(&variant.rank()),
+                "DoneLedgerStatus::{variant:?} (rank {}) is missing from SQL CHECK constraint",
+                variant.rank()
+            );
+        }
+
+        // Cardinality check: no extras on either side.
+        assert_eq!(
+            sql_discriminants.len(),
+            all_variants.len(),
+            "SQL discriminant count does not match Rust variant count"
+        );
     }
 }

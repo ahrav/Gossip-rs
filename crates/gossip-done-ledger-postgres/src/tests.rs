@@ -56,8 +56,13 @@ fn checksum_mismatch_is_detected() {
         DoneLedgerPgMigrationError::ChecksumMismatch { version, .. } => {
             assert_eq!(version, "0001_done_ledger_entries");
         }
-        DoneLedgerPgMigrationError::Postgres(e) => {
-            panic!("expected ChecksumMismatch, got Postgres error: {e}");
+        DoneLedgerPgMigrationError::Postgres { source, .. } => {
+            panic!("expected ChecksumMismatch, got Postgres error: {source}");
+        }
+        DoneLedgerPgMigrationError::CorruptedHistoryRecord { version, found_len } => {
+            panic!(
+                "expected ChecksumMismatch, got CorruptedHistoryRecord: version={version}, len={found_len}"
+            );
         }
     }
 }

@@ -120,7 +120,8 @@ pub fn pg_bigint_nonnegative_to_u64(
     if value < 0 {
         return Err(PgU64ConversionError::NegativeStoredValue { field, value });
     }
-    // Safe: the >= 0 check above guarantees value fits in u64.
+    // Non-negative i64 values are in range 0..=i64::MAX, which is a subset of u64,
+    // so this cast is lossless.
     Ok(value as u64)
 }
 
