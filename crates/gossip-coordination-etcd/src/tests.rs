@@ -2884,87 +2884,56 @@ fn split_replace_rejects_over_cap_max_children_per_op() {
 // shard_limit_violation unit tests (pure, no etcd required)
 // ---------------------------------------------------------------------------
 
-/// The etcd backend counts persisted shards via a prefix scan that includes
-/// the parent being split. After split_replace the parent becomes terminal
-/// (Split status) and N children are created, so the net live-shard delta
-/// is N - 1, not N. Passing `sorted.len()` (= N) as the `additional`
-/// argument to `shard_limit_violation` over-counts by one, causing a false
-/// ShardLimitExceeded rejection when the tenant is at exactly the limit
-/// that should still permit the split.
+/// split_replace retires the parent (terminal Split status) and creates N
+/// children. The persisted count from the prefix scan includes the parent,
+/// so the net growth is N - 1 (the parent slot is reclaimed). Passing
+/// `num_children.saturating_sub(1)` to `shard_limit_violation` must allow a
+/// split that lands exactly at the per-tenant ceiling.
 #[test]
-fn shard_limit_split_replace_off_by_one_with_parent_in_count() {
+fn shard_limit_split_replace_accounts_for_parent_in_tenant_count() {
     use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 2;
-
-    // max_per_tenant = 11, persisted count = 10 (including the parent
-    // being split). A 2-way split retires the parent (terminal Split) and
-    // creates 2 children, so the net delta in live shards is +1. Post-split
-    // live count = 10 - 1 + 2 = 11, exactly at the limit. This MUST be
-    // allowed.
-    let max_per_tenant: usize = 11;
-    let max_total: usize = 100;
+    // 10 persisted shards (including the parent). A 2-way split retires
+    // the parent and creates 2 children: net delta = +1, post-split = 11.
     let counts = ShardCountSnapshot {
-        tenant: 10, // includes the parent being split
+        tenant: 10,
         total: 10,
     };
-
-    // BUG: using num_children (= 2) as `additional` computes
-    // 10 + 2 = 12 > 11, falsely rejecting the split.
-    let buggy = shard_limit_violation(counts, num_children, max_per_tenant, max_total);
-    assert!(
-        buggy.is_some(),
-        "passing raw child count (N) must trigger a false violation, proving the bug"
-    );
-
-    // FIX: using num_children - 1 (= 1) as `additional` computes
-    // 10 + 1 = 11 <= 11, correctly allowing the split.
-    let fixed = shard_limit_violation(
+    let result = shard_limit_violation(
         counts,
         num_children.saturating_sub(1),
-        max_per_tenant,
-        max_total,
+        11, // max_per_tenant — exactly at limit post-split
+        100,
     );
     assert!(
-        fixed.is_none(),
-        "passing N - 1 must allow the split when post-split count equals the limit"
+        result.is_none(),
+        "split landing exactly at the tenant limit must be allowed"
     );
 }
 
-/// Verify the same off-by-one manifests on the global shard limit path.
+/// Same parent-accounting logic as the per-tenant test, but verified against
+/// the global shard ceiling.
 #[test]
-fn shard_limit_split_replace_off_by_one_global_limit() {
+fn shard_limit_split_replace_accounts_for_parent_in_global_count() {
     use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 3;
-    let max_per_tenant: usize = 1000; // high enough to never trigger
-
     // 49 persisted shards (including the parent). A 3-way split retires
-    // the parent and creates 3 children, net delta = +2. Post-split
-    // live = 49 - 1 + 3 = 51, exactly at the limit. Must be allowed.
-    let max_total: usize = 51;
+    // the parent and creates 3 children: net delta = +2, post-split = 51.
     let counts = ShardCountSnapshot {
         tenant: 49,
-        total: 49, // includes the parent
+        total: 49,
     };
-
-    // BUG: 49 + 3 = 52 > 51, falsely rejects.
-    let buggy = shard_limit_violation(counts, num_children, max_per_tenant, max_total);
-    assert!(
-        buggy.is_some(),
-        "raw child count must trigger false global violation"
-    );
-
-    // FIX: 49 + 2 = 51 <= 51, correctly allows.
-    let fixed = shard_limit_violation(
+    let result = shard_limit_violation(
         counts,
         num_children.saturating_sub(1),
-        max_per_tenant,
-        max_total,
+        1000, // high per-tenant limit — won't trigger
+        51,   // max_total — exactly at limit post-split
     );
     assert!(
-        fixed.is_none(),
-        "N - 1 must allow the split when post-split global count equals the limit"
+        result.is_none(),
+        "split landing exactly at the global limit must be allowed"
     );
 }
 

@@ -953,6 +953,8 @@ impl CoordinationBackend for EtcdCoordinator {
                         err,
                     ))
                 })?;
+                // The parent stays Active (not terminal), so the persisted count
+                // already includes it. Only the new residual shard is net growth.
                 if let Some(limit) = shard_limit_violation(
                     counts,
                     1,
@@ -1782,6 +1784,8 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     e,
                 ))
             })?;
+            // The parent stays Active (not terminal), so the persisted count
+            // already includes it. Only the new residual shard is net growth.
             if let Some(limit) = shard_limit_violation(
                 counts,
                 1,

@@ -31,7 +31,7 @@
 
 use std::collections::HashSet;
 
-use etcd_client::{GetOptions, Txn, TxnOp};
+use etcd_client::{GetOptions, TxnOp};
 use gossip_coordination::{
     AcquireResultView, AcquireScratch, AsyncRunManagement, ClaimError, CreateRunError, GetRunError,
     IdempotentOutcome, InfraError, InitialShardInput, LogicalTime, OpId, OpKind, OpLogEntry,
@@ -608,33 +608,23 @@ impl RunManagement for EtcdCoordinator {
                     this.keyspace
                         .shard_active_index_key(tenant, key.run(), key.shard());
 
-                let txn = Txn::new()
-                    .when(vec![
-                        super::compare_shard_revision(
-                            shard_record_key.clone(),
-                            persisted.mod_revision,
-                        ),
-                        super::compare_run_revision(run_key, persisted_run.mod_revision),
-                        super::compare_present(run_active_key),
-                        super::compare_absent(owner_key),
-                    ])
-                    .and_then(vec![
-                        TxnOp::put(shard_record_key.into_bytes(), shard_buf.clone(), None),
-                        TxnOp::put(active_shard_key.into_bytes(), Vec::<u8>::new(), None),
-                    ]);
-                let response = match this.etcd_txn(txn) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        return Err(UnparkError::BackendError(super::map_etcd_err(
-                            "unpark.txn",
-                            err,
-                        )));
-                    }
-                };
-                if response.succeeded() {
-                    return Ok(CasOutcome::Committed(IdempotentOutcome::Executed(())));
-                }
-                Ok(CasOutcome::RetryNeeded)
+                let mut txn = TxnBuilder::new();
+                txn.compare(super::compare_shard_revision(
+                    shard_record_key.clone(),
+                    persisted.mod_revision,
+                ))
+                .compare(super::compare_run_revision(
+                    run_key,
+                    persisted_run.mod_revision,
+                ))
+                .compare(super::compare_present(run_active_key))
+                .compare(super::compare_absent(owner_key))
+                .put(shard_record_key.into_bytes(), shard_buf.clone())
+                .put(active_shard_key.into_bytes(), Vec::<u8>::new());
+                txn.execute(this, IdempotentOutcome::Executed(()))
+                    .map_err(|err| {
+                        UnparkError::BackendError(super::map_etcd_err("unpark.txn", err))
+                    })
             },
             |this| {
                 let persisted = match this.load_shard_record(tenant, key) {
@@ -1174,30 +1164,21 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                     let ask = this
                         .keyspace
                         .shard_active_index_key(tenant, key.run(), key.shard());
-                    let txn = Txn::new()
-                        .when(vec![
-                            super::compare_shard_revision(srk.clone(), persisted.mod_revision),
-                            super::compare_run_revision(rk, persisted_run.mod_revision),
-                            super::compare_present(rak),
-                            super::compare_absent(ok),
-                        ])
-                        .and_then(vec![
-                            TxnOp::put(srk.into_bytes(), shard_buf, None),
-                            TxnOp::put(ask.into_bytes(), Vec::<u8>::new(), None),
-                        ]);
-                    let response = match this.etcd_txn(txn).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return Err(UnparkError::BackendError(super::map_etcd_err(
-                                "unpark.txn",
-                                e,
-                            )));
-                        }
-                    };
-                    if response.succeeded() {
-                        return Ok(CasOutcome::Committed(IdempotentOutcome::Executed(())));
-                    }
-                    Ok(CasOutcome::RetryNeeded)
+                    let mut txn = TxnBuilder::new();
+                    txn.compare(super::compare_shard_revision(
+                        srk.clone(),
+                        persisted.mod_revision,
+                    ))
+                    .compare(super::compare_run_revision(rk, persisted_run.mod_revision))
+                    .compare(super::compare_present(rak))
+                    .compare(super::compare_absent(ok))
+                    .put(srk.into_bytes(), shard_buf)
+                    .put(ask.into_bytes(), Vec::<u8>::new());
+                    txn.execute_async(this, IdempotentOutcome::Executed(()))
+                        .await
+                        .map_err(|e| {
+                            UnparkError::BackendError(super::map_etcd_err("unpark.txn", e))
+                        })
                 })
             },
             |this| {
