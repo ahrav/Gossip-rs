@@ -34,21 +34,42 @@
 use blake3::Hash;
 use postgres::{Client, Transaction};
 
-use crate::{DoneLedgerPgMigrationError, schema::MIGRATION_ADVISORY_LOCK_KEY};
+use crate::{
+    DoneLedgerPgMigrationError,
+    schema::{MIGRATION_ADVISORY_LOCK_KEY, SCHEMA_MIGRATIONS_TABLE},
+};
 
-const CREATE_MIGRATIONS_TABLE_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS done_ledger_schema_migrations (
+/// Build the `CREATE TABLE IF NOT EXISTS` DDL for the migration history
+/// table.  Derives the table name from [`SCHEMA_MIGRATIONS_TABLE`] so a
+/// rename propagates through the compiler rather than silently drifting.
+fn create_migrations_table_sql() -> String {
+    format!(
+        r#"
+CREATE TABLE IF NOT EXISTS {table} (
     version      TEXT PRIMARY KEY,
     checksum     BYTEA NOT NULL CHECK (octet_length(checksum) = 32),
     applied_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-"#;
+"#,
+        table = SCHEMA_MIGRATIONS_TABLE
+    )
+}
 
-const SELECT_MIGRATION_CHECKSUM_SQL: &str =
-    "SELECT checksum FROM done_ledger_schema_migrations WHERE version = $1";
+/// Build the `SELECT checksum` query for a single migration version.
+fn select_migration_checksum_sql() -> String {
+    format!(
+        "SELECT checksum FROM {table} WHERE version = $1",
+        table = SCHEMA_MIGRATIONS_TABLE
+    )
+}
 
-const INSERT_MIGRATION_SQL: &str =
-    "INSERT INTO done_ledger_schema_migrations(version, checksum) VALUES ($1, $2)";
+/// Build the `INSERT` statement that records a newly-applied migration.
+fn insert_migration_sql() -> String {
+    format!(
+        "INSERT INTO {table}(version, checksum) VALUES ($1, $2)",
+        table = SCHEMA_MIGRATIONS_TABLE
+    )
+}
 
 /// A single forward-only SQL migration compiled into the binary.
 ///
@@ -159,12 +180,13 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), DoneLedgerPgMigra
 ///
 /// ## Transaction protocol
 ///
-/// 1. Begin a transaction with a `lock_timeout` to prevent indefinite
-///    blocking on conflicting DDL locks.
-/// 2. `CREATE TABLE IF NOT EXISTS` the history table (idempotent bootstrap).
-/// 3. Acquire `pg_advisory_xact_lock` to serialise concurrent runners.
-/// 4. For each migration: apply if absent, or verify checksum if present.
-/// 5. Commit. On any error the transaction rolls back automatically.
+/// 1. Begin a transaction.
+/// 2. Acquire `pg_advisory_xact_lock` to serialise concurrent runners
+///    (waits indefinitely — not subject to `lock_timeout`).
+/// 3. Set `lock_timeout` to prevent indefinite blocking on DDL locks.
+/// 4. `CREATE TABLE IF NOT EXISTS` the history table (idempotent bootstrap).
+/// 5. For each migration: apply if absent, or verify checksum if present.
+/// 6. Commit. On any error the transaction rolls back automatically.
 ///
 /// # Errors
 ///
@@ -175,19 +197,26 @@ pub fn apply_migrations(
 ) -> Result<(), DoneLedgerPgMigrationError> {
     let mut tx = client.transaction()?;
 
-    // Cap how long DDL statements wait for conflicting locks. Without
-    // this, a future migration that issues ALTER TABLE / CREATE INDEX
-    // could block indefinitely if another session holds a conflicting
-    // lock, causing a cascading connection-queue stall.  LOCAL scopes
-    // the timeout to this transaction only.
-    tx.batch_execute("SET LOCAL lock_timeout = '5s'")?;
-
-    tx.batch_execute(CREATE_MIGRATIONS_TABLE_SQL)?;
+    // Serialize all concurrent migration runners.  Advisory locks are
+    // purely in-memory (no table dependency), so this works even during
+    // the very first bootstrap when no tables exist yet.  Acquired
+    // *before* lock_timeout is set so that legitimate concurrent
+    // runners wait as long as needed rather than timing out after 5 s.
     tx.query_one(
         "SELECT pg_advisory_xact_lock($1)",
         &[&MIGRATION_ADVISORY_LOCK_KEY],
     )?;
 
+    // Cap how long DDL statements wait for conflicting locks.  Without
+    // this, a future migration that issues ALTER TABLE / CREATE INDEX
+    // could block indefinitely if another session holds a conflicting
+    // lock, causing a cascading connection-queue stall.  LOCAL scopes
+    // the timeout to this transaction only.  Set *after* the advisory
+    // lock so the timeout applies only to DDL, not to the advisory
+    // lock wait itself.
+    tx.batch_execute("SET LOCAL lock_timeout = '5s'")?;
+
+    tx.batch_execute(&create_migrations_table_sql())?;
     apply_migration_set(&mut tx, migrations)?;
     tx.commit()?;
     Ok(())
@@ -212,7 +241,8 @@ fn apply_or_verify_migration(
 ) -> Result<(), DoneLedgerPgMigrationError> {
     let expected_checksum = migration.checksum();
     let version = migration.version();
-    let row = tx.query_opt(SELECT_MIGRATION_CHECKSUM_SQL, &[&version])?;
+    let select_sql = select_migration_checksum_sql();
+    let row = tx.query_opt(&select_sql, &[&version])?;
 
     if let Some(row) = row {
         // Migration already applied — verify the embedded SQL has not changed.
@@ -224,7 +254,8 @@ fn apply_or_verify_migration(
     // First application: execute the SQL and record its checksum.
     tx.batch_execute(migration.sql())?;
     let checksum_bytes: &[u8] = expected_checksum.as_bytes();
-    tx.execute(INSERT_MIGRATION_SQL, &[&version, &checksum_bytes])?;
+    let insert_sql = insert_migration_sql();
+    tx.execute(&insert_sql, &[&version, &checksum_bytes])?;
     Ok(())
 }
 
