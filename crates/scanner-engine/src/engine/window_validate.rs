@@ -74,8 +74,8 @@
 //! [`extract_secret_span_locs_raw`]: super::helpers::extract_secret_span_locs_raw
 
 use crate::api::{
-    confidence, DecodeStep, FileId, FindingRec, LocalContextSpec, StepId, Utf16Endianness,
-    STEP_ROOT,
+    DecodeStep, FileId, FindingRec, LocalContextSpec, STEP_ROOT, StepId, Utf16Endianness,
+    confidence,
 };
 use memchr::memmem;
 use regex::bytes::CaptureLocations;
@@ -83,9 +83,9 @@ use std::ops::Range;
 
 use super::core::Engine;
 use super::helpers::{
-    contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
-    entropy_gate_outcome, extract_secret_span_locs_raw, map_utf16_decoded_offset,
-    EntropyGateOutcome,
+    EntropyGateOutcome, contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf,
+    decode_utf16le_to_buf, entropy_gate_outcome, extract_secret_span_locs_raw,
+    map_utf16_decoded_offset,
 };
 use super::rule_repr::{
     CharClassCompiled, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns,
