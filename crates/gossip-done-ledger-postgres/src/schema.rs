@@ -50,7 +50,7 @@ pub const DONE_LEDGER_RUN_SHARD_INDEX: &str = "done_ledger_entries_run_shard_idx
 ///
 /// Fixed 64-bit constant chosen to be unlikely to collide with advisory
 /// locks used by other subsystems. The ASCII mnemonic is `"GSDLPGM1"`
-/// (Gossip-Done-Ledger-PostGres-Migrations-1). The lock is acquired
+/// (Gossip-Schema-Done-Ledger-PostGres-Migrations-1). The lock is acquired
 /// per-transaction via `pg_advisory_xact_lock`, so it is automatically
 /// released when the migration transaction commits or rolls back.
 pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4753444c_50474d31; // "GSDLPGM1"

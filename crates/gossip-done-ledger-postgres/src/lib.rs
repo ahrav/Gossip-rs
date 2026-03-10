@@ -47,10 +47,9 @@ pub mod schema;
 pub mod types;
 
 pub use error::DoneLedgerPgMigrationError;
-pub use migrations::{
-    EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations,
-    connect_and_apply_migrations,
-};
+#[cfg(feature = "test-utils")]
+pub use migrations::connect_and_apply_migrations;
+pub use migrations::{EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations};
 pub use types::{
     PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
     u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,

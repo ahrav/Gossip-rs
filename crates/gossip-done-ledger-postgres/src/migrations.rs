@@ -16,6 +16,10 @@
 //! 2. **Advisory lock** — a transaction-scoped `pg_advisory_xact_lock` on
 //!    [`MIGRATION_ADVISORY_LOCK_KEY`] serialises concurrent migration
 //!    attempts so only one transaction mutates the schema at a time.
+//!    During initial bootstrap (history table does not yet exist),
+//!    PostgreSQL's DDL lock on the `CREATE TABLE` provides equivalent
+//!    serialization; the advisory lock becomes the primary guard on
+//!    subsequent startups when the `CREATE TABLE IF NOT EXISTS` is a no-op.
 //! 3. **Checksum gate** — if a version already appears in the history table,
 //!    the runner verifies its checksum matches the embedded SQL.
 //!    A mismatch produces [`DoneLedgerPgMigrationError::ChecksumMismatch`].
@@ -28,7 +32,7 @@
 //! [`DoneLedgerPgMigrationError::ChecksumMismatch`]: crate::DoneLedgerPgMigrationError::ChecksumMismatch
 
 use blake3::Hash;
-use postgres::{Client, NoTls, Transaction};
+use postgres::{Client, Transaction};
 
 use crate::{DoneLedgerPgMigrationError, schema::MIGRATION_ADVISORY_LOCK_KEY};
 
@@ -121,10 +125,11 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[EmbeddedMigration::new(
 /// Returns [`DoneLedgerPgMigrationError::Postgres`] on connection or SQL
 /// failure, or [`DoneLedgerPgMigrationError::ChecksumMismatch`] if an
 /// already-applied migration's SQL text has changed.
+#[cfg(feature = "test-utils")]
 pub fn connect_and_apply_migrations(
     database_url: &str,
 ) -> Result<Client, DoneLedgerPgMigrationError> {
-    let mut client = Client::connect(database_url, NoTls)?;
+    let mut client = Client::connect(database_url, postgres::NoTls)?;
     apply_all_migrations(&mut client)?;
     Ok(client)
 }
@@ -154,7 +159,8 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), DoneLedgerPgMigra
 ///
 /// ## Transaction protocol
 ///
-/// 1. Begin a transaction.
+/// 1. Begin a transaction with a `lock_timeout` to prevent indefinite
+///    blocking on conflicting DDL locks.
 /// 2. `CREATE TABLE IF NOT EXISTS` the history table (idempotent bootstrap).
 /// 3. Acquire `pg_advisory_xact_lock` to serialise concurrent runners.
 /// 4. For each migration: apply if absent, or verify checksum if present.
@@ -168,6 +174,14 @@ pub fn apply_migrations(
     migrations: &[EmbeddedMigration],
 ) -> Result<(), DoneLedgerPgMigrationError> {
     let mut tx = client.transaction()?;
+
+    // Cap how long DDL statements wait for conflicting locks. Without
+    // this, a future migration that issues ALTER TABLE / CREATE INDEX
+    // could block indefinitely if another session holds a conflicting
+    // lock, causing a cascading connection-queue stall.  LOCAL scopes
+    // the timeout to this transaction only.
+    tx.batch_execute("SET LOCAL lock_timeout = '5s'")?;
+
     tx.batch_execute(CREATE_MIGRATIONS_TABLE_SQL)?;
     tx.query_one(
         "SELECT pg_advisory_xact_lock($1)",
@@ -236,6 +250,9 @@ fn verify_stored_checksum(
 /// Lowercase hex encoding for arbitrary byte slices. Used to render the
 /// database-side checksum in error messages (the embedded-side checksum
 /// uses `blake3::Hash::to_hex` directly).
+///
+/// Kept as a manual implementation to avoid adding a `hex` crate
+/// dependency for a single error-path call site.
 fn encode_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
