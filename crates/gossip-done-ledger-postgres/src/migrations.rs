@@ -495,27 +495,16 @@ mod tests {
             );
         }
 
-        // Every Rust variant must appear in the SQL set.
-        let all_variants = [
-            DoneLedgerStatus::FailedRetryable,
-            DoneLedgerStatus::FailedPermanent,
-            DoneLedgerStatus::Skipped,
-            DoneLedgerStatus::ScannedClean,
-            DoneLedgerStatus::ScannedWithFindings,
-        ];
-        for variant in &all_variants {
-            assert!(
-                sql_discriminants.contains(&variant.rank()),
-                "DoneLedgerStatus::{variant:?} (rank {}) is missing from SQL CHECK constraint",
-                variant.rank()
-            );
-        }
+        // Derive the full Rust variant set from from_rank() so this test
+        // automatically catches new variants without a manual list update.
+        let rust_ranks: Vec<u8> = (0..=u8::MAX)
+            .filter(|&rank| DoneLedgerStatus::from_rank(rank).is_some())
+            .collect();
 
-        // Cardinality check: no extras on either side.
         assert_eq!(
-            sql_discriminants.len(),
-            all_variants.len(),
-            "SQL discriminant count does not match Rust variant count"
+            sql_discriminants,
+            rust_ranks.as_slice(),
+            "SQL CHECK constraint discriminants drifted from DoneLedgerStatus::from_rank"
         );
     }
 }

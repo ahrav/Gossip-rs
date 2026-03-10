@@ -103,6 +103,28 @@ fn concurrent_migrations_both_succeed() {
 
 // ── Schema constraint enforcement ───────────────────────────────────────
 
+/// Assert that a Postgres error is a CHECK_VIOLATION (SQLSTATE 23514).
+fn assert_check_violation(err: &postgres::Error) {
+    let db_err = err.as_db_error().expect("expected server-side DbError");
+    assert_eq!(
+        *db_err.code(),
+        postgres::error::SqlState::CHECK_VIOLATION,
+        "expected CHECK_VIOLATION, got: {db_err}"
+    );
+}
+
+/// Assert that a Postgres error is a CHECK_VIOLATION on a specific
+/// named constraint.
+fn assert_constraint_violation(err: &postgres::Error, expected_constraint: &str) {
+    assert_check_violation(err);
+    let db_err = err.as_db_error().unwrap();
+    let constraint = db_err.constraint().expect("expected constraint name");
+    assert!(
+        constraint.contains(expected_constraint),
+        "expected constraint containing {expected_constraint:?}, got {constraint:?}"
+    );
+}
+
 /// Helper: insert a row into `done_ledger_entries` with caller-controlled
 /// field values, returning the Postgres error (if any).
 fn try_insert(
@@ -206,11 +228,7 @@ fn schema_rejects_invalid_status() {
         },
     )
     .expect_err("status=99 should violate CHECK constraint");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("check") || msg.contains("CHECK") || msg.contains("violates"),
-        "error should reference constraint violation: {msg}"
-    );
+    assert_check_violation(&err);
 }
 
 #[test]
@@ -225,11 +243,7 @@ fn schema_rejects_negative_bytes_scanned() {
         },
     )
     .expect_err("bytes_scanned=-1 should violate CHECK constraint");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("check") || msg.contains("CHECK") || msg.contains("violates"),
-        "error should reference constraint violation: {msg}"
-    );
+    assert_check_violation(&err);
 }
 
 #[test]
@@ -247,11 +261,7 @@ fn schema_enforces_status_shape_constraint() {
         },
     )
     .expect_err("ScannedClean with findings > 0 should violate shape constraint");
-    assert!(
-        err.to_string().contains("status_shape"),
-        "error should name status_shape constraint: {}",
-        err
-    );
+    assert_constraint_violation(&err, "status_shape");
 
     // Error status (1) with error_code IS NULL should be rejected.
     let err = try_insert(
@@ -264,11 +274,7 @@ fn schema_enforces_status_shape_constraint() {
         },
     )
     .expect_err("error status without error_code should violate shape constraint");
-    assert!(
-        err.to_string().contains("status_shape"),
-        "error should name status_shape constraint: {}",
-        err
-    );
+    assert_constraint_violation(&err, "status_shape");
 }
 
 #[test]
@@ -283,11 +289,7 @@ fn schema_rejects_invalid_bytea_length() {
         },
     )
     .expect_err("31-byte tenant_id should violate octet_length CHECK");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("check") || msg.contains("CHECK") || msg.contains("violates"),
-        "error should reference constraint violation: {msg}"
-    );
+    assert_check_violation(&err);
 }
 
 #[test]
@@ -303,9 +305,5 @@ fn schema_enforces_finished_at_ge_started_at() {
         },
     )
     .expect_err("finished_at < started_at should violate CHECK constraint");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("check") || msg.contains("CHECK") || msg.contains("violates"),
-        "error should reference constraint violation: {msg}"
-    );
+    assert_check_violation(&err);
 }
