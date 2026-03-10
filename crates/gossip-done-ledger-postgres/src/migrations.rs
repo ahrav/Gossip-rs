@@ -28,6 +28,10 @@
 //! transaction: either every migration succeeds or the entire batch rolls
 //! back.
 //!
+//! Because migrations execute inside one transaction, migration SQL must not
+//! use commands that require running outside a transaction block (for example
+//! `CREATE INDEX CONCURRENTLY`).
+//!
 //! [`MIGRATION_ADVISORY_LOCK_KEY`]: crate::schema::MIGRATION_ADVISORY_LOCK_KEY
 //! [`DoneLedgerPgMigrationError::ChecksumMismatch`]: crate::DoneLedgerPgMigrationError::ChecksumMismatch
 
@@ -236,6 +240,9 @@ pub fn apply_migrations(
     Ok(())
 }
 
+/// Iterate through a migration slice within an already-locked transaction,
+/// applying or verifying each in order. Pre-builds the SQL strings once
+/// so they are reused across migrations.
 fn apply_migration_set(
     tx: &mut Transaction<'_>,
     migrations: &[EmbeddedMigration],

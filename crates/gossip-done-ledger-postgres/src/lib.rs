@@ -7,12 +7,12 @@
 //!
 //! ## Scope
 //!
-//! This crate is **infrastructure-only**: it provides the PostgreSQL schema
-//! definition, forward-only migration runner, and `u64` ↔ `BIGINT`
-//! type-mapping helpers. It does **not** implement the [`DoneLedger`] trait.
-//! A complete backend crate should depend on this crate for schema setup and
-//! type conversion, then implement [`DoneLedger`] against a live
-//! `postgres::Client`.
+//! This crate includes:
+//!
+//! - a synchronous PostgreSQL [`DoneLedger`] backend ([`DoneLedgerPg`]),
+//! - the canonical table/index constants in [`schema`],
+//! - forward-only checksum-verified embedded migrations in [`migrations`],
+//! - and `u64` ↔ `BIGINT` conversion helpers in [`types`].
 //!
 //! ## Path to conformance
 //!
@@ -21,15 +21,16 @@
 //! semantics, idempotent upsert, and batch-get positional alignment. See
 //! `gossip-persistence-inmemory/tests/conformance.rs` for a working example.
 //!
-//! [`run_conformance`]: gossip_contracts::persistence::run_conformance
+//! [`run_conformance`]: gossip_contracts::persistence::run_done_ledger_conformance
 //!
 //! ## Modules
 //!
-//! | Module | Responsibility |
-//! |--------|----------------|
-//! | [`schema`] | Canonical table/index names for query construction and tests |
-//! | [`migrations`] | Forward-only, checksum-verified embedded SQL migration runner |
-//! | [`types`] | `u64 ↔ BIGINT` conversion functions with two storage modes |
+//! | Module | Visibility | Responsibility |
+//! |--------|------------|----------------|
+//! | `backend` | private (types re-exported) | [`DoneLedgerPg`] implementation over synchronous `postgres::Client` |
+//! | [`schema`] | public | Canonical table/index names and SQL query constants |
+//! | [`migrations`] | public | Forward-only, checksum-verified embedded SQL migration runner |
+//! | [`types`] | public | `u64 ↔ BIGINT` conversion functions with two storage modes |
 //!
 //! ## `u64` ↔ `BIGINT` storage strategy
 //!
@@ -54,19 +55,25 @@
 //!
 //! The crate uses the synchronous [`postgres`] client. Synchronous I/O keeps
 //! durable-before-return semantics straightforward and avoids coupling the
-//! migration surface to a specific async runtime.
+//! migration surface to a specific async runtime. Convenience constructors
+//! use `NoTls`; production callers should pass a TLS-configured client through
+//! [`DoneLedgerPg::from_client`].
 //!
 //! [`DoneLedger`]: gossip_contracts::persistence::DoneLedger
 //! [`postgres`]: https://docs.rs/postgres
 
 #![forbid(unsafe_code)]
 
+mod backend;
 mod error;
 pub mod migrations;
 pub mod schema;
 pub mod types;
 
-pub use error::{DoneLedgerPgMigrationError, MigrationOperation};
+pub use backend::DoneLedgerPg;
+pub use error::{
+    DoneLedgerPgConversionError, DoneLedgerPgError, DoneLedgerPgMigrationError, MigrationOperation,
+};
 #[cfg(feature = "test-utils")]
 pub use migrations::connect_and_apply_migrations;
 pub use migrations::{EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations};

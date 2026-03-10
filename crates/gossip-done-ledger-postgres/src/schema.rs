@@ -55,6 +55,172 @@ pub const DONE_LEDGER_RUN_SHARD_INDEX: &str = "done_ledger_entries_run_shard_idx
 /// released when the migration transaction commits or rolls back.
 pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4753444c_50474d31; // "GSDLPGM1"
 
+/// Positional `batch_get` query used by [`crate::DoneLedgerPg`].
+///
+/// Uses `ANY($3::bytea[])` so one round-trip can fetch all requested
+/// object-version hashes. PostgreSQL returns matching rows in arbitrary
+/// order; the Rust caller restores positional alignment by indexing the
+/// result set into a `HashMap<OvidHash, DoneLedgerRecord>` and projecting
+/// back onto the input slice.
+pub const BATCH_GET_SQL: &str = r#"
+SELECT
+    tenant_id,
+    policy_hash,
+    ovid_hash,
+    status,
+    bytes_scanned,
+    findings_count,
+    fence_epoch,
+    started_at,
+    finished_at,
+    run_id,
+    shard_id,
+    error_code
+FROM done_ledger_entries
+WHERE tenant_id = $1
+  AND policy_hash = $2
+  AND ovid_hash = ANY($3::bytea[])
+"#;
+
+/// Monotonic done-ledger UPSERT used by [`crate::DoneLedgerPg`].
+///
+/// Merge behavior mirrors the in-memory reference backend so that the
+/// Rust `merge_done_ledger_records` function and the SQL `ON CONFLICT`
+/// clause produce identical results for the same inputs:
+///
+/// - **Status** — lattice-merged via `GREATEST` (higher rank = more
+///   terminal state). Status discriminants used in the SQL:
+///   - `10` = `ScannedClean` (resets `findings_count` to 0)
+///   - `11` = `ScannedWithFindings` (clamps `findings_count >= 1`)
+///   - `1`, `2`, `3` = non-scanned states (keep `findings_count` max)
+/// - **`bytes_scanned`** — non-regressing (`GREATEST`)
+/// - **`findings_count`** — status-aware: reset, floor, or max depending
+///   on the merged status (see the `CASE` expression)
+/// - **Provenance** (`run_id`, `shard_id`, `fence_epoch`, `started_at`,
+///   `finished_at`) — winner is selected by status rank, then
+///   `finished_at`, then `started_at` (three-way tie-break)
+/// - **`error_code`** — cleared (`NULL`) when merged status is scanned;
+///   otherwise taken from the provenance winner, falling back to the
+///   loser's error code via `COALESCE`
+pub const UPSERT_SQL: &str = r#"
+INSERT INTO done_ledger_entries (
+    tenant_id,
+    policy_hash,
+    ovid_hash,
+    status,
+    bytes_scanned,
+    findings_count,
+    run_id,
+    shard_id,
+    fence_epoch,
+    started_at,
+    finished_at,
+    error_code
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+)
+ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET
+    status = GREATEST(EXCLUDED.status, done_ledger_entries.status),
+    bytes_scanned = GREATEST(EXCLUDED.bytes_scanned, done_ledger_entries.bytes_scanned),
+    findings_count = CASE
+        WHEN GREATEST(EXCLUDED.status, done_ledger_entries.status) = 10 THEN 0
+        WHEN GREATEST(EXCLUDED.status, done_ledger_entries.status) = 11 THEN
+            GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count, 1)
+        ELSE GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count)
+    END,
+    run_id = CASE
+        WHEN (
+            EXCLUDED.status > done_ledger_entries.status
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
+            )
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
+                AND EXCLUDED.started_at > done_ledger_entries.started_at
+            )
+        ) THEN EXCLUDED.run_id
+        ELSE done_ledger_entries.run_id
+    END,
+    shard_id = CASE
+        WHEN (
+            EXCLUDED.status > done_ledger_entries.status
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
+            )
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
+                AND EXCLUDED.started_at > done_ledger_entries.started_at
+            )
+        ) THEN EXCLUDED.shard_id
+        ELSE done_ledger_entries.shard_id
+    END,
+    fence_epoch = CASE
+        WHEN (
+            EXCLUDED.status > done_ledger_entries.status
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
+            )
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
+                AND EXCLUDED.started_at > done_ledger_entries.started_at
+            )
+        ) THEN EXCLUDED.fence_epoch
+        ELSE done_ledger_entries.fence_epoch
+    END,
+    started_at = CASE
+        WHEN (
+            EXCLUDED.status > done_ledger_entries.status
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
+            )
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
+                AND EXCLUDED.started_at > done_ledger_entries.started_at
+            )
+        ) THEN EXCLUDED.started_at
+        ELSE done_ledger_entries.started_at
+    END,
+    finished_at = CASE
+        WHEN (
+            EXCLUDED.status > done_ledger_entries.status
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
+            )
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
+                AND EXCLUDED.started_at > done_ledger_entries.started_at
+            )
+        ) THEN EXCLUDED.finished_at
+        ELSE done_ledger_entries.finished_at
+    END,
+    error_code = CASE
+        WHEN GREATEST(EXCLUDED.status, done_ledger_entries.status) IN (10, 11) THEN NULL
+        WHEN (
+            EXCLUDED.status > done_ledger_entries.status
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
+            )
+            OR (
+                EXCLUDED.status = done_ledger_entries.status
+                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
+                AND EXCLUDED.started_at > done_ledger_entries.started_at
+            )
+        ) THEN COALESCE(EXCLUDED.error_code, done_ledger_entries.error_code)
+        ELSE COALESCE(done_ledger_entries.error_code, EXCLUDED.error_code)
+    END
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +249,27 @@ mod tests {
         assert!(
             SCHEMA_MIGRATIONS_TABLE.starts_with("done_ledger_"),
             "migrations table should use done_ledger_ prefix"
+        );
+    }
+
+    #[test]
+    fn batch_get_sql_uses_bytea_array_lookup() {
+        assert!(
+            BATCH_GET_SQL.contains("ANY($3::bytea[])"),
+            "batch_get SQL should use a single bytea[] array parameter"
+        );
+    }
+
+    #[test]
+    fn upsert_sql_merges_status_and_metrics_monotonically() {
+        assert!(
+            UPSERT_SQL.contains("GREATEST(EXCLUDED.status, done_ledger_entries.status)"),
+            "upsert SQL should lattice-merge status"
+        );
+        assert!(
+            UPSERT_SQL
+                .contains("GREATEST(EXCLUDED.bytes_scanned, done_ledger_entries.bytes_scanned)"),
+            "upsert SQL should keep bytes_scanned non-regressing"
         );
     }
 }
