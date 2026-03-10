@@ -1,3 +1,34 @@
+//! [`RunManagement`] and [`AsyncRunManagement`] trait impls for the etcd backend.
+//!
+//! These impls persist the full run lifecycle to etcd:
+//!
+//! ```text
+//!    create_run          register_shards        complete_run / fail_run
+//! ──────────────> Initializing ──────────────> Active ──────────────> Done / Failed
+//!                      │                          │
+//!                      └── cancel_run ────────────┴── cancel_run ──> Cancelled
+//! ```
+//!
+//! **Visibility rule**: a run becomes visible to workers only after
+//! `register_shards` publishes the active-run index entry. Before that,
+//! the run exists in etcd but is invisible to `list_active_runs_into`
+//! and `collect_claim_candidates_into`.
+//!
+//! # Shard claiming
+//!
+//! The [`ShardClaiming`] impl delegates to [`default_claim_next_available`],
+//! which iterates the candidate list produced by
+//! `collect_claim_candidates_into` and calls `acquire_and_restore_into` on
+//! each until one succeeds. The candidate buffer is reused across calls
+//! to avoid per-claim allocation.
+//!
+//! # Unpark
+//!
+//! `unpark_shard` transitions a `Parked` shard back to `Active` and
+//! publishes a new active-shard index entry. The CAS transaction guards
+//! both the shard and the run (run must still be `Active`) to prevent
+//! unparking into a terminated run.
+
 use std::collections::HashSet;
 
 use etcd_client::{GetOptions, Txn, TxnOp};

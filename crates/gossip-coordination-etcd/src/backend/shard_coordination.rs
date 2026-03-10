@@ -1,3 +1,48 @@
+//! [`CoordinationBackend`] and [`AsyncCoordinationBackend`] trait impls for
+//! the etcd backend — the shard hot path and lifecycle operations.
+//!
+//! # Hot path operations
+//!
+//! These run per-shard, per-tick and are latency-sensitive:
+//!
+//! - **`acquire_and_restore_into`** — take ownership by granting an etcd
+//!   lease, bumping the fence epoch, and writing both the shard record and
+//!   `/owner` key in a single CAS. Restores the shard's persisted spec,
+//!   cursor, and spawned lineage into the caller's [`AcquireScratch`].
+//! - **`renew`** — extend the logical lease deadline without changing
+//!   ownership or fence epoch. Sends a keep-alive to the etcd lease
+//!   best-effort after the CAS commits.
+//! - **`checkpoint`** — persist a new cursor position. Validates cursor
+//!   monotonicity and bounds, then CAS-updates with an op-log entry.
+//!
+//! # Lifecycle operations
+//!
+//! - **`split_replace`** — atomically replace an owned shard with N child
+//!   shards. The parent becomes terminal (`Split` status), its owner key
+//!   and active-index entry are deleted. Children are created as unowned
+//!   `Active` shards with deterministic BLAKE3-derived IDs.
+//! - **`split_residual`** — shrink an owned shard's key range and spawn
+//!   a single residual shard for the removed range. The parent stays
+//!   `Active` and retains its owner.
+//! - **`complete`** / **`park_shard`** — not yet implemented; panic
+//!   fail-closed.
+//!
+//! # CAS guard patterns
+//!
+//! All lease-gated operations (everything except `acquire`) verify:
+//! 1. Shard record `mod_revision` (no concurrent mutation).
+//! 2. Owner key exists with the expected (worker, fence) value.
+//! 3. Owner key is attached to the expected etcd lease ID.
+//!
+//! `acquire` additionally handles the absent-owner case (first acquire
+//! or expired TTL) by guarding key absence instead.
+//!
+//! # Idempotency
+//!
+//! `checkpoint`, `split_replace`, and `split_residual` use op-log entries
+//! keyed by `OpId` + payload hash. `acquire` and `renew` rely on CAS
+//! fencing instead.
+
 use etcd_client::{Compare, PutOptions, TxnOp};
 use gossip_contracts::coordination::shard_spec::SplitValidationError;
 use gossip_coordination::validation::validate_cursor_update_pooled;
@@ -24,6 +69,11 @@ use super::{
 
 /// Project a persisted shard record into the caller's [`AcquireScratch`]
 /// buffer and build the [`AcquireResultView`].
+///
+/// Copies the shard's spec (key range, metadata), cursor (last key, token),
+/// and spawned lineage from the slab-backed record into the flat scratch
+/// buffer. The resulting view borrows from `out` and is returned to the
+/// caller alongside the freshly minted lease and capacity hint.
 ///
 /// Shared by both sync and async `acquire_and_restore_into` to keep the
 /// snapshot projection logic in a single place.

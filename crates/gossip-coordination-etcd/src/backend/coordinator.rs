@@ -1,3 +1,49 @@
+//! Coordinator types, etcd RPC wrappers, and CAS retry infrastructure.
+//!
+//! This module defines the two coordinator entrypoints:
+//!
+//! - [`EtcdCoordinator`] — sync wrapper that owns a single-threaded Tokio
+//!   runtime and drives all etcd RPCs via `runtime.block_on(...)`.
+//! - [`AsyncEtcdCoordinator`] — async core that expects an externally
+//!   provided Tokio runtime.
+//!
+//! Both expose the same core coordination surface (run management, shard hot
+//! path, shard lifecycle), differing only in execution model. The sync
+//! [`EtcdCoordinator`] additionally implements
+//! [`ShardClaiming`](gossip_coordination::ShardClaiming) for claim
+//! orchestration. Shared free functions and validation logic live in the
+//! parent [`super`] module; trait impls live in [`super::run_management`]
+//! and [`super::shard_coordination`].
+//!
+//! # CAS retry loop
+//!
+//! [`EtcdCoordinator::cas_retry`] and [`AsyncEtcdCoordinator::cas_retry`]
+//! drive the optimistic CAS pattern used by every mutating operation:
+//!
+//! ```text
+//! for attempt in 0..max_retries {
+//!     match attempt_fn() {
+//!         Committed(val) => return Ok(val),
+//!         RetryNeeded    => sleep(jittered_backoff),
+//!     }
+//! }
+//! on_exhaustion()  // re-read and diagnose
+//! ```
+//!
+//! The `on_exhaustion` closure runs without additional backoff and is
+//! responsible for re-reading persisted state to return the correct domain
+//! error (idempotent replay, terminal status, stale fence) or panic on
+//! truly unexplainable contention.
+//!
+//! # Data loading helpers
+//!
+//! `load_run_record`, `load_shard_record`, `scan_run_shards`, and
+//! `scan_tenant_runs` all perform defense-in-depth validation: after
+//! decoding a record, they check that its identity fields (tenant, run,
+//! shard) match the key path used to retrieve it. This detects silent
+//! data corruption at the access layer rather than surfacing it as a
+//! logic error later in validation.
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -216,9 +262,9 @@ impl EtcdCoordinator {
 
     /// Load a shard and validate a presented lease against persisted state.
     ///
-    /// This centralizes the common read + lease checks used by lease-gated
-    /// shard mutations (`renew`, `checkpoint`, `split_replace`,
-    /// `split_residual`).
+    /// This centralizes the common lease checks used by `renew`,
+    /// `checkpoint`, and `split_replace` in their main attempt paths,
+    /// and by all lease-gated mutations in their CAS exhaustion handlers.
     pub(super) fn validate_loaded_shard_lease<E>(
         &self,
         now: LogicalTime,
@@ -242,9 +288,8 @@ impl EtcdCoordinator {
 
     /// Load a shard and validate a presented lease against persisted state.
     ///
-    /// This centralizes the common read + lease checks used by lease-gated
-    /// shard mutations (`renew`, `checkpoint`, `split_replace`,
-    /// `split_residual`).
+    /// Combines [`Self::load_shard_record`] with lease validation. Used by
+    /// `renew`, `checkpoint`, `split_replace`, and their exhaustion handlers.
     pub(super) fn load_shard_and_validate_lease<E>(
         &self,
         now: LogicalTime,
@@ -1252,7 +1297,12 @@ impl AsyncEtcdCoordinator {
     }
 
     // -- Low-level async etcd RPC wrappers --
+    //
+    // Mirror the sync `etcd_*` methods on `EtcdCoordinator`. Each clones the
+    // etcd client (cheap Arc bump) and wraps the gRPC error with
+    // `EtcdCoordinatorError::Etcd` for uniform error handling.
 
+    /// Execute an async `get` RPC.
     pub(super) async fn etcd_get(
         &self,
         key: impl Into<Vec<u8>>,
@@ -1268,6 +1318,7 @@ impl AsyncEtcdCoordinator {
             })
     }
 
+    /// Execute an async CAS `txn` RPC.
     pub(super) async fn etcd_txn(
         &self,
         txn: etcd_client::Txn,
@@ -1282,6 +1333,7 @@ impl AsyncEtcdCoordinator {
             })
     }
 
+    /// Grant an etcd lease with the given TTL (seconds).
     pub(super) async fn etcd_lease_grant(
         &self,
         ttl: i64,
@@ -1334,6 +1386,7 @@ impl AsyncEtcdCoordinator {
         }
     }
 
+    /// Immediately revoke an etcd lease (async).
     pub(super) async fn etcd_lease_revoke(
         &self,
         lease_id: i64,
@@ -1364,7 +1417,13 @@ impl AsyncEtcdCoordinator {
     }
 
     // -- Higher-level data access helpers (async) --
+    //
+    // These are async mirrors of the sync helpers on `EtcdCoordinator`.
+    // They perform the same defense-in-depth identity validation.
 
+    /// Load a single run record by exact key (async).
+    ///
+    /// See [`EtcdCoordinator::load_run_record`] for validation details.
     pub(super) async fn load_run_record(
         &self,
         tenant: TenantId,
@@ -1406,6 +1465,9 @@ impl AsyncEtcdCoordinator {
         }))
     }
 
+    /// Load a shard record and its owner binding by exact key (async).
+    ///
+    /// See [`EtcdCoordinator::load_shard_record`] for validation details.
     pub(super) async fn load_shard_record(
         &self,
         tenant: TenantId,
@@ -1487,6 +1549,9 @@ impl AsyncEtcdCoordinator {
         }))
     }
 
+    /// Prefix-scan all shard records under a run (async).
+    ///
+    /// See [`EtcdCoordinator::scan_run_shards`] for validation details.
     pub(super) async fn scan_run_shards(
         &self,
         tenant: TenantId,
@@ -1599,6 +1664,9 @@ impl AsyncEtcdCoordinator {
         Ok(out)
     }
 
+    /// Count persisted shard records under a prefix (async).
+    ///
+    /// See [`EtcdCoordinator::count_persisted_shards_under_prefix`].
     pub(super) async fn count_persisted_shards_under_prefix(
         &self,
         prefix: String,
@@ -1621,6 +1689,7 @@ impl AsyncEtcdCoordinator {
             .count())
     }
 
+    /// Load current persisted shard counts for one tenant and globally (async).
     pub(super) async fn current_shard_counts(
         &self,
         tenant: TenantId,
@@ -1635,6 +1704,9 @@ impl AsyncEtcdCoordinator {
         })
     }
 
+    /// Lightweight capacity hint using count-only and keys-only RPCs (async).
+    ///
+    /// See [`EtcdCoordinator::count_available_lightweight`].
     pub(super) async fn count_available_lightweight(
         &self,
         tenant: TenantId,
@@ -1677,7 +1749,9 @@ impl AsyncEtcdCoordinator {
         })
     }
 
-    /// Async variant of [`EtcdCoordinator::load_shard_and_validate_lease`].
+    /// Validate a presented lease against a loaded shard's persisted state (async).
+    ///
+    /// See [`EtcdCoordinator::validate_loaded_shard_lease`].
     pub(super) fn validate_loaded_shard_lease<E>(
         &self,
         now: LogicalTime,
@@ -1699,7 +1773,9 @@ impl AsyncEtcdCoordinator {
         Ok(())
     }
 
-    /// Async variant of [`EtcdCoordinator::load_shard_and_validate_lease`].
+    /// Load a shard, then validate a presented lease against it (async).
+    ///
+    /// See [`EtcdCoordinator::load_shard_and_validate_lease`].
     pub(super) async fn load_shard_and_validate_lease<E>(
         &self,
         now: LogicalTime,
@@ -1727,7 +1803,7 @@ impl AsyncEtcdCoordinator {
         Ok(persisted)
     }
 
-    /// Async-compatible mirror of the sync shard-owner CAS helper.
+    /// Async-compatible mirror of [`EtcdCoordinator::build_shard_owner_cas`].
     pub(super) fn build_shard_owner_cas(
         &self,
         shard_record_key: ShardRecordKey,
@@ -1753,6 +1829,7 @@ impl AsyncEtcdCoordinator {
         compares
     }
 
+    /// Load a run record, panicking if the key is missing or unreadable (async).
     pub(super) async fn load_run_or_panic(&self, tenant: TenantId, run: RunId) -> PersistedRun {
         match self.load_run_record(tenant, run).await {
             Ok(Some(run_record)) => run_record,
@@ -1761,6 +1838,7 @@ impl AsyncEtcdCoordinator {
         }
     }
 
+    /// Load a shard record, panicking if the key is missing or unreadable (async).
     pub(super) async fn load_shard_or_panic(
         &self,
         tenant: TenantId,
@@ -1773,6 +1851,7 @@ impl AsyncEtcdCoordinator {
         }
     }
 
+    /// Panics with a message identifying the unimplemented operation (async variant).
     pub(super) fn fail_unimplemented<T>(&self, operation: &'static str) -> T {
         panic!(
             "AsyncEtcdCoordinator::{operation} is not yet persisted to etcd; \
@@ -1780,9 +1859,12 @@ impl AsyncEtcdCoordinator {
         );
     }
 
-    /// Async CAS retry loop. The attempt and exhaustion closures return
-    /// boxed futures because async closures with mutable borrows require
-    /// explicit lifetime management.
+    /// Async CAS retry loop with exponential backoff and jitter.
+    ///
+    /// Semantically identical to [`EtcdCoordinator::cas_retry`] but
+    /// accepts async closures (boxed futures). The boxing is necessary
+    /// because the closures borrow `&mut Self` across `.await` points,
+    /// which Rust's current async closures cannot express directly.
     pub(super) async fn cas_retry<T, E>(
         &mut self,
         mut attempt: impl FnMut(
@@ -1811,7 +1893,10 @@ impl AsyncEtcdCoordinator {
         on_exhaustion(self).await
     }
 
-    /// Shared optimistic-CAS implementation for terminal run transitions.
+    /// Shared optimistic-CAS implementation for terminal run transitions (async).
+    ///
+    /// See [`EtcdCoordinator::transition_run_terminal`] for the full
+    /// algorithm description.
     pub(super) async fn transition_run_terminal(
         &mut self,
         now: LogicalTime,

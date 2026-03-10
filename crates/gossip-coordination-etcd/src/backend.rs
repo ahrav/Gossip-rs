@@ -138,10 +138,20 @@ enum CasOutcome<T> {
     RetryNeeded,
 }
 
-/// Thin builder for etcd CAS transactions used by coordination mutations.
+/// Builder for etcd compare-and-swap (CAS) transactions.
 ///
-/// This keeps compare/op assembly explicit at call sites while removing
-/// repeated `Txn::new().when(...).and_then(...)` boilerplate.
+/// Coordination mutations assemble a transaction in three phases:
+/// 1. **Compares** — preconditions that must hold (revision equality,
+///    key absence, owner value/lease identity).
+/// 2. **Success ops** — puts and deletes that execute atomically if all
+///    compares pass.
+/// 3. **Execute** — submit via [`TxnBuilder::execute`] (sync) or
+///    [`TxnBuilder::execute_async`] (async), which returns
+///    [`CasOutcome::Committed`] or [`CasOutcome::RetryNeeded`].
+///
+/// Using a builder keeps compare/op assembly explicit at call sites
+/// while eliminating the repeated `Txn::new().when(...).and_then(...)`
+/// ceremony.
 #[derive(Default)]
 struct TxnBuilder {
     compares: Vec<Compare>,
@@ -237,6 +247,12 @@ struct PersistedOwner {
 /// then builds a CAS transaction conditioned on `mod_revision`. The slab
 /// is co-located with the record because `ShardRecord` pools its
 /// variable-length fields (spec, cursor, spawned) in a `ByteSlab`.
+///
+/// # Lifetime coupling
+///
+/// The `record` borrows from `slab` via `ByteSlot` handles; the `Drop`
+/// impl deallocates pooled fields before the slab itself is freed,
+/// preventing double-free or dangling-slot access.
 struct PersistedShard {
     record: ShardRecord,
     /// Slab backing the pooled fields in `record` (`spec`, `cursor`, `spawned`).
@@ -283,7 +299,7 @@ impl Drop for PersistedShard {
 }
 
 // ---------------------------------------------------------------------------
-// Free functions — key parsing, CAS delay, terminal transitions
+// Free functions — key parsing, CAS delay, terminal transitions, encoding
 // ---------------------------------------------------------------------------
 
 /// Compute a backoff delay for CAS retry loops.
@@ -383,8 +399,7 @@ fn apply_terminal_run_transition(
 }
 
 // ---------------------------------------------------------------------------
-// De-duplicated helpers — shared by both EtcdCoordinator and
-// AsyncEtcdCoordinator (previously identical associated functions on each)
+// De-duplicated helpers — shared by both sync and async coordinators
 // ---------------------------------------------------------------------------
 
 /// Create a decode slab sized from the blob length, clamped to
@@ -393,8 +408,8 @@ fn apply_terminal_run_transition(
 /// Pooled fields (spec key/range, cursor key/token, spawned IDs) are
 /// copied into the slab during decode. The raw blob stores them
 /// length-prefixed; the slab stores them contiguously. A 3×
-/// multiplier on the blob plus a fixed pad for small-record overhead
-/// covers typical records without over-allocating.
+/// multiplier on the blob length plus a fixed 1 KiB pad for small-record
+/// overhead covers typical records without over-allocating.
 fn make_decode_slab(blob_len: usize) -> ByteSlab {
     let cap = blob_len
         .saturating_mul(3)
