@@ -367,7 +367,11 @@ fn upsert_record(
     let status = i16::from(record.status().rank());
     let bytes_scanned = u64_to_pg_bigint_checked(record.bytes_scanned(), "bytes_scanned")
         .map_err(DoneLedgerPgConversionError::from)?;
-    let findings_count = record.findings_count() as i32;
+    let findings_count = i32::try_from(record.findings_count()).map_err(|_| {
+        DoneLedgerPgConversionError::FindingsCountOutOfRange {
+            value: i64::from(record.findings_count()),
+        }
+    })?;
     let run_id = u64_to_pg_bigint_bits(provenance.run_id().as_raw());
     let shard_id = u64_to_pg_bigint_bits(provenance.shard_id().as_raw());
     let fence_epoch = u64_to_pg_bigint_checked(provenance.fence_epoch().as_raw(), "fence_epoch")
@@ -415,8 +419,8 @@ fn upsert_record(
 ///
 /// Each BYTEA column allocates a `Vec<u8>` (the `postgres` crate's return
 /// type for `row.get`). This is a WARM-path cost accepted for simplicity;
-/// a custom `FromSql<[u8; 32]>` impl would eliminate 3 allocations per row
-/// if profiling shows this is material.
+/// a crate-local newtype with a `FromSql` impl would eliminate 3
+/// allocations per row if profiling shows this is material.
 fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
     let tenant_id = TenantId::from_bytes(decode_fixed_32(row.get("tenant_id"), "tenant_id")?);
     let policy_hash =
