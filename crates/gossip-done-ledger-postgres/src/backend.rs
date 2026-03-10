@@ -293,6 +293,13 @@ fn dedupe_and_validate(
             }
             Entry::Occupied(mut slot) => {
                 let merged_record = merge_done_ledger_records(slot.get(), record)?;
+                // Defensive: verify merged output satisfies the same cross-field
+                // invariants that individual inputs were validated against.
+                // The merge logic already maintains these, but this guard
+                // catches regressions if the merge rules are modified.
+                merged_record
+                    .validate()
+                    .map_err(|source| DoneLedgerPgError::InvalidMergedRecord { source })?;
                 slot.insert(merged_record);
             }
         }

@@ -272,4 +272,19 @@ mod tests {
             "upsert SQL should keep bytes_scanned non-regressing"
         );
     }
+
+    /// Both SQL query constants must embed the canonical table name.
+    /// This guards against silent drift if the table constant is renamed
+    /// but the SQL literals are not updated in lockstep.
+    #[test]
+    fn sql_constants_reference_canonical_table_name() {
+        assert!(
+            BATCH_GET_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
+            "BATCH_GET_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
+        );
+        assert!(
+            UPSERT_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
+            "UPSERT_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
+        );
+    }
 }

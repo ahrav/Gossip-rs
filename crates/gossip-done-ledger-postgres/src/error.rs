@@ -264,7 +264,7 @@ impl fmt::Display for DoneLedgerPgError {
                 max,
             } => write!(
                 f,
-                "{operation} batch too large: {len} records (maximum {max})"
+                "{operation} batch too large: {len} records (limit {max})"
             ),
             Self::InvalidRecord { index, source } => {
                 write!(f, "invalid done-ledger record at index {index}: {source}")
