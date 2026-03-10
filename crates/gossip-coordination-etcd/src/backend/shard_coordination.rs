@@ -276,12 +276,13 @@ impl CoordinationBackend for EtcdCoordinator {
                 Ok(CasOutcome::Committed((persisted, lease, capacity)))
             },
             |this| {
-                // Use load_shard_record directly: a missing shard in the
-                // exhaustion handler can be a legitimate concurrent
-                // deletion (e.g., split_replace completing the parent
-                // between the last CAS attempt and this read), not
-                // necessarily corruption. Mirror the attempt closure's
-                // ShardNotFound handling.
+                // Use load_shard_record directly so a missing shard
+                // returns ShardNotFound (matching the attempt closure)
+                // rather than corruption via load_shard_checked.
+                // A missing record is unlikely under normal operations
+                // (split_replace marks the parent Split but keeps the
+                // record), but external admin deletion or GC of
+                // terminal shards could cause it.
                 let persisted = match this.load_shard_record(tenant, key) {
                     Ok(Some(s)) => s,
                     Ok(None) => return Err(AcquireError::ShardNotFound { shard: key }),
