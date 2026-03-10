@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use etcd_client::{Compare, DeleteOptions, GetOptions, Txn, TxnOp};
+use etcd_client::{DeleteOptions, GetOptions, Txn, TxnOp};
 use gossip_coordination::{
     CapacityHint, IdempotentOutcome, InfraError, Lease, LogicalTime, OpId, RunId, RunOpKind,
     RunStatus, RunTransitionError, ShardCountSnapshot, ShardId, ShardKey, TenantId,
@@ -65,8 +65,8 @@ use crate::keyspace::{
 use super::{
     CasOutcome, PersistedOwner, PersistedRun, PersistedShard, TxnBuilder,
     apply_terminal_run_transition, cas_retry_delay, compare_absent, compare_present,
-    compare_run_revision, compare_shard_revision, decode_owner_kv, fatal_storage_error,
-    make_decode_slab, validate_owner_consistency,
+    compare_run_revision, decode_owner_kv, fatal_storage_error, make_decode_slab,
+    validate_loaded_shard_lease, validate_owner_consistency,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -262,32 +262,6 @@ impl EtcdCoordinator {
 
     /// Load a shard and validate a presented lease against persisted state.
     ///
-    /// This centralizes the common lease checks used by `renew`,
-    /// `checkpoint`, and `split_replace` in their main attempt paths,
-    /// and by all lease-gated mutations in their CAS exhaustion handlers.
-    pub(super) fn validate_loaded_shard_lease<E>(
-        &self,
-        now: LogicalTime,
-        tenant: TenantId,
-        lease: &Lease,
-        persisted: &PersistedShard,
-        map_stale_fence: impl FnOnce(
-            gossip_coordination::FenceEpoch,
-            gossip_coordination::FenceEpoch,
-        ) -> E,
-    ) -> Result<(), E>
-    where
-        E: From<gossip_coordination::CoordError>,
-    {
-        gossip_coordination::validate_lease(now, tenant, lease, &persisted.record)?;
-        if !persisted.owner_matches_lease(lease) {
-            return Err(map_stale_fence(lease.fence(), persisted.record.fence_epoch));
-        }
-        Ok(())
-    }
-
-    /// Load a shard and validate a presented lease against persisted state.
-    ///
     /// Combines [`Self::load_shard_record`] with lease validation. Used by
     /// `renew`, `checkpoint`, `split_replace`, and their exhaustion handlers.
     pub(super) fn load_shard_and_validate_lease<E>(
@@ -313,35 +287,8 @@ impl EtcdCoordinator {
                 return Err(map_load_error(err));
             }
         };
-        self.validate_loaded_shard_lease(now, tenant, lease, &persisted, map_stale_fence)?;
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, map_stale_fence)?;
         Ok(persisted)
-    }
-
-    /// Build the canonical shard-owner CAS guards:
-    /// shard `mod_revision` + owner value/lease checks.
-    pub(super) fn build_shard_owner_cas(
-        &self,
-        shard_record_key: ShardRecordKey,
-        owner_key: ShardOwnerKey,
-        persisted: &PersistedShard,
-        owner_value: Vec<u8>,
-    ) -> Vec<Compare> {
-        let owner_lease_id = persisted
-            .owner
-            .as_ref()
-            .expect("validated owner must carry an etcd lease id")
-            .lease_id;
-        let mut compares = Vec::with_capacity(4);
-        compares.push(compare_shard_revision(
-            shard_record_key,
-            persisted.mod_revision,
-        ));
-        compares.extend(super::compare_owner_present(
-            owner_key,
-            owner_value,
-            owner_lease_id,
-        ));
-        compares
     }
 
     /// Execute a `get` RPC on the internal single-threaded Tokio runtime.
@@ -1749,30 +1696,6 @@ impl AsyncEtcdCoordinator {
         })
     }
 
-    /// Validate a presented lease against a loaded shard's persisted state (async).
-    ///
-    /// See [`EtcdCoordinator::validate_loaded_shard_lease`].
-    pub(super) fn validate_loaded_shard_lease<E>(
-        &self,
-        now: LogicalTime,
-        tenant: TenantId,
-        lease: &Lease,
-        persisted: &PersistedShard,
-        map_stale_fence: impl FnOnce(
-            gossip_coordination::FenceEpoch,
-            gossip_coordination::FenceEpoch,
-        ) -> E,
-    ) -> Result<(), E>
-    where
-        E: From<gossip_coordination::CoordError>,
-    {
-        gossip_coordination::validate_lease(now, tenant, lease, &persisted.record)?;
-        if !persisted.owner_matches_lease(lease) {
-            return Err(map_stale_fence(lease.fence(), persisted.record.fence_epoch));
-        }
-        Ok(())
-    }
-
     /// Load a shard, then validate a presented lease against it (async).
     ///
     /// See [`EtcdCoordinator::load_shard_and_validate_lease`].
@@ -1799,34 +1722,8 @@ impl AsyncEtcdCoordinator {
                 return Err(map_load_error(err));
             }
         };
-        self.validate_loaded_shard_lease(now, tenant, lease, &persisted, map_stale_fence)?;
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, map_stale_fence)?;
         Ok(persisted)
-    }
-
-    /// Async-compatible mirror of [`EtcdCoordinator::build_shard_owner_cas`].
-    pub(super) fn build_shard_owner_cas(
-        &self,
-        shard_record_key: ShardRecordKey,
-        owner_key: ShardOwnerKey,
-        persisted: &PersistedShard,
-        owner_value: Vec<u8>,
-    ) -> Vec<Compare> {
-        let owner_lease_id = persisted
-            .owner
-            .as_ref()
-            .expect("validated owner must carry an etcd lease id")
-            .lease_id;
-        let mut compares = Vec::with_capacity(4);
-        compares.push(compare_shard_revision(
-            shard_record_key,
-            persisted.mod_revision,
-        ));
-        compares.extend(super::compare_owner_present(
-            owner_key,
-            owner_value,
-            owner_lease_id,
-        ));
-        compares
     }
 
     /// Load a run record, panicking if the key is missing or unreadable (async).

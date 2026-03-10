@@ -64,7 +64,8 @@ use crate::codec::{encode_owner_value_into, encode_shard_record, encode_shard_re
 
 use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
 use super::{
-    CasOutcome, PersistedShard, TxnBuilder, cas_retry_delay, split_replace_replay_child_ids,
+    CasOutcome, PersistedShard, TxnBuilder, build_shard_owner_cas, cas_retry_delay,
+    split_replace_replay_child_ids, validate_loaded_shard_lease,
 };
 
 /// Project a persisted shard record into the caller's [`AcquireScratch`]
@@ -232,9 +233,8 @@ impl CoordinationBackend for EtcdCoordinator {
                     compares.push(super::compare_absent(owner_key.clone()));
                 }
 
-                let mut txn = TxnBuilder::new();
-                txn.compare_all(compares)
-                    .put(shard_record_key.into_bytes(), shard_buf.clone())
+                let mut txn = TxnBuilder::from_compares(compares);
+                txn.put(shard_record_key.into_bytes(), shard_buf.clone())
                     .put_with_options(
                         owner_key.into_bytes(),
                         owner_buf.clone(),
@@ -372,16 +372,15 @@ impl CoordinationBackend for EtcdCoordinator {
                 let owner_key = this
                     .keyspace
                     .shard_owner_key(tenant, key.run(), key.shard());
-                let compares = this.build_shard_owner_cas(
+                let compares = build_shard_owner_cas(
                     shard_record_key.clone(),
                     owner_key,
                     &persisted,
                     owner_buf.clone(),
                 );
 
-                let mut txn = TxnBuilder::new();
-                txn.compare_all(compares)
-                    .put(shard_record_key.into_bytes(), shard_buf.clone());
+                let mut txn = TxnBuilder::from_compares(compares);
+                txn.put(shard_record_key.into_bytes(), shard_buf.clone());
                 let outcome = txn.execute(this, ()).map_err(|err| {
                     RenewError::BackendError(super::map_etcd_err("renew.txn", err))
                 })?;
@@ -473,7 +472,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
                 }
-                this.validate_loaded_shard_lease(
+                validate_loaded_shard_lease(
                     now,
                     tenant,
                     lease,
@@ -519,16 +518,15 @@ impl CoordinationBackend for EtcdCoordinator {
                 let owner_key = this
                     .keyspace
                     .shard_owner_key(tenant, key.run(), key.shard());
-                let compares = this.build_shard_owner_cas(
+                let compares = build_shard_owner_cas(
                     shard_record_key.clone(),
                     owner_key,
                     &persisted,
                     owner_buf.clone(),
                 );
 
-                let mut txn = TxnBuilder::new();
-                txn.compare_all(compares)
-                    .put(shard_record_key.into_bytes(), shard_buf.clone());
+                let mut txn = TxnBuilder::from_compares(compares);
+                txn.put(shard_record_key.into_bytes(), shard_buf.clone());
                 txn.execute(this, IdempotentOutcome::Executed(()))
                     .map_err(|err| {
                         CheckpointError::BackendError(super::map_etcd_err("checkpoint.txn", err))
@@ -539,7 +537,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     return Ok(IdempotentOutcome::Replayed(()));
                 }
-                this.validate_loaded_shard_lease(
+                validate_loaded_shard_lease(
                     now,
                     tenant,
                     lease,
@@ -654,7 +652,7 @@ impl CoordinationBackend for EtcdCoordinator {
                         status: persisted.record.status,
                     });
                 }
-                this.validate_loaded_shard_lease(
+                validate_loaded_shard_lease(
                     now,
                     tenant,
                     lease,
@@ -780,7 +778,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 let owner_key = this
                     .keyspace
                     .shard_owner_key(tenant, key.run(), key.shard());
-                let mut compares = this.build_shard_owner_cas(
+                let mut compares = build_shard_owner_cas(
                     shard_record_key.clone(),
                     owner_key.clone(),
                     &persisted,
@@ -793,9 +791,8 @@ impl CoordinationBackend for EtcdCoordinator {
                 // active-index entries.
                 this.inject_split_replace_fault_if_armed(tenant, key);
 
-                let mut txn = TxnBuilder::new();
-                txn.compare_all(compares)
-                    .put(shard_record_key.into_bytes(), parent_blob)
+                let mut txn = TxnBuilder::from_compares(compares);
+                txn.put(shard_record_key.into_bytes(), parent_blob)
                     .delete(owner_key.into_bytes())
                     .delete(
                         this.keyspace
@@ -831,7 +828,7 @@ impl CoordinationBackend for EtcdCoordinator {
                         status: persisted.record.status,
                     });
                 }
-                this.validate_loaded_shard_lease(
+                validate_loaded_shard_lease(
                     now,
                     tenant,
                     lease,
@@ -1028,7 +1025,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 let owner_key = this
                     .keyspace
                     .shard_owner_key(tenant, key.run(), key.shard());
-                let mut compares = this.build_shard_owner_cas(
+                let mut compares = build_shard_owner_cas(
                     shard_record_key.clone(),
                     owner_key,
                     &persisted,
@@ -1038,9 +1035,8 @@ impl CoordinationBackend for EtcdCoordinator {
 
                 this.inject_split_residual_fault_if_armed(tenant, key);
 
-                let mut txn = TxnBuilder::new();
-                txn.compare_all(compares)
-                    .put(shard_record_key.into_bytes(), parent_blob)
+                let mut txn = TxnBuilder::from_compares(compares);
+                txn.put(shard_record_key.into_bytes(), parent_blob)
                     .put(
                         residual_record_key.into_bytes(),
                         encode_shard_record(&residual_record, &residual_slab).unwrap_or_else(
@@ -1080,7 +1076,7 @@ impl CoordinationBackend for EtcdCoordinator {
                         status: persisted.record.status,
                     });
                 }
-                this.validate_loaded_shard_lease(
+                validate_loaded_shard_lease(
                     now,
                     tenant,
                     lease,
@@ -1224,14 +1220,12 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                         } else {
                             compares.push(super::compare_absent(ok.clone()));
                         }
-                        let mut txn = TxnBuilder::new();
-                        txn.compare_all(compares)
-                            .put(srk.into_bytes(), shard_buf)
-                            .put_with_options(
-                                ok.into_bytes(),
-                                owner_buf,
-                                PutOptions::new().with_lease(new_lease_id),
-                            );
+                        let mut txn = TxnBuilder::from_compares(compares);
+                        txn.put(srk.into_bytes(), shard_buf).put_with_options(
+                            ok.into_bytes(),
+                            owner_buf,
+                            PutOptions::new().with_lease(new_lease_id),
+                        );
                         let outcome = match txn.execute_async(this, ()).await {
                             Ok(outcome) => outcome,
                             Err(err) => {
@@ -1345,11 +1339,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let ok = self
                 .keyspace
                 .shard_owner_key(tenant, key.run(), key.shard());
-            let compares =
-                self.build_shard_owner_cas(srk.clone(), ok, &persisted, owner_buf.clone());
-            let mut txn = TxnBuilder::new();
-            txn.compare_all(compares)
-                .put(srk.into_bytes(), shard_buf.clone());
+            let compares = build_shard_owner_cas(srk.clone(), ok, &persisted, owner_buf.clone());
+            let mut txn = TxnBuilder::from_compares(compares);
+            txn.put(srk.into_bytes(), shard_buf.clone());
             let outcome = txn
                 .execute_async(self, ())
                 .await
@@ -1376,7 +1368,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         }
         // Exhaustion.
         let persisted = self.load_shard_or_panic(tenant, key).await;
-        self.validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             RenewError::StaleFence { presented, current }
         })?;
         super::fatal_storage_error(
@@ -1414,13 +1406,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                 return Ok(IdempotentOutcome::Replayed(()));
             }
-            self.validate_loaded_shard_lease(
-                now,
-                tenant,
-                lease,
-                &persisted,
-                |presented, current| CheckpointError::StaleFence { presented, current },
-            )?;
+            validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
+                CheckpointError::StaleFence { presented, current }
+            })?;
             validate_cursor_update_pooled(
                 new_cursor,
                 persisted.record.cursor.last_key(&persisted.slab),
@@ -1456,11 +1444,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let ok = self
                 .keyspace
                 .shard_owner_key(tenant, key.run(), key.shard());
-            let compares =
-                self.build_shard_owner_cas(srk.clone(), ok, &persisted, owner_buf.clone());
-            let mut txn = TxnBuilder::new();
-            txn.compare_all(compares)
-                .put(srk.into_bytes(), shard_buf.clone());
+            let compares = build_shard_owner_cas(srk.clone(), ok, &persisted, owner_buf.clone());
+            let mut txn = TxnBuilder::from_compares(compares);
+            txn.put(srk.into_bytes(), shard_buf.clone());
             let outcome = txn
                 .execute_async(self, IdempotentOutcome::Executed(()))
                 .await
@@ -1479,7 +1465,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
             return Ok(IdempotentOutcome::Replayed(()));
         }
-        self.validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             CheckpointError::StaleFence { presented, current }
         })?;
         super::fatal_storage_error(
@@ -1557,13 +1543,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     status: persisted.record.status,
                 });
             }
-            self.validate_loaded_shard_lease(
-                now,
-                tenant,
-                lease,
-                &persisted,
-                |presented, current| SplitReplaceError::StaleFence { presented, current },
-            )?;
+            validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
+                SplitReplaceError::StaleFence { presented, current }
+            })?;
             let child_count = plan.children().len();
             if child_count > self.config.max_children_per_op() {
                 return Err(SplitReplaceError::SplitInvalid(
@@ -1662,12 +1644,11 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 .keyspace
                 .shard_owner_key(tenant, key.run(), key.shard());
             let mut compares =
-                self.build_shard_owner_cas(srk.clone(), ok.clone(), &persisted, owner_blob);
+                build_shard_owner_cas(srk.clone(), ok.clone(), &persisted, owner_blob);
             compares.append(&mut child_absent_compares);
             self.inject_split_replace_fault_if_armed(tenant, key).await;
-            let mut txn = TxnBuilder::new();
-            txn.compare_all(compares)
-                .put(srk.into_bytes(), parent_blob)
+            let mut txn = TxnBuilder::from_compares(compares);
+            txn.put(srk.into_bytes(), parent_blob)
                 .delete(ok.into_bytes())
                 .delete(
                     self.keyspace
@@ -1710,7 +1691,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 status: persisted.record.status,
             });
         }
-        self.validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             SplitReplaceError::StaleFence { presented, current }
         })?;
         let sorted =
@@ -1866,12 +1847,11 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let ok = self
                 .keyspace
                 .shard_owner_key(tenant, key.run(), key.shard());
-            let mut compares = self.build_shard_owner_cas(srk.clone(), ok, &persisted, owner_blob);
+            let mut compares = build_shard_owner_cas(srk.clone(), ok, &persisted, owner_blob);
             compares.push(super::compare_absent(rrk.clone()));
             self.inject_split_residual_fault_if_armed(tenant, key).await;
-            let mut txn = TxnBuilder::new();
-            txn.compare_all(compares)
-                .put(srk.into_bytes(), parent_blob)
+            let mut txn = TxnBuilder::from_compares(compares);
+            txn.put(srk.into_bytes(), parent_blob)
                 .put(
                     rrk.into_bytes(),
                     encode_shard_record(&residual_record, &residual_slab).unwrap_or_else(|e| {
@@ -1915,7 +1895,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 status: persisted.record.status,
             });
         }
-        self.validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             SplitResidualError::StaleFence { presented, current }
         })?;
         let residual_id = derive_split_shard_id(

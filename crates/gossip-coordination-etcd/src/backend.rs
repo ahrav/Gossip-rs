@@ -164,6 +164,17 @@ impl TxnBuilder {
         Self::default()
     }
 
+    /// Create a builder pre-loaded with compare clauses.
+    ///
+    /// Takes ownership of the caller's `Vec<Compare>`, avoiding a second
+    /// allocation that `new() + compare_all()` would incur.
+    fn from_compares(compares: Vec<Compare>) -> Self {
+        Self {
+            compares,
+            success_ops: Vec::new(),
+        }
+    }
+
     /// Add a single compare clause.
     fn compare(&mut self, compare: Compare) -> &mut Self {
         self.compares.push(compare);
@@ -562,6 +573,66 @@ fn map_etcd_err(
             gossip_coordination::InfraError::transient(operation, err)
         }
     }
+}
+
+// -- Shared lease/CAS validation helpers --
+//
+// These are used by both `EtcdCoordinator` and `AsyncEtcdCoordinator`
+// trait impls across `shard_coordination` and `run_management`.
+
+/// Validate a presented lease against a loaded shard's persisted state.
+///
+/// Checks protocol-level lease validity (expiry, tenant, status) via
+/// [`gossip_coordination::validate_lease`], then verifies that the shard's
+/// current owner binding matches the presented lease's worker + fence
+/// epoch. Returns `map_stale_fence(presented, current)` on mismatch.
+fn validate_loaded_shard_lease<E>(
+    now: LogicalTime,
+    tenant: TenantId,
+    lease: &Lease,
+    persisted: &PersistedShard,
+    map_stale_fence: impl FnOnce(gossip_coordination::FenceEpoch, gossip_coordination::FenceEpoch) -> E,
+) -> Result<(), E>
+where
+    E: From<gossip_coordination::CoordError>,
+{
+    gossip_coordination::validate_lease(now, tenant, lease, &persisted.record)?;
+    if !persisted.owner_matches_lease(lease) {
+        return Err(map_stale_fence(lease.fence(), persisted.record.fence_epoch));
+    }
+    Ok(())
+}
+
+/// Build the canonical shard-owner CAS guards:
+/// shard `mod_revision` + owner value/lease checks.
+///
+/// Returns a `Vec<Compare>` with 4 clauses:
+/// 1. Shard record `mod_revision` equality.
+/// 2. Owner key exists (version > 0).
+/// 3. Owner key value matches.
+/// 4. Owner key etcd lease ID matches.
+fn build_shard_owner_cas(
+    shard_record_key: ShardRecordKey,
+    owner_key: ShardOwnerKey,
+    persisted: &PersistedShard,
+    owner_value: Vec<u8>,
+) -> Vec<Compare> {
+    let owner_lease_id = persisted
+        .owner
+        .as_ref()
+        .expect("validated owner must carry an etcd lease id")
+        .lease_id;
+    let mut compares = Vec::with_capacity(4);
+    compares.push(compare_shard_revision(
+        shard_record_key,
+        persisted.mod_revision,
+    ));
+    compares.extend(compare_owner_present(
+        owner_key,
+        owner_value,
+        owner_lease_id,
+    ));
+    compares
 }
 
 // -- CAS guard helpers --

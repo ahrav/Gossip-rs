@@ -235,9 +235,8 @@ impl RunManagement for EtcdCoordinator {
                 let run_blob = encode_run_record(&run_record);
 
                 let run_active_key = this.keyspace.run_active_index_key(tenant, run);
-                let mut txn = TxnBuilder::new();
-                txn.compare_all(compares)
-                    .put(run_key.into_bytes(), run_blob)
+                let mut txn = TxnBuilder::from_compares(compares);
+                txn.put(run_key.into_bytes(), run_blob)
                     .ops(txn_ops)
                     .put(run_active_key.into_bytes(), Vec::<u8>::new());
                 txn.execute(this, IdempotentOutcome::Executed(shard_ids))
@@ -877,9 +876,8 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             run_record.assert_invariants();
             let run_blob = encode_run_record(&run_record);
             let rak = self.keyspace.run_active_index_key(tenant, run);
-            let mut txn = TxnBuilder::new();
-            txn.compare_all(compares)
-                .put(run_key.into_bytes(), run_blob)
+            let mut txn = TxnBuilder::from_compares(compares);
+            txn.put(run_key.into_bytes(), run_blob)
                 .ops(txn_ops)
                 .put(rak.into_bytes(), Vec::<u8>::new());
             let outcome = txn
