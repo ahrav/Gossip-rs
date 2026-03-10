@@ -1034,9 +1034,20 @@ impl EtcdCoordinator {
                     })
             },
             |this| {
-                let persisted = this
-                    .load_run_checked(tenant, run)
-                    .map_err(RunTransitionError::BackendError)?;
+                // Use load_run_record directly: a missing run in the
+                // exhaustion handler can be a legitimate concurrent
+                // deletion (e.g., gc_stale_initializing_runs_into racing
+                // with cancel_run), not necessarily corruption.
+                let persisted = match this.load_run_record(tenant, run) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Err(RunTransitionError::RunNotFound),
+                    Err(err) => {
+                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
+                            "run_terminal.exhaust.load_run",
+                            err,
+                        )));
+                    }
+                };
                 if persisted.record.tenant != tenant {
                     return Err(RunTransitionError::TenantMismatch { expected: tenant });
                 }
@@ -1098,18 +1109,22 @@ impl EtcdCoordinator {
     /// Returns `InfraError::corruption` if the key is missing (the record
     /// existed earlier in the retry loop, so absence signals data loss) and
     /// maps backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics
+    /// (e.g., `"acquire.load_run"`, `"register_shards.exhaust.load_run"`).
     pub(super) fn load_run_checked(
         &self,
+        context: &'static str,
         tenant: TenantId,
         run: RunId,
     ) -> Result<PersistedRun, InfraError> {
         match self.load_run_record(tenant, run) {
             Ok(Some(run_record)) => Ok(run_record),
             Ok(None) => Err(InfraError::corruption(
-                "load_run",
+                context,
                 format!("run {run:?} missing"),
             )),
-            Err(err) => Err(super::map_etcd_err("load_run", err)),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 
@@ -1117,18 +1132,22 @@ impl EtcdCoordinator {
     ///
     /// Returns `InfraError::corruption` if the key is missing and maps
     /// backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics
+    /// (e.g., `"checkpoint.exhaust.load_shard"`).
     pub(super) fn load_shard_checked(
         &self,
+        context: &'static str,
         tenant: TenantId,
         key: ShardKey,
     ) -> Result<PersistedShard, InfraError> {
         match self.load_shard_record(tenant, key) {
             Ok(Some(shard)) => Ok(shard),
             Ok(None) => Err(InfraError::corruption(
-                "load_shard",
+                context,
                 format!("shard {key:?} missing"),
             )),
-            Err(err) => Err(super::map_etcd_err("load_shard", err)),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 }
@@ -1750,18 +1769,21 @@ impl AsyncEtcdCoordinator {
     ///
     /// Returns `InfraError::corruption` if the key is missing and maps
     /// backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics.
     pub(super) async fn load_run_checked(
         &self,
+        context: &'static str,
         tenant: TenantId,
         run: RunId,
     ) -> Result<PersistedRun, InfraError> {
         match self.load_run_record(tenant, run).await {
             Ok(Some(run_record)) => Ok(run_record),
             Ok(None) => Err(InfraError::corruption(
-                "load_run",
+                context,
                 format!("run {run:?} missing"),
             )),
-            Err(err) => Err(super::map_etcd_err("load_run", err)),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 
@@ -1769,18 +1791,21 @@ impl AsyncEtcdCoordinator {
     ///
     /// Returns `InfraError::corruption` if the key is missing and maps
     /// backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics.
     pub(super) async fn load_shard_checked(
         &self,
+        context: &'static str,
         tenant: TenantId,
         key: ShardKey,
     ) -> Result<PersistedShard, InfraError> {
         match self.load_shard_record(tenant, key).await {
             Ok(Some(shard)) => Ok(shard),
             Ok(None) => Err(InfraError::corruption(
-                "load_shard",
+                context,
                 format!("shard {key:?} missing"),
             )),
-            Err(err) => Err(super::map_etcd_err("load_shard", err)),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 
@@ -1932,10 +1957,16 @@ impl AsyncEtcdCoordinator {
             },
             |this| {
                 Box::pin(async move {
-                    let persisted = this
-                        .load_run_checked(tenant, run)
-                        .await
-                        .map_err(RunTransitionError::BackendError)?;
+                    let persisted = match this.load_run_record(tenant, run).await {
+                        Ok(Some(r)) => r,
+                        Ok(None) => return Err(RunTransitionError::RunNotFound),
+                        Err(err) => {
+                            return Err(RunTransitionError::BackendError(super::map_etcd_err(
+                                "run_terminal.exhaust.load_run",
+                                err,
+                            )));
+                        }
+                    };
                     if persisted.record.tenant != tenant {
                         return Err(RunTransitionError::TenantMismatch { expected: tenant });
                     }

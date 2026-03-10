@@ -249,7 +249,7 @@ impl RunManagement for EtcdCoordinator {
             },
             |this| {
                 let persisted_run = this
-                    .load_run_checked(tenant, run)
+                    .load_run_checked("register_shards.exhaust.load_run", tenant, run)
                     .map_err(RegisterShardsError::BackendError)?;
                 if let Some(entry) = persisted_run
                     .record
@@ -891,7 +891,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         }
         // Exhaustion.
         let persisted_run = self
-            .load_run_checked(tenant, run)
+            .load_run_checked("register_shards.exhaust.load_run", tenant, run)
             .await
             .map_err(RegisterShardsError::BackendError)?;
         if let Some(entry) = persisted_run

@@ -475,11 +475,13 @@ fn encode_ephemeral_shard_blob(
     mut record: ShardRecord,
     mut slab: ByteSlab,
 ) -> Result<Vec<u8>, gossip_coordination::InfraError> {
-    let blob = encode_shard_record(&record, &slab)
-        .map_err(|err| gossip_coordination::InfraError::corruption(context, err))?;
+    let result = encode_shard_record(&record, &slab);
+    // Deallocate pooled fields and clear the slab before propagating
+    // errors — ByteSlab's debug-mode drop asserts live_count == 0,
+    // so an early return would panic instead of surfacing InfraError.
     record.deallocate_fields(&mut slab);
     slab.clear();
-    Ok(blob)
+    result.map_err(|err| gossip_coordination::InfraError::corruption(context, err))
 }
 
 /// Construct a root shard record from registration input, validate its

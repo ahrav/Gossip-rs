@@ -142,6 +142,14 @@ impl CoordinationBackend for EtcdCoordinator {
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
 
+        // Load the run config once before the CAS loop — lease_duration
+        // is immutable after create_run, so re-reading it per attempt
+        // wastes an etcd round-trip under contention.
+        let run_record = self
+            .load_run_checked("acquire.load_run", tenant, key.run())
+            .map_err(AcquireError::BackendError)?;
+        let lease_duration = run_record.record.config.lease_duration();
+
         // The closure returns intermediate owned data to avoid lifetime
         // conflicts between the closure's capture of `out` and the
         // returned `AcquireResultView` which borrows from `out`.
@@ -180,10 +188,6 @@ impl CoordinationBackend for EtcdCoordinator {
                     });
                 }
 
-                let run_record = this
-                    .load_run_checked(tenant, key.run())
-                    .map_err(AcquireError::BackendError)?;
-                let lease_duration = run_record.record.config.lease_duration();
                 let new_deadline = now
                     .checked_add(lease_duration)
                     .unwrap_or(LogicalTime::from_raw(u64::MAX));
@@ -272,9 +276,22 @@ impl CoordinationBackend for EtcdCoordinator {
                 Ok(CasOutcome::Committed((persisted, lease, capacity)))
             },
             |this| {
-                let persisted = this
-                    .load_shard_checked(tenant, key)
-                    .map_err(AcquireError::BackendError)?;
+                // Use load_shard_record directly: a missing shard in the
+                // exhaustion handler can be a legitimate concurrent
+                // deletion (e.g., split_replace completing the parent
+                // between the last CAS attempt and this read), not
+                // necessarily corruption. Mirror the attempt closure's
+                // ShardNotFound handling.
+                let persisted = match this.load_shard_record(tenant, key) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => return Err(AcquireError::ShardNotFound { shard: key }),
+                    Err(err) => {
+                        return Err(AcquireError::BackendError(super::map_etcd_err(
+                            "acquire.exhaust.load_shard",
+                            err,
+                        )));
+                    }
+                };
                 if persisted.record.tenant != tenant {
                     return Err(AcquireError::TenantMismatch { expected: tenant });
                 }
@@ -334,6 +351,13 @@ impl CoordinationBackend for EtcdCoordinator {
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
 
+        // Load run config once before the CAS loop — lease_duration is
+        // immutable after create_run.
+        let run_record = self
+            .load_run_checked("renew.load_run", tenant, key.run())
+            .map_err(RenewError::BackendError)?;
+        let lease_duration = run_record.record.config.lease_duration();
+
         self.cas_retry(
             |this, _attempt| {
                 let persisted = this.load_shard_and_validate_lease(
@@ -345,10 +369,6 @@ impl CoordinationBackend for EtcdCoordinator {
                     |presented, current| RenewError::StaleFence { presented, current },
                 )?;
 
-                let run_record = this
-                    .load_run_checked(tenant, key.run())
-                    .map_err(RenewError::BackendError)?;
-                let lease_duration = run_record.record.config.lease_duration();
                 let new_deadline = now
                     .checked_add(lease_duration)
                     .unwrap_or(LogicalTime::from_raw(u64::MAX));
@@ -540,7 +560,7 @@ impl CoordinationBackend for EtcdCoordinator {
             },
             |this| {
                 let persisted = this
-                    .load_shard_checked(tenant, key)
+                    .load_shard_checked("checkpoint.exhaust.load_shard", tenant, key)
                     .map_err(CheckpointError::BackendError)?;
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     return Ok(IdempotentOutcome::Replayed(()));
@@ -553,9 +573,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     |presented, current| CheckpointError::StaleFence { presented, current },
                 )?;
 
-                Err(CheckpointError::BackendError(InfraError::transient(
+                Err(CheckpointError::BackendError(InfraError::corruption(
                     "checkpoint",
-                    "CAS retry budget exhausted",
+                    "CAS retry budget exhausted after ruling out replay, stale fence, \
+                     and terminal status — possible external etcd modification",
                 )))
             },
         )
@@ -828,7 +849,7 @@ impl CoordinationBackend for EtcdCoordinator {
             },
             |this| {
                 let persisted = this
-                    .load_shard_checked(tenant, key)
+                    .load_shard_checked("split_replace.exhaust.load_shard", tenant, key)
                     .map_err(SplitReplaceError::BackendError)?;
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     let children = split_replace_replay_child_ids(
@@ -889,9 +910,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                 }
 
-                Err(SplitReplaceError::BackendError(InfraError::transient(
+                Err(SplitReplaceError::BackendError(InfraError::corruption(
                     "split_replace",
-                    "CAS retry budget exhausted",
+                    "CAS retry budget exhausted after ruling out replay, stale fence, \
+                     terminal status, and derived-ID collision — possible external etcd modification",
                 )))
             },
         )
@@ -1085,7 +1107,7 @@ impl CoordinationBackend for EtcdCoordinator {
             },
             |this| {
                 let persisted = this
-                    .load_shard_checked(tenant, key)
+                    .load_shard_checked("split_residual.exhaust.load_shard", tenant, key)
                     .map_err(SplitResidualError::BackendError)?;
                 if let Some(replay) = split_residual_check_replay(
                     &persisted.record,
@@ -1118,7 +1140,12 @@ impl CoordinationBackend for EtcdCoordinator {
                     op_id,
                     DerivedShardKind::Residual,
                     u32::try_from(persisted.record.spawned.len())
-                        .expect("spawned index exceeds u32"),
+                        .map_err(|_| {
+                            SplitResidualError::BackendError(InfraError::corruption(
+                                "split_residual.exhaust.collision_probe",
+                                "spawned index overflows u32",
+                            ))
+                        })?,
                 );
                 let residual_key = ShardKey::new(persisted.record.run, residual_id);
                 match this.load_shard_record(tenant, residual_key) {
@@ -1138,9 +1165,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                 }
 
-                Err(SplitResidualError::BackendError(InfraError::transient(
+                Err(SplitResidualError::BackendError(InfraError::corruption(
                     "split_residual",
-                    "CAS retry budget exhausted",
+                    "CAS retry budget exhausted after ruling out replay, stale fence, \
+                     terminal status, and derived-ID collision — possible external etcd modification",
                 )))
             },
         )
@@ -1156,6 +1184,14 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         worker: WorkerId,
         out: &'a mut AcquireScratch,
     ) -> Result<AcquireResultView<'a>, AcquireError> {
+        // Load run config once before the CAS loop — lease_duration is
+        // immutable after create_run.
+        let run_record = self
+            .load_run_checked("acquire.load_run", tenant, key.run())
+            .await
+            .map_err(AcquireError::BackendError)?;
+        let lease_duration = run_record.record.config.lease_duration();
+
         let (persisted, lease, capacity) = self
             .cas_retry(
                 |this, _attempt| {
@@ -1194,11 +1230,6 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                                     .expect("live deadline"),
                             });
                         }
-                        let run_record = this
-                            .load_run_checked(tenant, key.run())
-                            .await
-                            .map_err(AcquireError::BackendError)?;
-                        let lease_duration = run_record.record.config.lease_duration();
                         let new_deadline = now
                             .checked_add(lease_duration)
                             .unwrap_or(LogicalTime::from_raw(u64::MAX));
@@ -1291,10 +1322,16 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 },
                 |this| {
                     Box::pin(async move {
-                        let persisted = this
-                            .load_shard_checked(tenant, key)
-                            .await
-                            .map_err(AcquireError::BackendError)?;
+                        let persisted = match this.load_shard_record(tenant, key).await {
+                            Ok(Some(s)) => s,
+                            Ok(None) => return Err(AcquireError::ShardNotFound { shard: key }),
+                            Err(err) => {
+                                return Err(AcquireError::BackendError(super::map_etcd_err(
+                                    "acquire.exhaust.load_shard",
+                                    err,
+                                )));
+                            }
+                        };
                         if persisted.record.tenant != tenant {
                             return Err(AcquireError::TenantMismatch { expected: tenant });
                         }
@@ -1333,6 +1370,15 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         let key = lease.shard_key();
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
+
+        // Load run config once before the retry loop — lease_duration is
+        // immutable after create_run.
+        let run_record = self
+            .load_run_checked("renew.load_run", tenant, key.run())
+            .await
+            .map_err(RenewError::BackendError)?;
+        let lease_duration = run_record.record.config.lease_duration();
+
         let max_retries = self.config.optimistic_txn_retries();
         for attempt_num in 0..max_retries {
             shard_buf.clear();
@@ -1347,12 +1393,8 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     |presented, current| RenewError::StaleFence { presented, current },
                 )
                 .await?;
-            let run_record = self
-                .load_run_checked(tenant, key.run())
-                .await
-                .map_err(RenewError::BackendError)?;
             let new_deadline = now
-                .checked_add(run_record.record.config.lease_duration())
+                .checked_add(lease_duration)
                 .unwrap_or(LogicalTime::from_raw(u64::MAX));
             let old_lease_id = persisted
                 .owner
@@ -1402,7 +1444,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         }
         // Exhaustion.
         let persisted = self
-            .load_shard_checked(tenant, key)
+            .load_shard_checked("renew.exhaust.load_shard", tenant, key)
             .await
             .map_err(RenewError::BackendError)?;
         validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
@@ -1499,7 +1541,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         }
         // Exhaustion.
         let persisted = self
-            .load_shard_checked(tenant, key)
+            .load_shard_checked("checkpoint.exhaust.load_shard", tenant, key)
             .await
             .map_err(CheckpointError::BackendError)?;
         if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
@@ -1508,9 +1550,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             CheckpointError::StaleFence { presented, current }
         })?;
-        Err(CheckpointError::BackendError(InfraError::transient(
+        Err(CheckpointError::BackendError(InfraError::corruption(
             "checkpoint",
-            "CAS retry budget exhausted",
+            "CAS retry budget exhausted after ruling out replay, stale fence, \
+             and terminal status — possible external etcd modification",
         )))
     }
 
@@ -1626,8 +1669,12 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     persisted.record.shard,
                     op_id,
                     DerivedShardKind::Child,
-                    u32::try_from(persisted.record.spawned.len() + sorted_index)
-                        .expect("child index exceeds u32"),
+                    u32::try_from(persisted.record.spawned.len() + sorted_index).map_err(|_| {
+                        SplitReplaceError::BackendError(InfraError::corruption(
+                            "split_replace.exhaust.collision_probe",
+                            "spawned index overflows u32",
+                        ))
+                    })?,
                 );
                 let mut child_slab = ByteSlab::with_capacity(
                     super::build_slab_capacity_for_spec_and_cursor(child.spec(), child.cursor()),
@@ -1725,7 +1772,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         }
         // Exhaustion: re-read and diagnose.
         let persisted = self
-            .load_shard_checked(tenant, key)
+            .load_shard_checked("split_replace.exhaust.load_shard", tenant, key)
             .await
             .map_err(SplitReplaceError::BackendError)?;
         if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
@@ -1753,8 +1800,12 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 persisted.record.shard,
                 op_id,
                 DerivedShardKind::Child,
-                u32::try_from(persisted.record.spawned.len() + sorted_index)
-                    .expect("child index exceeds u32"),
+                u32::try_from(persisted.record.spawned.len() + sorted_index).map_err(|_| {
+                    SplitReplaceError::BackendError(InfraError::corruption(
+                        "split_replace.exhaust.collision_probe",
+                        "spawned index overflows u32",
+                    ))
+                })?,
             );
             let child_key = ShardKey::new(persisted.record.run, child_id);
             match self.load_shard_record(tenant, child_key).await {
@@ -1774,9 +1825,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 }
             }
         }
-        Err(SplitReplaceError::BackendError(InfraError::transient(
+        Err(SplitReplaceError::BackendError(InfraError::corruption(
             "split_replace",
-            "CAS retry budget exhausted",
+            "CAS retry budget exhausted after ruling out replay, stale fence, \
+             terminal status, and derived-ID collision — possible external etcd modification",
         )))
     }
 
@@ -1944,7 +1996,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         }
         // Exhaustion: re-read and diagnose.
         let persisted = self
-            .load_shard_checked(tenant, key)
+            .load_shard_checked("split_residual.exhaust.load_shard", tenant, key)
             .await
             .map_err(SplitResidualError::BackendError)?;
         if let Some(replay) =
@@ -1966,7 +2018,12 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             persisted.record.shard,
             op_id,
             DerivedShardKind::Residual,
-            u32::try_from(persisted.record.spawned.len()).expect("spawned index exceeds u32"),
+            u32::try_from(persisted.record.spawned.len()).map_err(|_| {
+                SplitResidualError::BackendError(InfraError::corruption(
+                    "split_residual.exhaust.collision_probe",
+                    "spawned index overflows u32",
+                ))
+            })?,
         );
         let residual_key = ShardKey::new(persisted.record.run, residual_id);
         match self.load_shard_record(tenant, residual_key).await {
@@ -1985,9 +2042,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 )));
             }
         }
-        Err(SplitResidualError::BackendError(InfraError::transient(
+        Err(SplitResidualError::BackendError(InfraError::corruption(
             "split_residual",
-            "CAS retry budget exhausted",
+            "CAS retry budget exhausted after ruling out replay, stale fence, \
+             terminal status, and derived-ID collision — possible external etcd modification",
         )))
     }
 }
