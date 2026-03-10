@@ -64,7 +64,6 @@
 //! descriptive message. They remain fail-closed until their etcd
 //! transaction semantics are defined.
 
-use std::fmt;
 use std::time::Duration;
 
 use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
@@ -466,19 +465,21 @@ fn build_slab_capacity_for_initial_shard(input: &InitialShardInput<'_>) -> usize
 }
 
 /// Encode a shard record into a binary blob, then deallocate its pooled
-/// fields and clear the slab. Panics via [`fatal_storage_error`] on
-/// encode failure — encoding a just-constructed record should never fail
-/// under normal operation; failure indicates a codec or invariant bug.
+/// fields and clear the slab.
+///
+/// Returns `InfraError::corruption` on encode failure — encoding a
+/// just-constructed record should never fail under normal operation;
+/// failure indicates a codec or invariant bug.
 fn encode_ephemeral_shard_blob(
     context: &'static str,
     mut record: ShardRecord,
     mut slab: ByteSlab,
-) -> Vec<u8> {
-    let blob =
-        encode_shard_record(&record, &slab).unwrap_or_else(|err| fatal_storage_error(context, err));
+) -> Result<Vec<u8>, gossip_coordination::InfraError> {
+    let blob = encode_shard_record(&record, &slab)
+        .map_err(|err| gossip_coordination::InfraError::corruption(context, err))?;
     record.deallocate_fields(&mut slab);
     slab.clear();
-    blob
+    Ok(blob)
 }
 
 /// Construct a root shard record from registration input, validate its
@@ -506,11 +507,8 @@ fn build_root_shard_blob(
         resource: "shard_slab",
     })?;
     record.assert_invariants(&slab);
-    Ok(encode_ephemeral_shard_blob(
-        "register_shards.encode_shard",
-        record,
-        slab,
-    ))
+    encode_ephemeral_shard_blob("register_shards.encode_shard", record, slab)
+        .map_err(RegisterShardsError::BackendError)
 }
 
 /// Verify that a persisted owner binding is consistent with the shard
@@ -720,14 +718,4 @@ fn decode_owner_kv(kv: &etcd_client::KeyValue) -> Result<PersistedOwner, EtcdCoo
         binding,
         lease_id: kv.lease(),
     })
-}
-
-/// Panics on an unrecoverable storage error.
-///
-/// Called when an etcd operation fails in a context where there is no
-/// meaningful recovery (e.g., encoding a shard record that was just
-/// successfully decoded). The panic message includes `context` for
-/// diagnosis.
-fn fatal_storage_error<T>(context: &'static str, err: impl fmt::Display) -> T {
-    panic!("etcd coordination backend {context} failed: {err}");
 }

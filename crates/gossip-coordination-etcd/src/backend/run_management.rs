@@ -248,7 +248,9 @@ impl RunManagement for EtcdCoordinator {
                     })
             },
             |this| {
-                let persisted_run = this.load_run_or_panic(tenant, run);
+                let persisted_run = this
+                    .load_run_checked(tenant, run)
+                    .map_err(RegisterShardsError::BackendError)?;
                 if let Some(entry) = persisted_run
                     .record
                     .check_op_idempotency(op_id, payload_hash)?
@@ -258,10 +260,13 @@ impl RunManagement for EtcdCoordinator {
                             return Ok(IdempotentOutcome::Replayed(shard_ids.to_vec()));
                         }
                         RunOpResult::Ack => {
-                            panic!(
-                                "Run {run:?}: RegisterShards op-log entry has Ack result \
-                                 (expected RegisteredShards) — data corruption"
-                            );
+                            return Err(RegisterShardsError::BackendError(InfraError::corruption(
+                                "register_shards",
+                                format!(
+                                    "Run {run:?}: RegisterShards op-log entry has Ack result \
+                                         (expected RegisteredShards)"
+                                ),
+                            )));
                         }
                     }
                 }
@@ -271,10 +276,10 @@ impl RunManagement for EtcdCoordinator {
                     });
                 }
 
-                super::fatal_storage_error(
-                    "register_shards.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(RegisterShardsError::BackendError(InfraError::transient(
+                    "register_shards",
+                    "CAS retry budget exhausted",
+                )))
             },
         )
     }
@@ -885,7 +890,10 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             tokio::time::sleep(cas_retry_delay(attempt_num)).await;
         }
         // Exhaustion.
-        let persisted_run = self.load_run_or_panic(tenant, run).await;
+        let persisted_run = self
+            .load_run_checked(tenant, run)
+            .await
+            .map_err(RegisterShardsError::BackendError)?;
         if let Some(entry) = persisted_run
             .record
             .check_op_idempotency(op_id, payload_hash)?
@@ -895,7 +903,13 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                     return Ok(IdempotentOutcome::Replayed(shard_ids.to_vec()));
                 }
                 RunOpResult::Ack => {
-                    panic!("Run {run:?}: RegisterShards Ack result — data corruption")
+                    return Err(RegisterShardsError::BackendError(InfraError::corruption(
+                        "register_shards",
+                        format!(
+                            "Run {run:?}: RegisterShards op-log entry has Ack result \
+                                 (expected RegisteredShards)"
+                        ),
+                    )));
                 }
             }
         }
@@ -904,10 +918,10 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                 status: persisted_run.record.status,
             });
         }
-        super::fatal_storage_error(
-            "register_shards.compare_retry_budget",
-            "compare contention did not converge",
-        )
+        Err(RegisterShardsError::BackendError(InfraError::transient(
+            "register_shards",
+            "CAS retry budget exhausted",
+        )))
     }
 
     async fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError> {

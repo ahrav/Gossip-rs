@@ -180,7 +180,9 @@ impl CoordinationBackend for EtcdCoordinator {
                     });
                 }
 
-                let run_record = this.load_run_or_panic(tenant, key.run());
+                let run_record = this
+                    .load_run_checked(tenant, key.run())
+                    .map_err(AcquireError::BackendError)?;
                 let lease_duration = run_record.record.config.lease_duration();
                 let new_deadline = now
                     .checked_add(lease_duration)
@@ -270,7 +272,9 @@ impl CoordinationBackend for EtcdCoordinator {
                 Ok(CasOutcome::Committed((persisted, lease, capacity)))
             },
             |this| {
-                let persisted = this.load_shard_or_panic(tenant, key);
+                let persisted = this
+                    .load_shard_checked(tenant, key)
+                    .map_err(AcquireError::BackendError)?;
                 if persisted.record.tenant != tenant {
                     return Err(AcquireError::TenantMismatch { expected: tenant });
                 }
@@ -293,10 +297,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     });
                 }
 
-                super::fatal_storage_error(
-                    "acquire.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(AcquireError::BackendError(InfraError::transient(
+                    "acquire",
+                    "CAS retry budget exhausted",
+                )))
             },
         )?;
 
@@ -341,7 +345,9 @@ impl CoordinationBackend for EtcdCoordinator {
                     |presented, current| RenewError::StaleFence { presented, current },
                 )?;
 
-                let run_record = this.load_run_or_panic(tenant, key.run());
+                let run_record = this
+                    .load_run_checked(tenant, key.run())
+                    .map_err(RenewError::BackendError)?;
                 let lease_duration = run_record.record.config.lease_duration();
                 let new_deadline = now
                     .checked_add(lease_duration)
@@ -425,10 +431,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     |presented, current| RenewError::StaleFence { presented, current },
                 )?;
 
-                super::fatal_storage_error(
-                    "renew.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(RenewError::BackendError(InfraError::transient(
+                    "renew",
+                    "CAS retry budget exhausted",
+                )))
             },
         )
     }
@@ -533,7 +539,9 @@ impl CoordinationBackend for EtcdCoordinator {
                     })
             },
             |this| {
-                let persisted = this.load_shard_or_panic(tenant, key);
+                let persisted = this
+                    .load_shard_checked(tenant, key)
+                    .map_err(CheckpointError::BackendError)?;
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     return Ok(IdempotentOutcome::Replayed(()));
                 }
@@ -545,10 +553,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     |presented, current| CheckpointError::StaleFence { presented, current },
                 )?;
 
-                super::fatal_storage_error(
-                    "checkpoint.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(CheckpointError::BackendError(InfraError::transient(
+                    "checkpoint",
+                    "CAS retry budget exhausted",
+                )))
             },
         )
     }
@@ -740,9 +748,12 @@ impl CoordinationBackend for EtcdCoordinator {
                     child_absent_compares.push(super::compare_absent(child_record_key.clone()));
                     child_puts.push(TxnOp::put(
                         child_record_key.into_bytes(),
-                        encode_shard_record(&child_record, &child_slab).unwrap_or_else(|err| {
-                            super::fatal_storage_error("split_replace.encode_child", err)
-                        }),
+                        encode_shard_record(&child_record, &child_slab).map_err(|err| {
+                            SplitReplaceError::BackendError(InfraError::corruption(
+                                "split_replace.encode_child",
+                                err,
+                            ))
+                        })?,
                         None,
                     ));
                     child_index_ops.push(TxnOp::put(
@@ -764,10 +775,13 @@ impl CoordinationBackend for EtcdCoordinator {
                     now,
                     &mut persisted.slab,
                 )?;
-                let parent_blob = encode_shard_record(&persisted.record, &persisted.slab)
-                    .unwrap_or_else(|err| {
-                        super::fatal_storage_error("split_replace.encode_parent", err)
-                    });
+                let parent_blob =
+                    encode_shard_record(&persisted.record, &persisted.slab).map_err(|err| {
+                        SplitReplaceError::BackendError(InfraError::corruption(
+                            "split_replace.encode_parent",
+                            err,
+                        ))
+                    })?;
                 let owner_blob = persisted
                     .expected_owner_value()
                     .expect("validated owner must produce an owner value");
@@ -813,7 +827,9 @@ impl CoordinationBackend for EtcdCoordinator {
                 })
             },
             |this| {
-                let persisted = this.load_shard_or_panic(tenant, key);
+                let persisted = this
+                    .load_shard_checked(tenant, key)
+                    .map_err(SplitReplaceError::BackendError)?;
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     let children = split_replace_replay_child_ids(
                         &persisted.record,
@@ -873,10 +889,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                 }
 
-                super::fatal_storage_error(
-                    "split_replace.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(SplitReplaceError::BackendError(InfraError::transient(
+                    "split_replace",
+                    "CAS retry budget exhausted",
+                )))
             },
         )
     }
@@ -1013,10 +1029,13 @@ impl CoordinationBackend for EtcdCoordinator {
                     now,
                     &mut persisted.slab,
                 )?;
-                let parent_blob = encode_shard_record(&persisted.record, &persisted.slab)
-                    .unwrap_or_else(|err| {
-                        super::fatal_storage_error("split_residual.encode_parent", err)
-                    });
+                let parent_blob =
+                    encode_shard_record(&persisted.record, &persisted.slab).map_err(|err| {
+                        SplitResidualError::BackendError(InfraError::corruption(
+                            "split_residual.encode_parent",
+                            err,
+                        ))
+                    })?;
                 let owner_blob = persisted
                     .expected_owner_value()
                     .expect("validated owner must produce an owner value");
@@ -1034,17 +1053,19 @@ impl CoordinationBackend for EtcdCoordinator {
                     owner_blob,
                 );
                 compares.push(super::compare_absent(residual_record_key.clone()));
+                let residual_blob =
+                    encode_shard_record(&residual_record, &residual_slab).map_err(|err| {
+                        SplitResidualError::BackendError(InfraError::corruption(
+                            "split_residual.encode_residual",
+                            err,
+                        ))
+                    })?;
 
                 this.inject_split_residual_fault_if_armed(tenant, key);
 
                 let mut txn = TxnBuilder::from_compares(compares);
                 txn.put(shard_record_key.into_bytes(), parent_blob)
-                    .put(
-                        residual_record_key.into_bytes(),
-                        encode_shard_record(&residual_record, &residual_slab).unwrap_or_else(
-                            |err| super::fatal_storage_error("split_residual.encode_residual", err),
-                        ),
-                    )
+                    .put(residual_record_key.into_bytes(), residual_blob)
                     .put(
                         this.keyspace
                             .shard_active_index_key(tenant, persisted.record.run, residual_id)
@@ -1063,7 +1084,9 @@ impl CoordinationBackend for EtcdCoordinator {
                 })
             },
             |this| {
-                let persisted = this.load_shard_or_panic(tenant, key);
+                let persisted = this
+                    .load_shard_checked(tenant, key)
+                    .map_err(SplitResidualError::BackendError)?;
                 if let Some(replay) = split_residual_check_replay(
                     &persisted.record,
                     op_id,
@@ -1115,10 +1138,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                 }
 
-                super::fatal_storage_error(
-                    "split_residual.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(SplitResidualError::BackendError(InfraError::transient(
+                    "split_residual",
+                    "CAS retry budget exhausted",
+                )))
             },
         )
     }
@@ -1171,7 +1194,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                                     .expect("live deadline"),
                             });
                         }
-                        let run_record = this.load_run_or_panic(tenant, key.run()).await;
+                        let run_record = this
+                            .load_run_checked(tenant, key.run())
+                            .await
+                            .map_err(AcquireError::BackendError)?;
                         let lease_duration = run_record.record.config.lease_duration();
                         let new_deadline = now
                             .checked_add(lease_duration)
@@ -1265,7 +1291,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 },
                 |this| {
                     Box::pin(async move {
-                        let persisted = this.load_shard_or_panic(tenant, key).await;
+                        let persisted = this
+                            .load_shard_checked(tenant, key)
+                            .await
+                            .map_err(AcquireError::BackendError)?;
                         if persisted.record.tenant != tenant {
                             return Err(AcquireError::TenantMismatch { expected: tenant });
                         }
@@ -1284,10 +1313,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                                     .expect("live deadline"),
                             });
                         }
-                        super::fatal_storage_error(
-                            "acquire.compare_retry_budget",
-                            "compare contention did not converge",
-                        )
+                        Err(AcquireError::BackendError(InfraError::transient(
+                            "acquire",
+                            "CAS retry budget exhausted",
+                        )))
                     })
                 },
             )
@@ -1318,7 +1347,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     |presented, current| RenewError::StaleFence { presented, current },
                 )
                 .await?;
-            let run_record = self.load_run_or_panic(tenant, key.run()).await;
+            let run_record = self
+                .load_run_checked(tenant, key.run())
+                .await
+                .map_err(RenewError::BackendError)?;
             let new_deadline = now
                 .checked_add(run_record.record.config.lease_duration())
                 .unwrap_or(LogicalTime::from_raw(u64::MAX));
@@ -1369,14 +1401,17 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             }
         }
         // Exhaustion.
-        let persisted = self.load_shard_or_panic(tenant, key).await;
+        let persisted = self
+            .load_shard_checked(tenant, key)
+            .await
+            .map_err(RenewError::BackendError)?;
         validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             RenewError::StaleFence { presented, current }
         })?;
-        super::fatal_storage_error(
-            "renew.compare_retry_budget",
-            "compare contention did not converge",
-        )
+        Err(RenewError::BackendError(InfraError::transient(
+            "renew",
+            "CAS retry budget exhausted",
+        )))
     }
 
     async fn checkpoint(
@@ -1463,17 +1498,20 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             }
         }
         // Exhaustion.
-        let persisted = self.load_shard_or_panic(tenant, key).await;
+        let persisted = self
+            .load_shard_checked(tenant, key)
+            .await
+            .map_err(CheckpointError::BackendError)?;
         if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
             return Ok(IdempotentOutcome::Replayed(()));
         }
         validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             CheckpointError::StaleFence { presented, current }
         })?;
-        super::fatal_storage_error(
-            "checkpoint.compare_retry_budget",
-            "compare contention did not converge",
-        )
+        Err(CheckpointError::BackendError(InfraError::transient(
+            "checkpoint",
+            "CAS retry budget exhausted",
+        )))
     }
 
     async fn complete(
@@ -1611,9 +1649,12 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 child_absent_compares.push(super::compare_absent(crk.clone()));
                 child_puts.push(TxnOp::put(
                     crk.into_bytes(),
-                    encode_shard_record(&child_record, &child_slab).unwrap_or_else(|e| {
-                        super::fatal_storage_error("split_replace.encode_child", e)
-                    }),
+                    encode_shard_record(&child_record, &child_slab).map_err(|e| {
+                        SplitReplaceError::BackendError(InfraError::corruption(
+                            "split_replace.encode_child",
+                            e,
+                        ))
+                    })?,
                     None,
                 ));
                 child_index_ops.push(TxnOp::put(
@@ -1634,8 +1675,13 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 now,
                 &mut persisted.slab,
             )?;
-            let parent_blob = encode_shard_record(&persisted.record, &persisted.slab)
-                .unwrap_or_else(|e| super::fatal_storage_error("split_replace.encode_parent", e));
+            let parent_blob =
+                encode_shard_record(&persisted.record, &persisted.slab).map_err(|e| {
+                    SplitReplaceError::BackendError(InfraError::corruption(
+                        "split_replace.encode_parent",
+                        e,
+                    ))
+                })?;
             let owner_blob = persisted
                 .expected_owner_value()
                 .expect("validated owner value");
@@ -1678,7 +1724,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             }
         }
         // Exhaustion: re-read and diagnose.
-        let persisted = self.load_shard_or_panic(tenant, key).await;
+        let persisted = self
+            .load_shard_checked(tenant, key)
+            .await
+            .map_err(SplitReplaceError::BackendError)?;
         if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
             let children = split_replace_replay_child_ids(
                 &persisted.record,
@@ -1725,10 +1774,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 }
             }
         }
-        super::fatal_storage_error(
-            "split_replace.compare_retry_budget",
-            "compare contention did not converge",
-        )
+        Err(SplitReplaceError::BackendError(InfraError::transient(
+            "split_replace",
+            "CAS retry budget exhausted",
+        )))
     }
 
     async fn split_residual(
@@ -1840,8 +1889,13 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 now,
                 &mut persisted.slab,
             )?;
-            let parent_blob = encode_shard_record(&persisted.record, &persisted.slab)
-                .unwrap_or_else(|e| super::fatal_storage_error("split_residual.encode_parent", e));
+            let parent_blob =
+                encode_shard_record(&persisted.record, &persisted.slab).map_err(|e| {
+                    SplitResidualError::BackendError(InfraError::corruption(
+                        "split_residual.encode_parent",
+                        e,
+                    ))
+                })?;
             let owner_blob = persisted
                 .expected_owner_value()
                 .expect("validated owner value");
@@ -1853,15 +1907,17 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 .shard_owner_key(tenant, key.run(), key.shard());
             let mut compares = build_shard_owner_cas(srk.clone(), ok, &persisted, owner_blob);
             compares.push(super::compare_absent(rrk.clone()));
+            let residual_blob =
+                encode_shard_record(&residual_record, &residual_slab).map_err(|e| {
+                    SplitResidualError::BackendError(InfraError::corruption(
+                        "split_residual.encode_residual",
+                        e,
+                    ))
+                })?;
             self.inject_split_residual_fault_if_armed(tenant, key).await;
             let mut txn = TxnBuilder::from_compares(compares);
             txn.put(srk.into_bytes(), parent_blob)
-                .put(
-                    rrk.into_bytes(),
-                    encode_shard_record(&residual_record, &residual_slab).unwrap_or_else(|e| {
-                        super::fatal_storage_error("split_residual.encode_residual", e)
-                    }),
-                )
+                .put(rrk.into_bytes(), residual_blob)
                 .put(
                     self.keyspace
                         .shard_active_index_key(tenant, persisted.record.run, residual_id)
@@ -1887,7 +1943,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             }
         }
         // Exhaustion: re-read and diagnose.
-        let persisted = self.load_shard_or_panic(tenant, key).await;
+        let persisted = self
+            .load_shard_checked(tenant, key)
+            .await
+            .map_err(SplitResidualError::BackendError)?;
         if let Some(replay) =
             split_residual_check_replay(&persisted.record, op_id, payload_hash, &persisted.slab)?
         {
@@ -1926,9 +1985,9 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 )));
             }
         }
-        super::fatal_storage_error(
-            "split_residual.compare_retry_budget",
-            "compare contention did not converge",
-        )
+        Err(SplitResidualError::BackendError(InfraError::transient(
+            "split_residual",
+            "CAS retry budget exhausted",
+        )))
     }
 }
