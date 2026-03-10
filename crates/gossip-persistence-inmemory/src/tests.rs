@@ -810,6 +810,86 @@ fn done_ledger_merge_failure_to_scanned_clean_clears_findings_count() {
     assert_eq!(stored.error_code(), None);
 }
 
+/// Verify that batch-first dedup then merge-with-durable produces results
+/// consistent with the PG backend's two-phase approach.
+///
+/// Scenario: durable holds `ScannedWithFindings(findings=1)`. A single batch
+/// contains the same key twice: `FailedRetryable(findings=3)` followed by
+/// `ScannedClean`. The batch dedup folds these into `ScannedClean(findings=0)`
+/// (because `ScannedClean` forces findings to 0). Merging that against
+/// durable yields `ScannedWithFindings(findings=1)` — the status from durable
+/// dominates (rank 11 > 10), and `max(1, 0).max(1) = 1`.
+///
+/// A per-record strategy (merge each record against durable sequentially)
+/// would instead yield `findings=3`, because the `FailedRetryable(findings=3)`
+/// merges first into the `ScannedWithFindings` durable row, promoting
+/// `findings_count` to 3 before the `ScannedClean` arrives and keeps it at 3.
+///
+/// Both PG and in-memory backends use the two-phase approach, so the correct
+/// answer is `findings=1`.
+#[test]
+fn batch_dedup_then_merge_agrees_with_two_phase_semantics() {
+    let store = InMemoryDoneLedger::new();
+
+    // Seed durable state: ScannedWithFindings(findings=1).
+    let durable = done_record(
+        1,
+        2,
+        3,
+        ScannedWithFindings,
+        500,
+        1,
+        provenance(1, 2, 3, 10, 20),
+        None,
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&durable))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    // Batch with two records for the same key: FailedRetryable(findings=3)
+    // then ScannedClean.
+    let failed = done_record(
+        1,
+        2,
+        3,
+        FailedRetryable,
+        100,
+        3,
+        provenance(10, 11, 12, 30, 40),
+        Some("TIMEOUT"),
+    );
+    let clean = done_record(
+        1,
+        2,
+        3,
+        ScannedClean,
+        200,
+        0,
+        provenance(20, 21, 22, 50, 60),
+        None,
+    );
+    store
+        .batch_upsert(&[failed.clone(), clean])
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.get_record(durable.key()).unwrap().unwrap();
+
+    // Two-phase result: dedup folds batch to ScannedClean(findings=0),
+    // merge with durable yields ScannedWithFindings(findings=1).
+    assert_eq!(stored.status(), ScannedWithFindings);
+    assert_eq!(
+        stored.findings_count(),
+        1,
+        "two-phase dedup: ScannedClean zeroes findings in batch fold, \
+         durable ScannedWithFindings retains its findings_count=1"
+    );
+    assert_eq!(stored.bytes_scanned(), 500, "max(500, 200) from durable");
+}
+
 // ---------------------------------------------------------------------------
 // Delay injection and concurrent write ordering
 // ---------------------------------------------------------------------------

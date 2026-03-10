@@ -521,8 +521,12 @@ mod tests {
         }
     }
 
+    /// Verify that the Rust lattice merge is equivalent to `max(rank)` for
+    /// all status pairs, which is the semantic contract that lets the SQL
+    /// `GREATEST(EXCLUDED.status, done_ledger_entries.status)` expression
+    /// produce identical results.
     #[test]
-    fn sql_greatest_matches_rust_lattice_merge_for_all_status_pairs() {
+    fn rust_status_merge_is_equivalent_to_max_on_ranks() {
         use gossip_contracts::persistence::DoneLedgerStatus;
 
         let all_ranks: Vec<u8> = (0..=u8::MAX)
@@ -536,11 +540,24 @@ mod tests {
                 assert_eq!(
                     a.merge(b).rank(),
                     a_rank.max(b_rank),
-                    "SQL GREATEST strategy diverges from Rust lattice merge \
-                     for ({a:?}, {b:?})"
+                    "Rust lattice merge must equal max(rank) for ({a:?}, {b:?})"
                 );
             }
         }
+    }
+
+    /// Guard that `UPSERT_SQL` uses `GREATEST` for the status merge column.
+    /// Without this, the Rust-side max-on-ranks equivalence (tested above)
+    /// would not be enough — someone could change the SQL to use a different
+    /// expression without breaking the Rust test.
+    #[test]
+    fn upsert_sql_uses_greatest_for_status_merge() {
+        let upsert = crate::schema::UPSERT_SQL;
+        assert!(
+            upsert.contains("GREATEST(EXCLUDED.status, done_ledger_entries.status)"),
+            "UPSERT_SQL must merge status via GREATEST(EXCLUDED.status, \
+             done_ledger_entries.status)"
+        );
     }
 
     // ── SQL/Rust status discriminant alignment ──────────────────────

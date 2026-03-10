@@ -571,7 +571,7 @@ impl DoneLedgerRecord {
     /// # Merge rules
     ///
     /// 1. **Status** — lattice join via [`DoneLedgerStatus::merge`]. Status never
-    ///    regresses: `scanned` dominates `failed`, which dominates `skipped`.
+    ///    regresses: `scanned` dominates `skipped`, which dominates `failed`.
     /// 2. **`bytes_scanned`** — non-regressing maximum of both records.
     /// 3. **`findings_count`** — status-aware:
     ///    - `ScannedClean`: forced to 0.
