@@ -1,9 +1,10 @@
 //! [`CoordinationBackend`] and [`AsyncCoordinationBackend`] trait impls for
-//! the etcd backend — the shard hot path and lifecycle operations.
+//! the etcd backend — shard coordination and lifecycle operations.
 //!
-//! # Hot path operations
+//! # Warm path operations
 //!
-//! These run per-shard, per-tick and are latency-sensitive:
+//! Latency-sensitive but each CAS retry includes an etcd network round-trip,
+//! so these are WARM paths under the project allocation policy:
 //!
 //! - **`acquire_and_restore_into`** — take ownership by granting an etcd
 //!   lease, bumping the fence epoch, and writing both the shard record and
