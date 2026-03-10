@@ -32,8 +32,8 @@
 //!
 //! The `on_exhaustion` closure runs without additional backoff and is
 //! responsible for re-reading persisted state to return the correct domain
-//! error (idempotent replay, terminal status, stale fence) or panic on
-//! truly unexplainable contention.
+//! error (idempotent replay, terminal status, stale fence, or transient
+//! contention error).
 //!
 //! # Data loading helpers
 //!
@@ -65,8 +65,8 @@ use crate::keyspace::{
 use super::{
     CasOutcome, PersistedOwner, PersistedRun, PersistedShard, TxnBuilder,
     apply_terminal_run_transition, cas_retry_delay, compare_absent, compare_present,
-    compare_run_revision, decode_owner_kv, fatal_storage_error, make_decode_slab,
-    validate_loaded_shard_lease, validate_owner_consistency,
+    compare_run_revision, decode_owner_kv, make_decode_slab, validate_loaded_shard_lease,
+    validate_owner_consistency,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1034,7 +1034,30 @@ impl EtcdCoordinator {
                     })
             },
             |this| {
-                let persisted = this.load_run_or_panic(tenant, run);
+                // Use load_run_record directly so we can distinguish
+                // "run legitimately deleted by GC" from "data loss".
+                //
+                // gc_stale_initializing_runs_into only deletes Initializing
+                // runs, so a missing run is benign only for cancel_run
+                // (require_active == false). For complete_run / fail_run
+                // (require_active == true) the run must have been Active,
+                // which GC never touches — a missing Active run is corruption.
+                let persisted = match this.load_run_record(tenant, run) {
+                    Ok(Some(r)) => r,
+                    Ok(None) if !require_active => return Err(RunTransitionError::RunNotFound),
+                    Ok(None) => {
+                        return Err(RunTransitionError::BackendError(InfraError::corruption(
+                            "run_terminal.exhaust.load_run",
+                            format!("run {run:?} missing (expected Active)"),
+                        )));
+                    }
+                    Err(err) => {
+                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
+                            "run_terminal.exhaust.load_run",
+                            err,
+                        )));
+                    }
+                };
                 if persisted.record.tenant != tenant {
                     return Err(RunTransitionError::TenantMismatch { expected: tenant });
                 }
@@ -1091,24 +1114,50 @@ impl EtcdCoordinator {
         }
     }
 
-    /// Load a run record, panicking if the key is missing or unreadable.
+    /// Load a run record that is expected to exist.
     ///
-    /// Used in paths where the run is expected to exist (e.g., after
-    /// a successful `create_run`).
-    pub(super) fn load_run_or_panic(&self, tenant: TenantId, run: RunId) -> PersistedRun {
+    /// Returns `InfraError::corruption` if the key is missing (the record
+    /// existed earlier in the retry loop, so absence signals data loss) and
+    /// maps backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics
+    /// (e.g., `"acquire.load_run"`, `"register_shards.exhaust.load_run"`).
+    pub(super) fn load_run_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<PersistedRun, InfraError> {
         match self.load_run_record(tenant, run) {
-            Ok(Some(run_record)) => run_record,
-            Ok(None) => fatal_storage_error("load run", format!("run {run:?} missing")),
-            Err(err) => fatal_storage_error("load run", err),
+            Ok(Some(run_record)) => Ok(run_record),
+            Ok(None) => Err(InfraError::corruption(
+                context,
+                format!("run {run:?} missing"),
+            )),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 
-    /// Load a shard record, panicking if the key is missing or unreadable.
-    pub(super) fn load_shard_or_panic(&self, tenant: TenantId, key: ShardKey) -> PersistedShard {
+    /// Load a shard record that is expected to exist.
+    ///
+    /// Returns `InfraError::corruption` if the key is missing and maps
+    /// backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics
+    /// (e.g., `"checkpoint.exhaust.load_shard"`).
+    pub(super) fn load_shard_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<PersistedShard, InfraError> {
         match self.load_shard_record(tenant, key) {
-            Ok(Some(shard)) => shard,
-            Ok(None) => fatal_storage_error("load shard", format!("shard {key:?} missing")),
-            Err(err) => fatal_storage_error("load shard", err),
+            Ok(Some(shard)) => Ok(shard),
+            Ok(None) => Err(InfraError::corruption(
+                context,
+                format!("shard {key:?} missing"),
+            )),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 }
@@ -1726,25 +1775,47 @@ impl AsyncEtcdCoordinator {
         Ok(persisted)
     }
 
-    /// Load a run record, panicking if the key is missing or unreadable (async).
-    pub(super) async fn load_run_or_panic(&self, tenant: TenantId, run: RunId) -> PersistedRun {
+    /// Load a run record that is expected to exist (async).
+    ///
+    /// Returns `InfraError::corruption` if the key is missing and maps
+    /// backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics.
+    pub(super) async fn load_run_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<PersistedRun, InfraError> {
         match self.load_run_record(tenant, run).await {
-            Ok(Some(run_record)) => run_record,
-            Ok(None) => fatal_storage_error("load run", format!("run {run:?} missing")),
-            Err(err) => fatal_storage_error("load run", err),
+            Ok(Some(run_record)) => Ok(run_record),
+            Ok(None) => Err(InfraError::corruption(
+                context,
+                format!("run {run:?} missing"),
+            )),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 
-    /// Load a shard record, panicking if the key is missing or unreadable (async).
-    pub(super) async fn load_shard_or_panic(
+    /// Load a shard record that is expected to exist (async).
+    ///
+    /// Returns `InfraError::corruption` if the key is missing and maps
+    /// backend errors via [`map_etcd_err`](super::map_etcd_err).
+    ///
+    /// `context` identifies the calling operation for diagnostics.
+    pub(super) async fn load_shard_checked(
         &self,
+        context: &'static str,
         tenant: TenantId,
         key: ShardKey,
-    ) -> PersistedShard {
+    ) -> Result<PersistedShard, InfraError> {
         match self.load_shard_record(tenant, key).await {
-            Ok(Some(shard)) => shard,
-            Ok(None) => fatal_storage_error("load shard", format!("shard {key:?} missing")),
-            Err(err) => fatal_storage_error("load shard", err),
+            Ok(Some(shard)) => Ok(shard),
+            Ok(None) => Err(InfraError::corruption(
+                context,
+                format!("shard {key:?} missing"),
+            )),
+            Err(err) => Err(super::map_etcd_err(context, err)),
         }
     }
 
@@ -1896,7 +1967,22 @@ impl AsyncEtcdCoordinator {
             },
             |this| {
                 Box::pin(async move {
-                    let persisted = this.load_run_or_panic(tenant, run).await;
+                    let persisted = match this.load_run_record(tenant, run).await {
+                        Ok(Some(r)) => r,
+                        Ok(None) if !require_active => return Err(RunTransitionError::RunNotFound),
+                        Ok(None) => {
+                            return Err(RunTransitionError::BackendError(InfraError::corruption(
+                                "run_terminal.exhaust.load_run",
+                                format!("run {run:?} missing (expected Active)"),
+                            )));
+                        }
+                        Err(err) => {
+                            return Err(RunTransitionError::BackendError(super::map_etcd_err(
+                                "run_terminal.exhaust.load_run",
+                                err,
+                            )));
+                        }
+                    };
                     if persisted.record.tenant != tenant {
                         return Err(RunTransitionError::TenantMismatch { expected: tenant });
                     }

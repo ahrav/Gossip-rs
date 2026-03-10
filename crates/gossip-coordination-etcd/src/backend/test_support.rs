@@ -321,13 +321,13 @@ impl EtcdCoordinator {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn inject_split_replace_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
         self.maybe_drop_owner_before_split_replace_txn(tenant, key)
-            .unwrap_or_else(|err| super::fatal_storage_error("split_replace.inject_fault", err));
+            .expect("test fault injection for split_replace must not fail");
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn inject_split_residual_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
         self.maybe_drop_owner_before_split_residual_txn(tenant, key)
-            .unwrap_or_else(|err| super::fatal_storage_error("split_residual.inject_fault", err));
+            .expect("test fault injection for split_residual must not fail");
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
@@ -424,7 +424,7 @@ impl AsyncEtcdCoordinator {
     ) {
         self.maybe_drop_owner_before_split_replace_txn(tenant, key)
             .await
-            .unwrap_or_else(|err| super::fatal_storage_error("split_replace.inject_fault", err));
+            .expect("test fault injection for split_replace must not fail");
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -435,7 +435,7 @@ impl AsyncEtcdCoordinator {
     ) {
         self.maybe_drop_owner_before_split_residual_txn(tenant, key)
             .await
-            .unwrap_or_else(|err| super::fatal_storage_error("split_residual.inject_fault", err));
+            .expect("test fault injection for split_residual must not fail");
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
