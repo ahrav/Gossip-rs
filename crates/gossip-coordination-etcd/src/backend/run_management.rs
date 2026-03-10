@@ -248,9 +248,19 @@ impl RunManagement for EtcdCoordinator {
                     })
             },
             |this| {
-                let persisted_run = this
-                    .load_run_checked("register_shards.exhaust.load_run", tenant, run)
-                    .map_err(RegisterShardsError::BackendError)?;
+                // Use load_run_record directly: register_shards operates on
+                // Initializing runs, which gc_stale_initializing_runs_into
+                // can legitimately delete during the CAS retry window.
+                let persisted_run = match this.load_run_record(tenant, run) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Err(RegisterShardsError::RunNotFound),
+                    Err(err) => {
+                        return Err(RegisterShardsError::BackendError(super::map_etcd_err(
+                            "register_shards.exhaust.load_run",
+                            err,
+                        )));
+                    }
+                };
                 if let Some(entry) = persisted_run
                     .record
                     .check_op_idempotency(op_id, payload_hash)?
@@ -890,10 +900,16 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             tokio::time::sleep(cas_retry_delay(attempt_num)).await;
         }
         // Exhaustion.
-        let persisted_run = self
-            .load_run_checked("register_shards.exhaust.load_run", tenant, run)
-            .await
-            .map_err(RegisterShardsError::BackendError)?;
+        let persisted_run = match self.load_run_record(tenant, run).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return Err(RegisterShardsError::RunNotFound),
+            Err(err) => {
+                return Err(RegisterShardsError::BackendError(super::map_etcd_err(
+                    "register_shards.exhaust.load_run",
+                    err,
+                )));
+            }
+        };
         if let Some(entry) = persisted_run
             .record
             .check_op_idempotency(op_id, payload_hash)?

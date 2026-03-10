@@ -1671,7 +1671,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                     DerivedShardKind::Child,
                     u32::try_from(persisted.record.spawned.len() + sorted_index).map_err(|_| {
                         SplitReplaceError::BackendError(InfraError::corruption(
-                            "split_replace.exhaust.collision_probe",
+                            "split_replace.derive_child_id",
                             "spawned index overflows u32",
                         ))
                     })?,

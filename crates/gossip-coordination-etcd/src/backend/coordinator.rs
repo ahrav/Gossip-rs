@@ -1034,13 +1034,23 @@ impl EtcdCoordinator {
                     })
             },
             |this| {
-                // Use load_run_record directly: a missing run in the
-                // exhaustion handler can be a legitimate concurrent
-                // deletion (e.g., gc_stale_initializing_runs_into racing
-                // with cancel_run), not necessarily corruption.
+                // Use load_run_record directly so we can distinguish
+                // "run legitimately deleted by GC" from "data loss".
+                //
+                // gc_stale_initializing_runs_into only deletes Initializing
+                // runs, so a missing run is benign only for cancel_run
+                // (require_active == false). For complete_run / fail_run
+                // (require_active == true) the run must have been Active,
+                // which GC never touches — a missing Active run is corruption.
                 let persisted = match this.load_run_record(tenant, run) {
                     Ok(Some(r)) => r,
-                    Ok(None) => return Err(RunTransitionError::RunNotFound),
+                    Ok(None) if !require_active => return Err(RunTransitionError::RunNotFound),
+                    Ok(None) => {
+                        return Err(RunTransitionError::BackendError(InfraError::corruption(
+                            "run_terminal.exhaust.load_run",
+                            format!("run {run:?} missing (expected Active)"),
+                        )));
+                    }
                     Err(err) => {
                         return Err(RunTransitionError::BackendError(super::map_etcd_err(
                             "run_terminal.exhaust.load_run",
@@ -1959,7 +1969,13 @@ impl AsyncEtcdCoordinator {
                 Box::pin(async move {
                     let persisted = match this.load_run_record(tenant, run).await {
                         Ok(Some(r)) => r,
-                        Ok(None) => return Err(RunTransitionError::RunNotFound),
+                        Ok(None) if !require_active => return Err(RunTransitionError::RunNotFound),
+                        Ok(None) => {
+                            return Err(RunTransitionError::BackendError(InfraError::corruption(
+                                "run_terminal.exhaust.load_run",
+                                format!("run {run:?} missing (expected Active)"),
+                            )));
+                        }
                         Err(err) => {
                             return Err(RunTransitionError::BackendError(super::map_etcd_err(
                                 "run_terminal.exhaust.load_run",
