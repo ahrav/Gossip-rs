@@ -9,7 +9,8 @@ use gossip_contracts::{
     persistence::{
         self, CommitHandle, DoneLedger, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
         DoneLedgerStatus, FindingRecord, FindingsSink, FindingsUpsertBatch, ObservationRecord,
-        OccurrenceRecord, run_conformance,
+        OccurrenceRecord, run_conformance, run_done_ledger_conformance, run_findings_conformance,
+        run_redaction_conformance,
     },
     test_util::{ovid, policy, tenant},
 };
@@ -27,6 +28,31 @@ fn in_memory_backends_pass_persistence_conformance() {
     assert_eq!(report.findings_checks, 4);
     assert_eq!(report.redaction_checks, 3);
     assert_eq!(report.total_checks(), 11);
+}
+
+#[test]
+fn done_ledger_conformance_is_exposed_from_flat_and_module_paths() {
+    let flat_done_ledger = InMemoryDoneLedger::new();
+    let flat_checks = run_done_ledger_conformance(&flat_done_ledger)
+        .unwrap_or_else(|err| panic!("flat done-ledger conformance failed: {err}"));
+    assert_eq!(flat_checks, 4);
+
+    let module_done_ledger = InMemoryDoneLedger::new();
+    let module_checks = persistence::conformance::run_done_ledger_conformance(&module_done_ledger)
+        .unwrap_or_else(|err| panic!("module-path done-ledger conformance failed: {err}"));
+    assert_eq!(module_checks, 4);
+}
+
+#[test]
+fn findings_and_redaction_conformance_are_exposed_from_flat_path() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let findings_checks = run_findings_conformance(&findings_sink)
+        .unwrap_or_else(|err| panic!("flat findings conformance failed: {err}"));
+    assert_eq!(findings_checks, 4);
+
+    let redaction_checks = run_redaction_conformance()
+        .unwrap_or_else(|err| panic!("flat redaction conformance failed: {err}"));
+    assert_eq!(redaction_checks, 3);
 }
 
 /// The reference in-memory backend intentionally accepts batches of any size.
