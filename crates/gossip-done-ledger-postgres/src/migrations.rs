@@ -141,6 +141,13 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[EmbeddedMigration::new(
 /// or connection pooling should construct their own [`Client`] and call
 /// [`apply_all_migrations`] directly.
 ///
+/// # Security
+///
+/// This function connects over plaintext TCP (`NoTls`). It must not be
+/// used in production deployments where the database connection traverses
+/// an untrusted network. Production callers should construct a TLS-enabled
+/// [`Client`] and call [`apply_all_migrations`] directly.
+///
 /// # Errors
 ///
 /// Returns [`DoneLedgerPgMigrationError::Postgres`] on connection or SQL
@@ -332,5 +339,46 @@ mod tests {
                 panic!("unexpected Postgres error variant: {err}");
             }
         }
+    }
+
+    // ── encode_hex ──────────────────────────────────────────────────
+
+    use super::encode_hex;
+
+    #[test]
+    fn encode_hex_produces_lowercase() {
+        assert_eq!(encode_hex(&[0x0a, 0xff, 0x00]), "0aff00");
+    }
+
+    #[test]
+    fn encode_hex_boundary_bytes() {
+        assert_eq!(encode_hex(&[0x00]), "00");
+        assert_eq!(encode_hex(&[0xff]), "ff");
+    }
+
+    #[test]
+    fn encode_hex_empty_input() {
+        assert_eq!(encode_hex(&[]), "");
+    }
+
+    // ── checksum properties ─────────────────────────────────────────
+
+    #[test]
+    fn checksum_is_deterministic() {
+        let m = EmbeddedMigration::new("0001", "CREATE TABLE t (id INT);");
+        assert_eq!(m.checksum(), m.checksum());
+    }
+
+    #[test]
+    fn checksum_is_32_bytes() {
+        let m = EmbeddedMigration::new("0001", "SELECT 1;");
+        assert_eq!(m.checksum().as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn checksum_changes_with_sql_content() {
+        let a = EmbeddedMigration::new("0001", "SELECT 1;");
+        let b = EmbeddedMigration::new("0001", "SELECT 2;");
+        assert_ne!(a.checksum(), b.checksum());
     }
 }

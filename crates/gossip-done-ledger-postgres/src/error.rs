@@ -69,3 +69,40 @@ impl From<postgres::Error> for DoneLedgerPgMigrationError {
         Self::Postgres(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksum_mismatch_display_includes_version_and_hashes() {
+        let err = DoneLedgerPgMigrationError::ChecksumMismatch {
+            version: "0001_test",
+            expected_hex: "aa".repeat(32),
+            found_hex: "bb".repeat(32),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("0001_test"), "should contain version: {msg}");
+        assert!(
+            msg.contains(&"aa".repeat(32)),
+            "should contain expected hex: {msg}"
+        );
+        assert!(
+            msg.contains(&"bb".repeat(32)),
+            "should contain found hex: {msg}"
+        );
+    }
+
+    #[test]
+    fn checksum_mismatch_error_source_is_none() {
+        let err = DoneLedgerPgMigrationError::ChecksumMismatch {
+            version: "0001_test",
+            expected_hex: String::new(),
+            found_hex: String::new(),
+        };
+        assert!(
+            err.source().is_none(),
+            "ChecksumMismatch should have no source error"
+        );
+    }
+}

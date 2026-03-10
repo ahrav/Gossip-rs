@@ -54,3 +54,35 @@ pub const DONE_LEDGER_RUN_SHARD_INDEX: &str = "done_ledger_entries_run_shard_idx
 /// per-transaction via `pg_advisory_xact_lock`, so it is automatically
 /// released when the migration transaction commits or rolls back.
 pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4753444c_50474d31; // "GSDLPGM1"
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advisory_lock_key_matches_ascii_mnemonic() {
+        let bytes = MIGRATION_ADVISORY_LOCK_KEY.to_be_bytes();
+        let ascii = std::str::from_utf8(&bytes).expect("lock key bytes should be valid ASCII");
+        assert_eq!(ascii, "GSDLPGM1");
+    }
+
+    #[test]
+    fn primary_key_column_order() {
+        assert_eq!(
+            DONE_LEDGER_PRIMARY_KEY_COLUMNS,
+            &["tenant_id", "policy_hash", "ovid_hash"]
+        );
+    }
+
+    #[test]
+    fn table_name_format() {
+        assert!(
+            DONE_LEDGER_ENTRIES_TABLE.starts_with("done_ledger_"),
+            "entries table should use done_ledger_ prefix"
+        );
+        assert!(
+            SCHEMA_MIGRATIONS_TABLE.starts_with("done_ledger_"),
+            "migrations table should use done_ledger_ prefix"
+        );
+    }
+}

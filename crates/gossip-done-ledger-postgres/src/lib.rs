@@ -3,7 +3,27 @@
 //! The done-ledger records whether a specific object-version has been processed
 //! under a given tenant and scan policy (see [`DoneLedger`] for the full
 //! contract). This crate provides the PostgreSQL-specific pieces needed to back
-//! that contract:
+//! that contract.
+//!
+//! ## Scope
+//!
+//! This crate is **infrastructure-only**: it provides the PostgreSQL schema
+//! definition, forward-only migration runner, and `u64` ↔ `BIGINT`
+//! type-mapping helpers. It does **not** implement the [`DoneLedger`] trait.
+//! A complete backend crate should depend on this crate for schema setup and
+//! type conversion, then implement [`DoneLedger`] against a live
+//! `postgres::Client`.
+//!
+//! ## Path to conformance
+//!
+//! Any backend implementing [`DoneLedger`] must pass the persistence
+//! conformance harness ([`run_conformance`]) to verify lattice-merge
+//! semantics, idempotent upsert, and batch-get positional alignment. See
+//! `gossip-persistence-inmemory/tests/conformance.rs` for a working example.
+//!
+//! [`run_conformance`]: gossip_contracts::persistence::run_conformance
+//!
+//! ## Modules
 //!
 //! | Module | Responsibility |
 //! |--------|----------------|
@@ -54,3 +74,8 @@ pub use types::{
     PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
     u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
 };
+
+#[cfg(test)]
+mod test_postgres;
+#[cfg(test)]
+mod tests;

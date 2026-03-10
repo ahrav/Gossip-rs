@@ -180,4 +180,95 @@ mod tests {
             }
         );
     }
+
+    // ── Proptest: full-domain bijection verification ────────────────
+
+    use gossip_contracts::test_util::miri_proptest_config;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(miri_proptest_config())]
+
+        #[test]
+        fn bit_pattern_round_trip_full_domain(value: u64) {
+            let stored = u64_to_pg_bigint_bits(value);
+            let restored = pg_bigint_to_u64_bits(stored);
+            prop_assert_eq!(restored, value);
+        }
+
+        #[test]
+        fn ordered_round_trip_nonneg_domain(value in 0u64..=(i64::MAX as u64)) {
+            let stored = u64_to_pg_bigint_checked(value, "test_field")
+                .expect("value within i64::MAX must succeed");
+            let restored = pg_bigint_nonnegative_to_u64(stored, "test_field")
+                .expect("non-negative stored value must decode");
+            prop_assert_eq!(restored, value);
+        }
+
+        #[test]
+        fn ordered_rejects_above_i64_max(value in ((i64::MAX as u64) + 1)..=u64::MAX) {
+            let err = u64_to_pg_bigint_checked(value, "test_field");
+            prop_assert!(err.is_err(), "values above i64::MAX must be rejected");
+        }
+    }
+
+    // ── Edge cases ──────────────────────────────────────────────────
+
+    #[test]
+    fn bit_pattern_round_trip_i64_min() {
+        // i64::MIN as u64 is 2^63, which should round-trip through bit-pattern mode.
+        let value = i64::MIN as u64;
+        let stored = u64_to_pg_bigint_bits(value);
+        assert_eq!(stored, i64::MIN);
+        let restored = pg_bigint_to_u64_bits(stored);
+        assert_eq!(restored, value);
+    }
+
+    #[test]
+    fn ordered_mode_zero() {
+        let stored = u64_to_pg_bigint_checked(0, "fence_epoch")
+            .expect("zero should be valid in ordered mode");
+        assert_eq!(stored, 0i64);
+        let restored = pg_bigint_nonnegative_to_u64(stored, "fence_epoch")
+            .expect("zero should decode in ordered mode");
+        assert_eq!(restored, 0u64);
+    }
+
+    #[test]
+    fn ordered_mode_rejects_i64_min_as_stored_value() {
+        let err = pg_bigint_nonnegative_to_u64(i64::MIN, "started_at")
+            .expect_err("i64::MIN is negative and must be rejected");
+        assert_eq!(
+            err,
+            PgU64ConversionError::NegativeStoredValue {
+                field: "started_at",
+                value: i64::MIN,
+            }
+        );
+    }
+
+    // ── Display tests ───────────────────────────────────────────────
+
+    #[test]
+    fn conversion_error_display_includes_field_name() {
+        let ordered_err = PgU64ConversionError::OrderedOutOfRange {
+            field: "bytes_scanned",
+            value: u64::MAX,
+        };
+        let msg = ordered_err.to_string();
+        assert!(
+            msg.contains("bytes_scanned"),
+            "Display should include field name: {msg}"
+        );
+
+        let negative_err = PgU64ConversionError::NegativeStoredValue {
+            field: "started_at",
+            value: -42,
+        };
+        let msg = negative_err.to_string();
+        assert!(
+            msg.contains("started_at"),
+            "Display should include field name: {msg}"
+        );
+    }
 }
