@@ -16,10 +16,10 @@
 //! 2. **Advisory lock** — a transaction-scoped `pg_advisory_xact_lock` on
 //!    [`MIGRATION_ADVISORY_LOCK_KEY`] serialises concurrent migration
 //!    attempts so only one transaction mutates the schema at a time.
-//!    During initial bootstrap (history table does not yet exist),
-//!    PostgreSQL's DDL lock on the `CREATE TABLE` provides equivalent
-//!    serialization; the advisory lock becomes the primary guard on
-//!    subsequent startups when the `CREATE TABLE IF NOT EXISTS` is a no-op.
+//!    The advisory lock is acquired before any DDL, so it is the
+//!    primary serialization mechanism in all cases — including initial
+//!    bootstrap when no tables exist yet (advisory locks are purely
+//!    in-memory and have no table dependency).
 //! 3. **Checksum gate** — if a version already appears in the history table,
 //!    the runner verifies its checksum matches the embedded SQL.
 //!    A mismatch produces [`DoneLedgerPgMigrationError::ChecksumMismatch`].
@@ -456,6 +456,12 @@ mod tests {
             "0001_done_ledger_entries",
             "2c6a36c62f0c6f8e66e6d7c71b00b49a13c61f3a4f02c4c384960e0a9f539dd5",
         )];
+
+        assert_eq!(
+            expected.len(),
+            MIGRATIONS.len(),
+            "every embedded migration must have a golden checksum entry"
+        );
 
         for (version, golden_hex) in expected {
             let m = MIGRATIONS

@@ -74,14 +74,22 @@ fn concurrent_migrations_both_succeed() {
     let url = crate::test_postgres::create_test_db();
     let url2 = url.clone();
 
+    // Barrier ensures both threads attempt migration at roughly the same
+    // instant, maximising the chance of real advisory-lock contention.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b1 = barrier.clone();
+    let b2 = barrier.clone();
+
     let t1 = std::thread::spawn(move || {
         let mut c =
             postgres::Client::connect(&url, postgres::NoTls).expect("thread 1 connect failed");
+        b1.wait();
         apply_all_migrations(&mut c)
     });
     let t2 = std::thread::spawn(move || {
         let mut c =
             postgres::Client::connect(&url2, postgres::NoTls).expect("thread 2 connect failed");
+        b2.wait();
         apply_all_migrations(&mut c)
     });
 
