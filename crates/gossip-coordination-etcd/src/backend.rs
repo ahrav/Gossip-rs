@@ -67,7 +67,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use etcd_client::{Compare, CompareOp};
+use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::shard_spec::ShardSpecRef;
 use gossip_coordination::{
     ByteSlab, CursorSemantics, CursorUpdate, InitialShardInput, Lease, LogicalTime, OpId,
@@ -138,6 +138,101 @@ enum CasOutcome<T> {
     RetryNeeded,
 }
 
+/// Builder for etcd compare-and-swap (CAS) transactions.
+///
+/// Coordination mutations assemble a transaction in three phases:
+/// 1. **Compares** — preconditions that must hold (revision equality,
+///    key absence, owner value/lease identity).
+/// 2. **Success ops** — puts and deletes that execute atomically if all
+///    compares pass.
+/// 3. **Execute** — submit via [`TxnBuilder::execute`] (sync) or
+///    [`TxnBuilder::execute_async`] (async), which returns
+///    [`CasOutcome::Committed`] or [`CasOutcome::RetryNeeded`].
+///
+/// Using a builder keeps compare/op assembly explicit at call sites
+/// while eliminating the repeated `Txn::new().when(...).and_then(...)`
+/// ceremony.
+#[derive(Default)]
+struct TxnBuilder {
+    compares: Vec<Compare>,
+    success_ops: Vec<TxnOp>,
+}
+
+impl TxnBuilder {
+    /// Create an empty transaction builder.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a builder pre-loaded with compare clauses.
+    ///
+    /// Takes ownership of the caller's `Vec<Compare>`, avoiding a second
+    /// allocation that `new() + compare_all()` would incur.
+    fn from_compares(compares: Vec<Compare>) -> Self {
+        Self {
+            compares,
+            success_ops: Vec::new(),
+        }
+    }
+
+    /// Add a single compare clause.
+    fn compare(&mut self, compare: Compare) -> &mut Self {
+        self.compares.push(compare);
+        self
+    }
+
+    /// Add multiple compare clauses.
+    fn compare_all(&mut self, compares: impl IntoIterator<Item = Compare>) -> &mut Self {
+        self.compares.extend(compares);
+        self
+    }
+
+    /// Add a put operation without options.
+    fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> &mut Self {
+        self.success_ops.push(TxnOp::put(key, value, None));
+        self
+    }
+
+    /// Add a put operation with explicit options.
+    fn put_with_options(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        options: PutOptions,
+    ) -> &mut Self {
+        self.success_ops.push(TxnOp::put(key, value, Some(options)));
+        self
+    }
+
+    /// Add a delete operation without options.
+    fn delete(&mut self, key: impl Into<Vec<u8>>) -> &mut Self {
+        self.success_ops.push(TxnOp::delete(key, None));
+        self
+    }
+
+    /// Add multiple already-constructed transaction operations.
+    fn ops(&mut self, ops: impl IntoIterator<Item = TxnOp>) -> &mut Self {
+        self.success_ops.extend(ops);
+        self
+    }
+
+    /// Build the etcd transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no compare clauses were added. An empty compare set
+    /// produces an unconditional transaction — always a logic error in
+    /// CAS-guarded coordination code.
+    fn build(self) -> Txn {
+        assert!(
+            !self.compares.is_empty(),
+            "TxnBuilder::build called with no compare clauses — \
+             this produces an unconditional transaction"
+        );
+        Txn::new().when(self.compares).and_then(self.success_ops)
+    }
+}
+
 /// A run record loaded from etcd, paired with its `mod_revision` for
 /// compare-and-swap transaction guards.
 ///
@@ -174,6 +269,12 @@ struct PersistedOwner {
 /// then builds a CAS transaction conditioned on `mod_revision`. The slab
 /// is co-located with the record because `ShardRecord` pools its
 /// variable-length fields (spec, cursor, spawned) in a `ByteSlab`.
+///
+/// # Lifetime coupling
+///
+/// The `record` borrows from `slab` via `ByteSlot` handles; the `Drop`
+/// impl deallocates pooled fields before the slab itself is freed,
+/// preventing double-free or dangling-slot access.
 struct PersistedShard {
     record: ShardRecord,
     /// Slab backing the pooled fields in `record` (`spec`, `cursor`, `spawned`).
@@ -220,7 +321,7 @@ impl Drop for PersistedShard {
 }
 
 // ---------------------------------------------------------------------------
-// Free functions — key parsing, CAS delay, terminal transitions
+// Free functions — key parsing, CAS delay, terminal transitions, encoding
 // ---------------------------------------------------------------------------
 
 /// Compute a backoff delay for CAS retry loops.
@@ -320,8 +421,7 @@ fn apply_terminal_run_transition(
 }
 
 // ---------------------------------------------------------------------------
-// De-duplicated helpers — shared by both EtcdCoordinator and
-// AsyncEtcdCoordinator (previously identical associated functions on each)
+// Shared helpers — used by both sync and async coordinators
 // ---------------------------------------------------------------------------
 
 /// Create a decode slab sized from the blob length, clamped to
@@ -330,8 +430,8 @@ fn apply_terminal_run_transition(
 /// Pooled fields (spec key/range, cursor key/token, spawned IDs) are
 /// copied into the slab during decode. The raw blob stores them
 /// length-prefixed; the slab stores them contiguously. A 3×
-/// multiplier on the blob plus a fixed pad for small-record overhead
-/// covers typical records without over-allocating.
+/// multiplier on the blob length plus a fixed 1 KiB pad for small-record
+/// overhead covers typical records without over-allocating.
 fn make_decode_slab(blob_len: usize) -> ByteSlab {
     let cap = blob_len
         .saturating_mul(3)
@@ -484,6 +584,66 @@ fn map_etcd_err(
             gossip_coordination::InfraError::transient(operation, err)
         }
     }
+}
+
+// -- Shared lease/CAS validation helpers --
+//
+// These are used by both `EtcdCoordinator` and `AsyncEtcdCoordinator`
+// trait impls across `shard_coordination` and `run_management`.
+
+/// Validate a presented lease against a loaded shard's persisted state.
+///
+/// Checks protocol-level lease validity (expiry, tenant, status) via
+/// [`gossip_coordination::validate_lease`], then verifies that the shard's
+/// current owner binding matches the presented lease's worker + fence
+/// epoch. Returns `map_stale_fence(presented, current)` on mismatch.
+fn validate_loaded_shard_lease<E>(
+    now: LogicalTime,
+    tenant: TenantId,
+    lease: &Lease,
+    persisted: &PersistedShard,
+    map_stale_fence: impl FnOnce(gossip_coordination::FenceEpoch, gossip_coordination::FenceEpoch) -> E,
+) -> Result<(), E>
+where
+    E: From<gossip_coordination::CoordError>,
+{
+    gossip_coordination::validate_lease(now, tenant, lease, &persisted.record)?;
+    if !persisted.owner_matches_lease(lease) {
+        return Err(map_stale_fence(lease.fence(), persisted.record.fence_epoch));
+    }
+    Ok(())
+}
+
+/// Build the canonical shard-owner CAS guards:
+/// shard `mod_revision` + owner value/lease checks.
+///
+/// Returns a `Vec<Compare>` with 4 clauses:
+/// 1. Shard record `mod_revision` equality.
+/// 2. Owner key exists (version > 0).
+/// 3. Owner key value matches.
+/// 4. Owner key etcd lease ID matches.
+fn build_shard_owner_cas(
+    shard_record_key: ShardRecordKey,
+    owner_key: ShardOwnerKey,
+    persisted: &PersistedShard,
+    owner_value: Vec<u8>,
+) -> Vec<Compare> {
+    let owner_lease_id = persisted
+        .owner
+        .as_ref()
+        .expect("validated owner must carry an etcd lease id")
+        .lease_id;
+    let mut compares = Vec::with_capacity(4);
+    compares.push(compare_shard_revision(
+        shard_record_key,
+        persisted.mod_revision,
+    ));
+    compares.extend(compare_owner_present(
+        owner_key,
+        owner_value,
+        owner_lease_id,
+    ));
+    compares
 }
 
 // -- CAS guard helpers --

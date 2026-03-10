@@ -2901,7 +2901,7 @@ fn shard_limit_split_replace_uses_full_child_count() {
     let max_total: usize = 100;
 
     let counts = ShardCountSnapshot {
-        tenant: 10, // includes the parent being split
+        tenant: 10,
         total: 10,
     };
 
@@ -2938,6 +2938,56 @@ fn shard_limit_split_replace_uses_full_child_count_global() {
     assert_eq!(v.additional, num_children);
     assert_eq!(v.max, max_total);
     assert_eq!(v.scope, ShardLimitScope::Global);
+}
+
+/// A 1-way split (one child replaces the parent) adds 1 record to
+/// storage. When the tenant is already at ceiling - 1, adding 1 lands
+/// exactly at the limit and must be allowed.
+#[test]
+fn shard_limit_one_way_split_at_ceiling_is_allowed() {
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
+
+    let num_children: usize = 1;
+    let counts = ShardCountSnapshot {
+        tenant: 10,
+        total: 10,
+    };
+    let result = shard_limit_violation(
+        counts,
+        num_children, // 1 child added to storage
+        11,           // tenant ceiling: 10 + 1 = 11, exactly at limit
+        11,           // global ceiling: same
+    );
+    assert!(
+        result.is_none(),
+        "1-way split landing exactly at ceiling must be allowed"
+    );
+}
+
+/// A 3-way split that pushes post-split count one past the tenant limit.
+/// Verifies the violation carries exact field values for the +1 overshoot.
+#[test]
+fn shard_limit_three_way_split_just_over_tenant_limit() {
+    use gossip_coordination::{ShardCountSnapshot, ShardLimitViolation, shard_limit_violation};
+
+    let num_children: usize = 3;
+    // 10 persisted. 3-way split → 3 children added. Post-split = 13.
+    // Ceiling is 12 so 10 + 3 = 13 > 12 → violation by exactly 1.
+    let counts = ShardCountSnapshot {
+        tenant: 10,
+        total: 10,
+    };
+    let v = shard_limit_violation(counts, num_children, 12, 100)
+        .expect("3-way split exceeding tenant limit by 1 must be rejected");
+    assert_eq!(
+        v,
+        ShardLimitViolation {
+            current: 10,
+            additional: 3,
+            max: 12,
+            scope: ShardLimitScope::PerTenant,
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
