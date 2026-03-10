@@ -218,13 +218,13 @@ impl TxnBuilder {
 
     /// Build the etcd transaction.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     ///
     /// Panics if no compare clauses were added. An empty compare set
     /// produces an unconditional transaction — always a logic error in
     /// CAS-guarded coordination code.
     fn build(self) -> Txn {
-        debug_assert!(
+        assert!(
             !self.compares.is_empty(),
             "TxnBuilder::build called with no compare clauses — \
              this produces an unconditional transaction"
@@ -421,7 +421,7 @@ fn apply_terminal_run_transition(
 }
 
 // ---------------------------------------------------------------------------
-// De-duplicated helpers — shared by both sync and async coordinators
+// Shared helpers — used by both sync and async coordinators
 // ---------------------------------------------------------------------------
 
 /// Create a decode slab sized from the blob length, clamped to
