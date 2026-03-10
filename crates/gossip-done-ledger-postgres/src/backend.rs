@@ -418,48 +418,49 @@ fn upsert_record(
 /// schema drift.
 ///
 /// Each BYTEA column allocates a `Vec<u8>` (the `postgres` crate's return
-/// type for `row.get`). This is a WARM-path cost accepted for simplicity;
+/// type for `row.try_get`). This is a WARM-path cost accepted for simplicity;
 /// a crate-local newtype with a `FromSql` impl would eliminate 3
 /// allocations per row if profiling shows this is material.
 fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
-    let tenant_id = TenantId::from_bytes(decode_fixed_32(row.get("tenant_id"), "tenant_id")?);
+    let tenant_id = TenantId::from_bytes(decode_fixed_32(row.try_get("tenant_id")?, "tenant_id")?);
     let policy_hash =
-        PolicyHash::from_bytes(decode_fixed_32(row.get("policy_hash"), "policy_hash")?);
-    let ovid_hash = OvidHash::from_bytes(decode_fixed_32(row.get("ovid_hash"), "ovid_hash")?);
+        PolicyHash::from_bytes(decode_fixed_32(row.try_get("policy_hash")?, "policy_hash")?);
+    let ovid_hash = OvidHash::from_bytes(decode_fixed_32(row.try_get("ovid_hash")?, "ovid_hash")?);
 
-    let status_rank: i16 = row.get("status");
+    let status_rank: i16 = row.try_get("status")?;
     let status_rank_u8 = u8::try_from(status_rank)
         .map_err(|_| DoneLedgerPgConversionError::UnknownStatusRank { rank: status_rank })?;
     let status = DoneLedgerStatus::from_rank(status_rank_u8)
         .ok_or(DoneLedgerPgConversionError::UnknownStatusRank { rank: status_rank })?;
 
-    let bytes_scanned = pg_bigint_nonnegative_to_u64(row.get("bytes_scanned"), "bytes_scanned")
-        .map_err(DoneLedgerPgConversionError::from)?;
+    let bytes_scanned =
+        pg_bigint_nonnegative_to_u64(row.try_get("bytes_scanned")?, "bytes_scanned")
+            .map_err(DoneLedgerPgConversionError::from)?;
 
-    let findings_count_raw: i32 = row.get("findings_count");
+    let findings_count_raw: i32 = row.try_get("findings_count")?;
     let findings_count = u32::try_from(findings_count_raw).map_err(|_| {
         DoneLedgerPgConversionError::FindingsCountOutOfRange {
             value: i64::from(findings_count_raw),
         }
     })?;
 
-    let run_id = RunId::from_raw(pg_bigint_to_u64_bits(row.get("run_id")));
-    let shard_id = ShardId::from_raw(pg_bigint_to_u64_bits(row.get("shard_id")));
+    let run_id = RunId::from_raw(pg_bigint_to_u64_bits(row.try_get("run_id")?));
+    let shard_id = ShardId::from_raw(pg_bigint_to_u64_bits(row.try_get("shard_id")?));
     let fence_epoch = FenceEpoch::from_raw(
-        pg_bigint_nonnegative_to_u64(row.get("fence_epoch"), "fence_epoch")
+        pg_bigint_nonnegative_to_u64(row.try_get("fence_epoch")?, "fence_epoch")
             .map_err(DoneLedgerPgConversionError::from)?,
     );
     let started_at = LogicalTime::from_raw(
-        pg_bigint_nonnegative_to_u64(row.get("started_at"), "started_at")
+        pg_bigint_nonnegative_to_u64(row.try_get("started_at")?, "started_at")
             .map_err(DoneLedgerPgConversionError::from)?,
     );
     let finished_at = LogicalTime::from_raw(
-        pg_bigint_nonnegative_to_u64(row.get("finished_at"), "finished_at")
+        pg_bigint_nonnegative_to_u64(row.try_get("finished_at")?, "finished_at")
             .map_err(DoneLedgerPgConversionError::from)?,
     );
 
     let error_code = row
-        .get::<_, Option<String>>("error_code")
+        .try_get::<_, Option<String>>("error_code")?
         .map(DoneLedgerErrorCode::try_new)
         .transpose()
         .map_err(|source| DoneLedgerPgError::PersistedRecordInvalid {
