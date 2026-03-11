@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use gossip_contracts::connector::ItemKey;
 use gossip_contracts::identity::{ConnectorInstanceIdHash, StableItemId};
 use gossip_scan_driver::{
@@ -66,6 +66,16 @@ use scanner_scheduler::store::{
 use crate::common::derive_stable_item_id;
 use crate::{MemItem, connector_tag_for_kind};
 
+/// Backpressure cap for scan-event channels. Sized to absorb scheduler
+/// burst without blocking on well-behaved sinks. The forwarder thread
+/// drains events sequentially, so a full channel stalls the worker pool
+/// until the sink catches up — preventing unbounded memory growth.
+const EVENT_CHANNEL_CAP: usize = 8_192;
+
+/// Backpressure cap for commit-sink channels. Commits are heavier
+/// (identity derivation) so a lower bound is appropriate.
+const COMMIT_CHANNEL_CAP: usize = 1_024;
+
 /// Diagnostic verbosity for git scan debug output.
 ///
 /// Returned via [`execute_git_assignment`] and printed to stderr by the
@@ -85,6 +95,11 @@ pub enum GitDebugLevel {
 ///
 /// Passed directly to git scan entry points by the runtime layer,
 /// keeping the source-neutral `ScanExecutionConfig` free of git types.
+///
+/// Lives in `gossip-connectors` (not `gossip-scan-driver`) because
+/// it depends on `scanner-git` types (`GitScanMode`, `MergeDiffMode`).
+/// Moving it to the vocabulary crate would pull `scanner-git` into
+/// every consumer of `gossip-scan-driver`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GitExecutionConfig {
     /// Stable repository identifier used to namespace persisted keys.
@@ -273,10 +288,10 @@ impl ScanDriver for FsScanDriver {
         cancel: &CancellationToken,
     ) -> Result<ScanReport> {
         std::thread::scope(|scope| -> Result<ScanReport> {
-            let (event_tx, event_rx) = unbounded();
+            let (event_tx, event_rx) = bounded(EVENT_CHANNEL_CAP);
             let event_forwarder = scope.spawn(move || forward_core_events(out, event_rx));
 
-            let (commit_tx, commit_rx) = unbounded();
+            let (commit_tx, commit_rx) = bounded(COMMIT_CHANNEL_CAP);
             let commit_forwarder = scope.spawn(move || forward_commits(commit, commit_rx));
 
             let mut scan_cfg = ParallelScanConfig {
@@ -375,7 +390,7 @@ impl GitScanDriver {
         }
 
         std::thread::scope(|scope| -> Result<ScanReport> {
-            let (event_tx, event_rx) = unbounded();
+            let (event_tx, event_rx) = bounded(EVENT_CHANNEL_CAP);
             let event_forwarder = scope.spawn(move || forward_events(out, event_rx));
 
             let git_sink: Arc<dyn GitEventSink> =

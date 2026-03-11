@@ -39,18 +39,14 @@ use anyhow::{Error as AnyError, Result};
 use gossip_contracts::identity::{TenantId, TenantSecretKey};
 use gossip_scan_driver::{Assignment, CancellationToken, CursorUpdate, ScanReport};
 
-use gossip_connectors::{GitExecutionConfig, execute_git_assignment};
-use gossip_scan_driver::ConnectorKind;
+use gossip_connectors::GitExecutionConfig;
 
 use crate::commit_sink::DurableCommitSink;
 use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink, IdentityChainRecord,
     StoredCoreEvent, StoredGitEvent,
 };
-use crate::{
-    AssignmentOutcome, RuntimeEngineConfig, ScanBudgets, ScanRuntimeError,
-    execute_assignment_with_config, runtime_engine,
-};
+use crate::{RuntimeEngineConfig, ScanBudgets, ScanRuntimeError, execute_assignment_with_config};
 
 /// Lease payload consumed by the distributed runtime.
 ///
@@ -60,7 +56,10 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct ShardLease {
     /// Unique shard identifier used for done-ledger tracking.
-    pub shard_id: String,
+    ///
+    /// `Arc<str>` avoids per-clone heap allocation when the ID is shared
+    /// across the event sink, commit sink, and coordinator calls.
+    pub shard_id: Arc<str>,
     /// Scan assignment to execute for this shard.
     pub assignment: Assignment,
     /// Tenant owning this shard, used for identity derivation.
@@ -78,12 +77,18 @@ pub struct ShardLease {
 /// - `complete_shard` is idempotent or at-least-once tolerant, because
 ///   crash recovery may replay the call.
 /// - `mark_shard_done` is called only after `complete_shard` succeeds.
+/// - `release_shard` must validate lease ownership — releasing another
+///   worker's lease is a logic error.
 /// - The `event_recorder` is safe to share across the event and commit
 ///   sinks for a single shard.
 pub trait DistributedCoordinator: Send + Sync {
     /// Acquire the next lease to process, or `None` when no work remains.
     fn acquire_shard(&self) -> Result<Option<ShardLease>>;
     /// Release a lease without marking it complete (used by done-ledger skips).
+    ///
+    /// Implementations MUST verify that the lease belongs to the calling worker's
+    /// active session before releasing. Releasing a lease acquired by another
+    /// worker or session is a logic error and must be rejected or ignored.
     fn release_shard(&self, lease: &ShardLease) -> Result<()>;
     /// Mark one lease complete with optional checkpoint metadata.
     fn complete_shard(
@@ -198,10 +203,10 @@ pub fn run_worker(
             continue;
         }
 
-        let sink = CoordinationEventSink::new(Arc::clone(&recorder), lease.shard_id.clone());
+        let sink = CoordinationEventSink::new(Arc::clone(&recorder), Arc::clone(&lease.shard_id));
         let commit = DurableCommitSink::new(
             Arc::clone(&recorder),
-            lease.shard_id.clone(),
+            Arc::clone(&lease.shard_id),
             lease.tenant_id,
             lease.tenant_secret_key,
         );
@@ -213,39 +218,16 @@ pub fn run_worker(
         runtime.filesystem.emit_findings_to_commit_sink = true;
 
         let engine_config = RuntimeEngineConfig::default();
-        let outcome = if lease.assignment.connector_kind == ConnectorKind::Git {
-            // Git assignments use the dedicated git entry point so
-            // git-specific events are preserved in the coordination sink.
-            let engine =
-                runtime_engine(&engine_config).map_err(DistributedRuntimeError::Runtime)?;
-            let (scan_report, checkpoint_hint, debug_output) = execute_git_assignment(
-                &lease.assignment,
-                engine,
-                &runtime,
-                &GitExecutionConfig::default(),
-                &sink,
-                &cancel,
-            )
-            .map_err(|e| DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(e)))?;
-            AssignmentOutcome {
-                report: scan_report,
-                checkpoint_hint,
-                debug_output,
-            }
-        } else {
-            // Non-git assignments use the source-neutral trait path.
-            // CoordinationEventSink implements EventOutput, so trait
-            // upcasting provides the &dyn EventOutput reference.
-            execute_assignment_with_config(
-                &lease.assignment,
-                runtime,
-                &engine_config,
-                &sink,
-                &commit,
-                &cancel,
-            )
-            .map_err(DistributedRuntimeError::Runtime)?
-        };
+        let outcome = execute_assignment_with_config(
+            &lease.assignment,
+            runtime,
+            &engine_config,
+            &GitExecutionConfig::default(),
+            &sink,
+            &commit,
+            &cancel,
+        )
+        .map_err(DistributedRuntimeError::Runtime)?;
 
         coordinator
             .complete_shard(&lease, outcome.checkpoint_hint, outcome.report)
@@ -370,7 +352,7 @@ impl DistributedCoordinator for InMemoryCoordinator {
             .lock()
             .expect("state lock")
             .released
-            .push(lease.shard_id.clone());
+            .push(lease.shard_id.to_string());
         Ok(())
     }
 
@@ -385,7 +367,7 @@ impl DistributedCoordinator for InMemoryCoordinator {
             .expect("state lock")
             .completed
             .push(CompletedShard {
-                shard_id: lease.shard_id.clone(),
+                shard_id: lease.shard_id.to_string(),
                 checkpoint,
                 report,
             });
@@ -465,7 +447,7 @@ mod tests {
 
     fn fs_lease(shard_id: &str, path: &std::path::Path) -> ShardLease {
         ShardLease {
-            shard_id: shard_id.to_owned(),
+            shard_id: Arc::from(shard_id),
             assignment: Assignment {
                 job_id: format!("job-{shard_id}"),
                 connector_kind: ConnectorKind::Filesystem,
@@ -484,7 +466,7 @@ mod tests {
 
     fn git_lease(shard_id: &str, repo_root: &std::path::Path) -> ShardLease {
         ShardLease {
-            shard_id: shard_id.to_owned(),
+            shard_id: Arc::from(shard_id),
             assignment: Assignment {
                 job_id: format!("job-{shard_id}"),
                 connector_kind: ConnectorKind::Git,

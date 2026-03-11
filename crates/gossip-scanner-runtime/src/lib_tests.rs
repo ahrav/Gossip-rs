@@ -442,7 +442,7 @@ fn scan_fs_distributed_matches_cli_findings_for_fixture() {
             .expect("canonicalize cli run");
 
     let lease = distributed::ShardLease {
-        shard_id: "parity-shard".to_owned(),
+        shard_id: std::sync::Arc::from("parity-shard"),
         assignment: Assignment {
             job_id: "parity-job".to_owned(),
             connector_kind: ConnectorKind::Filesystem,
