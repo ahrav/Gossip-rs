@@ -72,7 +72,13 @@ WHERE tenant_id = $1
   AND ovid_hash = ANY($3::bytea[])
 "#;
 
-/// Monotonic done-ledger UPSERT used by [`crate::DoneLedgerPg`].
+/// Bulk monotonic done-ledger UPSERT used by [`crate::DoneLedgerPg`].
+///
+/// Accepts 12 array parameters (one per column) and uses `unnest()` to
+/// expand them into rows. This sends a single SQL statement per batch
+/// regardless of batch size, avoiding the per-row round-trip cost of a
+/// loop-based approach and sidestepping the PostgreSQL 65,535 bind-parameter
+/// limit that a dynamic multi-row `VALUES` clause would hit at ~5,400 rows.
 ///
 /// Merge behavior mirrors the in-memory reference backend so that the
 /// Rust [`DoneLedgerRecord::merge`](gossip_contracts::persistence::DoneLedgerRecord::merge) method and the SQL `ON CONFLICT`
@@ -106,8 +112,20 @@ INSERT INTO done_ledger_entries (
     started_at,
     finished_at,
     error_code
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+)
+SELECT * FROM unnest(
+    $1::bytea[],
+    $2::bytea[],
+    $3::bytea[],
+    $4::smallint[],
+    $5::bigint[],
+    $6::int[],
+    $7::bigint[],
+    $8::bigint[],
+    $9::bigint[],
+    $10::bigint[],
+    $11::bigint[],
+    $12::text[]
 )
 ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET
     status = GREATEST(EXCLUDED.status, done_ledger_entries.status),

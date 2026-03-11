@@ -252,11 +252,6 @@ pub enum DoneLedgerPgError {
         started_at: u64,
         finished_at: u64,
     },
-    /// A single-row upsert within a batch transaction failed.
-    UpsertFailed {
-        index: usize,
-        source: Box<DoneLedgerPgError>,
-    },
     /// Persisted row failed decode-time contract validation.
     PersistedRecordInvalid {
         context: &'static str,
@@ -308,9 +303,6 @@ impl fmt::Display for DoneLedgerPgError {
                 f,
                 "record at index {index}: started_at ({started_at}) exceeds finished_at ({finished_at})"
             ),
-            Self::UpsertFailed { index, source } => {
-                write!(f, "upsert failed at record index {index}: {source}")
-            }
             Self::Conversion(source) => {
                 write!(f, "postgres done-ledger conversion failed: {source}")
             }
@@ -329,7 +321,6 @@ impl Error for DoneLedgerPgError {
         match self {
             Self::Postgres(source) => Some(source),
             Self::Migration(source) => Some(source),
-            Self::UpsertFailed { source, .. } => Some(source),
             Self::MutexPoisoned | Self::BatchTooLarge { .. } | Self::ProvenanceInvalid { .. } => {
                 None
             }
