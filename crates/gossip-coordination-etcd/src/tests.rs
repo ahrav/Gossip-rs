@@ -59,11 +59,11 @@ use gossip_contracts::coordination::{
 };
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
-    derive_split_shard_id, AcquireError, AcquireScratch, ByteSlab, CheckpointError,
-    CoordinationBackend, DerivedShardKind, IdempotentOutcome, InitialShardInput, ParkReason,
-    RegisterShardsError, RunConfig, RunManagement, RunStatus, RunTransitionError, ShardLimitScope,
-    ShardRecord, ShardStatus, SplitReplaceError, SplitResidualError, UnparkError,
-    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS,
+    AcquireError, AcquireScratch, ByteSlab, CheckpointError, CoordinationBackend,
+    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, IdempotentOutcome,
+    InitialShardInput, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
+    RunTransitionError, ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError,
+    SplitResidualError, UnparkError, derive_split_shard_id,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -3047,7 +3047,7 @@ fn split_replace_rejects_over_cap_max_children_per_op() {
 /// Post-split stored count = 10 + 2 = 12 > 11, so the split is rejected.
 #[test]
 fn shard_limit_split_replace_uses_full_child_count() {
-    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot};
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 2;
     let max_per_tenant: usize = 11;
@@ -3073,7 +3073,7 @@ fn shard_limit_split_replace_uses_full_child_count() {
 /// Post-split stored count = 49 + 3 = 52 > 51, so the split is rejected.
 #[test]
 fn shard_limit_split_replace_uses_full_child_count_global() {
-    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot};
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 3;
     let max_per_tenant: usize = 1000;
@@ -3098,7 +3098,7 @@ fn shard_limit_split_replace_uses_full_child_count_global() {
 /// exactly at the limit and must be allowed.
 #[test]
 fn shard_limit_one_way_split_at_ceiling_is_allowed() {
-    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot};
+    use gossip_coordination::{ShardCountSnapshot, shard_limit_violation};
 
     let num_children: usize = 1;
     let counts = ShardCountSnapshot {
@@ -3121,7 +3121,7 @@ fn shard_limit_one_way_split_at_ceiling_is_allowed() {
 /// Verifies the violation carries exact field values for the +1 overshoot.
 #[test]
 fn shard_limit_three_way_split_just_over_tenant_limit() {
-    use gossip_coordination::{shard_limit_violation, ShardCountSnapshot, ShardLimitViolation};
+    use gossip_coordination::{ShardCountSnapshot, ShardLimitViolation, shard_limit_violation};
 
     let num_children: usize = 3;
     // 10 persisted. 3-way split → 3 children added. Post-split = 13.
@@ -3627,13 +3627,10 @@ fn concurrent_split_replace_respects_per_tenant_limit() {
     let a_ok = result_a.is_ok();
     let b_ok = result_b.is_ok();
 
-    // With limit=4 and 2 initial shards: first split adds 1 child
-    // (net: 2 parents + 1 child = 3, but parent stays as terminal = 3 total).
-    // Actually split_replace creates N children and parent goes Split (terminal).
-    // Each split here creates 1 child + keeps parent as Split. The net persisted
-    // count grows: 2 initial -> after first split: 3 (parent Split + 1 child + 1 other).
-    // After second split: 4 (parent Split + 1 child + other parent Split + 1 child).
-    // With limit=4 both CAN fit. So let's just verify the counter is consistent.
+    // Each split_replace adds 2 children to the counter. Starting
+    // from 2, the first split brings the counter to 4 (at the limit).
+    // The second split would need 4+2=6 > limit=4, so the CAS guard
+    // ensures at most one succeeds. Verify the counter is consistent.
     let verifier = test_coordinator_in_namespace(&namespace);
     let counter = verifier
         .test_load_tenant_shard_count(test_tenant())
