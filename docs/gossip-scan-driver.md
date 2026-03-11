@@ -286,15 +286,18 @@ The crate defines only traits and types. Concrete implementations live in `gossi
 | Factory | Driver | Source | Backend |
 |---------|--------|--------|---------|
 | `FilesystemScanSourceFactory` | `FsScanDriver` | `AssignmentSource::Filesystem` | `parallel_scan_dir` from `scanner-scheduler` |
-| `GitScanSourceFactory` | `GitScanDriver` | `AssignmentSource::Git` | `run_git_scan` from `scanner-git` |
 | `InMemoryScanSourceFactory` | `InMemoryScanDriver` | `AssignmentSource::InMemory` | Direct iteration over `MemItem` slices |
+
+> **Git scans** bypass the factory/trait path entirely. The standalone
+> `execute_git_assignment()` function handles git assignments directly,
+> accepting `&dyn GitEventOutput` for git-specific events that the
+> source-neutral `ScanDriver` trait cannot express.
 
 ### Capability Matrix
 
 | Factory | `supports_checkpoint_hints` | `supports_cooperative_cancel` |
 |---------|:---------------------------:|:-----------------------------:|
-| Filesystem | yes | no |
-| Git | no | no |
+| Filesystem | no | no |
 | InMemory | yes | yes |
 
 ---

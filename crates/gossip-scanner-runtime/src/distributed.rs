@@ -218,6 +218,10 @@ pub fn run_worker(
         runtime.filesystem.emit_findings_to_commit_sink = true;
 
         let engine_config = RuntimeEngineConfig::default();
+        // Distributed git scanning does not yet carry per-lease execution
+        // config; the defaults (repo_id: 1, OdbBlobFast, AllParents) are
+        // acceptable while distributed git support is nascent.  Wire-through
+        // via ShardLease or DistributedRuntimeConfig is the intended follow-up.
         let outcome = execute_assignment_with_config(
             &lease.assignment,
             runtime,
