@@ -322,6 +322,8 @@ jobs:
   # ── Fuzz Pack Smoke (PR only) ───────────────────────────────────────
   # Quick sanity check on the 4 pack-format fuzz targets when fuzz or
   # source files change in a PR. Each target runs for 20 seconds max.
+  # Targets are hardcoded (unlike fuzz-nightly's dynamic discovery);
+  # update the list below when fuzz_pack_*.rs files are added/removed.
   fuzz-pack-smoke:
     name: Fuzz Pack Smoke (PR)
     runs-on: ubuntu-24.04
@@ -565,7 +567,6 @@ jobs:
             target: aarch64-apple-darwin
             label: macOS
             shared-key: nightly-macos-fuzz
-            extra-apt: ""
     env:
       RUSTC_WRAPPER: ""
       FUZZ_RUNS: 10000
