@@ -270,11 +270,14 @@ impl Default for GitExecutionConfig {
 /// Aggregate counters returned by [`ScanDriver::run`] after a scan completes.
 ///
 /// Used for coordination-layer bookkeeping (shard progress, error budgets)
-/// and CLI summary output. Throughput and elapsed time are intentionally
-/// omitted — callers derive those from wall-clock measurement because
-/// drivers may spend time outside the scan loop (engine init, path
-/// validation, ref resolution) that the coordination layer should not
-/// account for.
+/// and CLI summary output. Wall-clock elapsed time is intentionally omitted
+/// — callers derive that from their own timers because drivers may spend
+/// time outside the scan loop (engine init, path validation, ref resolution)
+/// that the coordination layer should not account for. The [`scan_ns`] and
+/// [`persist_ns`] fields capture internal phase durations only.
+///
+/// [`scan_ns`]: ScanReport::scan_ns
+/// [`persist_ns`]: ScanReport::persist_ns
 ///
 /// Counter overflow semantics depend on the backend: the in-memory driver
 /// uses saturating arithmetic, while the filesystem and git drivers inherit
@@ -384,9 +387,11 @@ pub struct FindingRecord {
     /// the same `norm_hash` matched the same logical secret regardless of
     /// surrounding context or transform chain.
     pub norm_hash: [u8; 32],
-    /// Additive confidence score from gate signals (Phase 1 range: 0–10).
-    /// Does **not** participate in dedup — two findings at the same span
-    /// with different scores still deduplicate normally.
+    /// Additive confidence score from gate signals. Conventionally 0–10 but
+    /// the `i8` type is not range-restricted — consumers must tolerate
+    /// values outside that range. Does **not** participate in dedup — two
+    /// findings at the same span with different scores still deduplicate
+    /// normally.
     pub confidence_score: i8,
 }
 

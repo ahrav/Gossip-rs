@@ -860,7 +860,7 @@ fn build_runtime_engine(
 ///
 /// 1. Explicit `--rules=<path>` override
 /// 2. `default_rules.yaml` adjacent to the binary executable
-/// 3. Compile-time embedded fallback (223 rules from `default_rules.yaml`)
+/// 3. Compile-time embedded fallback (rules from `default_rules.yaml`)
 ///
 /// Emits provenance info to stderr so operators can verify which rules are
 /// active.

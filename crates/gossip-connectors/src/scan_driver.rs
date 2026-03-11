@@ -7,8 +7,14 @@
 //!
 //! # Threading model
 //!
-//! The filesystem and git drivers run inside [`std::thread::scope`] with two
-//! auxiliary threads per scan invocation:
+//! The filesystem and git drivers run inside [`std::thread::scope`]:
+//!
+//! - **Filesystem driver** — spawns **two** auxiliary threads: an event
+//!   forwarder and a commit forwarder.
+//! - **Git driver** — spawns **one** auxiliary thread: an event forwarder
+//!   only (the commit sink is unused; see [`GitScanDriver::run`]).
+//!
+//! Auxiliary threads:
 //!
 //! - **Event forwarder** — drains owned events from a channel and re-emits
 //!   them as borrowed `CoreEvent`/`GitEvent` into the caller-provided
@@ -97,7 +103,10 @@ impl ScanSourceFactory for FilesystemScanSourceFactory {
 
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
-            supports_checkpoint_hints: true,
+            // parallel_scan_dir does not track per-item cursor state, so the FS
+            // driver's `checkpoint_hint()` always returns `None`. This will
+            // become `true` when resumable FS scans are implemented.
+            supports_checkpoint_hints: false,
             // parallel_scan_dir does not accept a cancellation token and has no
             // mid-scan cancellation mechanism. The driver only checks the token
             // before starting (pre-check), not during the scan.
@@ -209,7 +218,7 @@ impl ScanSourceFactory for InMemoryScanSourceFactory {
 /// Filesystem scan driver backed by [`parallel_scan_dir`].
 ///
 /// Spawns scoped threads for event and commit forwarding so the scheduler's
-/// channel-based sinks are bridged to the [`GitEventOutput`] / [`CommitSink`]
+/// channel-based sinks are bridged to the [`EventOutput`] / [`CommitSink`]
 /// interfaces expected by the coordination layer.
 ///
 /// # Checkpoint behaviour
@@ -305,8 +314,9 @@ impl ScanDriver for FsScanDriver {
 
 /// Git scan driver backed by [`run_git_scan`].
 ///
-/// Resolves refs via [`NativeRefResolver`] and treats every ref
-/// as unseen ([`EmptyWatermarkStore`]), performing a full scan on each run.
+/// Resolves refs via [`NativeRefResolver`], uses [`EmptyWatermarkStore`] so
+/// all refs appear unwatermarked, and uses [`NeverSeenStore`] so all blobs
+/// appear unseen — resulting in a full repository scan on every run.
 #[derive(Debug)]
 struct GitScanDriver {
     repo_root: PathBuf,
