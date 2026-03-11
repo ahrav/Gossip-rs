@@ -917,16 +917,31 @@ impl EtcdCoordinator {
             active_shard_prefix.push('/');
             let removed_shard_count =
                 self.count_persisted_shards_under_prefix(shard_prefix.clone())?;
-            let counter_update = self.load_tenant_shard_count(tenant)?.map(|counter| {
-                let next_count = counter
+
+            // Always build the counter update — even when the counter key
+            // does not yet exist.  When absent, bootstrap from a tenant-wide
+            // shard scan and guard creation with `compare_absent` so that a
+            // concurrent `register_shards` (which also uses `compare_absent`
+            // during bootstrap) will conflict rather than committing an
+            // inflated count that includes shards this GC pass is removing.
+            let counter_key = self.keyspace.tenant_shard_count_key(tenant);
+            let (counter_compare, next_count) = if let Some(counter) =
+                self.load_tenant_shard_count(tenant)?
+            {
+                let next = counter
                     .count
                     .saturating_sub(usize_to_u64_saturating(removed_shard_count));
                 (
-                    self.keyspace.tenant_shard_count_key(tenant),
-                    counter,
-                    next_count,
+                    compare_tenant_shard_count_revision(counter_key.clone(), counter.mod_revision),
+                    next,
                 )
-            });
+            } else {
+                let scanned =
+                    self.count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))?;
+                let next = usize_to_u64_saturating(scanned)
+                    .saturating_sub(usize_to_u64_saturating(removed_shard_count));
+                (compare_absent(counter_key.clone()), next)
+            };
 
             let mut txn = TxnBuilder::new();
             txn.compare(compare_run_revision(
@@ -946,16 +961,10 @@ impl EtcdCoordinator {
                     Some(DeleteOptions::new().with_prefix()),
                 ),
             ]);
-            if let Some((counter_key, persisted_counter, next_count)) = counter_update {
-                txn.compare(compare_tenant_shard_count_revision(
-                    counter_key.clone(),
-                    persisted_counter.mod_revision,
-                ))
-                .put(
-                    counter_key.into_bytes(),
-                    encode_tenant_shard_count(next_count),
-                );
-            }
+            txn.compare(counter_compare).put(
+                counter_key.into_bytes(),
+                encode_tenant_shard_count(next_count),
+            );
 
             let response = self.etcd_txn(txn.build())?;
             if response.succeeded() {

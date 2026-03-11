@@ -369,7 +369,7 @@ impl EtcdCoordinatorConfig {
     /// operation.
     ///
     /// Higher values increase the total `split_replace` etcd txn-op count:
-    /// writes = `3 + 2N`, compares = `4 + N`, total = `7 + 3N`.
+    /// writes = `4 + 2N`, compares = `5 + N`, total = `9 + 3N`.
     /// Operators must keep this within the cluster's `--max-txn-ops`.
     #[must_use]
     pub fn max_children_per_op(&self) -> usize {
@@ -509,7 +509,7 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             Self::MaxChildrenPerOpExceedsEtcdTxnBudget { requested, max } => write!(
                 f,
                 "max_children_per_op ({requested}) exceeds etcd split-transaction budget ({max}); \
-                 each child adds 3 txn entries to a fixed overhead of 7, \
+                 each child adds 3 txn entries to a fixed overhead of 9, \
                  capped at 128 total (etcd default --max-txn-ops)",
             ),
             Self::MaxChildrenPerOpExceedsGlobalLimit {
