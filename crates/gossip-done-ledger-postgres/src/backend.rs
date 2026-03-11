@@ -403,7 +403,7 @@ fn collect_columns(records: &[DoneLedgerRecord]) -> Result<UpsertColumns, DoneLe
         error_codes: Vec::with_capacity(n),
     };
 
-    for record in records {
+    for (idx, record) in records.iter().enumerate() {
         let key = record.key();
         let prov = record.provenance();
 
@@ -415,14 +415,21 @@ fn collect_columns(records: &[DoneLedgerRecord]) -> Result<UpsertColumns, DoneLe
         cols.statuses.push(i16::from(record.status().rank()));
 
         cols.bytes_scanned.push(
-            u64_to_pg_bigint_checked(record.bytes_scanned(), "bytes_scanned")
-                .map_err(DoneLedgerPgConversionError::from)?,
+            u64_to_pg_bigint_checked(record.bytes_scanned(), "bytes_scanned").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
         );
 
         cols.findings_counts
             .push(i32::try_from(record.findings_count()).map_err(|_| {
-                DoneLedgerPgConversionError::FindingsCountOutOfRange {
-                    value: i64::from(record.findings_count()),
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: DoneLedgerPgConversionError::FindingsCountOutOfRange {
+                        value: i64::from(record.findings_count()),
+                    },
                 }
             })?);
 
@@ -432,16 +439,28 @@ fn collect_columns(records: &[DoneLedgerRecord]) -> Result<UpsertColumns, DoneLe
             .push(u64_to_pg_bigint_bits(prov.shard_id().as_raw()));
 
         cols.fence_epochs.push(
-            u64_to_pg_bigint_checked(prov.fence_epoch().as_raw(), "fence_epoch")
-                .map_err(DoneLedgerPgConversionError::from)?,
+            u64_to_pg_bigint_checked(prov.fence_epoch().as_raw(), "fence_epoch").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
         );
         cols.started_ats.push(
-            u64_to_pg_bigint_checked(prov.started_at().as_raw(), "started_at")
-                .map_err(DoneLedgerPgConversionError::from)?,
+            u64_to_pg_bigint_checked(prov.started_at().as_raw(), "started_at").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
         );
         cols.finished_ats.push(
-            u64_to_pg_bigint_checked(prov.finished_at().as_raw(), "finished_at")
-                .map_err(DoneLedgerPgConversionError::from)?,
+            u64_to_pg_bigint_checked(prov.finished_at().as_raw(), "finished_at").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
         );
 
         cols.error_codes
@@ -607,6 +626,50 @@ mod tests {
             }),
         )
         .expect("test record should satisfy construction invariants")
+    }
+
+    #[test]
+    fn collect_columns_conversion_error_identifies_failing_record_index() {
+        // A record with bytes_scanned > i64::MAX passes domain validation
+        // but fails SQL type conversion in collect_columns. The error
+        // should identify which record in the batch caused the failure.
+        let good = done_record(
+            1,
+            1,
+            1,
+            DoneLedgerStatus::ScannedClean,
+            100,
+            0,
+            1,
+            1,
+            1,
+            10,
+            20,
+            None,
+        );
+        let bad = done_record(
+            1,
+            1,
+            2,
+            DoneLedgerStatus::ScannedClean,
+            u64::MAX, // exceeds i64::MAX → conversion failure
+            0,
+            1,
+            1,
+            1,
+            10,
+            20,
+            None,
+        );
+
+        let err = super::collect_columns(&[good, bad])
+            .err()
+            .expect("bytes_scanned = u64::MAX should fail SQL type conversion");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("index 1"),
+            "conversion error should identify the failing record at index 1, got: {msg}"
+        );
     }
 
     #[test]

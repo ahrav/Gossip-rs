@@ -400,6 +400,144 @@ fn batch_upsert_merges_duplicate_keys_before_persist() {
     assert_eq!(merged.provenance(), scanned.provenance());
 }
 
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn cross_batch_upsert_exercises_sql_on_conflict_merge() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    // First batch: insert a failed record.
+    let failed = done_record(
+        5,
+        6,
+        31,
+        DoneLedgerStatus::FailedRetryable,
+        400,
+        3,
+        10,
+        11,
+        12,
+        100,
+        200,
+        Some("TIMEOUT"),
+    );
+    backend
+        .batch_upsert(std::slice::from_ref(&failed))
+        .expect("first upsert should succeed")
+        .wait()
+        .expect("first commit should succeed");
+
+    // Second batch: insert a scanned record with the same key.
+    // This triggers the SQL ON CONFLICT clause (not Rust-side dedup).
+    let scanned = done_record(
+        5,
+        6,
+        31,
+        DoneLedgerStatus::ScannedWithFindings,
+        200,
+        5,
+        20,
+        21,
+        22,
+        110,
+        250,
+        None,
+    );
+    backend
+        .batch_upsert(std::slice::from_ref(&scanned))
+        .expect("second upsert should succeed")
+        .wait()
+        .expect("second commit should succeed");
+
+    let fetched = backend
+        .batch_get(tenant(5), policy(6), &[ovid(31)])
+        .expect("batch_get should succeed");
+    let merged = fetched[0]
+        .as_ref()
+        .expect("row should exist after cross-batch upsert");
+
+    // ScannedWithFindings (rank 11) > FailedRetryable (rank 1).
+    assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
+    // bytes_scanned takes the GREATEST across both batches.
+    assert_eq!(merged.bytes_scanned(), 400);
+    // Scanned status clears error_code.
+    assert_eq!(merged.error_code(), None);
+    // Provenance comes from the status winner (ScannedWithFindings).
+    assert_eq!(merged.provenance(), scanned.provenance());
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn cross_batch_upsert_equal_status_picks_later_finished_at() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    // First batch: FailedRetryable with finished_at=200.
+    let earlier = done_record(
+        6,
+        7,
+        41,
+        DoneLedgerStatus::FailedRetryable,
+        300,
+        2,
+        10,
+        11,
+        12,
+        100,
+        200,
+        Some("ERR_A"),
+    );
+    backend
+        .batch_upsert(std::slice::from_ref(&earlier))
+        .expect("first upsert should succeed")
+        .wait()
+        .expect("first commit should succeed");
+
+    // Second batch: same status, later finished_at=300.
+    // The provenance tie-break should select this record's provenance.
+    let later = done_record(
+        6,
+        7,
+        41,
+        DoneLedgerStatus::FailedRetryable,
+        100,
+        1,
+        20,
+        21,
+        22,
+        150,
+        300,
+        Some("ERR_B"),
+    );
+    backend
+        .batch_upsert(std::slice::from_ref(&later))
+        .expect("second upsert should succeed")
+        .wait()
+        .expect("second commit should succeed");
+
+    let fetched = backend
+        .batch_get(tenant(6), policy(7), &[ovid(41)])
+        .expect("batch_get should succeed");
+    let merged = fetched[0]
+        .as_ref()
+        .expect("row should exist after equal-status cross-batch upsert");
+
+    // Same status — no promotion.
+    assert_eq!(merged.status(), DoneLedgerStatus::FailedRetryable);
+    // bytes_scanned takes the GREATEST.
+    assert_eq!(merged.bytes_scanned(), 300);
+    // findings_count takes the GREATEST (non-scanned status branch).
+    assert_eq!(merged.findings_count(), 2);
+    // Provenance winner is the later finished_at record.
+    assert_eq!(merged.provenance(), later.provenance());
+    // error_code from the provenance winner (COALESCE picks winner first).
+    assert_eq!(merged.error_code().map(|c| c.as_str()), Some("ERR_B"),);
+}
+
 // ── Schema constraint enforcement ───────────────────────────────────────
 
 /// Assert that a Postgres error is a CHECK_VIOLATION (SQLSTATE 23514).

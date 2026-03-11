@@ -244,7 +244,14 @@ pub enum DoneLedgerPgError {
     /// Duplicate-key merge produced an invalid record shape.
     InvalidMergedRecord { source: PersistenceInputError },
     /// Rust ↔ SQL conversion failed.
-    Conversion(DoneLedgerPgConversionError),
+    ///
+    /// When this occurs during batch encoding (write path), `record_index`
+    /// identifies which record in the batch triggered the failure. During
+    /// decode (read path), `record_index` is `None`.
+    Conversion {
+        record_index: Option<usize>,
+        source: DoneLedgerPgConversionError,
+    },
     /// Provenance timestamps violate the `finished_at >= started_at` ordering
     /// invariant, which would be rejected by the database CHECK constraint.
     ProvenanceInvalid {
@@ -303,7 +310,19 @@ impl fmt::Display for DoneLedgerPgError {
                 f,
                 "record at index {index}: started_at ({started_at}) exceeds finished_at ({finished_at})"
             ),
-            Self::Conversion(source) => {
+            Self::Conversion {
+                record_index: Some(idx),
+                source,
+            } => {
+                write!(
+                    f,
+                    "postgres done-ledger conversion failed at record index {idx}: {source}"
+                )
+            }
+            Self::Conversion {
+                record_index: None,
+                source,
+            } => {
                 write!(f, "postgres done-ledger conversion failed: {source}")
             }
             Self::PersistedRecordInvalid { context, source } => {
@@ -327,7 +346,7 @@ impl Error for DoneLedgerPgError {
             Self::InvalidRecord { source, .. }
             | Self::InvalidMergedRecord { source }
             | Self::PersistedRecordInvalid { source, .. } => Some(source),
-            Self::Conversion(source) => Some(source),
+            Self::Conversion { source, .. } => Some(source),
         }
     }
 }
@@ -346,7 +365,10 @@ impl From<DoneLedgerPgMigrationError> for DoneLedgerPgError {
 
 impl From<DoneLedgerPgConversionError> for DoneLedgerPgError {
     fn from(value: DoneLedgerPgConversionError) -> Self {
-        Self::Conversion(value)
+        Self::Conversion {
+            record_index: None,
+            source: value,
+        }
     }
 }
 
