@@ -596,20 +596,35 @@ jobs:
             fuzz-corpus-nightly-${{ matrix.label }}-
 
       - name: Fuzz all targets
+        env:
+          FUZZ_TARGET_TRIPLE: ${{ matrix.target }}
         run: |
+          set -euo pipefail
+          failed=0
           for fuzz_dir in crates/*/fuzz; do
-            [ -d "$fuzz_dir/fuzz_targets" ] || continue
-            crate="$(basename "$(dirname "$fuzz_dir")")"
-            echo "::group::Fuzz — $crate"
-            cd "$fuzz_dir"
-            for target in $(ls fuzz_targets/*.rs | sed 's|.*/||;s|\.rs$||' | sort); do
-              echo "  Target: $target"
-              cargo +nightly fuzz run "$target" \
-                --target ${{ matrix.target }} -- -runs=${FUZZ_RUNS}
+            [ -d "${fuzz_dir}/fuzz_targets" ] || continue
+            crate_name="$(basename "$(dirname "${fuzz_dir}")")"
+            targets=()
+            for f in "${fuzz_dir}"/fuzz_targets/fuzz_*.rs; do
+              [ -f "$f" ] || continue
+              targets+=("$(basename "${f%.rs}")")
             done
-            cd "$GITHUB_WORKSPACE"
+            [ "${#targets[@]}" -gt 0 ] || continue
+            echo "::group::${crate_name} (${#targets[@]} targets)"
+            cd "${fuzz_dir}"
+            for target in "${targets[@]}"; do
+              echo "  Running: ${target}"
+              if ! cargo +nightly fuzz run "${target}" \
+                --target "${FUZZ_TARGET_TRIPLE}" \
+                -- -runs="${FUZZ_RUNS}"; then
+                echo "::error::Fuzz target ${target} in ${crate_name} failed"
+                failed=1
+              fi
+            done
+            cd "${GITHUB_WORKSPACE}"
             echo "::endgroup::"
           done
+          [ "${failed}" -eq 0 ] || exit 1
 
   # ── Nightly Summary ───────────────────────────────────────────────
   nightly-summary:
