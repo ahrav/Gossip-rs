@@ -52,7 +52,7 @@ The pipeline works as follows:
 
 1. The orchestration layer constructs an `Assignment` describing the work unit (source location, cursor position, shard boundaries, policy hash).
 2. A `ScanSourceFactory` inspects the assignment and produces a boxed `ScanDriver` appropriate for the source type.
-3. The driver's `run()` method executes the scan, consuming engine resources, emitting core and git-specific events through `GitEventOutput`, forwarding per-item lifecycle calls through `CommitSink`, and respecting the `CancellationToken`.
+3. The driver's `run()` method executes the scan, consuming engine resources, emitting core and git-specific events through `GitEventOutput`, and respecting the `CancellationToken`. Filesystem and in-memory drivers also forward per-item lifecycle calls through `CommitSink`; the git driver currently does not use the commit sink (git persistence is handled separately via the scanner's `PersistenceStore`).
 
 ---
 
@@ -272,7 +272,7 @@ Batch of findings for one item, passed to `CommitSink::upsert_findings`.
 4. On success, the factory returns a boxed `ScanDriver`.
 5. The caller prepares shared resources: the detection `Engine`, `ScanExecutionConfig`, unified `GitEventOutput` sink, `CommitSink`, and `CancellationToken`.
 6. `ScanDriver::run()` is called with all resources.
-7. The driver executes the scan. Filesystem drivers use `parallel_scan_dir`, git drivers use `run_git_scan`, and in-memory drivers iterate pre-loaded items. Core and git-specific events are emitted through `GitEventOutput`; per-item commit lifecycle calls flow through `CommitSink`.
+7. The driver executes the scan. Filesystem drivers use `parallel_scan_dir`, git drivers use `run_git_scan`, and in-memory drivers iterate pre-loaded items. Core and git-specific events are emitted through `GitEventOutput`. Filesystem and in-memory drivers forward per-item commit lifecycle calls through `CommitSink`; the git driver does not currently use the commit sink.
 8. `run()` returns a `ScanReport` with aggregate metrics.
 9. The caller may query `checkpoint_hint()` for a resume cursor (if `SourceCapabilities::supports_checkpoint_hints` is true).
 10. The orchestration layer persists the cursor and report for future resumable scans.

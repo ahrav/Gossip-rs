@@ -103,7 +103,8 @@ pub struct DistributedRuntimeConfig {
 
 /// Summary report from one [`run_worker`] invocation.
 ///
-/// Invariant: `leases_seen == shards_scanned + shards_skipped_done`.
+/// On success: `leases_seen == shards_scanned + shards_skipped_done`.
+/// On error the worker returns immediately and no report is observable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DistributedRunReport {
     /// Total number of leases dequeued from the coordinator (including skips).

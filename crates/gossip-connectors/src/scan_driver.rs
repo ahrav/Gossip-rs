@@ -587,9 +587,11 @@ impl StoreProducer for ChannelStoreProducer {
 /// Messages forwarded from the scheduler's [`StoreProducer`] to the
 /// coordination layer's [`CommitSink`] via a crossbeam channel.
 ///
-/// Only [`Batch`](CommitMessage::Batch) messages are currently acted upon;
-/// `RunLoss` and `EndRun` are received and acknowledged but not yet wired
-/// to the coordination layer.
+/// Only [`Batch`](CommitMessage::Batch) messages drive the commit-sink
+/// lifecycle. `RunLoss` and `EndRun` are received but not acted upon
+/// because their information (`dropped_findings`, `persist_incomplete`,
+/// `persist_emit_failures`) is already captured in the `ScanReport`
+/// returned by `parallel_scan_dir` through the driver's return path.
 #[derive(Debug)]
 enum CommitMessage {
     Batch(OwnedCommitBatch),

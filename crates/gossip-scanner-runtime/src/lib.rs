@@ -158,7 +158,9 @@ pub(crate) struct RuntimeEngineConfig {
 pub struct ScanBudgets {
     /// Maximum items processed between checkpoints.
     pub max_items: usize,
-    /// Runtime-level byte budget knob (must be non-zero).
+    /// Runtime-level byte budget knob (must be non-zero). Currently
+    /// validated but not enforced at the execution layer — enforcement
+    /// will be added when the byte-budget limiting path is wired in.
     pub max_bytes: u64,
 }
 
@@ -714,16 +716,15 @@ pub(crate) fn scan_git_with_runtime(
             repo_root: canonical_repo,
         },
     );
-    let mut runtime = config
-        .budgets
-        .to_execution_config_with_workers(config.workers)?;
+    let workers = config.workers.max(1);
+    let mut runtime = config.budgets.to_execution_config_with_workers(workers)?;
     // Keep git execution tuning centralized in the shared ScanExecutionConfig
     // so both CLI and distributed worker paths hit identical driver behavior.
     runtime.git = GitExecutionConfig {
         repo_id: config.repo_id,
         scan_mode: config.scan_mode,
         merge_diff_mode: config.merge_mode,
-        pack_exec_workers: Some(config.workers),
+        pack_exec_workers: Some(workers),
         scan_binary: config.scan_binary,
         enrich_identities: config.enrich_identities,
         debug_level: config.debug_level,
@@ -817,6 +818,12 @@ pub(crate) fn build_assignment(
 /// For the default config, returns a process-global cached instance
 /// (via [`OnceLock`]) so multiple scans avoid redundant regex compilation.
 /// Custom configs build a fresh engine every call.
+///
+/// The default-config path uses `expect` because the build chain is
+/// infallible: `builtin_rules()` is compiled-in, `default_runtime_tuning()`
+/// uses hardcoded constants, and `Engine::new_with_anchor_policy` asserts
+/// validity at construction. A failure here indicates a programming error
+/// in the default constants.
 fn runtime_engine(
     config: &RuntimeEngineConfig,
 ) -> Result<Arc<scanner_engine::Engine>, ScanRuntimeError> {
