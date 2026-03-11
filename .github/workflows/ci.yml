@@ -66,6 +66,7 @@ jobs:
             fuzz:
               - 'crates/*/fuzz/**'
               - 'crates/**/*.rs'
+              - 'crates/**/Cargo.toml'
 
   # ── Format ─────────────────────────────────────────────────────────
   fmt:
@@ -656,6 +657,11 @@ jobs:
   # ── Fuzz (nightly, macOS) ───────────────────────────────────────────
   # Same targets as fuzz-linux on aarch64-apple-darwin to catch
   # platform-specific bugs (NEON vs SSE, endianness in pack parsing).
+  #
+  # No extra-brew for clang/llvm: Xcode on macos-15 ships Apple Clang
+  # with full libFuzzer and AddressSanitizer support. On Linux the
+  # system GCC lacks sanitizer integration, so we install clang+llvm
+  # explicitly via extra-apt.
   fuzz-macos:
     name: Fuzz (Scheduled, macOS)
     runs-on: macos-15

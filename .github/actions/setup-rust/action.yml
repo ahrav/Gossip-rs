@@ -68,18 +68,25 @@ runs:
         sudo apt-get install -y -- "${base_packages[@]}"
 
     # vectorscan-rs-sys requires Boost headers on macOS too.
+    # etcd-client compiles .proto files via prost-build, which needs protoc.
     - name: Install system deps (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
         set -euo pipefail
-        base_packages=(boost)
+        base_packages=(boost protobuf)
 
         raw_input='${{ inputs.extra-brew }}'
         normalized_input="${raw_input//$'\n'/ }"
         normalized_input="${normalized_input//$'\t'/ }"
         if [[ -n "${normalized_input// /}" ]]; then
           read -r -a extra <<< "${normalized_input}"
+          for package in "${extra[@]}"; do
+            if [[ ! "${package}" =~ ^[A-Za-z0-9][A-Za-z0-9+.@:-]*$ ]]; then
+              echo "Invalid brew package token: '${package}'" >&2
+              exit 1
+            fi
+          done
           base_packages+=("${extra[@]}")
         fi
 
