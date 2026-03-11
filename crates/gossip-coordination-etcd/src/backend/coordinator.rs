@@ -928,9 +928,28 @@ impl EtcdCoordinator {
             let (counter_compare, next_count) = if let Some(counter) =
                 self.load_tenant_shard_count(tenant)?
             {
-                let next = counter
-                    .count
-                    .saturating_sub(usize_to_u64_saturating(removed_shard_count));
+                let removed = usize_to_u64_saturating(removed_shard_count);
+                let next = match counter.count.checked_sub(removed) {
+                    Some(n) => n,
+                    None => {
+                        // Counter drifted below the actual shard count —
+                        // rebuild from a fresh tenant-wide scan so the
+                        // persisted value converges back to truth.  The
+                        // CAS guard on `mod_revision` still prevents
+                        // concurrent-mutation races.
+                        tracing::warn!(
+                            tenant = %tenant,
+                            persisted_count = counter.count,
+                            removed = removed,
+                            "tenant shard counter underflow during GC; \
+                             rebuilding from scan"
+                        );
+                        let scanned = self.count_persisted_shards_under_prefix(
+                            self.keyspace.tenant_prefix(tenant),
+                        )?;
+                        usize_to_u64_saturating(scanned).saturating_sub(removed)
+                    }
+                };
                 (
                     compare_tenant_shard_count_revision(counter_key.clone(), counter.mod_revision),
                     next,
