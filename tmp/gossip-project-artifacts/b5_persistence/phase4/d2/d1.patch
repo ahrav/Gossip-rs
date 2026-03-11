@@ -1,0 +1,931 @@
+diff -ruN gossip_orig/Cargo.toml gossip/Cargo.toml
+--- gossip_orig/Cargo.toml	2026-03-08 05:05:26.763877711 +0000
++++ gossip/Cargo.toml	2026-03-09 07:38:38.315658847 +0000
+@@ -14,6 +14,7 @@
+     "crates/gossip-coordination-etcd",
+     "crates/gossip-persistence-inmemory",
+     "crates/gossip-frontier",
++    "crates/gossip-findings-postgres",
+     "crates/gossip-worker",
+     "crates/scanner-rs-cli",
+ ]
+@@ -39,6 +40,7 @@
+ gossip-coordination-etcd = { path = "crates/gossip-coordination-etcd" }
+ gossip-persistence-inmemory = { path = "crates/gossip-persistence-inmemory" }
+ gossip-frontier = { path = "crates/gossip-frontier" }
++gossip-findings-postgres = { path = "crates/gossip-findings-postgres" }
+ 
+ # External dev/test dependencies
+ rstest = "0.25"
+diff -ruN gossip_orig/crates/gossip-findings-postgres/Cargo.toml gossip/crates/gossip-findings-postgres/Cargo.toml
+--- gossip_orig/crates/gossip-findings-postgres/Cargo.toml	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/Cargo.toml	2026-03-09 07:43:30.711817235 +0000
+@@ -0,0 +1,15 @@
++[package]
++name = "gossip-findings-postgres"
++version.workspace = true
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++publish = false
++description = "PostgreSQL findings persistence schema, migrations, and row projections for gossip-rs"
++
++[lib]
++
++[dependencies]
++gossip-contracts.workspace = true
++postgres = "0.19"
++blake3 = "1.8"
+diff -ruN gossip_orig/crates/gossip-findings-postgres/README.txt gossip/crates/gossip-findings-postgres/README.txt
+--- gossip_orig/crates/gossip-findings-postgres/README.txt	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/README.txt	2026-03-09 07:43:30.802426257 +0000
+@@ -0,0 +1,19 @@
++D0 + D1 findings Postgres backend foundation
++
++This crate locks the normalized relational shape and adds forward-only,
++checksum-verified migrations.
++
++Schema model:
++- findings     : stable finding identity
++- occurrences  : version + span identity
++- observations : policy-scoped detection/provenance
++
++Key invariant:
++- occurrences intentionally omit policy_hash
++- observations intentionally include policy_hash
++
++Migration runner properties:
++- embedded SQL migrations
++- migration checksum verification
++- transaction-scoped advisory lock
++- idempotent re-run from scratch or on already-migrated databases
+diff -ruN gossip_orig/crates/gossip-findings-postgres/migrations/0001_findings_schema.sql gossip/crates/gossip-findings-postgres/migrations/0001_findings_schema.sql
+--- gossip_orig/crates/gossip-findings-postgres/migrations/0001_findings_schema.sql	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/migrations/0001_findings_schema.sql	2026-03-09 07:43:30.795335183 +0000
+@@ -0,0 +1,112 @@
++-- 0001_findings_schema
++--
++-- Initial PostgreSQL schema for the findings persistence backend.
++--
++-- The durable write-path model is intentionally normalized:
++--   findings      : stable identity (policy-independent)
++--   occurrences   : version + span identity (policy-independent)
++--   observations  : policy-scoped detection/provenance
++--
++-- Policy-specific state must live in observations, not occurrences.
++
++CREATE TABLE findings (
++    tenant_id        BYTEA NOT NULL CHECK (octet_length(tenant_id) = 32),
++    finding_id       BYTEA NOT NULL CHECK (octet_length(finding_id) = 32),
++    stable_item_id   BYTEA NOT NULL CHECK (octet_length(stable_item_id) = 32),
++    rule_fingerprint BYTEA NOT NULL CHECK (octet_length(rule_fingerprint) = 32),
++    secret_hash      BYTEA NOT NULL CHECK (octet_length(secret_hash) = 32),
++
++    CONSTRAINT findings_pk PRIMARY KEY (tenant_id, finding_id),
++    CONSTRAINT findings_natural_unique UNIQUE (
++        tenant_id,
++        stable_item_id,
++        rule_fingerprint,
++        secret_hash
++    )
++);
++
++CREATE TABLE occurrences (
++    tenant_id         BYTEA  NOT NULL CHECK (octet_length(tenant_id) = 32),
++    occurrence_id     BYTEA  NOT NULL CHECK (octet_length(occurrence_id) = 32),
++    finding_id        BYTEA  NOT NULL CHECK (octet_length(finding_id) = 32),
++    object_version_id BYTEA  NOT NULL CHECK (octet_length(object_version_id) = 32),
++    byte_offset       BIGINT NOT NULL CHECK (byte_offset >= 0),
++    byte_length       BIGINT NOT NULL CHECK (byte_length > 0),
++
++    CONSTRAINT occurrences_pk PRIMARY KEY (tenant_id, occurrence_id),
++    CONSTRAINT occurrences_finding_fk
++        FOREIGN KEY (tenant_id, finding_id)
++        REFERENCES findings (tenant_id, finding_id)
++        ON DELETE CASCADE,
++    CONSTRAINT occurrences_natural_unique UNIQUE (
++        tenant_id,
++        finding_id,
++        object_version_id,
++        byte_offset,
++        byte_length
++    )
++);
++
++CREATE TABLE observations (
++    tenant_id        BYTEA  NOT NULL CHECK (octet_length(tenant_id) = 32),
++    observation_id   BYTEA  NOT NULL CHECK (octet_length(observation_id) = 32),
++    occurrence_id    BYTEA  NOT NULL CHECK (octet_length(occurrence_id) = 32),
++    policy_hash      BYTEA  NOT NULL CHECK (octet_length(policy_hash) = 32),
++    ovid_hash        BYTEA  NOT NULL CHECK (octet_length(ovid_hash) = 32),
++    run_id           BIGINT NOT NULL,
++    shard_id         BIGINT NOT NULL,
++    fence_epoch      BIGINT NOT NULL CHECK (fence_epoch >= 0),
++    seen_at          BIGINT NOT NULL CHECK (seen_at >= 0),
++    location_display TEXT,
++    location_url     TEXT,
++
++    CONSTRAINT observations_pk PRIMARY KEY (tenant_id, observation_id),
++    CONSTRAINT observations_occurrence_fk
++        FOREIGN KEY (tenant_id, occurrence_id)
++        REFERENCES occurrences (tenant_id, occurrence_id)
++        ON DELETE CASCADE,
++    CONSTRAINT observations_natural_unique UNIQUE (
++        tenant_id,
++        policy_hash,
++        occurrence_id
++    ),
++    CONSTRAINT observations_location_display_ck
++        CHECK (
++            location_display IS NULL
++            OR octet_length(location_display) BETWEEN 1 AND 4096
++        ),
++    CONSTRAINT observations_location_url_ck
++        CHECK (
++            location_url IS NULL
++            OR octet_length(location_url) BETWEEN 1 AND 4096
++        )
++);
++
++-- Tenant-filtered lookup paths.
++CREATE INDEX findings_tenant_secret_hash_idx
++    ON findings (tenant_id, secret_hash, finding_id);
++
++CREATE INDEX findings_tenant_stable_item_id_idx
++    ON findings (tenant_id, stable_item_id, finding_id);
++
++CREATE INDEX occurrences_tenant_finding_id_idx
++    ON occurrences (tenant_id, finding_id, occurrence_id);
++
++CREATE INDEX occurrences_tenant_object_version_id_idx
++    ON occurrences (tenant_id, object_version_id, occurrence_id);
++
++-- Latest-seen queries and policy-filtered browsing live on observations.
++CREATE INDEX observations_tenant_seen_at_idx
++    ON observations (tenant_id, seen_at DESC, observation_id);
++
++CREATE INDEX observations_tenant_policy_seen_at_idx
++    ON observations (tenant_id, policy_hash, seen_at DESC, observation_id);
++
++CREATE INDEX observations_tenant_occurrence_id_idx
++    ON observations (tenant_id, occurrence_id, observation_id);
++
++CREATE INDEX observations_tenant_ovid_hash_idx
++    ON observations (tenant_id, ovid_hash, observation_id);
++
++CREATE INDEX observations_tenant_run_shard_idx
++    ON observations (tenant_id, run_id, shard_id, observation_id);
+diff -ruN gossip_orig/crates/gossip-findings-postgres/src/error.rs gossip/crates/gossip-findings-postgres/src/error.rs
+--- gossip_orig/crates/gossip-findings-postgres/src/error.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/src/error.rs	2026-03-09 07:43:30.725621134 +0000
+@@ -0,0 +1,95 @@
++//! Error surface for the findings Postgres schema and migration layers.
++
++use std::{error::Error, fmt};
++
++use gossip_contracts::persistence::PersistenceInputError;
++
++use crate::pg_int::PgIntConversionError;
++
++/// Errors produced while validating or projecting findings records into the
++/// PostgreSQL row model.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum FindingsPgSchemaError {
++    /// Contract-level findings batch validation failed.
++    Persistence(PersistenceInputError),
++    /// A `u64` value could not be represented by the chosen `BIGINT`
++    /// encoding strategy for a given column.
++    PgIntConversion(PgIntConversionError),
++}
++
++impl fmt::Display for FindingsPgSchemaError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Persistence(err) => write!(f, "findings schema validation failed: {err}"),
++            Self::PgIntConversion(err) => {
++                write!(f, "findings schema integer conversion failed: {err}")
++            }
++        }
++    }
++}
++
++impl Error for FindingsPgSchemaError {
++    fn source(&self) -> Option<&(dyn Error + 'static)> {
++        match self {
++            Self::Persistence(err) => Some(err),
++            Self::PgIntConversion(err) => Some(err),
++        }
++    }
++}
++
++impl From<PersistenceInputError> for FindingsPgSchemaError {
++    fn from(value: PersistenceInputError) -> Self {
++        Self::Persistence(value)
++    }
++}
++
++impl From<PgIntConversionError> for FindingsPgSchemaError {
++    fn from(value: PgIntConversionError) -> Self {
++        Self::PgIntConversion(value)
++    }
++}
++
++/// Migration failure surfaced by the Postgres findings crate.
++#[derive(Debug)]
++pub enum FindingsPgMigrationError {
++    /// Underlying PostgreSQL driver error.
++    Postgres(postgres::Error),
++    /// The migration table contains a version whose checksum no longer matches
++    /// the embedded SQL bytes.
++    ChecksumMismatch {
++        version: &'static str,
++        expected_hex: String,
++        found_hex: String,
++    },
++}
++
++impl fmt::Display for FindingsPgMigrationError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Postgres(err) => write!(f, "postgres findings migration error: {err}"),
++            Self::ChecksumMismatch {
++                version,
++                expected_hex,
++                found_hex,
++            } => write!(
++                f,
++                "migration checksum mismatch for version {version}: expected {expected_hex}, found {found_hex}"
++            ),
++        }
++    }
++}
++
++impl Error for FindingsPgMigrationError {
++    fn source(&self) -> Option<&(dyn Error + 'static)> {
++        match self {
++            Self::Postgres(err) => Some(err),
++            Self::ChecksumMismatch { .. } => None,
++        }
++    }
++}
++
++impl From<postgres::Error> for FindingsPgMigrationError {
++    fn from(value: postgres::Error) -> Self {
++        Self::Postgres(value)
++    }
++}
+diff -ruN gossip_orig/crates/gossip-findings-postgres/src/lib.rs gossip/crates/gossip-findings-postgres/src/lib.rs
+--- gossip_orig/crates/gossip-findings-postgres/src/lib.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/src/lib.rs	2026-03-09 07:43:30.718876744 +0000
+@@ -0,0 +1,61 @@
++//! PostgreSQL findings persistence schema, migrations, and row projections.
++//!
++//! This crate packages the findings-side durable relational shape for the Phase
++//! V query plane and commit path. The schema is intentionally normalized into
++//! three write-path layers that match the current contracts model:
++//!
++//! 1. `findings`      - stable finding identity, policy-independent
++//! 2. `occurrences`   - version + span identity, policy-independent
++//! 3. `observations`  - policy-scoped detection/provenance layer
++//!
++//! The key rule is structural, not stylistic:
++//!
++//! - `occurrences` MUST NOT contain `policy_hash`
++//! - `observations` MUST contain `policy_hash`
++//!
++//! That keeps the durable schema aligned with the persistence contracts and the
++//! Phase V model where policy-scoped state lives in observations rather than in
++//! stable finding identity.
++//!
++//! ## What D1 provides
++//!
++//! - the D0 schema plan and row projections,
++//! - forward-only embedded SQL migrations,
++//! - a migration runner with checksum verification and advisory locking,
++//! - Postgres BIGINT conversion helpers reused by the future `FindingsSinkPg`.
++//!
++//! ## What D1 intentionally does not provide yet
++//!
++//! - the concrete `FindingsSink` backend implementation (D2),
++//! - integration tests for replay/dedupe semantics (D3),
++//! - query-plane read APIs (D4).
++
++#![forbid(unsafe_code)]
++
++mod error;
++mod pg_int;
++pub mod migrations;
++pub mod schema;
++
++pub use error::{FindingsPgMigrationError, FindingsPgSchemaError};
++pub use migrations::{
++    EmbeddedMigration, MIGRATIONS, apply_all_migrations, connect_and_apply_migrations,
++};
++pub use pg_int::{
++    PgIntConversionError, pg_i64_bits_to_u64, pg_i64_nonnegative_to_u64, u64_to_pg_i64_bits,
++    u64_to_pg_i64_checked,
++};
++pub use schema::{
++    FINDINGS_CANONICAL_UNIQUE_COLUMNS, FINDINGS_COLUMNS, FINDINGS_PRIMARY_KEY_COLUMNS,
++    FINDINGS_TABLE, FINDINGS_TENANT_SECRET_HASH_INDEX, FINDINGS_TENANT_STABLE_ITEM_INDEX,
++    MIGRATION_ADVISORY_LOCK_KEY, OBSERVATIONS_CANONICAL_UNIQUE_COLUMNS,
++    OBSERVATIONS_COLUMNS, OBSERVATIONS_PRIMARY_KEY_COLUMNS, OBSERVATIONS_TABLE,
++    OBSERVATIONS_TENANT_OCCURRENCE_INDEX, OBSERVATIONS_TENANT_OVID_INDEX,
++    OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX, OBSERVATIONS_TENANT_RUN_SHARD_INDEX,
++    OBSERVATIONS_TENANT_SEEN_AT_INDEX, OCCURRENCES_CANONICAL_UNIQUE_COLUMNS,
++    OCCURRENCES_COLUMNS, OCCURRENCES_PRIMARY_KEY_COLUMNS, OCCURRENCES_TABLE,
++    OCCURRENCES_TENANT_FINDING_INDEX, OCCURRENCES_TENANT_OBJECT_VERSION_INDEX,
++    OPTIONAL_SECRET_TRIAGE_PRIMARY_KEY_COLUMNS, OPTIONAL_SECRET_TRIAGE_TABLE,
++    SCHEMA_MIGRATIONS_TABLE, FindingRow, FindingsSchemaPlan, ObservationRow, OccurrenceRow,
++    ProjectedFindingsBatch,
++};
+diff -ruN gossip_orig/crates/gossip-findings-postgres/src/migrations.rs gossip/crates/gossip-findings-postgres/src/migrations.rs
+--- gossip_orig/crates/gossip-findings-postgres/src/migrations.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/src/migrations.rs	2026-03-09 07:43:30.787966572 +0000
+@@ -0,0 +1,127 @@
++//! Forward-only embedded SQL migrations for the Postgres findings backend.
++//!
++//! Idempotence is enforced by a migration history table plus a transaction-
++//! scoped advisory lock:
++//!
++//! 1. ensure the history table exists,
++//! 2. take the advisory lock,
++//! 3. compare embedded checksums against recorded checksums,
++//! 4. apply only missing migrations,
++//! 5. commit atomically.
++
++use blake3::Hash;
++use postgres::{Client, NoTls};
++
++use crate::{
++    error::FindingsPgMigrationError,
++    schema::{MIGRATION_ADVISORY_LOCK_KEY, SCHEMA_MIGRATIONS_TABLE},
++};
++
++const CREATE_MIGRATIONS_TABLE_SQL: &str = r#"
++CREATE TABLE IF NOT EXISTS findings_schema_migrations (
++    version      TEXT PRIMARY KEY,
++    checksum     BYTEA NOT NULL CHECK (octet_length(checksum) = 32),
++    applied_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++"#;
++
++/// One embedded forward-only migration.
++#[derive(Clone, Copy, Debug)]
++pub struct EmbeddedMigration {
++    version: &'static str,
++    sql: &'static str,
++}
++
++impl EmbeddedMigration {
++    #[inline]
++    pub const fn new(version: &'static str, sql: &'static str) -> Self {
++        Self { version, sql }
++    }
++
++    #[inline]
++    #[must_use]
++    pub const fn version(self) -> &'static str {
++        self.version
++    }
++
++    #[inline]
++    #[must_use]
++    pub const fn sql(self) -> &'static str {
++        self.sql
++    }
++
++    #[must_use]
++    pub fn checksum(self) -> Hash {
++        blake3::hash(self.sql.as_bytes())
++    }
++}
++
++/// Embedded migration set for the crate.
++pub const MIGRATIONS: &[EmbeddedMigration] = &[
++    EmbeddedMigration::new(
++        "0001_findings_schema",
++        include_str!("../migrations/0001_findings_schema.sql"),
++    ),
++];
++
++/// Convenience entrypoint: connect to Postgres and apply all migrations.
++pub fn connect_and_apply_migrations(
++    database_url: &str,
++) -> Result<Client, FindingsPgMigrationError> {
++    let mut client = Client::connect(database_url, NoTls)?;
++    apply_all_migrations(&mut client)?;
++    Ok(client)
++}
++
++/// Apply all embedded migrations under a transaction-scoped advisory lock.
++pub fn apply_all_migrations(client: &mut Client) -> Result<(), FindingsPgMigrationError> {
++    let mut tx = client.transaction()?;
++    tx.batch_execute(CREATE_MIGRATIONS_TABLE_SQL)?;
++    tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_ADVISORY_LOCK_KEY])?;
++
++    for migration in MIGRATIONS {
++        let row = tx.query_opt(
++            "SELECT checksum FROM findings_schema_migrations WHERE version = $1",
++            &[&migration.version()],
++        )?;
++        let expected = migration.checksum();
++
++        if let Some(row) = row {
++            let found: Vec<u8> = row.get(0);
++            if found.as_slice() != expected.as_bytes() {
++                return Err(FindingsPgMigrationError::ChecksumMismatch {
++                    version: migration.version(),
++                    expected_hex: expected.to_hex().to_string(),
++                    found_hex: hex_encode(&found),
++                });
++            }
++            continue;
++        }
++
++        tx.batch_execute(migration.sql())?;
++        let checksum: &[u8] = expected.as_bytes();
++        tx.execute(
++            "INSERT INTO findings_schema_migrations(version, checksum) VALUES ($1, $2)",
++            &[&migration.version(), &checksum],
++        )?;
++    }
++
++    tx.commit()?;
++    Ok(())
++}
++
++/// Return the logical migration history table name.
++#[inline]
++#[must_use]
++pub const fn schema_migrations_table() -> &'static str {
++    SCHEMA_MIGRATIONS_TABLE
++}
++
++fn hex_encode(bytes: &[u8]) -> String {
++    let mut out = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        use std::fmt::Write as _;
++        let _ = write!(&mut out, "{byte:02x}");
++    }
++    out
++}
+diff -ruN gossip_orig/crates/gossip-findings-postgres/src/pg_int.rs gossip/crates/gossip-findings-postgres/src/pg_int.rs
+--- gossip_orig/crates/gossip-findings-postgres/src/pg_int.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/src/pg_int.rs	2026-03-09 07:43:30.732387894 +0000
+@@ -0,0 +1,69 @@
++//! Helpers for mapping contract `u64` values onto PostgreSQL `BIGINT` columns.
++//!
++//! We intentionally use two strategies:
++//!
++//! - **Bit reinterpretation** for equality/grouping identifiers (`run_id`,
++//!   `shard_id`) where signed ordering is irrelevant.
++//! - **Checked non-negative `BIGINT`** for ordered counters/times
++//!   (`fence_epoch`, `seen_at`, byte offsets/lengths) where SQL ordering must
++//!   preserve semantic ordering.
++
++use std::{error::Error, fmt};
++
++/// Conversion failures between contract `u64` values and PostgreSQL `BIGINT`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum PgIntConversionError {
++    /// A value exceeded the positive range of PostgreSQL `BIGINT` for a column
++    /// that relies on natural SQL ordering.
++    OutOfRange { field: &'static str, value: u64 },
++    /// A supposedly non-negative stored `BIGINT` contained a negative value.
++    NegativeStoredValue { field: &'static str, value: i64 },
++}
++
++impl fmt::Display for PgIntConversionError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::OutOfRange { field, value } => {
++                write!(f, "{field}={value} does not fit into ordered PostgreSQL BIGINT")
++            }
++            Self::NegativeStoredValue { field, value } => {
++                write!(f, "stored PostgreSQL BIGINT for {field} was negative: {value}")
++            }
++        }
++    }
++}
++
++impl Error for PgIntConversionError {}
++
++/// Reinterpret a `u64` as PostgreSQL `BIGINT` bits.
++///
++/// Use this only for columns that participate in equality, grouping, or joins,
++/// not range ordering.
++#[inline]
++#[must_use]
++pub fn u64_to_pg_i64_bits(v: u64) -> i64 {
++    i64::from_ne_bytes(v.to_ne_bytes())
++}
++
++/// Reverse [`u64_to_pg_i64_bits`].
++#[inline]
++#[must_use]
++pub fn pg_i64_bits_to_u64(v: i64) -> u64 {
++    u64::from_ne_bytes(v.to_ne_bytes())
++}
++
++/// Convert a `u64` into a non-negative PostgreSQL `BIGINT`, rejecting values
++/// above `i64::MAX`.
++#[inline]
++pub fn u64_to_pg_i64_checked(v: u64, field: &'static str) -> Result<i64, PgIntConversionError> {
++    i64::try_from(v).map_err(|_| PgIntConversionError::OutOfRange { field, value: v })
++}
++
++/// Convert a stored non-negative PostgreSQL `BIGINT` back into `u64`.
++#[inline]
++pub fn pg_i64_nonnegative_to_u64(v: i64, field: &'static str) -> Result<u64, PgIntConversionError> {
++    if v < 0 {
++        return Err(PgIntConversionError::NegativeStoredValue { field, value: v });
++    }
++    Ok(v as u64)
++}
+diff -ruN gossip_orig/crates/gossip-findings-postgres/src/schema.rs gossip/crates/gossip-findings-postgres/src/schema.rs
+--- gossip_orig/crates/gossip-findings-postgres/src/schema.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-findings-postgres/src/schema.rs	2026-03-09 07:43:30.739054078 +0000
+@@ -0,0 +1,382 @@
++//! Canonical PostgreSQL schema plan for findings persistence.
++//!
++//! D0/D1 lock the relational write model before backend SQL code is written.
++//! This prevents backend code from drifting away from the contracts-layer
++//! identity model.
++//!
++//! ## Table roles
++//!
++//! - `findings` stores stable finding identity and secret/rule linkage.
++//! - `occurrences` stores version-specific byte ranges and references findings.
++//! - `observations` stores policy-scoped detection/provenance facts and
++//!   references occurrences.
++//! - `secret_triage` is reserved for later work and intentionally **not**
++//!   modeled yet because there is no contract type for mutable triage state.
++
++use gossip_contracts::persistence::{
++    FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
++};
++
++use crate::{
++    FindingsPgSchemaError,
++    pg_int::{u64_to_pg_i64_bits, u64_to_pg_i64_checked},
++};
++
++/// Durable findings table name.
++pub const FINDINGS_TABLE: &str = "findings";
++/// Durable occurrences table name.
++pub const OCCURRENCES_TABLE: &str = "occurrences";
++/// Durable observations table name.
++pub const OBSERVATIONS_TABLE: &str = "observations";
++/// Reserved future table name for secret-level triage state.
++pub const OPTIONAL_SECRET_TRIAGE_TABLE: &str = "secret_triage";
++
++/// Migration history table name.
++pub const SCHEMA_MIGRATIONS_TABLE: &str = "findings_schema_migrations";
++
++/// Advisory lock key guarding migration application.
++///
++/// Fixed 64-bit value derived once for the logical namespace
++/// `gossip-findings-postgres:migrations`.
++pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x47465047_4d494731; // "GFPGMIG1"
++
++/// Primary key columns for `findings`.
++pub const FINDINGS_PRIMARY_KEY_COLUMNS: &[&str] = &["tenant_id", "finding_id"];
++/// Primary key columns for `occurrences`.
++pub const OCCURRENCES_PRIMARY_KEY_COLUMNS: &[&str] = &["tenant_id", "occurrence_id"];
++/// Primary key columns for `observations`.
++pub const OBSERVATIONS_PRIMARY_KEY_COLUMNS: &[&str] = &["tenant_id", "observation_id"];
++/// Reserved future primary key columns for `secret_triage`.
++pub const OPTIONAL_SECRET_TRIAGE_PRIMARY_KEY_COLUMNS: &[&str] = &["tenant_id", "secret_hash"];
++
++/// Full insert column set for `findings`.
++pub const FINDINGS_COLUMNS: &[&str] = &[
++    "tenant_id",
++    "finding_id",
++    "stable_item_id",
++    "rule_fingerprint",
++    "secret_hash",
++];
++
++/// Full insert column set for `occurrences`.
++pub const OCCURRENCES_COLUMNS: &[&str] = &[
++    "tenant_id",
++    "occurrence_id",
++    "finding_id",
++    "object_version_id",
++    "byte_offset",
++    "byte_length",
++];
++
++/// Full insert column set for `observations`.
++pub const OBSERVATIONS_COLUMNS: &[&str] = &[
++    "tenant_id",
++    "observation_id",
++    "occurrence_id",
++    "policy_hash",
++    "ovid_hash",
++    "run_id",
++    "shard_id",
++    "fence_epoch",
++    "seen_at",
++    "location_display",
++    "location_url",
++];
++
++/// Canonical natural-key uniqueness set for `findings`.
++pub const FINDINGS_CANONICAL_UNIQUE_COLUMNS: &[&str] = &[
++    "tenant_id",
++    "stable_item_id",
++    "rule_fingerprint",
++    "secret_hash",
++];
++
++/// Canonical natural-key uniqueness set for `occurrences`.
++///
++/// Note the intentional absence of `policy_hash`: occurrences are version- and
++/// span-scoped, not policy-scoped.
++pub const OCCURRENCES_CANONICAL_UNIQUE_COLUMNS: &[&str] = &[
++    "tenant_id",
++    "finding_id",
++    "object_version_id",
++    "byte_offset",
++    "byte_length",
++];
++
++/// Canonical natural-key uniqueness set for `observations`.
++///
++/// This is the policy-scoped layer, so `policy_hash` belongs here.
++pub const OBSERVATIONS_CANONICAL_UNIQUE_COLUMNS: &[&str] = &[
++    "tenant_id",
++    "policy_hash",
++    "occurrence_id",
++];
++
++/// Index name for tenant-scoped secret grouping lookups.
++pub const FINDINGS_TENANT_SECRET_HASH_INDEX: &str = "findings_tenant_secret_hash_idx";
++/// Index name for item-centric lookups.
++pub const FINDINGS_TENANT_STABLE_ITEM_INDEX: &str = "findings_tenant_stable_item_id_idx";
++/// Index name for joining occurrences back to findings.
++pub const OCCURRENCES_TENANT_FINDING_INDEX: &str = "occurrences_tenant_finding_id_idx";
++/// Index name for object-version provenance lookups.
++pub const OCCURRENCES_TENANT_OBJECT_VERSION_INDEX: &str =
++    "occurrences_tenant_object_version_id_idx";
++/// Index name for tenant-wide latest-seen queries over observations.
++pub const OBSERVATIONS_TENANT_SEEN_AT_INDEX: &str = "observations_tenant_seen_at_idx";
++/// Index name for policy/time filtering over observations.
++pub const OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX: &str =
++    "observations_tenant_policy_seen_at_idx";
++/// Index name for occurrence -> observation joins.
++pub const OBSERVATIONS_TENANT_OCCURRENCE_INDEX: &str =
++    "observations_tenant_occurrence_id_idx";
++/// Index name for policy+done-ledger join/provenance lookups.
++pub const OBSERVATIONS_TENANT_OVID_INDEX: &str = "observations_tenant_ovid_hash_idx";
++/// Index name for operational provenance by `(tenant_id, run_id, shard_id)`.
++pub const OBSERVATIONS_TENANT_RUN_SHARD_INDEX: &str =
++    "observations_tenant_run_shard_idx";
++
++/// Stable Postgres schema plan for the findings backend.
++///
++/// `include_secret_triage` only reserves whether later migrations may install
++/// the optional triage table. D0/D1 do not model any mutable triage row shape.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct FindingsSchemaPlan {
++    include_secret_triage: bool,
++}
++
++impl Default for FindingsSchemaPlan {
++    fn default() -> Self {
++        Self::mvp()
++    }
++}
++
++impl FindingsSchemaPlan {
++    /// MVP schema plan: three normalized write-path tables, no triage table yet.
++    #[inline]
++    #[must_use]
++    pub const fn mvp() -> Self {
++        Self {
++            include_secret_triage: false,
++        }
++    }
++
++    /// Enable reservation of the future `secret_triage` table.
++    #[inline]
++    #[must_use]
++    pub const fn with_secret_triage(self) -> Self {
++        Self {
++            include_secret_triage: true,
++        }
++    }
++
++    /// Returns whether the optional `secret_triage` table is part of the plan.
++    #[inline]
++    #[must_use]
++    pub const fn include_secret_triage(self) -> bool {
++        self.include_secret_triage
++    }
++
++    /// Validate a contracts-layer batch against the Postgres schema plan.
++    ///
++    /// This defers to the contracts layer for canonical observation identity and
++    /// referential closure, then lets row projection enforce Postgres-specific
++    /// integer encoding constraints.
++    pub fn validate_batch(self, batch: FindingsUpsertBatch<'_>) -> Result<(), FindingsPgSchemaError> {
++        let _ = self;
++        batch.validate_observation_identity()?;
++        batch.validate_referential_integrity()?;
++        Ok(())
++    }
++
++    /// Project a contracts-layer batch into Postgres-friendly primitive rows.
++    ///
++    /// The resulting rows are schema-final: later D1 migrations and D2 insert
++    /// statements should consume this shape directly.
++    pub fn project_batch(
++        self,
++        batch: FindingsUpsertBatch<'_>,
++    ) -> Result<ProjectedFindingsBatch, FindingsPgSchemaError> {
++        self.validate_batch(batch)?;
++
++        let findings = batch.findings().iter().map(FindingRow::from_record).collect();
++
++        let occurrences = batch
++            .occurrences()
++            .iter()
++            .map(OccurrenceRow::from_record)
++            .collect::<Result<Vec<_>, _>>()?;
++
++        let observations = batch
++            .observations()
++            .iter()
++            .map(ObservationRow::from_record)
++            .collect::<Result<Vec<_>, _>>()?;
++
++        Ok(ProjectedFindingsBatch {
++            findings,
++            occurrences,
++            observations,
++        })
++    }
++}
++
++/// Stable-row projection for the `findings` table.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct FindingRow {
++    pub tenant_id: [u8; 32],
++    pub finding_id: [u8; 32],
++    pub stable_item_id: [u8; 32],
++    pub rule_fingerprint: [u8; 32],
++    pub secret_hash: [u8; 32],
++}
++
++impl FindingRow {
++    /// Project a contracts-layer [`FindingRecord`] into the durable row shape.
++    #[must_use]
++    pub fn from_record(record: &FindingRecord) -> Self {
++        Self {
++            tenant_id: *record.tenant_id().as_bytes(),
++            finding_id: *record.finding_id().as_bytes(),
++            stable_item_id: *record.stable_item_id().as_bytes(),
++            rule_fingerprint: *record.rule_fingerprint().as_bytes(),
++            secret_hash: *record.secret_hash().as_bytes(),
++        }
++    }
++}
++
++/// Version-specific row projection for the `occurrences` table.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct OccurrenceRow {
++    pub tenant_id: [u8; 32],
++    pub occurrence_id: [u8; 32],
++    pub finding_id: [u8; 32],
++    pub object_version_id: [u8; 32],
++    pub byte_offset: i64,
++    pub byte_length: i64,
++}
++
++impl OccurrenceRow {
++    /// Project a contracts-layer [`OccurrenceRecord`] into the durable row
++    /// shape, validating non-negative ordered `BIGINT` columns.
++    pub fn from_record(record: &OccurrenceRecord) -> Result<Self, FindingsPgSchemaError> {
++        Ok(Self {
++            tenant_id: *record.tenant_id().as_bytes(),
++            occurrence_id: *record.occurrence_id().as_bytes(),
++            finding_id: *record.finding_id().as_bytes(),
++            object_version_id: *record.object_version_id().as_bytes(),
++            byte_offset: u64_to_pg_i64_checked(record.byte_offset(), "occurrences.byte_offset")?,
++            byte_length: u64_to_pg_i64_checked(
++                record.byte_length().get(),
++                "occurrences.byte_length",
++            )?,
++        })
++    }
++}
++
++/// Policy-scoped row projection for the `observations` table.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ObservationRow {
++    pub tenant_id: [u8; 32],
++    pub observation_id: [u8; 32],
++    pub occurrence_id: [u8; 32],
++    pub policy_hash: [u8; 32],
++    pub ovid_hash: [u8; 32],
++    pub run_id: i64,
++    pub shard_id: i64,
++    pub fence_epoch: i64,
++    pub seen_at: i64,
++    pub location_display: Option<String>,
++    pub location_url: Option<String>,
++}
++
++impl ObservationRow {
++    /// Project a contracts-layer [`ObservationRecord`] into the durable row
++    /// shape.
++    ///
++    /// `run_id` and `shard_id` use bit reinterpretation because they behave as
++    /// opaque equality/grouping identifiers. `fence_epoch` and `seen_at` use
++    /// checked non-negative `BIGINT` because ordering semantics matter.
++    pub fn from_record(record: &ObservationRecord) -> Result<Self, FindingsPgSchemaError> {
++        let (location_display, location_url) = match record.location() {
++            Some(location) => (
++                Some(location.display().to_owned()),
++                location.url().map(ToOwned::to_owned),
++            ),
++            None => (None, None),
++        };
++
++        Ok(Self {
++            tenant_id: *record.tenant_id().as_bytes(),
++            observation_id: *record.observation_id().as_bytes(),
++            occurrence_id: *record.occurrence_id().as_bytes(),
++            policy_hash: *record.policy_hash().as_bytes(),
++            ovid_hash: *record.ovid_hash().as_bytes(),
++            run_id: u64_to_pg_i64_bits(record.run_id().as_raw()),
++            shard_id: u64_to_pg_i64_bits(record.shard_id().as_raw()),
++            fence_epoch: u64_to_pg_i64_checked(
++                record.fence_epoch().as_raw(),
++                "observations.fence_epoch",
++            )?,
++            seen_at: u64_to_pg_i64_checked(record.seen_at().as_raw(), "observations.seen_at")?,
++            location_display,
++            location_url,
++        })
++    }
++}
++
++/// Fully projected, Postgres-friendly findings batch.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct ProjectedFindingsBatch {
++    findings: Vec<FindingRow>,
++    occurrences: Vec<OccurrenceRow>,
++    observations: Vec<ObservationRow>,
++}
++
++impl ProjectedFindingsBatch {
++    /// Project the contracts batch using the default MVP schema plan.
++    pub fn from_contract_batch(batch: FindingsUpsertBatch<'_>) -> Result<Self, FindingsPgSchemaError> {
++        FindingsSchemaPlan::mvp().project_batch(batch)
++    }
++
++    /// Stable finding rows.
++    #[inline]
++    #[must_use]
++    pub fn findings(&self) -> &[FindingRow] {
++        &self.findings
++    }
++
++    /// Version-specific occurrence rows.
++    #[inline]
++    #[must_use]
++    pub fn occurrences(&self) -> &[OccurrenceRow] {
++        &self.occurrences
++    }
++
++    /// Policy-scoped observation rows.
++    #[inline]
++    #[must_use]
++    pub fn observations(&self) -> &[ObservationRow] {
++        &self.observations
++    }
++
++    /// Returns `true` if all three layers are empty.
++    #[inline]
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.findings.is_empty() && self.occurrences.is_empty() && self.observations.is_empty()
++    }
++
++    /// Total number of projected rows.
++    #[inline]
++    #[must_use]
++    pub fn total_rows(&self) -> usize {
++        self.findings.len() + self.occurrences.len() + self.observations.len()
++    }
++}
++
++// Tests intentionally omitted for this task.
++// D2/D3 should add coverage for:
++// - schema plan projections preserving policy-independent occurrence keys
++// - observation rows differing across policy_hash for same occurrence
++// - BIGINT conversion bounds for seen_at/fence_epoch/byte offsets
++// - location projection preserving safe display/url fields only
