@@ -1,15 +1,39 @@
-//! CLI entrypoint wiring for scanner runtime.
+//! CLI entrypoint: argument parsing, scan dispatch, and summary output.
+//!
+//! This module owns the `scanner-rs scan {fs|git}` interface. It parses raw
+//! `OsString` arguments into a `CliConfig`, selects an event sink based on
+//! `--event-format`, dispatches to the unified runtime (`scan_fs_with_runtime`
+//! / `scan_git_with_runtime`), and prints a compact `key=value` summary to
+//! stderr.
+//!
+//! # Argument structure
+//!
+//! ```text
+//! scanner-rs scan fs  --path <dir|file> [FS OPTIONS] [COMMON OPTIONS]
+//! scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
+//! ```
+//!
+//! All flags accept both `--flag=value` and `--flag value` forms. Source
+//! paths can also be passed as bare positional arguments. Hidden `--x-*`
+//! flags (git-only) are parsed but excluded from `--help` output.
+//!
+//! # Worker auto-sizing
+//!
+//! For git scans without an explicit `--workers` override, the CLI probes
+//! `git count-objects -v` to read the in-pack object count and passes it to
+//! `auto_pack_exec_workers_for_in_pack` for right-sized parallelism. The
+//! probe runs before the timing window so it does not inflate
+//! elapsed/throughput numbers.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use gossip_connectors::GitDebugLevel;
 use gossip_scan_driver::CancellationToken;
-use gossip_scan_driver::GitDebugLevel;
 use scanner_engine::TransformId;
-use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode, NullEventSink};
-use scanner_scheduler::events::EventOutput;
+use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::source_kind::SourceKind;
 
 use crate::commit_sink::CliNoOpCommitSink;
@@ -20,7 +44,10 @@ use crate::{
     scan_git_with_runtime,
 };
 
-/// CLI source command.
+/// Parsed source subcommand from the CLI.
+///
+/// Determines which scan path (`scan_fs_with_runtime` or
+/// `scan_git_with_runtime`) the [`run`] function dispatches to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliSource {
     /// Scan a filesystem path (directory or file).
@@ -29,7 +56,12 @@ pub enum CliSource {
     Git { repo: PathBuf },
 }
 
-/// Parsed CLI config produced by [`parse_args`].
+/// Fully parsed CLI configuration produced by [`parse_args`].
+///
+/// All values have been validated and default-filled; this struct is ready
+/// for direct consumption by [`run`]. Builder-pattern setters are
+/// intentionally omitted — construction flows exclusively through the
+/// argument parser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliConfig {
     /// Scan source (fs path or git repo).
@@ -78,7 +110,11 @@ pub struct CliConfig {
     pub git_engine_chunk_mb: Option<u32>,
 }
 
-/// Runtime CLI error.
+/// CLI-layer error.
+///
+/// [`HelpRequested`](CliError::HelpRequested) exits cleanly (exit code 0);
+/// [`Usage`](CliError::Usage) exits with a non-zero code and error message;
+/// [`Runtime`](CliError::Runtime) wraps scan-runtime failures.
 #[derive(Debug)]
 pub enum CliError {
     /// `--help` or `-h` was passed; the contained string is the usage text.
@@ -113,11 +149,22 @@ impl From<ScanRuntimeError> for CliError {
     }
 }
 
-/// Parse CLI args from the process environment.
+/// Parse CLI arguments from the process environment.
+///
+/// Skips `argv[0]` (the binary name) and delegates to the internal
+/// argument parser.
 pub fn parse_args() -> Result<CliConfig, CliError> {
     parse_args_from(std::env::args_os().skip(1))
 }
 
+/// Parse CLI arguments from an arbitrary iterator.
+///
+/// Expects the iterator to start at the subcommand position (i.e., `argv[0]`
+/// already stripped). Accepts `OsString` to handle non-UTF-8 paths on Unix.
+///
+/// Returns [`CliError::HelpRequested`] for `--help`/`-h` at any position,
+/// [`CliError::Usage`] for invalid arguments, or a fully populated
+/// [`CliConfig`] on success.
 fn parse_args_from<I>(args: I) -> Result<CliConfig, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -686,8 +733,6 @@ where
 /// ```
 pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError> {
     let sink = build_event_sink(config.event_format, config.verbose, config.null_sink);
-    let core_sink: &dyn EventOutput = sink.as_ref();
-    let git_sink: &dyn GitEventOutput = sink.as_ref();
     let commit = CliNoOpCommitSink;
     let cancel = CancellationToken::new();
 
@@ -731,7 +776,7 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
                     .with_anchor_mode(config.anchor_mode)
                     .with_rules_file(config.rules_file.clone())
                     .with_transform_filter(config.transform_filter.clone()),
-                core_sink,
+                sink.as_ref(),
                 &commit,
                 &cancel,
             )?
@@ -755,9 +800,7 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
                     .with_merge_mode(config.git_merge_mode)
                     .with_tree_delta_cache_mb(config.git_tree_delta_cache_mb)
                     .with_engine_chunk_mb(config.git_engine_chunk_mb),
-                core_sink,
-                Some(git_sink),
-                &commit,
+                sink.as_ref(),
                 &cancel,
             )?;
             if let Some(debug_output) = outcome.debug_output.as_deref() {
@@ -767,7 +810,7 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
         }
     };
 
-    core_sink.flush();
+    sink.flush();
     let elapsed = wall_start.elapsed();
 
     print_scan_summary(
@@ -783,8 +826,11 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
 
 /// Print a compact `key=value` summary to stderr.
 ///
-/// Field order is stable for scripted parsing. Git scans use `objects=`
-/// instead of `files=` to match the reference scanner output.
+/// Field order is stable and machine-parseable. Git scans use `objects=`
+/// instead of `files=` to match the reference scanner-rs binary output.
+/// When `summary_debug` is true, additional breakdown fields (`workers`,
+/// `binary_skipped`, `init_ms`, `scan_ms`, `persist_ms`, etc.) are
+/// appended after the standard fields.
 fn print_scan_summary(
     report: &gossip_scan_driver::ScanReport,
     elapsed: std::time::Duration,
@@ -866,7 +912,10 @@ fn render_scan_summary(
     buf
 }
 
-/// Format byte counts using binary IEC units (KiB, MiB, GiB, ...).
+/// Format byte counts using binary IEC units (KiB, MiB, GiB, TiB, PiB).
+///
+/// Values below 1 KiB are formatted without a decimal (e.g., `512B`).
+/// Larger values are formatted with two decimal places (e.g., `1.43GiB`).
 fn format_human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     if bytes < 1024 {
@@ -882,18 +931,19 @@ fn format_human_bytes(bytes: u64) -> String {
     format!("{value:.2}PiB")
 }
 
-trait CliEventSink: EventOutput + GitEventOutput {}
-
-impl<T> CliEventSink for T where T: EventOutput + GitEventOutput {}
-
+/// Construct the appropriate event sink for the requested output format.
+///
+/// When `null_sink` is true, returns a null sink that discards all events
+/// (useful for benchmarking without I/O overhead). Otherwise returns a sink
+/// that writes to stdout in the requested format.
 fn build_event_sink(
     event_format: EventFormat,
     verbose: bool,
     null_sink: bool,
-) -> Box<dyn CliEventSink> {
+) -> Box<dyn GitEventOutput> {
     if null_sink {
         eprintln!("info: --null-sink enabled; findings will not be written to stdout");
-        return Box::new(NullEventSink);
+        return Box::new(scanner_git::NullEventSink);
     }
     match event_format {
         EventFormat::Jsonl => Box::new(JsonlEventSink::new(io::stdout())),
@@ -1068,20 +1118,28 @@ fn parse_transforms(value: &str, source_kind: &str) -> Result<TransformFilter, C
     }
 }
 
+/// Strip an ASCII prefix from an `OsStr`, returning the remainder.
+///
+/// # Safety
+///
+/// Uses `OsStr::from_encoded_bytes_unchecked` on the suffix bytes. This is
+/// safe because all prefixes passed to this function are ASCII-only (`--flag=`),
+/// meaning the split point never falls inside a multi-byte character.
 fn strip_os_prefix<'a>(arg: &'a OsStr, prefix: &str) -> Option<&'a OsStr> {
     let bytes = arg.as_encoded_bytes();
     if bytes.starts_with(prefix.as_bytes()) {
-        // SAFETY: `prefix` is ASCII-only and therefore a valid split point.
         Some(unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[prefix.len()..]) })
     } else {
         None
     }
 }
 
-/// Return `in-pack` object count for the repository.
+/// Return the `in-pack` object count for the repository by shelling out to
+/// `git count-objects -v`.
 ///
 /// This probe is advisory and used only for worker auto-sizing. Callers
-/// should fall back to deterministic defaults when it fails.
+/// should fall back to deterministic defaults when it fails (e.g., `git`
+/// not on PATH, bare repos, or permission errors).
 fn probe_in_pack_object_count(repo_root: &std::path::Path) -> io::Result<u64> {
     let output = std::process::Command::new("git")
         .arg("-C")

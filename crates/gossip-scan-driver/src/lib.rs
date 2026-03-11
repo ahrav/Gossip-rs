@@ -16,14 +16,14 @@
 //!                        ▼
 //!               Box<dyn ScanDriver>
 //!                        │
-//!          ┌─────────────┼───────────────────┐
-//!          │             run()                │
-//!          │  Engine + Config + EventOutput   │
-//!          │  + CommitSink + CancellationToken│
-//!          │             │                    │
-//!          │             ▼                    │
-//!          │        ScanReport                │
-//!          └─────────────────────────────────-┘
+//!          ┌─────────────┼─────────────────┐
+//!          │             run()              │
+//!          │ Engine + Config + EventOutput  │
+//!          │  + CommitSink + CancellToken   │
+//!          │             │                  │
+//!          │             ▼                  │
+//!          │        ScanReport              │
+//!          └───────────────────────────────-┘
 //! ```
 //!
 //! # Why a separate crate?
@@ -49,7 +49,6 @@ use anyhow::Result;
 use gossip_contracts::connector::{Cursor, ItemKey, VersionId};
 use gossip_contracts::coordination::ShardSpec;
 use gossip_contracts::identity::{PolicyHash, StableItemId};
-use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::events::EventOutput;
 
 /// Cooperative cancellation token for long-running scans.
@@ -181,12 +180,13 @@ impl Default for FilesystemExecutionConfig {
 /// Top-level runtime configuration passed to every [`ScanDriver::run`] call.
 ///
 /// Contains cross-cutting knobs (worker count, checkpoint interval) plus
-/// embedded source-specific sections. Drivers read the section that matches
-/// their backend and ignore the rest.
+/// an embedded filesystem-specific section. Git-specific configuration
+/// lives in `gossip-connectors` and is passed directly to the git scan
+/// entry point, keeping this crate source-neutral.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanExecutionConfig {
     /// Number of scanner worker threads. Interpreted as a hint — some
-    /// drivers cap or override it (see [`GitExecutionConfig::pack_exec_workers`]).
+    /// drivers cap or override it based on their own internal defaults.
     pub workers: usize,
     /// Emit a progress / checkpoint event after this many items. The
     /// coordination layer uses these events to track incremental progress
@@ -194,8 +194,6 @@ pub struct ScanExecutionConfig {
     pub checkpoint_every_items: u64,
     /// Filesystem-specific overrides.
     pub filesystem: FilesystemExecutionConfig,
-    /// Git-specific overrides.
-    pub git: GitExecutionConfig,
 }
 
 impl Default for ScanExecutionConfig {
@@ -204,66 +202,6 @@ impl Default for ScanExecutionConfig {
             workers: 1,
             checkpoint_every_items: 1_000,
             filesystem: FilesystemExecutionConfig::default(),
-            git: GitExecutionConfig::default(),
-        }
-    }
-}
-
-/// Diagnostic verbosity for git scan debug output.
-///
-/// Returned via [`ScanDriver::debug_output`] and printed to stderr by the
-/// CLI after the scan completes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GitDebugLevel {
-    /// No diagnostic output (default).
-    #[default]
-    Off,
-    /// High-level aggregate statistics (ref counts, blob totals).
-    Stats,
-    /// Detailed per-phase timing and pack-exec performance counters.
-    Perf,
-}
-
-/// Git-specific runtime knobs.
-///
-/// Embedded in [`ScanExecutionConfig::git`] and forwarded to the
-/// `run_git_scan` entry point by the git driver.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GitExecutionConfig {
-    /// Stable repository identifier used to namespace persisted keys.
-    pub repo_id: u64,
-    /// Git scan mode (diff-history vs ODB-blob fast-path).
-    pub scan_mode: GitScanMode,
-    /// Merge-diff strategy for merge commits.
-    pub merge_diff_mode: MergeDiffMode,
-    /// Optional explicit pack-exec worker override.
-    ///
-    /// When `None`, git driver falls back to [`ScanExecutionConfig::workers`].
-    pub pack_exec_workers: Option<usize>,
-    /// When true, skip binary-class filtering and scan all blobs.
-    pub scan_binary: bool,
-    /// When true, emit identity-dictionary and enriched commit metadata.
-    pub enrich_identities: bool,
-    /// Optional diagnostic output level.
-    pub debug_level: GitDebugLevel,
-    /// Optional tree delta cache size override in MiB.
-    pub tree_delta_cache_mb: Option<u32>,
-    /// Optional engine chunk size override in MiB.
-    pub engine_chunk_mb: Option<u32>,
-}
-
-impl Default for GitExecutionConfig {
-    fn default() -> Self {
-        Self {
-            repo_id: 1,
-            scan_mode: GitScanMode::OdbBlobFast,
-            merge_diff_mode: MergeDiffMode::AllParents,
-            pack_exec_workers: None,
-            scan_binary: false,
-            enrich_identities: false,
-            debug_level: GitDebugLevel::Off,
-            tree_delta_cache_mb: None,
-            engine_chunk_mb: None,
         }
     }
 }
@@ -271,11 +209,14 @@ impl Default for GitExecutionConfig {
 /// Aggregate counters returned by [`ScanDriver::run`] after a scan completes.
 ///
 /// Used for coordination-layer bookkeeping (shard progress, error budgets)
-/// and CLI summary output. Throughput and elapsed time are intentionally
-/// omitted — callers derive those from wall-clock measurement because
-/// drivers may spend time outside the scan loop (engine init, path
-/// validation, ref resolution) that the coordination layer should not
-/// account for.
+/// and CLI summary output. Wall-clock elapsed time is intentionally omitted
+/// — callers derive that from their own timers because drivers may spend
+/// time outside the scan loop (engine init, path validation, ref resolution)
+/// that the coordination layer should not account for. The [`scan_ns`] and
+/// [`persist_ns`] fields capture internal phase durations only.
+///
+/// [`scan_ns`]: ScanReport::scan_ns
+/// [`persist_ns`]: ScanReport::persist_ns
 ///
 /// Counter overflow semantics depend on the backend: the in-memory driver
 /// uses saturating arithmetic, while the filesystem and git drivers inherit
@@ -371,7 +312,8 @@ pub struct ItemMeta {
 /// Carries the minimal set of fields the coordination layer needs to
 /// derive the full identity chain (`norm_hash → secret_hash → finding_id
 /// → occurrence_id`). Richer per-finding details (matched text, transform
-/// path) travel through the [`EventOutput`] stream instead.
+/// path) travel through the [`scanner_scheduler::events::EventOutput`] stream
+/// instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRecord {
     /// Numeric identifier of the detection rule that matched.
@@ -384,9 +326,11 @@ pub struct FindingRecord {
     /// the same `norm_hash` matched the same logical secret regardless of
     /// surrounding context or transform chain.
     pub norm_hash: [u8; 32],
-    /// Additive confidence score from gate signals (Phase 1 range: 0–10).
-    /// Does **not** participate in dedup — two findings at the same span
-    /// with different scores still deduplicate normally.
+    /// Additive confidence score from gate signals. Conventionally 0–10 but
+    /// the `i8` type is not range-restricted — consumers must tolerate
+    /// values outside that range. Does **not** participate in dedup — two
+    /// findings at the same span with different scores still deduplicate
+    /// normally.
     pub confidence_score: i8,
 }
 
@@ -410,7 +354,8 @@ pub struct FindingsBatch {
 /// In distributed mode the sink derives identity chains and records
 /// progress for the coordination layer. In CLI mode, [`NoOpCommitSink`]
 /// discards all calls. The git driver currently ignores the sink
-/// entirely — git findings flow only through the [`EventOutput`] stream.
+/// entirely — git findings flow only through the
+/// [`scanner_scheduler::events::EventOutput`] stream.
 ///
 /// [`begin_item`]: CommitSink::begin_item
 /// [`upsert_findings`]: CommitSink::upsert_findings
@@ -429,8 +374,13 @@ pub trait CommitSink: Send + Sync {
     fn finish_item(&self, item_key: &ItemKey) -> Result<()>;
 }
 
-/// No-op [`CommitSink`] for CLI and direct-mode scans where per-item
-/// persistence is not needed.
+/// No-op [`CommitSink`] that discards all calls.
+///
+/// Used in CLI and direct-mode scans where per-item persistence is not
+/// needed. The git scan path bypasses `CommitSink` entirely — git scans
+/// use a commit-graph persistence model (ref watermarks, seen-blob
+/// deduplication) rather than the per-item begin/finish lifecycle.
+/// Durable finding persistence for git scans is not yet implemented.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoOpCommitSink;
 
@@ -459,8 +409,11 @@ impl CommitSink for NoOpCommitSink {
 /// # Implementors
 ///
 /// - `FsScanDriver` — filesystem walk via `parallel_scan_dir`
-/// - `GitScanDriver` — git repository via `run_git_scan`
 /// - `InMemoryScanDriver` — pre-loaded dataset for tests
+///
+/// Git scans use a dedicated execution path (`execute_git_assignment`)
+/// rather than this trait, because they require `&dyn GitEventOutput`
+/// instead of the source-neutral `&dyn EventOutput`.
 pub trait ScanDriver: Send {
     /// Execute the scan and return aggregate counters.
     ///
@@ -468,8 +421,7 @@ pub trait ScanDriver: Send {
     ///
     /// - `engine` — compiled detection rules shared across workers.
     /// - `cfg` — runtime knobs (workers, checkpoint interval, source config).
-    /// - `out` — event sink for findings, progress, and diagnostics.
-    /// - `git_out` — optional git-specific event sink (ignored by non-git drivers).
+    /// - `out` — event sink for core (source-neutral) scan events.
     /// - `commit` — per-item lifecycle sink for persistence (see [`CommitSink`]).
     /// - `cancel` — cooperative cancellation token; drivers that support it
     ///   poll [`CancellationToken::is_cancelled`] at regular intervals.
@@ -484,7 +436,6 @@ pub trait ScanDriver: Send {
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
         out: &dyn EventOutput,
-        git_out: Option<&dyn GitEventOutput>,
         commit: &dyn CommitSink,
         cancel: &CancellationToken,
     ) -> Result<ScanReport>;
@@ -501,8 +452,8 @@ pub trait ScanDriver: Send {
 
     /// Optional human-readable debug diagnostics generated during the scan.
     ///
-    /// Used by the git driver to surface ref-resolution stats and pack-exec
-    /// timing. The CLI prints this to stderr after the scan completes.
+    /// The CLI prints this to stderr after the scan completes. Currently
+    /// unused by the source-neutral implementors (returns `None`).
     fn debug_output(&self) -> Option<String> {
         None
     }

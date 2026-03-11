@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use gossip_scan_driver::GitDebugLevel;
+use gossip_connectors::GitDebugLevel;
 use scanner_engine::TransformId;
 use scanner_git::{GitScanMode, MergeDiffMode};
 use scanner_scheduler::source_kind::SourceKind;

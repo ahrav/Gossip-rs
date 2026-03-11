@@ -41,7 +41,7 @@ The crate provides four core capabilities:
 | `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |
 | `split_estimator.rs` | `StreamingSplitEstimator` -- bounded-memory byte-weighted split-point estimation                          |
 | `git.rs`         | `GitConnector` -- Git repository connector with ref enumeration and blob reading                              |
-| `scan_driver.rs` | `ScanSourceFactory` impls: `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
+| `scan_driver.rs` | `ScanSourceFactory` impls: `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`; standalone `execute_git_assignment` |
 
 ---
 
@@ -90,7 +90,7 @@ The crate provides four core capabilities:
 | Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `resolve_bounds`                                     |
 | Streaming split estimation     | `gossip-connectors::split_estimator` | `StreamingSplitEstimator` (bounded-memory byte-weighted median)             |
 | Scan driver traits             | `gossip-scan-driver`             | `ScanDriver::run()`, `ScanSourceFactory`, `Assignment`                             |
-| Scan source factory impls      | `gossip-connectors::scan_driver` | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
+| Scan source factory impls      | `gossip-connectors::scan_driver` | `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`, `execute_git_assignment` |
 | Scan runtime entry points      | `gossip-scanner-runtime`         | `scan_fs()`, `scan_git()`, execution-mode dispatch                                 |
 
 ### Dependency direction
@@ -106,8 +106,8 @@ value types. It must NOT depend on `gossip-coordination`,
 `gossip-scan-driver` defines the `ScanDriver` and `ScanSourceFactory` traits
 that bridge assignments to source-specific execution backends.
 `gossip-connectors::scan_driver` provides concrete factory implementations
-(`FilesystemScanSourceFactory`, `GitScanSourceFactory`,
-`InMemoryScanSourceFactory`). `gossip-scanner-runtime` provides the top-level
+(`FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`) and the
+standalone `execute_git_assignment` entry point for git scans. `gossip-scanner-runtime` provides the top-level
 entry points (`scan_fs()`, `scan_git()`) that compose driver execution with
 engine and event infrastructure.
 
@@ -459,10 +459,14 @@ boxed `ScanDriver` that runs the actual scan.
 | Factory                        | `ConnectorKind` | Driver                | Backend                       |
 | ------------------------------ | --------------- | --------------------- | ----------------------------- |
 | `FilesystemScanSourceFactory`  | `Filesystem`    | `FsScanDriver`        | `parallel_scan_dir`           |
-| `GitScanSourceFactory`         | `Git`           | `GitScanDriver`       | `run_git_scan`                |
 | `InMemoryScanSourceFactory`    | `InMemory`      | `InMemoryScanDriver`  | Sequential item iteration     |
 
-All three factory types are re-exported from the crate root.
+> Git scans use `execute_git_assignment()` instead of the factory/trait
+> path — see below.
+
+The crate root re-exports `FilesystemScanSourceFactory`,
+`InMemoryScanSourceFactory`, `execute_git_assignment`,
+`GitExecutionConfig`, and `GitDebugLevel`.
 
 ### `FilesystemScanSourceFactory`
 
@@ -470,18 +474,23 @@ Zero-sized, `Copy`-able factory. Creates `FsScanDriver` which wraps
 `parallel_scan_dir` from `scanner-scheduler`. Event and commit forwarding
 use scoped threads with crossbeam channels to bridge the scheduler's
 `EventOutput` / `StoreProducer` interfaces to the coordination layer's
-`CommitSink`. Does not support cooperative cancellation (only pre-check).
-Supports checkpoint hints.
+`EventOutput` and `CommitSink` sinks (`FsScanDriver::run` takes
+`&dyn EventOutput`, not `&dyn GitEventOutput` — the git-specific event
+trait is only used on the dedicated git execution path). Does not support
+cooperative cancellation (only pre-check). Checkpoint hints are not
+currently supported (will be added with resumable FS scans).
 
-### `GitScanSourceFactory`
+### `execute_git_assignment`
 
-Zero-sized, `Copy`-able factory. Creates `GitScanDriver` which wraps
-`run_git_scan` from `scanner-git`. Resolves refs via `NativeRefResolver`
-(shells out to `git for-each-ref`), treats all refs as unseen
-(`EmptyWatermarkStore`), performing a full scan on each run. The
-`CommitSink` is intentionally unused -- git scans use a commit-graph
-persistence model rather than the per-item begin/finish lifecycle. Does
-not support checkpoint hints or cooperative cancellation.
+Sole entry point for git scans; does not go through `ScanDriver::run` or
+`ScanSourceFactory`. Requires `&dyn GitEventOutput` so the driver can
+emit git-specific events (`CommitMeta`, `IdentityDictionary`) alongside
+`CoreEvent`s. Accepts `GitExecutionConfig` to control scan mode
+(`OdbBlobFast` vs `DiffHistory`), merge-diff mode (`AllParents` vs
+`FirstParent`), and the stable repository identifier. Returns
+`(ScanReport, Option<CursorUpdate>, Option<String>)`; the cursor is
+always `None` because git uses watermark-based persistence, not
+cursor-based.
 
 ### `InMemoryScanSourceFactory`
 
@@ -497,10 +506,11 @@ engine. Supports both checkpoint hints and cooperative cancellation.
 The scan drivers use crossbeam channels to forward events and findings
 across thread boundaries:
 
-- `ChannelEventOutput` -- serializes `CoreEvent`s as owned values
-  (`OwnedCoreEvent`) for cross-thread forwarding to `EventOutput`.
-- `ChannelGitEventOutput` -- extends `ChannelEventOutput` with
-  `GitEvent` forwarding for git-aware sinks.
+- `ChannelEventOutput` -- implements `EventOutput` and forwards
+  `CoreEvent`s as `OwnedCoreEvent` for cross-thread delivery.
+- `ChannelGitEventOutput` -- implements both `EventOutput` and
+  `GitEventOutput`, forwarding both core and git events through a
+  shared channel (used only in the git execution path).
 - `ChannelStoreProducer` -- normalizes scheduler paths (absolute OS
   paths from `FsFindingBatch`) to connector-relative `/`-separated key
   encoding via `normalize_scheduler_path`, then forwards batches through
@@ -520,8 +530,8 @@ the scanner engine and coordination layer:
 - **`gossip-scan-driver`** (`crates/gossip-scan-driver/src/lib.rs`) --
   defines `ScanDriver::run()` and `ScanSourceFactory` traits.
 - **`gossip-connectors::scan_driver`** (`crates/gossip-connectors/src/scan_driver.rs`) --
-  provides `FilesystemScanSourceFactory`, `GitScanSourceFactory`, and
-  `InMemoryScanSourceFactory` (see Section 6a).
+  provides `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`,
+  and `execute_git_assignment` (see Section 6a).
 - **`gossip-scanner-runtime`** (`crates/gossip-scanner-runtime/src/lib.rs`) --
   provides `scan_fs()` and `scan_git()` top-level entry points that
   compose driver execution with engine and event infrastructure.

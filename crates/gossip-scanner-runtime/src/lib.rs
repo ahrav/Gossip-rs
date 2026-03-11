@@ -1,13 +1,36 @@
-//! Unified scanner runtime entrypoints backed by `ScanDriver`.
+//! Unified scanner runtime: config construction, engine management, path
+//! validation, and scan dispatch.
 //!
-//! Both CLI and distributed execution paths route through the same
-//! assignment-to-driver seam:
+//! Filesystem and git assignments follow separate dispatch paths:
 //!
 //! ```text
-//! config -> Assignment -> ScanSourceFactory -> ScanDriver::run
+//! config ─► Assignment ─┬─ (FS) ─► ScanSourceFactory ─► ScanDriver::run ─► ScanReport
+//!                       └─ (Git) ─► execute_git_assignment ─► ScanReport
 //! ```
 //!
-//! Parity invariant: `Direct` and `Connector` modes currently execute the same
+//! `driver_for_assignment` rejects `ConnectorKind::Git`; git scans bypass
+//! the `ScanDriver` trait and call `execute_git_assignment` directly with
+//! `&dyn GitEventOutput` (no `CommitSink`).
+//!
+//! # Entry points
+//!
+//! | Function | Use case |
+//! |----------|----------|
+//! | [`scan_fs`] / [`scan_git`] | Top-level dispatchers (choose mode) |
+//! | `scan_fs_with_runtime` / `scan_git_with_runtime` | Internal; accept caller-provided sinks |
+//! | `execute_assignment_with_config` | Non-git dispatch core; used by distributed worker for FS assignments |
+//! | `execute_git_assignment` | Git-specific entry point; used by both CLI and distributed worker |
+//!
+//! # Engine caching
+//!
+//! When the engine configuration matches the default, a process-global
+//! `OnceLock` caches the compiled engine so that multiple scans in the
+//! same process (e.g., a distributed worker loop) pay the regex
+//! compilation cost only once.
+//!
+//! # Parity invariant
+//!
+//! `Direct` and `Connector` execution modes currently execute the same
 //! runtime path. The mode flag remains for CLI compatibility and telemetry.
 
 use std::fmt;
@@ -16,7 +39,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
-use gossip_connectors::{FilesystemScanSourceFactory, GitScanSourceFactory};
+use gossip_connectors::{
+    FilesystemScanSourceFactory, GitDebugLevel, GitExecutionConfig, execute_git_assignment,
+};
 use gossip_contracts::{
     connector::{ConnectorInputError, Cursor},
     coordination::ShardSpec,
@@ -24,12 +49,14 @@ use gossip_contracts::{
 };
 use gossip_scan_driver::{
     Assignment, AssignmentSource, CancellationToken, CommitSink, ConnectorKind, CursorUpdate,
-    GitDebugLevel, GitExecutionConfig, NoOpCommitSink, ScanExecutionConfig, ScanReport,
-    ScanSourceFactory,
+    NoOpCommitSink, ScanExecutionConfig, ScanReport, ScanSourceFactory,
 };
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformId, TransformMode};
 use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
-use scanner_scheduler::events::{EventOutput, NullEventOutput};
+use scanner_scheduler::events::EventOutput;
+// `GitEventOutput: EventOutput`, so all event sinks implement both traits.
+// The unified `execute_assignment_with_config` accepts `&dyn GitEventOutput`
+// and upcasts to `&dyn EventOutput` for source-neutral drivers.
 
 /// Provides CLI entrypoint wiring, argument parsing, and scan dispatch.
 pub mod cli;
@@ -134,11 +161,16 @@ pub(crate) struct RuntimeEngineConfig {
 }
 
 /// Runtime budgets for source scans.
+///
+/// Both fields must be non-zero; conversion to `ScanExecutionConfig`
+/// returns [`ScanRuntimeError::ConnectorInput`] if either is zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudgets {
     /// Maximum items processed between checkpoints.
     pub max_items: usize,
-    /// Runtime-level byte budget knob (must be non-zero).
+    /// Runtime-level byte budget knob (must be non-zero). Currently
+    /// validated but not enforced at the execution layer — enforcement
+    /// will be added when the byte-budget limiting path is wired in.
     pub max_bytes: u64,
 }
 
@@ -472,6 +504,11 @@ impl GitScanConfig {
 }
 
 /// Runtime wiring errors for unified scan execution.
+///
+/// Each variant maps to a distinct failure category so callers can
+/// distinguish actionable errors (e.g., fix the path) from internal
+/// failures (e.g., engine compilation bug). The `Display` implementation
+/// produces human-readable messages suitable for CLI stderr output.
 #[derive(Debug)]
 pub enum ScanRuntimeError {
     /// A scan target path failed validation (does not exist, wrong type, etc.).
@@ -570,6 +607,9 @@ impl From<ConnectorInputError> for ScanRuntimeError {
 }
 
 /// Execution outcome for one assignment run.
+///
+/// Consumed by both the CLI (for summary printing) and the distributed
+/// worker (for coordinator completion).
 #[derive(Clone, Debug)]
 pub struct AssignmentOutcome {
     /// Scan-driver report for the assignment.
@@ -602,7 +642,7 @@ pub fn scan_git(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> 
 
 /// Filesystem scan routed through the unified assignment/driver seam.
 pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let out = NullEventOutput;
+    let out = scanner_scheduler::events::NullEventOutput;
     let commit = NoOpCommitSink;
     let cancel = CancellationToken::new();
     scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
@@ -618,10 +658,9 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
 
 /// Git scan routed through the unified assignment/driver seam.
 pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let out = NullEventOutput;
-    let commit = NoOpCommitSink;
+    let out = scanner_git::NullEventSink;
     let cancel = CancellationToken::new();
-    scan_git_with_runtime(config, &out, None, &commit, &cancel).map(|outcome| outcome.report)
+    scan_git_with_runtime(config, &out, &cancel).map(|outcome| outcome.report)
 }
 
 /// Connector-mode git scan.
@@ -632,6 +671,12 @@ pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanReport, ScanRunt
     scan_git_direct(config)
 }
 
+/// Internal filesystem scan entry point that accepts caller-provided sinks.
+///
+/// Used by both CLI (with stdout event sink) and distributed mode (with
+/// coordination event sink). Validates the path, synthesizes a single-shard
+/// assignment, and drives the FS factory directly — the connector kind is
+/// known statically, so the unified dispatch is unnecessary here.
 pub(crate) fn scan_fs_with_runtime(
     config: &FsScanConfig,
     out: &dyn EventOutput,
@@ -652,20 +697,41 @@ pub(crate) fn scan_fs_with_runtime(
     runtime.filesystem.skip_archives = config.skip_archives;
     runtime.filesystem.skip_binary = !config.scan_binary;
     runtime.filesystem.emit_findings_to_commit_sink = config.persist_findings;
-    let engine = RuntimeEngineConfig {
+    let engine_config = RuntimeEngineConfig {
         anchor_mode: config.anchor_mode,
         decode_depth: config.decode_depth,
         rules_file: config.rules_file.clone(),
         transform_filter: config.transform_filter.clone(),
     };
-    execute_assignment_with_config(&assignment, runtime, &engine, out, None, commit, cancel)
+
+    let mut driver = FilesystemScanSourceFactory
+        .driver_for_assignment(&assignment)
+        .map_err(ScanRuntimeError::Driver)?;
+    let report = driver
+        .run(
+            runtime_engine(&engine_config)?,
+            &runtime,
+            out,
+            commit,
+            cancel,
+        )
+        .map_err(ScanRuntimeError::Driver)?;
+    Ok(AssignmentOutcome {
+        report,
+        checkpoint_hint: driver.checkpoint_hint(),
+        debug_output: driver.debug_output(),
+    })
 }
 
+/// Internal git scan entry point that accepts caller-provided sinks.
+///
+/// Used by both CLI (with stdout event sink) and distributed mode (with
+/// coordination event sink). Validates the repository path, builds the
+/// git-specific config, and calls [`execute_git_assignment`] directly so
+/// git-specific events are preserved in the output sink.
 pub(crate) fn scan_git_with_runtime(
     config: &GitScanConfig,
-    out: &dyn EventOutput,
-    git_out: Option<&dyn GitEventOutput>,
-    commit: &dyn CommitSink,
+    out: &dyn GitEventOutput,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
     let canonical_repo = validate_git_repo_path(&config.repo)?;
@@ -676,78 +742,92 @@ pub(crate) fn scan_git_with_runtime(
             repo_root: canonical_repo,
         },
     );
-    let mut runtime = config
-        .budgets
-        .to_execution_config_with_workers(config.workers)?;
-    // Keep git execution tuning centralized in the shared ScanExecutionConfig
-    // so both CLI and distributed worker paths hit identical driver behavior.
-    runtime.git = GitExecutionConfig {
+    let workers = config.workers.max(1);
+    let runtime = config.budgets.to_execution_config_with_workers(workers)?;
+    let git_cfg = GitExecutionConfig {
         repo_id: config.repo_id,
         scan_mode: config.scan_mode,
         merge_diff_mode: config.merge_mode,
-        pack_exec_workers: Some(config.workers),
+        pack_exec_workers: Some(workers),
         scan_binary: config.scan_binary,
         enrich_identities: config.enrich_identities,
         debug_level: config.debug_level,
         tree_delta_cache_mb: config.tree_delta_cache_mb,
         engine_chunk_mb: config.engine_chunk_mb,
     };
-    let engine = RuntimeEngineConfig {
+    let engine_config = RuntimeEngineConfig {
         anchor_mode: config.anchor_mode,
         decode_depth: config.decode_depth,
         rules_file: config.rules_file.clone(),
         transform_filter: config.transform_filter.clone(),
     };
-    execute_assignment_with_config(&assignment, runtime, &engine, out, git_out, commit, cancel)
+    let engine = runtime_engine(&engine_config)?;
+    let (report, checkpoint_hint, debug_output) =
+        execute_git_assignment(&assignment, engine, &runtime, &git_cfg, out, cancel)
+            .map_err(ScanRuntimeError::Driver)?;
+    Ok(AssignmentOutcome {
+        report,
+        checkpoint_hint,
+        debug_output,
+    })
 }
 
+/// Unified assignment execution core for all connector kinds.
+///
+/// Dispatches to the appropriate driver based on `assignment.connector_kind`:
+/// - **Filesystem** uses `FilesystemScanSourceFactory` through the `ScanDriver` trait.
+/// - **Git** uses [`execute_git_assignment`] with the full `GitEventOutput` sink
+///   so git-specific events are preserved.
+/// - **InMemory** is rejected (test-only, wired through `InMemoryScanSourceFactory`
+///   directly).
+///
+/// `GitEventOutput` is a supertrait of `EventOutput`, so the filesystem path
+/// upcasts the sink reference via `out as &dyn EventOutput`.
 pub(crate) fn execute_assignment_with_config(
     assignment: &Assignment,
     config: ScanExecutionConfig,
     engine_config: &RuntimeEngineConfig,
-    out: &dyn EventOutput,
-    git_out: Option<&dyn GitEventOutput>,
+    git_cfg: &GitExecutionConfig,
+    out: &dyn GitEventOutput,
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    // Keep runtime entry points and distributed workers on one driver seam.
-    let mut driver = driver_for_assignment(assignment)?;
-    let report = driver
-        .run(
-            runtime_engine(engine_config)?,
-            &config,
-            out,
-            git_out,
-            commit,
-            cancel,
-        )
-        .map_err(ScanRuntimeError::Driver)?;
-
-    Ok(AssignmentOutcome {
-        report,
-        checkpoint_hint: driver.checkpoint_hint(),
-        debug_output: driver.debug_output(),
-    })
-}
-
-fn driver_for_assignment(
-    assignment: &Assignment,
-) -> Result<Box<dyn gossip_scan_driver::ScanDriver>, ScanRuntimeError> {
-    let factory: &dyn ScanSourceFactory = match assignment.connector_kind {
-        ConnectorKind::Filesystem => &FilesystemScanSourceFactory,
-        ConnectorKind::Git => &GitScanSourceFactory,
-        ConnectorKind::InMemory => {
-            return Err(ScanRuntimeError::UnsupportedConnectorKind(
-                assignment.connector_kind,
-            ));
+    match assignment.connector_kind {
+        ConnectorKind::Filesystem => {
+            let engine = runtime_engine(engine_config)?;
+            let mut driver = FilesystemScanSourceFactory
+                .driver_for_assignment(assignment)
+                .map_err(ScanRuntimeError::Driver)?;
+            let report = driver
+                .run(engine, &config, out as &dyn EventOutput, commit, cancel)
+                .map_err(ScanRuntimeError::Driver)?;
+            Ok(AssignmentOutcome {
+                report,
+                checkpoint_hint: driver.checkpoint_hint(),
+                debug_output: driver.debug_output(),
+            })
         }
-    };
-
-    factory
-        .driver_for_assignment(assignment)
-        .map_err(ScanRuntimeError::Driver)
+        ConnectorKind::Git => {
+            let engine = runtime_engine(engine_config)?;
+            let (report, checkpoint_hint, debug_output) =
+                execute_git_assignment(assignment, engine, &config, git_cfg, out, cancel)
+                    .map_err(ScanRuntimeError::Driver)?;
+            Ok(AssignmentOutcome {
+                report,
+                checkpoint_hint,
+                debug_output,
+            })
+        }
+        ConnectorKind::InMemory => Err(ScanRuntimeError::UnsupportedConnectorKind(
+            ConnectorKind::InMemory,
+        )),
+    }
 }
 
+/// Synthesize a single-shard assignment for direct/CLI scan paths.
+///
+/// Uses a placeholder policy hash and an unbounded shard spec (empty start
+/// and end bounds) because CLI scans always cover the entire source.
 pub(crate) fn build_assignment(
     connector_kind: ConnectorKind,
     connector_instance_id: String,
@@ -764,7 +844,18 @@ pub(crate) fn build_assignment(
     }
 }
 
-fn runtime_engine(
+/// Obtain a compiled scanner engine for the given config.
+///
+/// For the default config, returns a process-global cached instance
+/// (via [`OnceLock`]) so multiple scans avoid redundant regex compilation.
+/// Custom configs build a fresh engine every call.
+///
+/// The default-config path uses `expect` because the build chain is
+/// infallible: `builtin_rules()` is compiled-in, `default_runtime_tuning()`
+/// uses hardcoded constants, and `Engine::new_with_anchor_policy` asserts
+/// validity at construction. A failure here indicates a programming error
+/// in the default constants.
+pub(crate) fn runtime_engine(
     config: &RuntimeEngineConfig,
 ) -> Result<Arc<scanner_engine::Engine>, ScanRuntimeError> {
     if config == &RuntimeEngineConfig::default() {
@@ -781,6 +872,10 @@ fn runtime_engine(
     }
 }
 
+/// Build a fresh scanner engine from the provided config.
+///
+/// Applies rule loading (3-tier resolution), tuning overrides, transform
+/// filtering, and anchor policy selection.
 fn build_runtime_engine(
     config: &RuntimeEngineConfig,
 ) -> Result<scanner_engine::Engine, ScanRuntimeError> {
@@ -803,7 +898,7 @@ fn build_runtime_engine(
 ///
 /// 1. Explicit `--rules=<path>` override
 /// 2. `default_rules.yaml` adjacent to the binary executable
-/// 3. Compile-time embedded fallback (223 rules from `default_rules.yaml`)
+/// 3. Compile-time embedded fallback (rules from `default_rules.yaml`)
 ///
 /// Emits provenance info to stderr so operators can verify which rules are
 /// active.
@@ -874,6 +969,12 @@ fn load_runtime_rules(
     Ok(rules)
 }
 
+/// Default transform decoder pipeline: URL percent-encoding and Base64.
+///
+/// Both decoders use `Gate::AnchorsInDecoded` to trigger only when anchors
+/// appear in the decoded output, avoiding false positives from random
+/// encoded payloads. The `min_len` thresholds (16 for URL, 32 for Base64)
+/// skip fragments too short to contain meaningful secrets.
 fn default_runtime_transforms() -> Vec<TransformConfig> {
     vec![
         TransformConfig {
@@ -901,6 +1002,10 @@ fn default_runtime_transforms() -> Vec<TransformConfig> {
     ]
 }
 
+/// Default engine tuning parameters.
+///
+/// These values are calibrated for the reference scanner binary and should
+/// not be changed without benchmarking against the standard corpus.
 fn default_runtime_tuning() -> scanner_engine::Tuning {
     scanner_engine::Tuning {
         merge_gap: 64,
@@ -916,6 +1021,10 @@ fn default_runtime_tuning() -> scanner_engine::Tuning {
     }
 }
 
+/// Apply the CLI-specified transform filter to the default decoder list.
+///
+/// `All` passes through unchanged, `None` returns an empty vec (no decoding),
+/// `Only(ids)` retains only the matching decoders.
 fn apply_transform_filter(
     transforms: Vec<TransformConfig>,
     filter: &TransformFilter,
@@ -930,6 +1039,11 @@ fn apply_transform_filter(
     }
 }
 
+/// Validate and canonicalize a filesystem scan target.
+///
+/// Accepts regular files (single-file scan) and directories (recursive walk).
+/// Returns `Err` if the path does not exist, is neither a file nor a
+/// directory, or canonicalization fails.
 fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
@@ -952,6 +1066,12 @@ fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     })
 }
 
+/// Validate and canonicalize a git repository scan target.
+///
+/// Shells out to `git rev-parse --show-toplevel` to resolve the actual
+/// repository root, then verifies the caller-provided path matches that
+/// root exactly. Subdirectory scans are rejected because the git scanner
+/// operates on the full repository graph.
 fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
@@ -1014,6 +1134,7 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     Ok(canonical_input)
 }
 
+/// Query available hardware parallelism, falling back to 1 on failure.
 pub(crate) fn available_workers() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get())

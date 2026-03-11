@@ -139,8 +139,8 @@ graph LR
     end
 
     subgraph Factories["gossip-connectors (factories)"]
-        FSF["<b>FilesystemScanSourceFactory</b><br/>→ FsScanDriver<br/>checkpoint: ✓  cancel: ✗"]
-        GSF["<b>GitScanSourceFactory</b><br/>→ GitScanDriver<br/>checkpoint: ✗  cancel: ✗"]
+        FSF["<b>FilesystemScanSourceFactory</b><br/>→ FsScanDriver<br/>checkpoint: ✗  cancel: ✗"]
+        EGA["<b>execute_git_assignment</b><br/>standalone fn (no factory/trait)<br/>checkpoint: ✗  cancel: ✗"]
         MSF["<b>InMemoryScanSourceFactory</b><br/>→ InMemoryScanDriver<br/>checkpoint: ✓  cancel: ✓"]
     end
 
@@ -149,30 +149,30 @@ graph LR
     SSF -->|"produces"| SD
 
     FSF -->|impl| SSF
-    GSF -->|impl| SSF
     MSF -->|impl| SSF
+    CK -->|"Git kind"| EGA
 
     style AS fill:#DCFCE7,stroke:#166534
     style CK fill:#EF4444,stroke:#991B1B,color:#fff
     style SSF fill:#FEE2E2,stroke:#991B1B
     style SD fill:#FEE2E2,stroke:#991B1B
     style FSF fill:#FEE2E2,stroke:#991B1B
-    style GSF fill:#FEE2E2,stroke:#991B1B
+    style EGA fill:#FEE2E2,stroke:#991B1B
     style MSF fill:#FEE2E2,stroke:#991B1B
 ```
 
 **Execution flow:**
 
 1. The coordination layer builds an `Assignment` from a shard claim, including `ConnectorKind`, `ShardSpec`, `Cursor`, and source-specific payload (`AssignmentSource::Filesystem { root }`, `AssignmentSource::Git { repo_root }`, or `AssignmentSource::InMemory { dataset_id }`).
-2. The runtime selects a `ScanSourceFactory` by `ConnectorKind` and calls `driver_for_assignment` to produce a boxed `ScanDriver`.
+2. For filesystem and in-memory assignments, the runtime selects a `ScanSourceFactory` by `ConnectorKind` and calls `driver_for_assignment` to produce a boxed `ScanDriver`. Git assignments bypass the factory/trait path and use `execute_git_assignment` directly (requires `&dyn GitEventOutput`).
 3. The driver's `run()` method receives a compiled `Engine`, execution config, event/commit sinks, and a `CancellationToken`, then returns a `ScanReport` with aggregate counters.
 
 **Capability differences by factory:**
 
-| Factory | Checkpoint hints | Cooperative cancel |
-|---------|------------------|--------------------|
-| `FilesystemScanSourceFactory` | Yes | No (`parallel_scan_dir` has no mid-scan cancel) |
-| `GitScanSourceFactory` | No | No |
+| Factory / Entry Point | Checkpoint hints | Cooperative cancel |
+|-----------------------|------------------|--------------------|
+| `FilesystemScanSourceFactory` | No | No (`parallel_scan_dir` has no mid-scan cancel) |
+| `execute_git_assignment` | No (watermark-based persistence) | No |
 | `InMemoryScanSourceFactory` | Yes | Yes (polls `is_cancelled()` per item) |
 
 See also: [04-end-to-end-scan-flow.md](./04-end-to-end-scan-flow.md) for the ScanDriver architecture and distributed worker loop, [05-shard-and-run-state-machines.md](./05-shard-and-run-state-machines.md) for shard assignment lifecycle.
@@ -271,5 +271,5 @@ See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for how classified er
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/git.rs` | `GitConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector`, `MemItem` |
-| `gossip-connectors` | `crates/gossip-connectors/src/scan_driver.rs` | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
+| `gossip-connectors` | `crates/gossip-connectors/src/scan_driver.rs` | `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`, `execute_git_assignment` |
 | `gossip-scan-driver` | `crates/gossip-scan-driver/src/lib.rs` | `ConnectorKind`, `Assignment`, `AssignmentSource`, `ScanSourceFactory`, `ScanDriver`, `ScanReport`, `SourceCapabilities`, `CancellationToken`, `CommitSink` |

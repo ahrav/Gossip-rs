@@ -221,6 +221,66 @@ fn scan_git_connector_matches_direct_for_repo() {
 }
 
 #[test]
+fn git_config_normalizes_zero_workers_consistently() {
+    // Construct a GitScanConfig with workers=0 via struct literal
+    // (bypassing with_workers which clamps to max(1)).
+    let config = GitScanConfig {
+        repo: PathBuf::from("/tmp/fake-repo"),
+        workers: 0,
+        decode_depth: None,
+        scan_binary: false,
+        debug_level: GitDebugLevel::Off,
+        enrich_identities: false,
+        anchor_mode: AnchorMode::Manual,
+        rules_file: None,
+        transform_filter: TransformFilter::All,
+        repo_id: 1,
+        scan_mode: GitScanMode::OdbBlobFast,
+        merge_mode: MergeDiffMode::AllParents,
+        tree_delta_cache_mb: None,
+        engine_chunk_mb: None,
+        execution_mode: ExecutionMode::Direct,
+        budgets: ScanBudgets::default(),
+    };
+
+    // Reproduce the runtime config construction from scan_git_with_runtime.
+    let workers = config.workers.max(1);
+    let runtime = config
+        .budgets
+        .to_execution_config_with_workers(workers)
+        .expect("config should build");
+
+    // Both fields should use the same normalized worker count.
+    assert_eq!(
+        runtime.workers, 1,
+        "to_execution_config_with_workers should normalize 0 to 1"
+    );
+    assert_eq!(
+        workers, 1,
+        "pack_exec_workers should use the normalized worker count, not the raw config value"
+    );
+}
+
+/// End-to-end check that `scan_git_direct` succeeds with `workers=0`.
+///
+/// Exercises the real normalization path in `scan_git_with_runtime` rather
+/// than replicating the `.max(1)` logic inline. A zero-worker config must
+/// be clamped to 1 internally — not panic or produce a degenerate scan.
+#[test]
+fn scan_git_direct_normalizes_zero_workers_end_to_end() {
+    let repo = create_test_repo(&[("secret.txt", b"password=xK9mP2qL7wN4vR8t")]);
+    let config = GitScanConfig {
+        workers: 0,
+        ..GitScanConfig::new(repo.path())
+    };
+    let outcome = scan_git_direct(&config).expect("workers=0 should normalize to 1 and scan");
+    assert!(
+        outcome.items_scanned >= 1,
+        "scan with workers=0 (normalized to 1) should process at least one item"
+    );
+}
+
+#[test]
 fn scan_git_direct_errors_for_non_repo() {
     let dir = tempdir().expect("tempdir");
     let error = scan_git_direct(&GitScanConfig::new(dir.path())).expect_err("non-repo");
@@ -382,7 +442,7 @@ fn scan_fs_distributed_matches_cli_findings_for_fixture() {
             .expect("canonicalize cli run");
 
     let lease = distributed::ShardLease {
-        shard_id: "parity-shard".to_owned(),
+        shard_id: std::sync::Arc::from("parity-shard"),
         assignment: Assignment {
             job_id: "parity-job".to_owned(),
             connector_kind: ConnectorKind::Filesystem,

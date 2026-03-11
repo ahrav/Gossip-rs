@@ -120,18 +120,15 @@ pub trait CoordinationEventRecorder: Send + Sync {
 
 /// Distributed event sink that forwards events to a coordinator recorder.
 pub struct CoordinationEventSink {
-    shard_id: String,
+    shard_id: Arc<str>,
     recorder: Arc<dyn CoordinationEventRecorder>,
 }
 
 impl CoordinationEventSink {
     /// Creates a sink that forwards events to `recorder` tagged with `shard_id`.
     #[must_use]
-    pub fn new(recorder: Arc<dyn CoordinationEventRecorder>, shard_id: impl Into<String>) -> Self {
-        Self {
-            shard_id: shard_id.into(),
-            recorder,
-        }
+    pub fn new(recorder: Arc<dyn CoordinationEventRecorder>, shard_id: Arc<str>) -> Self {
+        Self { shard_id, recorder }
     }
 }
 

@@ -4,7 +4,7 @@
 //! records so the scan loop remains focused on detection and scheduling.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use gossip_contracts::{
@@ -34,7 +34,7 @@ pub use gossip_scan_driver::NoOpCommitSink as CliNoOpCommitSink;
 /// The sink stores per-item metadata from `begin_item` so `upsert_findings`
 /// can use connector-provided version IDs when present.
 pub struct DurableCommitSink {
-    shard_id: String,
+    shard_id: Arc<str>,
     recorder: std::sync::Arc<dyn CoordinationEventRecorder>,
     tenant_id: TenantId,
     tenant_secret_key: TenantSecretKey,
@@ -51,12 +51,12 @@ impl DurableCommitSink {
     #[must_use]
     pub fn new(
         recorder: std::sync::Arc<dyn CoordinationEventRecorder>,
-        shard_id: impl Into<String>,
+        shard_id: Arc<str>,
         tenant_id: TenantId,
         tenant_secret_key: TenantSecretKey,
     ) -> Self {
         Self {
-            shard_id: shard_id.into(),
+            shard_id,
             recorder,
             tenant_id,
             tenant_secret_key,
@@ -231,7 +231,7 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let sink = DurableCommitSink::new(
             recorder.clone(),
-            "shard-a",
+            Arc::from("shard-a"),
             TenantId::from_bytes([0x11; 32]),
             TenantSecretKey::from_bytes([0x22; 32]),
         );
@@ -280,7 +280,7 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let sink = DurableCommitSink::new(
             recorder.clone(),
-            "shard-b",
+            Arc::from("shard-b"),
             TenantId::from_bytes([0x11; 32]),
             TenantSecretKey::from_bytes([0x22; 32]),
         );

@@ -40,8 +40,7 @@ The crate intentionally contains no concrete implementations — only trait defi
                │                                         │
                │  engine: Arc<Engine>                     │
                │  cfg: &ScanExecutionConfig               │
-               │  out: &dyn EventOutput                  │
-               │  git_out: Option<&dyn GitEventOutput>   │
+               │  out: &dyn GitEventOutput               │
                │  commit: &dyn CommitSink                │
                │  cancel: &CancellationToken             │
                │                                         │
@@ -53,7 +52,7 @@ The pipeline works as follows:
 
 1. The orchestration layer constructs an `Assignment` describing the work unit (source location, cursor position, shard boundaries, policy hash).
 2. A `ScanSourceFactory` inspects the assignment and produces a boxed `ScanDriver` appropriate for the source type.
-3. The driver's `run()` method executes the scan, consuming engine resources, emitting events through `EventOutput`, forwarding per-item lifecycle calls through `CommitSink`, and respecting the `CancellationToken`.
+3. The driver's `run()` method executes the scan, consuming engine resources, emitting core and git-specific events through `GitEventOutput`, and respecting the `CancellationToken`. Filesystem and in-memory drivers also forward per-item lifecycle calls through `CommitSink`; the git driver currently does not use the commit sink (git persistence is handled separately via the scanner's `PersistenceStore`).
 
 ---
 
@@ -65,7 +64,7 @@ Source-specific execution backend. Drivers are `Send` (created on one thread, ru
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `run` | `(&mut self, engine, cfg, out, git_out, commit, cancel) → Result<ScanReport>` | Execute the scan. Receives the shared detection engine, runtime configuration, event/commit sinks, and cancellation token. Returns aggregate metrics on success. |
+| `run` | `(&mut self, engine, cfg, out, commit, cancel) → Result<ScanReport>` | Execute the scan. Receives the shared detection engine, runtime configuration, unified event sink, commit sink, and cancellation token. Returns aggregate metrics on success. |
 | `checkpoint_hint` | `(&self) → Option<CursorUpdate>` | Returns the latest cursor checkpoint produced during scanning. Default returns `None` (no checkpoint support). |
 | `debug_output` | `(&self) → Option<String>` | Returns optional diagnostic text collected during the scan (e.g., git stage timings). Default returns `None`. |
 
@@ -271,9 +270,9 @@ Batch of findings for one item, passed to `CommitSink::upsert_findings`.
 2. The assignment is passed to the appropriate `ScanSourceFactory`.
 3. The factory validates that `connector_kind` and `source` variant match (e.g., `ConnectorKind::Filesystem` with `AssignmentSource::Filesystem`).
 4. On success, the factory returns a boxed `ScanDriver`.
-5. The caller prepares shared resources: the detection `Engine`, `ScanExecutionConfig`, `EventOutput` sink, optional `GitEventOutput` sink, `CommitSink`, and `CancellationToken`.
+5. The caller prepares shared resources: the detection `Engine`, `ScanExecutionConfig`, unified `GitEventOutput` sink, `CommitSink`, and `CancellationToken`.
 6. `ScanDriver::run()` is called with all resources.
-7. The driver executes the scan. Filesystem drivers use `parallel_scan_dir`, git drivers use `run_git_scan`, and in-memory drivers iterate pre-loaded items. Events are emitted through the `EventOutput` trait; per-item commit lifecycle calls flow through `CommitSink`.
+7. The driver executes the scan. Filesystem drivers use `parallel_scan_dir`, git drivers use `run_git_scan`, and in-memory drivers iterate pre-loaded items. Core and git-specific events are emitted through `GitEventOutput`. Filesystem and in-memory drivers forward per-item commit lifecycle calls through `CommitSink`; the git driver does not currently use the commit sink.
 8. `run()` returns a `ScanReport` with aggregate metrics.
 9. The caller may query `checkpoint_hint()` for a resume cursor (if `SourceCapabilities::supports_checkpoint_hints` is true).
 10. The orchestration layer persists the cursor and report for future resumable scans.
@@ -287,15 +286,18 @@ The crate defines only traits and types. Concrete implementations live in `gossi
 | Factory | Driver | Source | Backend |
 |---------|--------|--------|---------|
 | `FilesystemScanSourceFactory` | `FsScanDriver` | `AssignmentSource::Filesystem` | `parallel_scan_dir` from `scanner-scheduler` |
-| `GitScanSourceFactory` | `GitScanDriver` | `AssignmentSource::Git` | `run_git_scan` from `scanner-git` |
 | `InMemoryScanSourceFactory` | `InMemoryScanDriver` | `AssignmentSource::InMemory` | Direct iteration over `MemItem` slices |
+
+> **Git scans** bypass the factory/trait path entirely. The standalone
+> `execute_git_assignment()` function handles git assignments directly,
+> accepting `&dyn GitEventOutput` for git-specific events that the
+> source-neutral `ScanDriver` trait cannot express.
 
 ### Capability Matrix
 
 | Factory | `supports_checkpoint_hints` | `supports_cooperative_cancel` |
 |---------|:---------------------------:|:-----------------------------:|
-| Filesystem | yes | no |
-| Git | no | no |
+| Filesystem | no | no |
 | InMemory | yes | yes |
 
 ---

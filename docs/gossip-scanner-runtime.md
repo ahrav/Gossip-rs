@@ -33,9 +33,10 @@ parity testing infrastructure.
 
 ### Unified execution seam
 
-Both CLI and distributed execution paths route through the same
-assignment-to-driver seam. The mode flag (`ExecutionMode`) is retained
-for CLI compatibility and telemetry but does not alter scan behavior:
+Both CLI and distributed execution paths build an `Assignment` and route
+it to a driver, but filesystem and git assignments follow structurally
+separate paths. `driver_for_assignment` rejects `ConnectorKind::Git` —
+git assignments bypass the `ScanDriver` trait entirely:
 
 ```text
 CLI args ──► CliConfig ──► FsScanConfig / GitScanConfig
@@ -44,17 +45,21 @@ Distributed ──► ShardLease ─────┤
                                 ▼
                    build_assignment()
                         │
-                        ▼
-              driver_for_assignment()
-                        │
-                        ▼
-             ScanSourceFactory::driver_for_assignment()
-                        │
-                        ▼
-               ScanDriver::run(engine, config, out, git_out, commit, cancel)
-                        │
-                        ▼
-                 AssignmentOutcome { report, checkpoint_hint, debug_output }
+           ┌────────────┴────────────┐
+           │ Filesystem / InMemory   │ Git
+           ▼                         ▼
+  driver_for_assignment()     execute_git_assignment()
+           │                   (dedicated git entry point,
+           ▼                    &dyn GitEventOutput, no CommitSink)
+  ScanSourceFactory                  │
+  ::driver_for_assignment()          ▼
+           │               (ScanReport, checkpoint, debug)
+           ▼
+  ScanDriver::run(engine, config,
+    out: &dyn EventOutput, commit, cancel)
+           │
+           ▼
+  AssignmentOutcome { report, checkpoint_hint, debug_output }
 ```
 
 ### Key wiring functions
@@ -63,8 +68,9 @@ Distributed ──► ShardLease ─────┤
 |----------|------|
 | `scan_fs` / `scan_git` | Top-level dispatchers that delegate to direct/connector variants |
 | `scan_fs_with_runtime` / `scan_git_with_runtime` | Internal entrypoints that accept event output, commit sink, and cancellation token |
-| `execute_assignment_with_config` | Shared driver seam: builds engine, runs driver, returns `AssignmentOutcome` |
-| `driver_for_assignment` | Maps `ConnectorKind` to `ScanSourceFactory` (`FilesystemScanSourceFactory` or `GitScanSourceFactory`) |
+| `execute_assignment_with_config` | Non-git driver seam: builds engine, runs driver via `ScanDriver::run`, returns `AssignmentOutcome` |
+| `execute_git_assignment` | Git-specific entry point: builds `GitScanDriver` directly, takes `&dyn GitEventOutput`, no `CommitSink` |
+| `driver_for_assignment` | Maps `ConnectorKind` to `ScanSourceFactory` — rejects `ConnectorKind::Git` with `UnsupportedConnectorKind` |
 | `runtime_engine` | Builds or caches the scanner `Engine` with rules, transforms, and tuning |
 | `build_assignment` | Constructs an `Assignment` from connector kind, instance ID, and source |
 
@@ -579,7 +585,8 @@ Distributed event sink that bridges scan-driver output to the
 coordinator recorder. Implements both `EventOutput` (core events) and
 `GitEventOutput` (git-specific events). Constructed inside the worker
 loop via `CoordinationEventSink::new(recorder, shard_id)` and passed
-as both `out` and `git_out` to `execute_assignment_with_config`.
+as the `out` sink — to `execute_assignment_with_config` for non-git
+assignments, or to `execute_git_assignment` for git assignments.
 
 Each event variant is converted from its borrowed form (`CoreEvent`,
 `GitEvent`) into the corresponding owned form (`StoredCoreEvent`,
