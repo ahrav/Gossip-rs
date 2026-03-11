@@ -715,6 +715,8 @@ impl CoordinationBackend for EtcdCoordinator {
                             err,
                         ))
                     })?;
+                // Global limit is best-effort preflight (no CAS guard); see
+                // the comment in register_shards for the design rationale.
                 let total_count = this
                     .count_persisted_shards_under_prefix(this.keyspace.tenants_prefix())
                     .map_err(|err| {

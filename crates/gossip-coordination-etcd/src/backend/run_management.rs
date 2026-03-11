@@ -183,6 +183,14 @@ impl RunManagement for EtcdCoordinator {
                             err,
                         ))
                     })?;
+                // Per-tenant limit is CAS-enforced: `tenant_counter.compare`
+                // guards against concurrent same-tenant mutations.  The global
+                // limit is best-effort preflight only — `total_count` is a
+                // point-in-time scan with no CAS guard, so concurrent
+                // cross-tenant shard creation can overshoot `max_total_shards`.
+                // A global sentinel key would serialize all shard-creating
+                // transactions across every tenant; the preflight catches the
+                // common case (approaching capacity) without that contention.
                 let total_count = this
                     .count_persisted_shards_under_prefix(this.keyspace.tenants_prefix())
                     .map_err(|err| {
