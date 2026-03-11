@@ -24,3 +24,4 @@ postgres = "0.19"
 testcontainers.workspace = true
 proptest.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
+gossip-done-ledger-postgres.workspace = true
