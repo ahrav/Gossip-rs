@@ -64,9 +64,8 @@ jobs:
               - 'Cargo.lock'
               - '.github/**'
             fuzz:
-              - 'crates/*/fuzz/**'
-              - 'crates/**/*.rs'
-              - 'crates/**/Cargo.toml'
+              - 'crates/scanner-git/fuzz/**'
+              - 'crates/scanner-git/src/**'
 
   # ── Format ─────────────────────────────────────────────────────────
   fmt:
@@ -86,35 +85,28 @@ jobs:
 
   # ── Lint ───────────────────────────────────────────────────────────
   clippy:
-    name: Clippy
-    runs-on: ubuntu-24.04
+    name: Clippy (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            shared-key: stable-linux
+            label: x86_64
+          - os: macos-15
+            shared-key: stable-macos
+            label: aarch64
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
           components: clippy
-          shared-key: stable-linux
-
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  # ── Lint (aarch64) ─────────────────────────────────────────────────
-  clippy-aarch64:
-    name: Clippy (aarch64)
-    runs-on: macos-15
-    timeout-minutes: 20
-    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
-    needs: [changes]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: stable
-          components: clippy
-          shared-key: stable-macos
+          shared-key: ${{ matrix.shared-key }}
 
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -123,11 +115,23 @@ jobs:
   # tiger-harness, kgram-gate, bench, b64-stats, perf-counters.
   # Those are exercised nightly by test-full-harness with --all-features.
   test:
-    name: Test
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    name: Test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            shared-key: stable-linux
+            timeout: 15
+            label: x86_64
+          - os: macos-15
+            shared-key: stable-macos
+            timeout: 30
+            label: aarch64
     env:
       PROPTEST_CASES: "4"
       STRESS_ITERATIONS: "20"
@@ -136,7 +140,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
-          shared-key: stable-linux
+          shared-key: ${{ matrix.shared-key }}
           save-cache: "false"
 
       - name: Install cargo-nextest
@@ -158,41 +162,6 @@ jobs:
           --profile ci
 
       # nextest does not run doctests; run them separately.
-      - name: Run doctests
-        run: >-
-          cargo test
-          --features test-support,perf-stats
-          --doc
-
-  # ── Test (aarch64) ─────────────────────────────────────────────────
-  test-aarch64:
-    name: Test (aarch64)
-    runs-on: macos-15
-    timeout-minutes: 30
-    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
-    needs: [changes]
-    env:
-      PROPTEST_CASES: "4"
-      STRESS_ITERATIONS: "20"
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: stable
-          shared-key: stable-macos
-          save-cache: "false"
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
-        with:
-          tool: cargo-nextest
-
-      - name: Run tests
-        run: >-
-          cargo nextest run
-          --features test-support,perf-stats
-          --profile ci
-
       - name: Run doctests
         run: >-
           cargo test
@@ -368,7 +337,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-          shared-key: nightly-linux-fuzz
+          shared-key: nightly-linux-fuzz-smoke
           extra-apt: "clang llvm"
           cache-workspaces: "crates/scanner-git/fuzz -> target"
 
@@ -378,7 +347,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: crates/scanner-git/fuzz/corpus
-          key: fuzz-corpus-pack-${{ hashFiles('crates/scanner-git/fuzz/corpus/fuzz_pack_*/**') }}
+          key: fuzz-corpus-pack-${{ github.sha }}
           restore-keys: |
             fuzz-corpus-pack-
 
@@ -571,102 +540,32 @@ jobs:
           -p scanner-engine --lib
           -- engine::simd_classify engine::offline_validate
 
-  # ── Fuzz (nightly, Linux) ─────────────────────────────────────────
-  # Runs all fuzz targets across every crate with a fuzz/ directory.
-  # Each target gets 10K iterations on x86_64-unknown-linux-gnu.
-  fuzz-linux:
-    name: Fuzz (Scheduled, Linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    if: github.event_name == 'schedule'
-    env:
-      RUSTC_WRAPPER: ""
-      FUZZ_RUNS: 10000
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: nightly
-          components: rust-src
-          shared-key: nightly-linux-fuzz
-          extra-apt: "clang llvm"
-
-      - uses: ./.github/actions/setup-cargo-fuzz
-
-      - name: Restore fuzz corpus cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            crates/gossip-contracts/fuzz/corpus
-            crates/gossip-coordination-etcd/fuzz/corpus
-            crates/gossip-stdx/fuzz/corpus
-            crates/scanner-engine/fuzz/corpus
-            crates/scanner-git/fuzz/corpus
-          key: fuzz-corpus-nightly-linux-${{ github.run_id }}
-          restore-keys: |
-            fuzz-corpus-nightly-linux-
-
-      - name: Fuzz — gossip-contracts (2 targets)
-        working-directory: crates/gossip-contracts/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_derivation_chain --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_item_identity_key --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — gossip-coordination-etcd (4 targets)
-        working-directory: crates/gossip-coordination-etcd/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_decode_run_record --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_decode_shard_record --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_round_trip_run_record --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_round_trip_shard_record --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — gossip-stdx (6 targets)
-        working-directory: crates/gossip-stdx/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_atomic_bitset --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_byte_slab --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_inline_vec --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_ring_buffer --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_spsc --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_timing_wheel --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — scanner-engine (12 targets)
-        working-directory: crates/scanner-engine/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_anchor_soundness --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_build_and_scan --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_determinism --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_differential --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_dotenv_extract --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_hit_pool_callback --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_java_class_extract --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_offline_validators --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pyc_extract --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_simd_classify --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_tiger_chunking --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_vs_cache_load --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — scanner-git (4 targets)
-        working-directory: crates/scanner-git/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_pack_delta_into --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_exec --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_inflate_stream --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_parse_delta --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
-
-  # ── Fuzz (nightly, macOS) ───────────────────────────────────────────
-  # Same targets as fuzz-linux on aarch64-apple-darwin to catch
-  # platform-specific bugs (NEON vs SSE, endianness in pack parsing).
+  # ── Fuzz (nightly) ──────────────────────────────────────────────────
+  # Discovers and runs all fuzz targets across every crate with a fuzz/
+  # directory. Each target gets 10K iterations per platform.
   #
-  # No extra-brew for clang/llvm: Xcode on macos-15 ships Apple Clang
-  # with full libFuzzer and AddressSanitizer support. On Linux the
-  # system GCC lacks sanitizer integration, so we install clang+llvm
-  # explicitly via extra-apt.
-  fuzz-macos:
-    name: Fuzz (Scheduled, macOS)
-    runs-on: macos-15
+  # On Linux we install clang+llvm via extra-apt because the system GCC
+  # lacks sanitizer integration. On macOS, Xcode ships Apple Clang with
+  # full libFuzzer and AddressSanitizer support, so no extra packages.
+  fuzz-nightly:
+    name: Fuzz (Scheduled, ${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux
+            shared-key: nightly-linux-fuzz
+            extra-apt: "clang llvm"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            label: macOS
+            shared-key: nightly-macos-fuzz
+            extra-apt: ""
     env:
       RUSTC_WRAPPER: ""
       FUZZ_RUNS: 10000
@@ -676,10 +575,13 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-          shared-key: nightly-macos-fuzz
+          shared-key: ${{ matrix.shared-key }}
+          extra-apt: ${{ matrix.extra-apt }}
 
       - uses: ./.github/actions/setup-cargo-fuzz
 
+      # Corpus accumulates: restore latest via prefix, save under unique key.
+      # GitHub's 10 GB LRU cache evicts oldest entries automatically.
       - name: Restore fuzz corpus cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -689,63 +591,31 @@ jobs:
             crates/gossip-stdx/fuzz/corpus
             crates/scanner-engine/fuzz/corpus
             crates/scanner-git/fuzz/corpus
-          key: fuzz-corpus-nightly-macos-${{ github.run_id }}
+          key: fuzz-corpus-nightly-${{ matrix.label }}-${{ github.run_number }}
           restore-keys: |
-            fuzz-corpus-nightly-macos-
+            fuzz-corpus-nightly-${{ matrix.label }}-
 
-      - name: Fuzz — gossip-contracts (2 targets)
-        working-directory: crates/gossip-contracts/fuzz
+      - name: Fuzz all targets
         run: |
-          cargo +nightly fuzz run fuzz_derivation_chain --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_item_identity_key --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — gossip-coordination-etcd (4 targets)
-        working-directory: crates/gossip-coordination-etcd/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_decode_run_record --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_decode_shard_record --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_round_trip_run_record --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_round_trip_shard_record --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — gossip-stdx (6 targets)
-        working-directory: crates/gossip-stdx/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_atomic_bitset --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_byte_slab --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_inline_vec --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_ring_buffer --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_spsc --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_timing_wheel --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — scanner-engine (12 targets)
-        working-directory: crates/scanner-engine/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_anchor_soundness --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_build_and_scan --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_determinism --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_differential --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_dotenv_extract --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_hit_pool_callback --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_java_class_extract --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_offline_validators --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pyc_extract --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_simd_classify --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_tiger_chunking --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_vs_cache_load --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-
-      - name: Fuzz — scanner-git (4 targets)
-        working-directory: crates/scanner-git/fuzz
-        run: |
-          cargo +nightly fuzz run fuzz_pack_delta_into --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_exec --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_inflate_stream --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_parse_delta --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          for fuzz_dir in crates/*/fuzz; do
+            [ -d "$fuzz_dir/fuzz_targets" ] || continue
+            crate="$(basename "$(dirname "$fuzz_dir")")"
+            echo "::group::Fuzz — $crate"
+            cd "$fuzz_dir"
+            for target in $(ls fuzz_targets/*.rs | sed 's|.*/||;s|\.rs$||' | sort); do
+              echo "  Target: $target"
+              cargo +nightly fuzz run "$target" \
+                --target ${{ matrix.target }} -- -runs=${FUZZ_RUNS}
+            done
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
 
   # ── Nightly Summary ───────────────────────────────────────────────
   nightly-summary:
     name: Nightly Summary
     if: always() && github.event_name == 'schedule'
-    needs: [test-full-harness, miri, kani, loom, asan, fuzz-linux, fuzz-macos]
+    needs: [test-full-harness, miri, kani, loom, asan, fuzz-nightly]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
