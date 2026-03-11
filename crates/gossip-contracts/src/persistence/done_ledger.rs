@@ -114,8 +114,8 @@ impl CanonicalBytes for DoneLedgerKey {
 /// Monotonic done-ledger result lattice.
 ///
 /// Discriminant values define the merge ordering: `merge(a, b) = max(a.rank(), b.rank())`.
-/// This makes the lattice a join-semilattice with the three required properties
-/// (idempotence, commutativity, monotonicity).
+/// This makes the lattice a join-semilattice satisfying idempotence,
+/// commutativity, and associativity. Monotonicity follows as a consequence.
 ///
 /// ## Rank design
 ///

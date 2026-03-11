@@ -48,7 +48,7 @@ Non-negotiables (project-wide):
 | `FindingsSink` | Triage/query plane: findings + occurrences + observations persistence | `upsert_batch(&self, FindingsUpsertBatch<'_>) -> Result<Self::CommitHandle, Self::Error>` |
 | `CommitHandle` | Durable acknowledgement handle; `wait()` consumes self and returns a receipt | `wait(self) -> Result<Self::Receipt, Self::Error>` |
 | `CommitReceipt` | Marker trait for durable persistence proof objects | Supertrait bounds: `Clone + Debug + Send + Sync + 'static` |
-| `CoordinationBackend` | Shard lifecycle: acquire, checkpoint, complete, park, split (lives in `gossip-coordination/src/traits.rs`, not in this module) | `acquire_and_restore_into`, `checkpoint`, `complete`, `park_shard`, `split_residual`, `split_replace` |
+| `CoordinationBackend` | Shard lifecycle: acquire, renew, checkpoint, complete, park, split (lives in `gossip-coordination/src/traits.rs`, not in this module) | `acquire_and_restore_into`, `renew`, `checkpoint`, `complete`, `park_shard`, `split_residual`, `split_replace` |
 
 ### Typestate machine
 
@@ -65,7 +65,7 @@ Non-negotiables (project-wide):
 |------|---------|
 | `DoneLedgerKey` | Composite lookup key: `(TenantId, PolicyHash, OvidHash)` — fixed-width, implements `CanonicalBytes`. |
 | `DoneLedgerStatus` | Scan outcome enum with monotonic join-semilattice semantics: `FailedRetryable(1) < FailedPermanent(2) < Skipped(3) < ScannedClean(10) < ScannedWithFindings(11)`. Rank gap between 3 and 10 reserves space for future non-terminal states. |
-| `DoneLedgerRecord` | Complete done-ledger row: key, lattice status, `bytes_scanned`, `findings_count`, provenance, optional error code. Validated at construction (`try_new`) and optionally via `validate()` before persisting. Supports `merge_with` for lattice upsert. |
+| `DoneLedgerRecord` | Complete done-ledger row: key, lattice status, `bytes_scanned`, `findings_count`, provenance, optional error code. Validated at construction (`try_new`) and optionally via `validate()` before persisting. Supports `merge` for lattice upsert. |
 | `DoneLedgerProvenance` | Write-side metadata: `run_id`, `shard_id`, `fence_epoch`, `started_at`, `finished_at`. Not part of the dedup key. |
 | `DoneLedgerErrorCode` | ASCII-safe bounded string (max 128 bytes) for structured error codes like `HTTP_403`, `TIMEOUT`. Validated alphabet at construction. |
 | `OvidHash` | Content-addressed Object-Version Identity digest (BLAKE3, 32 bytes). Derived from `OvidHashInputs` via `derive_ovid_hash`. |
@@ -77,7 +77,7 @@ Non-negotiables (project-wide):
 |------|---------|
 | `FindingRecord` | Layer 1 — stable identity: `(tenant, stable_item_id, rule_fingerprint, secret_hash)`. Content-addressed `FindingId`. Version-independent and policy-independent. Never stores raw secrets. |
 | `OccurrenceRecord` | Layer 2 — version-specific: pins a finding to an `ObjectVersionId` with `(byte_offset, byte_length)` span. `byte_length` guaranteed non-zero via `NonZeroU64`. Content-addressed `OccurrenceId`. |
-| `ObservationRecord` | Layer 3 — policy- and run-scoped: records that an occurrence was seen under a specific `(policy_hash, run_id, shard_id, fence_epoch)`. Optional display-safe `Location` metadata. Content-addressed `ObservationId`. |
+| `ObservationRecord` | Layer 3 — policy- and run-scoped: records that an occurrence was seen under a specific `(policy_hash, run_id, shard_id, fence_epoch)` with associated `ovid_hash`. Optional display-safe `Location` metadata. Content-addressed `ObservationId`. |
 | `FindingsUpsertBatch<'a>` | Borrowed zero-copy batch view over all three layers. Provides `validate_referential_integrity()` for intra-batch consistency checks. |
 
 **Commit receipts** (`commit.rs`):
@@ -105,7 +105,7 @@ Non-negotiables (project-wide):
 
 | Type | Purpose |
 |------|---------|
-| `PersistenceInputError` | Validation errors for value types: empty fields, size limits, invalid bytes, zero spans, inconsistent findings counts, missing/unexpected error codes, orphaned references, inconsistent tenants. |
+| `PersistenceInputError` | Validation errors for value types: empty fields, size limits, invalid bytes, zero spans, observation-id mismatch, inconsistent findings counts, missing/unexpected error codes, orphaned references, inconsistent tenants, provenance ordering. |
 
 ### Test doubles and adapters
 
@@ -124,7 +124,7 @@ Non-negotiables (project-wide):
 
 | Crate | Scope | Notes |
 |------|-------|-------|
-| `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits, applies forward-only migrations with checksum verification and advisory locking, and documents that transaction-scoped migrations cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). |
+| `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits, applies forward-only migrations with checksum verification and advisory locking, and documents that transaction-scoped migrations cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
 
 ---
 
@@ -172,4 +172,4 @@ Coordinator restart (contract for durable backends; not yet implemented):
 3. Do not create unbounded wide partitions for the done-ledger.
 4. Do not store raw secret bytes in any persistence backend (including snippets). Store hashes and safe display fields only.
 5. Do not partition done-ledger by shard id (ledger key is shard-independent).
-6. Do not allow unbounded split fanout. Enforce `max_children_per_op`.
+6. Do not allow unbounded split fanout. Enforced by `MAX_SPLIT_CHILDREN` (hard cap per operation, `gossip-contracts/src/coordination/limits.rs`) and `DEFAULT_MAX_CHILDREN_PER_OP` (per-backend tunable, e.g. etcd config).
