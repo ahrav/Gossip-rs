@@ -157,7 +157,7 @@ graph TB
     end
 
     subgraph layer3 ["Layer 3: Policy-Scoped Observation"]
-        OBS["ObservationRecord<br/>tenant_id: TenantId<br/>policy_hash: PolicyHash<br/>observation_id: ObservationId<br/>occurrence_id: OccurrenceId<br/>run_id: RunId<br/>shard_id: ShardId<br/>fence_epoch: FenceEpoch<br/>seen_at: LogicalTime<br/>location: Option&lt;Location&gt;"]
+        OBS["ObservationRecord<br/>tenant_id: TenantId<br/>policy_hash: PolicyHash<br/>observation_id: ObservationId<br/>occurrence_id: OccurrenceId<br/>ovid_hash: OvidHash<br/>run_id: RunId<br/>shard_id: ShardId<br/>fence_epoch: FenceEpoch<br/>seen_at: LogicalTime<br/>location: Option&lt;Location&gt;"]
         OBSID["ObservationId = BLAKE3(<br/>  tenant_id,<br/>  policy_hash,<br/>  occurrence_id<br/>)"]
     end
 
