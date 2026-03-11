@@ -2,7 +2,7 @@
 //!
 //! ## Test layers
 //!
-//! Tests are organized in three tiers of increasing infrastructure
+//! Tests are organized in four tiers of increasing infrastructure
 //! requirements:
 //!
 //! 1. **Config validation** — pure, deterministic unit tests that verify
@@ -22,7 +22,15 @@
 //!    environment variable pointing to a reachable cluster. They cover
 //!    the full acquire/checkpoint/renew/split lifecycle, deterministic
 //!    split atomicity fault injection, idempotent replay, lease expiry,
-//!    and concurrent acquire contention.
+//!    and sequential acquire contention.
+//!
+//! 4. **Concurrent CAS contention** — multi-threaded tests that exercise
+//!    real CAS retry paths. Each thread owns its own `EtcdCoordinator`
+//!    (with its own Tokio runtime) but all target the same etcd
+//!    keyspace. A `std::sync::Barrier` synchronizes threads to maximize
+//!    CAS contention probability. These tests verify that `mod_revision`
+//!    -based CAS guards on per-tenant shard counters correctly serialize
+//!    concurrent shard-creating operations.
 //!
 //! ## Running integration tests
 //!
@@ -37,8 +45,9 @@
 
 use crate::keyspace::PersistedShardSubtreeKey;
 use crate::test_etcd::{
-    test_coordinator, test_coordinator_with_limits, test_coordinator_with_ttl,
-    test_coordinator_with_tuning,
+    contention_namespace, test_coordinator, test_coordinator_in_namespace,
+    test_coordinator_in_namespace_with_limits, test_coordinator_with_limits,
+    test_coordinator_with_ttl, test_coordinator_with_tuning,
 };
 use crate::{
     EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError, EtcdKeyspace,
@@ -289,40 +298,41 @@ fn config_rejects_zero_max_children_per_op() {
 
 /// The per-backend child cap must stay within the etcd `split_replace`
 /// transaction budget. Each child adds 3 transaction entries (1 compare +
-/// 2 ops) to a fixed overhead of 7, so `(128 - 7) / 3 = 40` is the max.
+/// 2 ops) to a fixed overhead of 9 (parent CAS + tenant-counter CAS),
+/// so `(128 - 9) / 3 = 39` is the max.
 #[test]
 fn config_rejects_max_children_per_op_above_etcd_txn_budget() {
-    // 40 children should be accepted (boundary value).
-    EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 40)
-        .expect("40 children must be accepted — exactly at the etcd txn budget ceiling");
+    // 39 children should be accepted (boundary value).
+    EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 39)
+        .expect("39 children must be accepted — exactly at the etcd txn budget ceiling");
 
-    // 41 children should be rejected: 7 + 3*41 = 130 > 128.
+    // 40 children should be rejected: 9 + 3*40 = 129 > 128.
     let error =
-        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 41)
-            .expect_err("41 children must fail — exceeds etcd txn budget");
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 40)
+            .expect_err("40 children must fail — exceeds etcd txn budget");
     assert!(matches!(
         error,
         EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsEtcdTxnBudget {
-            requested: 41,
-            max: 40,
+            requested: 40,
+            max: 39,
         }
     ));
 }
 
 /// Values above `MAX_SPLIT_CHILDREN` (256) are also rejected, but the
-/// tighter etcd txn budget check (40) fires first. This test verifies
+/// tighter etcd txn budget check (39) fires first. This test verifies
 /// that out-of-range values still produce a clear rejection.
 #[test]
 fn config_rejects_max_children_per_op_above_global_limit() {
     let error =
         EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 257)
             .expect_err("max_children_per_op above MAX_SPLIT_CHILDREN must fail validation");
-    // The etcd txn budget check is stricter (40 < 256), so it fires first.
+    // The etcd txn budget check is stricter (39 < 256), so it fires first.
     assert!(matches!(
         error,
         EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsEtcdTxnBudget {
             requested: 257,
-            max: 40,
+            max: 39,
         }
     ));
 }
@@ -541,6 +551,10 @@ fn keyspace_builds_expected_paths() {
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef"
     );
     assert_eq!(
+        keyspace.tenant_shard_count_key(tenant).as_str(),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/shard_count"
+    );
+    assert_eq!(
         keyspace.shard_record_key(tenant, run, shard).as_str(),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards/8000000000000042"
     );
@@ -588,6 +602,7 @@ fn keyspace_typed_keys_preserve_kind_and_relationships() {
     let owner_key = shard_key.owner_key();
     let shard_active_key = keyspace.shard_active_index_key(tenant, run, shard);
     let run_key = keyspace.run_record_key(tenant, run);
+    let tenant_counter_key = keyspace.tenant_shard_count_key(tenant);
 
     assert_eq!(
         owner_key.as_str(),
@@ -606,6 +621,10 @@ fn keyspace_typed_keys_preserve_kind_and_relationships() {
         None
     );
     assert_eq!(PersistedShardSubtreeKey::classify(run_key.as_bytes()), None);
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(tenant_counter_key.as_bytes()),
+        None
+    );
 }
 
 /// Uppercase hex segments are rejected to preserve canonical lowercase keys.
@@ -692,6 +711,7 @@ proptest! {
         let tenants = ks.tenants_prefix();
         let tenant_pfx = ks.tenant_prefix(tenant);
         let runs = ks.runs_prefix(tenant);
+        let tenant_counter = ks.tenant_shard_count_key(tenant);
         let run_key = ks.run_record_key(tenant, run);
         let shards_pfx = ks.run_shards_prefix(tenant, run);
         let scan_pfx = ks.shard_records_scan_prefix(tenant, run);
@@ -706,6 +726,7 @@ proptest! {
             tenants.as_str(),
             tenant_pfx.as_str(),
             runs.as_str(),
+            tenant_counter.as_str(),
             run_key.as_str(),
             shards_pfx.as_str(),
             scan_pfx.as_str(),
@@ -735,6 +756,7 @@ proptest! {
         // Hierarchical containment: each child starts with its parent.
         prop_assert!(tenant_pfx.starts_with(&tenants));
         prop_assert!(runs.starts_with(&tenant_pfx));
+        prop_assert!(tenant_counter.as_str().starts_with(&tenant_pfx));
         prop_assert!(run_key.as_str().starts_with(&runs));
         prop_assert!(shards_pfx.starts_with(run_key.as_str()));
         prop_assert!(shard_key.as_str().starts_with(&shards_pfx));
@@ -944,6 +966,69 @@ fn register_shards_rejects_global_shard_limit_against_local_etcd() {
     );
 }
 
+/// If the tenant counter key is missing, `register_shards` bootstraps it
+/// from the tenant prefix scan and creates the key in the same CAS txn.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn register_shards_bootstraps_counter_when_key_is_absent() {
+    let mut backend = test_coordinator_with_limits(10, 100);
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+
+    let run_a = RunId::from_raw(0x7001);
+    backend
+        .create_run(now(1), test_tenant(), run_a, config)
+        .expect("create_run for run_a should succeed");
+    let manifest_a = [InitialShardInput::new(
+        ShardId::from_raw(0xA001),
+        ShardSpecRef::new(b"a", b"m", b""),
+        CursorUpdate::initial(),
+    )];
+    let register_a = backend
+        .register_shards(now(2), test_tenant(), run_a, &manifest_a, OpId::from_raw(1))
+        .expect("initial register_shards should succeed");
+    assert!(register_a.is_executed());
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(1),
+        "initial registration should set counter to 1"
+    );
+
+    backend
+        .test_delete_tenant_shard_count(test_tenant())
+        .expect("counter delete should succeed");
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        None,
+        "counter key should be absent before bootstrap"
+    );
+
+    let run_b = RunId::from_raw(0x7002);
+    backend
+        .create_run(now(3), test_tenant(), run_b, config)
+        .expect("create_run for run_b should succeed");
+    let manifest_b = [InitialShardInput::new(
+        ShardId::from_raw(0xA002),
+        ShardSpecRef::new(b"m", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let register_b = backend
+        .register_shards(now(4), test_tenant(), run_b, &manifest_b, OpId::from_raw(2))
+        .expect("register_shards should bootstrap absent counter");
+    assert!(register_b.is_executed());
+
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(2),
+        "bootstrap should scan existing shard count and publish updated value"
+    );
+}
+
 /// Smoke test: connect to etcd and verify that the status RPC returns a
 /// non-empty cluster version.
 #[test]
@@ -1091,6 +1176,13 @@ fn split_replace_round_trip_against_local_etcd() {
         .expect("split_replace should succeed");
     assert!(first.is_executed());
     assert_eq!(first.as_ref().children.len(), 2);
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(3),
+        "counter should include parent + 2 children after split_replace"
+    );
 
     let parent = backend
         .test_load_shard_snapshot(test_tenant(), key)
@@ -1286,6 +1378,13 @@ fn split_residual_round_trip_against_local_etcd() {
         .split_residual(now(5), test_tenant(), &acquire.lease, plan.clone(), op)
         .expect("split_residual should succeed");
     assert!(first.is_executed());
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(2),
+        "counter should grow by 1 after split_residual"
+    );
 
     let parent = backend
         .test_load_shard_snapshot(test_tenant(), key)
@@ -1690,6 +1789,60 @@ fn gc_stale_initializing_runs_deletes_only_old_orphans() {
         .list_active_runs_into(test_tenant(), &mut active)
         .expect("active run listing should succeed");
     assert_eq!(active, vec![run_active]);
+}
+
+/// GC decrements the tenant shard counter by the number of deleted shard
+/// records when collecting a stale initializing run.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn gc_stale_initializing_runs_decrements_tenant_counter() {
+    let mut backend = test_coordinator();
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0x4F01);
+    let shard = ShardId::from_raw(0x8F01);
+
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+
+    let spec = ShardSpec::with_range(b"a", b"z");
+    let mut slab = ByteSlab::with_capacity(1024);
+    let mut shard_record = ShardRecord::new_active_with_cursor(
+        test_tenant(),
+        run,
+        shard,
+        spec.as_ref(),
+        CursorUpdate::initial(),
+        CursorSemantics::Completed,
+        &mut slab,
+    )
+    .expect("test shard record should be constructible");
+    backend
+        .test_seed_shard_record(&shard_record, &slab)
+        .expect("seeding shard record should succeed");
+    backend
+        .test_seed_active_shard_index(test_tenant(), run, shard)
+        .expect("seeding active-shard index should succeed");
+    shard_record.deallocate_fields(&mut slab);
+    slab.clear();
+
+    backend
+        .test_seed_tenant_shard_count(test_tenant(), 1)
+        .expect("seeding tenant counter should succeed");
+
+    let mut deleted = Vec::new();
+    backend
+        .gc_stale_initializing_runs_into(test_tenant(), now(2), &mut deleted)
+        .expect("gc should succeed");
+    assert_eq!(deleted, vec![run]);
+
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(0),
+        "counter should decrement when GC deletes shard records"
+    );
 }
 
 /// Unpark a shard that was manually seeded as `Parked` (via
@@ -3175,5 +3328,419 @@ fn unpark_shard_rejects_terminal_run() {
             }
         ),
         "expected RunTerminal(Done), got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests: concurrent CAS contention
+// ---------------------------------------------------------------------------
+//
+// These tests exercise the real TOCTOU CAS retry paths by running multiple
+// EtcdCoordinator instances (each in its own thread with its own Tokio
+// runtime) against the same shared etcd keyspace. They validate that
+// revision-based CAS guards correctly serialize concurrent operations.
+//
+// Pattern: std::thread::scope + Barrier to synchronize N workers.
+
+/// Multiple workers race to acquire the same unowned shard. Exactly one
+/// must win; all others must receive `AlreadyLeased`. Each worker runs
+/// in a separate thread with its own EtcdCoordinator targeting the same
+/// namespace.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn concurrent_acquire_exactly_one_wins() {
+    const N_WORKERS: usize = 5;
+    let namespace = contention_namespace();
+
+    // Phase 1: Setup (single thread seeds the run and shard).
+    let run = RunId::from_raw(0xCA01);
+    let shard = ShardId::from_raw(0xCA02);
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    {
+        let mut setup = test_coordinator_in_namespace(&namespace);
+        setup
+            .create_run(now(1), test_tenant(), run, config)
+            .expect("create_run should succeed");
+        let manifest = [InitialShardInput::new(
+            shard,
+            ShardSpecRef::new(b"a", b"z", b""),
+            CursorUpdate::initial(),
+        )];
+        let reg = setup
+            .register_shards(now(2), test_tenant(), run, &manifest, OpId::from_raw(1))
+            .expect("register_shards should succeed");
+        assert!(reg.is_executed());
+    } // Drop the setup coordinator (and its runtime) before spawning threads.
+
+    // Phase 2: Contention (N threads race to acquire the same shard).
+    let key = ShardKey::new(run, shard);
+    let barrier = std::sync::Barrier::new(N_WORKERS);
+    let results: Vec<Result<_, AcquireError>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (1..=N_WORKERS)
+            .map(|i| {
+                let b = &barrier;
+                let ns = &namespace;
+                s.spawn(move || {
+                    let mut coord = test_coordinator_in_namespace(ns);
+                    let mut scratch = AcquireScratch::new();
+                    b.wait();
+                    coord
+                        .acquire_and_restore_into(
+                            now(10),
+                            test_tenant(),
+                            key,
+                            test_worker(i as u64),
+                            &mut scratch,
+                        )
+                        .map(|view| view.lease)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Phase 3: Assert exactly one winner, N-1 AlreadyLeased.
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    let already_leased = results
+        .iter()
+        .filter(|r| matches!(r, Err(AcquireError::AlreadyLeased { .. })))
+        .count();
+    assert_eq!(successes, 1, "exactly one worker must win the acquire race");
+    assert_eq!(
+        already_leased,
+        N_WORKERS - 1,
+        "all other workers must get AlreadyLeased"
+    );
+}
+
+/// Two threads race to register shards for the same tenant with a tight
+/// per-tenant limit. The CAS guard on the per-tenant counter key must
+/// serialize the registrations, preventing both from exceeding the limit.
+///
+/// Setup: limit = 5 shards per tenant. Thread A registers 3 shards,
+/// thread B registers 3 shards. Total would be 6 > 5, so at least one
+/// must be rejected with `ShardLimitExceeded`.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn concurrent_register_shards_respects_per_tenant_limit() {
+    let namespace = contention_namespace();
+
+    let run_a = RunId::from_raw(0xCB01);
+    let run_b = RunId::from_raw(0xCB02);
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+
+    // Phase 1: Setup — create two runs under the same tenant. Use a
+    // setup coordinator with tight limits to create runs (runs don't
+    // count toward shard limits, only shards do).
+    {
+        let mut setup = test_coordinator_in_namespace_with_limits(&namespace, 5, 100);
+        setup
+            .create_run(now(1), test_tenant(), run_a, config)
+            .expect("create_run A should succeed");
+        setup
+            .create_run(now(2), test_tenant(), run_b, config)
+            .expect("create_run B should succeed");
+    }
+
+    // Phase 2: Two threads race to register 3 shards each.
+    let barrier = std::sync::Barrier::new(2);
+    let (result_a, result_b) = std::thread::scope(|s| {
+        let b = &barrier;
+        let ns = &namespace;
+
+        let ha = s.spawn(move || {
+            let mut coord = test_coordinator_in_namespace_with_limits(ns, 5, 100);
+            let manifest = [
+                InitialShardInput::new(
+                    ShardId::from_raw(0xA001),
+                    ShardSpecRef::new(b"\x10", b"\x19", b""),
+                    CursorUpdate::initial(),
+                ),
+                InitialShardInput::new(
+                    ShardId::from_raw(0xA002),
+                    ShardSpecRef::new(b"\x20", b"\x29", b""),
+                    CursorUpdate::initial(),
+                ),
+                InitialShardInput::new(
+                    ShardId::from_raw(0xA003),
+                    ShardSpecRef::new(b"\x30", b"\x39", b""),
+                    CursorUpdate::initial(),
+                ),
+            ];
+            b.wait();
+            coord.register_shards(now(10), test_tenant(), run_a, &manifest, OpId::from_raw(10))
+        });
+        let hb = s.spawn(move || {
+            let mut coord = test_coordinator_in_namespace_with_limits(ns, 5, 100);
+            let manifest = [
+                InitialShardInput::new(
+                    ShardId::from_raw(0xA004),
+                    ShardSpecRef::new(b"\x40", b"\x49", b""),
+                    CursorUpdate::initial(),
+                ),
+                InitialShardInput::new(
+                    ShardId::from_raw(0xA005),
+                    ShardSpecRef::new(b"\x50", b"\x59", b""),
+                    CursorUpdate::initial(),
+                ),
+                InitialShardInput::new(
+                    ShardId::from_raw(0xA006),
+                    ShardSpecRef::new(b"\x60", b"\x69", b""),
+                    CursorUpdate::initial(),
+                ),
+            ];
+            b.wait();
+            coord.register_shards(now(10), test_tenant(), run_b, &manifest, OpId::from_raw(20))
+        });
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+
+    // Phase 3: At least one must fail with ShardLimitExceeded.
+    let a_ok = result_a.is_ok();
+    let b_ok = result_b.is_ok();
+    assert!(
+        !(a_ok && b_ok),
+        "both register_shards succeeded ({a_ok}, {b_ok}) — \
+         per-tenant limit of 5 should have rejected at least one. \
+         a={result_a:?}, b={result_b:?}"
+    );
+
+    // Verify the limit violation error shape.
+    let rejected = if a_ok { &result_b } else { &result_a };
+    assert!(
+        matches!(
+            rejected,
+            Err(RegisterShardsError::ShardLimitExceeded {
+                scope: ShardLimitScope::PerTenant,
+                ..
+            })
+        ),
+        "rejected registration must cite per-tenant limit: {rejected:?}"
+    );
+
+    // Phase 4: Independent oracle — counter matches actual shard count.
+    let verifier = test_coordinator_in_namespace(&namespace);
+    let counter = verifier
+        .test_load_tenant_shard_count(test_tenant())
+        .expect("counter load should succeed");
+    // The winner registered 3 shards; the loser registered 0.
+    assert_eq!(
+        counter,
+        Some(3),
+        "counter must match the single successful registration's shard count"
+    );
+}
+
+/// Two threads concurrently split different shards under the same tenant
+/// with a tight per-tenant limit. The CAS guard on the tenant counter
+/// must prevent both splits from committing if their combined child
+/// counts would exceed the limit.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn concurrent_split_replace_respects_per_tenant_limit() {
+    let namespace = contention_namespace();
+
+    let run = RunId::from_raw(0xCC01);
+    let shard_a = ShardId::from_raw(0xCC11);
+    let shard_b = ShardId::from_raw(0xCC12);
+    // Per-tenant limit = 4. We start with 2 parent shards. Each split
+    // creates 2 children (parent goes terminal but stays in storage, so
+    // the counter increases by 2). First split brings the counter from
+    // 2 to 4. Second split would bring it from 4 to 6, exceeding
+    // limit=4. The CAS guard on the tenant counter serializes them, so
+    // at most one split should succeed.
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+
+    // Phase 1: Setup — seed two shards, acquire them.
+    let (lease_a, lease_b) = {
+        let mut setup = test_coordinator_in_namespace_with_limits(&namespace, 4, 100);
+        setup
+            .create_run(now(1), test_tenant(), run, config)
+            .expect("create_run should succeed");
+        let manifest = [
+            InitialShardInput::new(
+                shard_a,
+                ShardSpecRef::new(b"\x00", b"\x80", b""),
+                CursorUpdate::initial(),
+            ),
+            InitialShardInput::new(
+                shard_b,
+                ShardSpecRef::new(b"\x80", b"\xff", b""),
+                CursorUpdate::initial(),
+            ),
+        ];
+        let _ = setup
+            .register_shards(now(2), test_tenant(), run, &manifest, OpId::from_raw(1))
+            .expect("register_shards should succeed");
+
+        let key_a = ShardKey::new(run, shard_a);
+        let key_b = ShardKey::new(run, shard_b);
+        let mut scratch = AcquireScratch::new();
+        let la = setup
+            .acquire_and_restore_into(now(3), test_tenant(), key_a, test_worker(1), &mut scratch)
+            .expect("acquire A should succeed")
+            .lease;
+        let lb = setup
+            .acquire_and_restore_into(now(4), test_tenant(), key_b, test_worker(2), &mut scratch)
+            .expect("acquire B should succeed")
+            .lease;
+        (la, lb)
+    };
+
+    // Phase 2: Two threads race to split their respective shards.
+    let barrier = std::sync::Barrier::new(2);
+    let (result_a, result_b) = std::thread::scope(|s| {
+        let b = &barrier;
+        let ns = &namespace;
+        let la = &lease_a;
+        let lb = &lease_b;
+
+        let ha = s.spawn(move || {
+            let mut coord = test_coordinator_in_namespace_with_limits(ns, 4, 100);
+            let left = ShardSpec::with_range(b"\x00", b"\x40");
+            let right = ShardSpec::with_range(b"\x40", b"\x80");
+            let plan = SplitReplacePlan::try_new(vec![
+                SplitReplaceChild::new(left.as_ref(), CursorUpdate::initial()),
+                SplitReplaceChild::new(right.as_ref(), CursorUpdate::initial()),
+            ])
+            .expect("split plan A should be valid");
+            b.wait();
+            coord.split_replace(now(10), test_tenant(), la, plan, OpId::from_raw(100))
+        });
+        let hb = s.spawn(move || {
+            let mut coord = test_coordinator_in_namespace_with_limits(ns, 4, 100);
+            let left = ShardSpec::with_range(b"\x80", b"\xC0");
+            let right = ShardSpec::with_range(b"\xC0", b"\xff");
+            let plan = SplitReplacePlan::try_new(vec![
+                SplitReplaceChild::new(left.as_ref(), CursorUpdate::initial()),
+                SplitReplaceChild::new(right.as_ref(), CursorUpdate::initial()),
+            ])
+            .expect("split plan B should be valid");
+            b.wait();
+            coord.split_replace(now(10), test_tenant(), lb, plan, OpId::from_raw(200))
+        });
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+
+    // Phase 3: At most one split should succeed if combined children
+    // would exceed the per-tenant limit.
+    let a_ok = result_a.is_ok();
+    let b_ok = result_b.is_ok();
+
+    // Each split_replace adds 2 children to the counter. Starting
+    // from 2, the first split brings the counter to 4 (at the limit).
+    // The second split would need 4+2=6 > limit=4, so the CAS guard
+    // ensures at most one succeeds. Verify the counter is consistent.
+    let verifier = test_coordinator_in_namespace(&namespace);
+    let counter = verifier
+        .test_load_tenant_shard_count(test_tenant())
+        .expect("counter load should succeed");
+
+    if a_ok && b_ok {
+        // Both succeeded — counter should reflect all shards (parents + children).
+        assert_eq!(
+            counter,
+            Some(4),
+            "counter must equal 2 parents + 2 children = 4 total persisted shards"
+        );
+    } else {
+        // At least one failed — counter should reflect partial state.
+        let successes = usize::from(a_ok) + usize::from(b_ok);
+        assert!(
+            successes >= 1,
+            "at least one split should succeed: a={result_a:?}, b={result_b:?}"
+        );
+        assert_eq!(
+            counter,
+            Some(3),
+            "one split succeeded: 2 initial + 1 child = 3 persisted shards"
+        );
+    }
+}
+
+/// When the per-tenant counter key is absent, two concurrent
+/// register_shards operations on the same tenant must both succeed
+/// via the bootstrap path: one creates the counter (compare_absent CAS),
+/// the other retries after the CAS failure and reads the established
+/// counter.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn concurrent_register_shards_bootstraps_counter_under_contention() {
+    let namespace = contention_namespace();
+
+    let run_a = RunId::from_raw(0xCD01);
+    let run_b = RunId::from_raw(0xCD02);
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+
+    // Phase 1: Setup — create two runs, register nothing yet (so the
+    // counter key is absent for this tenant).
+    {
+        let mut setup = test_coordinator_in_namespace(&namespace);
+        setup
+            .create_run(now(1), test_tenant(), run_a, config)
+            .expect("create_run A should succeed");
+        setup
+            .create_run(now(2), test_tenant(), run_b, config)
+            .expect("create_run B should succeed");
+    }
+
+    // Verify counter is absent.
+    {
+        let checker = test_coordinator_in_namespace(&namespace);
+        let counter = checker
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed");
+        assert_eq!(
+            counter, None,
+            "counter must be absent before any registration"
+        );
+    }
+
+    // Phase 2: Two threads race to register_shards. Each targets a
+    // different run (non-overlapping shard IDs, non-overlapping key
+    // ranges). Both will attempt bootstrap because the counter is absent.
+    let barrier = std::sync::Barrier::new(2);
+    let (result_a, result_b) = std::thread::scope(|s| {
+        let b = &barrier;
+        let ns = &namespace;
+
+        let ha = s.spawn(move || {
+            let mut coord = test_coordinator_in_namespace(ns);
+            let manifest = [InitialShardInput::new(
+                ShardId::from_raw(0xD001),
+                ShardSpecRef::new(b"a", b"m", b""),
+                CursorUpdate::initial(),
+            )];
+            b.wait();
+            coord.register_shards(now(10), test_tenant(), run_a, &manifest, OpId::from_raw(10))
+        });
+        let hb = s.spawn(move || {
+            let mut coord = test_coordinator_in_namespace(ns);
+            let manifest = [InitialShardInput::new(
+                ShardId::from_raw(0xD002),
+                ShardSpecRef::new(b"m", b"z", b""),
+                CursorUpdate::initial(),
+            )];
+            b.wait();
+            coord.register_shards(now(10), test_tenant(), run_b, &manifest, OpId::from_raw(20))
+        });
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+
+    // Phase 3: Both must succeed. The CAS retry loop handles the
+    // counter bootstrap race: one creates the key, the other retries
+    // and reads the established counter.
+    let _ = result_a.expect("register_shards A should succeed via bootstrap or retry");
+    let _ = result_b.expect("register_shards B should succeed via bootstrap or retry");
+
+    // Phase 4: Independent oracle — counter matches actual shard count.
+    let verifier = test_coordinator_in_namespace(&namespace);
+    let counter = verifier
+        .test_load_tenant_shard_count(test_tenant())
+        .expect("counter load should succeed");
+    assert_eq!(
+        counter,
+        Some(2),
+        "counter must equal the sum of both registrations (1 + 1 = 2)"
     );
 }
