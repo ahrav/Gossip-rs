@@ -1351,6 +1351,18 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "gossip-contracts",
+ "gossip-pg-common",
+ "postgres",
+ "proptest",
+ "testcontainers",
+]
+
+[[package]]
+name = "gossip-findings-postgres"
+version = "0.1.0"
+dependencies = [
+ "gossip-contracts",
+ "gossip-pg-common",
  "postgres",
  "proptest",
  "testcontainers",
@@ -1371,6 +1383,14 @@ name = "gossip-persistence-inmemory"
 version = "0.1.0"
 dependencies = [
  "gossip-contracts",
+]
+
+[[package]]
+name = "gossip-pg-common"
+version = "0.1.0"
+dependencies = [
+ "gossip-contracts",
+ "proptest",
 ]
 
 [[package]]

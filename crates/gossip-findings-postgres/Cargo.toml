@@ -1,26 +1,24 @@
 [package]
-name = "gossip-done-ledger-postgres"
+name = "gossip-findings-postgres"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "PostgreSQL done-ledger backend and migrations for gossip-rs"
+description = "PostgreSQL findings schema and type-mapping for gossip-rs"
 
 [lib]
 
 [features]
-## Exposes plaintext NoTls convenience helpers: `connect_and_apply_migrations`,
-## `DoneLedgerPg::connect`, and `DoneLedgerPg::connect_and_migrate`.
+## Exposes plaintext NoTls convenience helpers once migration helpers land.
 ## Enable in integration tests and local dev only — production callers should
-## construct their own `Client` with TLS and use `DoneLedgerPg::from_client`.
+## construct their own `Client` with TLS.
 test-utils = []
 
 [dependencies]
 gossip-contracts.workspace = true
 gossip-pg-common.workspace = true
 postgres = "0.19"
-blake3 = "1.8"
 
 [dev-dependencies]
 testcontainers.workspace = true

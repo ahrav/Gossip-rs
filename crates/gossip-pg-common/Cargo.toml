@@ -1,0 +1,17 @@
+[package]
+name = "gossip-pg-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Shared PostgreSQL type-mapping and migration primitives for gossip-rs persistence crates"
+
+[lib]
+
+[dependencies]
+# Pure Rust types and inline conversion functions — no runtime dependencies.
+
+[dev-dependencies]
+proptest.workspace = true
+gossip-contracts = { workspace = true, features = ["test-support"] }

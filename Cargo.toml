@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/gossip-stdx",
     "crates/gossip-contracts",
+    "crates/gossip-pg-common",
     "crates/gossip-done-ledger-postgres",
+    "crates/gossip-findings-postgres",
     "crates/gossip-scan-driver",
     "crates/scanner-engine",
     "crates/scanner-scheduler",
@@ -30,7 +32,9 @@ repository = "https://github.com/ahrav/gossip-rs"
 # Internal crate dependencies
 gossip-stdx = { path = "crates/gossip-stdx" }
 gossip-contracts = { path = "crates/gossip-contracts" }
+gossip-pg-common = { path = "crates/gossip-pg-common" }
 gossip-done-ledger-postgres = { path = "crates/gossip-done-ledger-postgres" }
+gossip-findings-postgres = { path = "crates/gossip-findings-postgres" }
 gossip-scan-driver = { path = "crates/gossip-scan-driver" }
 scanner-engine = { path = "crates/scanner-engine" }
 scanner-scheduler = { path = "crates/scanner-scheduler" }
