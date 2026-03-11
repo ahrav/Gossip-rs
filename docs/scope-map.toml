@@ -79,6 +79,11 @@ dir = "crates/gossip-done-ledger-postgres/src/"
 doc = "docs/gossip-contracts/boundary-5-persistence.md"
 dir = "crates/gossip-findings-postgres/src/"
 
+# Shared PostgreSQL type-mapping primitives used by all Postgres persistence backends.
+[[scopes]]
+doc = "docs/gossip-contracts/boundary-5-persistence.md"
+dir = "crates/gossip-pg-common/src/"
+
 [[scopes]]
 doc = "docs/gossip-persistence-inmemory.md"
 dir = "crates/gossip-persistence-inmemory/src/"

@@ -9,6 +9,7 @@
 use std::{error::Error, fmt};
 
 use gossip_contracts::persistence::PersistenceInputError;
+pub use gossip_pg_common::migration::MigrationOperation;
 
 use crate::types::PgU64ConversionError;
 
@@ -52,40 +53,6 @@ impl From<PgU64ConversionError> for FindingsPgSchemaError {
     }
 }
 
-/// Labels the migration step that produced a PostgreSQL driver error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MigrationOperation {
-    /// Initial TCP/TLS connection to the database.
-    Connect,
-    /// Session or transaction configuration (`SET LOCAL`, `BEGIN`).
-    Configure,
-    /// Creating or querying the migration history table.
-    HistoryTable,
-    /// Acquiring the transaction-scoped advisory lock.
-    AdvisoryLock,
-    /// Executing a migration's SQL body.
-    ApplyMigration,
-    /// Inserting or querying the migration history record.
-    RecordMigration,
-    /// Committing the migration transaction.
-    Commit,
-}
-
-impl fmt::Display for MigrationOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Connect => f.write_str("connect"),
-            Self::Configure => f.write_str("configure"),
-            Self::HistoryTable => f.write_str("history_table"),
-            Self::AdvisoryLock => f.write_str("advisory_lock"),
-            Self::ApplyMigration => f.write_str("apply_migration"),
-            Self::RecordMigration => f.write_str("record_migration"),
-            Self::Commit => f.write_str("commit"),
-        }
-    }
-}
-
 /// Error type for findings PostgreSQL schema migrations.
 #[derive(Debug)]
 pub enum FindingsPgMigrationError {
@@ -114,6 +81,21 @@ pub enum FindingsPgMigrationError {
         /// Actual byte length of the stored checksum.
         found_len: usize,
     },
+}
+
+impl FindingsPgMigrationError {
+    /// Wrap a PostgreSQL driver error with the operation that produced it.
+    ///
+    /// No callers yet — the migration runner that will use this constructor
+    /// has not been implemented. Matches the sibling crate's API surface
+    /// (`DoneLedgerPgMigrationError::postgres`).
+    #[allow(dead_code)]
+    pub(crate) fn postgres(op: MigrationOperation, source: postgres::Error) -> Self {
+        Self::Postgres {
+            operation: op,
+            source,
+        }
+    }
 }
 
 impl fmt::Display for FindingsPgMigrationError {
@@ -246,28 +228,5 @@ mod tests {
         };
 
         assert!(err.source().is_none());
-    }
-
-    #[test]
-    fn migration_operation_display_matches_sql_step_names() {
-        assert_eq!(MigrationOperation::Connect.to_string(), "connect");
-        assert_eq!(MigrationOperation::Configure.to_string(), "configure");
-        assert_eq!(
-            MigrationOperation::HistoryTable.to_string(),
-            "history_table"
-        );
-        assert_eq!(
-            MigrationOperation::AdvisoryLock.to_string(),
-            "advisory_lock"
-        );
-        assert_eq!(
-            MigrationOperation::ApplyMigration.to_string(),
-            "apply_migration"
-        );
-        assert_eq!(
-            MigrationOperation::RecordMigration.to_string(),
-            "record_migration"
-        );
-        assert_eq!(MigrationOperation::Commit.to_string(), "commit");
     }
 }

@@ -17,8 +17,8 @@ test-utils = []
 
 [dependencies]
 gossip-contracts.workspace = true
+gossip-pg-common.workspace = true
 postgres = "0.19"
-blake3 = "1.8"
 
 [dev-dependencies]
 testcontainers.workspace = true

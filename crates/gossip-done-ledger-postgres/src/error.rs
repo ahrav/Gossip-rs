@@ -10,45 +10,9 @@
 use std::{error::Error, fmt};
 
 use gossip_contracts::persistence::PersistenceInputError;
+pub use gossip_pg_common::migration::MigrationOperation;
 
 use crate::types::PgU64ConversionError;
-
-/// Labels the migration step that produced a PostgreSQL driver error.
-///
-/// Paired with the driver error in [`DoneLedgerPgMigrationError::Postgres`]
-/// to provide structured failure context without losing the underlying cause.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MigrationOperation {
-    /// Initial TCP/TLS connection to the database.
-    Connect,
-    /// Session or transaction configuration (`SET LOCAL`, `BEGIN`).
-    Configure,
-    /// Creating or querying the migration history table.
-    HistoryTable,
-    /// Acquiring the transaction-scoped advisory lock.
-    AdvisoryLock,
-    /// Executing a migration's SQL body.
-    ApplyMigration,
-    /// Inserting or querying the migration history record.
-    RecordMigration,
-    /// Committing the migration transaction.
-    Commit,
-}
-
-impl fmt::Display for MigrationOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Connect => f.write_str("connect"),
-            Self::Configure => f.write_str("configure"),
-            Self::HistoryTable => f.write_str("history_table"),
-            Self::AdvisoryLock => f.write_str("advisory_lock"),
-            Self::ApplyMigration => f.write_str("apply_migration"),
-            Self::RecordMigration => f.write_str("record_migration"),
-            Self::Commit => f.write_str("commit"),
-        }
-    }
-}
 
 /// Error type for schema migration operations.
 ///
@@ -430,28 +394,5 @@ mod tests {
             err.source().is_none(),
             "CorruptedHistoryRecord should have no source error"
         );
-    }
-
-    #[test]
-    fn migration_operation_display() {
-        assert_eq!(MigrationOperation::Connect.to_string(), "connect");
-        assert_eq!(MigrationOperation::Configure.to_string(), "configure");
-        assert_eq!(
-            MigrationOperation::HistoryTable.to_string(),
-            "history_table"
-        );
-        assert_eq!(
-            MigrationOperation::AdvisoryLock.to_string(),
-            "advisory_lock"
-        );
-        assert_eq!(
-            MigrationOperation::ApplyMigration.to_string(),
-            "apply_migration"
-        );
-        assert_eq!(
-            MigrationOperation::RecordMigration.to_string(),
-            "record_migration"
-        );
-        assert_eq!(MigrationOperation::Commit.to_string(), "commit");
     }
 }
