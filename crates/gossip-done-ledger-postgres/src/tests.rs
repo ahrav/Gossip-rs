@@ -22,7 +22,7 @@
 //! # With Docker:
 //! cargo test -p gossip-done-ledger-postgres -- --ignored
 //!
-//! # With a pre-existing database:
+//! # With an external PostgreSQL (needs CREATE DATABASE privilege):
 //! GOSSIP_POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
 //!   cargo test -p gossip-done-ledger-postgres -- --ignored
 //! ```
