@@ -3756,19 +3756,25 @@ fn concurrent_register_shards_bootstraps_counter_under_contention() {
 
 /// `list_shards_into` returns only shards belonging to the queried tenant.
 /// Shards registered under a different tenant must never appear.
+///
+/// Both tenants share the same `RunId` and `ShardId` so the tenant prefix
+/// is the only discriminator. A backend that ignores the tenant prefix
+/// would return both tenants' shards in a single query.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn list_shards_returns_only_shards_from_requested_tenant() {
     let mut backend = test_coordinator();
 
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let shared_run = test_run();
+    let shared_shard = ShardId::from_raw(0x01);
 
-    // Tenant A: one run with one shard.
+    // Tenant A: one shard under the shared run.
     backend
-        .create_run(now(1), test_tenant(), test_run(), config)
+        .create_run(now(1), test_tenant(), shared_run, config)
         .expect("create_run A");
     let manifest_a = [InitialShardInput::new(
-        ShardId::from_raw(0x01),
+        shared_shard,
         ShardSpecRef::new(b"a", b"m", b""),
         CursorUpdate::initial(),
     )];
@@ -3776,18 +3782,18 @@ fn list_shards_returns_only_shards_from_requested_tenant() {
         .register_shards(
             now(2),
             test_tenant(),
-            test_run(),
+            shared_run,
             &manifest_a,
             OpId::from_raw(1),
         )
         .expect("register A");
 
-    // Tenant B: one run with a different shard.
+    // Tenant B: same RunId, same ShardId, different key range.
     backend
-        .create_run(now(3), other_tenant(), other_run(), config)
+        .create_run(now(3), other_tenant(), shared_run, config)
         .expect("create_run B");
     let manifest_b = [InitialShardInput::new(
-        ShardId::from_raw(0x02),
+        shared_shard,
         ShardSpecRef::new(b"m", b"z", b""),
         CursorUpdate::initial(),
     )];
@@ -3795,7 +3801,7 @@ fn list_shards_returns_only_shards_from_requested_tenant() {
         .register_shards(
             now(4),
             other_tenant(),
-            other_run(),
+            shared_run,
             &manifest_b,
             OpId::from_raw(2),
         )
@@ -3807,43 +3813,45 @@ fn list_shards_returns_only_shards_from_requested_tenant() {
         .list_shards_into(
             now(5),
             test_tenant(),
-            test_run(),
+            shared_run,
             ShardFilter::all(),
             &mut shards_a,
         )
         .expect("list A");
     assert_eq!(shards_a.len(), 1);
-    assert_eq!(shards_a[0].shard, ShardId::from_raw(0x01));
+    assert_eq!(shards_a[0].shard, shared_shard);
 
-    // Query tenant B — should see only B's shard.
+    // Query tenant B — should see only B's shard (not a merged 2-element list).
     let mut shards_b = Vec::new();
     backend
         .list_shards_into(
             now(5),
             other_tenant(),
-            other_run(),
+            shared_run,
             ShardFilter::all(),
             &mut shards_b,
         )
         .expect("list B");
     assert_eq!(shards_b.len(), 1);
-    assert_eq!(shards_b[0].shard, ShardId::from_raw(0x02));
+    assert_eq!(shards_b[0].shard, shared_shard);
 }
 
 /// Acquiring a shard in one tenant must not affect the lease state of the
-/// same shard ID registered under a different tenant. Both tenants use
-/// the same `ShardId` value to prove keyspace-level isolation.
+/// same shard ID registered under a different tenant. Both tenants share
+/// the same `RunId` and `ShardId` so the tenant prefix is the only
+/// discriminator.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn acquire_in_one_tenant_does_not_affect_other_tenant() {
     let mut backend = test_coordinator();
 
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let shared_run = test_run();
     let shared_shard = ShardId::from_raw(0x42);
 
-    // Both tenants register a shard with the same ShardId.
+    // Both tenants register the same RunId + ShardId.
     backend
-        .create_run(now(1), test_tenant(), test_run(), config)
+        .create_run(now(1), test_tenant(), shared_run, config)
         .expect("create_run A");
     let manifest = [InitialShardInput::new(
         shared_shard,
@@ -3854,27 +3862,27 @@ fn acquire_in_one_tenant_does_not_affect_other_tenant() {
         .register_shards(
             now(2),
             test_tenant(),
-            test_run(),
+            shared_run,
             &manifest,
             OpId::from_raw(1),
         )
         .expect("register A");
 
     backend
-        .create_run(now(3), other_tenant(), other_run(), config)
+        .create_run(now(3), other_tenant(), shared_run, config)
         .expect("create_run B");
     let _ = backend
         .register_shards(
             now(4),
             other_tenant(),
-            other_run(),
+            shared_run,
             &manifest,
             OpId::from_raw(2),
         )
         .expect("register B");
 
     // Acquire in tenant A — the shard becomes leased.
-    let key_a = ShardKey::new(test_run(), shared_shard);
+    let key_a = ShardKey::new(shared_run, shared_shard);
     let mut scratch = AcquireScratch::new();
     let _acquire_a = backend
         .acquire_and_restore_into(now(5), test_tenant(), key_a, test_worker(1), &mut scratch)
@@ -3886,7 +3894,7 @@ fn acquire_in_one_tenant_does_not_affect_other_tenant() {
         .list_shards_into(
             now(6),
             other_tenant(),
-            other_run(),
+            shared_run,
             ShardFilter::available(),
             &mut shards_b,
         )
@@ -3901,16 +3909,22 @@ fn acquire_in_one_tenant_does_not_affect_other_tenant() {
 
 /// `collect_claim_candidates_into` returns only candidates from the queried
 /// tenant's run. Shards in a different tenant's run must not appear.
+///
+/// Both tenants share the same `RunId` and overlapping `ShardId`s so the
+/// tenant prefix is the only discriminator. Tenant A registers two shards,
+/// tenant B registers one; a backend that ignores the prefix would return
+/// three candidates for tenant A.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn collect_claim_candidates_scoped_to_tenant() {
     let mut backend = test_coordinator();
 
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let shared_run = test_run();
 
-    // Tenant A: two shards.
+    // Tenant A: two shards (0x01, 0x02).
     backend
-        .create_run(now(1), test_tenant(), test_run(), config)
+        .create_run(now(1), test_tenant(), shared_run, config)
         .expect("create_run A");
     let manifest_a = [
         InitialShardInput::new(
@@ -3928,18 +3942,18 @@ fn collect_claim_candidates_scoped_to_tenant() {
         .register_shards(
             now(2),
             test_tenant(),
-            test_run(),
+            shared_run,
             &manifest_a,
             OpId::from_raw(1),
         )
         .expect("register A");
 
-    // Tenant B: one shard.
+    // Tenant B: one shard (0x01) — same ID as one of A's shards.
     backend
-        .create_run(now(3), other_tenant(), other_run(), config)
+        .create_run(now(3), other_tenant(), shared_run, config)
         .expect("create_run B");
     let manifest_b = [InitialShardInput::new(
-        ShardId::from_raw(0x03),
+        ShardId::from_raw(0x01),
         ShardSpecRef::new(b"a", b"z", b""),
         CursorUpdate::initial(),
     )];
@@ -3947,7 +3961,7 @@ fn collect_claim_candidates_scoped_to_tenant() {
         .register_shards(
             now(4),
             other_tenant(),
-            other_run(),
+            shared_run,
             &manifest_b,
             OpId::from_raw(2),
         )
@@ -3956,7 +3970,7 @@ fn collect_claim_candidates_scoped_to_tenant() {
     // Candidates for tenant A — should see exactly A's two shards.
     let mut candidates_a = Vec::new();
     backend
-        .collect_claim_candidates_into(now(5), test_tenant(), test_run(), &mut candidates_a)
+        .collect_claim_candidates_into(now(5), test_tenant(), shared_run, &mut candidates_a)
         .expect("candidates A");
     assert_eq!(candidates_a.len(), 2, "tenant A has two available shards");
     assert!(candidates_a.contains(&ShardId::from_raw(0x01)));
@@ -3965,28 +3979,64 @@ fn collect_claim_candidates_scoped_to_tenant() {
     // Candidates for tenant B — should see exactly B's one shard.
     let mut candidates_b = Vec::new();
     backend
-        .collect_claim_candidates_into(now(5), other_tenant(), other_run(), &mut candidates_b)
+        .collect_claim_candidates_into(now(5), other_tenant(), shared_run, &mut candidates_b)
         .expect("candidates B");
     assert_eq!(candidates_b.len(), 1, "tenant B has one available shard");
-    assert_eq!(candidates_b[0], ShardId::from_raw(0x03));
+    assert_eq!(candidates_b[0], ShardId::from_raw(0x01));
 }
 
 /// `list_active_runs_into` returns only runs belonging to the queried tenant.
 /// Runs created under a different tenant must not appear.
+///
+/// Both tenants share the same `RunId` so the tenant prefix is the only
+/// discriminator — a backend that keys on `run` alone would see duplicates.
+/// Each run must be activated via `register_shards` to appear in the
+/// active-run index; `create_run` alone leaves them in `Initializing`.
 #[test]
 #[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn list_active_runs_scoped_to_tenant() {
     let mut backend = test_coordinator();
 
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let shared_run = test_run();
 
-    // Create runs in both tenants.
+    // Create and activate a run under tenant A.
     backend
-        .create_run(now(1), test_tenant(), test_run(), config)
+        .create_run(now(1), test_tenant(), shared_run, config)
         .expect("create_run A");
+    let manifest_a = [InitialShardInput::new(
+        ShardId::from_raw(0x01),
+        ShardSpecRef::new(b"a", b"m", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            shared_run,
+            &manifest_a,
+            OpId::from_raw(1),
+        )
+        .expect("register A");
+
+    // Create and activate a run under tenant B with the same RunId.
     backend
-        .create_run(now(2), other_tenant(), other_run(), config)
+        .create_run(now(3), other_tenant(), shared_run, config)
         .expect("create_run B");
+    let manifest_b = [InitialShardInput::new(
+        ShardId::from_raw(0x02),
+        ShardSpecRef::new(b"m", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(4),
+            other_tenant(),
+            shared_run,
+            &manifest_b,
+            OpId::from_raw(2),
+        )
+        .expect("register B");
 
     // List runs for tenant A — should see only A's run.
     let mut runs_a = Vec::new();
@@ -3994,7 +4044,7 @@ fn list_active_runs_scoped_to_tenant() {
         .list_active_runs_into(test_tenant(), &mut runs_a)
         .expect("list runs A");
     assert_eq!(runs_a.len(), 1);
-    assert_eq!(runs_a[0], test_run());
+    assert_eq!(runs_a[0], shared_run);
 
     // List runs for tenant B — should see only B's run.
     let mut runs_b = Vec::new();
@@ -4002,7 +4052,7 @@ fn list_active_runs_scoped_to_tenant() {
         .list_active_runs_into(other_tenant(), &mut runs_b)
         .expect("list runs B");
     assert_eq!(runs_b.len(), 1);
-    assert_eq!(runs_b[0], other_run());
+    assert_eq!(runs_b[0], shared_run);
 }
 
 /// `get_run` with a tenant that does not own the run must return `RunNotFound`.
