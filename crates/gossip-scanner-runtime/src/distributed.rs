@@ -1,8 +1,35 @@
 //! Distributed runtime entrypoint wired through `ScanDriver::run`.
 //!
-//! This module keeps distributed orchestration intentionally small and explicit:
-//! each lease goes through a done-ledger gate, then runs a single assignment
-//! with coordinator-backed event/commit sinks.
+//! This module keeps distributed orchestration intentionally small and
+//! explicit: each lease goes through a done-ledger gate, then runs a single
+//! assignment with coordinator-backed event and commit sinks.
+//!
+//! # Lease lifecycle
+//!
+//! ```text
+//! acquire_shard ─► is_shard_done? ──yes──► release_shard (skip)
+//!                       │ no
+//!                       ▼
+//!               execute_assignment
+//!                       │
+//!                       ▼
+//!              complete_shard ─► mark_shard_done
+//! ```
+//!
+//! The `complete_shard` → `mark_shard_done` ordering guarantees that if the
+//! process crashes between those two calls, the shard may be retried but the
+//! system never observes a done-ledger entry without the corresponding
+//! report and checkpoint metadata. This requires `complete_shard` to be
+//! idempotent (or at-least-once tolerant) on coordinators that support
+//! re-lease after failure.
+//!
+//! # Sink wiring
+//!
+//! Each shard gets its own `CoordinationEventSink` (for event telemetry)
+//! and `DurableCommitSink` (for identity-chain persistence). The durable
+//! sink derives `norm_hash → secret_hash → finding_id → occurrence_id`
+//! from engine findings and records them through the shared
+//! `CoordinationEventRecorder`.
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
@@ -20,6 +47,10 @@ use crate::coordination_sink::{
 use crate::{RuntimeEngineConfig, ScanBudgets, ScanRuntimeError, execute_assignment_with_config};
 
 /// Lease payload consumed by the distributed runtime.
+///
+/// Bundles a scan [`Assignment`] with the tenant identity needed for
+/// finding-level secret hash derivation. One lease corresponds to one
+/// shard from the coordination layer.
 #[derive(Clone, Debug)]
 pub struct ShardLease {
     /// Unique shard identifier used for done-ledger tracking.
@@ -33,6 +64,16 @@ pub struct ShardLease {
 }
 
 /// Coordinator surface required by the distributed runtime.
+///
+/// Implementors must guarantee:
+///
+/// - `acquire_shard` returns `None` when no more work is available (the
+///   worker loop terminates on `None`).
+/// - `complete_shard` is idempotent or at-least-once tolerant, because
+///   crash recovery may replay the call.
+/// - `mark_shard_done` is called only after `complete_shard` succeeds.
+/// - The `event_recorder` is safe to share across the event and commit
+///   sinks for a single shard.
 pub trait DistributedCoordinator: Send + Sync {
     /// Acquire the next lease to process, or `None` when no work remains.
     fn acquire_shard(&self) -> Result<Option<ShardLease>>;
@@ -60,7 +101,9 @@ pub struct DistributedRuntimeConfig {
     pub budgets: ScanBudgets,
 }
 
-/// Summary report from one distributed run loop.
+/// Summary report from one [`run_worker`] invocation.
+///
+/// Invariant: `leases_seen == shards_scanned + shards_skipped_done`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DistributedRunReport {
     /// Total number of leases dequeued from the coordinator (including skips).
@@ -72,6 +115,10 @@ pub struct DistributedRunReport {
 }
 
 /// Distributed runtime error.
+///
+/// Distinguishes coordinator-layer failures (network, locking, persistence)
+/// from scan-runtime failures (engine init, driver crashes) so callers can
+/// apply different retry or escalation strategies.
 #[derive(Debug)]
 pub enum DistributedRuntimeError {
     /// The coordinator returned an error (acquire, release, or complete).
@@ -163,7 +210,6 @@ pub fn run_worker(
             runtime,
             &RuntimeEngineConfig::default(),
             &sink,
-            Some(&sink),
             &commit,
             &cancel,
         )
@@ -183,6 +229,11 @@ pub fn run_worker(
 }
 
 /// In-memory distributed coordinator for tests and local harnesses.
+///
+/// All state is held behind a single `Mutex` and is `Clone`-safe via `Arc`.
+/// This coordinator is intentionally **not** idempotent for `complete_shard`:
+/// duplicate calls produce duplicate entries, which is useful for testing
+/// crash-recovery semantics (see the `complete_shard_duplicate_call` test).
 #[derive(Clone, Default)]
 pub struct InMemoryCoordinator {
     state: Arc<Mutex<InMemoryCoordinatorState>>,

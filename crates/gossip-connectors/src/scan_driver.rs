@@ -1,7 +1,32 @@
 //! Scan-driver adapters that bridge connector assignments to scheduler runners.
 //!
-//! These wrappers intentionally live in a gossip-side crate so scanner crates
-//! remain independent leaf crates.
+//! Each driver type ([`FsScanDriver`], [`GitScanDriver`], [`InMemoryScanDriver`])
+//! owns a complete scan lifecycle: validating the assignment, spawning scoped
+//! worker threads, forwarding events and commits across a crossbeam channel
+//! bridge, and aggregating the result into a [`ScanReport`].
+//!
+//! # Threading model
+//!
+//! The filesystem and git drivers run inside [`std::thread::scope`] with two
+//! auxiliary threads per scan invocation:
+//!
+//! - **Event forwarder** — drains owned events from a channel and re-emits
+//!   them as borrowed `CoreEvent`/`GitEvent` into the caller-provided
+//!   [`GitEventOutput`] sink.
+//! - **Commit forwarder** (filesystem only) — drains [`CommitMessage`] values
+//!   and drives the [`CommitSink`] lifecycle (`begin_item` → `upsert_findings`
+//!   → `finish_item`).
+//!
+//! The channel bridge exists because scanner-scheduler sinks use borrowed
+//! (`'_`) event types that cannot cross thread boundaries. The owned mirrors
+//! ([`OwnedCoreEvent`], [`OwnedGitEvent`]) clone borrowed fields into `'static`
+//! storage for safe channel transport.
+//!
+//! # Crate placement
+//!
+//! These wrappers live in `gossip-connectors` (not in the scanner crates) so
+//! that scanner crates remain independent leaf dependencies with no knowledge
+//! of the coordination or connector abstractions.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,11 +57,16 @@ use scanner_scheduler::store::{
 use crate::common::derive_stable_item_id;
 use crate::{MemItem, connector_tag_for_kind};
 
-/// Factory for filesystem assignments.
+/// Factory that produces filesystem scan drivers from [`Assignment`]s.
+///
+/// Stateless and `Copy` — one instance serves all filesystem assignments.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FilesystemScanSourceFactory;
 
-/// Build a filesystem driver from an assignment.
+/// Extract and validate a filesystem assignment into a ready-to-run driver.
+///
+/// Rejects kind mismatches and invalid connector instance IDs early so
+/// that callers receive a clear error rather than a panic during the scan.
 fn filesystem_driver_from_assignment(assignment: &Assignment) -> Result<FsScanDriver> {
     if assignment.connector_kind != ConnectorKind::Filesystem {
         bail!(
@@ -76,7 +106,9 @@ impl ScanSourceFactory for FilesystemScanSourceFactory {
     }
 }
 
-/// Factory for git assignments.
+/// Factory that produces git scan drivers from git [`Assignment`]s.
+///
+/// Stateless and `Copy` — one instance serves all git assignments.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GitScanSourceFactory;
 
@@ -107,7 +139,13 @@ impl ScanSourceFactory for GitScanSourceFactory {
     }
 }
 
-/// Factory for in-memory dataset assignments used in tests/harnesses.
+/// Factory that produces in-memory scan drivers from in-memory
+/// [`Assignment`]s.
+///
+/// Unlike the filesystem and git factories, this factory is stateful: it
+/// holds a shared reference to the pre-loaded dataset so that multiple
+/// drivers produced from the same factory share the same backing data
+/// without re-copying.
 #[derive(Clone, Debug)]
 pub struct InMemoryScanSourceFactory {
     dataset_id: String,
@@ -171,8 +209,14 @@ impl ScanSourceFactory for InMemoryScanSourceFactory {
 /// Filesystem scan driver backed by [`parallel_scan_dir`].
 ///
 /// Spawns scoped threads for event and commit forwarding so the scheduler's
-/// channel-based sinks are bridged to the [`EventOutput`] / [`CommitSink`]
+/// channel-based sinks are bridged to the [`GitEventOutput`] / [`CommitSink`]
 /// interfaces expected by the coordination layer.
+///
+/// # Checkpoint behaviour
+///
+/// Filesystem scans do not yet track per-item cursor state, so
+/// `checkpoint_hint()` always returns `None`. A resumed scan restarts from
+/// the beginning of the directory tree.
 #[derive(Debug)]
 struct FsScanDriver {
     root: PathBuf,
@@ -185,14 +229,13 @@ impl ScanDriver for FsScanDriver {
         &mut self,
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
-        out: &dyn EventOutput,
-        _git_out: Option<&dyn GitEventOutput>,
+        out: &dyn GitEventOutput,
         commit: &dyn CommitSink,
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
         std::thread::scope(|scope| -> Result<ScanReport> {
             let (event_tx, event_rx) = unbounded();
-            let event_forwarder = scope.spawn(move || forward_events(out, None, event_rx));
+            let event_forwarder = scope.spawn(move || forward_events(out, event_rx));
 
             let (commit_tx, commit_rx) = unbounded();
             let commit_forwarder = scope.spawn(move || forward_commits(commit, commit_rx));
@@ -283,8 +326,7 @@ impl ScanDriver for GitScanDriver {
         &mut self,
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
-        out: &dyn EventOutput,
-        git_out: Option<&dyn GitEventOutput>,
+        out: &dyn GitEventOutput,
         _commit: &dyn CommitSink,
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
@@ -295,7 +337,7 @@ impl ScanDriver for GitScanDriver {
 
         std::thread::scope(|scope| -> Result<ScanReport> {
             let (event_tx, event_rx) = unbounded();
-            let event_forwarder = scope.spawn(move || forward_events(out, git_out, event_rx));
+            let event_forwarder = scope.spawn(move || forward_events(out, event_rx));
 
             let git_sink: Arc<dyn GitEventSink> =
                 Arc::new(ChannelGitEventOutput::new(event_tx.clone()));
@@ -356,8 +398,7 @@ impl ScanDriver for InMemoryScanDriver {
         &mut self,
         _engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
-        out: &dyn EventOutput,
-        _git_out: Option<&dyn GitEventOutput>,
+        out: &dyn GitEventOutput,
         commit: &dyn CommitSink,
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
@@ -469,6 +510,12 @@ impl GitEventOutput for ChannelGitEventOutput {
 
 /// [`StoreProducer`] adapter that normalizes scheduler paths to the connector's
 /// relative key encoding and forwards batches through a channel.
+///
+/// The scheduler stores absolute OS-encoded paths in finding batches, but
+/// the connector keyspace uses root-relative `/`-separated byte strings.
+/// This adapter performs the normalization via [`normalize_scheduler_path`]
+/// before forwarding, ensuring that commit-sink keys align with connector
+/// cursors and identity derivation.
 #[derive(Clone, Debug)]
 struct ChannelStoreProducer {
     tx: Sender<CommitMessage>,
@@ -529,6 +576,10 @@ impl StoreProducer for ChannelStoreProducer {
 
 /// Messages forwarded from the scheduler's [`StoreProducer`] to the
 /// coordination layer's [`CommitSink`] via a crossbeam channel.
+///
+/// Only [`Batch`](CommitMessage::Batch) messages are currently acted upon;
+/// `RunLoss` and `EndRun` are received and acknowledged but not yet wired
+/// to the coordination layer.
 #[derive(Debug)]
 enum CommitMessage {
     Batch(OwnedCommitBatch),
@@ -536,6 +587,8 @@ enum CommitMessage {
     EndRun(bool),
 }
 
+/// Owned finding batch with a pre-normalized relative path and
+/// pre-computed stable item identity, ready for the [`CommitSink`] bridge.
 #[derive(Debug)]
 struct OwnedCommitBatch {
     object_path: Vec<u8>,
@@ -545,25 +598,14 @@ struct OwnedCommitBatch {
 
 /// Drain owned events from `rx` and re-emit them into `out` as borrowed
 /// event values, flushing when the channel closes.
-fn forward_events(
-    out: &dyn EventOutput,
-    git_out: Option<&dyn GitEventOutput>,
-    rx: Receiver<OwnedDriverEvent>,
-) {
+fn forward_events(out: &dyn GitEventOutput, rx: Receiver<OwnedDriverEvent>) {
     while let Ok(event) = rx.recv() {
         match event {
             OwnedDriverEvent::Core(core) => core.emit_into(out),
-            OwnedDriverEvent::Git(git) => {
-                if let Some(sink) = git_out {
-                    git.emit_into(sink);
-                }
-            }
+            OwnedDriverEvent::Git(git) => git.emit_into(out),
         }
     }
     out.flush();
-    if let Some(sink) = git_out {
-        sink.flush();
-    }
 }
 
 /// Forward commit messages from the channel to the commit sink.
@@ -604,7 +646,20 @@ fn forward_commits(commit: &dyn CommitSink, rx: Receiver<CommitMessage>) -> Resu
 /// (via `task.path.as_os_str().as_encoded_bytes()`), but the filesystem connector
 /// encodes `ItemKey` values as root-relative `/`-separated byte strings (via
 /// `strip_prefix(root)` + `encode_rel_path` in `filesystem.rs`). This function
-/// bridges the two representations so commit-sink keys align with connector cursors.
+/// bridges the two representations so commit-sink keys align with connector
+/// cursors and stable identity derivation.
+///
+/// # Safety
+///
+/// Uses `OsStr::from_encoded_bytes_unchecked` to reconstruct the OS string.
+/// This is safe because the input bytes originated from
+/// `path.as_os_str().as_encoded_bytes()` in the scheduler, guaranteeing a
+/// valid platform-encoded round-trip.
+///
+/// # Errors
+///
+/// Returns `Err` if `raw_bytes` is not under `root`, contains non-normal
+/// path components (e.g. `..` or `.`), or encodes to an empty relative key.
 fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> Result<Vec<u8>> {
     // SAFETY: The scheduler produced these bytes via
     // `path.as_os_str().as_encoded_bytes()`, so they are valid platform-encoded
@@ -640,6 +695,10 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// Map a scheduler batch to the [`CommitSink`] lifecycle:
 /// `begin_item` → `upsert_findings` (if any) → `finish_item`.
+///
+/// Each batch represents one fully-scanned item. The `begin/finish` pair
+/// is always emitted even when the batch contains no findings, so the
+/// coordination layer records progress for clean items.
 fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedCommitBatch) -> Result<()> {
     let item_key = ItemKey::try_from_slice(&batch.object_path)
         .map_err(|error| anyhow!("invalid item key from scheduler batch: {error}"))?;
@@ -670,6 +729,10 @@ fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedCommitBatch) -> Res
 
 /// Convert a git scanner result into the generic [`ScanReport`] used by
 /// the coordination layer.
+///
+/// Git scans do not produce persistence metrics (no commit-sink wiring),
+/// so `dropped_findings`, `persist_emit_failures`, `persist_incomplete`,
+/// and `persist_ns` are all zero.
 fn git_report_to_scan_report(
     result: GitScanResult,
     scan_elapsed: std::time::Duration,
@@ -705,6 +768,10 @@ fn git_report_to_scan_report(
 }
 
 /// Owned mirror of driver events for channel forwarding.
+///
+/// Wraps both core (scheduler) and git-specific event types so a single
+/// channel can carry all event traffic from worker threads to the
+/// consumer-side forwarder.
 #[derive(Debug)]
 enum OwnedDriverEvent {
     Core(OwnedCoreEvent),
@@ -714,7 +781,12 @@ enum OwnedDriverEvent {
 /// Convert runtime-level execution knobs into the low-level git runner config.
 ///
 /// Runtime options use MiB units for CLI ergonomics; this function performs
-/// checked MiB->byte conversion and applies sane worker fallbacks.
+/// checked MiB→byte conversion and applies sane worker fallbacks.
+///
+/// # Errors
+///
+/// Returns `Err` if a MiB value is zero or overflows `u32` / `usize` when
+/// multiplied by 1 MiB.
 fn build_git_scan_config(cfg: &ScanExecutionConfig) -> Result<GitScanConfig> {
     const MIB: u32 = 1024 * 1024;
 
@@ -759,6 +831,11 @@ fn build_git_scan_config(cfg: &ScanExecutionConfig) -> Result<GitScanConfig> {
 }
 
 /// Build stderr-oriented debug output for `--debug` / `--debug=perf`.
+///
+/// Returns `None` when debug level is [`GitDebugLevel::Off`]. At `Stats`
+/// level, emits aggregate object/byte/finding counts and stage-level
+/// timings. At `Perf` level, additionally appends per-pack-exec cache
+/// and resolve timing breakdowns.
 fn format_git_debug_output(
     report: &scanner_git::GitScanReport,
     level: GitDebugLevel,
@@ -951,7 +1028,7 @@ impl OwnedCoreEvent {
         }
     }
 
-    fn emit_into(&self, out: &dyn EventOutput) {
+    fn emit_into(&self, out: &dyn GitEventOutput) {
         match self {
             Self::Finding {
                 source,
@@ -1012,6 +1089,10 @@ impl OwnedCoreEvent {
 }
 
 /// Owned mirror of [`GitEvent`] for sending across thread boundaries.
+///
+/// `GitEvent` borrows identity dictionary values from the scanner, so it
+/// cannot outlive the emitting thread. This enum clones borrowed fields
+/// for safe channel transport.
 #[derive(Debug)]
 enum OwnedGitEvent {
     CommitMeta {
@@ -1093,6 +1174,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 mod tests {
     use super::*;
     use gossip_scan_driver::{CommitSink, FindingsBatch, ItemMeta};
+    use scanner_git::VecEventSink;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -1245,5 +1327,33 @@ mod tests {
         };
         let git_cfg = build_git_scan_config(&cfg).expect("build git config");
         assert_eq!(git_cfg.pack_exec_workers, 7);
+    }
+
+    #[test]
+    fn forward_events_re_emits_core_and_git_events_into_one_sink() {
+        let sink = VecEventSink::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        tx.send(OwnedDriverEvent::Core(OwnedCoreEvent::Diagnostic {
+            level: "info",
+            message: "core-event".to_owned(),
+        }))
+        .expect("send core event");
+        tx.send(OwnedDriverEvent::Git(OwnedGitEvent::CommitMeta {
+            commit_id: 7,
+            commit_oid: OidBytes::sha1([0x11; 20]),
+            timestamp: 42,
+            identity: None,
+        }))
+        .expect("send git event");
+        drop(tx);
+
+        forward_events(&sink, rx);
+
+        let encoded = String::from_utf8(sink.take()).expect("sink output should be utf8");
+        assert!(encoded.contains("\"type\":\"diagnostic\""));
+        assert!(encoded.contains("\"message\":\"core-event\""));
+        assert!(encoded.contains("\"type\":\"commit_meta\""));
+        assert!(encoded.contains("\"commit_id\":7"));
     }
 }

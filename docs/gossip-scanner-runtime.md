@@ -51,7 +51,7 @@ Distributed ──► ShardLease ─────┤
              ScanSourceFactory::driver_for_assignment()
                         │
                         ▼
-               ScanDriver::run(engine, config, out, git_out, commit, cancel)
+               ScanDriver::run(engine, config, out, commit, cancel)
                         │
                         ▼
                  AssignmentOutcome { report, checkpoint_hint, debug_output }
@@ -579,7 +579,7 @@ Distributed event sink that bridges scan-driver output to the
 coordinator recorder. Implements both `EventOutput` (core events) and
 `GitEventOutput` (git-specific events). Constructed inside the worker
 loop via `CoordinationEventSink::new(recorder, shard_id)` and passed
-as both `out` and `git_out` to `execute_assignment_with_config`.
+as the unified `out` sink to `execute_assignment_with_config`.
 
 Each event variant is converted from its borrowed form (`CoreEvent`,
 `GitEvent`) into the corresponding owned form (`StoredCoreEvent`,

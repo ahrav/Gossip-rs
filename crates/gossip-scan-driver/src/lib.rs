@@ -18,7 +18,7 @@
 //!                        │
 //!          ┌─────────────┼───────────────────┐
 //!          │             run()                │
-//!          │  Engine + Config + EventOutput   │
+//!          │ Engine + Config + GitEventOutput │
 //!          │  + CommitSink + CancellationToken│
 //!          │             │                    │
 //!          │             ▼                    │
@@ -50,7 +50,6 @@ use gossip_contracts::connector::{Cursor, ItemKey, VersionId};
 use gossip_contracts::coordination::ShardSpec;
 use gossip_contracts::identity::{PolicyHash, StableItemId};
 use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
-use scanner_scheduler::events::EventOutput;
 
 /// Cooperative cancellation token for long-running scans.
 ///
@@ -371,7 +370,8 @@ pub struct ItemMeta {
 /// Carries the minimal set of fields the coordination layer needs to
 /// derive the full identity chain (`norm_hash → secret_hash → finding_id
 /// → occurrence_id`). Richer per-finding details (matched text, transform
-/// path) travel through the [`EventOutput`] stream instead.
+/// path) travel through the [`scanner_scheduler::events::EventOutput`] stream
+/// instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRecord {
     /// Numeric identifier of the detection rule that matched.
@@ -410,7 +410,8 @@ pub struct FindingsBatch {
 /// In distributed mode the sink derives identity chains and records
 /// progress for the coordination layer. In CLI mode, [`NoOpCommitSink`]
 /// discards all calls. The git driver currently ignores the sink
-/// entirely — git findings flow only through the [`EventOutput`] stream.
+/// entirely — git findings flow only through the
+/// [`scanner_scheduler::events::EventOutput`] stream.
 ///
 /// [`begin_item`]: CommitSink::begin_item
 /// [`upsert_findings`]: CommitSink::upsert_findings
@@ -429,8 +430,12 @@ pub trait CommitSink: Send + Sync {
     fn finish_item(&self, item_key: &ItemKey) -> Result<()>;
 }
 
-/// No-op [`CommitSink`] for CLI and direct-mode scans where per-item
-/// persistence is not needed.
+/// No-op [`CommitSink`] that discards all calls.
+///
+/// Used in CLI and direct-mode scans where per-item persistence is not
+/// needed. Also used as the commit sink for git scans, which route
+/// finding persistence through the git scanner's own event stream instead
+/// of the per-item lifecycle.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoOpCommitSink;
 
@@ -468,8 +473,7 @@ pub trait ScanDriver: Send {
     ///
     /// - `engine` — compiled detection rules shared across workers.
     /// - `cfg` — runtime knobs (workers, checkpoint interval, source config).
-    /// - `out` — event sink for findings, progress, and diagnostics.
-    /// - `git_out` — optional git-specific event sink (ignored by non-git drivers).
+    /// - `out` — event sink for both core and git-specific events.
     /// - `commit` — per-item lifecycle sink for persistence (see [`CommitSink`]).
     /// - `cancel` — cooperative cancellation token; drivers that support it
     ///   poll [`CancellationToken::is_cancelled`] at regular intervals.
@@ -483,8 +487,7 @@ pub trait ScanDriver: Send {
         &mut self,
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
-        out: &dyn EventOutput,
-        git_out: Option<&dyn GitEventOutput>,
+        out: &dyn GitEventOutput,
         commit: &dyn CommitSink,
         cancel: &CancellationToken,
     ) -> Result<ScanReport>;

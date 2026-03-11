@@ -34,7 +34,7 @@ sequenceDiagram
     RT->>SF: driver_for_assignment(&assignment)
     SF-->>RT: Box&lt;dyn ScanDriver&gt;
     RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-    RT->>DR: driver.run(engine, cfg, out, git_out, commit, cancel)
+    RT->>DR: driver.run(engine, cfg, out, commit, cancel)
     activate DR
     DR-->>RT: ScanReport
     deactivate DR
@@ -53,7 +53,7 @@ sequenceDiagram
             RT->>SF: driver_for_assignment(&assignment)
             SF-->>RT: Box&lt;dyn ScanDriver&gt;
             RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-            RT->>DR: driver.run(engine, cfg, out, git_out, commit, cancel)
+            RT->>DR: driver.run(engine, cfg, out, commit, cancel)
             activate DR
             DR-->>RT: ScanReport
             deactivate DR
