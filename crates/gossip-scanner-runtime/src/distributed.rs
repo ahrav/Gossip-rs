@@ -39,12 +39,18 @@ use anyhow::{Error as AnyError, Result};
 use gossip_contracts::identity::{TenantId, TenantSecretKey};
 use gossip_scan_driver::{Assignment, CancellationToken, CursorUpdate, ScanReport};
 
+use gossip_connectors::{GitExecutionConfig, execute_git_assignment};
+use gossip_scan_driver::ConnectorKind;
+
 use crate::commit_sink::DurableCommitSink;
 use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink, IdentityChainRecord,
     StoredCoreEvent, StoredGitEvent,
 };
-use crate::{RuntimeEngineConfig, ScanBudgets, ScanRuntimeError, execute_assignment_with_config};
+use crate::{
+    AssignmentOutcome, RuntimeEngineConfig, ScanBudgets, ScanRuntimeError,
+    execute_assignment_with_config, runtime_engine,
+};
 
 /// Lease payload consumed by the distributed runtime.
 ///
@@ -206,15 +212,40 @@ pub fn run_worker(
         let mut runtime = config.budgets.to_execution_config()?;
         runtime.filesystem.emit_findings_to_commit_sink = true;
 
-        let outcome = execute_assignment_with_config(
-            &lease.assignment,
-            runtime,
-            &RuntimeEngineConfig::default(),
-            &sink,
-            &commit,
-            &cancel,
-        )
-        .map_err(DistributedRuntimeError::Runtime)?;
+        let engine_config = RuntimeEngineConfig::default();
+        let outcome = if lease.assignment.connector_kind == ConnectorKind::Git {
+            // Git assignments use the dedicated git entry point so
+            // git-specific events are preserved in the coordination sink.
+            let engine =
+                runtime_engine(&engine_config).map_err(DistributedRuntimeError::Runtime)?;
+            let (scan_report, checkpoint_hint, debug_output) = execute_git_assignment(
+                &lease.assignment,
+                engine,
+                &runtime,
+                &GitExecutionConfig::default(),
+                &sink,
+                &cancel,
+            )
+            .map_err(|e| DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(e)))?;
+            AssignmentOutcome {
+                report: scan_report,
+                checkpoint_hint,
+                debug_output,
+            }
+        } else {
+            // Non-git assignments use the source-neutral trait path.
+            // CoordinationEventSink implements EventOutput, so trait
+            // upcasting provides the &dyn EventOutput reference.
+            execute_assignment_with_config(
+                &lease.assignment,
+                runtime,
+                &engine_config,
+                &sink,
+                &commit,
+                &cancel,
+            )
+            .map_err(DistributedRuntimeError::Runtime)?
+        };
 
         coordinator
             .complete_shard(&lease, outcome.checkpoint_hint, outcome.report)

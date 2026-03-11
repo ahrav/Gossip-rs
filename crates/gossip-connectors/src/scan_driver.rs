@@ -1,9 +1,10 @@
 //! Scan-driver adapters that bridge connector assignments to scheduler runners.
 //!
-//! Each driver type ([`FsScanDriver`], [`GitScanDriver`], [`InMemoryScanDriver`])
-//! owns a complete scan lifecycle: validating the assignment, spawning scoped
-//! worker threads, forwarding events and commits across a crossbeam channel
-//! bridge, and aggregating the result into a [`ScanReport`].
+//! Source-neutral drivers ([`FsScanDriver`], [`InMemoryScanDriver`]) implement
+//! the [`ScanDriver`] trait. The git driver (`GitScanDriver`) is private and
+//! accessed exclusively through [`execute_git_assignment`] — it does not
+//! implement `ScanDriver` because git scans require `&dyn GitEventOutput`
+//! rather than the source-neutral `&dyn EventOutput`.
 //!
 //! # Threading model
 //!
@@ -11,8 +12,9 @@
 //!
 //! - **Filesystem driver** — spawns **two** auxiliary threads: an event
 //!   forwarder and a commit forwarder.
-//! - **Git driver** — spawns **one** auxiliary thread: an event forwarder
-//!   only (the commit sink is unused; see [`GitScanDriver::run`]).
+//! - **Git driver** (via [`execute_git_assignment`]) — spawns **one**
+//!   auxiliary thread: an event forwarder only (git scans use a
+//!   watermark-based model, not the per-item commit lifecycle).
 //!
 //! Auxiliary threads:
 //!
@@ -42,14 +44,15 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use gossip_contracts::connector::ItemKey;
 use gossip_contracts::identity::{ConnectorInstanceIdHash, StableItemId};
 use gossip_scan_driver::{
-    Assignment, AssignmentSource, CommitSink, ConnectorKind, CursorUpdate, FindingRecord,
-    FindingsBatch, GitDebugLevel, ItemMeta, ScanDriver, ScanExecutionConfig, ScanReport,
+    Assignment, AssignmentSource, CancellationToken, CommitSink, ConnectorKind, CursorUpdate,
+    FindingRecord, FindingsBatch, ItemMeta, ScanDriver, ScanExecutionConfig, ScanReport,
     ScanSourceFactory, SourceCapabilities,
 };
 use scanner_git::{
     CommitIdentityIds, CommitMetaEvent, EventSink as GitEventSink, GitEvent, GitEventOutput,
-    GitScanConfig, GitScanResult, IdentityDictionaryEvent, NativeRefResolver, NeverSeenStore,
-    OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig, run_git_scan,
+    GitScanConfig, GitScanMode, GitScanResult, IdentityDictionaryEvent, MergeDiffMode,
+    NativeRefResolver, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig,
+    run_git_scan,
 };
 use scanner_scheduler::events::{
     CoreEvent, DiagnosticEvent, EventOutput, FindingEvent, ProgressEvent, SummaryEvent,
@@ -62,6 +65,66 @@ use scanner_scheduler::store::{
 
 use crate::common::derive_stable_item_id;
 use crate::{MemItem, connector_tag_for_kind};
+
+/// Diagnostic verbosity for git scan debug output.
+///
+/// Returned via [`execute_git_assignment`] and printed to stderr by the
+/// CLI after the scan completes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GitDebugLevel {
+    /// No diagnostic output (default).
+    #[default]
+    Off,
+    /// High-level aggregate statistics (ref counts, blob totals).
+    Stats,
+    /// Detailed per-phase timing and pack-exec performance counters.
+    Perf,
+}
+
+/// Git-specific runtime knobs.
+///
+/// Passed directly to git scan entry points by the runtime layer,
+/// keeping the source-neutral `ScanExecutionConfig` free of git types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitExecutionConfig {
+    /// Stable repository identifier used to namespace persisted keys.
+    pub repo_id: u64,
+    /// Git scan mode (diff-history vs ODB-blob fast-path).
+    pub scan_mode: GitScanMode,
+    /// Merge-diff strategy for merge commits.
+    pub merge_diff_mode: MergeDiffMode,
+    /// Optional explicit pack-exec worker override.
+    ///
+    /// When `None`, the git driver falls back to
+    /// [`ScanExecutionConfig::workers`].
+    pub pack_exec_workers: Option<usize>,
+    /// When true, skip binary-class filtering and scan all blobs.
+    pub scan_binary: bool,
+    /// When true, emit identity-dictionary and enriched commit metadata.
+    pub enrich_identities: bool,
+    /// Diagnostic output level.
+    pub debug_level: GitDebugLevel,
+    /// Optional tree delta cache size override in MiB.
+    pub tree_delta_cache_mb: Option<u32>,
+    /// Optional engine chunk size override in MiB.
+    pub engine_chunk_mb: Option<u32>,
+}
+
+impl Default for GitExecutionConfig {
+    fn default() -> Self {
+        Self {
+            repo_id: 1,
+            scan_mode: GitScanMode::OdbBlobFast,
+            merge_diff_mode: MergeDiffMode::AllParents,
+            pack_exec_workers: None,
+            scan_binary: false,
+            enrich_identities: false,
+            debug_level: GitDebugLevel::Off,
+            tree_delta_cache_mb: None,
+            engine_chunk_mb: None,
+        }
+    }
+}
 
 /// Factory that produces filesystem scan drivers from [`Assignment`]s.
 ///
@@ -110,39 +173,6 @@ impl ScanSourceFactory for FilesystemScanSourceFactory {
             // parallel_scan_dir does not accept a cancellation token and has no
             // mid-scan cancellation mechanism. The driver only checks the token
             // before starting (pre-check), not during the scan.
-            supports_cooperative_cancel: false,
-        }
-    }
-}
-
-/// Factory that produces git scan drivers from git [`Assignment`]s.
-///
-/// Stateless and `Copy` — one instance serves all git assignments.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct GitScanSourceFactory;
-
-impl ScanSourceFactory for GitScanSourceFactory {
-    fn driver_for_assignment(&self, assignment: &Assignment) -> Result<Box<dyn ScanDriver>> {
-        if assignment.connector_kind != ConnectorKind::Git {
-            bail!(
-                "assignment kind mismatch: expected git, got {:?}",
-                assignment.connector_kind
-            );
-        }
-
-        let AssignmentSource::Git { repo_root } = &assignment.source else {
-            bail!("git assignment missing git source payload");
-        };
-
-        Ok(Box::new(GitScanDriver {
-            repo_root: repo_root.clone(),
-            debug_output: None,
-        }))
-    }
-
-    fn capabilities(&self) -> SourceCapabilities {
-        SourceCapabilities {
-            supports_checkpoint_hints: false,
             supports_cooperative_cancel: false,
         }
     }
@@ -238,13 +268,13 @@ impl ScanDriver for FsScanDriver {
         &mut self,
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
-        out: &dyn GitEventOutput,
+        out: &dyn EventOutput,
         commit: &dyn CommitSink,
-        cancel: &gossip_scan_driver::CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ScanReport> {
         std::thread::scope(|scope| -> Result<ScanReport> {
             let (event_tx, event_rx) = unbounded();
-            let event_forwarder = scope.spawn(move || forward_events(out, event_rx));
+            let event_forwarder = scope.spawn(move || forward_core_events(out, event_rx));
 
             let (commit_tx, commit_rx) = unbounded();
             let commit_forwarder = scope.spawn(move || forward_commits(commit, commit_rx));
@@ -323,22 +353,21 @@ struct GitScanDriver {
     debug_output: Option<String>,
 }
 
-impl ScanDriver for GitScanDriver {
-    /// Run the git scan driver.
+impl GitScanDriver {
+    /// Run the git scan with full git event support.
     ///
-    /// **Note:** The `commit` sink is intentionally unused. Git scans operate
-    /// on a commit-graph model (ref watermarks, seen-blob deduplication) that
-    /// does not map to the per-item begin/finish lifecycle of the commit sink.
-    /// Persistence for git findings is handled separately via the git scanner's
-    /// `PersistenceStore` (currently passed as `None` until git persistence is
-    /// integrated with the coordination backend).
+    /// Accepts `&dyn GitEventOutput` so git-specific events (`CommitMeta`,
+    /// `IdentityDictionary`) are forwarded to the caller's sink. The `commit`
+    /// sink is intentionally omitted — git scans operate on a commit-graph
+    /// model (ref watermarks, seen-blob deduplication) that does not map to
+    /// the per-item begin/finish lifecycle.
     fn run(
         &mut self,
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
+        git_cfg: &GitExecutionConfig,
         out: &dyn GitEventOutput,
-        _commit: &dyn CommitSink,
-        cancel: &gossip_scan_driver::CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ScanReport> {
         self.debug_output = None;
         if cancel.is_cancelled() {
@@ -352,7 +381,7 @@ impl ScanDriver for GitScanDriver {
             let git_sink: Arc<dyn GitEventSink> =
                 Arc::new(ChannelGitEventOutput::new(event_tx.clone()));
 
-            let git_cfg = build_git_scan_config(cfg)?;
+            let low_level_cfg = build_git_scan_config(cfg, git_cfg)?;
 
             let resolver = NativeRefResolver::new(StartSetConfig::DefaultBranchOnly);
             let watermarks = EmptyWatermarkStore;
@@ -365,13 +394,13 @@ impl ScanDriver for GitScanDriver {
                 &seen,
                 &watermarks,
                 None,
-                &git_cfg,
+                &low_level_cfg,
                 git_sink,
             )
             .with_context(|| format!("git scan failed for {}", self.repo_root.display()))?;
             let scan_elapsed = scan_start.elapsed();
 
-            self.debug_output = format_git_debug_output(&result.0, cfg.git.debug_level);
+            self.debug_output = format_git_debug_output(&result.0, git_cfg.debug_level);
             drop(event_tx);
             join_scoped(event_forwarder, "event forwarder thread")?;
 
@@ -379,6 +408,10 @@ impl ScanDriver for GitScanDriver {
         })
     }
 
+    /// Optional human-readable debug diagnostics generated during the scan.
+    ///
+    /// Surfaces ref-resolution stats and pack-exec timing for `--debug` /
+    /// `--debug=perf`. The CLI prints this to stderr after the scan completes.
     fn debug_output(&self) -> Option<String> {
         self.debug_output.clone()
     }
@@ -408,9 +441,9 @@ impl ScanDriver for InMemoryScanDriver {
         &mut self,
         _engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
-        out: &dyn GitEventOutput,
+        out: &dyn EventOutput,
         commit: &dyn CommitSink,
-        cancel: &gossip_scan_driver::CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ScanReport> {
         let mut report = ScanReport::default();
         let checkpoint_every = cfg.checkpoint_every_items.max(1);
@@ -609,12 +642,26 @@ struct OwnedCommitBatch {
 }
 
 /// Drain owned events from `rx` and re-emit them into `out` as borrowed
-/// event values, flushing when the channel closes.
+/// event values, flushing when the channel closes. Handles both core and
+/// git events — used by the git scan path.
 fn forward_events(out: &dyn GitEventOutput, rx: Receiver<OwnedDriverEvent>) {
     while let Ok(event) = rx.recv() {
         match event {
             OwnedDriverEvent::Core(core) => core.emit_into(out),
             OwnedDriverEvent::Git(git) => git.emit_into(out),
+        }
+    }
+    out.flush();
+}
+
+/// Drain owned events from `rx` and re-emit core events into `out`,
+/// ignoring any git events. Used by non-git drivers that only produce
+/// core events.
+fn forward_core_events(out: &dyn EventOutput, rx: Receiver<OwnedDriverEvent>) {
+    while let Ok(event) = rx.recv() {
+        match event {
+            OwnedDriverEvent::Core(core) => core.emit_into(out),
+            OwnedDriverEvent::Git(_) => {}
         }
     }
     out.flush();
@@ -792,14 +839,19 @@ enum OwnedDriverEvent {
 
 /// Convert runtime-level execution knobs into the low-level git runner config.
 ///
-/// Runtime options use MiB units for CLI ergonomics; this function performs
-/// checked MiB→byte conversion and applies sane worker fallbacks.
+/// Accepts the cross-cutting `ScanExecutionConfig` (for worker fallback) and
+/// the git-specific `GitExecutionConfig`. Runtime options use MiB units for
+/// CLI ergonomics; this function performs checked MiB→byte conversion and
+/// applies sane worker fallbacks.
 ///
 /// # Errors
 ///
 /// Returns `Err` if a MiB value is zero or overflows `u32` / `usize` when
 /// multiplied by 1 MiB.
-fn build_git_scan_config(cfg: &ScanExecutionConfig) -> Result<GitScanConfig> {
+fn build_git_scan_config(
+    cfg: &ScanExecutionConfig,
+    git: &GitExecutionConfig,
+) -> Result<GitScanConfig> {
     const MIB: u32 = 1024 * 1024;
 
     fn mebibytes_to_u32_bytes(value_mb: u32, label: &str) -> Result<u32> {
@@ -817,29 +869,73 @@ fn build_git_scan_config(cfg: &ScanExecutionConfig) -> Result<GitScanConfig> {
     }
 
     let mut git_cfg = GitScanConfig {
-        repo_id: cfg.git.repo_id,
-        scan_mode: cfg.git.scan_mode,
-        merge_diff_mode: cfg.git.merge_diff_mode,
-        pack_exec_workers: cfg
-            .git
+        repo_id: git.repo_id,
+        scan_mode: git.scan_mode,
+        merge_diff_mode: git.merge_diff_mode,
+        pack_exec_workers: git
             .pack_exec_workers
             .unwrap_or_else(|| cfg.workers.max(1))
             .max(1),
-        enrich_identities: cfg.git.enrich_identities,
+        enrich_identities: git.enrich_identities,
         ..GitScanConfig::default()
     };
-    git_cfg.engine_adapter.scan_binary = cfg.git.scan_binary;
+    git_cfg.engine_adapter.scan_binary = git.scan_binary;
 
-    if let Some(value_mb) = cfg.git.tree_delta_cache_mb {
+    if let Some(value_mb) = git.tree_delta_cache_mb {
         git_cfg.tree_diff.max_tree_delta_cache_bytes =
             mebibytes_to_u32_bytes(value_mb, "x-tree-delta-cache-mb")?;
     }
-    if let Some(value_mb) = cfg.git.engine_chunk_mb {
+    if let Some(value_mb) = git.engine_chunk_mb {
         git_cfg.engine_adapter.chunk_bytes =
             mebibytes_to_usize_bytes(value_mb, "x-engine-chunk-mb")?;
     }
 
     Ok(git_cfg)
+}
+
+/// Execute a git assignment with full git event support.
+///
+/// This is the sole entry point for git scans. Git does not go through the
+/// generic `ScanDriver::run` trait — it has its own dedicated execution
+/// path because git scans require `&dyn GitEventOutput` for git-specific
+/// events (`CommitMeta`, `IdentityDictionary`).
+///
+/// Returns the scan report, an optional cursor update (always `None` for
+/// git — watermark-based, not cursor-based), and optional debug diagnostics.
+///
+/// # Errors
+///
+/// Returns `Err` if the assignment is not a git assignment, the repository
+/// cannot be opened, or the scan driver encounters a fatal error.
+pub fn execute_git_assignment(
+    assignment: &Assignment,
+    engine: Arc<scanner_engine::Engine>,
+    cfg: &ScanExecutionConfig,
+    git_cfg: &GitExecutionConfig,
+    out: &dyn GitEventOutput,
+    cancel: &CancellationToken,
+) -> Result<(ScanReport, Option<CursorUpdate>, Option<String>)> {
+    if assignment.connector_kind != ConnectorKind::Git {
+        bail!(
+            "assignment kind mismatch: expected git, got {:?}",
+            assignment.connector_kind
+        );
+    }
+
+    let AssignmentSource::Git { repo_root } = &assignment.source else {
+        bail!("git assignment missing git source payload");
+    };
+
+    let mut driver = GitScanDriver {
+        repo_root: repo_root.clone(),
+        debug_output: None,
+    };
+
+    let report = driver.run(engine, cfg, git_cfg, out, cancel)?;
+    let debug = driver.debug_output();
+    // Git scans do not produce checkpoint cursors — they scan from ref
+    // watermarks, not from item-level cursors.
+    Ok((report, None, debug))
 }
 
 /// Build stderr-oriented debug output for `--debug` / `--debug=perf`.
@@ -1040,7 +1136,7 @@ impl OwnedCoreEvent {
         }
     }
 
-    fn emit_into(&self, out: &dyn GitEventOutput) {
+    fn emit_into(&self, out: &dyn EventOutput) {
         match self {
             Self::Finding {
                 source,
@@ -1186,7 +1282,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 mod tests {
     use super::*;
     use gossip_scan_driver::{CommitSink, FindingsBatch, ItemMeta};
-    use scanner_git::VecEventSink;
+    use scanner_git::{GitScanMode, MergeDiffMode, VecEventSink};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -1296,27 +1392,24 @@ mod tests {
     fn build_git_scan_config_maps_runtime_git_knobs() {
         let cfg = ScanExecutionConfig {
             workers: 3,
-            git: gossip_scan_driver::GitExecutionConfig {
-                repo_id: 42,
-                scan_mode: scanner_git::GitScanMode::DiffHistory,
-                merge_diff_mode: scanner_git::MergeDiffMode::FirstParentOnly,
-                pack_exec_workers: Some(5),
-                scan_binary: true,
-                enrich_identities: true,
-                debug_level: GitDebugLevel::Perf,
-                tree_delta_cache_mb: Some(256),
-                engine_chunk_mb: Some(4),
-            },
             ..ScanExecutionConfig::default()
         };
+        let git = GitExecutionConfig {
+            repo_id: 42,
+            scan_mode: GitScanMode::DiffHistory,
+            merge_diff_mode: MergeDiffMode::FirstParentOnly,
+            pack_exec_workers: Some(5),
+            scan_binary: true,
+            enrich_identities: true,
+            debug_level: GitDebugLevel::Perf,
+            tree_delta_cache_mb: Some(256),
+            engine_chunk_mb: Some(4),
+        };
 
-        let git_cfg = build_git_scan_config(&cfg).expect("build git config");
+        let git_cfg = build_git_scan_config(&cfg, &git).expect("build git config");
         assert_eq!(git_cfg.repo_id, 42);
-        assert_eq!(git_cfg.scan_mode, scanner_git::GitScanMode::DiffHistory);
-        assert_eq!(
-            git_cfg.merge_diff_mode,
-            scanner_git::MergeDiffMode::FirstParentOnly
-        );
+        assert_eq!(git_cfg.scan_mode, GitScanMode::DiffHistory);
+        assert_eq!(git_cfg.merge_diff_mode, MergeDiffMode::FirstParentOnly);
         assert_eq!(git_cfg.pack_exec_workers, 5);
         assert!(git_cfg.engine_adapter.scan_binary);
         assert!(git_cfg.enrich_identities);
@@ -1331,13 +1424,13 @@ mod tests {
     fn build_git_scan_config_uses_shared_worker_fallback() {
         let cfg = ScanExecutionConfig {
             workers: 7,
-            git: gossip_scan_driver::GitExecutionConfig {
-                pack_exec_workers: None,
-                ..gossip_scan_driver::GitExecutionConfig::default()
-            },
             ..ScanExecutionConfig::default()
         };
-        let git_cfg = build_git_scan_config(&cfg).expect("build git config");
+        let git = GitExecutionConfig {
+            pack_exec_workers: None,
+            ..GitExecutionConfig::default()
+        };
+        let git_cfg = build_git_scan_config(&cfg, &git).expect("build git config");
         assert_eq!(git_cfg.pack_exec_workers, 7);
     }
 

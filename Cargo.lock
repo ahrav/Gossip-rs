@@ -1380,7 +1380,6 @@ dependencies = [
  "anyhow",
  "gossip-contracts",
  "scanner-engine",
- "scanner-git",
  "scanner-scheduler",
 ]
 

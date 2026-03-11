@@ -30,10 +30,10 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use gossip_connectors::GitDebugLevel;
 use gossip_scan_driver::CancellationToken;
-use gossip_scan_driver::GitDebugLevel;
 use scanner_engine::TransformId;
-use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode, NullEventSink};
+use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::source_kind::SourceKind;
 
 use crate::commit_sink::CliNoOpCommitSink;
@@ -801,7 +801,6 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
                     .with_tree_delta_cache_mb(config.git_tree_delta_cache_mb)
                     .with_engine_chunk_mb(config.git_engine_chunk_mb),
                 sink.as_ref(),
-                &commit,
                 &cancel,
             )?;
             if let Some(debug_output) = outcome.debug_output.as_deref() {
@@ -934,9 +933,9 @@ fn format_human_bytes(bytes: u64) -> String {
 
 /// Construct the appropriate event sink for the requested output format.
 ///
-/// When `null_sink` is true, returns a [`NullEventSink`] that discards all
-/// events (useful for benchmarking without I/O overhead). Otherwise returns
-/// a sink that writes to stdout in the requested format.
+/// When `null_sink` is true, returns a null sink that discards all events
+/// (useful for benchmarking without I/O overhead). Otherwise returns a sink
+/// that writes to stdout in the requested format.
 fn build_event_sink(
     event_format: EventFormat,
     verbose: bool,
@@ -944,7 +943,7 @@ fn build_event_sink(
 ) -> Box<dyn GitEventOutput> {
     if null_sink {
         eprintln!("info: --null-sink enabled; findings will not be written to stdout");
-        return Box::new(NullEventSink);
+        return Box::new(scanner_git::NullEventSink);
     }
     match event_format {
         EventFormat::Jsonl => Box::new(JsonlEventSink::new(io::stdout())),

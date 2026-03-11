@@ -15,5 +15,4 @@ aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
 anyhow.workspace = true
 gossip-contracts.workspace = true
 scanner-engine.workspace = true
-scanner-git.workspace = true
 scanner-scheduler.workspace = true

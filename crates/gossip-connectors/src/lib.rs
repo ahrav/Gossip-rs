@@ -31,7 +31,8 @@ pub use filesystem::FilesystemConnector;
 pub use git::GitConnector;
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 pub use scan_driver::{
-    FilesystemScanSourceFactory, GitScanSourceFactory, InMemoryScanSourceFactory,
+    FilesystemScanSourceFactory, GitDebugLevel, GitExecutionConfig, InMemoryScanSourceFactory,
+    execute_git_assignment,
 };
 
 /// Return the canonical tag assigned to a connector kind.

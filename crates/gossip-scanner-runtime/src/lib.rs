@@ -34,7 +34,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
-use gossip_connectors::{FilesystemScanSourceFactory, GitScanSourceFactory};
+use gossip_connectors::{
+    FilesystemScanSourceFactory, GitDebugLevel, GitExecutionConfig, execute_git_assignment,
+};
 use gossip_contracts::{
     connector::{ConnectorInputError, Cursor},
     coordination::ShardSpec,
@@ -42,11 +44,11 @@ use gossip_contracts::{
 };
 use gossip_scan_driver::{
     Assignment, AssignmentSource, CancellationToken, CommitSink, ConnectorKind, CursorUpdate,
-    GitDebugLevel, GitExecutionConfig, NoOpCommitSink, ScanExecutionConfig, ScanReport,
-    ScanSourceFactory,
+    NoOpCommitSink, ScanExecutionConfig, ScanReport, ScanSourceFactory,
 };
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformId, TransformMode};
-use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode, NullEventSink};
+use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
+use scanner_scheduler::events::EventOutput;
 
 /// Provides CLI entrypoint wiring, argument parsing, and scan dispatch.
 pub mod cli;
@@ -632,7 +634,7 @@ pub fn scan_git(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> 
 
 /// Filesystem scan routed through the unified assignment/driver seam.
 pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let out = NullEventSink;
+    let out = scanner_scheduler::events::NullEventOutput;
     let commit = NoOpCommitSink;
     let cancel = CancellationToken::new();
     scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
@@ -648,10 +650,9 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
 
 /// Git scan routed through the unified assignment/driver seam.
 pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let out = NullEventSink;
-    let commit = NoOpCommitSink;
+    let out = scanner_git::NullEventSink;
     let cancel = CancellationToken::new();
-    scan_git_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
+    scan_git_with_runtime(config, &out, &cancel).map(|outcome| outcome.report)
 }
 
 /// Connector-mode git scan.
@@ -669,7 +670,7 @@ pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanReport, ScanRunt
 /// assignment, and routes through [`execute_assignment_with_config`].
 pub(crate) fn scan_fs_with_runtime(
     config: &FsScanConfig,
-    out: &dyn GitEventOutput,
+    out: &dyn EventOutput,
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
@@ -699,13 +700,12 @@ pub(crate) fn scan_fs_with_runtime(
 /// Internal git scan entry point that accepts caller-provided sinks.
 ///
 /// Used by both CLI (with stdout event sink) and distributed mode (with
-/// coordination event sink). Validates the repository path, synthesizes a
-/// single-shard assignment, and routes through
-/// [`execute_assignment_with_config`].
+/// coordination event sink). Validates the repository path, builds the
+/// git-specific config, and calls [`execute_git_assignment`] directly so
+/// git-specific events are preserved in the output sink.
 pub(crate) fn scan_git_with_runtime(
     config: &GitScanConfig,
     out: &dyn GitEventOutput,
-    commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
     let canonical_repo = validate_git_repo_path(&config.repo)?;
@@ -717,10 +717,8 @@ pub(crate) fn scan_git_with_runtime(
         },
     );
     let workers = config.workers.max(1);
-    let mut runtime = config.budgets.to_execution_config_with_workers(workers)?;
-    // Keep git execution tuning centralized in the shared ScanExecutionConfig
-    // so both CLI and distributed worker paths hit identical driver behavior.
-    runtime.git = GitExecutionConfig {
+    let runtime = config.budgets.to_execution_config_with_workers(workers)?;
+    let git_cfg = GitExecutionConfig {
         repo_id: config.repo_id,
         scan_mode: config.scan_mode,
         merge_diff_mode: config.merge_mode,
@@ -731,32 +729,40 @@ pub(crate) fn scan_git_with_runtime(
         tree_delta_cache_mb: config.tree_delta_cache_mb,
         engine_chunk_mb: config.engine_chunk_mb,
     };
-    let engine = RuntimeEngineConfig {
+    let engine_config = RuntimeEngineConfig {
         anchor_mode: config.anchor_mode,
         decode_depth: config.decode_depth,
         rules_file: config.rules_file.clone(),
         transform_filter: config.transform_filter.clone(),
     };
-    execute_assignment_with_config(&assignment, runtime, &engine, out, commit, cancel)
+    let engine = runtime_engine(&engine_config)?;
+    let (report, checkpoint_hint, debug_output) =
+        execute_git_assignment(&assignment, engine, &runtime, &git_cfg, out, cancel)
+            .map_err(ScanRuntimeError::Driver)?;
+    Ok(AssignmentOutcome {
+        report,
+        checkpoint_hint,
+        debug_output,
+    })
 }
 
-/// Shared assignment execution core used by all entry points.
+/// Shared assignment execution core for non-git entry points.
 ///
 /// Resolves the factory for the assignment's connector kind, obtains or
 /// builds the engine (cached for default configs), runs the driver, and
 /// collects the outcome including any checkpoint hint and debug output.
 ///
-/// This is the single convergence point for CLI, direct, and distributed
-/// scan paths.
+/// Git assignments should use [`execute_git_assignment`] (from
+/// `gossip-connectors`) instead, which provides a `&dyn GitEventOutput`
+/// sink to preserve git-specific events.
 pub(crate) fn execute_assignment_with_config(
     assignment: &Assignment,
     config: ScanExecutionConfig,
     engine_config: &RuntimeEngineConfig,
-    out: &dyn GitEventOutput,
+    out: &dyn EventOutput,
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    // Keep runtime entry points and distributed workers on one driver seam.
     let mut driver = driver_for_assignment(assignment)?;
     let report = driver
         .run(runtime_engine(engine_config)?, &config, out, commit, cancel)
@@ -772,16 +778,17 @@ pub(crate) fn execute_assignment_with_config(
 /// Select the appropriate factory for `assignment.connector_kind` and
 /// produce a boxed driver.
 ///
-/// `InMemory` assignments are not supported by the runtime entry points
-/// (they exist only for test harnesses wired through `InMemoryScanSourceFactory`
-/// directly).
+/// Git and InMemory assignments are not supported through this path:
+/// - **Git** uses [`execute_git_assignment`] directly (requires
+///   `&dyn GitEventOutput`, not the source-neutral `&dyn EventOutput`).
+/// - **InMemory** exists only for test harnesses wired through
+///   `InMemoryScanSourceFactory` directly.
 fn driver_for_assignment(
     assignment: &Assignment,
 ) -> Result<Box<dyn gossip_scan_driver::ScanDriver>, ScanRuntimeError> {
     let factory: &dyn ScanSourceFactory = match assignment.connector_kind {
         ConnectorKind::Filesystem => &FilesystemScanSourceFactory,
-        ConnectorKind::Git => &GitScanSourceFactory,
-        ConnectorKind::InMemory => {
+        ConnectorKind::Git | ConnectorKind::InMemory => {
             return Err(ScanRuntimeError::UnsupportedConnectorKind(
                 assignment.connector_kind,
             ));
@@ -824,7 +831,7 @@ pub(crate) fn build_assignment(
 /// uses hardcoded constants, and `Engine::new_with_anchor_policy` asserts
 /// validity at construction. A failure here indicates a programming error
 /// in the default constants.
-fn runtime_engine(
+pub(crate) fn runtime_engine(
     config: &RuntimeEngineConfig,
 ) -> Result<Arc<scanner_engine::Engine>, ScanRuntimeError> {
     if config == &RuntimeEngineConfig::default() {
