@@ -10,7 +10,11 @@
 > (see [gossip-persistence-inmemory.md](../gossip-persistence-inmemory.md)).
 > PostgreSQL done-ledger backend, schema, migrations, and conversion helpers live in
 > `gossip-done-ledger-postgres`
-> (`crates/gossip-done-ledger-postgres/src/`).
+> (`crates/gossip-done-ledger-postgres/src/`). Findings PostgreSQL schema,
+> migration, and type-mapping scaffolding lives in `gossip-findings-postgres`
+> (`crates/gossip-findings-postgres/src/`); that crate currently stops at the
+> schema, migration, and type-mapping boundary and does not implement
+> `FindingsSink`.
 
 Boundary 5 defines the persistence contracts for three subsystems:
 
@@ -125,6 +129,7 @@ Non-negotiables (project-wide):
 | Crate | Scope | Notes |
 |------|-------|-------|
 | `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits, applies forward-only migrations with checksum verification and advisory locking, and documents that transaction-scoped migrations cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
+| `gossip-findings-postgres` | Findings PostgreSQL schema, migration, and type-mapping scaffold | Provides findings-specific schema/migration error types, `u64` ↔ `BIGINT` helpers, and the module boundaries for canonical schema constants and embedded migrations. The crate does not implement `FindingsSink`; it defines the storage-boundary support that backend code will use. |
 
 ---
 

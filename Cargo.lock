@@ -1357,6 +1357,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-findings-postgres"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "gossip-contracts",
+ "postgres",
+ "proptest",
+ "testcontainers",
+]
+
+[[package]]
 name = "gossip-frontier"
 version = "0.1.0"
 dependencies = [

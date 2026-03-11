@@ -1,0 +1,26 @@
+[package]
+name = "gossip-findings-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "PostgreSQL findings schema and type-mapping for gossip-rs"
+
+[lib]
+
+[features]
+## Exposes plaintext NoTls convenience helpers once migration helpers land.
+## Enable in integration tests and local dev only — production callers should
+## construct their own `Client` with TLS.
+test-utils = []
+
+[dependencies]
+gossip-contracts.workspace = true
+postgres = "0.19"
+blake3 = "1.8"
+
+[dev-dependencies]
+testcontainers.workspace = true
+proptest.workspace = true
+gossip-contracts = { workspace = true, features = ["test-support"] }
