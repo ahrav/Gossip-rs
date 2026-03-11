@@ -22,7 +22,7 @@
 //! # With Docker:
 //! cargo test -p gossip-done-ledger-postgres -- --ignored
 //!
-//! # With a pre-existing database:
+//! # With an external PostgreSQL (needs CREATE DATABASE privilege):
 //! GOSSIP_POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
 //!   cargo test -p gossip-done-ledger-postgres -- --ignored
 //! ```
@@ -155,8 +155,9 @@ fn persisted_checksum_tamper_is_detected_on_reapply() {
     let updated = client
         .execute(
             &format!(
-                "UPDATE {} SET checksum = decode(repeat('00', 32), 'hex') WHERE version = $1",
-                crate::schema::SCHEMA_MIGRATIONS_TABLE
+                "UPDATE {} SET checksum = decode(repeat('00', {}), 'hex') WHERE version = $1",
+                crate::schema::SCHEMA_MIGRATIONS_TABLE,
+                blake3::OUT_LEN, // BLAKE3 output width; matches schema CHECK constraint.
             ),
             &[&"0001_done_ledger_entries"],
         )

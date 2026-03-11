@@ -76,7 +76,7 @@ graph TB
         FCR["FindingsCommitReceipt<br/>finding/occurrence/<br/>observation counts"]
         DLCR["DoneLedgerCommitReceipt<br/>record_count,<br/>scanned_count,<br/>findings_count"]
         CCR["CheckpointCommitReceipt<br/>PageCommitScope +<br/>checkpointed_at"]
-        ICR["ItemCommitReceipt<br/>= Findings + DoneLedger"]
+        ICR["ItemCommitReceipt<br/>PageCommitScope +<br/>Findings + DoneLedger"]
         PCR["PageCommitReceipt<br/>= Item + Checkpoint"]
 
         FCR --> ICR
@@ -157,7 +157,7 @@ graph TB
     end
 
     subgraph layer3 ["Layer 3: Policy-Scoped Observation"]
-        OBS["ObservationRecord<br/>tenant_id: TenantId<br/>policy_hash: PolicyHash<br/>observation_id: ObservationId<br/>occurrence_id: OccurrenceId<br/>run_id: RunId<br/>shard_id: ShardId<br/>fence_epoch: FenceEpoch<br/>seen_at: LogicalTime<br/>location: Option&lt;Location&gt;"]
+        OBS["ObservationRecord<br/>tenant_id: TenantId<br/>policy_hash: PolicyHash<br/>observation_id: ObservationId<br/>occurrence_id: OccurrenceId<br/>ovid_hash: OvidHash<br/>run_id: RunId<br/>shard_id: ShardId<br/>fence_epoch: FenceEpoch<br/>seen_at: LogicalTime<br/>location: Option&lt;Location&gt;"]
         OBSID["ObservationId = BLAKE3(<br/>  tenant_id,<br/>  policy_hash,<br/>  occurrence_id<br/>)"]
     end
 
@@ -225,10 +225,10 @@ status field is a **monotonic join-semilattice**: once a status reaches a higher
 rank, no concurrent or replayed write can downgrade it. This property is the
 foundation of crash-safe deduplication under at-least-once delivery.
 
-The lattice merge rule is `merge(a, b) = max(a.rank(), b.rank())`. The three
-required semilattice properties (idempotence, commutativity, associativity) hold
-by construction because `rank()` returns a `u8` discriminant and `max` over
-integers satisfies all three.
+The lattice merge rule is `merge(a, b) = max(a.rank(), b.rank())`. The
+required semilattice properties (idempotence, commutativity, associativity)
+hold by construction because `rank()` returns a `u8` discriminant and `max`
+over integers satisfies all three. Monotonicity follows as a consequence.
 
 ```mermaid
 %% Diagram: done-ledger-status-lattice

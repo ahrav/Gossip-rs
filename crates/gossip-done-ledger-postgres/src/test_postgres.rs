@@ -91,8 +91,8 @@ fn shared_endpoint() -> &'static PgEndpoint {
     })
 }
 
-/// Read `GOSSIP_POSTGRES_TEST_URL` and return the first non-empty value, or
-/// `None`.
+/// Read `GOSSIP_POSTGRES_TEST_URL` and return `Some(value)` if set and
+/// non-empty, or `None` otherwise.
 fn external_url() -> Option<String> {
     std::env::var("GOSSIP_POSTGRES_TEST_URL")
         .ok()

@@ -15,11 +15,14 @@
 //! ## Monotonic status lattice
 //!
 //! [`DoneLedgerStatus`] forms a join-semilattice ordered by discriminant rank.
-//! The merge rule is `max(self.rank(), other.rank())`, which guarantees:
+//! The merge rule is `max(self.rank(), other.rank())`, which makes
+//! [`DoneLedgerStatus`] a join-semilattice satisfying:
 //! - **Idempotence**: merging a value with itself is a no-op.
 //! - **Commutativity**: `a.merge(b) == b.merge(a)`.
-//! - **Monotonicity**: once an object reaches a scanned state, no failure can
-//!   downgrade it.
+//! - **Associativity**: merge grouping does not affect the result.
+//!
+//! Monotonicity follows as a consequence: once an object reaches a scanned
+//! state, no failure can downgrade it.
 //!
 //! Backend implementations must preserve this lattice during upsert. See the
 //! [`DoneLedger`] trait for the full contract.
@@ -114,8 +117,8 @@ impl CanonicalBytes for DoneLedgerKey {
 /// Monotonic done-ledger result lattice.
 ///
 /// Discriminant values define the merge ordering: `merge(a, b) = max(a.rank(), b.rank())`.
-/// This makes the lattice a join-semilattice with the three required properties
-/// (idempotence, commutativity, monotonicity).
+/// This makes the lattice a join-semilattice satisfying idempotence,
+/// commutativity, and associativity. Monotonicity follows as a consequence.
 ///
 /// ## Rank design
 ///
