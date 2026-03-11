@@ -8,13 +8,23 @@
 //! [`ReadyCommitHandle`] is only constructed **after** `tx.commit()`
 //! succeeds, so the receipt returned to the caller is durable-before-return.
 //!
+//! ## Bulk upsert
+//!
+//! `batch_upsert` sends a single SQL statement per call by using
+//! `INSERT ... SELECT * FROM unnest($1::bytea[], ...) ON CONFLICT`.
+//! Column-parallel arrays (one per schema column) are passed as 12 array
+//! parameters; `unnest()` expands them into rows on the server side.
+//! This avoids N round-trips for N records and sidesteps the PostgreSQL
+//! 65,535 bind-parameter limit that a dynamic multi-row `VALUES` clause
+//! would hit at ~5,400 rows (12 params x 5,461).
+//!
 //! ## Duplicate-key handling
 //!
 //! When a single `batch_upsert` call contains multiple records with the same
 //! [`DoneLedgerKey`], the backend folds them in submission order using the
 //! same lattice-merge rules as the SQL `ON CONFLICT` clause (see
-//! [`UPSERT_SQL`]). This ensures that the number of SQL statements equals
-//! the number of *distinct* keys, not the number of input records.
+//! [`UPSERT_SQL`]). This ensures that the array parameters contain at most
+//! one entry per distinct key.
 //!
 //! ## Positional alignment
 //!
@@ -41,7 +51,7 @@ use gossip_contracts::{
 };
 #[cfg(feature = "test-utils")]
 use postgres::NoTls;
-use postgres::{Client, Row, Transaction};
+use postgres::{Client, Row};
 
 use crate::{
     error::{DoneLedgerPgConversionError, DoneLedgerPgError},
@@ -244,16 +254,28 @@ impl DoneLedger for DoneLedgerPg {
         }
 
         let merged = dedupe_and_validate(records)?;
+        let columns = collect_columns(&merged)?;
         let mut client = self.lock_client()?;
         let mut tx = client.transaction()?;
         let stmt = tx.prepare(UPSERT_SQL)?;
 
-        for (idx, record) in merged.iter().enumerate() {
-            upsert_record(&mut tx, &stmt, record).map_err(|e| DoneLedgerPgError::UpsertFailed {
-                index: idx,
-                source: Box::new(e),
-            })?;
-        }
+        tx.execute(
+            &stmt,
+            &[
+                &columns.tenant_ids as &(dyn postgres::types::ToSql + Sync),
+                &columns.policy_hashes,
+                &columns.ovid_hashes,
+                &columns.statuses,
+                &columns.bytes_scanned,
+                &columns.findings_counts,
+                &columns.run_ids,
+                &columns.shard_ids,
+                &columns.fence_epochs,
+                &columns.started_ats,
+                &columns.finished_ats,
+                &columns.error_codes,
+            ],
+        )?;
 
         tx.commit()?;
         Ok(ReadyCommitHandle::ok(build_receipt(&merged)))
@@ -336,64 +358,116 @@ fn dedupe_and_validate(
     Ok(deduped)
 }
 
-/// Encode a single `DoneLedgerRecord` into SQL parameters and execute the
-/// `UPSERT_SQL` statement within the given transaction.
+/// Columnar representation of a deduplicated record batch, ready for
+/// binding to the `unnest()`-based [`UPSERT_SQL`] statement.
+///
+/// Each field is a `Vec` whose length equals the number of distinct keys
+/// in the batch. The vectors are positionally aligned: element `i` across
+/// all vectors describes the same logical row.
+struct UpsertColumns {
+    tenant_ids: Vec<Vec<u8>>,
+    policy_hashes: Vec<Vec<u8>>,
+    ovid_hashes: Vec<Vec<u8>>,
+    statuses: Vec<i16>,
+    bytes_scanned: Vec<i64>,
+    findings_counts: Vec<i32>,
+    run_ids: Vec<i64>,
+    shard_ids: Vec<i64>,
+    fence_epochs: Vec<i64>,
+    started_ats: Vec<i64>,
+    finished_ats: Vec<i64>,
+    error_codes: Vec<Option<String>>,
+}
+
+/// Transpose a slice of validated `DoneLedgerRecord`s into column-parallel
+/// arrays suitable for PostgreSQL array parameters.
 ///
 /// Identity fields (`run_id`, `shard_id`) are encoded in bit-pattern mode;
 /// ordered fields (`bytes_scanned`, `fence_epoch`, `started_at`,
 /// `finished_at`) use checked non-negative mode. See [`crate::types`] for
 /// the distinction.
-fn upsert_record(
-    tx: &mut Transaction<'_>,
-    stmt: &postgres::Statement,
-    record: &DoneLedgerRecord,
-) -> Result<(), DoneLedgerPgError> {
-    let key = record.key();
-    let provenance = record.provenance();
-    let tenant_id = key.tenant_id();
-    let policy_hash = key.policy_hash();
-    let ovid_hash = key.ovid_hash();
+fn collect_columns(records: &[DoneLedgerRecord]) -> Result<UpsertColumns, DoneLedgerPgError> {
+    let n = records.len();
+    let mut cols = UpsertColumns {
+        tenant_ids: Vec::with_capacity(n),
+        policy_hashes: Vec::with_capacity(n),
+        ovid_hashes: Vec::with_capacity(n),
+        statuses: Vec::with_capacity(n),
+        bytes_scanned: Vec::with_capacity(n),
+        findings_counts: Vec::with_capacity(n),
+        run_ids: Vec::with_capacity(n),
+        shard_ids: Vec::with_capacity(n),
+        fence_epochs: Vec::with_capacity(n),
+        started_ats: Vec::with_capacity(n),
+        finished_ats: Vec::with_capacity(n),
+        error_codes: Vec::with_capacity(n),
+    };
 
-    let status = i16::from(record.status().rank());
-    let bytes_scanned = u64_to_pg_bigint_checked(record.bytes_scanned(), "bytes_scanned")
-        .map_err(DoneLedgerPgConversionError::from)?;
-    let findings_count = i32::try_from(record.findings_count()).map_err(|_| {
-        DoneLedgerPgConversionError::FindingsCountOutOfRange {
-            value: i64::from(record.findings_count()),
-        }
-    })?;
-    let run_id = u64_to_pg_bigint_bits(provenance.run_id().as_raw());
-    let shard_id = u64_to_pg_bigint_bits(provenance.shard_id().as_raw());
-    let fence_epoch = u64_to_pg_bigint_checked(provenance.fence_epoch().as_raw(), "fence_epoch")
-        .map_err(DoneLedgerPgConversionError::from)?;
-    let started_at = u64_to_pg_bigint_checked(provenance.started_at().as_raw(), "started_at")
-        .map_err(DoneLedgerPgConversionError::from)?;
-    let finished_at = u64_to_pg_bigint_checked(provenance.finished_at().as_raw(), "finished_at")
-        .map_err(DoneLedgerPgConversionError::from)?;
-    let error_code = record.error_code().map(DoneLedgerErrorCode::as_str);
-    let tenant_bytes: &[u8] = tenant_id.as_bytes();
-    let policy_bytes: &[u8] = policy_hash.as_bytes();
-    let ovid_bytes: &[u8] = ovid_hash.as_bytes();
+    for (idx, record) in records.iter().enumerate() {
+        let key = record.key();
+        let prov = record.provenance();
 
-    tx.execute(
-        stmt,
-        &[
-            &tenant_bytes,
-            &policy_bytes,
-            &ovid_bytes,
-            &status,
-            &bytes_scanned,
-            &findings_count,
-            &run_id,
-            &shard_id,
-            &fence_epoch,
-            &started_at,
-            &finished_at,
-            &error_code,
-        ],
-    )?;
+        cols.tenant_ids.push(key.tenant_id().as_bytes().to_vec());
+        cols.policy_hashes
+            .push(key.policy_hash().as_bytes().to_vec());
+        cols.ovid_hashes.push(key.ovid_hash().as_bytes().to_vec());
 
-    Ok(())
+        cols.statuses.push(i16::from(record.status().rank()));
+
+        cols.bytes_scanned.push(
+            u64_to_pg_bigint_checked(record.bytes_scanned(), "bytes_scanned").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
+        );
+
+        cols.findings_counts
+            .push(i32::try_from(record.findings_count()).map_err(|_| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: DoneLedgerPgConversionError::FindingsCountOutOfRange {
+                        value: i64::from(record.findings_count()),
+                    },
+                }
+            })?);
+
+        cols.run_ids
+            .push(u64_to_pg_bigint_bits(prov.run_id().as_raw()));
+        cols.shard_ids
+            .push(u64_to_pg_bigint_bits(prov.shard_id().as_raw()));
+
+        cols.fence_epochs.push(
+            u64_to_pg_bigint_checked(prov.fence_epoch().as_raw(), "fence_epoch").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
+        );
+        cols.started_ats.push(
+            u64_to_pg_bigint_checked(prov.started_at().as_raw(), "started_at").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
+        );
+        cols.finished_ats.push(
+            u64_to_pg_bigint_checked(prov.finished_at().as_raw(), "finished_at").map_err(|e| {
+                DoneLedgerPgError::Conversion {
+                    record_index: Some(idx),
+                    source: e.into(),
+                }
+            })?,
+        );
+
+        cols.error_codes
+            .push(record.error_code().map(|c| c.as_str().to_owned()));
+    }
+
+    Ok(cols)
 }
 
 /// Decode a PostgreSQL result row into a validated `DoneLedgerRecord`.
@@ -552,6 +626,50 @@ mod tests {
             }),
         )
         .expect("test record should satisfy construction invariants")
+    }
+
+    #[test]
+    fn collect_columns_conversion_error_identifies_failing_record_index() {
+        // A record with bytes_scanned > i64::MAX passes domain validation
+        // but fails SQL type conversion in collect_columns. The error
+        // should identify which record in the batch caused the failure.
+        let good = done_record(
+            1,
+            1,
+            1,
+            DoneLedgerStatus::ScannedClean,
+            100,
+            0,
+            1,
+            1,
+            1,
+            10,
+            20,
+            None,
+        );
+        let bad = done_record(
+            1,
+            1,
+            2,
+            DoneLedgerStatus::ScannedClean,
+            u64::MAX, // exceeds i64::MAX → conversion failure
+            0,
+            1,
+            1,
+            1,
+            10,
+            20,
+            None,
+        );
+
+        let err = super::collect_columns(&[good, bad])
+            .err()
+            .expect("bytes_scanned = u64::MAX should fail SQL type conversion");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("index 1"),
+            "conversion error should identify the failing record at index 1, got: {msg}"
+        );
     }
 
     #[test]
