@@ -575,10 +575,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     |presented, current| CheckpointError::StaleFence { presented, current },
                 )?;
 
-                Err(CheckpointError::BackendError(InfraError::corruption(
+                Err(CheckpointError::BackendError(InfraError::transient(
                     "checkpoint",
                     "CAS retry budget exhausted after ruling out replay, stale fence, \
-                     and terminal status — possible external etcd modification",
+                     and terminal status",
                 )))
             },
         )
@@ -934,10 +934,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                 }
 
-                Err(SplitReplaceError::BackendError(InfraError::corruption(
+                Err(SplitReplaceError::BackendError(InfraError::transient(
                     "split_replace",
                     "CAS retry budget exhausted after ruling out replay, stale fence, \
-                     terminal status, and derived-ID collision — possible external etcd modification",
+                     terminal status, and derived-ID collision",
                 )))
             },
         )
@@ -1182,13 +1182,12 @@ impl CoordinationBackend for EtcdCoordinator {
                     persisted.record.shard,
                     op_id,
                     DerivedShardKind::Residual,
-                    u32::try_from(persisted.record.spawned.len())
-                        .map_err(|_| {
-                            SplitResidualError::BackendError(InfraError::corruption(
-                                "split_residual.exhaust.collision_probe",
-                                "spawned index overflows u32",
-                            ))
-                        })?,
+                    u32::try_from(persisted.record.spawned.len()).map_err(|_| {
+                        SplitResidualError::BackendError(InfraError::corruption(
+                            "split_residual.exhaust.collision_probe",
+                            "spawned index overflows u32",
+                        ))
+                    })?,
                 );
                 let residual_key = ShardKey::new(persisted.record.run, residual_id);
                 match this.load_shard_record(tenant, residual_key) {
@@ -1208,10 +1207,10 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                 }
 
-                Err(SplitResidualError::BackendError(InfraError::corruption(
+                Err(SplitResidualError::BackendError(InfraError::transient(
                     "split_residual",
                     "CAS retry budget exhausted after ruling out replay, stale fence, \
-                     terminal status, and derived-ID collision — possible external etcd modification",
+                     terminal status, and derived-ID collision",
                 )))
             },
         )
@@ -1593,10 +1592,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         validate_loaded_shard_lease(now, tenant, lease, &persisted, |presented, current| {
             CheckpointError::StaleFence { presented, current }
         })?;
-        Err(CheckpointError::BackendError(InfraError::corruption(
+        Err(CheckpointError::BackendError(InfraError::transient(
             "checkpoint",
             "CAS retry budget exhausted after ruling out replay, stale fence, \
-             and terminal status — possible external etcd modification",
+             and terminal status",
         )))
     }
 
@@ -1889,10 +1888,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 }
             }
         }
-        Err(SplitReplaceError::BackendError(InfraError::corruption(
+        Err(SplitReplaceError::BackendError(InfraError::transient(
             "split_replace",
             "CAS retry budget exhausted after ruling out replay, stale fence, \
-             terminal status, and derived-ID collision — possible external etcd modification",
+             terminal status, and derived-ID collision",
         )))
     }
 
@@ -2127,10 +2126,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 )));
             }
         }
-        Err(SplitResidualError::BackendError(InfraError::corruption(
+        Err(SplitResidualError::BackendError(InfraError::transient(
             "split_residual",
             "CAS retry budget exhausted after ruling out replay, stale fence, \
-             terminal status, and derived-ID collision — possible external etcd modification",
+             terminal status, and derived-ID collision",
         )))
     }
 }

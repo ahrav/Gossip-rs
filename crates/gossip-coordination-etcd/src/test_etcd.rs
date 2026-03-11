@@ -200,3 +200,44 @@ pub(crate) fn test_coordinator_with_tuning(
     .expect("test endpoint config should be valid");
     EtcdCoordinator::connect(config).expect("test etcd should be reachable")
 }
+
+// ---------------------------------------------------------------------------
+// Shared-namespace helpers for multi-coordinator CAS contention tests
+// ---------------------------------------------------------------------------
+
+/// Generate a unique namespace prefix that can be shared across multiple
+/// coordinators in a single test. Unlike [`unique_namespace`] (which is
+/// called implicitly by [`test_coordinator`] and friends), this returns
+/// the raw namespace string so multiple coordinators can target the same
+/// etcd keyspace.
+pub(crate) fn contention_namespace() -> String {
+    unique_namespace()
+}
+
+/// Create an [`EtcdCoordinator`] targeting a specific shared namespace.
+///
+/// Unlike [`test_coordinator`] which creates a unique namespace per call,
+/// this allows multiple coordinators to share one keyspace for CAS
+/// contention testing. Each coordinator still owns its own Tokio runtime
+/// and connection, so they can be used from separate threads.
+pub(crate) fn test_coordinator_in_namespace(namespace: &str) -> EtcdCoordinator {
+    let ep = shared_endpoint();
+    let config = EtcdCoordinatorConfig::from_endpoints_csv(&ep.endpoint, namespace)
+        .expect("test endpoint config should be valid");
+    EtcdCoordinator::connect(config).expect("test etcd should be reachable")
+}
+
+/// Create an [`EtcdCoordinator`] in a shared namespace with explicit
+/// shard count limits for limit enforcement contention tests.
+pub(crate) fn test_coordinator_in_namespace_with_limits(
+    namespace: &str,
+    max_shards_per_tenant: usize,
+    max_total_shards: usize,
+) -> EtcdCoordinator {
+    let ep = shared_endpoint();
+    let config = EtcdCoordinatorConfig::from_endpoints_csv(&ep.endpoint, namespace)
+        .expect("test endpoint config should be valid")
+        .with_shard_limits(max_shards_per_tenant, max_total_shards)
+        .expect("test shard limits should be valid");
+    EtcdCoordinator::connect(config).expect("test etcd should be reachable")
+}
