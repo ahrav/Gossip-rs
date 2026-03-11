@@ -51,10 +51,10 @@ use gossip_coordination::{
     AcquireError, AcquireResultView, AcquireScratch, AsyncCoordinationBackend, ByteSlab,
     CapacityHint, CheckpointError, CompleteError, CoordinationBackend, CursorUpdate,
     DerivedShardKind, IdempotentOutcome, InfraError, Lease, LeaseHolder, LogicalTime, OpId, OpKind,
-    OpLogEntry, OpResult, ParkError, ParkReason, RenewError, RenewResult, ShardKey, ShardRecord,
-    ShardStatus, SplitChildIds, SplitReplaceError, SplitReplacePlan, SplitReplaceResult,
-    SplitResidualError, SplitResidualPlan, SplitResidualResult, TenantId, WorkerId,
-    check_op_idempotency, derive_split_shard_id, hash_checkpoint_payload,
+    OpLogEntry, OpResult, ParkError, ParkReason, RenewError, RenewResult, ShardCountSnapshot,
+    ShardKey, ShardRecord, ShardStatus, SplitChildIds, SplitReplaceError, SplitReplacePlan,
+    SplitReplaceResult, SplitResidualError, SplitResidualPlan, SplitResidualResult, TenantId,
+    WorkerId, check_op_idempotency, derive_split_shard_id, hash_checkpoint_payload,
     hash_split_replace_payload, hash_split_residual_payload, shard_limit_violation,
     split_replace_apply_parent, split_replace_validate_preconditions, split_residual_apply_parent,
     split_residual_build_record, split_residual_check_replay,
@@ -707,12 +707,26 @@ impl CoordinationBackend for EtcdCoordinator {
                     &plan,
                     &persisted.slab,
                 )?;
-                let counts = this.current_shard_counts(tenant).map_err(|err| {
-                    SplitReplaceError::BackendError(super::map_etcd_err(
-                        "split_replace.count_shards",
-                        err,
-                    ))
-                })?;
+                let tenant_counter = this
+                    .prepare_tenant_shard_count_mutation(tenant, sorted.len())
+                    .map_err(|err| {
+                        SplitReplaceError::BackendError(super::map_etcd_err(
+                            "split_replace.load_tenant_counter",
+                            err,
+                        ))
+                    })?;
+                let total_count = this
+                    .count_persisted_shards_under_prefix(this.keyspace.tenants_prefix())
+                    .map_err(|err| {
+                        SplitReplaceError::BackendError(super::map_etcd_err(
+                            "split_replace.count_total_shards",
+                            err,
+                        ))
+                    })?;
+                let counts = ShardCountSnapshot {
+                    tenant: tenant_counter.current_count,
+                    total: total_count,
+                };
                 // The persisted count includes the parent shard (still in etcd).
                 // After split the parent becomes terminal (Split status) and
                 // stays in storage while N children are created, so the total
@@ -823,6 +837,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     owner_blob,
                 );
                 compares.append(&mut child_absent_compares);
+                compares.push(tenant_counter.compare);
 
                 // Atomically: update parent to Split status, delete its owner
                 // and active-index keys, then create all child records and their
@@ -838,7 +853,11 @@ impl CoordinationBackend for EtcdCoordinator {
                             .into_bytes(),
                     )
                     .ops(child_puts.drain(..))
-                    .ops(child_index_ops.drain(..));
+                    .ops(child_index_ops.drain(..))
+                    .put(
+                        tenant_counter.key.into_bytes(),
+                        super::encode_tenant_shard_count(tenant_counter.next_count),
+                    );
 
                 txn.execute(
                     this,
@@ -988,12 +1007,26 @@ impl CoordinationBackend for EtcdCoordinator {
                     &plan,
                     &persisted.slab,
                 )?;
-                let counts = this.current_shard_counts(tenant).map_err(|err| {
-                    SplitResidualError::BackendError(super::map_etcd_err(
-                        "split_residual.count_shards",
-                        err,
-                    ))
-                })?;
+                let tenant_counter = this
+                    .prepare_tenant_shard_count_mutation(tenant, 1)
+                    .map_err(|err| {
+                        SplitResidualError::BackendError(super::map_etcd_err(
+                            "split_residual.load_tenant_counter",
+                            err,
+                        ))
+                    })?;
+                let total_count = this
+                    .count_persisted_shards_under_prefix(this.keyspace.tenants_prefix())
+                    .map_err(|err| {
+                        SplitResidualError::BackendError(super::map_etcd_err(
+                            "split_residual.count_total_shards",
+                            err,
+                        ))
+                    })?;
+                let counts = ShardCountSnapshot {
+                    tenant: tenant_counter.current_count,
+                    total: total_count,
+                };
                 // The parent stays Active (not terminal), so the persisted count
                 // already includes it. Only the new residual shard is net growth.
                 if let Some(limit) = shard_limit_violation(
@@ -1078,6 +1111,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     owner_blob,
                 );
                 compares.push(super::compare_absent(residual_record_key.clone()));
+                compares.push(tenant_counter.compare);
                 let residual_blob =
                     encode_shard_record(&residual_record, &residual_slab).map_err(|err| {
                         SplitResidualError::BackendError(InfraError::corruption(
@@ -1096,6 +1130,10 @@ impl CoordinationBackend for EtcdCoordinator {
                             .shard_active_index_key(tenant, persisted.record.run, residual_id)
                             .into_bytes(),
                         Vec::new(),
+                    )
+                    .put(
+                        tenant_counter.key.into_bytes(),
+                        super::encode_tenant_shard_count(tenant_counter.next_count),
                     );
 
                 txn.execute(
@@ -1643,12 +1681,28 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             }
             let sorted =
                 split_replace_validate_preconditions(&persisted.record, &plan, &persisted.slab)?;
-            let counts = self.current_shard_counts(tenant).await.map_err(|e| {
-                SplitReplaceError::BackendError(super::map_etcd_err(
-                    "split_replace.count_shards",
-                    e,
-                ))
-            })?;
+            let tenant_counter = self
+                .prepare_tenant_shard_count_mutation(tenant, sorted.len())
+                .await
+                .map_err(|err| {
+                    SplitReplaceError::BackendError(super::map_etcd_err(
+                        "split_replace.load_tenant_counter",
+                        err,
+                    ))
+                })?;
+            let total_count = self
+                .count_persisted_shards_under_prefix(self.keyspace.tenants_prefix())
+                .await
+                .map_err(|err| {
+                    SplitReplaceError::BackendError(super::map_etcd_err(
+                        "split_replace.count_total_shards",
+                        err,
+                    ))
+                })?;
+            let counts = ShardCountSnapshot {
+                tenant: tenant_counter.current_count,
+                total: total_count,
+            };
             if let Some(limit) = shard_limit_violation(
                 counts,
                 sorted.len(),
@@ -1744,6 +1798,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let mut compares =
                 build_shard_owner_cas(srk.clone(), ok.clone(), &persisted, owner_blob);
             compares.append(&mut child_absent_compares);
+            compares.push(tenant_counter.compare);
             self.inject_split_replace_fault_if_armed(tenant, key).await;
             let mut txn = TxnBuilder::from_compares(compares);
             txn.put(srk.into_bytes(), parent_blob)
@@ -1754,7 +1809,11 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                         .into_bytes(),
                 )
                 .ops(child_puts.drain(..))
-                .ops(child_index_ops.drain(..));
+                .ops(child_index_ops.drain(..))
+                .put(
+                    tenant_counter.key.into_bytes(),
+                    super::encode_tenant_shard_count(tenant_counter.next_count),
+                );
             let outcome = txn
                 .execute_async(
                     self,
@@ -1882,12 +1941,28 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 &plan,
                 &persisted.slab,
             )?;
-            let counts = self.current_shard_counts(tenant).await.map_err(|e| {
-                SplitResidualError::BackendError(super::map_etcd_err(
-                    "split_residual.count_shards",
-                    e,
-                ))
-            })?;
+            let tenant_counter = self
+                .prepare_tenant_shard_count_mutation(tenant, 1)
+                .await
+                .map_err(|err| {
+                    SplitResidualError::BackendError(super::map_etcd_err(
+                        "split_residual.load_tenant_counter",
+                        err,
+                    ))
+                })?;
+            let total_count = self
+                .count_persisted_shards_under_prefix(self.keyspace.tenants_prefix())
+                .await
+                .map_err(|err| {
+                    SplitResidualError::BackendError(super::map_etcd_err(
+                        "split_residual.count_total_shards",
+                        err,
+                    ))
+                })?;
+            let counts = ShardCountSnapshot {
+                tenant: tenant_counter.current_count,
+                total: total_count,
+            };
             // The parent stays Active (not terminal), so the persisted count
             // already includes it. Only the new residual shard is net growth.
             if let Some(limit) = shard_limit_violation(
@@ -1962,6 +2037,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 .shard_owner_key(tenant, key.run(), key.shard());
             let mut compares = build_shard_owner_cas(srk.clone(), ok, &persisted, owner_blob);
             compares.push(super::compare_absent(rrk.clone()));
+            compares.push(tenant_counter.compare);
             let residual_blob =
                 encode_shard_record(&residual_record, &residual_slab).map_err(|e| {
                     SplitResidualError::BackendError(InfraError::corruption(
@@ -1978,6 +2054,10 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                         .shard_active_index_key(tenant, persisted.record.run, residual_id)
                         .into_bytes(),
                     Vec::new(),
+                )
+                .put(
+                    tenant_counter.key.into_bytes(),
+                    super::encode_tenant_shard_count(tenant_counter.next_count),
                 );
             let outcome = txn
                 .execute_async(

@@ -78,7 +78,7 @@ use crate::codec::{
     EtcdCodecError, OwnerLeaseValue, decode_owner_value, encode_owner_value, encode_shard_record,
 };
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
-use crate::keyspace::{EtcdKey, RunRecordKey, ShardOwnerKey, ShardRecordKey};
+use crate::keyspace::{EtcdKey, RunRecordKey, ShardOwnerKey, ShardRecordKey, TenantShardCountKey};
 
 mod coordinator;
 mod run_management;
@@ -116,9 +116,9 @@ const DEFAULT_BUILD_SLAB_FLOOR: usize = 1024;
 ///
 /// Derived from etcd's default `--max-txn-ops` limit of 128. Each shard
 /// generates 2 ops (put-record, put-active-index) and 1 compare
-/// (compare-absent). The run itself adds 3 fixed ops
-/// (compare-run-revision, put-run-record, put-run-active-index), giving
-/// `(128 - 3) / 3 = 41` as the maximum shard count per transaction.
+/// (compare-absent). Fixed overhead adds 5 ops: run compare+put+active-index
+/// plus tenant-counter compare+put, giving `(128 - 5) / 3 = 41` as the
+/// maximum shard count per transaction.
 const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 
 /// Maximum children per `split_replace` etcd transaction.
@@ -126,8 +126,10 @@ const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 /// Each child generates 2 ops (put-record, put-active-index) and 1 compare
 /// (compare-absent). The parent side adds 4 compares (shard-revision,
 /// owner-version, owner-value, owner-lease) and 3 ops (put-parent,
-/// delete-owner, delete-active-index), giving `(128 - 7) / 3 = 40`.
-pub(crate) const MAX_CHILDREN_PER_SPLIT_TXN: usize = 40;
+/// delete-owner, delete-active-index). Per-tenant counter enforcement adds
+/// 1 compare + 1 put, giving fixed overhead 9 and `9 + 3N <= 128`, so
+/// `(128 - 9) / 3 = 39`.
+pub(crate) const MAX_CHILDREN_PER_SPLIT_TXN: usize = 39;
 
 /// Outcome of a single CAS attempt within a retry loop.
 enum CasOutcome<T> {
@@ -243,6 +245,30 @@ struct PersistedRun {
     record: RunRecord,
     /// etcd key modification revision used as a CAS precondition.
     mod_revision: i64,
+}
+
+/// Decoded per-tenant materialized shard count and its `mod_revision`.
+///
+/// The count value tracks the number of persisted shard records under one
+/// tenant (including terminal shards). `mod_revision` is used as a CAS guard
+/// so concurrent shard-creating operations serialize within a tenant.
+#[derive(Clone, Copy, Debug)]
+struct PersistedTenantShardCount {
+    count: u64,
+    mod_revision: i64,
+}
+
+/// Prepared per-tenant shard-count CAS update for one mutation attempt.
+///
+/// Call sites use this to:
+/// 1. evaluate per-tenant shard-limit checks against `current_count`, and
+/// 2. add the same compare+put pair to the mutation transaction.
+#[derive(Debug)]
+struct TenantShardCountMutation {
+    key: TenantShardCountKey,
+    current_count: usize,
+    next_count: u64,
+    compare: Compare,
 }
 
 /// Decoded owner-key state for a single shard, including the etcd lease
@@ -658,6 +684,14 @@ fn compare_run_revision(run_record_key: RunRecordKey, mod_revision: i64) -> Comp
     Compare::mod_revision(run_record_key, CompareOp::Equal, mod_revision)
 }
 
+/// CAS guard: tenant shard-count key has not changed since `mod_revision`.
+fn compare_tenant_shard_count_revision(
+    counter_key: TenantShardCountKey,
+    mod_revision: i64,
+) -> Compare {
+    Compare::mod_revision(counter_key, CompareOp::Equal, mod_revision)
+}
+
 /// CAS guard: the key must not exist (etcd version == 0).
 ///
 /// Used to ensure a shard or run record is being created for the first
@@ -699,6 +733,48 @@ fn decode_owner_binding(
     bytes: &[u8],
 ) -> Result<OwnerLeaseValue, EtcdCoordinatorError> {
     decode_owner_value(bytes).map_err(|source| EtcdCoordinatorError::Codec { operation, source })
+}
+
+/// Encode a tenant shard counter as 8-byte little-endian `u64`.
+fn encode_tenant_shard_count(count: u64) -> [u8; 8] {
+    count.to_le_bytes()
+}
+
+/// Decode a tenant shard counter from 8-byte little-endian `u64`.
+fn decode_tenant_shard_count(
+    operation: EtcdOperation,
+    bytes: &[u8],
+) -> Result<u64, EtcdCoordinatorError> {
+    let Ok(raw) = <[u8; 8]>::try_from(bytes) else {
+        return Err(EtcdCoordinatorError::Codec {
+            operation,
+            source: EtcdCodecError::InvariantViolation {
+                kind: "TenantShardCount",
+                detail: "tenant shard counter value must be exactly 8 bytes",
+            },
+        });
+    };
+    Ok(u64::from_le_bytes(raw))
+}
+
+/// Decode a tenant shard counter KV with its revision metadata.
+fn decode_tenant_shard_count_kv(
+    kv: &etcd_client::KeyValue,
+) -> Result<PersistedTenantShardCount, EtcdCoordinatorError> {
+    Ok(PersistedTenantShardCount {
+        count: decode_tenant_shard_count(EtcdOperation::Get, kv.value())?,
+        mod_revision: kv.mod_revision(),
+    })
+}
+
+/// Convert a `usize` count to `u64`, saturating at `u64::MAX`.
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Convert a `u64` count to `usize`, saturating at `usize::MAX`.
+fn u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 /// Decode an owner-key KV pair, validating the non-zero lease invariant.

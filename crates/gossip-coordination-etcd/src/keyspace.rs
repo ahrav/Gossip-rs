@@ -16,6 +16,7 @@
 //! {prefix}/
 //!   tenants/
 //!     {tenant_hex}/                        # 64 lowercase hex chars (32-byte TenantId)
+//!       shard_count                        # per-tenant materialized shard counter (u64 LE)
 //!       runs/
 //!         {run_hex}/                       # 16 zero-padded hex chars (u64 RunId)
 //!           shards/
@@ -115,6 +116,10 @@ pub struct ShardOwnerKey(String);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RunActiveIndexKey(String);
 
+/// Exact etcd key path for a per-tenant shard counter.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TenantShardCountKey(String);
+
 /// Exact etcd key path for an active-shard index entry.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ShardActiveIndexKey(String);
@@ -198,6 +203,7 @@ impl_exact_key!(RunRecordKey);
 impl_exact_key!(ShardRecordKey);
 impl_exact_key!(ShardOwnerKey);
 impl_exact_key!(RunActiveIndexKey);
+impl_exact_key!(TenantShardCountKey);
 impl_exact_key!(ShardActiveIndexKey);
 
 impl ShardRecordKey {
@@ -400,6 +406,25 @@ impl EtcdKeyspace {
         let mut buf = String::new();
         self.tenant_prefix_into(&mut buf, tenant);
         buf
+    }
+
+    /// Exact key for a tenant's materialized shard counter:
+    /// `{prefix}/tenants/{tenant_hex}/shard_count`.
+    ///
+    /// The value stores an 8-byte little-endian `u64` count of persisted
+    /// shard records under the tenant. Appends into `buf` without clearing.
+    pub fn tenant_shard_count_key_into(&self, buf: &mut String, tenant: TenantId) {
+        self.tenant_prefix_into(buf, tenant);
+        buf.push_str("/shard_count");
+    }
+
+    /// Exact key for a tenant's materialized shard counter:
+    /// `{prefix}/tenants/{tenant_hex}/shard_count`.
+    #[must_use]
+    pub fn tenant_shard_count_key(&self, tenant: TenantId) -> TenantShardCountKey {
+        let mut buf = String::new();
+        self.tenant_shard_count_key_into(&mut buf, tenant);
+        TenantShardCountKey::from_string(buf)
     }
 
     // -----------------------------------------------------------------------

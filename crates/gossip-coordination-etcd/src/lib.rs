@@ -74,7 +74,7 @@ pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 pub use error::{EtcdCoordinatorError, EtcdOperation};
 pub use keyspace::{
     EtcdKeyspace, EtcdKeyspaceError, RunActiveIndexKey, RunRecordKey, ShardActiveIndexKey,
-    ShardOwnerKey, ShardRecordKey,
+    ShardOwnerKey, ShardRecordKey, TenantShardCountKey,
 };
 
 #[cfg(test)]

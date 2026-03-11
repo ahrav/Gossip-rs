@@ -37,8 +37,8 @@ use gossip_coordination::{
     IdempotentOutcome, InfraError, InitialShardInput, LogicalTime, OpId, OpKind, OpLogEntry,
     OpResult, RegisterShardsError, RingBuffer, RunConfig, RunId, RunManagement, RunOpKind,
     RunOpLogEntry, RunOpResult, RunProgress, RunRecord, RunStatus, RunTransitionError,
-    ShardClaiming, ShardFilter, ShardId, ShardKey, ShardStatus, ShardSummary, TenantId,
-    UnparkError, WorkerId, check_op_idempotency, default_claim_next_available,
+    ShardClaiming, ShardCountSnapshot, ShardFilter, ShardId, ShardKey, ShardStatus, ShardSummary,
+    TenantId, UnparkError, WorkerId, check_op_idempotency, default_claim_next_available,
     hash_register_shards_payload, hash_unpark_payload, shard_limit_violation, validate_manifest,
 };
 
@@ -101,7 +101,8 @@ impl RunManagement for EtcdCoordinator {
     /// The batch size is capped at `MAX_SHARDS_PER_ETCD_TXN` (41) due
     /// to etcd's default `--max-txn-ops` limit of 128. Each shard
     /// contributes 3 operations (compare-absent, put-record,
-    /// put-active-index), plus 3 fixed ops for the run record.
+    /// put-active-index). Fixed overhead is 5 operations:
+    /// run compare+put+active-index plus tenant-counter compare+put.
     ///
     /// Idempotent: replays return the shard IDs from the op-log.
     fn register_shards(
@@ -174,12 +175,26 @@ impl RunManagement for EtcdCoordinator {
 
                 let cursor_semantics = run_record.config.cursor_semantics();
                 let shard_ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
-                let counts = this.current_shard_counts(tenant).map_err(|err| {
-                    RegisterShardsError::BackendError(super::map_etcd_err(
-                        "register_shards.count_shards",
-                        err,
-                    ))
-                })?;
+                let tenant_counter = this
+                    .prepare_tenant_shard_count_mutation(tenant, shard_ids.len())
+                    .map_err(|err| {
+                        RegisterShardsError::BackendError(super::map_etcd_err(
+                            "register_shards.load_tenant_counter",
+                            err,
+                        ))
+                    })?;
+                let total_count = this
+                    .count_persisted_shards_under_prefix(this.keyspace.tenants_prefix())
+                    .map_err(|err| {
+                        RegisterShardsError::BackendError(super::map_etcd_err(
+                            "register_shards.count_total_shards",
+                            err,
+                        ))
+                    })?;
+                let counts = ShardCountSnapshot {
+                    tenant: tenant_counter.current_count,
+                    total: total_count,
+                };
                 if let Some(limit) = shard_limit_violation(
                     counts,
                     shard_ids.len(),
@@ -195,12 +210,13 @@ impl RunManagement for EtcdCoordinator {
                 }
 
                 let mut txn_ops = Vec::with_capacity(1 + (shards.len() * 2) + 1);
-                let mut compares = Vec::with_capacity(1 + shards.len());
+                let mut compares = Vec::with_capacity(2 + shards.len());
                 let run_key = this.keyspace.run_record_key(tenant, run);
                 compares.push(super::compare_run_revision(
                     run_key.clone(),
                     persisted_run.mod_revision,
                 ));
+                compares.push(tenant_counter.compare);
 
                 for shard in shards {
                     let shard_key = this.keyspace.shard_record_key(tenant, run, shard.shard());
@@ -238,7 +254,11 @@ impl RunManagement for EtcdCoordinator {
                 let mut txn = TxnBuilder::from_compares(compares);
                 txn.put(run_key.into_bytes(), run_blob)
                     .ops(txn_ops)
-                    .put(run_active_key.into_bytes(), Vec::<u8>::new());
+                    .put(run_active_key.into_bytes(), Vec::<u8>::new())
+                    .put(
+                        tenant_counter.key.into_bytes(),
+                        super::encode_tenant_shard_count(tenant_counter.next_count),
+                    );
                 txn.execute(this, IdempotentOutcome::Executed(shard_ids))
                     .map_err(|err| {
                         RegisterShardsError::BackendError(super::map_etcd_err(
@@ -829,12 +849,28 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             validate_manifest(shards).map_err(RegisterShardsError::ManifestInvalid)?;
             let cursor_semantics = run_record.config.cursor_semantics();
             let shard_ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
-            let counts = self.current_shard_counts(tenant).await.map_err(|e| {
-                RegisterShardsError::BackendError(super::map_etcd_err(
-                    "register_shards.count_shards",
-                    e,
-                ))
-            })?;
+            let tenant_counter = self
+                .prepare_tenant_shard_count_mutation(tenant, shard_ids.len())
+                .await
+                .map_err(|err| {
+                    RegisterShardsError::BackendError(super::map_etcd_err(
+                        "register_shards.load_tenant_counter",
+                        err,
+                    ))
+                })?;
+            let total_count = self
+                .count_persisted_shards_under_prefix(self.keyspace.tenants_prefix())
+                .await
+                .map_err(|err| {
+                    RegisterShardsError::BackendError(super::map_etcd_err(
+                        "register_shards.count_total_shards",
+                        err,
+                    ))
+                })?;
+            let counts = ShardCountSnapshot {
+                tenant: tenant_counter.current_count,
+                total: total_count,
+            };
             if let Some(limit) = shard_limit_violation(
                 counts,
                 shard_ids.len(),
@@ -849,12 +885,13 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                 });
             }
             let mut txn_ops = Vec::with_capacity(1 + (shards.len() * 2) + 1);
-            let mut compares = Vec::with_capacity(1 + shards.len());
+            let mut compares = Vec::with_capacity(2 + shards.len());
             let run_key = self.keyspace.run_record_key(tenant, run);
             compares.push(super::compare_run_revision(
                 run_key.clone(),
                 persisted_run.mod_revision,
             ));
+            compares.push(tenant_counter.compare);
             for shard in shards {
                 let sk = self.keyspace.shard_record_key(tenant, run, shard.shard());
                 compares.push(super::compare_absent(sk.clone()));
@@ -884,7 +921,11 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             let mut txn = TxnBuilder::from_compares(compares);
             txn.put(run_key.into_bytes(), run_blob)
                 .ops(txn_ops)
-                .put(rak.into_bytes(), Vec::<u8>::new());
+                .put(rak.into_bytes(), Vec::<u8>::new())
+                .put(
+                    tenant_counter.key.into_bytes(),
+                    super::encode_tenant_shard_count(tenant_counter.next_count),
+                );
             let outcome = txn
                 .execute_async(self, IdempotentOutcome::Executed(shard_ids))
                 .await

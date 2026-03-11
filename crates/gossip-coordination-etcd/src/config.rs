@@ -63,8 +63,8 @@ pub(crate) const DEFAULT_MAX_CHILDREN_PER_OP: usize = 8;
 ///   the whole backend.
 /// - **Max children per split op** bounds the fanout of one atomic
 ///   `split_replace` publication. Raising it also raises the total
-///   etcd txn-op count: writes = `3 + 2N`, compares = `4 + N`,
-///   total = `7 + 3N` where N = children. The default 8 yields 31
+///   etcd txn-op count: writes = `4 + 2N`, compares = `5 + N`,
+///   total = `9 + 3N` where N = children. The default 8 yields 33
 ///   total ops; operators raising the cap must verify against their
 ///   cluster's `--max-txn-ops` (default 128).
 #[derive(Clone)]
@@ -468,7 +468,7 @@ pub enum EtcdCoordinatorConfigError {
     /// exceeding etcd's default `--max-txn-ops` limit of 128.
     ///
     /// Each child adds 3 transaction entries (1 compare + 2 ops) to a
-    /// fixed overhead of 7, so the ceiling is `(128 - 7) / 3 = 40`.
+    /// fixed overhead of 9, so the ceiling is `(128 - 9) / 3 = 39`.
     MaxChildrenPerOpExceedsEtcdTxnBudget { requested: usize, max: usize },
     /// `max_children_per_op` cannot exceed the global split limit.
     MaxChildrenPerOpExceedsGlobalLimit { requested: usize, global_max: usize },
