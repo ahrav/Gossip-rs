@@ -1,12 +1,16 @@
 //! Unified scanner runtime: config construction, engine management, path
 //! validation, and scan dispatch.
 //!
-//! Both CLI and distributed execution paths route through the same
-//! assignment-to-driver seam:
+//! Filesystem and git assignments follow separate dispatch paths:
 //!
 //! ```text
-//! config ─► Assignment ─► ScanSourceFactory ─► ScanDriver::run ─► ScanReport
+//! config ─► Assignment ─┬─ (FS) ─► ScanSourceFactory ─► ScanDriver::run ─► ScanReport
+//!                       └─ (Git) ─► execute_git_assignment ─► ScanReport
 //! ```
+//!
+//! `driver_for_assignment` rejects `ConnectorKind::Git`; git scans bypass
+//! the `ScanDriver` trait and call `execute_git_assignment` directly with
+//! `&dyn GitEventOutput` (no `CommitSink`).
 //!
 //! # Entry points
 //!
@@ -14,7 +18,8 @@
 //! |----------|----------|
 //! | [`scan_fs`] / [`scan_git`] | Top-level dispatchers (choose mode) |
 //! | `scan_fs_with_runtime` / `scan_git_with_runtime` | Internal; accept caller-provided sinks |
-//! | `execute_assignment_with_config` | Unified core for all connector kinds; used by distributed worker |
+//! | `execute_assignment_with_config` | Non-git dispatch core; used by distributed worker for FS assignments |
+//! | `execute_git_assignment` | Git-specific entry point; used by both CLI and distributed worker |
 //!
 //! # Engine caching
 //!
@@ -787,9 +792,9 @@ pub(crate) fn execute_assignment_with_config(
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    let engine = runtime_engine(engine_config)?;
     match assignment.connector_kind {
         ConnectorKind::Filesystem => {
+            let engine = runtime_engine(engine_config)?;
             let mut driver = FilesystemScanSourceFactory
                 .driver_for_assignment(assignment)
                 .map_err(ScanRuntimeError::Driver)?;
@@ -803,6 +808,7 @@ pub(crate) fn execute_assignment_with_config(
             })
         }
         ConnectorKind::Git => {
+            let engine = runtime_engine(engine_config)?;
             let (report, checkpoint_hint, debug_output) =
                 execute_git_assignment(assignment, engine, &config, git_cfg, out, cancel)
                     .map_err(ScanRuntimeError::Driver)?;

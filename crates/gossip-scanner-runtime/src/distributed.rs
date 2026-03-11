@@ -74,8 +74,10 @@ pub struct ShardLease {
 ///
 /// - `acquire_shard` returns `None` when no more work is available (the
 ///   worker loop terminates on `None`).
-/// - `complete_shard` is idempotent or at-least-once tolerant, because
-///   crash recovery may replay the call.
+/// - Production coordinators must make `complete_shard` idempotent or
+///   at-least-once tolerant, because crash recovery may replay the call.
+///   Test coordinators (e.g., [`InMemoryCoordinator`]) may intentionally
+///   relax this to expose replay behavior.
 /// - `mark_shard_done` is called only after `complete_shard` succeeds.
 /// - `release_shard` must validate lease ownership — releasing another
 ///   worker's lease is a logic error.
