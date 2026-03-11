@@ -21,6 +21,10 @@ inputs:
     description: "Additional apt packages to install (space-separated)"
     required: false
     default: ""
+  extra-brew:
+    description: "Additional Homebrew packages to install (space-separated)"
+    required: false
+    default: ""
   cache-workspaces:
     description: "Workspaces for rust-cache (e.g. 'fuzz -> target')"
     required: false
@@ -42,11 +46,13 @@ runs:
     - name: Install system deps (Linux)
       if: runner.os == 'Linux'
       shell: bash
+      env:
+        EXTRA_APT: ${{ inputs.extra-apt }}
       run: |
         set -euo pipefail
         base_packages=(libboost-dev protobuf-compiler)
 
-        raw_input='${{ inputs.extra-apt }}'
+        raw_input="${EXTRA_APT}"
         normalized_input="${raw_input//$'\n'/ }"
         normalized_input="${normalized_input//$'\t'/ }"
         if [[ -n "${normalized_input// /}" ]]; then
@@ -62,6 +68,33 @@ runs:
 
         sudo apt-get update
         sudo apt-get install -y -- "${base_packages[@]}"
+
+    # vectorscan-rs-sys requires Boost headers on macOS too.
+    # etcd-client compiles .proto files via prost-build, which needs protoc.
+    - name: Install system deps (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        EXTRA_BREW: ${{ inputs.extra-brew }}
+      run: |
+        set -euo pipefail
+        base_packages=(boost protobuf)
+
+        raw_input="${EXTRA_BREW}"
+        normalized_input="${raw_input//$'\n'/ }"
+        normalized_input="${normalized_input//$'\t'/ }"
+        if [[ -n "${normalized_input// /}" ]]; then
+          read -r -a extra <<< "${normalized_input}"
+          for package in "${extra[@]}"; do
+            if [[ ! "${package}" =~ ^[A-Za-z0-9][A-Za-z0-9+.@:-]*$ ]]; then
+              echo "Invalid brew package token: '${package}'" >&2
+              exit 1
+            fi
+          done
+          base_packages+=("${extra[@]}")
+        fi
+
+        brew install "${base_packages[@]}"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
