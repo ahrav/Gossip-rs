@@ -470,7 +470,9 @@ Zero-sized, `Copy`-able factory. Creates `FsScanDriver` which wraps
 `parallel_scan_dir` from `scanner-scheduler`. Event and commit forwarding
 use scoped threads with crossbeam channels to bridge the scheduler's
 `EventOutput` / `StoreProducer` interfaces to the coordination layer's
-unified `GitEventOutput` and `CommitSink` sinks. Does not support
+`EventOutput` and `CommitSink` sinks (`FsScanDriver::run` takes
+`&dyn EventOutput`, not `&dyn GitEventOutput` — the git-specific event
+trait is only used on the dedicated git execution path). Does not support
 cooperative cancellation (only pre-check). Supports checkpoint hints.
 
 ### `GitScanSourceFactory`
@@ -498,10 +500,11 @@ The scan drivers use crossbeam channels to forward events and findings
 across thread boundaries:
 
 - `ChannelEventOutput` -- serializes `CoreEvent`s as owned values
-  (`OwnedCoreEvent`) for cross-thread forwarding to the unified
-  `GitEventOutput` sink.
+  (`OwnedCoreEvent`) for cross-thread forwarding to the caller-provided
+  `EventOutput` sink.
 - `ChannelGitEventOutput` -- extends `ChannelEventOutput` with
-  `GitEvent` forwarding so both event families share one sink object.
+  `GitEvent` forwarding so both event families share one sink object
+  (used only in the git execution path).
 - `ChannelStoreProducer` -- normalizes scheduler paths (absolute OS
   paths from `FsFindingBatch`) to connector-relative `/`-separated key
   encoding via `normalize_scheduler_path`, then forwards batches through

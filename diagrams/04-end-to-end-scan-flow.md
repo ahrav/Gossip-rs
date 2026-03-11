@@ -29,15 +29,25 @@ sequenceDiagram
 
     note over CLI: CLI Path (scanner-rs-cli)
     CLI->>RT: scan_fs_with_runtime / scan_git_with_runtime
-    RT->>RT: build_assignment(source, shard_spec, cursor)
-    RT->>RT: execute_assignment_with_config(assignment, ...)
-    RT->>SF: driver_for_assignment(&assignment)
-    SF-->>RT: Box&lt;dyn ScanDriver&gt;
-    RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-    RT->>DR: driver.run(engine, cfg, out, commit, cancel)
-    activate DR
-    DR-->>RT: ScanReport
-    deactivate DR
+
+    alt Filesystem assignment
+        RT->>RT: build_assignment(source, shard_spec, cursor)
+        RT->>RT: execute_assignment_with_config(assignment, ...)
+        RT->>SF: driver_for_assignment(&assignment)
+        SF-->>RT: Box&lt;dyn ScanDriver&gt;
+        RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
+        RT->>DR: driver.run(engine, cfg, out: &amp;dyn EventOutput, commit, cancel)
+        activate DR
+        DR-->>RT: ScanReport
+        deactivate DR
+    else Git assignment
+        RT->>RT: build_assignment(source, shard_spec, cursor)
+        RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
+        RT->>DR: execute_git_assignment(assignment, engine, cfg, git_cfg, out: &amp;dyn GitEventOutput, cancel)
+        activate DR
+        DR-->>RT: (ScanReport, checkpoint_hint, debug_output)
+        deactivate DR
+    end
     RT-->>CLI: ScanReport
 
     note over DW,DC: Distributed Path (run_worker loop)
@@ -48,7 +58,15 @@ sequenceDiagram
         DC-->>DW: bool
         alt Already done
             DW->>DC: release_shard(&lease)
-        else Not done
+        else Git assignment
+            DW->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
+            DW->>DR: execute_git_assignment(assignment, engine, cfg, git_cfg, &amp;sink, cancel)
+            activate DR
+            DR-->>DW: (ScanReport, checkpoint_hint, debug_output)
+            deactivate DR
+            DW->>DC: complete_shard(&lease, checkpoint_hint, report)
+            DW->>DC: mark_shard_done(&shard_id)
+        else Non-git assignment
             DW->>RT: execute_assignment_with_config(lease.assignment, ...)
             RT->>SF: driver_for_assignment(&assignment)
             SF-->>RT: Box&lt;dyn ScanDriver&gt;

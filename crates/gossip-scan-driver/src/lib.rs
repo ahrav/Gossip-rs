@@ -377,9 +377,10 @@ pub trait CommitSink: Send + Sync {
 /// No-op [`CommitSink`] that discards all calls.
 ///
 /// Used in CLI and direct-mode scans where per-item persistence is not
-/// needed. Also used as the commit sink for git scans, which route
-/// finding persistence through the git scanner's own event stream instead
-/// of the per-item lifecycle.
+/// needed. The git scan path bypasses `CommitSink` entirely — git scans
+/// use a commit-graph persistence model (ref watermarks, seen-blob
+/// deduplication) rather than the per-item begin/finish lifecycle.
+/// Durable finding persistence for git scans is not yet implemented.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoOpCommitSink;
 
