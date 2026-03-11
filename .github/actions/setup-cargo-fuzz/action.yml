@@ -7,10 +7,20 @@ runs:
     - name: Install cargo-binstall
       shell: bash
       run: |
-        # cargo-binstall v1.17.5
-        curl -L --proto '=https' --tlsv1.2 -sSf \
-          https://raw.githubusercontent.com/cargo-bins/cargo-binstall/7691a5b29cda4f5499b819e5618012ba4b6c3334/install-from-binstall-release.sh \
-          | bash
+        # cargo-binstall v1.17.5 (pinned by commit SHA)
+        script=$(curl -L --proto '=https' --tlsv1.2 -sSf \
+          https://raw.githubusercontent.com/cargo-bins/cargo-binstall/7691a5b29cda4f5499b819e5618012ba4b6c3334/install-from-binstall-release.sh)
+        expected="c2e963fbab3bdd8653b59c28d349bf85740cf4998e5e398d250dcd2884cd667d"
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual=$(printf '%s' "$script" | sha256sum | awk '{print $1}')
+        else
+          actual=$(printf '%s' "$script" | shasum -a 256 | awk '{print $1}')
+        fi
+        if [ "$actual" != "$expected" ]; then
+          echo "::error::cargo-binstall install script checksum mismatch (expected $expected, got $actual)"
+          exit 1
+        fi
+        printf '%s' "$script" | bash
 
     - name: Install cargo-fuzz
       shell: bash

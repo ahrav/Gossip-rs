@@ -50,8 +50,8 @@ use std::fmt;
 use etcd_client::{DeleteOptions, GetOptions, Txn, TxnOp};
 use gossip_coordination::{
     CapacityHint, IdempotentOutcome, InfraError, Lease, LogicalTime, OpId, RunId, RunOpKind,
-    RunStatus, RunTransitionError, ShardCountSnapshot, ShardId, ShardKey, TenantId,
-    hash_cancel_run_payload, hash_complete_run_payload, hash_fail_run_payload,
+    RunStatus, RunTransitionError, ShardId, ShardKey, TenantId, hash_cancel_run_payload,
+    hash_complete_run_payload, hash_fail_run_payload,
 };
 
 use crate::codec::{EtcdCodecError, decode_run_record, decode_shard_record, encode_run_record};
@@ -63,9 +63,11 @@ use crate::keyspace::{
 };
 
 use super::{
-    CasOutcome, PersistedOwner, PersistedRun, PersistedShard, TxnBuilder,
-    apply_terminal_run_transition, cas_retry_delay, compare_absent, compare_present,
-    compare_run_revision, decode_owner_kv, make_decode_slab, validate_loaded_shard_lease,
+    CasOutcome, PersistedOwner, PersistedRun, PersistedShard, PersistedTenantShardCount,
+    TenantShardCountMutation, TxnBuilder, apply_terminal_run_transition, cas_retry_delay,
+    compare_absent, compare_present, compare_run_revision, compare_tenant_shard_count_revision,
+    decode_owner_kv, decode_tenant_shard_count_kv, encode_tenant_shard_count, make_decode_slab,
+    u64_to_usize_saturating, usize_to_u64_saturating, validate_loaded_shard_lease,
     validate_owner_consistency,
 };
 
@@ -427,6 +429,53 @@ impl EtcdCoordinator {
         }))
     }
 
+    /// Load the per-tenant materialized shard counter key.
+    ///
+    /// Returns `Ok(None)` when the counter key does not exist; callers then
+    /// bootstrap from a tenant prefix scan.
+    pub(super) fn load_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<PersistedTenantShardCount>, EtcdCoordinatorError> {
+        let key = self.keyspace.tenant_shard_count_key(tenant).into_bytes();
+        let response = self.etcd_get(key, None)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        Ok(Some(decode_tenant_shard_count_kv(kv)?))
+    }
+
+    /// Prepare a CAS-guarded per-tenant counter update for one mutation.
+    ///
+    /// If the counter key exists, uses its current value and revision.
+    /// If absent, bootstraps from a tenant shard scan and guards creation
+    /// with `compare_absent`.
+    pub(super) fn prepare_tenant_shard_count_mutation(
+        &self,
+        tenant: TenantId,
+        additional: usize,
+    ) -> Result<TenantShardCountMutation, EtcdCoordinatorError> {
+        let counter_key = self.keyspace.tenant_shard_count_key(tenant);
+        let delta = usize_to_u64_saturating(additional);
+        if let Some(counter) = self.load_tenant_shard_count(tenant)? {
+            return Ok(TenantShardCountMutation {
+                key: counter_key.clone(),
+                current_count: u64_to_usize_saturating(counter.count),
+                next_count: counter.count.saturating_add(delta),
+                compare: compare_tenant_shard_count_revision(counter_key, counter.mod_revision),
+            });
+        }
+
+        let scanned =
+            self.count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))?;
+        Ok(TenantShardCountMutation {
+            key: counter_key.clone(),
+            current_count: scanned,
+            next_count: usize_to_u64_saturating(scanned).saturating_add(delta),
+            compare: compare_absent(counter_key),
+        })
+    }
+
     /// Load a single shard record and its owner binding by exact key.
     ///
     /// Uses a single prefix-range GET on the shard record key. Because
@@ -777,9 +826,8 @@ impl EtcdCoordinator {
     /// The subtree contains run records, owner keys, and active indexes in
     /// addition to shard records, so the caller filters keys structurally.
     ///
-    /// This is intentionally an O(N) preflight read. The backend does not yet
-    /// maintain dedicated shard-count keys, and these paths are setup/lifecycle
-    /// operations where correctness is more important than constant-time reads.
+    /// This remains an O(N) scan and is used for global-limit preflight and
+    /// lazy bootstrap when a tenant counter key is absent.
     pub(super) fn count_persisted_shards_under_prefix(
         &self,
         prefix: String,
@@ -798,23 +846,6 @@ impl EtcdCoordinator {
                     == Some(PersistedShardSubtreeKey::Record)
             })
             .count())
-    }
-
-    /// Load current persisted shard counts for one tenant and for the whole
-    /// backend.
-    ///
-    /// Unlike the in-memory backend's remove-mutate-restore flow, etcd reads
-    /// the parent shard directly from storage, so the current counts already
-    /// include the parent being split.
-    pub(super) fn current_shard_counts(
-        &self,
-        tenant: TenantId,
-    ) -> Result<ShardCountSnapshot, EtcdCoordinatorError> {
-        Ok(ShardCountSnapshot {
-            tenant: self
-                .count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))?,
-            total: self.count_persisted_shards_under_prefix(self.keyspace.tenants_prefix())?,
-        })
     }
 
     /// List runs visible to workers by scanning only the active-run index.
@@ -884,25 +915,77 @@ impl EtcdCoordinator {
             let shard_prefix = self.keyspace.shard_records_scan_prefix(tenant, run);
             let mut active_shard_prefix = self.keyspace.shards_active_prefix(tenant, run);
             active_shard_prefix.push('/');
+            let removed_shard_count =
+                self.count_persisted_shards_under_prefix(shard_prefix.clone())?;
 
-            let txn = Txn::new()
-                .when(vec![
-                    compare_run_revision(run_key.clone(), persisted.mod_revision),
-                    compare_absent(active_key.clone()),
-                ])
-                .and_then(vec![
-                    TxnOp::delete(run_key.into_bytes(), None),
-                    TxnOp::delete(active_key.into_bytes(), None),
-                    TxnOp::delete(
-                        shard_prefix.into_bytes(),
-                        Some(DeleteOptions::new().with_prefix()),
-                    ),
-                    TxnOp::delete(
-                        active_shard_prefix.into_bytes(),
-                        Some(DeleteOptions::new().with_prefix()),
-                    ),
-                ]);
-            let response = self.etcd_txn(txn)?;
+            // Always build the counter update — even when the counter key
+            // does not yet exist.  When absent, bootstrap from a tenant-wide
+            // shard scan and guard creation with `compare_absent` so that a
+            // concurrent `register_shards` (which also uses `compare_absent`
+            // during bootstrap) will conflict rather than committing an
+            // inflated count that includes shards this GC pass is removing.
+            let counter_key = self.keyspace.tenant_shard_count_key(tenant);
+            let (counter_compare, next_count) = if let Some(counter) =
+                self.load_tenant_shard_count(tenant)?
+            {
+                let removed = usize_to_u64_saturating(removed_shard_count);
+                let next = match counter.count.checked_sub(removed) {
+                    Some(n) => n,
+                    None => {
+                        // Counter drifted below the actual shard count —
+                        // rebuild from a fresh tenant-wide scan so the
+                        // persisted value converges back to truth.  The
+                        // CAS guard on `mod_revision` still prevents
+                        // concurrent-mutation races.
+                        tracing::warn!(
+                            tenant = %tenant,
+                            persisted_count = counter.count,
+                            removed = removed,
+                            "tenant shard counter underflow during GC; \
+                             rebuilding from scan"
+                        );
+                        let scanned = self.count_persisted_shards_under_prefix(
+                            self.keyspace.tenant_prefix(tenant),
+                        )?;
+                        usize_to_u64_saturating(scanned).saturating_sub(removed)
+                    }
+                };
+                (
+                    compare_tenant_shard_count_revision(counter_key.clone(), counter.mod_revision),
+                    next,
+                )
+            } else {
+                let scanned =
+                    self.count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))?;
+                let next = usize_to_u64_saturating(scanned)
+                    .saturating_sub(usize_to_u64_saturating(removed_shard_count));
+                (compare_absent(counter_key.clone()), next)
+            };
+
+            let mut txn = TxnBuilder::new();
+            txn.compare(compare_run_revision(
+                run_key.clone(),
+                persisted.mod_revision,
+            ))
+            .compare(compare_absent(active_key.clone()))
+            .delete(run_key.into_bytes())
+            .delete(active_key.into_bytes())
+            .ops([
+                TxnOp::delete(
+                    shard_prefix.into_bytes(),
+                    Some(DeleteOptions::new().with_prefix()),
+                ),
+                TxnOp::delete(
+                    active_shard_prefix.into_bytes(),
+                    Some(DeleteOptions::new().with_prefix()),
+                ),
+            ]);
+            txn.compare(counter_compare).put(
+                counter_key.into_bytes(),
+                encode_tenant_shard_count(next_count),
+            );
+
+            let response = self.etcd_txn(txn.build())?;
             if response.succeeded() {
                 out.push(run);
             } else {
@@ -1461,6 +1544,54 @@ impl AsyncEtcdCoordinator {
         }))
     }
 
+    /// Load the per-tenant materialized shard counter key (async).
+    ///
+    /// Returns `Ok(None)` when the counter key does not exist; callers then
+    /// bootstrap from a tenant prefix scan.
+    pub(super) async fn load_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<PersistedTenantShardCount>, EtcdCoordinatorError> {
+        let key = self.keyspace.tenant_shard_count_key(tenant).into_bytes();
+        let response = self.etcd_get(key, None).await?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        Ok(Some(decode_tenant_shard_count_kv(kv)?))
+    }
+
+    /// Prepare a CAS-guarded per-tenant counter update for one mutation.
+    ///
+    /// If the counter key exists, uses its current value and revision.
+    /// If absent, bootstraps from a tenant shard scan and guards creation
+    /// with `compare_absent`.
+    pub(super) async fn prepare_tenant_shard_count_mutation(
+        &self,
+        tenant: TenantId,
+        additional: usize,
+    ) -> Result<TenantShardCountMutation, EtcdCoordinatorError> {
+        let counter_key = self.keyspace.tenant_shard_count_key(tenant);
+        let delta = usize_to_u64_saturating(additional);
+        if let Some(counter) = self.load_tenant_shard_count(tenant).await? {
+            return Ok(TenantShardCountMutation {
+                key: counter_key.clone(),
+                current_count: u64_to_usize_saturating(counter.count),
+                next_count: counter.count.saturating_add(delta),
+                compare: compare_tenant_shard_count_revision(counter_key, counter.mod_revision),
+            });
+        }
+
+        let scanned = self
+            .count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))
+            .await?;
+        Ok(TenantShardCountMutation {
+            key: counter_key.clone(),
+            current_count: scanned,
+            next_count: usize_to_u64_saturating(scanned).saturating_add(delta),
+            compare: compare_absent(counter_key),
+        })
+    }
+
     /// Load a shard record and its owner binding by exact key (async).
     ///
     /// See [`EtcdCoordinator::load_shard_record`] for validation details.
@@ -1686,20 +1817,6 @@ impl AsyncEtcdCoordinator {
     }
 
     /// Load current persisted shard counts for one tenant and globally (async).
-    pub(super) async fn current_shard_counts(
-        &self,
-        tenant: TenantId,
-    ) -> Result<ShardCountSnapshot, EtcdCoordinatorError> {
-        Ok(ShardCountSnapshot {
-            tenant: self
-                .count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))
-                .await?,
-            total: self
-                .count_persisted_shards_under_prefix(self.keyspace.tenants_prefix())
-                .await?,
-        })
-    }
-
     /// Lightweight capacity hint using count-only and keys-only RPCs (async).
     ///
     /// See [`EtcdCoordinator::count_available_lightweight`].

@@ -225,6 +225,40 @@ impl EtcdCoordinator {
         Ok(())
     }
 
+    /// Seed or overwrite the tenant shard counter key.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_seed_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+        count: u64,
+    ) -> Result<(), EtcdCoordinatorError> {
+        let key = self.keyspace.tenant_shard_count_key(tenant).into_bytes();
+        self.etcd_put(key, super::encode_tenant_shard_count(count).to_vec(), None)?;
+        Ok(())
+    }
+
+    /// Delete the tenant shard counter key.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_delete_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+    ) -> Result<(), EtcdCoordinatorError> {
+        let key = self.keyspace.tenant_shard_count_key(tenant).into_bytes();
+        self.etcd_delete(key, None)?;
+        Ok(())
+    }
+
+    /// Load the tenant shard counter value.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_load_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<u64>, EtcdCoordinatorError> {
+        Ok(self
+            .load_tenant_shard_count(tenant)?
+            .map(|persisted| persisted.count))
+    }
+
     /// Load the persisted owner binding and its etcd lease ID.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_load_owner_binding(
