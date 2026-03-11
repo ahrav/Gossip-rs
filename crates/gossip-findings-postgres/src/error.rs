@@ -138,48 +138,49 @@ mod tests {
 
     #[test]
     fn schema_error_display_uses_persistence_source_message() {
-        let err = FindingsPgSchemaError::from(PersistenceInputError::Empty { field: "tenant_id" });
-        assert_eq!(err.to_string(), "tenant_id must not be empty");
+        let inner = PersistenceInputError::Empty { field: "tenant_id" };
+        let expected = inner.to_string();
+        let err = FindingsPgSchemaError::from(inner);
+        assert_eq!(err.to_string(), expected);
     }
 
     #[test]
     fn schema_error_source_exposes_persistence_error() {
-        let err = FindingsPgSchemaError::from(PersistenceInputError::TooLarge {
+        let inner = PersistenceInputError::TooLarge {
             field: "location_display",
             size: 4097,
             max: 4096,
-        });
+        };
+        let expected = inner.to_string();
+        let err = FindingsPgSchemaError::from(inner);
 
         let source = err.source().expect("schema error should expose source");
-        assert_eq!(
-            source.to_string(),
-            "location_display too large (4097 bytes, max 4096)"
-        );
+        assert_eq!(source.to_string(), expected);
     }
 
     #[test]
     fn schema_error_display_uses_conversion_source_message() {
-        let err = FindingsPgSchemaError::from(PgU64ConversionError::OrderedOutOfRange {
+        let inner = PgU64ConversionError::OrderedOutOfRange {
             field: "seen_at",
             value: u64::MAX,
-        });
+        };
+        let expected = inner.to_string();
+        let err = FindingsPgSchemaError::from(inner);
 
-        assert!(err.to_string().contains("seen_at"));
-        assert!(err.to_string().contains(&u64::MAX.to_string()));
+        assert_eq!(err.to_string(), expected);
     }
 
     #[test]
     fn schema_error_source_exposes_conversion_error() {
-        let err = FindingsPgSchemaError::from(PgU64ConversionError::NegativeStoredValue {
+        let inner = PgU64ConversionError::NegativeStoredValue {
             field: "byte_offset",
             value: -1,
-        });
+        };
+        let expected = inner.to_string();
+        let err = FindingsPgSchemaError::from(inner);
 
         let source = err.source().expect("schema error should expose source");
-        assert_eq!(
-            source.to_string(),
-            "stored value -1 for field byte_offset is negative but the schema requires non-negative BIGINT"
-        );
+        assert_eq!(source.to_string(), expected);
     }
 
     #[test]
