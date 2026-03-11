@@ -1,15 +1,17 @@
 //! Integration tests for the PostgreSQL done-ledger schema and migration runner.
 //!
 //! All tests in this module require a running PostgreSQL instance (either via
-//! Docker/testcontainers or an external `POSTGRES_TEST_URL`). They are marked
+//! Docker/testcontainers or an external `GOSSIP_POSTGRES_TEST_URL`). They are marked
 //! `#[ignore]` so that `cargo test` without Docker skips them cleanly.
 //!
 //! ## Test categories
 //!
-//! - **Migration runner** — idempotence, checksum-mismatch detection, and
-//!   concurrent advisory-lock serialisation.
+//! - **Migration runner** — migration-from-scratch, idempotent reapply,
+//!   checksum-mismatch detection (synthetic and persisted-history tamper),
+//!   connection smoke checks, and concurrent advisory-lock serialisation.
 //! - **`DoneLedger` backend behavior** — conformance suite, positional
-//!   alignment of `batch_get`, and duplicate-key merge in `batch_upsert`.
+//!   alignment of `batch_get`, empty-input and absent-key edge handling,
+//!   and duplicate-key merge in `batch_upsert`.
 //! - **Schema constraint enforcement** — verifies that SQL `CHECK`
 //!   constraints reject invalid status values, negative counters,
 //!   wrong-length `BYTEA` columns, and shape-inconsistent rows.
@@ -21,7 +23,7 @@
 //! cargo test -p gossip-done-ledger-postgres -- --ignored
 //!
 //! # With a pre-existing database:
-//! POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
+//! GOSSIP_POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
 //!   cargo test -p gossip-done-ledger-postgres -- --ignored
 //! ```
 
@@ -39,7 +41,7 @@ use gossip_contracts::{
 // ── Migration runner ────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn migrations_are_idempotent() {
     let mut client = test_client_bare();
 
@@ -65,7 +67,7 @@ fn migrations_are_idempotent() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn checksum_mismatch_is_detected() {
     let mut client = test_client_bare();
 
@@ -97,7 +99,7 @@ fn checksum_mismatch_is_detected() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn concurrent_migrations_both_succeed() {
     // Create a single bare database — both threads target the same DB.
     let url = crate::test_postgres::create_test_db();
@@ -128,6 +130,54 @@ fn concurrent_migrations_both_succeed() {
     t2.join()
         .expect("thread 2 panicked")
         .expect("thread 2 migration failed");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn provisioned_database_url_is_connectable() {
+    let url = crate::test_postgres::create_test_db();
+    let mut client =
+        postgres::Client::connect(&url, postgres::NoTls).expect("connect should succeed");
+    let one: i32 = client
+        .query_one("SELECT 1", &[])
+        .expect("smoke query should succeed")
+        .get(0);
+    assert_eq!(one, 1);
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn persisted_checksum_tamper_is_detected_on_reapply() {
+    let mut client = test_client_bare();
+
+    apply_all_migrations(&mut client).expect("initial migration should succeed");
+
+    let updated = client
+        .execute(
+            &format!(
+                "UPDATE {} SET checksum = decode(repeat('00', 32), 'hex') WHERE version = $1",
+                crate::schema::SCHEMA_MIGRATIONS_TABLE
+            ),
+            &[&"0001_done_ledger_entries"],
+        )
+        .expect("checksum tamper update should succeed");
+    assert_eq!(updated, 1, "expected to tamper exactly one migration row");
+
+    let err = apply_all_migrations(&mut client)
+        .expect_err("tampered persisted checksum should fail re-application");
+    match err {
+        DoneLedgerPgMigrationError::ChecksumMismatch { version, .. } => {
+            assert_eq!(version, "0001_done_ledger_entries");
+        }
+        DoneLedgerPgMigrationError::Postgres { source, .. } => {
+            panic!("expected ChecksumMismatch, got Postgres error: {source}");
+        }
+        DoneLedgerPgMigrationError::CorruptedHistoryRecord { version, found_len } => {
+            panic!(
+                "expected ChecksumMismatch, got CorruptedHistoryRecord: version={version}, len={found_len}"
+            );
+        }
+    }
 }
 
 // ── DoneLedger backend behavior ───────────────────────────────────────────
@@ -180,7 +230,7 @@ fn done_record(
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn done_ledger_backend_passes_conformance_suite() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -193,7 +243,42 @@ fn done_ledger_backend_passes_conformance_suite() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn batch_get_empty_input_returns_empty_vec() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    let fetched = backend
+        .batch_get(tenant(5), policy(6), &[])
+        .expect("empty batch_get should succeed");
+    assert!(fetched.is_empty());
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn batch_get_nonexistent_key_returns_none() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    let fetched = backend
+        .batch_get(tenant(5), policy(6), &[ovid(200)])
+        .expect("batch_get should succeed for absent key");
+    assert_eq!(fetched.len(), 1);
+    assert!(fetched[0].is_none());
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn batch_upsert_empty_input_returns_zero_receipt() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    let receipt = backend
+        .batch_upsert(&[])
+        .expect("empty batch_upsert should succeed")
+        .wait()
+        .expect("empty batch_upsert commit handle should resolve");
+    assert_eq!(receipt.record_count(), 0);
+    assert_eq!(receipt.scanned_count(), 0);
+    assert_eq!(receipt.findings_count(), 0);
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn batch_get_preserves_positional_alignment_with_duplicates() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -256,7 +341,7 @@ fn batch_get_preserves_positional_alignment_with_duplicates() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn batch_upsert_merges_duplicate_keys_before_persist() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -431,7 +516,7 @@ impl RowOverrides {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn schema_rejects_invalid_status() {
     let mut client = test_client();
     let err = try_insert(
@@ -446,7 +531,7 @@ fn schema_rejects_invalid_status() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn schema_rejects_negative_bytes_scanned() {
     let mut client = test_client();
     let err = try_insert(
@@ -461,7 +546,7 @@ fn schema_rejects_negative_bytes_scanned() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn schema_enforces_status_shape_constraint() {
     let mut client = test_client();
 
@@ -492,7 +577,7 @@ fn schema_enforces_status_shape_constraint() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn schema_rejects_invalid_bytea_length() {
     let mut client = test_client();
     let err = try_insert(
@@ -507,7 +592,7 @@ fn schema_rejects_invalid_bytea_length() {
 }
 
 #[test]
-#[ignore = "requires Docker or POSTGRES_TEST_URL"]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn schema_enforces_finished_at_ge_started_at() {
     let mut client = test_client();
     let err = try_insert(

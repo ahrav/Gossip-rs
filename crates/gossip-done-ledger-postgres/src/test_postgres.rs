@@ -4,7 +4,7 @@
 //! [`postgres::Client`] instances backed by either:
 //!
 //! - An auto-provisioned Docker container (default), or
-//! - A pre-existing PostgreSQL at the URL in `POSTGRES_TEST_URL`.
+//! - A pre-existing PostgreSQL at the URL in `GOSSIP_POSTGRES_TEST_URL`.
 //!
 //! A single PostgreSQL container is shared across all tests in a binary via
 //! [`OnceLock`]; each test gets its own freshly-created database for complete
@@ -17,7 +17,7 @@
 //! cargo test -p gossip-done-ledger-postgres -- --ignored
 //!
 //! # With a pre-existing PostgreSQL (no Docker needed):
-//! POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
+//! GOSSIP_POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
 //!   cargo test -p gossip-done-ledger-postgres -- --ignored
 //! ```
 
@@ -35,7 +35,8 @@ use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// PostgreSQL connection source: either a testcontainers-managed Docker
-/// container or a pre-existing external instance from `POSTGRES_TEST_URL`.
+/// container or a pre-existing external instance from
+/// `GOSSIP_POSTGRES_TEST_URL`.
 struct PgEndpoint {
     /// Base connection URL pointing at the `postgres` maintenance database.
     url: String,
@@ -61,7 +62,7 @@ fn pg_image() -> ContainerRequest<GenericImage> {
 /// Start (or reuse) the shared PostgreSQL endpoint.
 ///
 /// Resolution order:
-/// 1. If `POSTGRES_TEST_URL` is set and non-empty, use it directly.
+/// 1. If `GOSSIP_POSTGRES_TEST_URL` is set and non-empty, use it directly.
 /// 2. Otherwise, start a PostgreSQL container via testcontainers.
 fn shared_endpoint() -> &'static PgEndpoint {
     SHARED_PG.get_or_init(|| {
@@ -90,9 +91,10 @@ fn shared_endpoint() -> &'static PgEndpoint {
     })
 }
 
-/// Read `POSTGRES_TEST_URL` and return the first non-empty value, or `None`.
+/// Read `GOSSIP_POSTGRES_TEST_URL` and return the first non-empty value, or
+/// `None`.
 fn external_url() -> Option<String> {
-    std::env::var("POSTGRES_TEST_URL")
+    std::env::var("GOSSIP_POSTGRES_TEST_URL")
         .ok()
         .map(|raw| raw.trim().to_owned())
         .filter(|s| !s.is_empty())
