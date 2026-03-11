@@ -289,40 +289,41 @@ fn config_rejects_zero_max_children_per_op() {
 
 /// The per-backend child cap must stay within the etcd `split_replace`
 /// transaction budget. Each child adds 3 transaction entries (1 compare +
-/// 2 ops) to a fixed overhead of 7, so `(128 - 7) / 3 = 40` is the max.
+/// 2 ops) to a fixed overhead of 9 (parent CAS + tenant-counter CAS),
+/// so `(128 - 9) / 3 = 39` is the max.
 #[test]
 fn config_rejects_max_children_per_op_above_etcd_txn_budget() {
-    // 40 children should be accepted (boundary value).
-    EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 40)
-        .expect("40 children must be accepted — exactly at the etcd txn budget ceiling");
+    // 39 children should be accepted (boundary value).
+    EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 39)
+        .expect("39 children must be accepted — exactly at the etcd txn budget ceiling");
 
-    // 41 children should be rejected: 7 + 3*41 = 130 > 128.
+    // 40 children should be rejected: 9 + 3*40 = 129 > 128.
     let error =
-        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 41)
-            .expect_err("41 children must fail — exceeds etcd txn budget");
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 40)
+            .expect_err("40 children must fail — exceeds etcd txn budget");
     assert!(matches!(
         error,
         EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsEtcdTxnBudget {
-            requested: 41,
-            max: 40,
+            requested: 40,
+            max: 39,
         }
     ));
 }
 
 /// Values above `MAX_SPLIT_CHILDREN` (256) are also rejected, but the
-/// tighter etcd txn budget check (40) fires first. This test verifies
+/// tighter etcd txn budget check (39) fires first. This test verifies
 /// that out-of-range values still produce a clear rejection.
 #[test]
 fn config_rejects_max_children_per_op_above_global_limit() {
     let error =
         EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 257)
             .expect_err("max_children_per_op above MAX_SPLIT_CHILDREN must fail validation");
-    // The etcd txn budget check is stricter (40 < 256), so it fires first.
+    // The etcd txn budget check is stricter (39 < 256), so it fires first.
     assert!(matches!(
         error,
         EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsEtcdTxnBudget {
             requested: 257,
-            max: 40,
+            max: 39,
         }
     ));
 }
@@ -541,6 +542,10 @@ fn keyspace_builds_expected_paths() {
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef"
     );
     assert_eq!(
+        keyspace.tenant_shard_count_key(tenant).as_str(),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/shard_count"
+    );
+    assert_eq!(
         keyspace.shard_record_key(tenant, run, shard).as_str(),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards/8000000000000042"
     );
@@ -588,6 +593,7 @@ fn keyspace_typed_keys_preserve_kind_and_relationships() {
     let owner_key = shard_key.owner_key();
     let shard_active_key = keyspace.shard_active_index_key(tenant, run, shard);
     let run_key = keyspace.run_record_key(tenant, run);
+    let tenant_counter_key = keyspace.tenant_shard_count_key(tenant);
 
     assert_eq!(
         owner_key.as_str(),
@@ -606,6 +612,10 @@ fn keyspace_typed_keys_preserve_kind_and_relationships() {
         None
     );
     assert_eq!(PersistedShardSubtreeKey::classify(run_key.as_bytes()), None);
+    assert_eq!(
+        PersistedShardSubtreeKey::classify(tenant_counter_key.as_bytes()),
+        None
+    );
 }
 
 /// Uppercase hex segments are rejected to preserve canonical lowercase keys.
@@ -692,6 +702,7 @@ proptest! {
         let tenants = ks.tenants_prefix();
         let tenant_pfx = ks.tenant_prefix(tenant);
         let runs = ks.runs_prefix(tenant);
+        let tenant_counter = ks.tenant_shard_count_key(tenant);
         let run_key = ks.run_record_key(tenant, run);
         let shards_pfx = ks.run_shards_prefix(tenant, run);
         let scan_pfx = ks.shard_records_scan_prefix(tenant, run);
@@ -706,6 +717,7 @@ proptest! {
             tenants.as_str(),
             tenant_pfx.as_str(),
             runs.as_str(),
+            tenant_counter.as_str(),
             run_key.as_str(),
             shards_pfx.as_str(),
             scan_pfx.as_str(),
@@ -735,6 +747,7 @@ proptest! {
         // Hierarchical containment: each child starts with its parent.
         prop_assert!(tenant_pfx.starts_with(&tenants));
         prop_assert!(runs.starts_with(&tenant_pfx));
+        prop_assert!(tenant_counter.as_str().starts_with(&tenant_pfx));
         prop_assert!(run_key.as_str().starts_with(&runs));
         prop_assert!(shards_pfx.starts_with(run_key.as_str()));
         prop_assert!(shard_key.as_str().starts_with(&shards_pfx));
@@ -944,6 +957,69 @@ fn register_shards_rejects_global_shard_limit_against_local_etcd() {
     );
 }
 
+/// If the tenant counter key is missing, `register_shards` bootstraps it
+/// from the tenant prefix scan and creates the key in the same CAS txn.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn register_shards_bootstraps_counter_when_key_is_absent() {
+    let mut backend = test_coordinator_with_limits(10, 100);
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+
+    let run_a = RunId::from_raw(0x7001);
+    backend
+        .create_run(now(1), test_tenant(), run_a, config)
+        .expect("create_run for run_a should succeed");
+    let manifest_a = [InitialShardInput::new(
+        ShardId::from_raw(0xA001),
+        ShardSpecRef::new(b"a", b"m", b""),
+        CursorUpdate::initial(),
+    )];
+    let register_a = backend
+        .register_shards(now(2), test_tenant(), run_a, &manifest_a, OpId::from_raw(1))
+        .expect("initial register_shards should succeed");
+    assert!(register_a.is_executed());
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(1),
+        "initial registration should set counter to 1"
+    );
+
+    backend
+        .test_delete_tenant_shard_count(test_tenant())
+        .expect("counter delete should succeed");
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        None,
+        "counter key should be absent before bootstrap"
+    );
+
+    let run_b = RunId::from_raw(0x7002);
+    backend
+        .create_run(now(3), test_tenant(), run_b, config)
+        .expect("create_run for run_b should succeed");
+    let manifest_b = [InitialShardInput::new(
+        ShardId::from_raw(0xA002),
+        ShardSpecRef::new(b"m", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let register_b = backend
+        .register_shards(now(4), test_tenant(), run_b, &manifest_b, OpId::from_raw(2))
+        .expect("register_shards should bootstrap absent counter");
+    assert!(register_b.is_executed());
+
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(2),
+        "bootstrap should scan existing shard count and publish updated value"
+    );
+}
+
 /// Smoke test: connect to etcd and verify that the status RPC returns a
 /// non-empty cluster version.
 #[test]
@@ -1091,6 +1167,13 @@ fn split_replace_round_trip_against_local_etcd() {
         .expect("split_replace should succeed");
     assert!(first.is_executed());
     assert_eq!(first.as_ref().children.len(), 2);
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(3),
+        "counter should include parent + 2 children after split_replace"
+    );
 
     let parent = backend
         .test_load_shard_snapshot(test_tenant(), key)
@@ -1286,6 +1369,13 @@ fn split_residual_round_trip_against_local_etcd() {
         .split_residual(now(5), test_tenant(), &acquire.lease, plan.clone(), op)
         .expect("split_residual should succeed");
     assert!(first.is_executed());
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(2),
+        "counter should grow by 1 after split_residual"
+    );
 
     let parent = backend
         .test_load_shard_snapshot(test_tenant(), key)
@@ -1690,6 +1780,60 @@ fn gc_stale_initializing_runs_deletes_only_old_orphans() {
         .list_active_runs_into(test_tenant(), &mut active)
         .expect("active run listing should succeed");
     assert_eq!(active, vec![run_active]);
+}
+
+/// GC decrements the tenant shard counter by the number of deleted shard
+/// records when collecting a stale initializing run.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn gc_stale_initializing_runs_decrements_tenant_counter() {
+    let mut backend = test_coordinator();
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0x4F01);
+    let shard = ShardId::from_raw(0x8F01);
+
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+
+    let spec = ShardSpec::with_range(b"a", b"z");
+    let mut slab = ByteSlab::with_capacity(1024);
+    let mut shard_record = ShardRecord::new_active_with_cursor(
+        test_tenant(),
+        run,
+        shard,
+        spec.as_ref(),
+        CursorUpdate::initial(),
+        CursorSemantics::Completed,
+        &mut slab,
+    )
+    .expect("test shard record should be constructible");
+    backend
+        .test_seed_shard_record(&shard_record, &slab)
+        .expect("seeding shard record should succeed");
+    backend
+        .test_seed_active_shard_index(test_tenant(), run, shard)
+        .expect("seeding active-shard index should succeed");
+    shard_record.deallocate_fields(&mut slab);
+    slab.clear();
+
+    backend
+        .test_seed_tenant_shard_count(test_tenant(), 1)
+        .expect("seeding tenant counter should succeed");
+
+    let mut deleted = Vec::new();
+    backend
+        .gc_stale_initializing_runs_into(test_tenant(), now(2), &mut deleted)
+        .expect("gc should succeed");
+    assert_eq!(deleted, vec![run]);
+
+    assert_eq!(
+        backend
+            .test_load_tenant_shard_count(test_tenant())
+            .expect("counter load should succeed"),
+        Some(0),
+        "counter should decrement when GC deletes shard records"
+    );
 }
 
 /// Unpark a shard that was manually seeded as `Parked` (via
