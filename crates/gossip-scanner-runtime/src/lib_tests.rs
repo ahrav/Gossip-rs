@@ -261,6 +261,25 @@ fn git_config_normalizes_zero_workers_consistently() {
     );
 }
 
+/// End-to-end check that `scan_git_direct` succeeds with `workers=0`.
+///
+/// Exercises the real normalization path in `scan_git_with_runtime` rather
+/// than replicating the `.max(1)` logic inline. A zero-worker config must
+/// be clamped to 1 internally — not panic or produce a degenerate scan.
+#[test]
+fn scan_git_direct_normalizes_zero_workers_end_to_end() {
+    let repo = create_test_repo(&[("secret.txt", b"password=xK9mP2qL7wN4vR8t")]);
+    let config = GitScanConfig {
+        workers: 0,
+        ..GitScanConfig::new(repo.path())
+    };
+    let outcome = scan_git_direct(&config).expect("workers=0 should normalize to 1 and scan");
+    assert!(
+        outcome.items_scanned >= 1,
+        "scan with workers=0 (normalized to 1) should process at least one item"
+    );
+}
+
 #[test]
 fn scan_git_direct_errors_for_non_repo() {
     let dir = tempdir().expect("tempdir");
