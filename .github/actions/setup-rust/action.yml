@@ -21,6 +21,10 @@ inputs:
     description: "Additional apt packages to install (space-separated)"
     required: false
     default: ""
+  extra-brew:
+    description: "Additional Homebrew packages to install (space-separated)"
+    required: false
+    default: ""
   cache-workspaces:
     description: "Workspaces for rust-cache (e.g. 'fuzz -> target')"
     required: false
@@ -62,6 +66,24 @@ runs:
 
         sudo apt-get update
         sudo apt-get install -y -- "${base_packages[@]}"
+
+    # vectorscan-rs-sys requires Boost headers on macOS too.
+    - name: Install system deps (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        base_packages=(boost)
+
+        raw_input='${{ inputs.extra-brew }}'
+        normalized_input="${raw_input//$'\n'/ }"
+        normalized_input="${normalized_input//$'\t'/ }"
+        if [[ -n "${normalized_input// /}" ]]; then
+          read -r -a extra <<< "${normalized_input}"
+          base_packages+=("${extra[@]}")
+        fi
+
+        brew install "${base_packages[@]}"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
