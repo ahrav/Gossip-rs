@@ -155,8 +155,9 @@ fn persisted_checksum_tamper_is_detected_on_reapply() {
     let updated = client
         .execute(
             &format!(
-                "UPDATE {} SET checksum = decode(repeat('00', 32), 'hex') WHERE version = $1",
-                crate::schema::SCHEMA_MIGRATIONS_TABLE
+                "UPDATE {} SET checksum = decode(repeat('00', {}), 'hex') WHERE version = $1",
+                crate::schema::SCHEMA_MIGRATIONS_TABLE,
+                blake3::OUT_LEN, // BLAKE3 output width; matches schema CHECK constraint.
             ),
             &[&"0001_done_ledger_entries"],
         )
