@@ -12,7 +12,6 @@ use std::fmt;
 /// (e.g. `DoneLedgerPgMigrationError::Postgres`) to provide structured
 /// failure context without losing the underlying cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum MigrationOperation {
     /// Initial TCP/TLS connection to the database.
     Connect,
