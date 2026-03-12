@@ -526,10 +526,16 @@ impl DoneLedgerSim {
                         actual: None,
                     });
                 }
-                // oracle=None, ledger=Some is possible when pending
-                // writes have auto-completed but the oracle hasn't
-                // committed yet (race-free in single-threaded sim,
-                // but can happen with interleaved ops). Skip this case.
+                (None, Some(actual)) => {
+                    // Single-threaded sim: oracle commits synchronously,
+                    // so a ledger record with no oracle entry means the
+                    // oracle missed a commit or a delayed write leaked.
+                    violations.push(DoneLedgerInvariantViolation::ReadConsistency {
+                        key,
+                        oracle: None,
+                        actual: Some(Box::new(actual.clone())),
+                    });
+                }
                 _ => {}
             }
         }
@@ -1129,7 +1135,11 @@ mod tests {
 
         assert_eq!(report1.ops_executed, report2.ops_executed);
         assert_eq!(report1.event_counts, report2.event_counts);
-        assert_eq!(report1.violations.len(), report2.violations.len());
+        assert_eq!(
+            format!("{:?}", report1.violations),
+            format!("{:?}", report2.violations),
+            "violation contents differ between replays with same seed"
+        );
         assert_eq!(report1.converged, report2.converged);
     }
 }
