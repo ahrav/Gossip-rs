@@ -59,3 +59,8 @@ pub use types::{
     PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
     u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
 };
+
+#[cfg(test)]
+mod test_postgres;
+#[cfg(test)]
+mod tests;

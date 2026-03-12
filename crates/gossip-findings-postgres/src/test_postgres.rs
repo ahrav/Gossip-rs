@@ -1,25 +1,13 @@
-//! Testcontainers-based PostgreSQL lifecycle management for integration tests.
+//! Testcontainers-based PostgreSQL lifecycle management for findings
+//! integration tests.
 //!
-//! Provides [`test_client`] and [`test_client_bare`] to create
-//! [`postgres::Client`] instances backed by either:
+//! Provides [`test_client`] and [`test_client_bare`] helpers backed by either:
 //!
-//! - An auto-provisioned Docker container (default), or
-//! - A pre-existing PostgreSQL at the URL in `GOSSIP_POSTGRES_TEST_URL`.
+//! - an auto-provisioned Docker container, or
+//! - an external PostgreSQL from `GOSSIP_POSTGRES_TEST_URL`.
 //!
-//! A single PostgreSQL container is shared across all tests in a binary via
-//! [`OnceLock`]; each test gets its own freshly-created database for complete
-//! isolation.
-//!
-//! # Running tests
-//!
-//! ```bash
-//! # With Docker running (auto-provisions postgres:16-alpine):
-//! cargo test -p gossip-done-ledger-postgres -- --ignored
-//!
-//! # With a pre-existing PostgreSQL (no Docker needed):
-//! GOSSIP_POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
-//!   cargo test -p gossip-done-ledger-postgres -- --ignored
-//! ```
+//! A single PostgreSQL instance is shared across the test binary, while each
+//! test gets a freshly created database for isolation.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,9 +17,7 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 
-/// Monotonic counter for generating unique database names across tests
-/// in the same binary. Combined with `std::process::id()` for
-/// cross-binary uniqueness when nextest runs test binaries in parallel.
+/// Monotonic suffix for unique per-test database names.
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Nanosecond-resolution nonce seeded once at process start. Combined with
@@ -39,20 +25,17 @@ static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// PostgreSQL instance retains databases across test runs.
 static RUN_NONCE: OnceLock<u64> = OnceLock::new();
 
-/// PostgreSQL connection source: either a testcontainers-managed Docker
-/// container or a pre-existing external instance from
-/// `GOSSIP_POSTGRES_TEST_URL`.
+/// Base PostgreSQL endpoint used to provision fresh test databases.
 struct PgEndpoint {
-    /// Base connection URL pointing at the `postgres` maintenance database.
+    /// Connection string pointing at the maintenance database.
     url: String,
-    /// Held alive to prevent container reaping. `None` when using an
-    /// external PostgreSQL (no container lifecycle to manage).
+    /// Held alive so the shared testcontainer is not reaped mid-test.
     _container: Option<Container<GenericImage>>,
 }
 
 static SHARED_PG: OnceLock<PgEndpoint> = OnceLock::new();
 
-/// Build the PostgreSQL container image definition.
+/// Build the shared PostgreSQL container image definition.
 fn pg_image() -> ContainerRequest<GenericImage> {
     GenericImage::new("postgres", "16-alpine")
         .with_wait_for(WaitFor::message_on_stderr(
@@ -64,11 +47,11 @@ fn pg_image() -> ContainerRequest<GenericImage> {
         .with_env_var("POSTGRES_DB", "postgres")
 }
 
-/// Start (or reuse) the shared PostgreSQL endpoint.
+/// Start or reuse the shared PostgreSQL endpoint.
 ///
 /// Resolution order:
-/// 1. If `GOSSIP_POSTGRES_TEST_URL` is set and non-empty, use it directly.
-/// 2. Otherwise, start a PostgreSQL container via testcontainers.
+/// 1. `GOSSIP_POSTGRES_TEST_URL`, if present and non-empty.
+/// 2. A `postgres:16-alpine` container managed by testcontainers.
 fn shared_endpoint() -> &'static PgEndpoint {
     SHARED_PG.get_or_init(|| {
         if let Some(url) = external_url() {
@@ -80,15 +63,40 @@ fn shared_endpoint() -> &'static PgEndpoint {
 
         let container = pg_image()
             .start()
-            .expect("failed to start postgres container — is Docker running?");
+            .expect("failed to start postgres container; ensure Docker is available");
 
-        let host = container.get_host().expect("failed to get container host");
+        let host = container
+            .get_host()
+            .expect("failed to resolve container host");
         let port = container
             .get_host_port_ipv4(5432)
-            .expect("failed to get mapped port for 5432");
+            .expect("failed to resolve mapped postgres port");
 
         let url =
             format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
+
+        // Guard against a WaitFor early-ready race: PostgreSQL logs the
+        // "ready to accept connections" message twice during startup and the
+        // container may not be fully accepting connections on the first match.
+        // Retry the initial connect a few times with backoff.
+        let mut last_err = None;
+        for attempt in 0..5 {
+            match Client::connect(&url, NoTls) {
+                Ok(c) => {
+                    drop(c);
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1)));
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("postgres container not accepting connections after retries: {e}");
+        }
+
         PgEndpoint {
             url,
             _container: Some(container),
@@ -96,16 +104,15 @@ fn shared_endpoint() -> &'static PgEndpoint {
     })
 }
 
-/// Read `GOSSIP_POSTGRES_TEST_URL` and return `Some(value)` if set and
-/// non-empty, or `None` otherwise.
+/// Read `GOSSIP_POSTGRES_TEST_URL` when it is set to a non-empty value.
 fn external_url() -> Option<String> {
     std::env::var("GOSSIP_POSTGRES_TEST_URL")
         .ok()
         .map(|raw| raw.trim().to_owned())
-        .filter(|s| !s.is_empty())
+        .filter(|raw| !raw.is_empty())
 }
 
-/// Generate a unique database name for test isolation.
+/// Generate a unique test database name.
 ///
 /// Includes a nanosecond-resolution nonce so that names remain unique across
 /// test runs sharing a persistent external PostgreSQL instance.
@@ -276,35 +283,30 @@ fn rewrite_uri_query_dbname(query: &str, db_name: &str) -> String {
         .join("&")
 }
 
-/// Create a fresh test database and return a connection URL pointing at it.
+/// Create a fresh isolated database and return a connection string for it.
 pub(crate) fn create_test_db() -> String {
     let endpoint = shared_endpoint();
     let db_name = unique_db_name();
     let mut admin = Client::connect(&endpoint.url, NoTls)
         .expect("failed to connect to postgres maintenance database");
     admin
-        .batch_execute(&format!("CREATE DATABASE {db_name}"))
-        .expect("failed to create test database");
+        .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+        .expect("failed to create fresh test database");
     connection_string_for_db(&endpoint.url, &db_name)
 }
 
-/// Create a fresh test database, connect, and apply all migrations.
-///
-/// Returns a [`Client`] connected to an isolated database with the full
-/// done-ledger schema applied.
+/// Create a fresh test database and apply the crate migrations.
 pub(crate) fn test_client() -> Client {
     let url = create_test_db();
     let mut client = Client::connect(&url, NoTls).expect("failed to connect to test database");
-    crate::apply_all_migrations(&mut client).expect("failed to apply migrations");
+    crate::apply_all_migrations(&mut client).expect("failed to apply findings migrations");
     client
 }
 
-/// Create a fresh test database and connect without applying migrations.
-///
-/// Useful for testing the migration runner itself.
+/// Create a fresh test database without applying migrations.
 pub(crate) fn test_client_bare() -> Client {
     let url = create_test_db();
-    Client::connect(&url, NoTls).expect("failed to connect to test database")
+    Client::connect(&url, NoTls).expect("failed to connect to bare test database")
 }
 
 #[cfg(test)]
@@ -373,8 +375,12 @@ mod tests {
 
     #[test]
     fn keyword_connection_string_with_quoted_value_containing_dbname() {
+        // libpq keyword-value format supports single-quoted values. If a
+        // quoted value contains "dbname=", split_whitespace breaks the token
+        // boundary and the starts_with("dbname=") check falsely matches.
         let input = "host=127.0.0.1 password='secret dbname=dummy' dbname=postgres";
         let rewritten = rewrite_keyword_connection_string(input, "test_quoted");
+        // Correct behavior: only the real dbname= key is replaced.
         assert_eq!(
             rewritten, "host=127.0.0.1 password='secret dbname=dummy' dbname=test_quoted",
             "quoted values containing dbname= must not be rewritten"
@@ -383,6 +389,8 @@ mod tests {
 
     #[test]
     fn keyword_connection_string_with_backslash_escaped_quote() {
+        // libpq uses backslash escaping inside single-quoted values:
+        // \' is an escaped quote, \\ is an escaped backslash.
         let input = r"host=127.0.0.1 password='it\'s complex dbname=dummy' dbname=postgres";
         let rewritten = rewrite_keyword_connection_string(input, "test_bs");
         assert_eq!(
@@ -393,6 +401,7 @@ mod tests {
 
     #[test]
     fn keyword_connection_string_with_spaces_around_equals() {
+        // libpq keyword-value format allows optional spaces around '='.
         let input = "host=127.0.0.1 dbname = postgres";
         let rewritten = rewrite_keyword_connection_string(input, "test_sp");
         assert!(
@@ -407,6 +416,8 @@ mod tests {
 
     #[test]
     fn keyword_connection_string_dangling_backslash_does_not_panic() {
+        // A malformed quoted value ending with a lone backslash must not
+        // cause an out-of-bounds panic in the tokenizer.
         let input = "host=127.0.0.1 password='trailing\\";
         let rewritten = rewrite_keyword_connection_string(input, "test_dbs");
         assert!(
