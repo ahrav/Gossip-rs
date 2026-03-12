@@ -605,6 +605,32 @@ mod tests {
     }
 
     #[test]
+    fn observation_row_from_record_rejects_seen_at_above_pg_bigint_max() {
+        let tenant_id = TenantId::from_bytes([0x11; 32]);
+        let finding = finding_record(tenant_id);
+        let occurrence = occurrence_record(tenant_id, finding.finding_id(), 3, 4);
+        let record = ObservationRecord::new(
+            tenant_id,
+            occurrence.occurrence_id(),
+            PolicyHash::from_bytes([0x77; 32]),
+            OvidHash::from_bytes([0x88; 32]),
+            RunId::from_raw(1),
+            ShardId::from_raw(2),
+            FenceEpoch::from_raw(9),
+            LogicalTime::from_raw(i64::MAX as u64 + 1),
+        );
+
+        let err = ObservationRow::from_record(&record).expect_err("overflow should fail");
+        assert_eq!(
+            err,
+            FindingsPgSchemaError::PgU64Conversion(PgU64ConversionError::OrderedOutOfRange {
+                field: "seen_at",
+                value: i64::MAX as u64 + 1,
+            })
+        );
+    }
+
+    #[test]
     fn policy_hash_only_appears_in_observation_natural_key_columns() {
         assert!(
             !OCCURRENCES_CANONICAL_UNIQUE_COLUMNS.contains(&"policy_hash"),

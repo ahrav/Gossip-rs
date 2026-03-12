@@ -317,11 +317,11 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::schema::{
-        FINDINGS_TENANT_SECRET_HASH_INDEX, FINDINGS_TENANT_STABLE_ITEM_ID_INDEX,
-        OBSERVATIONS_TENANT_OCCURRENCE_ID_INDEX, OBSERVATIONS_TENANT_OVID_HASH_INDEX,
-        OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX, OBSERVATIONS_TENANT_RUN_SHARD_INDEX,
-        OBSERVATIONS_TENANT_SEEN_AT_INDEX, OCCURRENCES_TENANT_FINDING_ID_INDEX,
-        OCCURRENCES_TENANT_OBJECT_VERSION_ID_INDEX,
+        FINDINGS_TABLE, FINDINGS_TENANT_SECRET_HASH_INDEX, FINDINGS_TENANT_STABLE_ITEM_ID_INDEX,
+        OBSERVATIONS_TABLE, OBSERVATIONS_TENANT_OCCURRENCE_ID_INDEX,
+        OBSERVATIONS_TENANT_OVID_HASH_INDEX, OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX,
+        OBSERVATIONS_TENANT_RUN_SHARD_INDEX, OBSERVATIONS_TENANT_SEEN_AT_INDEX, OCCURRENCES_TABLE,
+        OCCURRENCES_TENANT_FINDING_ID_INDEX, OCCURRENCES_TENANT_OBJECT_VERSION_ID_INDEX,
     };
 
     use super::{EmbeddedMigration, FindingsPgMigrationError, MIGRATIONS, verify_stored_checksum};
@@ -456,7 +456,7 @@ mod tests {
     fn migration_checksums_are_stable() {
         let expected: &[(&str, &str)] = &[(
             "0001_findings_schema",
-            "520ddb36ee644e1985208f1b7cea7ba7c10eaa901e288d629a10e35b6815e160",
+            "0e4db3e9eb0d1755c5ba77931c322c9da182faedfe1957d334e6668f5db7dcdb",
         )];
 
         assert_eq!(
@@ -482,6 +482,15 @@ mod tests {
     #[test]
     fn migration_sql_uses_schema_index_names_and_keeps_policy_hash_out_of_occurrences() {
         let sql = MIGRATIONS[0].sql();
+
+        for table_name in [FINDINGS_TABLE, OCCURRENCES_TABLE, OBSERVATIONS_TABLE] {
+            let create_stmt = format!("CREATE TABLE {table_name}");
+            assert!(
+                sql.contains(&create_stmt),
+                "embedded migration must contain `{create_stmt}`"
+            );
+        }
+
         for index_name in [
             FINDINGS_TENANT_SECRET_HASH_INDEX,
             FINDINGS_TENANT_STABLE_ITEM_ID_INDEX,

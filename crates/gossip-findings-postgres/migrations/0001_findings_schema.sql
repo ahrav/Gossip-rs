@@ -57,7 +57,7 @@ CREATE TABLE occurrences (
     CONSTRAINT occurrences_byte_length_positive_ck
         CHECK (byte_length > 0),
     CONSTRAINT occurrences_span_no_overflow_ck
-        CHECK (byte_offset <= 9223372036854775806 - byte_length),
+        CHECK (byte_offset <= 9223372036854775807 - byte_length),
     CONSTRAINT occurrences_finding_fk
         FOREIGN KEY (tenant_id, finding_id)
         REFERENCES findings (tenant_id, finding_id)
