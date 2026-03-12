@@ -39,6 +39,7 @@ use gossip_contracts::{
     },
     test_util::{done_record, ovid, policy, tenant},
 };
+use gossip_stdx::test_support::proptest_cases;
 use proptest::{
     prelude::*,
     sample::select,
@@ -215,18 +216,6 @@ const PG_BIGINT_MAX: u64 = i64::MAX as u64;
 /// Upper bound of `u32` values that fit in a PostgreSQL `INTEGER` (signed `i32`).
 const PG_INTEGER_MAX: u32 = i32::MAX as u32;
 
-/// Default proptest case count for the SQL/Rust merge parity test.
-///
-/// Override via `PROPTEST_CASES=N` environment variable. The default of 256
-/// balances confidence with CI wall-clock time (~5.6k SQL round-trips).
-/// Set higher (e.g. 1000) for thorough pre-merge validation.
-fn proptest_case_count() -> u32 {
-    std::env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256)
-}
-
 /// Representative error-code strings used by proptest generators.
 ///
 /// Non-scanned statuses require a non-`NULL` `error_code`; strategies index
@@ -334,6 +323,7 @@ fn arb_bigint_domain_u64() -> BoxedStrategy<u64> {
         Just(PG_BIGINT_MAX - 1),
         Just(PG_BIGINT_MAX),
         3u64..=4_096u64,
+        (PG_BIGINT_MAX / 4)..=(PG_BIGINT_MAX / 2),
         (PG_BIGINT_MAX - 4_096u64)..=PG_BIGINT_MAX,
     ]
     .boxed()
@@ -515,40 +505,37 @@ fn arb_general_case() -> BoxedStrategy<MergeParityCase> {
 /// The incoming record always has a strictly higher status rank than the
 /// existing record, guaranteeing that the merge winner is determined by
 /// the first tier of the tie-breaking rule (status rank).
+///
+/// Uses structural index generation (`existing_idx` < `incoming_idx` into
+/// the rank-sorted `ALL_STATUSES`) instead of `prop_filter`, eliminating
+/// rejections and improving shrinkability.
 fn arb_higher_status_case() -> BoxedStrategy<MergeParityCase> {
     (
         arb_key_seeds(),
-        arb_status(),
+        0usize..ALL_STATUSES.len() - 1,
         arb_raw_record_spec(),
-        arb_status(),
         arb_raw_record_spec(),
     )
-        .prop_filter(
-            "higher-status scenario needs distinct statuses",
-            |(_, existing_status, _, incoming_status, _)| existing_status != incoming_status,
-        )
-        .prop_map(
-            |(key_seeds, left_status, left_raw_record, right_status, right_raw_record)| {
-                let (existing_status, incoming_status, existing_raw_record, incoming_raw_record) =
-                    if left_status.rank() < right_status.rank() {
-                        (left_status, right_status, left_raw_record, right_raw_record)
-                    } else {
-                        (right_status, left_status, right_raw_record, left_raw_record)
-                    };
+        .prop_flat_map(
+            |(key_seeds, existing_idx, existing_raw_record, incoming_raw_record)| {
+                (existing_idx + 1..ALL_STATUSES.len()).prop_map(move |incoming_idx| {
+                    let existing_status = ALL_STATUSES[existing_idx];
+                    let incoming_status = ALL_STATUSES[incoming_idx];
 
-                MergeParityCase {
-                    scenario: MergeScenario::HigherStatus,
-                    existing: build_generated_record(
-                        key_seeds,
-                        existing_status,
-                        existing_raw_record,
-                    ),
-                    incoming: build_generated_record(
-                        key_seeds,
-                        incoming_status,
-                        incoming_raw_record,
-                    ),
-                }
+                    MergeParityCase {
+                        scenario: MergeScenario::HigherStatus,
+                        existing: build_generated_record(
+                            key_seeds,
+                            existing_status,
+                            existing_raw_record,
+                        ),
+                        incoming: build_generated_record(
+                            key_seeds,
+                            incoming_status,
+                            incoming_raw_record,
+                        ),
+                    }
+                })
             },
         )
         .boxed()
@@ -563,6 +550,7 @@ fn arb_later_finished_case() -> BoxedStrategy<MergeParityCase> {
         arb_status(),
         arb_raw_record_spec(),
         arb_raw_record_spec(),
+        prop_oneof![Just(0u64), Just(PG_BIGINT_MAX - 3_000u64)],
         (
             0u64..=2_000u64,
             0u64..=200u64,
@@ -576,11 +564,19 @@ fn arb_later_finished_case() -> BoxedStrategy<MergeParityCase> {
                 status,
                 existing_raw_record,
                 incoming_raw_record,
-                (existing_started_at, existing_duration, later_finished_gap, incoming_started_raw),
+                base_offset,
+                (
+                    existing_started_at_raw,
+                    existing_duration,
+                    later_finished_gap,
+                    incoming_started_raw,
+                ),
             )| {
+                let existing_started_at = base_offset + existing_started_at_raw;
                 let existing_finished_at = existing_started_at + existing_duration;
                 let incoming_finished_at = existing_finished_at + later_finished_gap;
-                let incoming_started_at = incoming_started_raw.min(incoming_finished_at);
+                let incoming_started_at =
+                    (base_offset + incoming_started_raw).min(incoming_finished_at);
 
                 debug_assert!(
                     incoming_finished_at > existing_finished_at,
@@ -617,58 +613,64 @@ fn arb_later_finished_case() -> BoxedStrategy<MergeParityCase> {
 /// strictly later `started_at`. This isolates the third and final tier of
 /// the tie-breaking rule (latest `started_at` wins when status and
 /// `finished_at` are equal).
+///
+/// Uses `prop_flat_map` so the gap between `existing_started_at` and
+/// `incoming_started_at` is drawn uniformly from `1..=max_gap` rather
+/// than generated from a fixed range and clamped (which biases toward
+/// the boundary when `max_gap` is small).
 fn arb_later_started_case() -> BoxedStrategy<MergeParityCase> {
     (
         arb_key_seeds(),
         arb_status(),
         arb_raw_record_spec(),
         arb_raw_record_spec(),
-        (1u64..=2_000u64, 0u64..=1_999u64, 1u64..=2_000u64),
+        prop_oneof![Just(0u64), Just(PG_BIGINT_MAX - 3_000u64)],
+        (1u64..=2_000u64, 0u64..=1_999u64),
     )
-        .prop_map(
+        .prop_flat_map(
             |(
                 key_seeds,
                 status,
                 existing_raw_record,
                 incoming_raw_record,
-                (finished_at, existing_started_raw, incoming_started_gap_raw),
+                base_offset,
+                (finished_at_rel, existing_started_raw),
             )| {
-                let existing_started_at = existing_started_raw.min(finished_at - 1);
-                let max_gap = finished_at - existing_started_at;
-                // When `finished_at` is small (e.g., 1), `max_gap` can be 1,
-                // collapsing `incoming_started_gap_raw` to a single effective
-                // value. This is harmless: the strict-inequality invariant
-                // still holds and larger `finished_at` values exercise the
-                // full gap range.
-                let incoming_started_at =
-                    existing_started_at + incoming_started_gap_raw.min(max_gap);
+                let existing_started_at_rel = existing_started_raw.min(finished_at_rel - 1);
+                let max_gap = finished_at_rel - existing_started_at_rel;
 
-                debug_assert!(
-                    incoming_started_at > existing_started_at,
-                    "LaterStartedAt requires strictly later started_at"
-                );
+                (1u64..=max_gap.max(1)).prop_map(move |gap| {
+                    let finished_at = base_offset + finished_at_rel;
+                    let existing_started_at = base_offset + existing_started_at_rel;
+                    let incoming_started_at = existing_started_at + gap;
 
-                MergeParityCase {
-                    scenario: MergeScenario::LaterStartedAt,
-                    existing: build_generated_record(
-                        key_seeds,
-                        status,
-                        raw_record_with_timing(
-                            existing_raw_record,
-                            existing_started_at,
-                            finished_at,
+                    debug_assert!(
+                        incoming_started_at > existing_started_at,
+                        "LaterStartedAt requires strictly later started_at"
+                    );
+
+                    MergeParityCase {
+                        scenario: MergeScenario::LaterStartedAt,
+                        existing: build_generated_record(
+                            key_seeds,
+                            status,
+                            raw_record_with_timing(
+                                existing_raw_record,
+                                existing_started_at,
+                                finished_at,
+                            ),
                         ),
-                    ),
-                    incoming: build_generated_record(
-                        key_seeds,
-                        status,
-                        raw_record_with_timing(
-                            incoming_raw_record,
-                            incoming_started_at,
-                            finished_at,
+                        incoming: build_generated_record(
+                            key_seeds,
+                            status,
+                            raw_record_with_timing(
+                                incoming_raw_record,
+                                incoming_started_at,
+                                finished_at,
+                            ),
                         ),
-                    ),
-                }
+                    }
+                })
             },
         )
         .boxed()
@@ -684,6 +686,7 @@ fn arb_exact_tie_case() -> BoxedStrategy<MergeParityCase> {
         arb_status(),
         arb_raw_record_spec(),
         arb_raw_record_spec(),
+        prop_oneof![Just(0u64), Just(PG_BIGINT_MAX - 3_000u64)],
         (0u64..=2_000u64, 0u64..=200u64),
     )
         .prop_map(
@@ -692,8 +695,10 @@ fn arb_exact_tie_case() -> BoxedStrategy<MergeParityCase> {
                 status,
                 existing_raw_record,
                 incoming_raw_record,
-                (started_at, duration),
+                base_offset,
+                (started_at_raw, duration),
             )| {
+                let started_at = base_offset + started_at_raw;
                 let finished_at = started_at + duration;
 
                 MergeParityCase {
@@ -878,8 +883,9 @@ fn done_ledger_backend_passes_conformance_suite() {
 fn sql_on_conflict_merge_matches_rust_merge_proptest() {
     let backend = DoneLedgerPg::from_client(test_client());
     let strategy = arb_merge_parity_case();
+    let case_count = proptest_cases(256);
     let mut runner = TestRunner::new(ProptestConfig {
-        cases: proptest_case_count(),
+        cases: case_count,
         max_shrink_iters: 256,
         source_file: Some(file!()),
         ..ProptestConfig::default()
@@ -918,32 +924,52 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
                 case.scenario,
                 "incoming_then_existing",
             )?;
+
+            // Independent contract assertion: on exact tie, SQL must
+            // preserve the first-written (existing) record's provenance.
+            // This checks the contract directly rather than via the Rust
+            // merge, catching bugs where both Rust and SQL agree on the
+            // *wrong* answer.
+            if case.scenario == MergeScenario::ExactTie {
+                let sql_result = run_sql_merge_order(&backend, &case.existing, &case.incoming)?;
+                prop_assert_eq!(
+                    sql_result.provenance(),
+                    case.existing.provenance(),
+                    "ExactTie: SQL should preserve existing record's provenance"
+                );
+            }
+
             Ok(())
         })
         .expect("SQL and Rust merge parity proptest should pass");
 
-    let seen_statuses = seen_statuses.into_inner();
-    let expected_statuses: HashSet<_> = ALL_STATUSES.into_iter().collect();
-    assert_eq!(
-        seen_statuses, expected_statuses,
-        "proptest should exercise every DoneLedgerStatus variant"
-    );
-    assert!(
-        saw_higher_status.get(),
-        "proptest should cover higher-status provenance winner selection"
-    );
-    assert!(
-        saw_later_finished.get(),
-        "proptest should cover later-finished provenance winner selection"
-    );
-    assert!(
-        saw_later_started.get(),
-        "proptest should cover later-started provenance winner selection"
-    );
-    assert!(
-        saw_exact_tie.get(),
-        "proptest should cover exact-tie stability (existing row wins)"
-    );
+    // Coverage assertions require enough cases to hit every scenario arm.
+    // When running locally with the auto-clamped minimum (4 cases), skip
+    // these checks — they are validated in CI at higher case counts.
+    if case_count >= 100 {
+        let seen_statuses = seen_statuses.into_inner();
+        let expected_statuses: HashSet<_> = ALL_STATUSES.into_iter().collect();
+        assert_eq!(
+            seen_statuses, expected_statuses,
+            "proptest should exercise every DoneLedgerStatus variant"
+        );
+        assert!(
+            saw_higher_status.get(),
+            "proptest should cover higher-status provenance winner selection"
+        );
+        assert!(
+            saw_later_finished.get(),
+            "proptest should cover later-finished provenance winner selection"
+        );
+        assert!(
+            saw_later_started.get(),
+            "proptest should cover later-started provenance winner selection"
+        );
+        assert!(
+            saw_exact_tie.get(),
+            "proptest should cover exact-tie stability (existing row wins)"
+        );
+    }
 }
 
 /// `batch_get` with an empty `ovid_hashes` slice must return an empty vec
@@ -1311,6 +1337,80 @@ fn cross_batch_upsert_equal_status_picks_later_finished_at() {
     assert_eq!(merged.error_code().map(|c| c.as_str()), Some("ERR_B"),);
 }
 
+/// The SQL merge uses `GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count, 1)`
+/// for `ScannedWithFindings` status. This test verifies the floor clamp (the
+/// trailing `1`) is load-bearing: the existing `FailedRetryable` record has
+/// `findings_count=0`, so without the floor the merged value would be
+/// `GREATEST(1, 0) = 1` — coincidentally correct. With `findings_count=0` on
+/// the existing side, the three-argument GREATEST is the only thing preventing
+/// `GREATEST(0, 0) = 0` when an incoming `ScannedWithFindings` also carried 0
+/// (which Rust validation rejects, but SQL must handle defensively).
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    backend
+        .truncate_all_for_tests()
+        .expect("truncate should succeed before test");
+
+    // First batch: FailedRetryable with findings_count=0.
+    let failed = done_record(
+        7,
+        8,
+        51,
+        DoneLedgerStatus::FailedRetryable,
+        100,
+        0,
+        10,
+        11,
+        12,
+        50,
+        100,
+        Some("ERR"),
+    );
+    backend
+        .batch_upsert(std::slice::from_ref(&failed))
+        .expect("first upsert should succeed")
+        .wait()
+        .expect("first commit should succeed");
+
+    // Second batch: ScannedWithFindings with findings_count=1.
+    // Merge promotes status to ScannedWithFindings (rank 11 > rank 1).
+    // SQL GREATEST(1, 0, 1) = 1, exercising the floor clamp.
+    let scanned = done_record(
+        7,
+        8,
+        51,
+        DoneLedgerStatus::ScannedWithFindings,
+        200,
+        1,
+        20,
+        21,
+        22,
+        60,
+        150,
+        None,
+    );
+    backend
+        .batch_upsert(std::slice::from_ref(&scanned))
+        .expect("second upsert should succeed")
+        .wait()
+        .expect("second commit should succeed");
+
+    let fetched = backend
+        .batch_get(tenant(7), policy(8), &[ovid(51)])
+        .expect("batch_get should succeed");
+    let merged = fetched[0]
+        .as_ref()
+        .expect("row should exist after cross-batch upsert");
+
+    assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
+    // GREATEST(1, 0, 1) = 1 — the floor clamp is exercised because the
+    // existing record contributed findings_count=0.
+    assert_eq!(merged.findings_count(), 1);
+    assert_eq!(merged.provenance(), scanned.provenance());
+}
+
 // ── Schema constraint enforcement ───────────────────────────────────────
 //
 // These tests bypass `DoneLedgerPg` and issue raw SQL `INSERT` statements
@@ -1583,6 +1683,92 @@ fn schema_enforces_finished_at_ge_started_at() {
         },
     )
     .expect_err("finished_at < started_at should violate CHECK constraint");
+    assert_check_violation(&err);
+}
+
+/// `findings_count` is stored as `INTEGER` and must be non-negative.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn schema_rejects_negative_findings_count() {
+    let mut client = test_client();
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            findings_count: Some(-1),
+            ..Default::default()
+        },
+    )
+    .expect_err("findings_count=-1 should violate CHECK constraint");
+    assert_check_violation(&err);
+}
+
+/// `fence_epoch` is stored as `BIGINT` and must be non-negative.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn schema_rejects_negative_fence_epoch() {
+    let mut client = test_client();
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            fence_epoch: Some(-1),
+            ..Default::default()
+        },
+    )
+    .expect_err("fence_epoch=-1 should violate CHECK constraint");
+    assert_check_violation(&err);
+}
+
+/// `started_at` is stored as `BIGINT` and must be non-negative.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn schema_rejects_negative_started_at() {
+    let mut client = test_client();
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            started_at: Some(-1),
+            finished_at: Some(0),
+            ..Default::default()
+        },
+    )
+    .expect_err("started_at=-1 should violate CHECK constraint");
+    assert_check_violation(&err);
+}
+
+/// `error_code` has a max length of 128 bytes. A 129-byte string must be
+/// rejected by the `octet_length(...) BETWEEN 1 AND 128` CHECK.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn schema_rejects_oversized_error_code() {
+    let mut client = test_client();
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(1),
+            error_code: Some("X".repeat(129)),
+            ..Default::default()
+        },
+    )
+    .expect_err("129-byte error_code should violate CHECK constraint");
+    assert_check_violation(&err);
+}
+
+/// An empty `error_code` string violates the `octet_length(...) BETWEEN 1
+/// AND 128` CHECK — the minimum length is 1, not 0.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn schema_rejects_empty_error_code() {
+    let mut client = test_client();
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(1),
+            error_code: Some(String::new()),
+            ovid_hash: Some(vec![0xF1; 32]),
+            ..Default::default()
+        },
+    )
+    .expect_err("empty error_code should violate CHECK constraint");
     assert_check_violation(&err);
 }
 

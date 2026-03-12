@@ -26,3 +26,4 @@ blake3 = "1.8"
 testcontainers.workspace = true
 proptest.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
+gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
