@@ -279,7 +279,9 @@ impl DoneLedgerSim {
         let mut all_violations = Vec::new();
 
         // Release all ops in the store in oldest-first order.
-        let _ = self.ledger.release_all(CompletionOrder::OldestFirst);
+        self.ledger
+            .release_all(CompletionOrder::OldestFirst)
+            .expect("release_all should not fail on InMemoryDoneLedger");
 
         // Empty snapshot — I8 checks are skipped for stale pre-snapshots.
         let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();
@@ -384,7 +386,10 @@ impl DoneLedgerSim {
                 self.oracle.submit(op_id, records.to_vec());
 
                 // Check if this is a delayed write by querying pending IDs.
-                let pending_ids = self.ledger.pending_ids().unwrap_or_default();
+                let pending_ids = self
+                    .ledger
+                    .pending_ids()
+                    .expect("pending_ids should not fail on InMemoryDoneLedger");
 
                 if pending_ids.contains(&op_id) {
                     // Write is delayed — retain handle for later verification.
@@ -529,7 +534,12 @@ impl DoneLedgerSim {
                         }
                     }
                 } else {
-                    (DoneLedgerSimEvent::ReleaseNoop, Vec::new())
+                    // The store released this op but the harness has no
+                    // record of it — same invariant as exec_release_next.
+                    panic!(
+                        "release_specific returned Ok(true) for op_id {op_id} \
+                         which has no entry in pending_batches — harness tracking bug"
+                    );
                 }
             }
             Ok(false) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
@@ -544,7 +554,10 @@ impl DoneLedgerSim {
         let mut all_violations = Vec::new();
 
         // Release all ops in the store.
-        let count = self.ledger.release_all(order).unwrap_or_default();
+        let count = self
+            .ledger
+            .release_all(order)
+            .expect("release_all should not fail on InMemoryDoneLedger");
 
         // Empty snapshot for delayed writes (stale pre-snapshot).
         let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();

@@ -198,16 +198,22 @@ impl DoneLedgerInvariantChecker {
         let mut violations = Vec::new();
 
         // Deduplicate within the batch using merge — mirrors what
-        // DoneLedgerBackend::apply does internally.
+        // DoneLedgerBackend::apply does internally. A committed batch
+        // has already passed upfront validation, so merge should not
+        // fail here. Panic if it does to surface the inconsistency.
         let mut deduped: HashMap<DoneLedgerKey, DoneLedgerRecord> =
             HashMap::with_capacity(records.len());
         for rec in records {
             let key = rec.key();
             match deduped.get(&key) {
                 Some(existing) => {
-                    if let Ok(merged) = existing.merge(rec) {
-                        deduped.insert(key, merged);
-                    }
+                    let merged = existing.merge(rec).unwrap_or_else(|e| {
+                        panic!(
+                            "invariant checker merge failure for key {key:?}: {e} \
+                             — committed batch should not contain records that fail to merge"
+                        );
+                    });
+                    deduped.insert(key, merged);
                 }
                 None => {
                     deduped.insert(key, rec.clone());

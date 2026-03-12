@@ -121,7 +121,7 @@ impl DoneLedgerOracle {
         &self,
         ledger: &InMemoryDoneLedger,
     ) -> Vec<DoneLedgerInvariantViolation> {
-        debug_assert!(
+        assert!(
             self.pending.is_empty(),
             "verify_convergence called with {} pending batches — \
              drain all pending ops first",
