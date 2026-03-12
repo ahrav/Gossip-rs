@@ -9,8 +9,8 @@
 //! A single PostgreSQL instance is shared across the test binary, while each
 //! test gets a freshly created database for isolation.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use postgres::{Client, NoTls};
 use testcontainers::core::{IntoContainerPort, WaitFor};
