@@ -1384,6 +1384,8 @@ name = "gossip-persistence-inmemory"
 version = "0.1.0"
 dependencies = [
  "gossip-contracts",
+ "rand",
+ "rand_chacha",
 ]
 
 [[package]]
