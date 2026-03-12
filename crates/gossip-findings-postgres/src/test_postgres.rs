@@ -72,8 +72,33 @@ fn shared_endpoint() -> &'static PgEndpoint {
             .get_host_port_ipv4(5432)
             .expect("failed to resolve mapped postgres port");
 
+        let url =
+            format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
+
+        // Guard against a WaitFor early-ready race: PostgreSQL logs the
+        // "ready to accept connections" message twice during startup and the
+        // container may not be fully accepting connections on the first match.
+        // Retry the initial connect a few times with backoff.
+        let mut last_err = None;
+        for attempt in 0..5 {
+            match Client::connect(&url, NoTls) {
+                Ok(c) => {
+                    drop(c);
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1)));
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("postgres container not accepting connections after retries: {e}");
+        }
+
         PgEndpoint {
-            url: format!("host={host} port={port} user=postgres password=postgres dbname=postgres"),
+            url,
             _container: Some(container),
         }
     })
@@ -265,7 +290,7 @@ pub(crate) fn create_test_db() -> String {
     let mut admin = Client::connect(&endpoint.url, NoTls)
         .expect("failed to connect to postgres maintenance database");
     admin
-        .batch_execute(&format!("CREATE DATABASE {db_name}"))
+        .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
         .expect("failed to create fresh test database");
     connection_string_for_db(&endpoint.url, &db_name)
 }

@@ -1181,3 +1181,168 @@ fn observations_natural_unique_prevents_duplicates() {
     assert_unique_violation(&err);
     assert_constraint_name(&err, "observations_natural_unique");
 }
+
+// ── Additional bytea length constraint tests ──────────────────────────────
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_rejects_short_secret_hash() {
+    let mut client = test_client();
+    let err = try_insert_finding(
+        &mut client,
+        FindingOverrides {
+            secret_hash: Some(vec![0x14; 31]),
+            ..Default::default()
+        },
+    )
+    .expect_err("31-byte secret_hash should violate findings length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "findings_secret_hash_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_rejects_short_finding_id() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            finding_id: Some(vec![0x11; 31]),
+            ..Default::default()
+        },
+    )
+    .expect_err("31-byte finding_id should violate occurrences length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "occurrences_finding_id_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_short_ovid_hash() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            ovid_hash: Some(vec![0x33; 31]),
+            ..Default::default()
+        },
+    )
+    .expect_err("31-byte ovid_hash should violate observations length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_ovid_hash_len_ck");
+}
+
+// ── Round-trip read-back tests ────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_round_trip_all_columns() {
+    let mut client = test_client();
+    try_insert_finding(&mut client, FindingOverrides::default())
+        .expect("default finding should insert cleanly");
+
+    let defaults = FindingOverrides::defaults();
+    let tenant_id = defaults.tenant_id.unwrap();
+    let finding_id = defaults.finding_id.unwrap();
+
+    let row = client
+        .query_one(
+            &format!(
+                "SELECT tenant_id, finding_id, stable_item_id, rule_fingerprint, secret_hash
+                 FROM {} WHERE tenant_id = $1 AND finding_id = $2",
+                schema::FINDINGS_TABLE
+            ),
+            &[&tenant_id, &finding_id],
+        )
+        .expect("inserted finding should be readable");
+
+    assert_eq!(row.get::<_, Vec<u8>>(0), tenant_id);
+    assert_eq!(row.get::<_, Vec<u8>>(1), finding_id);
+    assert_eq!(row.get::<_, Vec<u8>>(2), defaults.stable_item_id.unwrap());
+    assert_eq!(row.get::<_, Vec<u8>>(3), defaults.rule_fingerprint.unwrap());
+    assert_eq!(row.get::<_, Vec<u8>>(4), defaults.secret_hash.unwrap());
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_round_trip_all_columns() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    try_insert_occurrence(&mut client, OccurrenceOverrides::default())
+        .expect("default occurrence should insert cleanly");
+
+    let defaults = OccurrenceOverrides::defaults();
+    let tenant_id = defaults.tenant_id.unwrap();
+    let occurrence_id = defaults.occurrence_id.unwrap();
+
+    let row = client
+        .query_one(
+            &format!(
+                "SELECT tenant_id, occurrence_id, finding_id, object_version_id,
+                        byte_offset, byte_length
+                 FROM {} WHERE tenant_id = $1 AND occurrence_id = $2",
+                schema::OCCURRENCES_TABLE
+            ),
+            &[&tenant_id, &occurrence_id],
+        )
+        .expect("inserted occurrence should be readable");
+
+    assert_eq!(row.get::<_, Vec<u8>>(0), tenant_id);
+    assert_eq!(row.get::<_, Vec<u8>>(1), occurrence_id);
+    assert_eq!(row.get::<_, Vec<u8>>(2), defaults.finding_id.unwrap());
+    assert_eq!(
+        row.get::<_, Vec<u8>>(3),
+        defaults.object_version_id.unwrap()
+    );
+    assert_eq!(row.get::<_, i64>(4), defaults.byte_offset.unwrap());
+    assert_eq!(row.get::<_, i64>(5), defaults.byte_length.unwrap());
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_round_trip_all_columns() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    try_insert_observation(&mut client, ObservationOverrides::default())
+        .expect("default observation should insert cleanly");
+
+    let defaults = ObservationOverrides::defaults();
+    let tenant_id = defaults.tenant_id.unwrap();
+    let observation_id = defaults.observation_id.unwrap();
+
+    let row = client
+        .query_one(
+            &format!(
+                "SELECT tenant_id, observation_id, occurrence_id, policy_hash, ovid_hash,
+                        run_id, shard_id, fence_epoch, seen_at,
+                        location_display, location_url
+                 FROM {} WHERE tenant_id = $1 AND observation_id = $2",
+                schema::OBSERVATIONS_TABLE
+            ),
+            &[&tenant_id, &observation_id],
+        )
+        .expect("inserted observation should be readable");
+
+    assert_eq!(row.get::<_, Vec<u8>>(0), tenant_id);
+    assert_eq!(row.get::<_, Vec<u8>>(1), observation_id);
+    assert_eq!(row.get::<_, Vec<u8>>(2), defaults.occurrence_id.unwrap());
+    assert_eq!(row.get::<_, Vec<u8>>(3), defaults.policy_hash.unwrap());
+    assert_eq!(row.get::<_, Vec<u8>>(4), defaults.ovid_hash.unwrap());
+    assert_eq!(row.get::<_, i64>(5), defaults.run_id.unwrap());
+    assert_eq!(row.get::<_, i64>(6), defaults.shard_id.unwrap());
+    assert_eq!(row.get::<_, i64>(7), defaults.fence_epoch.unwrap());
+    assert_eq!(row.get::<_, i64>(8), defaults.seen_at.unwrap());
+    assert_eq!(
+        row.get::<_, Option<String>>(9),
+        defaults.location_display.unwrap()
+    );
+    assert_eq!(
+        row.get::<_, Option<String>>(10),
+        defaults.location_url.unwrap()
+    );
+}
