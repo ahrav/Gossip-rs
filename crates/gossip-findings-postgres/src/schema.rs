@@ -12,8 +12,11 @@
 //! - Row field order matches the corresponding `*_INSERT_COLUMNS` constant so
 //!   future bind-array SQL can share a single source of truth for column
 //!   ordering.
-//! - Ordered `BIGINT` columns use checked non-negative conversion, while
-//!   equality-only identifiers use bit-pattern storage.
+//! - Ordered `BIGINT` columns (`fence_epoch`, `seen_at`, `byte_offset`,
+//!   `byte_length`) use checked non-negative conversion because SQL `ORDER BY`
+//!   and range-scan indexes depend on signed integer ordering matching the
+//!   logical counter ordering. Equality-only identifiers (`run_id`, `shard_id`)
+//!   use bit-pattern storage where ordering is irrelevant.
 
 use gossip_contracts::persistence::{
     FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
@@ -161,16 +164,21 @@ impl FindingsSchemaPlan {
 
     /// Validate a contracts-layer batch against the schema plan.
     ///
-    /// This runs the contracts-layer identity and referential checks before any
-    /// Postgres-specific integer conversions happen, so projection failures
-    /// only need to handle storage-boundary representation issues.
+    /// Runs the observation-identity invariant check before any Postgres-specific
+    /// integer conversions happen, so projection failures only need to handle
+    /// storage-boundary representation issues.
+    ///
+    /// Referential integrity (occurrence→finding, observation→occurrence) is
+    /// **not** checked here because batches may legitimately reference parents
+    /// that are already persisted but absent from the current batch. The real
+    /// enforcement point is the PostgreSQL foreign-key constraints on the
+    /// durable tables.
     pub fn validate_batch(
         self,
         batch: FindingsUpsertBatch<'_>,
     ) -> Result<(), FindingsPgSchemaError> {
         let _ = self;
         batch.validate_observation_identity()?;
-        batch.validate_referential_integrity()?;
         Ok(())
     }
 
@@ -289,8 +297,15 @@ impl ObservationRow {
     /// Project a contracts-layer observation into its durable row shape.
     ///
     /// `run_id` and `shard_id` use bit-pattern storage because callers only
-    /// need equality semantics for those columns. Ordered columns use checked
-    /// non-negative `BIGINT` conversion so SQL ordering stays correct.
+    /// need equality and grouping semantics (`=`, `GROUP BY`) for provenance
+    /// lookups — no SQL `ORDER BY` or range scan ever targets these columns.
+    ///
+    /// `fence_epoch` and `seen_at` use checked non-negative `BIGINT` conversion
+    /// because SQL `ORDER BY` and indexed range scans on `observations_tenant_seen_at_idx`
+    /// rely on PostgreSQL's signed integer ordering matching the logical
+    /// monotonic counter ordering. Bit-pattern storage would invert the
+    /// ordering for values above `i64::MAX`, breaking recency queries. Values
+    /// exceeding `i64::MAX` are rejected rather than silently misordered.
     pub fn from_record(record: &ObservationRecord) -> Result<Self, FindingsPgSchemaError> {
         let (location_display, location_url) = match record.location() {
             Some(location) => (
@@ -373,7 +388,6 @@ mod tests {
         },
         persistence::{
             FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord, OvidHash,
-            PersistenceInputError,
         },
     };
     use gossip_done_ledger_postgres::schema as done_ledger_schema;
@@ -481,6 +495,22 @@ mod tests {
             err,
             FindingsPgSchemaError::PgU64Conversion(PgU64ConversionError::OrderedOutOfRange {
                 field: "byte_offset",
+                value: i64::MAX as u64 + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn occurrence_row_from_record_rejects_byte_length_above_pg_bigint_max() {
+        let tenant_id = TenantId::from_bytes([0x11; 32]);
+        let finding = finding_record(tenant_id);
+        let record = occurrence_record(tenant_id, finding.finding_id(), 0, i64::MAX as u64 + 1);
+
+        let err = OccurrenceRow::from_record(&record).expect_err("overflow should fail");
+        assert_eq!(
+            err,
+            FindingsPgSchemaError::PgU64Conversion(PgU64ConversionError::OrderedOutOfRange {
+                field: "byte_length",
                 value: i64::MAX as u64 + 1,
             })
         );
@@ -645,30 +675,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_batch_rejects_orphaned_observations() {
-        let tenant_id = TenantId::from_bytes([0x11; 32]);
-        let observation = observation_record(
-            tenant_id,
-            gossip_contracts::identity::OccurrenceId::from_bytes([0x99; 32]),
-            12,
-            13,
-        );
-        let observations = [observation];
-        let batch = FindingsUpsertBatch::new(&[], &[], &observations);
-
-        let err = FindingsSchemaPlan::new()
-            .validate_batch(batch)
-            .expect_err("orphaned observation should fail referential validation");
-        assert_eq!(
-            err,
-            FindingsPgSchemaError::Persistence(PersistenceInputError::OrphanedReference {
-                child_type: "ObservationRecord",
-                parent_type: "OccurrenceRecord",
-            })
-        );
-    }
-
-    #[test]
     fn validate_batch_accepts_canonical_batches_built_from_public_contracts() {
         let tenant_id = TenantId::from_bytes([0x11; 32]);
         let finding = finding_record(tenant_id);
@@ -682,6 +688,27 @@ mod tests {
         FindingsSchemaPlan::new()
             .validate_batch(batch)
             .expect("canonical batch should pass validation");
+    }
+
+    #[test]
+    fn project_batch_accepts_incremental_submission_without_parent_finding() {
+        // Simulate an incremental write: the parent FindingRecord was already
+        // persisted in a prior batch, so this batch contains only an
+        // OccurrenceRecord referencing that finding_id.
+        let tenant_id = TenantId::from_bytes([0x11; 32]);
+        let finding = finding_record(tenant_id);
+        let occurrence = occurrence_record(tenant_id, finding.finding_id(), 3, 4);
+        let occurrences = [occurrence];
+        // No findings in this batch — they're already durable.
+        let batch = FindingsUpsertBatch::new(&[], &occurrences, &[]);
+
+        // Per the FindingsSink contract, references may be "persisted or
+        // in-batch". project_batch should accept this incremental batch.
+        let result = FindingsSchemaPlan::new().project_batch(batch);
+        assert!(
+            result.is_ok(),
+            "incremental batch with already-durable parent should project, got: {result:?}"
+        );
     }
 
     #[test]
