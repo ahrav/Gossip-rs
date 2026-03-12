@@ -168,7 +168,7 @@ impl DoneLedgerPg {
     pub(crate) fn truncate_all_for_tests(&self) -> Result<(), DoneLedgerPgError> {
         let mut client = self.lock_client()?;
         client.batch_execute(&format!(
-            "TRUNCATE TABLE {}",
+            "DELETE FROM {}",
             crate::schema::DONE_LEDGER_ENTRIES_TABLE
         ))?;
         Ok(())

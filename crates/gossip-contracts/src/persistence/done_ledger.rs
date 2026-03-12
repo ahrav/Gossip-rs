@@ -149,7 +149,20 @@ pub enum DoneLedgerStatus {
     ScannedWithFindings = 11,
 }
 
+/// Compile-time guard: if a variant is added or removed, the length of
+/// `DoneLedgerStatus::ALL` must be updated and this assertion will fail.
+const _: () = assert!(DoneLedgerStatus::ALL.len() == 5);
+
 impl DoneLedgerStatus {
+    /// All status variants in rank order, for exhaustive iteration.
+    pub const ALL: [DoneLedgerStatus; 5] = [
+        DoneLedgerStatus::FailedRetryable,
+        DoneLedgerStatus::FailedPermanent,
+        DoneLedgerStatus::Skipped,
+        DoneLedgerStatus::ScannedClean,
+        DoneLedgerStatus::ScannedWithFindings,
+    ];
+
     /// Numeric discriminant used as the total-order key for lattice merge.
     ///
     /// This value is what backends should persist and compare during upsert.

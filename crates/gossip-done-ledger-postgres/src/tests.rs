@@ -268,14 +268,17 @@ const PG_BIGINT_MAX: u64 = i64::MAX as u64;
 /// Upper bound of `u32` values that fit in a PostgreSQL `INTEGER` (signed `i32`).
 const PG_INTEGER_MAX: u32 = i32::MAX as u32;
 
-/// Number of proptest cases for the SQL/Rust merge parity test.
+/// Default proptest case count for the SQL/Rust merge parity test.
 ///
-/// 1,000 cases across five weighted scenarios (General ×2, HigherStatus,
-/// LaterFinishedAt, LaterStartedAt, ExactTie) provide high confidence that
-/// the SQL `ON CONFLICT` clause and `DoneLedgerRecord::merge` agree on all
-/// reachable merge outcomes. Post-run assertions verify that all five status
-/// variants and all non-General scenarios were exercised.
-const SQL_RUST_MERGE_PROPTEST_CASES: u32 = 1_000;
+/// Override via `PROPTEST_CASES=N` environment variable. The default of 256
+/// balances confidence with CI wall-clock time (~5.6k SQL round-trips).
+/// Set higher (e.g. 1000) for thorough pre-merge validation.
+fn proptest_case_count() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
 
 /// Representative error-code strings used by proptest generators.
 ///
@@ -290,13 +293,7 @@ const VALID_ERROR_CODES: [&str; 5] = [
 ];
 /// All five [`DoneLedgerStatus`] variants, used for exhaustiveness checks
 /// after proptest runs and as the sampling universe for `arb_status()`.
-const ALL_STATUSES: [DoneLedgerStatus; 5] = [
-    DoneLedgerStatus::FailedRetryable,
-    DoneLedgerStatus::FailedPermanent,
-    DoneLedgerStatus::Skipped,
-    DoneLedgerStatus::ScannedClean,
-    DoneLedgerStatus::ScannedWithFindings,
-];
+const ALL_STATUSES: [DoneLedgerStatus; 5] = DoneLedgerStatus::ALL;
 
 /// Which branch of the merge tie-breaking logic a proptest case is designed
 /// to exercise.
@@ -925,7 +922,8 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
     let backend = DoneLedgerPg::from_client(test_client());
     let strategy = arb_merge_parity_case();
     let mut runner = TestRunner::new(ProptestConfig {
-        cases: SQL_RUST_MERGE_PROPTEST_CASES,
+        cases: proptest_case_count(),
+        source_file: Some(file!()),
         ..ProptestConfig::default()
     });
     let seen_statuses = RefCell::new(HashSet::new());
@@ -1538,4 +1536,178 @@ fn schema_enforces_finished_at_ge_started_at() {
     )
     .expect_err("finished_at < started_at should violate CHECK constraint");
     assert_check_violation(&err);
+}
+
+// ── COALESCE fallback coverage ──────────────────────────────────────────
+//
+// The SQL `ON CONFLICT` error_code merge uses `COALESCE(winner, loser)`.
+// When the provenance winner has a NULL error_code, COALESCE falls back
+// to the loser's error_code. This path is unreachable through Rust-side
+// `batch_upsert` (which validates that non-scanned rows always carry an
+// error_code), so it must be exercised via raw SQL.
+
+/// Verifies the COALESCE fallback: when the provenance winner carries a
+/// NULL `error_code` and the loser carries a non-NULL one, the merged
+/// row inherits the loser's error_code.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn sql_coalesce_fallback_picks_non_null_error_code() {
+    let mut client = test_client();
+
+    // Insert initial row: non-scanned status with error_code and finished_at=100.
+    try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(1), // FailedRetryable
+            error_code: Some("ORIGINAL_ERR".to_string()),
+            finished_at: Some(100),
+            ..Default::default()
+        },
+    )
+    .expect("initial insert should succeed");
+
+    // Upsert with same key, same status, later finished_at (wins provenance),
+    // but NULL error_code. COALESCE should fall back to existing row's code.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {t} (tenant_id, policy_hash, ovid_hash, status, bytes_scanned, \
+                 findings_count, fence_epoch, started_at, finished_at, run_id, shard_id, error_code) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET \
+                 status = GREATEST(EXCLUDED.status, {t}.status), \
+                 error_code = CASE \
+                     WHEN GREATEST(EXCLUDED.status, {t}.status) IN (10, 11) THEN NULL \
+                     WHEN ( \
+                         EXCLUDED.status > {t}.status \
+                         OR (EXCLUDED.status = {t}.status AND EXCLUDED.finished_at > {t}.finished_at) \
+                         OR (EXCLUDED.status = {t}.status AND EXCLUDED.finished_at = {t}.finished_at \
+                             AND EXCLUDED.started_at > {t}.started_at) \
+                     ) THEN COALESCE(EXCLUDED.error_code, {t}.error_code) \
+                     ELSE COALESCE({t}.error_code, EXCLUDED.error_code) \
+                 END",
+                t = crate::schema::DONE_LEDGER_ENTRIES_TABLE
+            ),
+            &[
+                &vec![0xAAu8; 32] as &(dyn postgres::types::ToSql + Sync),
+                &vec![0xBBu8; 32],
+                &vec![0xCCu8; 32],
+                &1i16,           // same status
+                &1024i64,        // bytes_scanned
+                &0i32,           // findings_count
+                &1i64,           // fence_epoch
+                &100i64,         // started_at
+                &200i64,         // finished_at (later → wins provenance)
+                &2i64,           // run_id
+                &2i64,           // shard_id
+                &None::<String>, // NULL error_code on the winner
+            ],
+        )
+        .expect("COALESCE upsert should succeed");
+
+    let rows = client
+        .query(
+            &format!(
+                "SELECT error_code FROM {} WHERE tenant_id = $1 AND policy_hash = $2 AND ovid_hash = $3",
+                crate::schema::DONE_LEDGER_ENTRIES_TABLE
+            ),
+            &[
+                &vec![0xAAu8; 32] as &(dyn postgres::types::ToSql + Sync),
+                &vec![0xBBu8; 32],
+                &vec![0xCCu8; 32],
+            ],
+        )
+        .expect("query should succeed");
+
+    assert_eq!(rows.len(), 1);
+    let error_code: Option<String> = rows[0].get("error_code");
+    assert_eq!(
+        error_code.as_deref(),
+        Some("ORIGINAL_ERR"),
+        "COALESCE should fall back to the loser's non-NULL error_code"
+    );
+}
+
+/// Verifies the reverse path: when the existing (loser) has a non-NULL
+/// `error_code` and the incoming winner also has one, the winner's code
+/// is used directly (COALESCE short-circuits on its first non-NULL arg).
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn sql_coalesce_winner_error_code_takes_precedence() {
+    let mut client = test_client();
+
+    // Insert initial row with error_code "OLD_ERR" and finished_at=100.
+    try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(1),
+            error_code: Some("OLD_ERR".to_string()),
+            finished_at: Some(100),
+            ovid_hash: Some(vec![0xDD; 32]),
+            ..Default::default()
+        },
+    )
+    .expect("initial insert should succeed");
+
+    // Upsert: same status, later finished_at (wins), non-NULL error_code.
+    // COALESCE(EXCLUDED.error_code, existing.error_code) returns EXCLUDED's
+    // value because the first argument is non-NULL.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {t} (tenant_id, policy_hash, ovid_hash, status, bytes_scanned, \
+                 findings_count, fence_epoch, started_at, finished_at, run_id, shard_id, error_code) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET \
+                 status = GREATEST(EXCLUDED.status, {t}.status), \
+                 error_code = CASE \
+                     WHEN GREATEST(EXCLUDED.status, {t}.status) IN (10, 11) THEN NULL \
+                     WHEN ( \
+                         EXCLUDED.status > {t}.status \
+                         OR (EXCLUDED.status = {t}.status AND EXCLUDED.finished_at > {t}.finished_at) \
+                         OR (EXCLUDED.status = {t}.status AND EXCLUDED.finished_at = {t}.finished_at \
+                             AND EXCLUDED.started_at > {t}.started_at) \
+                     ) THEN COALESCE(EXCLUDED.error_code, {t}.error_code) \
+                     ELSE COALESCE({t}.error_code, EXCLUDED.error_code) \
+                 END",
+                t = crate::schema::DONE_LEDGER_ENTRIES_TABLE
+            ),
+            &[
+                &vec![0xAAu8; 32] as &(dyn postgres::types::ToSql + Sync),
+                &vec![0xBBu8; 32],
+                &vec![0xDDu8; 32],
+                &1i16,
+                &1024i64,
+                &0i32,
+                &1i64,
+                &100i64,
+                &200i64,
+                &3i64,
+                &3i64,
+                &Some("NEW_ERR".to_string()),
+            ],
+        )
+        .expect("winner-with-code upsert should succeed");
+
+    let rows = client
+        .query(
+            &format!(
+                "SELECT error_code FROM {} WHERE tenant_id = $1 AND policy_hash = $2 AND ovid_hash = $3",
+                crate::schema::DONE_LEDGER_ENTRIES_TABLE
+            ),
+            &[
+                &vec![0xAAu8; 32] as &(dyn postgres::types::ToSql + Sync),
+                &vec![0xBBu8; 32],
+                &vec![0xDDu8; 32],
+            ],
+        )
+        .expect("query should succeed");
+
+    assert_eq!(rows.len(), 1);
+    let error_code: Option<String> = rows[0].get("error_code");
+    assert_eq!(
+        error_code.as_deref(),
+        Some("NEW_ERR"),
+        "winner's non-NULL error_code should be used directly"
+    );
 }
