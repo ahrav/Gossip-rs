@@ -7,10 +7,18 @@ license.workspace = true
 publish = false
 description = "In-memory reference persistence backends for gossip-rs tests and simulation"
 
+[features]
+default = []
+test-support = ["gossip-contracts/test-support", "dep:rand", "dep:rand_chacha"]
+
 [lib]
 
 [dependencies]
 gossip-contracts = { workspace = true, features = ["test-support"] }
+rand = { version = "0.9", optional = true }
+rand_chacha = { version = "0.9", optional = true }
 
 [dev-dependencies]
 gossip-contracts = { workspace = true, features = ["test-support"] }
+rand = "0.9"
+rand_chacha = "0.9"

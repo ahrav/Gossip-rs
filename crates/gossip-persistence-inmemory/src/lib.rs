@@ -64,6 +64,9 @@ mod findings;
 pub(crate) mod pending;
 pub(crate) mod store;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod sim;
+
 pub use done_ledger::{InMemoryDoneLedger, InMemoryDoneLedgerHandle};
 pub use error::{CompletionOrder, InMemoryPersistenceError, InMemoryStoreKind, PendingWriteId};
 pub use findings::{InMemoryFindingsHandle, InMemoryFindingsSink};
