@@ -13,10 +13,11 @@
 > (`crates/gossip-done-ledger-postgres/src/`). Shared `u64 ↔ BIGINT` conversion
 > types and migration primitives live in `gossip-pg-common`
 > (`crates/gossip-pg-common/src/`). Findings PostgreSQL schema,
-> migration, and type-mapping scaffolding lives in `gossip-findings-postgres`
-> (`crates/gossip-findings-postgres/src/`); that crate currently provides the
-> canonical findings schema plan (table/index/column constants plus row
-> projections), findings-specific migration/type-mapping support, and does not
+> migrations, and type-mapping support live in `gossip-findings-postgres`
+> (`crates/gossip-findings-postgres/src/`); that crate provides the canonical
+> findings schema plan (table/index/column constants plus row projections),
+> an embedded forward-only migration runner with advisory locking and checksum
+> verification, and findings-specific type-mapping support, but it does not
 > implement `FindingsSink`.
 
 Boundary 5 defines the persistence contracts for three subsystems:
@@ -127,13 +128,13 @@ Non-negotiables (project-wide):
 | `run_findings_conformance` | (harness entry point) | Findings-only conformance harness exposed at `gossip_contracts::persistence::run_findings_conformance` (also available via `persistence::conformance`). Runs four checks (idempotent upsert, orphan occurrence rejection, orphan observation rejection, observation merge) and returns `Result<u32, PersistenceConformanceError>` with `Ok(4)` when all findings checks pass. Requires `FindingsSink + FindingsConformanceProbe`. |
 | `run_redaction_conformance` | (harness entry point) | Redaction-only conformance harness exposed at `gossip_contracts::persistence::run_redaction_conformance` (also available via `persistence::conformance`). Runs three checks (`NormHash`, `SecretHash`, `FindingRecord` `Debug` redaction) and returns `Result<u32, PersistenceConformanceError>` with `Ok(3)`. Requires no backend instance. |
 
-### Backend scaffolds
+### Backend crates
 
 | Crate | Scope | Notes |
 |------|-------|-------|
 | `gossip-pg-common` | Shared PostgreSQL type-mapping and migration primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), and the `MigrationOperation` enum. All PostgreSQL persistence backends depend on this crate instead of duplicating these types. |
 | `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits, applies forward-only migrations with checksum verification and advisory locking, and documents that transaction-scoped migrations cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
-| `gossip-findings-postgres` | Findings PostgreSQL schema, migration, and type-mapping scaffold | Provides findings-specific schema/migration error types, canonical table/index/column constants, and Postgres-ready row projections for `FindingRecord`, `OccurrenceRecord`, and `ObservationRecord`. The crate does not implement `FindingsSink`; it defines the storage-boundary support that backend code will use while migration execution is still scaffolded. |
+| `gossip-findings-postgres` | Findings PostgreSQL schema, migrations, and type-mapping support | Provides findings-specific schema/migration error types, canonical table/index/column constants, Postgres-ready row projections for `FindingRecord`, `OccurrenceRecord`, and `ObservationRecord`, and an embedded forward-only migration runner with advisory locking plus checksum verification. The crate does not implement `FindingsSink`; it provides the storage-boundary support that the backend will build on. |
 
 ---
 

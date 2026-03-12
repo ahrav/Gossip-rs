@@ -6,6 +6,16 @@
 
 use std::fmt;
 
+/// Known advisory lock keys for PostgreSQL migration runners.
+///
+/// Each PostgreSQL persistence backend acquires a transaction-scoped advisory
+/// lock during migration. Keys must be globally unique within any database
+/// instance that hosts multiple gossip-rs backends.
+pub const ADVISORY_LOCK_KEYS: &[(&str, i64)] = &[
+    ("GSDLPGM1", 0x4753444c_50474d31), // done-ledger
+    ("GFPGMIG1", 0x47465047_4d494731), // findings
+];
+
 /// Labels the migration step that produced a PostgreSQL driver error.
 ///
 /// Paired with a driver error in a crate-specific migration error type
@@ -23,7 +33,9 @@ pub enum MigrationOperation {
     AdvisoryLock,
     /// Executing a migration's SQL body.
     ApplyMigration,
-    /// Inserting or querying the migration history record.
+    /// Querying the migration history table for an existing record.
+    QueryMigration,
+    /// Inserting a newly-applied migration record into the history table.
     RecordMigration,
     /// Committing the migration transaction.
     Commit,
@@ -37,6 +49,7 @@ impl fmt::Display for MigrationOperation {
             Self::HistoryTable => f.write_str("history_table"),
             Self::AdvisoryLock => f.write_str("advisory_lock"),
             Self::ApplyMigration => f.write_str("apply_migration"),
+            Self::QueryMigration => f.write_str("query_migration"),
             Self::RecordMigration => f.write_str("record_migration"),
             Self::Commit => f.write_str("commit"),
         }
@@ -46,6 +59,22 @@ impl fmt::Display for MigrationOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisory_lock_keys_are_globally_unique() {
+        let mut seen_keys = std::collections::HashSet::new();
+        let mut seen_labels = std::collections::HashSet::new();
+        for &(label, key) in super::ADVISORY_LOCK_KEYS {
+            assert!(
+                seen_keys.insert(key),
+                "duplicate advisory lock key for {label}"
+            );
+            assert!(
+                seen_labels.insert(label),
+                "duplicate advisory lock label: {label}"
+            );
+        }
+    }
 
     #[test]
     fn migration_operation_display_matches_sql_step_names() {
@@ -62,6 +91,10 @@ mod tests {
         assert_eq!(
             MigrationOperation::ApplyMigration.to_string(),
             "apply_migration"
+        );
+        assert_eq!(
+            MigrationOperation::QueryMigration.to_string(),
+            "query_migration"
         );
         assert_eq!(
             MigrationOperation::RecordMigration.to_string(),

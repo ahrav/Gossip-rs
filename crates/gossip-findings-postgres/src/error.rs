@@ -21,6 +21,15 @@ pub enum FindingsPgSchemaError {
     /// A `u64` field could not be represented as a PostgreSQL `BIGINT`
     /// according to its storage mode.
     PgU64Conversion(PgU64ConversionError),
+    /// The combined occurrence span (`byte_offset + byte_length`) exceeds
+    /// the PostgreSQL signed `BIGINT` maximum, matching the SQL
+    /// `occurrences_span_no_overflow_ck` constraint.
+    SpanOverflow {
+        /// The non-negative `byte_offset` that individually fits in `i64`.
+        byte_offset: i64,
+        /// The positive `byte_length` that individually fits in `i64`.
+        byte_length: i64,
+    },
 }
 
 impl fmt::Display for FindingsPgSchemaError {
@@ -28,6 +37,15 @@ impl fmt::Display for FindingsPgSchemaError {
         match self {
             Self::Persistence(source) => write!(f, "{source}"),
             Self::PgU64Conversion(source) => write!(f, "{source}"),
+            Self::SpanOverflow {
+                byte_offset,
+                byte_length,
+            } => write!(
+                f,
+                "occurrence span overflow: byte_offset ({byte_offset}) + byte_length ({byte_length}) \
+                 exceeds i64::MAX ({max})",
+                max = i64::MAX
+            ),
         }
     }
 }
@@ -37,6 +55,7 @@ impl Error for FindingsPgSchemaError {
         match self {
             Self::Persistence(source) => Some(source),
             Self::PgU64Conversion(source) => Some(source),
+            Self::SpanOverflow { .. } => None,
         }
     }
 }
@@ -86,10 +105,8 @@ pub enum FindingsPgMigrationError {
 impl FindingsPgMigrationError {
     /// Wrap a PostgreSQL driver error with the operation that produced it.
     ///
-    /// No callers yet — the migration runner that will use this constructor
-    /// has not been implemented. Matches the sibling crate's API surface
+    /// Matches the sibling crate's API surface
     /// (`DoneLedgerPgMigrationError::postgres`).
-    #[allow(dead_code)]
     pub(crate) fn postgres(op: MigrationOperation, source: postgres::Error) -> Self {
         Self::Postgres {
             operation: op,
@@ -181,6 +198,35 @@ mod tests {
 
         let source = err.source().expect("schema error should expose source");
         assert_eq!(source.to_string(), expected);
+    }
+
+    #[test]
+    fn span_overflow_display_includes_offset_and_length() {
+        let err = FindingsPgSchemaError::SpanOverflow {
+            byte_offset: i64::MAX - 1,
+            byte_length: 3,
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("span overflow"),
+            "should mention span overflow"
+        );
+        assert!(
+            msg.contains(&(i64::MAX - 1).to_string()),
+            "should include byte_offset"
+        );
+        assert!(msg.contains('3'), "should include byte_length");
+    }
+
+    #[test]
+    fn span_overflow_has_no_source() {
+        let err = FindingsPgSchemaError::SpanOverflow {
+            byte_offset: i64::MAX - 1,
+            byte_length: 3,
+        };
+
+        assert!(err.source().is_none());
     }
 
     #[test]
