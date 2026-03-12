@@ -117,10 +117,6 @@ fn expected_columns(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn expected_index_names(names: &[&str]) -> BTreeSet<String> {
-    names.iter().map(|name| (*name).to_owned()).collect()
-}
-
 fn assert_has_expected_indexes(actual: &BTreeSet<String>, expected: &[&str]) {
     for name in expected {
         assert!(
@@ -502,19 +498,10 @@ fn migration_detects_checksum_mismatch() {
     let err = apply_migrations(&mut client, &tampered, Duration::from_secs(5))
         .expect_err("checksum mismatch should fail re-application");
 
-    match err {
-        FindingsPgMigrationError::ChecksumMismatch { version, .. } => {
-            assert_eq!(version, "0001_findings_schema");
-        }
-        FindingsPgMigrationError::Postgres { source, .. } => {
-            panic!("expected ChecksumMismatch, got Postgres error: {source}");
-        }
-        FindingsPgMigrationError::CorruptedHistoryRecord { version, found_len } => {
-            panic!(
-                "expected ChecksumMismatch, got CorruptedHistoryRecord: version={version}, len={found_len}"
-            );
-        }
-    }
+    let FindingsPgMigrationError::ChecksumMismatch { version, .. } = err else {
+        panic!("expected ChecksumMismatch, got: {err:?}");
+    };
+    assert_eq!(version, "0001_findings_schema");
 }
 
 #[test]
@@ -537,19 +524,10 @@ fn persisted_checksum_tamper_is_detected_on_reapply() {
 
     let err = apply_all_migrations(&mut client)
         .expect_err("tampered checksum should fail re-application");
-    match err {
-        FindingsPgMigrationError::ChecksumMismatch { version, .. } => {
-            assert_eq!(version, "0001_findings_schema");
-        }
-        FindingsPgMigrationError::Postgres { source, .. } => {
-            panic!("expected ChecksumMismatch, got Postgres error: {source}");
-        }
-        FindingsPgMigrationError::CorruptedHistoryRecord { version, found_len } => {
-            panic!(
-                "expected ChecksumMismatch, got CorruptedHistoryRecord: version={version}, len={found_len}"
-            );
-        }
-    }
+    let FindingsPgMigrationError::ChecksumMismatch { version, .. } = err else {
+        panic!("expected ChecksumMismatch, got: {err:?}");
+    };
+    assert_eq!(version, "0001_findings_schema");
 }
 
 #[test]
@@ -655,20 +633,16 @@ fn occurrences_table_has_expected_indexes() {
 fn observations_table_has_expected_indexes() {
     let mut client = test_client();
     let indexes = table_index_names(&mut client, schema::OBSERVATIONS_TABLE);
-    let expected = expected_index_names(&[
-        schema::OBSERVATIONS_TENANT_SEEN_AT_INDEX,
-        schema::OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX,
-        schema::OBSERVATIONS_TENANT_OCCURRENCE_ID_INDEX,
-        schema::OBSERVATIONS_TENANT_OVID_HASH_INDEX,
-        schema::OBSERVATIONS_TENANT_RUN_SHARD_INDEX,
-    ]);
-
-    for name in expected {
-        assert!(
-            indexes.contains(&name),
-            "expected index {name:?} to exist; actual indexes: {indexes:?}"
-        );
-    }
+    assert_has_expected_indexes(
+        &indexes,
+        &[
+            schema::OBSERVATIONS_TENANT_SEEN_AT_INDEX,
+            schema::OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX,
+            schema::OBSERVATIONS_TENANT_OCCURRENCE_ID_INDEX,
+            schema::OBSERVATIONS_TENANT_OVID_HASH_INDEX,
+            schema::OBSERVATIONS_TENANT_RUN_SHARD_INDEX,
+        ],
+    );
 }
 
 #[test]
@@ -857,6 +831,25 @@ fn occurrences_rejects_zero_byte_length() {
 
     assert_check_violation(&err);
     assert_constraint_name(&err, "occurrences_byte_length_positive_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_span_overflow_rejected_by_sql() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            byte_offset: Some(i64::MAX - 1),
+            byte_length: Some(2),
+            ..Default::default()
+        },
+    )
+    .expect_err("byte_offset + byte_length > i64::MAX should violate span overflow check");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "occurrences_span_no_overflow_ck");
 }
 
 #[test]
