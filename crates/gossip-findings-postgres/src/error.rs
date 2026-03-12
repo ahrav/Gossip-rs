@@ -89,7 +89,6 @@ impl FindingsPgMigrationError {
     /// No callers yet — the migration runner that will use this constructor
     /// has not been implemented. Matches the sibling crate's API surface
     /// (`DoneLedgerPgMigrationError::postgres`).
-    #[allow(dead_code)]
     pub(crate) fn postgres(op: MigrationOperation, source: postgres::Error) -> Self {
         Self::Postgres {
             operation: op,

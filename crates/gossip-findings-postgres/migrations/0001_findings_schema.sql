@@ -56,6 +56,8 @@ CREATE TABLE occurrences (
         CHECK (byte_offset >= 0),
     CONSTRAINT occurrences_byte_length_positive_ck
         CHECK (byte_length > 0),
+    CONSTRAINT occurrences_span_no_overflow_ck
+        CHECK (byte_offset <= 9223372036854775806 - byte_length),
     CONSTRAINT occurrences_finding_fk
         FOREIGN KEY (tenant_id, finding_id)
         REFERENCES findings (tenant_id, finding_id)
@@ -75,6 +77,10 @@ CREATE TABLE observations (
     occurrence_id    BYTEA  NOT NULL,
     policy_hash      BYTEA  NOT NULL,
     ovid_hash        BYTEA  NOT NULL,
+    -- run_id and shard_id use raw bit-pattern storage (u64 reinterpreted as
+    -- i64). Equality lookups are correct, but range queries or ORDER BY on
+    -- these columns produce wrong ordering for values >= 2^63 because
+    -- PostgreSQL treats them as signed. Use equality predicates only.
     run_id           BIGINT NOT NULL,
     shard_id         BIGINT NOT NULL,
     fence_epoch      BIGINT NOT NULL,

@@ -196,9 +196,9 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), DoneLedgerPgMigra
 /// constant.
 ///
 /// `lock_timeout` caps how long DDL statements wait for conflicting table-level
-/// locks. The timeout is formatted as integer seconds in the `SET LOCAL
-/// lock_timeout` statement, so sub-second precision is truncated. A zero
-/// duration disables the timeout (Postgres interprets `'0s'` as "wait
+/// locks. The timeout is formatted in milliseconds in the `SET LOCAL
+/// lock_timeout` statement, so sub-second precision is preserved. A zero
+/// duration disables the timeout (Postgres interprets `'0ms'` as "wait
 /// indefinitely").
 ///
 /// ## Transaction protocol
@@ -241,8 +241,8 @@ pub fn apply_migrations(
     // the timeout to this transaction only.  Set *after* the advisory
     // lock so the timeout applies only to DDL, not to the advisory
     // lock wait itself.
-    let timeout_secs = lock_timeout.as_secs();
-    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_secs}s'"))
+    let timeout_ms = lock_timeout.as_millis();
+    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_ms}ms'"))
         .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
     tx.batch_execute(&create_migrations_table_sql())
@@ -279,9 +279,9 @@ fn apply_or_verify_migration(
 ) -> Result<(), DoneLedgerPgMigrationError> {
     let expected_checksum = migration.checksum();
     let version = migration.version();
-    let row = tx.query_opt(select_sql, &[&version]).map_err(|e| {
-        DoneLedgerPgMigrationError::postgres(MigrationOperation::RecordMigration, e)
-    })?;
+    let row = tx
+        .query_opt(select_sql, &[&version])
+        .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::QueryMigration, e))?;
 
     if let Some(row) = row {
         // Migration already applied — verify the embedded SQL has not changed.

@@ -188,8 +188,8 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), FindingsPgMigrati
 /// sets without mutating the global constant.
 ///
 /// `lock_timeout` caps how long DDL statements wait for conflicting locks. The
-/// timeout is formatted as integer seconds in `SET LOCAL lock_timeout`, so
-/// sub-second precision is truncated. A zero duration disables the timeout.
+/// timeout is formatted in milliseconds in `SET LOCAL lock_timeout`, so
+/// sub-second precision is preserved. A zero duration disables the timeout.
 ///
 /// ## Transaction protocol
 ///
@@ -224,8 +224,8 @@ pub fn apply_migrations(
     // `lock_timeout` guards only the DDL path. Advisory-lock waits stay
     // unbounded so concurrent startup paths serialize instead of spuriously
     // failing after the timeout budget expires.
-    let timeout_secs = lock_timeout.as_secs();
-    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_secs}s'"))
+    let timeout_ms = lock_timeout.as_millis();
+    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_ms}ms'"))
         .map_err(|e| FindingsPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
     tx.batch_execute(&create_migrations_table_sql())
@@ -265,7 +265,7 @@ fn apply_or_verify_migration(
     let version = migration.version();
     let row = tx
         .query_opt(select_sql, &[&version])
-        .map_err(|e| FindingsPgMigrationError::postgres(MigrationOperation::RecordMigration, e))?;
+        .map_err(|e| FindingsPgMigrationError::postgres(MigrationOperation::QueryMigration, e))?;
 
     if let Some(row) = row {
         let found_checksum: Vec<u8> = row.get(0);
@@ -454,7 +454,7 @@ mod tests {
     fn migration_checksums_are_stable() {
         let expected: &[(&str, &str)] = &[(
             "0001_findings_schema",
-            "a79746057e029e8f5a7e123067e3eafd4d6ec587639f8d645234d1ceba258bb0",
+            "520ddb36ee644e1985208f1b7cea7ba7c10eaa901e288d629a10e35b6815e160",
         )];
 
         assert_eq!(

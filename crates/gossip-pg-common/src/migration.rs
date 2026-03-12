@@ -23,7 +23,9 @@ pub enum MigrationOperation {
     AdvisoryLock,
     /// Executing a migration's SQL body.
     ApplyMigration,
-    /// Inserting or querying the migration history record.
+    /// Querying the migration history table for an existing record.
+    QueryMigration,
+    /// Inserting a newly-applied migration record into the history table.
     RecordMigration,
     /// Committing the migration transaction.
     Commit,
@@ -37,6 +39,7 @@ impl fmt::Display for MigrationOperation {
             Self::HistoryTable => f.write_str("history_table"),
             Self::AdvisoryLock => f.write_str("advisory_lock"),
             Self::ApplyMigration => f.write_str("apply_migration"),
+            Self::QueryMigration => f.write_str("query_migration"),
             Self::RecordMigration => f.write_str("record_migration"),
             Self::Commit => f.write_str("commit"),
         }
@@ -62,6 +65,10 @@ mod tests {
         assert_eq!(
             MigrationOperation::ApplyMigration.to_string(),
             "apply_migration"
+        );
+        assert_eq!(
+            MigrationOperation::QueryMigration.to_string(),
+            "query_migration"
         );
         assert_eq!(
             MigrationOperation::RecordMigration.to_string(),
