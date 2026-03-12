@@ -177,6 +177,21 @@ fn table_indexes(client: &mut Client, table: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn stored_migration_versions(client: &mut Client) -> BTreeSet<String> {
+    client
+        .query(
+            &format!(
+                "SELECT version FROM {} ORDER BY version",
+                schema::SCHEMA_MIGRATIONS_TABLE
+            ),
+            &[],
+        )
+        .expect("migration version query should succeed")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
 fn table_foreign_keys(client: &mut Client, table: &str) -> BTreeMap<String, String> {
     client
         .query(
@@ -489,9 +504,12 @@ fn migration_is_idempotent() {
     apply_all_migrations(&mut client).expect("initial migration run should succeed");
     apply_all_migrations(&mut client).expect("second migration run should be idempotent");
 
+    let expected_versions: BTreeSet<String> =
+        MIGRATIONS.iter().map(|m| m.version().to_owned()).collect();
     assert_eq!(
-        row_count(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
-        MIGRATIONS.len() as i64
+        stored_migration_versions(&mut client),
+        expected_versions,
+        "stored migration versions must match embedded migration set exactly"
     );
 }
 
@@ -579,9 +597,11 @@ fn concurrent_migrations_both_succeed() {
     // duplicates and no missing entries.
     let mut client = postgres::Client::connect(&url_verify, postgres::NoTls)
         .expect("post-verification connection should succeed");
+    let expected_versions: BTreeSet<String> =
+        MIGRATIONS.iter().map(|m| m.version().to_owned()).collect();
     assert_eq!(
-        row_count(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
-        MIGRATIONS.len() as i64,
+        stored_migration_versions(&mut client),
+        expected_versions,
         "each migration must appear exactly once regardless of concurrent application"
     );
 }
@@ -1243,6 +1263,23 @@ fn findings_rejects_short_secret_hash() {
 
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_rejects_long_secret_hash() {
+    let mut client = test_client();
+    let err = try_insert_finding(
+        &mut client,
+        FindingOverrides {
+            secret_hash: Some(vec![0x14; 33]),
+            ..Default::default()
+        },
+    )
+    .expect_err("33-byte secret_hash should violate findings length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "findings_secret_hash_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn occurrences_rejects_short_finding_id() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -1261,6 +1298,24 @@ fn occurrences_rejects_short_finding_id() {
 
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_rejects_long_finding_id() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            finding_id: Some(vec![0x11; 33]),
+            ..Default::default()
+        },
+    )
+    .expect_err("33-byte finding_id should violate occurrences length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "occurrences_finding_id_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn observations_rejects_short_ovid_hash() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1272,6 +1327,24 @@ fn observations_rejects_short_ovid_hash() {
         },
     )
     .expect_err("31-byte ovid_hash should violate observations length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_ovid_hash_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_long_ovid_hash() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            ovid_hash: Some(vec![0x33; 33]),
+            ..Default::default()
+        },
+    )
+    .expect_err("33-byte ovid_hash should violate observations length checks");
 
     assert_check_violation(&err);
     assert_constraint_name(&err, "observations_ovid_hash_len_ck");
