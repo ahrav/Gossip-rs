@@ -359,6 +359,39 @@ mod tests {
     }
 
     #[test]
+    fn oracle_has_key_ledger_does_not() {
+        let mut oracle = DoneLedgerOracle::new();
+        let ledger = InMemoryDoneLedger::new();
+        let op1 = PendingWriteId::from_raw(1);
+
+        let rec = make_record(1, DoneLedgerStatus::ScannedClean, 100, 0, 200);
+        oracle.submit(op1, vec![rec.clone()]);
+        oracle.commit(op1);
+
+        // Oracle has committed state but ledger is empty — should detect
+        // divergence with oracle=Some, actual=None.
+        let violations = oracle.verify_convergence(&ledger);
+        assert_eq!(violations.len(), 1, "expected exactly one violation");
+        match &violations[0] {
+            DoneLedgerInvariantViolation::LatticeConvergence {
+                oracle: oracle_rec,
+                actual,
+                ..
+            } => {
+                assert!(
+                    oracle_rec.is_some(),
+                    "oracle committed this key, oracle field should be Some"
+                );
+                assert!(
+                    actual.is_none(),
+                    "ledger never received this key, actual should be None"
+                );
+            }
+            other => panic!("expected LatticeConvergence, got: {other}"),
+        }
+    }
+
+    #[test]
     fn verify_convergence_passes_when_synced() {
         use gossip_contracts::persistence::{CommitHandle, DoneLedger};
 

@@ -9,8 +9,8 @@
 //! A single PostgreSQL instance is shared across the test binary, while each
 //! test gets a freshly created database for isolation.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use postgres::{Client, NoTls};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -342,6 +342,33 @@ mod tests {
         assert_eq!(
             rewritten, r"host=127.0.0.1 password='it\'s complex dbname=dummy' dbname=test_bs",
             "backslash-escaped quotes inside values must not break tokenization"
+        );
+    }
+
+    #[test]
+    fn keyword_connection_string_with_spaces_around_equals() {
+        // libpq keyword-value format allows optional spaces around '='.
+        let input = "host=127.0.0.1 dbname = postgres";
+        let rewritten = rewrite_keyword_connection_string(input, "test_sp");
+        assert!(
+            !rewritten.contains("dbname = postgres"),
+            "existing dbname must be replaced even when spaces surround '='"
+        );
+        assert!(
+            rewritten.contains("dbname=test_sp"),
+            "rewritten string must contain the new dbname"
+        );
+    }
+
+    #[test]
+    fn keyword_connection_string_dangling_backslash_does_not_panic() {
+        // A malformed quoted value ending with a lone backslash must not
+        // cause an out-of-bounds panic in the tokenizer.
+        let input = "host=127.0.0.1 password='trailing\\";
+        let rewritten = rewrite_keyword_connection_string(input, "test_dbs");
+        assert!(
+            rewritten.contains("dbname=test_dbs"),
+            "function must still append dbname even with malformed input"
         );
     }
 }

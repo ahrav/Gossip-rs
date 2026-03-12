@@ -763,6 +763,23 @@ fn findings_rejects_short_bytea() {
 
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_rejects_long_bytea() {
+    let mut client = test_client();
+    let err = try_insert_finding(
+        &mut client,
+        FindingOverrides {
+            tenant_id: Some(vec![0x10; 33]),
+            ..Default::default()
+        },
+    )
+    .expect_err("33-byte tenant_id should violate findings length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "findings_tenant_id_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn occurrences_rejects_short_bytea() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -781,6 +798,24 @@ fn occurrences_rejects_short_bytea() {
 
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_rejects_long_bytea() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            occurrence_id: Some(vec![0x21; 33]),
+            ..Default::default()
+        },
+    )
+    .expect_err("33-byte occurrence_id should violate occurrences length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "occurrences_occurrence_id_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn observations_rejects_short_bytea() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -792,6 +827,24 @@ fn observations_rejects_short_bytea() {
         },
     )
     .expect_err("31-byte policy_hash should violate observations length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_policy_hash_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_long_bytea() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            policy_hash: Some(vec![0x32; 33]),
+            ..Default::default()
+        },
+    )
+    .expect_err("33-byte policy_hash should violate observations length checks");
 
     assert_check_violation(&err);
     assert_constraint_name(&err, "observations_policy_hash_len_ck");
@@ -987,6 +1040,42 @@ fn observations_location_url_size_limit() {
         },
     )
     .expect_err("4097-byte location_url should violate observations checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_location_url_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_empty_location_display() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            location_display: Some(Some(String::new())),
+            ..Default::default()
+        },
+    )
+    .expect_err("empty location_display should violate observations checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_location_display_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_empty_location_url() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            location_url: Some(Some(String::new())),
+            ..Default::default()
+        },
+    )
+    .expect_err("empty location_url should violate observations checks");
 
     assert_check_violation(&err);
     assert_constraint_name(&err, "observations_location_url_ck");
