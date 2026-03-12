@@ -53,13 +53,7 @@ const WARMUP_OPS: usize = 5;
 const MAX_OP_RETRIES: usize = 10;
 
 /// All possible DoneLedgerStatus values for random selection.
-const ALL_STATUSES: [DoneLedgerStatus; 5] = [
-    DoneLedgerStatus::FailedRetryable,
-    DoneLedgerStatus::FailedPermanent,
-    DoneLedgerStatus::Skipped,
-    DoneLedgerStatus::ScannedClean,
-    DoneLedgerStatus::ScannedWithFindings,
-];
+const ALL_STATUSES: [DoneLedgerStatus; 5] = DoneLedgerStatus::ALL;
 
 // ── FaultConfig ──────────────────────────────────────────────────────
 

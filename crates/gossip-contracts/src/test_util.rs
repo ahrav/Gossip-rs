@@ -195,6 +195,74 @@ pub fn ovid(seed: u8) -> crate::persistence::OvidHash {
     crate::persistence::OvidHash::from_bytes([seed; 32])
 }
 
+// ---------------------------------------------------------------------------
+// Done-ledger test helpers — shared across done-ledger backend tests
+// ---------------------------------------------------------------------------
+
+use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId};
+use crate::persistence::{
+    DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus,
+};
+
+/// Construct a [`DoneLedgerProvenance`] from raw `u64` fields.
+pub fn provenance(
+    run_id: u64,
+    shard_id: u64,
+    fence_epoch: u64,
+    started_at: u64,
+    finished_at: u64,
+) -> DoneLedgerProvenance {
+    DoneLedgerProvenance::new(
+        RunId::from_raw(run_id),
+        ShardId::from_raw(shard_id),
+        FenceEpoch::from_raw(fence_epoch),
+        LogicalTime::from_raw(started_at),
+        LogicalTime::from_raw(finished_at),
+    )
+}
+
+/// Construct a [`DoneLedgerRecord`] from flat scalar arguments.
+///
+/// Seeds are expanded into deterministic 32-byte identity hashes via
+/// [`tenant`], [`policy`], [`ovid`]. Panics on invalid combinations
+/// (e.g., `ScannedClean` with `findings_count > 0`), which is intentional
+/// for test code — the caller is responsible for providing self-consistent
+/// arguments.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors the done-ledger durable row shape"
+)]
+pub fn done_record(
+    tenant_seed: u8,
+    policy_seed: u8,
+    ovid_seed: u8,
+    status: DoneLedgerStatus,
+    bytes_scanned: u64,
+    findings_count: u32,
+    run_id: u64,
+    shard_id: u64,
+    fence_epoch: u64,
+    started_at: u64,
+    finished_at: u64,
+    error_code: Option<&str>,
+) -> DoneLedgerRecord {
+    let record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(tenant(tenant_seed), policy(policy_seed), ovid(ovid_seed)),
+        status,
+        bytes_scanned,
+        findings_count,
+        provenance(run_id, shard_id, fence_epoch, started_at, finished_at),
+        error_code.map(|code| {
+            DoneLedgerErrorCode::try_new(code).expect("test error code should be valid")
+        }),
+    )
+    .expect("test record should satisfy construction invariants");
+    record
+        .validate()
+        .expect("test record should pass full validation");
+    record
+}
+
 /// Minimal error type for [`CommitHandle`](crate::persistence::CommitHandle)
 /// test doubles.
 #[derive(Debug, Clone, PartialEq, Eq)]

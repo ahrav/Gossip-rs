@@ -168,7 +168,7 @@ impl DoneLedgerPg {
     pub(crate) fn truncate_all_for_tests(&self) -> Result<(), DoneLedgerPgError> {
         let mut client = self.lock_client()?;
         client.batch_execute(&format!(
-            "TRUNCATE TABLE {}",
+            "DELETE FROM {}",
             crate::schema::DONE_LEDGER_ENTRIES_TABLE
         ))?;
         Ok(())
@@ -572,61 +572,7 @@ fn decode_fixed_32(bytes: Vec<u8>, field: &'static str) -> Result<[u8; 32], Done
 #[cfg(test)]
 mod tests {
     use super::dedupe_and_validate;
-    use gossip_contracts::{
-        identity::{FenceEpoch, LogicalTime, RunId, ShardId},
-        persistence::{
-            DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-            DoneLedgerStatus,
-        },
-        test_util::{ovid, policy, tenant},
-    };
-
-    fn provenance(
-        run_id: u64,
-        shard_id: u64,
-        fence_epoch: u64,
-        started_at: u64,
-        finished_at: u64,
-    ) -> DoneLedgerProvenance {
-        DoneLedgerProvenance::new(
-            RunId::from_raw(run_id),
-            ShardId::from_raw(shard_id),
-            FenceEpoch::from_raw(fence_epoch),
-            LogicalTime::from_raw(started_at),
-            LogicalTime::from_raw(finished_at),
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "test helper mirrors the flat done-ledger row shape"
-    )]
-    fn done_record(
-        tenant_seed: u8,
-        policy_seed: u8,
-        ovid_seed: u8,
-        status: DoneLedgerStatus,
-        bytes_scanned: u64,
-        findings_count: u32,
-        run_id: u64,
-        shard_id: u64,
-        fence_epoch: u64,
-        started_at: u64,
-        finished_at: u64,
-        error_code: Option<&str>,
-    ) -> DoneLedgerRecord {
-        DoneLedgerRecord::try_new(
-            DoneLedgerKey::new(tenant(tenant_seed), policy(policy_seed), ovid(ovid_seed)),
-            status,
-            bytes_scanned,
-            findings_count,
-            provenance(run_id, shard_id, fence_epoch, started_at, finished_at),
-            error_code.map(|code| {
-                DoneLedgerErrorCode::try_new(code).expect("test error code should be valid")
-            }),
-        )
-        .expect("test record should satisfy construction invariants")
-    }
+    use gossip_contracts::{persistence::DoneLedgerStatus, test_util::done_record};
 
     #[test]
     fn collect_columns_conversion_error_identifies_failing_record_index() {

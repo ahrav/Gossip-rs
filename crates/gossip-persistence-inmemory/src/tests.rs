@@ -11,7 +11,7 @@ use gossip_contracts::{
         DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsSink, FindingsUpsertBatch,
         ObservationRecord, OccurrenceRecord,
     },
-    test_util::{ovid, policy, tenant},
+    test_util::{ovid, policy, provenance, tenant},
 };
 
 use crate::{
@@ -24,22 +24,6 @@ use gossip_contracts::persistence::PersistenceInputError;
 use DoneLedgerStatus::{
     FailedPermanent, FailedRetryable, ScannedClean, ScannedWithFindings, Skipped,
 };
-
-fn provenance(
-    run_id: u64,
-    shard_id: u64,
-    fence_epoch: u64,
-    started_at: u64,
-    finished_at: u64,
-) -> DoneLedgerProvenance {
-    DoneLedgerProvenance::new(
-        RunId::from_raw(run_id),
-        ShardId::from_raw(shard_id),
-        FenceEpoch::from_raw(fence_epoch),
-        LogicalTime::from_raw(started_at),
-        LogicalTime::from_raw(finished_at),
-    )
-}
 
 #[expect(
     clippy::too_many_arguments,

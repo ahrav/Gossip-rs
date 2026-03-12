@@ -1,9 +1,6 @@
 use rstest::rstest;
 
-use crate::{
-    identity::{FenceEpoch, LogicalTime, RunId, ShardId},
-    test_util::{canonical_digest, ovid, policy, tenant},
-};
+use crate::test_util::{canonical_digest, ovid, policy, provenance, tenant};
 
 use super::*;
 use DoneLedgerStatus::{
@@ -14,22 +11,8 @@ use DoneLedgerStatus::{
 // Test helpers
 // ---------------------------------------------------------------------------
 
-const ALL_STATUSES: [DoneLedgerStatus; 5] = [
-    FailedRetryable,
-    FailedPermanent,
-    Skipped,
-    ScannedClean,
-    ScannedWithFindings,
-];
-
 fn make_provenance() -> DoneLedgerProvenance {
-    DoneLedgerProvenance::new(
-        RunId::from_raw(1),
-        ShardId::from_raw(2),
-        FenceEpoch::from_raw(3),
-        LogicalTime::from_raw(100),
-        LogicalTime::from_raw(200),
-    )
+    provenance(1, 2, 3, 100, 200)
 }
 
 // ---------------------------------------------------------------------------
@@ -38,10 +21,10 @@ fn make_provenance() -> DoneLedgerProvenance {
 
 #[test]
 fn done_ledger_status_merge_is_commutative_idempotent_and_monotonic() {
-    for left in ALL_STATUSES {
+    for left in DoneLedgerStatus::ALL {
         assert_eq!(left.merge(left), left, "idempotence failed for {left:?}");
 
-        for right in ALL_STATUSES {
+        for right in DoneLedgerStatus::ALL {
             let merged = left.merge(right);
 
             assert_eq!(
@@ -60,9 +43,9 @@ fn done_ledger_status_merge_is_commutative_idempotent_and_monotonic() {
 
 #[test]
 fn done_ledger_status_merge_is_associative() {
-    for a in ALL_STATUSES {
-        for b in ALL_STATUSES {
-            for c in ALL_STATUSES {
+    for a in DoneLedgerStatus::ALL {
+        for b in DoneLedgerStatus::ALL {
+            for c in DoneLedgerStatus::ALL {
                 assert_eq!(
                     a.merge(b.merge(c)),
                     a.merge(b).merge(c),
@@ -79,7 +62,7 @@ fn done_ledger_status_merge_is_associative() {
 
 #[test]
 fn done_ledger_status_from_rank_round_trips_all_variants() {
-    for status in ALL_STATUSES {
+    for status in DoneLedgerStatus::ALL {
         let rank = status.rank();
         let reconstituted = DoneLedgerStatus::from_rank(rank)
             .unwrap_or_else(|| panic!("from_rank({rank}) should reconstitute {status:?}"));
@@ -505,5 +488,27 @@ fn provenance_rejects_start_after_finish_in_debug() {
         FenceEpoch::from_raw(3),
         LogicalTime::from_raw(200),
         LogicalTime::from_raw(100),
+    );
+}
+
+// Verify that `done_record()` rejects invalid status/error_code combos
+// after the `validate()` hardening.
+#[test]
+#[should_panic(expected = "test record should pass full validation")]
+fn done_record_rejects_failure_status_without_error_code() {
+    // FailedRetryable requires error_code per `validate()`.
+    let _ = crate::test_util::done_record(
+        1,
+        1,
+        1,
+        FailedRetryable,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        2,
+        None, // missing error_code
     );
 }
