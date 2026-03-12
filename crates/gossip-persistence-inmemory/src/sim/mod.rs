@@ -28,6 +28,8 @@
 mod harness;
 mod invariants;
 mod oracle;
+#[cfg(test)]
+mod tests;
 
 pub use harness::{DoneLedgerFaultConfig, DoneLedgerSim, DoneLedgerSimReport};
 pub use invariants::{DoneLedgerInvariantChecker, DoneLedgerInvariantViolation};
@@ -231,6 +233,42 @@ pub enum DoneLedgerSimEventKind {
     ReleaseNoop,
     FaultConfigured,
 }
+
+impl DoneLedgerSimEventKind {
+    /// All event kinds emitted by [`DoneLedgerSimEvent::kind`].
+    pub const ALL: [Self; 10] = [
+        Self::UpsertCommitted,
+        Self::UpsertPending,
+        Self::UpsertSubmitFailed,
+        Self::UpsertCommitFailed,
+        Self::GetOk,
+        Self::Released,
+        Self::ReleasedCommitFailed,
+        Self::ReleasedAll,
+        Self::ReleaseNoop,
+        Self::FaultConfigured,
+    ];
+}
+
+// Compile-time exhaustiveness guard: adding a variant to the enum without
+// updating ALL causes a non-exhaustive match error here.
+const _: () = {
+    const fn _exhaustive(k: DoneLedgerSimEventKind) -> usize {
+        match k {
+            DoneLedgerSimEventKind::UpsertCommitted => 0,
+            DoneLedgerSimEventKind::UpsertPending => 1,
+            DoneLedgerSimEventKind::UpsertSubmitFailed => 2,
+            DoneLedgerSimEventKind::UpsertCommitFailed => 3,
+            DoneLedgerSimEventKind::GetOk => 4,
+            DoneLedgerSimEventKind::Released => 5,
+            DoneLedgerSimEventKind::ReleasedCommitFailed => 6,
+            DoneLedgerSimEventKind::ReleasedAll => 7,
+            DoneLedgerSimEventKind::ReleaseNoop => 8,
+            DoneLedgerSimEventKind::FaultConfigured => 9,
+        }
+    }
+    assert!(DoneLedgerSimEventKind::ALL.len() == 10);
+};
 
 impl DoneLedgerSimEvent {
     /// Map to the histogram discriminant.
