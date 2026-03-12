@@ -4,7 +4,7 @@ In-memory reference implementations of the `DoneLedger` and `FindingsSink`
 persistence traits from `gossip-contracts::persistence`. Designed for
 testing, conformance verification, and deterministic simulation.
 
-> Source: `crates/gossip-persistence-inmemory/src/` (7 files).
+> Source: `crates/gossip-persistence-inmemory/src/` (12 files, including `sim/`).
 > Passes `run_conformance` from `gossip-contracts::persistence::conformance`.
 > For the persistence trait definitions see
 > [boundary-5-persistence.md](gossip-contracts/boundary-5-persistence.md).
@@ -13,15 +13,20 @@ testing, conformance verification, and deterministic simulation.
 
 ## 1. Source File Map
 
-| File             | Role                                                                                      |
-| ---------------- | ----------------------------------------------------------------------------------------- |
-| `lib.rs`         | Crate root, public re-exports, module declarations (`#![forbid(unsafe_code)]`)            |
-| `store.rs`       | `InMemoryStoreCore<B>` generic infrastructure, `StoreBackend` trait, `StoreHandle`, condvar protocol |
-| `done_ledger.rs` | `InMemoryDoneLedger` — `DoneLedger` trait impl, monotonic lattice merge                   |
-| `findings.rs`    | `InMemoryFindingsSink` — `FindingsSink` trait impl, three-layer upsert, referential integrity |
-| `pending.rs`     | `PendingOp<P, R>` and `PendingState<R>` — lifecycle types for the pending-write queue     |
-| `error.rs`       | `InMemoryPersistenceError`, `InMemoryStoreKind`, `PendingWriteId`, `CompletionOrder`      |
-| `tests.rs`       | Done-ledger and findings unit tests, fault injection coverage, delayed-completion scenarios  |
+| File                  | Role                                                                                           |
+| --------------------- | ---------------------------------------------------------------------------------------------- |
+| `lib.rs`              | Crate root, public re-exports, module declarations (`#![forbid(unsafe_code)]`)                 |
+| `store.rs`            | `InMemoryStoreCore<B>` generic infrastructure, `StoreBackend` trait, `StoreHandle`, condvar protocol |
+| `done_ledger.rs`      | `InMemoryDoneLedger` — `DoneLedger` trait impl, monotonic lattice merge                        |
+| `findings.rs`         | `InMemoryFindingsSink` — `FindingsSink` trait impl, three-layer upsert, referential integrity  |
+| `pending.rs`          | `PendingOp<P, R>` and `PendingState<R>` — lifecycle types for the pending-write queue          |
+| `error.rs`            | `InMemoryPersistenceError`, `InMemoryStoreKind`, `PendingWriteId`, `CompletionOrder`           |
+| `tests.rs`            | Done-ledger and findings unit tests, fault injection coverage, delayed-completion scenarios    |
+| `sim/mod.rs`          | Simulation entry point, `FaultLevel`, `SimContext`, operation/event enums, `PersistenceSim`    |
+| `sim/harness.rs`      | `DoneLedgerSim`, weighted random execution, swizzle-clog runner, event histograms              |
+| `sim/invariants.rs`   | `DoneLedgerInvariantChecker`, violation enum, per-step I1-I10 validation                       |
+| `sim/oracle.rs`       | `DoneLedgerOracle`, committed/pending model, convergence checks                                 |
+| `sim/tests.rs`        | Seed sweeps, event-coverage assertions, and proptest state-machine tests                        |
 
 ---
 
@@ -207,7 +212,37 @@ Release methods for delayed operations:
 
 ---
 
-## 8. Conformance
+## 8. Deterministic Simulation
+
+`DoneLedgerSim` turns the in-memory done-ledger into a seeded simulation
+target. The harness drives weighted `batch_upsert`, `batch_get`, and
+manual-release operations while the invariant checker validates every step.
+
+### Simulation pieces
+
+- `FaultLevel` selects the background fault profile (`SunnyDay`, `Stormy`,
+  `Radioactive`).
+- `DoneLedgerSimOp` models explicit writes, reads, release operations, and
+  fault-counter configuration.
+- `DoneLedgerSimEventKind` provides a stable histogram key so seed sweeps can
+  assert that the generator still reaches every behavior class.
+- `DoneLedgerOracle` tracks committed state independently of the ledger and
+  verifies I6 convergence after delayed writes drain.
+
+### Test suites
+
+- `done_ledger_sim_sunny_day` is the fast single-seed sanity check.
+- `done_ledger_sim_stormy_sweep` runs 100 seeds x 500 ops and asserts zero
+  violations, full event-kind coverage, and a sub-10-second runtime budget.
+- `done_ledger_sim_swizzle_clog_sweep` submits overlapping delayed batches,
+  releases them in PRNG-shuffled order, injects commit failures on a subset,
+  and checks that the oracle still converges with the ledger.
+- `done_ledger_sim_radioactive` is an ignored 50-seed stress sweep for the
+  highest fault tier.
+- `prop_done_ledger_state_machine` generates shrinkable `DoneLedgerSimOp`
+  sequences so a failing scenario minimizes to the smallest reproducer.
+
+## 9. Conformance
 
 Both backends pass `run_conformance` from
 `gossip-contracts::persistence::conformance`, which verifies:

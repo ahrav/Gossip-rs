@@ -28,6 +28,8 @@
 mod harness;
 mod invariants;
 mod oracle;
+#[cfg(test)]
+mod tests;
 
 pub use harness::{DoneLedgerFaultConfig, DoneLedgerSim, DoneLedgerSimReport};
 pub use invariants::{DoneLedgerInvariantChecker, DoneLedgerInvariantViolation};
@@ -230,6 +232,22 @@ pub enum DoneLedgerSimEventKind {
     ReleasedAll,
     ReleaseNoop,
     FaultConfigured,
+}
+
+impl DoneLedgerSimEventKind {
+    /// All event kinds emitted by [`DoneLedgerSimEvent::kind`].
+    pub const ALL: [Self; 10] = [
+        Self::UpsertCommitted,
+        Self::UpsertPending,
+        Self::UpsertSubmitFailed,
+        Self::UpsertCommitFailed,
+        Self::GetOk,
+        Self::Released,
+        Self::ReleasedCommitFailed,
+        Self::ReleasedAll,
+        Self::ReleaseNoop,
+        Self::FaultConfigured,
+    ];
 }
 
 impl DoneLedgerSimEvent {

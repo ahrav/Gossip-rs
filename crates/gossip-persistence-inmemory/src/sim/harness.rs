@@ -29,6 +29,7 @@ use gossip_contracts::{
     },
 };
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 use super::{
     DoneLedgerSimEvent, DoneLedgerSimEventKind, DoneLedgerSimOp, FaultLevel, PersistenceSim,
@@ -268,6 +269,85 @@ impl DoneLedgerSim {
             event_counts,
             converged,
         }
+    }
+
+    /// Execute the swizzle-clog pattern with delayed writes released in a
+    /// PRNG-shuffled order.
+    ///
+    /// Every batch overlaps a small shared key pool but uses a different
+    /// status/metric mix, forcing the ledger and oracle to prove that the
+    /// lattice merge converges regardless of completion order.
+    pub fn run_swizzle_clog(mut self, batch_count: usize) -> DoneLedgerSimReport {
+        let seed = self.context.seed();
+        let mut all_violations = Vec::new();
+        let mut event_counts = BTreeMap::new();
+
+        self.ledger
+            .set_auto_complete(false)
+            .expect("set_auto_complete should not fail on InMemoryDoneLedger");
+
+        for batch_idx in 0..batch_count {
+            let op = DoneLedgerSimOp::BatchUpsert {
+                records: self.build_swizzle_clog_batch(batch_idx),
+            };
+            let (event, violations) = self.step(op);
+            Self::record_event(&event, &mut event_counts);
+            all_violations.extend(violations);
+        }
+
+        let mut pending_ids = self
+            .ledger
+            .pending_ids()
+            .expect("pending_ids should not fail on InMemoryDoneLedger");
+        pending_ids.shuffle(self.context.rng());
+
+        let mut fail_release = vec![false; pending_ids.len()];
+        for should_fail in &mut fail_release {
+            *should_fail = self.context.rng().random_bool(0.25);
+        }
+        if !pending_ids.is_empty() && !fail_release.iter().any(|flag| *flag) {
+            let fail_idx = self.context.rng().random_range(0..fail_release.len());
+            fail_release[fail_idx] = true;
+        }
+
+        for (op_id, should_fail) in pending_ids.into_iter().zip(fail_release.into_iter()) {
+            if should_fail {
+                let (event, violations) =
+                    self.step(DoneLedgerSimOp::InjectCommitFailure { count: 1 });
+                Self::record_event(&event, &mut event_counts);
+                all_violations.extend(violations);
+            }
+
+            let (event, violations) = self.step(DoneLedgerSimOp::ReleaseSpecific { op_id });
+            Self::record_event(&event, &mut event_counts);
+            all_violations.extend(violations);
+        }
+
+        let convergence_violations = self.oracle.verify_convergence(&self.ledger);
+        let converged = convergence_violations.is_empty();
+        all_violations.extend(convergence_violations);
+
+        DoneLedgerSimReport {
+            seed,
+            ops_executed: self.ops_executed,
+            violations: all_violations,
+            event_counts,
+            converged,
+        }
+    }
+
+    /// Number of delayed writes still retained by the harness.
+    pub fn pending_batch_count(&self) -> usize {
+        self.pending_batches.len()
+    }
+
+    /// Verify I6 convergence once the caller has drained pending writes.
+    pub fn check_convergence(&self) -> Vec<DoneLedgerInvariantViolation> {
+        assert!(
+            self.pending_batches.is_empty(),
+            "check_convergence requires all pending batches to be drained first"
+        );
+        self.oracle.verify_convergence(&self.ledger)
     }
 
     // ── Pending-drain logic ──────────────────────────────────────────
@@ -775,9 +855,6 @@ impl DoneLedgerSim {
     }
 
     fn try_gen_release_oldest(&mut self) -> Option<DoneLedgerSimOp> {
-        if self.pending_batches.is_empty() {
-            return None;
-        }
         Some(DoneLedgerSimOp::ReleaseOldest)
     }
 
@@ -848,29 +925,53 @@ impl DoneLedgerSim {
         }
     }
 
-    // ── Record generation ────────────────────────────────────────────
+    fn build_swizzle_clog_batch(&mut self, batch_index: usize) -> Vec<DoneLedgerRecord> {
+        const BATCH_WIDTH: usize = 3;
+        const OVERLAP_POOL: usize = 5;
 
-    /// Generate a random `DoneLedgerRecord` using the shared ovid pool
-    /// and PRNG.
-    fn generate_random_record(&mut self) -> DoneLedgerRecord {
-        let ovid_idx = self.context.rng().random_range(0..self.ovid_pool.len());
-        let ovid_hash = self.ovid_pool[ovid_idx];
+        let status_cycle = [
+            DoneLedgerStatus::FailedRetryable,
+            DoneLedgerStatus::ScannedWithFindings,
+            DoneLedgerStatus::ScannedClean,
+            DoneLedgerStatus::FailedPermanent,
+            DoneLedgerStatus::Skipped,
+        ];
+        let status = status_cycle[batch_index % status_cycle.len()];
+        let base = batch_index % OVERLAP_POOL;
+        let started_at = 1_000 + (batch_index as u64 * 10);
 
-        let status_idx = self.context.rng().random_range(0..ALL_STATUSES.len());
-        let status = ALL_STATUSES[status_idx];
+        (0..BATCH_WIDTH)
+            .map(|offset| {
+                let ovid_index = (base + offset) % OVERLAP_POOL;
+                let bytes_scanned = 100 + (batch_index as u64 * 25) + offset as u64;
+                let findings_count = match status {
+                    DoneLedgerStatus::ScannedClean => 0,
+                    DoneLedgerStatus::ScannedWithFindings => (offset as u32) + 1,
+                    _ => offset as u32,
+                };
+                self.build_record(
+                    ovid_index,
+                    status,
+                    bytes_scanned,
+                    findings_count,
+                    started_at + offset as u64,
+                    started_at + offset as u64 + 5,
+                )
+            })
+            .collect()
+    }
 
-        let bytes_scanned = self.context.rng().random_range(0u64..=10_000);
-
-        let findings_count = match status {
-            DoneLedgerStatus::ScannedClean => 0,
-            DoneLedgerStatus::ScannedWithFindings => self.context.rng().random_range(1u32..=50),
-            _ => self.context.rng().random_range(0u32..=10),
-        };
-
+    fn build_record(
+        &mut self,
+        ovid_index: usize,
+        status: DoneLedgerStatus,
+        bytes_scanned: u64,
+        findings_count: u32,
+        started_at: u64,
+        finished_at: u64,
+    ) -> DoneLedgerRecord {
         let run_id = self.next_run_id;
         self.next_run_id += 1;
-        let started_at = self.context.rng().random_range(1u64..=1000);
-        let finished_at = started_at + self.context.rng().random_range(1u64..=500);
 
         let provenance = DoneLedgerProvenance::new(
             RunId::from_raw(run_id),
@@ -886,7 +987,11 @@ impl DoneLedgerSim {
             None
         };
 
-        let key = DoneLedgerKey::new(self.tenant, self.policy, ovid_hash);
+        let key = DoneLedgerKey::new(
+            self.tenant,
+            self.policy,
+            self.ovid_pool[ovid_index % self.ovid_pool.len()],
+        );
 
         DoneLedgerRecord::try_new(
             key,
@@ -897,6 +1002,35 @@ impl DoneLedgerSim {
             error_code,
         )
         .unwrap()
+    }
+
+    // ── Record generation ────────────────────────────────────────────
+
+    /// Generate a random `DoneLedgerRecord` using the shared ovid pool
+    /// and PRNG.
+    fn generate_random_record(&mut self) -> DoneLedgerRecord {
+        let ovid_idx = self.context.rng().random_range(0..self.ovid_pool.len());
+        let status_idx = self.context.rng().random_range(0..ALL_STATUSES.len());
+        let status = ALL_STATUSES[status_idx];
+
+        let bytes_scanned = self.context.rng().random_range(0u64..=10_000);
+
+        let findings_count = match status {
+            DoneLedgerStatus::ScannedClean => 0,
+            DoneLedgerStatus::ScannedWithFindings => self.context.rng().random_range(1u32..=50),
+            _ => self.context.rng().random_range(0u32..=10),
+        };
+
+        let started_at = self.context.rng().random_range(1u64..=1000);
+        let finished_at = started_at + self.context.rng().random_range(1u64..=500);
+        self.build_record(
+            ovid_idx,
+            status,
+            bytes_scanned,
+            findings_count,
+            started_at,
+            finished_at,
+        )
     }
 }
 
