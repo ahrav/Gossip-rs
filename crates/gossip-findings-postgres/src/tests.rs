@@ -511,6 +511,11 @@ fn migration_is_idempotent() {
         expected_versions,
         "stored migration versions must match embedded migration set exactly"
     );
+    assert_eq!(
+        row_count(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
+        MIGRATIONS.len() as i64,
+        "history table must have exactly one row per migration (no duplicates)"
+    );
 }
 
 #[test]
@@ -603,6 +608,11 @@ fn concurrent_migrations_both_succeed() {
         stored_migration_versions(&mut client),
         expected_versions,
         "each migration must appear exactly once regardless of concurrent application"
+    );
+    assert_eq!(
+        row_count(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
+        MIGRATIONS.len() as i64,
+        "history table must have exactly one row per migration (no duplicates)"
     );
 }
 
