@@ -958,10 +958,11 @@ mod tests {
         let rec = sim.generate_random_record();
         let (event, _) = sim.step(DoneLedgerSimOp::BatchUpsert { records: vec![rec] });
 
-        // Should NOT be UpsertSubmitFailed — that's a different failure mode.
+        // Must be UpsertCommitFailed — not UpsertSubmitFailed (wrong
+        // failure mode) and not UpsertCommitted (unexpected success).
         assert!(
-            !matches!(event, DoneLedgerSimEvent::UpsertSubmitFailed),
-            "commit failure at auto-complete should not emit UpsertSubmitFailed, got {event:?}"
+            matches!(event, DoneLedgerSimEvent::UpsertCommitFailed { .. }),
+            "expected UpsertCommitFailed, got {event:?}"
         );
     }
 
