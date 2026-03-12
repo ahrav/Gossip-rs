@@ -65,14 +65,36 @@ impl DoneLedgerOracle {
         let Some(records) = self.pending.remove(&op_id) else {
             return false;
         };
+
+        // Deduplicate within the batch first, mirroring
+        // DoneLedgerBackend::apply which deduplicates before merging
+        // with existing state. Without this, status-dependent fields
+        // like findings_count can diverge when a batch contains
+        // multiple records for the same key with different statuses.
+        let mut deduped: HashMap<DoneLedgerKey, DoneLedgerRecord> =
+            HashMap::with_capacity(records.len());
         for record in records {
             let key = record.key();
+            match deduped.get(&key) {
+                Some(existing) => {
+                    let merged = existing.merge(&record).unwrap_or_else(|e| {
+                        panic!(
+                            "oracle intra-batch merge failure for key {key:?}: {e} \
+                             (existing={existing:?}, incoming={record:?})"
+                        );
+                    });
+                    deduped.insert(key, merged);
+                }
+                None => {
+                    deduped.insert(key, record);
+                }
+            }
+        }
+
+        // Merge deduplicated records with committed state.
+        for (key, record) in deduped {
             match self.committed.get(&key) {
                 Some(existing) => {
-                    // merge() can only fail if the merged status/findings are
-                    // inconsistent — which should not happen with well-formed
-                    // test records. Panic on merge failure to surface bugs
-                    // immediately.
                     let merged = existing.merge(&record).unwrap_or_else(|e| {
                         panic!(
                             "oracle merge failure for key {key:?}: {e} \
