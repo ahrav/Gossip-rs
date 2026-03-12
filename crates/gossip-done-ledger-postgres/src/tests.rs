@@ -685,6 +685,11 @@ fn arb_later_started_case() -> BoxedStrategy<MergeParityCase> {
             )| {
                 let existing_started_at = existing_started_raw.min(finished_at - 1);
                 let max_gap = finished_at - existing_started_at;
+                // When `finished_at` is small (e.g., 1), `max_gap` can be 1,
+                // collapsing `incoming_started_gap_raw` to a single effective
+                // value. This is harmless: the strict-inequality invariant
+                // still holds and larger `finished_at` values exercise the
+                // full gap range.
                 let incoming_started_at =
                     existing_started_at + incoming_started_gap_raw.min(max_gap);
 
@@ -878,7 +883,7 @@ fn assert_sql_merge_matches_rust_merge(
     let context = format!("{scenario:?}/{order_label}");
     let expected = existing
         .merge(incoming)
-        .map_err(|err| prop_failure(&format!("{context} rust merge failed"), err))?;
+        .map_err(|err| prop_failure(&format!("{context}: rust merge failed"), err))?;
     let actual = run_sql_merge_order(backend, existing, incoming)?;
     assert_record_fields_match(&expected, &actual, &context)
 }
@@ -910,9 +915,9 @@ fn done_ledger_backend_passes_conformance_suite() {
 /// same order.
 ///
 /// Post-loop assertions verify that the proptest run achieved adequate
-/// coverage: all five status variants appeared, and the `HigherStatus`,
-/// `LaterFinishedAt`, and `LaterStartedAt` scenarios were each exercised
-/// at least once.
+/// coverage: all five status variants appeared, and all four non-General
+/// scenarios (`HigherStatus`, `LaterFinishedAt`, `LaterStartedAt`,
+/// `ExactTie`) were each exercised at least once.
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn sql_on_conflict_merge_matches_rust_merge_proptest() {
@@ -926,6 +931,7 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
     let saw_higher_status = Cell::new(false);
     let saw_later_finished = Cell::new(false);
     let saw_later_started = Cell::new(false);
+    let saw_exact_tie = Cell::new(false);
 
     runner
         .run(&strategy, |case| {
@@ -937,6 +943,7 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
                 .set(saw_later_finished.get() || case.scenario == MergeScenario::LaterFinishedAt);
             saw_later_started
                 .set(saw_later_started.get() || case.scenario == MergeScenario::LaterStartedAt);
+            saw_exact_tie.set(saw_exact_tie.get() || case.scenario == MergeScenario::ExactTie);
 
             assert_sql_merge_matches_rust_merge(
                 &backend,
@@ -975,6 +982,10 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
     assert!(
         saw_later_started.get(),
         "proptest should cover later-started provenance winner selection"
+    );
+    assert!(
+        saw_exact_tie.get(),
+        "proptest should cover exact-tie stability (existing row wins)"
     );
 }
 
