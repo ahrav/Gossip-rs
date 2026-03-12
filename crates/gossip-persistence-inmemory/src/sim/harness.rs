@@ -29,10 +29,10 @@ use gossip_contracts::{
 use rand::Rng;
 
 use super::{
-    invariants::{DoneLedgerInvariantChecker, DoneLedgerInvariantViolation},
-    oracle::DoneLedgerOracle,
     DoneLedgerSimEvent, DoneLedgerSimEventKind, DoneLedgerSimOp, FaultLevel, PersistenceSim,
     SimContext,
+    invariants::{DoneLedgerInvariantChecker, DoneLedgerInvariantViolation},
+    oracle::DoneLedgerOracle,
 };
 use crate::{CompletionOrder, InMemoryDoneLedger, InMemoryDoneLedgerHandle, PendingWriteId};
 
