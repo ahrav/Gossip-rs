@@ -10,7 +10,9 @@
 //! by a liveness phase:
 //!
 //! 1. **Safety phase**: random ops with fault injection. Invariants
-//!    I1–I5, I8–I10 are checked after every step.
+//!    I1–I4, I7, I9–I10 are checked after every step. I5 and I8 are
+//!    skipped for delayed-release operations (pre-snapshots are stale);
+//!    the oracle convergence check (I6) covers those paths instead.
 //! 2. **Liveness phase**: stop generating faults, drain pending writes
 //!    one at a time (checking each outcome), run additional ops, verify
 //!    I6 convergence via the oracle.
@@ -151,8 +153,8 @@ pub struct DoneLedgerSim {
     ops_executed: usize,
 
     /// Delayed writes keyed by operation ID. Each entry retains the
-    /// commit handle, original records, and pre-snapshot so the harness
-    /// can verify outcomes after release.
+    /// commit handle and original records. Pre-snapshots are not stored;
+    /// delayed-release paths use empty snapshots and skip I5/I8.
     pending_batches: HashMap<PendingWriteId, PendingBatch>,
 
     /// Cached error code for failure/skipped records to avoid
