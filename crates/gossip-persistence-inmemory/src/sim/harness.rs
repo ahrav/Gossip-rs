@@ -270,16 +270,6 @@ impl DoneLedgerSim {
 
     // ── Pending-drain logic ──────────────────────────────────────────
 
-    /// Release all pending writes, consuming the retained commit handles
-    /// to verify each outcome. Returns any violations.
-    ///
-    /// Pre-snapshots taken at submission time are stale for delayed writes
-    /// (other commits may have modified the same keys). We pass empty
-    /// snapshots to skip I8 (ProvenanceFidelity) which relies on the
-    /// pre-snapshot. I1/I2/I3/I9 still work correctly without it.
-    /// I5 (CommitRollback) is skipped for the same reason.
-    /// The oracle convergence check (I6) serves as the authoritative
-    /// verification for delayed-write correctness.
     /// Record an event in the histogram. For `ReleasedAll`, also records
     /// per-batch `Released`/`ReleasedCommitFailed` breakdown so the
     /// histogram is consistent with `drain_all_pending`.
@@ -301,6 +291,16 @@ impl DoneLedgerSim {
         }
     }
 
+    /// Release all pending writes, consuming the retained commit handles
+    /// to verify each outcome. Returns any violations.
+    ///
+    /// Pre-snapshots taken at submission time are stale for delayed writes
+    /// (other commits may have modified the same keys). We pass empty
+    /// snapshots to skip I8 (ProvenanceFidelity) which relies on the
+    /// pre-snapshot. I1/I2/I3/I9 still work correctly without it.
+    /// I5 (CommitRollback) is skipped for the same reason.
+    /// The oracle convergence check (I6) serves as the authoritative
+    /// verification for delayed-write correctness.
     fn drain_all_pending(
         &mut self,
         event_counts: &mut BTreeMap<DoneLedgerSimEventKind, usize>,
@@ -438,6 +438,16 @@ impl DoneLedgerSim {
                         !self.pending_batches.contains_key(&op_id),
                         "duplicate PendingWriteId {op_id} — store counter invariant violated"
                     );
+
+                    // Verify the delayed write has not leaked into visible
+                    // state. The ledger snapshot should be unchanged from
+                    // pre-submission for every key in this batch.
+                    let violations = self.checker.check_after_submit_failure(
+                        &self.ledger,
+                        records,
+                        &pre_snapshot,
+                    );
+
                     self.pending_batches.insert(
                         op_id,
                         PendingBatch {
@@ -445,7 +455,7 @@ impl DoneLedgerSim {
                             handle,
                         },
                     );
-                    (DoneLedgerSimEvent::UpsertPending { op_id }, Vec::new())
+                    (DoneLedgerSimEvent::UpsertPending { op_id }, violations)
                 } else {
                     // Auto-completed — wait() returns immediately.
                     match handle.wait() {
@@ -492,7 +502,39 @@ impl DoneLedgerSim {
             .batch_get(self.tenant, self.policy, &ovid_hashes)
             .expect("batch_get should not fail on InMemoryDoneLedger");
 
-        (DoneLedgerSimEvent::GetOk { results }, Vec::new())
+        // I7: Validate read results against the oracle's committed view.
+        // For keys the oracle has committed state for, the ledger must
+        // return a matching record.
+        let mut violations = Vec::new();
+        for (i, ovid_hash) in ovid_hashes.iter().enumerate() {
+            let key = DoneLedgerKey::new(self.tenant, self.policy, *ovid_hash);
+            let oracle_record = self.oracle.expected_state(&key);
+            let ledger_record = results.get(i).and_then(|r| r.as_ref());
+
+            match (oracle_record, ledger_record) {
+                (Some(expected), Some(actual)) if expected != actual => {
+                    violations.push(DoneLedgerInvariantViolation::ReadConsistency {
+                        key,
+                        oracle: Some(Box::new(expected.clone())),
+                        actual: Some(Box::new(actual.clone())),
+                    });
+                }
+                (Some(expected), None) => {
+                    violations.push(DoneLedgerInvariantViolation::ReadConsistency {
+                        key,
+                        oracle: Some(Box::new(expected.clone())),
+                        actual: None,
+                    });
+                }
+                // oracle=None, ledger=Some is possible when pending
+                // writes have auto-completed but the oracle hasn't
+                // committed yet (race-free in single-threaded sim,
+                // but can happen with interleaved ops). Skip this case.
+                _ => {}
+            }
+        }
+
+        (DoneLedgerSimEvent::GetOk { results }, violations)
     }
 
     fn exec_release_next(

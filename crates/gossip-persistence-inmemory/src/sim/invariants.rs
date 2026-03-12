@@ -97,6 +97,14 @@ pub enum DoneLedgerInvariantViolation {
         before: Box<DoneLedgerRecord>,
         after: Box<DoneLedgerRecord>,
     },
+
+    /// I7: `batch_get` returned a record that differs from the oracle's
+    /// committed view for a key with no pending writes.
+    ReadConsistency {
+        key: DoneLedgerKey,
+        oracle: Option<Box<DoneLedgerRecord>>,
+        actual: Option<Box<DoneLedgerRecord>>,
+    },
 }
 
 impl std::fmt::Display for DoneLedgerInvariantViolation {
@@ -149,6 +157,12 @@ impl std::fmt::Display for DoneLedgerInvariantViolation {
                 write!(
                     f,
                     "I10 IdempotentUpsert: key={key:?} state changed on replay"
+                )
+            }
+            Self::ReadConsistency { key, .. } => {
+                write!(
+                    f,
+                    "I7 ReadConsistency: key={key:?} batch_get/oracle divergence"
                 )
             }
         }
