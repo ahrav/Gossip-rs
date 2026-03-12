@@ -14,9 +14,10 @@
 > types and migration primitives live in `gossip-pg-common`
 > (`crates/gossip-pg-common/src/`). Findings PostgreSQL schema,
 > migration, and type-mapping scaffolding lives in `gossip-findings-postgres`
-> (`crates/gossip-findings-postgres/src/`); that crate currently stops at the
-> schema, migration, and type-mapping boundary and does not implement
-> `FindingsSink`.
+> (`crates/gossip-findings-postgres/src/`); that crate currently provides the
+> canonical findings schema plan (table/index/column constants plus row
+> projections), findings-specific migration/type-mapping support, and does not
+> implement `FindingsSink`.
 
 Boundary 5 defines the persistence contracts for three subsystems:
 
@@ -132,7 +133,7 @@ Non-negotiables (project-wide):
 |------|-------|-------|
 | `gossip-pg-common` | Shared PostgreSQL type-mapping and migration primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), and the `MigrationOperation` enum. All PostgreSQL persistence backends depend on this crate instead of duplicating these types. |
 | `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits, applies forward-only migrations with checksum verification and advisory locking, and documents that transaction-scoped migrations cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
-| `gossip-findings-postgres` | Findings PostgreSQL schema, migration, and type-mapping scaffold | Provides findings-specific schema/migration error types and the module boundaries for canonical schema constants and embedded migrations. The crate does not implement `FindingsSink`; it defines the storage-boundary support that backend code will use. |
+| `gossip-findings-postgres` | Findings PostgreSQL schema, migration, and type-mapping scaffold | Provides findings-specific schema/migration error types, canonical table/index/column constants, and Postgres-ready row projections for `FindingRecord`, `OccurrenceRecord`, and `ObservationRecord`. The crate does not implement `FindingsSink`; it defines the storage-boundary support that backend code will use while migration execution is still scaffolded. |
 
 ---
 
