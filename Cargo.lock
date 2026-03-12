@@ -1361,6 +1361,7 @@ dependencies = [
 name = "gossip-findings-postgres"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "gossip-contracts",
  "gossip-done-ledger-postgres",
  "gossip-pg-common",
