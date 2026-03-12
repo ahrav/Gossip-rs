@@ -117,21 +117,21 @@ fn connection_string_for_db(base_url: &str, db_name: &str) -> String {
     }
 }
 
-/// Replace or append the `dbname=` component in a libpq keyword-value string.
+/// Replace or append the `dbname` setting in a libpq keyword-value string.
 ///
-/// Uses quote-aware tokenization so that `dbname=` fragments embedded inside
-/// single-quoted parameter values (e.g. `password='secret dbname=dummy'`) are
-/// not falsely matched.
+/// Handles both compact (`dbname=postgres`) and spaced (`dbname = postgres`)
+/// forms. Uses quote-aware tokenization so that `dbname=` fragments embedded
+/// inside single-quoted parameter values are not falsely matched.
 fn rewrite_keyword_connection_string(base_url: &str, db_name: &str) -> String {
-    let tokens = keyword_value_tokens(base_url);
-    if tokens.iter().any(|t| t.starts_with("dbname=")) {
-        tokens
+    let pairs = keyword_value_pairs(base_url);
+    if pairs.iter().any(|(k, _)| *k == "dbname") {
+        pairs
             .into_iter()
-            .map(|t| {
-                if t.starts_with("dbname=") {
+            .map(|(k, _v)| {
+                if k == "dbname" {
                     format!("dbname={db_name}")
                 } else {
-                    t.to_owned()
+                    format!("{k}={_v}")
                 }
             })
             .collect::<Vec<_>>()
@@ -141,43 +141,72 @@ fn rewrite_keyword_connection_string(base_url: &str, db_name: &str) -> String {
     }
 }
 
-/// Split a libpq keyword-value connection string into tokens, respecting
-/// single-quoted values that may contain whitespace.
+/// Parse a libpq keyword-value connection string into `(key, value)` pairs.
 ///
-/// libpq uses backslash escaping inside quoted values: `\'` is a literal
-/// single-quote, `\\` is a literal backslash. The tokenizer consumes
-/// characters inside a quoted section until an unescaped closing `'`.
-fn keyword_value_tokens(input: &str) -> Vec<&str> {
-    let mut tokens = Vec::new();
+/// Supports optional whitespace around `=` (e.g. `dbname = postgres`) and
+/// single-quoted values with libpq backslash escaping (`\'`, `\\`).
+fn keyword_value_pairs(input: &str) -> Vec<(&str, &str)> {
+    let mut pairs = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
+
     while i < bytes.len() {
+        // Skip whitespace between pairs.
         if bytes[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            if bytes[i] == b'\'' {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        // Backslash escape — skip the next character.
-                        i += 2;
-                    } else if bytes[i] == b'\'' {
-                        i += 1;
-                        break;
-                    } else {
-                        i += 1;
-                    }
+
+        // Parse key: everything up to '=' or whitespace.
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key = &input[key_start..i];
+
+        // Skip optional whitespace before '='.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        // Expect '='.
+        if i >= bytes.len() || bytes[i] != b'=' {
+            // Bare keyword with no '=' — shouldn't happen in valid conninfo,
+            // but don't lose the token.
+            pairs.push((key, ""));
+            continue;
+        }
+        i += 1; // skip '='
+
+        // Skip optional whitespace after '='.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        // Parse value (possibly quoted).
+        let val_start = i;
+        if i < bytes.len() && bytes[i] == b'\'' {
+            // Quoted value — consume until unescaped closing quote.
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                } else if bytes[i] == b'\'' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
                 }
-            } else {
+            }
+        } else {
+            // Unquoted value — consume until whitespace.
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
         }
-        tokens.push(&input[start..i]);
+        pairs.push((key, &input[val_start..i]));
     }
-    tokens
+    pairs
 }
 
 /// Replace the database component in a libpq connection URI.
