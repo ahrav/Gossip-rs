@@ -20,6 +20,11 @@ use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 /// Monotonic suffix for unique per-test database names.
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Nanosecond-resolution nonce seeded once at process start. Combined with
+/// `DB_COUNTER` and PID, this prevents name collisions when an external
+/// PostgreSQL instance retains databases across test runs.
+static RUN_NONCE: OnceLock<u64> = OnceLock::new();
+
 /// Base PostgreSQL endpoint used to provision fresh test databases.
 struct PgEndpoint {
     /// Connection string pointing at the maintenance database.
@@ -83,15 +88,29 @@ fn external_url() -> Option<String> {
 }
 
 /// Generate a unique test database name.
+///
+/// Includes a nanosecond-resolution nonce so that names remain unique across
+/// test runs sharing a persistent external PostgreSQL instance.
 fn unique_db_name() -> String {
     let pid = std::process::id();
+    let nonce = *RUN_NONCE.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos() as u64
+    });
     let seq = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("test_{pid}_{seq}")
+    format!("test_{pid}_{nonce:x}_{seq}")
 }
 
 /// Build a connection string for a freshly-created database.
+///
+/// Detects the format by checking for a `postgresql://` or `postgres://`
+/// scheme prefix rather than scanning for `://` anywhere in the string,
+/// which avoids misrouting keyword-value strings whose parameter values
+/// happen to contain that substring.
 fn connection_string_for_db(base_url: &str, db_name: &str) -> String {
-    if base_url.contains("://") {
+    if base_url.starts_with("postgresql://") || base_url.starts_with("postgres://") {
         rewrite_uri_connection_string(base_url, db_name)
     } else {
         rewrite_keyword_connection_string(base_url, db_name)
@@ -125,8 +144,9 @@ fn rewrite_keyword_connection_string(base_url: &str, db_name: &str) -> String {
 /// Split a libpq keyword-value connection string into tokens, respecting
 /// single-quoted values that may contain whitespace.
 ///
-/// libpq treats `''` inside a quoted value as an escaped single-quote,
-/// so `password='it''s complex'` is a single token.
+/// libpq uses backslash escaping inside quoted values: `\'` is a literal
+/// single-quote, `\\` is a literal backslash. The tokenizer consumes
+/// characters inside a quoted section until an unescaped closing `'`.
 fn keyword_value_tokens(input: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let bytes = input.as_bytes();
@@ -141,14 +161,12 @@ fn keyword_value_tokens(input: &str) -> Vec<&str> {
             if bytes[i] == b'\'' {
                 i += 1;
                 while i < bytes.len() {
-                    if bytes[i] == b'\'' {
+                    if bytes[i] == b'\\' {
+                        // Backslash escape — skip the next character.
+                        i += 2;
+                    } else if bytes[i] == b'\'' {
                         i += 1;
-                        // Doubled quote ('') is an escape — stay inside.
-                        if i < bytes.len() && bytes[i] == b'\'' {
-                            i += 1;
-                        } else {
-                            break;
-                        }
+                        break;
                     } else {
                         i += 1;
                     }
@@ -312,6 +330,18 @@ mod tests {
         assert_eq!(
             rewritten, "host=127.0.0.1 password='secret dbname=dummy' dbname=test_quoted",
             "quoted values containing dbname= must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn keyword_connection_string_with_backslash_escaped_quote() {
+        // libpq uses backslash escaping inside single-quoted values:
+        // \' is an escaped quote, \\ is an escaped backslash.
+        let input = r"host=127.0.0.1 password='it\'s complex dbname=dummy' dbname=postgres";
+        let rewritten = rewrite_keyword_connection_string(input, "test_bs");
+        assert_eq!(
+            rewritten, r"host=127.0.0.1 password='it\'s complex dbname=dummy' dbname=test_bs",
+            "backslash-escaped quotes inside values must not break tokenization"
         );
     }
 }
