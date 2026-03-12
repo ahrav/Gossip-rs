@@ -865,9 +865,11 @@ fn done_ledger_backend_passes_conformance_suite() {
     assert_eq!(checks, 4);
 }
 
-/// Property test: for 1,000 randomly generated record pairs, the SQL
+/// Property test: for randomly generated record pairs, the SQL
 /// `ON CONFLICT` merge must produce the same result as the in-memory
-/// `DoneLedgerRecord::merge`.
+/// `DoneLedgerRecord::merge`. The case count is governed by
+/// [`proptest_cases`] (4 locally, 256 in CI, overridable via
+/// `PROPTEST_CASES`).
 ///
 /// Each case is tested in *both* write orders (existing→incoming and
 /// incoming→existing) because exact ties preserve the first-written row,
@@ -1338,13 +1340,13 @@ fn cross_batch_upsert_equal_status_picks_later_finished_at() {
 }
 
 /// The SQL merge uses `GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count, 1)`
-/// for `ScannedWithFindings` status. This test verifies the floor clamp (the
-/// trailing `1`) is load-bearing: the existing `FailedRetryable` record has
-/// `findings_count=0`, so without the floor the merged value would be
-/// `GREATEST(1, 0) = 1` — coincidentally correct. With `findings_count=0` on
-/// the existing side, the three-argument GREATEST is the only thing preventing
-/// `GREATEST(0, 0) = 0` when an incoming `ScannedWithFindings` also carried 0
-/// (which Rust validation rejects, but SQL must handle defensively).
+/// for `ScannedWithFindings` status. This test verifies that a valid
+/// cross-batch promotion from `FailedRetryable` to `ScannedWithFindings`
+/// picks up the incoming record's provenance and findings via the GREATEST
+/// merge. The floor clamp (trailing `1`) is not independently observable
+/// here because `GREATEST(1, 0, 1)` equals `GREATEST(1, 0)`;
+/// [`sql_greatest_floor_clamp_is_observable_at_sql_level`] exercises it
+/// directly via raw SQL with a zero-count incoming row.
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
@@ -1409,6 +1411,69 @@ fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
     // existing record contributed findings_count=0.
     assert_eq!(merged.findings_count(), 1);
     assert_eq!(merged.provenance(), scanned.provenance());
+}
+
+/// Directly exercises the `GREATEST(..., 1)` floor clamp at the SQL level
+/// by bypassing Rust validation to insert a `ScannedWithFindings` row with
+/// `findings_count=0`. Without the floor, `GREATEST(0, 0)` would yield 0;
+/// with it, `GREATEST(0, 0, 1)` yields 1.
+///
+/// This is a defense-in-depth test: Rust validation prevents
+/// `ScannedWithFindings` with `findings_count=0`, but the SQL merge must
+/// independently guarantee findings >= 1 for scanned-with-findings status.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn sql_greatest_floor_clamp_is_observable_at_sql_level() {
+    let mut client = test_client();
+
+    // Use raw SQL to insert a ScannedWithFindings (status=11) row with
+    // findings_count=0, which Rust validation would reject.
+    try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(11),        // ScannedWithFindings
+            findings_count: Some(0), // invalid per Rust, but SQL must handle it
+            ovid_hash: Some(vec![0xE1; 32]),
+            ..Default::default()
+        },
+    )
+    .expect("raw insert should succeed (bypasses Rust validation)");
+
+    // Upsert a second ScannedWithFindings row with findings_count=0.
+    // The merge produces GREATEST(0, 0, 1) = 1 if the floor exists,
+    // or GREATEST(0, 0) = 0 without it.
+    try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(11),
+            findings_count: Some(0),
+            ovid_hash: Some(vec![0xE1; 32]),
+            finished_at: Some(200), // later → wins provenance
+            ..Default::default()
+        },
+    )
+    .expect("upsert should succeed");
+
+    let rows = client
+        .query(
+            &format!(
+                "SELECT findings_count FROM {} WHERE tenant_id = $1 AND policy_hash = $2 AND ovid_hash = $3",
+                crate::schema::DONE_LEDGER_ENTRIES_TABLE
+            ),
+            &[
+                &vec![0xAAu8; 32] as &(dyn postgres::types::ToSql + Sync),
+                &vec![0xBBu8; 32],
+                &vec![0xE1u8; 32],
+            ],
+        )
+        .expect("query should succeed");
+
+    assert_eq!(rows.len(), 1);
+    let findings_count: i32 = rows[0].get("findings_count");
+    assert_eq!(
+        findings_count, 1,
+        "GREATEST(0, 0, 1) should yield 1 — the floor clamp is load-bearing"
+    );
 }
 
 // ── Schema constraint enforcement ───────────────────────────────────────
@@ -1773,6 +1838,15 @@ fn schema_rejects_empty_error_code() {
 }
 
 // ── ON CONFLICT error_code coverage ─────────────────────────────────────
+//
+// These tests use inline SQL rather than the production `UPSERT_SQL` for
+// two reasons: (1) the production statement uses `unnest()` arrays, while
+// these tests need single-row INSERT...VALUES to control exact inputs;
+// (2) the first test intentionally sends invalid data to trigger a CHECK
+// constraint — it must bypass all Rust-side validation and the production
+// path. The proptest parity suite covers drift between production SQL and
+// Rust merge logic; these tests isolate specific PostgreSQL behaviors
+// (CHECK enforcement timing, COALESCE semantics).
 //
 // The SQL `ON CONFLICT` merge uses `COALESCE(winner, loser)` for
 // `error_code`, but PostgreSQL enforces CHECK constraints on the incoming

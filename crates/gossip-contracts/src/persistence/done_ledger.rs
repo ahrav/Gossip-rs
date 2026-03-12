@@ -149,9 +149,23 @@ pub enum DoneLedgerStatus {
     ScannedWithFindings = 11,
 }
 
-// Compile-time guard: if a variant is added or removed, the length of
-// `DoneLedgerStatus::ALL` must be updated and this assertion will fail.
-const _: () = assert!(DoneLedgerStatus::ALL.len() == 5);
+// Compile-time exhaustiveness guard: adding or removing a variant forces
+// a compile error here because the match has no wildcard. Update both `ALL`
+// and this function whenever the variant set changes.
+const _: () = {
+    const fn check_exhaustive(s: DoneLedgerStatus) -> u8 {
+        match s {
+            DoneLedgerStatus::FailedRetryable => 0,
+            DoneLedgerStatus::FailedPermanent => 1,
+            DoneLedgerStatus::Skipped => 2,
+            DoneLedgerStatus::ScannedClean => 3,
+            DoneLedgerStatus::ScannedWithFindings => 4,
+        }
+    }
+    // Touch every variant so the match is reachable.
+    let _ = check_exhaustive(DoneLedgerStatus::FailedRetryable);
+    assert!(DoneLedgerStatus::ALL.len() == 5);
+};
 
 impl DoneLedgerStatus {
     /// All status variants in rank order, for exhaustive iteration.

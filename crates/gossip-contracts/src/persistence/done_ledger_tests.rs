@@ -490,3 +490,25 @@ fn provenance_rejects_start_after_finish_in_debug() {
         LogicalTime::from_raw(100),
     );
 }
+
+// Verify that `done_record()` rejects invalid status/error_code combos
+// after the `validate()` hardening.
+#[test]
+#[should_panic(expected = "test record should pass full validation")]
+fn done_record_rejects_failure_status_without_error_code() {
+    // FailedRetryable requires error_code per `validate()`.
+    let _ = crate::test_util::done_record(
+        1,
+        1,
+        1,
+        FailedRetryable,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        2,
+        None, // missing error_code
+    );
+}

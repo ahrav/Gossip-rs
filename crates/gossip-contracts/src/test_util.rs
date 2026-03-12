@@ -246,7 +246,7 @@ pub fn done_record(
     finished_at: u64,
     error_code: Option<&str>,
 ) -> DoneLedgerRecord {
-    DoneLedgerRecord::try_new(
+    let record = DoneLedgerRecord::try_new(
         DoneLedgerKey::new(tenant(tenant_seed), policy(policy_seed), ovid(ovid_seed)),
         status,
         bytes_scanned,
@@ -256,7 +256,11 @@ pub fn done_record(
             DoneLedgerErrorCode::try_new(code).expect("test error code should be valid")
         }),
     )
-    .expect("test record should satisfy construction invariants")
+    .expect("test record should satisfy construction invariants");
+    record
+        .validate()
+        .expect("test record should pass full validation");
+    record
 }
 
 /// Minimal error type for [`CommitHandle`](crate::persistence::CommitHandle)
