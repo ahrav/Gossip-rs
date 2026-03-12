@@ -294,6 +294,25 @@ fn done_ledger_sim_swizzle_clog_sweep() {
         DoneLedgerSim::new(seed, FaultLevel::SunnyDay).run_swizzle_clog(SWIZZLE_BATCHES)
     });
     assert_no_failures("done_ledger_sim_swizzle_clog_sweep", &outcome);
+
+    assert!(
+        outcome
+            .aggregate_counts
+            .get(&DoneLedgerSimEventKind::UpsertPending)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "swizzle-clog should produce pending writes"
+    );
+    assert!(
+        outcome
+            .aggregate_counts
+            .get(&DoneLedgerSimEventKind::ReleasedCommitFailed)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "swizzle-clog should exercise at least one commit failure"
+    );
 }
 
 #[test]

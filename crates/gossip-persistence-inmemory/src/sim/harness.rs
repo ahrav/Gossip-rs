@@ -262,6 +262,11 @@ impl DoneLedgerSim {
         let converged = convergence_violations.is_empty();
         all_violations.extend(convergence_violations);
 
+        debug_assert!(
+            self.oracle.committed_count() > 0,
+            "seed={seed}: convergence is vacuous — no records were committed"
+        );
+
         DoneLedgerSimReport {
             seed,
             ops_executed: self.ops_executed,
@@ -327,6 +332,11 @@ impl DoneLedgerSim {
         let converged = convergence_violations.is_empty();
         all_violations.extend(convergence_violations);
 
+        debug_assert!(
+            self.oracle.committed_count() > 0,
+            "seed={seed}: convergence is vacuous — no records were committed"
+        );
+
         DoneLedgerSimReport {
             seed,
             ops_executed: self.ops_executed,
@@ -373,16 +383,50 @@ impl DoneLedgerSim {
         }
     }
 
+    /// Consume a released pending batch: wait for the commit handle,
+    /// update the oracle (commit or abort), and run invariant checks.
+    ///
+    /// Pre-snapshots are stale for delayed writes (taken at submission
+    /// time, not release time), so I5 and I8 are skipped. The oracle
+    /// convergence check (I6) is the authoritative verification.
+    fn finish_released_batch(
+        &mut self,
+        op_id: PendingWriteId,
+        batch: PendingBatch,
+    ) -> (DoneLedgerSimEvent, Vec<DoneLedgerInvariantViolation>) {
+        let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();
+        match batch.handle.wait() {
+            Ok(receipt) => {
+                let was_pending = self.oracle.commit(op_id);
+                debug_assert!(
+                    was_pending,
+                    "finish_released_batch: op {op_id} was not pending in oracle"
+                );
+                let violations = self.checker.check_after_committed_upsert(
+                    &self.ledger,
+                    &batch.records,
+                    &receipt,
+                    &empty_snapshot,
+                );
+                (DoneLedgerSimEvent::Released { op_id, receipt }, violations)
+            }
+            Err(_) => {
+                self.oracle.abort(op_id);
+                (
+                    DoneLedgerSimEvent::ReleasedCommitFailed { op_id },
+                    Vec::new(),
+                )
+            }
+        }
+    }
+
     /// Release all pending writes, consuming the retained commit handles
     /// to verify each outcome. Returns any violations.
     ///
     /// Pre-snapshots taken at submission time are stale for delayed writes
-    /// (other commits may have modified the same keys). We pass empty
-    /// snapshots to skip I8 (ProvenanceFidelity) which relies on the
-    /// pre-snapshot. I1/I2/I3/I9 still work correctly without it.
-    /// I5 (CommitRollback) is skipped for the same reason.
-    /// The oracle convergence check (I6) serves as the authoritative
-    /// verification for delayed-write correctness.
+    /// (other commits may have modified the same keys). The
+    /// [`finish_released_batch`](Self::finish_released_batch) helper
+    /// handles oracle commit/abort and invariant checks per batch.
     fn drain_all_pending(
         &mut self,
         event_counts: &mut BTreeMap<DoneLedgerSimEventKind, usize>,
@@ -393,9 +437,6 @@ impl DoneLedgerSim {
         self.ledger
             .release_all(CompletionOrder::OldestFirst)
             .expect("release_all should not fail on InMemoryDoneLedger");
-
-        // Empty snapshot — I8 checks are skipped for stale pre-snapshots.
-        let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();
 
         // Consume retained handles in op_id order to match the store's
         // oldest-first release order. This ensures the oracle commits
@@ -408,35 +449,9 @@ impl DoneLedgerSim {
             self.ops_executed += 1;
             self.context.tick();
 
-            match batch.handle.wait() {
-                Ok(receipt) => {
-                    let was_pending = self.oracle.commit(op_id);
-                    debug_assert!(
-                        was_pending,
-                        "drain_all_pending: op {op_id} was not pending in oracle"
-                    );
-                    // Use empty_snapshot so I8 is skipped (stale pre-snapshot).
-                    let violations = self.checker.check_after_committed_upsert(
-                        &self.ledger,
-                        &batch.records,
-                        &receipt,
-                        &empty_snapshot,
-                    );
-                    *event_counts
-                        .entry(DoneLedgerSimEventKind::Released)
-                        .or_insert(0) += 1;
-                    all_violations.extend(violations);
-                }
-                Err(_) => {
-                    // Commit failed (residual fail_commit counter).
-                    // Skip I5 check — pre-snapshot is stale, convergence
-                    // check (I6) will catch any real bugs.
-                    self.oracle.abort(op_id);
-                    *event_counts
-                        .entry(DoneLedgerSimEventKind::ReleasedCommitFailed)
-                        .or_insert(0) += 1;
-                }
-            }
+            let (event, violations) = self.finish_released_batch(op_id, batch);
+            *event_counts.entry(event.kind()).or_insert(0) += 1;
+            all_violations.extend(violations);
         }
 
         all_violations
@@ -503,9 +518,6 @@ impl DoneLedgerSim {
             Ok(handle) => {
                 let op_id = handle.operation_id();
 
-                // Register with oracle as pending.
-                self.oracle.submit(op_id, records.to_vec());
-
                 // Check if this is a delayed write by querying pending IDs.
                 let pending_ids = self
                     .ledger
@@ -530,16 +542,20 @@ impl DoneLedgerSim {
                         &pre_snapshot,
                     );
 
+                    // Clone once; oracle and pending_batches share ownership.
+                    let records_owned = records.to_vec();
+                    self.oracle.submit(op_id, records_owned.clone());
                     self.pending_batches.insert(
                         op_id,
                         PendingBatch {
-                            records: records.to_vec(),
+                            records: records_owned,
                             handle,
                         },
                     );
                     (DoneLedgerSimEvent::UpsertPending { op_id }, violations)
                 } else {
-                    // Auto-completed — wait() returns immediately.
+                    // Auto-completed — oracle only needs one copy.
+                    self.oracle.submit(op_id, records.to_vec());
                     match handle.wait() {
                         Ok(receipt) => {
                             self.oracle.commit(op_id);
@@ -631,43 +647,13 @@ impl DoneLedgerSim {
     ) -> (DoneLedgerSimEvent, Vec<DoneLedgerInvariantViolation>) {
         match self.ledger.release_next(order) {
             Ok(Some(op_id)) => {
-                // The store has finished this op. Consume our retained
-                // handle to learn whether the commit succeeded or failed.
-                if let Some(batch) = self.pending_batches.remove(&op_id) {
-                    // Pre-snapshot is stale (taken at submission time,
-                    // not release time). Use empty snapshot to skip I8,
-                    // and skip I5 on commit failure. Convergence (I6)
-                    // is the authoritative check for delayed writes.
-                    let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();
-                    match batch.handle.wait() {
-                        Ok(receipt) => {
-                            self.oracle.commit(op_id);
-                            let violations = self.checker.check_after_committed_upsert(
-                                &self.ledger,
-                                &batch.records,
-                                &receipt,
-                                &empty_snapshot,
-                            );
-                            (DoneLedgerSimEvent::Released { op_id, receipt }, violations)
-                        }
-                        Err(_) => {
-                            self.oracle.abort(op_id);
-                            // Skip I5 — stale pre-snapshot.
-                            (
-                                DoneLedgerSimEvent::ReleasedCommitFailed { op_id },
-                                Vec::new(),
-                            )
-                        }
-                    }
-                } else {
-                    // The store released an op the harness never tracked.
-                    // This violates the invariant that every delayed write
-                    // is recorded in pending_batches at submission time.
+                let batch = self.pending_batches.remove(&op_id).unwrap_or_else(|| {
                     panic!(
                         "release_next returned op_id {op_id} which has no \
                          entry in pending_batches — harness tracking bug"
-                    );
-                }
+                    )
+                });
+                self.finish_released_batch(op_id, batch)
             }
             Ok(None) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
             Err(e) => panic!("release_next failed on InMemoryDoneLedger: {e}"),
@@ -680,36 +666,13 @@ impl DoneLedgerSim {
     ) -> (DoneLedgerSimEvent, Vec<DoneLedgerInvariantViolation>) {
         match self.ledger.release_specific(op_id) {
             Ok(true) => {
-                if let Some(batch) = self.pending_batches.remove(&op_id) {
-                    // Stale pre-snapshot — use empty for I8, skip I5.
-                    let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();
-                    match batch.handle.wait() {
-                        Ok(receipt) => {
-                            self.oracle.commit(op_id);
-                            let violations = self.checker.check_after_committed_upsert(
-                                &self.ledger,
-                                &batch.records,
-                                &receipt,
-                                &empty_snapshot,
-                            );
-                            (DoneLedgerSimEvent::Released { op_id, receipt }, violations)
-                        }
-                        Err(_) => {
-                            self.oracle.abort(op_id);
-                            (
-                                DoneLedgerSimEvent::ReleasedCommitFailed { op_id },
-                                Vec::new(),
-                            )
-                        }
-                    }
-                } else {
-                    // The store released this op but the harness has no
-                    // record of it — same invariant as exec_release_next.
+                let batch = self.pending_batches.remove(&op_id).unwrap_or_else(|| {
                     panic!(
                         "release_specific returned Ok(true) for op_id {op_id} \
                          which has no entry in pending_batches — harness tracking bug"
-                    );
-                }
+                    )
+                });
+                self.finish_released_batch(op_id, batch)
             }
             Ok(false) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
             Err(e) => panic!("release_specific failed on InMemoryDoneLedger: {e}"),
@@ -728,9 +691,6 @@ impl DoneLedgerSim {
             .release_all(order)
             .expect("release_all should not fail on InMemoryDoneLedger");
 
-        // Empty snapshot for delayed writes (stale pre-snapshot).
-        let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();
-
         // Sort by op_id to match the store's release order. The store
         // applies oldest-first or newest-first depending on `order`;
         // the oracle must commit in the same sequence so tie-breaking
@@ -746,23 +706,13 @@ impl DoneLedgerSim {
         let mut failed = 0usize;
 
         for (op_id, batch) in sorted_batches {
-            match batch.handle.wait() {
-                Ok(receipt) => {
-                    self.oracle.commit(op_id);
-                    let violations = self.checker.check_after_committed_upsert(
-                        &self.ledger,
-                        &batch.records,
-                        &receipt,
-                        &empty_snapshot,
-                    );
-                    committed += 1;
-                    all_violations.extend(violations);
-                }
-                Err(_) => {
-                    self.oracle.abort(op_id);
-                    failed += 1;
-                }
+            let (event, violations) = self.finish_released_batch(op_id, batch);
+            match event.kind() {
+                DoneLedgerSimEventKind::Released => committed += 1,
+                DoneLedgerSimEventKind::ReleasedCommitFailed => failed += 1,
+                _ => {}
             }
+            all_violations.extend(violations);
         }
 
         (
@@ -1261,6 +1211,33 @@ mod tests {
         assert!(
             convergence_violations.is_empty(),
             "oracle/ledger divergence after NewestFirst release: {convergence_violations:?}"
+        );
+    }
+
+    #[test]
+    fn read_consistency_detects_oracle_ledger_divergence() {
+        // I7: batch_get should detect when the oracle has committed a
+        // record that the ledger does not have (simulating a missed write
+        // or a ledger data loss).
+        let mut sim = DoneLedgerSim::new(42, FaultLevel::SunnyDay);
+
+        // Build a record at ovid_pool[0] and commit it only in the oracle
+        // (bypassing the ledger entirely).
+        let rec = sim.build_record(0, DoneLedgerStatus::ScannedClean, 100, 0, 500, 600);
+        let fake_op = crate::PendingWriteId::from_raw(9999);
+        sim.oracle.submit(fake_op, vec![rec]);
+        sim.oracle.commit(fake_op);
+
+        // BatchGet for ovid_pool[0] — oracle has the key, ledger does not.
+        let (event, violations) = sim.step(DoneLedgerSimOp::BatchGet {
+            ovid_indices: vec![0],
+        });
+        assert!(matches!(event, DoneLedgerSimEvent::GetOk { .. }));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, DoneLedgerInvariantViolation::ReadConsistency { .. })),
+            "expected ReadConsistency violation, got: {violations:?}"
         );
     }
 
