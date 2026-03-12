@@ -99,18 +99,20 @@ fn connection_string_for_db(base_url: &str, db_name: &str) -> String {
 }
 
 /// Replace or append the `dbname=` component in a libpq keyword-value string.
+///
+/// Uses quote-aware tokenization so that `dbname=` fragments embedded inside
+/// single-quoted parameter values (e.g. `password='secret dbname=dummy'`) are
+/// not falsely matched.
 fn rewrite_keyword_connection_string(base_url: &str, db_name: &str) -> String {
-    if base_url
-        .split_whitespace()
-        .any(|part| part.starts_with("dbname="))
-    {
-        base_url
-            .split_whitespace()
-            .map(|part| {
-                if part.starts_with("dbname=") {
+    let tokens = keyword_value_tokens(base_url);
+    if tokens.iter().any(|t| t.starts_with("dbname=")) {
+        tokens
+            .into_iter()
+            .map(|t| {
+                if t.starts_with("dbname=") {
                     format!("dbname={db_name}")
                 } else {
-                    part.to_owned()
+                    t.to_owned()
                 }
             })
             .collect::<Vec<_>>()
@@ -118,6 +120,46 @@ fn rewrite_keyword_connection_string(base_url: &str, db_name: &str) -> String {
     } else {
         format!("{base_url} dbname={db_name}")
     }
+}
+
+/// Split a libpq keyword-value connection string into tokens, respecting
+/// single-quoted values that may contain whitespace.
+///
+/// libpq treats `''` inside a quoted value as an escaped single-quote,
+/// so `password='it''s complex'` is a single token.
+fn keyword_value_tokens(input: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            if bytes[i] == b'\'' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        // Doubled quote ('') is an escape — stay inside.
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        tokens.push(&input[start..i]);
+    }
+    tokens
 }
 
 /// Replace the database component in a libpq connection URI.
@@ -257,5 +299,19 @@ mod tests {
         let input = "sslmode=disable&connect_timeout=5";
         let rewritten = rewrite_uri_query_dbname(input, "test_6");
         assert_eq!(rewritten, input);
+    }
+
+    #[test]
+    fn keyword_connection_string_with_quoted_value_containing_dbname() {
+        // libpq keyword-value format supports single-quoted values. If a
+        // quoted value contains "dbname=", split_whitespace breaks the token
+        // boundary and the starts_with("dbname=") check falsely matches.
+        let input = "host=127.0.0.1 password='secret dbname=dummy' dbname=postgres";
+        let rewritten = rewrite_keyword_connection_string(input, "test_quoted");
+        // Correct behavior: only the real dbname= key is replaced.
+        assert_eq!(
+            rewritten, "host=127.0.0.1 password='secret dbname=dummy' dbname=test_quoted",
+            "quoted values containing dbname= must not be rewritten"
+        );
     }
 }

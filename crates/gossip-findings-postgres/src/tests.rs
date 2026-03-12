@@ -560,7 +560,8 @@ fn concurrent_migrations_both_succeed() {
     let barrier_a = Arc::clone(&barrier);
     let barrier_b = Arc::clone(&barrier);
     let url_a = url.clone();
-    let url_b = url;
+    let url_b = url.clone();
+    let url_verify = url;
 
     let worker = |db_url: String, barrier: Arc<std::sync::Barrier>| {
         std::thread::spawn(move || {
@@ -582,6 +583,16 @@ fn concurrent_migrations_both_succeed() {
         .join()
         .expect("second migration thread should not panic")
         .expect("second migration thread should succeed");
+
+    // Verify the database state: exactly one history row per migration, no
+    // duplicates and no missing entries.
+    let mut client = postgres::Client::connect(&url_verify, postgres::NoTls)
+        .expect("post-verification connection should succeed");
+    assert_eq!(
+        row_count(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
+        MIGRATIONS.len() as i64,
+        "each migration must appear exactly once regardless of concurrent application"
+    );
 }
 
 #[test]
@@ -688,7 +699,16 @@ fn foreign_key_cascade_from_findings() {
     client
         .execute(&format!("DELETE FROM {}", schema::FINDINGS_TABLE), &[])
         .expect("deleting parent findings should succeed");
-    assert_eq!(row_count(&mut client, schema::OCCURRENCES_TABLE), 0);
+    assert_eq!(
+        row_count(&mut client, schema::FINDINGS_TABLE),
+        0,
+        "parent findings table should be empty after explicit delete"
+    );
+    assert_eq!(
+        row_count(&mut client, schema::OCCURRENCES_TABLE),
+        0,
+        "child occurrences should cascade-delete with parent finding"
+    );
 }
 
 #[test]
@@ -703,7 +723,16 @@ fn foreign_key_cascade_from_occurrences() {
     client
         .execute(&format!("DELETE FROM {}", schema::OCCURRENCES_TABLE), &[])
         .expect("deleting parent occurrences should succeed");
-    assert_eq!(row_count(&mut client, schema::OBSERVATIONS_TABLE), 0);
+    assert_eq!(
+        row_count(&mut client, schema::OBSERVATIONS_TABLE),
+        0,
+        "child observations should cascade-delete with parent occurrence"
+    );
+    assert_eq!(
+        row_count(&mut client, schema::FINDINGS_TABLE),
+        1,
+        "grandparent findings row must survive child occurrence deletion"
+    );
 }
 
 #[test]
@@ -871,7 +900,9 @@ fn observations_rejects_negative_seen_at() {
 fn observations_accepts_negative_run_id() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
-    let tenant_id = bytes32(0x10);
+    let tenant_id = ObservationOverrides::defaults()
+        .tenant_id
+        .expect("defaults must provide tenant_id");
     let observation_id = bytes32(0x41);
 
     let inserted = try_insert_observation(
@@ -903,7 +934,9 @@ fn observations_accepts_negative_run_id() {
 fn observations_accepts_negative_shard_id() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
-    let tenant_id = bytes32(0x10);
+    let tenant_id = ObservationOverrides::defaults()
+        .tenant_id
+        .expect("defaults must provide tenant_id");
     let observation_id = bytes32(0x42);
 
     let inserted = try_insert_observation(
@@ -950,10 +983,30 @@ fn observations_location_display_size_limit() {
 
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_location_url_size_limit() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            location_url: Some(Some("x".repeat(4_097))),
+            ..Default::default()
+        },
+    )
+    .expect_err("4097-byte location_url should violate observations checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_location_url_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn observations_location_url_accepts_null() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
-    let tenant_id = bytes32(0x10);
+    let tenant_id = ObservationOverrides::defaults()
+        .tenant_id
+        .expect("defaults must provide tenant_id");
     let observation_id = bytes32(0x43);
 
     let inserted = try_insert_observation(
