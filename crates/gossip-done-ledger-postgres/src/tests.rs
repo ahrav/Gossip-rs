@@ -405,6 +405,7 @@ fn arb_integer_domain_u32() -> BoxedStrategy<u32> {
         Just(PG_INTEGER_MAX - 1),
         Just(PG_INTEGER_MAX),
         3u32..=4_096u32,
+        (PG_INTEGER_MAX - 4_096u32)..=PG_INTEGER_MAX,
     ]
     .boxed()
 }
