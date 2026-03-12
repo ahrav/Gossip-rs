@@ -1413,67 +1413,68 @@ fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
     assert_eq!(merged.provenance(), scanned.provenance());
 }
 
-/// Directly exercises the `GREATEST(..., 1)` floor clamp at the SQL level
-/// by bypassing Rust validation to insert a `ScannedWithFindings` row with
-/// `findings_count=0`. Without the floor, `GREATEST(0, 0)` would yield 0;
-/// with it, `GREATEST(0, 0, 1)` yields 1.
+/// Verifies that an invalid `ScannedWithFindings` `EXCLUDED` row is rejected
+/// before the SQL floor clamp can rescue it.
 ///
-/// This is a defense-in-depth test: Rust validation prevents
-/// `ScannedWithFindings` with `findings_count=0`, but the SQL merge must
-/// independently guarantee findings >= 1 for scanned-with-findings status.
+/// The reachable clamp coverage lives in
+/// `cross_batch_upsert_scanned_with_findings_clamps_findings_floor`. This raw
+/// SQL test instead documents the schema boundary: PostgreSQL enforces
+/// `done_ledger_entries_status_shape_ck` on the incoming tuple before
+/// `ON CONFLICT DO UPDATE` can evaluate `GREATEST(..., 1)`.
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
-fn sql_greatest_floor_clamp_is_observable_at_sql_level() {
+fn sql_on_conflict_rejects_invalid_scanned_with_findings_excluded_row() {
     let mut client = test_client();
 
-    // Use raw SQL to insert a ScannedWithFindings (status=11) row with
-    // findings_count=0, which Rust validation would reject.
-    try_insert(
-        &mut client,
-        RowOverrides {
-            status: Some(11),        // ScannedWithFindings
-            findings_count: Some(0), // invalid per Rust, but SQL must handle it
-            ovid_hash: Some(vec![0xE1; 32]),
-            ..Default::default()
-        },
-    )
-    .expect("raw insert should succeed (bypasses Rust validation)");
-
-    // Upsert a second ScannedWithFindings row with findings_count=0.
-    // The merge produces GREATEST(0, 0, 1) = 1 if the floor exists,
-    // or GREATEST(0, 0) = 0 without it.
+    // Seed a valid ScannedWithFindings row so the second write takes the
+    // ON CONFLICT path.
     try_insert(
         &mut client,
         RowOverrides {
             status: Some(11),
-            findings_count: Some(0),
+            findings_count: Some(1),
             ovid_hash: Some(vec![0xE1; 32]),
-            finished_at: Some(200), // later → wins provenance
             ..Default::default()
         },
     )
-    .expect("upsert should succeed");
+    .expect("seed insert should succeed");
 
-    let rows = client
-        .query(
+    // The incoming row is invalid (`status=11` with `findings_count=0`), so
+    // PostgreSQL rejects it before the ON CONFLICT update can clamp the value
+    // with GREATEST(EXCLUDED.findings_count, existing.findings_count, 1).
+    let err = client
+        .execute(
             &format!(
-                "SELECT findings_count FROM {} WHERE tenant_id = $1 AND policy_hash = $2 AND ovid_hash = $3",
-                crate::schema::DONE_LEDGER_ENTRIES_TABLE
+                "INSERT INTO {t} (tenant_id, policy_hash, ovid_hash, status, bytes_scanned, \
+                 findings_count, fence_epoch, started_at, finished_at, run_id, shard_id, error_code) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET \
+                 status = GREATEST(EXCLUDED.status, {t}.status), \
+                 findings_count = CASE \
+                     WHEN GREATEST(EXCLUDED.status, {t}.status) = 10 THEN 0 \
+                     WHEN GREATEST(EXCLUDED.status, {t}.status) = 11 THEN \
+                         GREATEST(EXCLUDED.findings_count, {t}.findings_count, 1) \
+                     ELSE GREATEST(EXCLUDED.findings_count, {t}.findings_count) \
+                 END",
+                t = crate::schema::DONE_LEDGER_ENTRIES_TABLE
             ),
             &[
                 &vec![0xAAu8; 32] as &(dyn postgres::types::ToSql + Sync),
                 &vec![0xBBu8; 32],
                 &vec![0xE1u8; 32],
+                &11i16,
+                &1024i64,
+                &0i32, // invalid for ScannedWithFindings
+                &1i64,
+                &100i64,
+                &200i64, // later → would win provenance if the row were accepted
+                &2i64,
+                &2i64,
+                &None::<String>,
             ],
         )
-        .expect("query should succeed");
-
-    assert_eq!(rows.len(), 1);
-    let findings_count: i32 = rows[0].get("findings_count");
-    assert_eq!(
-        findings_count, 1,
-        "GREATEST(0, 0, 1) should yield 1 — the floor clamp is load-bearing"
-    );
+        .expect_err("invalid ScannedWithFindings EXCLUDED row should violate the shape constraint");
+    assert_constraint_violation(&err, "status_shape");
 }
 
 // ── Schema constraint enforcement ───────────────────────────────────────
