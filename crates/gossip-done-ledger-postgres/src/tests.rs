@@ -28,14 +28,16 @@
 //! ```
 
 use crate::test_postgres::{test_client, test_client_bare};
-use crate::{DoneLedgerPg, DoneLedgerPgMigrationError, apply_all_migrations, apply_migrations};
+use crate::{
+    DoneLedgerPg, DoneLedgerPgError, DoneLedgerPgMigrationError, apply_all_migrations,
+    apply_migrations,
+};
 use gossip_contracts::{
-    identity::{FenceEpoch, LogicalTime, RunId, ShardId},
     persistence::{
-        CommitHandle, DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
-        DoneLedgerRecord, DoneLedgerStatus, run_done_ledger_conformance,
+        CommitHandle, DoneLedger, DoneLedgerErrorCode, DoneLedgerRecord, DoneLedgerStatus,
+        RECOMMENDED_MAX_BATCH_SIZE, run_done_ledger_conformance,
     },
-    test_util::{ovid, policy, tenant},
+    test_util::{done_record, ovid, policy, tenant},
 };
 use proptest::{
     prelude::*,
@@ -203,61 +205,6 @@ fn persisted_checksum_tamper_is_detected_on_reapply() {
 }
 
 // ── DoneLedger backend behavior ───────────────────────────────────────────
-
-/// Shorthand to construct a [`DoneLedgerProvenance`] from raw `u64` fields.
-fn provenance(
-    run_id: u64,
-    shard_id: u64,
-    fence_epoch: u64,
-    started_at: u64,
-    finished_at: u64,
-) -> DoneLedgerProvenance {
-    DoneLedgerProvenance::new(
-        RunId::from_raw(run_id),
-        ShardId::from_raw(shard_id),
-        FenceEpoch::from_raw(fence_epoch),
-        LogicalTime::from_raw(started_at),
-        LogicalTime::from_raw(finished_at),
-    )
-}
-
-/// Construct a [`DoneLedgerRecord`] from flat scalar arguments.
-///
-/// Seeds are expanded into deterministic 32-byte identity hashes via
-/// `test_util::{tenant, policy, ovid}`. Panics on invalid combinations
-/// (e.g., `ScannedClean` with `findings_count > 0`), which is intentional
-/// for test code — the caller is responsible for providing self-consistent
-/// arguments.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "test helper mirrors the done-ledger durable row shape"
-)]
-fn done_record(
-    tenant_seed: u8,
-    policy_seed: u8,
-    ovid_seed: u8,
-    status: DoneLedgerStatus,
-    bytes_scanned: u64,
-    findings_count: u32,
-    run_id: u64,
-    shard_id: u64,
-    fence_epoch: u64,
-    started_at: u64,
-    finished_at: u64,
-    error_code: Option<&str>,
-) -> DoneLedgerRecord {
-    DoneLedgerRecord::try_new(
-        DoneLedgerKey::new(tenant(tenant_seed), policy(policy_seed), ovid(ovid_seed)),
-        status,
-        bytes_scanned,
-        findings_count,
-        provenance(run_id, shard_id, fence_epoch, started_at, finished_at),
-        error_code.map(|code| {
-            DoneLedgerErrorCode::try_new(code).expect("test error code should be valid")
-        }),
-    )
-    .expect("test record should satisfy construction invariants")
-}
 
 /// Upper bound of `u64` values that fit in a PostgreSQL `BIGINT` (signed `i64`).
 ///
@@ -635,6 +582,11 @@ fn arb_later_finished_case() -> BoxedStrategy<MergeParityCase> {
                 let incoming_finished_at = existing_finished_at + later_finished_gap;
                 let incoming_started_at = incoming_started_raw.min(incoming_finished_at);
 
+                debug_assert!(
+                    incoming_finished_at > existing_finished_at,
+                    "LaterFinishedAt requires strictly later finished_at"
+                );
+
                 MergeParityCase {
                     scenario: MergeScenario::LaterFinishedAt,
                     existing: build_generated_record(
@@ -690,6 +642,11 @@ fn arb_later_started_case() -> BoxedStrategy<MergeParityCase> {
                 // full gap range.
                 let incoming_started_at =
                     existing_started_at + incoming_started_gap_raw.min(max_gap);
+
+                debug_assert!(
+                    incoming_started_at > existing_started_at,
+                    "LaterStartedAt requires strictly later started_at"
+                );
 
                 MergeParityCase {
                     scenario: MergeScenario::LaterStartedAt,
@@ -923,6 +880,7 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
     let strategy = arb_merge_parity_case();
     let mut runner = TestRunner::new(ProptestConfig {
         cases: proptest_case_count(),
+        max_shrink_iters: 256,
         source_file: Some(file!()),
         ..ProptestConfig::default()
     });
@@ -1157,6 +1115,54 @@ fn batch_upsert_merges_duplicate_keys_before_persist() {
     assert_eq!(merged.provenance(), scanned.provenance());
 }
 
+/// `batch_get` with more than `RECOMMENDED_MAX_BATCH_SIZE` ovid hashes
+/// must be rejected before issuing any SQL.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn batch_get_rejects_oversized_input() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    let too_many: Vec<_> = (0..=RECOMMENDED_MAX_BATCH_SIZE)
+        .map(|i| ovid((i % 256) as u8))
+        .collect();
+    let err = backend
+        .batch_get(tenant(1), policy(1), &too_many)
+        .expect_err("oversized batch_get should be rejected");
+    assert!(
+        matches!(err, DoneLedgerPgError::BatchTooLarge { .. }),
+        "expected BatchTooLarge, got: {err}"
+    );
+}
+
+/// `batch_upsert` with more than `RECOMMENDED_MAX_BATCH_SIZE` records
+/// must be rejected before issuing any SQL.
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn batch_upsert_rejects_oversized_input() {
+    let backend = DoneLedgerPg::from_client(test_client());
+    let record = done_record(
+        1,
+        1,
+        1,
+        DoneLedgerStatus::ScannedClean,
+        100,
+        0,
+        1,
+        1,
+        1,
+        10,
+        20,
+        None,
+    );
+    let too_many: Vec<_> = std::iter::repeat_n(record, RECOMMENDED_MAX_BATCH_SIZE + 1).collect();
+    let err = backend
+        .batch_upsert(&too_many)
+        .expect_err("oversized batch_upsert should be rejected");
+    assert!(
+        matches!(err, DoneLedgerPgError::BatchTooLarge { .. }),
+        "expected BatchTooLarge, got: {err}"
+    );
+}
+
 /// Writing two records with the same key in *separate* `batch_upsert` calls
 /// exercises the PostgreSQL `ON CONFLICT` merge path (not the Rust-side
 /// `dedupe_and_validate` path). Verifies status promotion, `bytes_scanned`
@@ -1223,6 +1229,8 @@ fn cross_batch_upsert_exercises_sql_on_conflict_merge() {
     assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
     // bytes_scanned takes the GREATEST across both batches.
     assert_eq!(merged.bytes_scanned(), 400);
+    // findings_count takes GREATEST: max(3, 5) = 5.
+    assert_eq!(merged.findings_count(), 5);
     // Scanned status clears error_code.
     assert_eq!(merged.error_code(), None);
     // Provenance comes from the status winner (ScannedWithFindings).
@@ -1499,6 +1507,46 @@ fn schema_enforces_status_shape_constraint() {
         },
     )
     .expect_err("error status without error_code should violate shape constraint");
+    assert_constraint_violation(&err, "status_shape");
+
+    // ScannedWithFindings (11) with findings_count = 0 should be rejected.
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(11),
+            findings_count: Some(0),
+            ovid_hash: Some(vec![0xEE; 32]),
+            ..Default::default()
+        },
+    )
+    .expect_err("ScannedWithFindings with findings == 0 should violate shape constraint");
+    assert_constraint_violation(&err, "status_shape");
+
+    // ScannedWithFindings (11) with non-NULL error_code should be rejected.
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(11),
+            findings_count: Some(3),
+            error_code: Some("OOPS".to_string()),
+            ovid_hash: Some(vec![0xEF; 32]),
+            ..Default::default()
+        },
+    )
+    .expect_err("ScannedWithFindings with error_code should violate shape constraint");
+    assert_constraint_violation(&err, "status_shape");
+
+    // ScannedClean (10) with non-NULL error_code should be rejected.
+    let err = try_insert(
+        &mut client,
+        RowOverrides {
+            status: Some(10),
+            error_code: Some("OOPS".to_string()),
+            ovid_hash: Some(vec![0xF0; 32]),
+            ..Default::default()
+        },
+    )
+    .expect_err("ScannedClean with error_code should violate shape constraint");
     assert_constraint_violation(&err, "status_shape");
 }
 

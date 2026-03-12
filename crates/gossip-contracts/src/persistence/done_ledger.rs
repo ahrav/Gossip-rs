@@ -149,8 +149,8 @@ pub enum DoneLedgerStatus {
     ScannedWithFindings = 11,
 }
 
-/// Compile-time guard: if a variant is added or removed, the length of
-/// `DoneLedgerStatus::ALL` must be updated and this assertion will fail.
+// Compile-time guard: if a variant is added or removed, the length of
+// `DoneLedgerStatus::ALL` must be updated and this assertion will fail.
 const _: () = assert!(DoneLedgerStatus::ALL.len() == 5);
 
 impl DoneLedgerStatus {

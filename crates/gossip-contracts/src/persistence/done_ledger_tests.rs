@@ -1,9 +1,6 @@
 use rstest::rstest;
 
-use crate::{
-    identity::{FenceEpoch, LogicalTime, RunId, ShardId},
-    test_util::{canonical_digest, ovid, policy, tenant},
-};
+use crate::test_util::{canonical_digest, ovid, policy, provenance, tenant};
 
 use super::*;
 use DoneLedgerStatus::{
@@ -15,13 +12,7 @@ use DoneLedgerStatus::{
 // ---------------------------------------------------------------------------
 
 fn make_provenance() -> DoneLedgerProvenance {
-    DoneLedgerProvenance::new(
-        RunId::from_raw(1),
-        ShardId::from_raw(2),
-        FenceEpoch::from_raw(3),
-        LogicalTime::from_raw(100),
-        LogicalTime::from_raw(200),
-    )
+    provenance(1, 2, 3, 100, 200)
 }
 
 // ---------------------------------------------------------------------------
