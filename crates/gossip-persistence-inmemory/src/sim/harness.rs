@@ -108,7 +108,8 @@ impl DoneLedgerFaultConfig {
 pub struct DoneLedgerSimReport {
     /// The PRNG seed used for this run.
     pub seed: u64,
-    /// Total operations executed across both phases.
+    /// Total operations executed across both phases. During drain
+    /// phases, each pending batch release counts as one operation.
     pub ops_executed: usize,
     /// All invariant violations detected.
     pub violations: Vec<DoneLedgerInvariantViolation>,
@@ -154,6 +155,10 @@ pub struct DoneLedgerSim {
     /// can verify outcomes after release.
     pending_batches: HashMap<PendingWriteId, PendingBatch>,
 
+    /// Cached error code for failure/skipped records to avoid
+    /// per-record allocation of the same value.
+    sim_error_code: DoneLedgerErrorCode,
+
     /// Monotonic counter for generating unique provenance values.
     next_run_id: u64,
 }
@@ -189,6 +194,7 @@ impl DoneLedgerSim {
             ovid_pool,
             ops_executed: 0,
             pending_batches: HashMap::new(),
+            sim_error_code: DoneLedgerErrorCode::try_new("SIM_ERROR").unwrap(),
             next_run_id: 1,
         }
     }
@@ -322,7 +328,11 @@ impl DoneLedgerSim {
 
             match batch.handle.wait() {
                 Ok(receipt) => {
-                    self.oracle.commit(op_id);
+                    let was_pending = self.oracle.commit(op_id);
+                    debug_assert!(
+                        was_pending,
+                        "drain_all_pending: op {op_id} was not pending in oracle"
+                    );
                     // Use empty_snapshot so I8 is skipped (stale pre-snapshot).
                     let violations = self.checker.check_after_committed_upsert(
                         &self.ledger,
@@ -693,9 +703,7 @@ impl DoneLedgerSim {
         let roll: u32 = self.context.rng().random_range(0..100);
         match roll {
             0..60 => self.gen_batch_upsert().unwrap(),
-            60..80 => self
-                .gen_batch_get()
-                .unwrap_or_else(|| self.gen_batch_upsert().unwrap()),
+            60..80 => self.gen_batch_get().unwrap(),
             _ => self.gen_batch_upsert().unwrap(),
         }
     }
@@ -823,7 +831,7 @@ impl DoneLedgerSim {
         );
 
         let error_code = if status.is_failure() || status.is_skipped() {
-            Some(DoneLedgerErrorCode::try_new("SIM_ERROR").unwrap())
+            Some(self.sim_error_code.clone())
         } else {
             None
         };

@@ -50,7 +50,7 @@ fn should_inject(rng: &mut ChaCha8Rng, ppm: u32) -> bool {
     if ppm == 0 {
         return false;
     }
-    debug_assert!(ppm <= PPM_MAX);
+    assert!(ppm <= PPM_MAX);
     rng.random_range(0u32..PPM_MAX) < ppm
 }
 

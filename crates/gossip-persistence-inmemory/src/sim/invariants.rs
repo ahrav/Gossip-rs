@@ -15,6 +15,7 @@
 //! | I4 | SubmitRollback | After failed submission |
 //! | I5 | CommitRollback | After failed commit |
 //! | I6 | LatticeConvergence | Liveness phase only (via oracle) |
+//! | — | *(I7 reserved for findings-layer invariants)* | — |
 //! | I8 | ProvenanceFidelity | After committed upsert |
 //! | I9 | ReceiptAccuracy | After committed upsert |
 //! | I10 | IdempotentUpsert | After committed upsert of identical records |
