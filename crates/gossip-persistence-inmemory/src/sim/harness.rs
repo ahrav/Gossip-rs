@@ -216,13 +216,15 @@ impl DoneLedgerSim {
             let suppress_faults = i < WARMUP_OPS;
             let op = self.generate_random_op(suppress_faults);
             let (event, violations) = self.step(op);
-            *event_counts.entry(event.kind()).or_insert(0) += 1;
+            Self::record_event(&event, &mut event_counts);
             all_violations.extend(violations);
         }
 
         // ── Liveness phase ───────────────────────────────────────────
         // Set auto-complete so new writes commit immediately.
-        let _ = self.ledger.set_auto_complete(true);
+        self.ledger
+            .set_auto_complete(true)
+            .expect("set_auto_complete should not fail on InMemoryDoneLedger");
 
         // Drain pending writes accumulated during safety phase.
         let drain_violations = self.drain_all_pending(&mut event_counts);
@@ -235,7 +237,7 @@ impl DoneLedgerSim {
         for _ in 0..liveness_ops {
             let op = self.generate_liveness_op();
             let (event, violations) = self.step(op);
-            *event_counts.entry(event.kind()).or_insert(0) += 1;
+            Self::record_event(&event, &mut event_counts);
             all_violations.extend(violations);
         }
 
@@ -272,6 +274,27 @@ impl DoneLedgerSim {
     /// I5 (CommitRollback) is skipped for the same reason.
     /// The oracle convergence check (I6) serves as the authoritative
     /// verification for delayed-write correctness.
+    /// Record an event in the histogram. For `ReleasedAll`, also records
+    /// per-batch `Released`/`ReleasedCommitFailed` breakdown so the
+    /// histogram is consistent with `drain_all_pending`.
+    fn record_event(
+        event: &DoneLedgerSimEvent,
+        event_counts: &mut BTreeMap<DoneLedgerSimEventKind, usize>,
+    ) {
+        *event_counts.entry(event.kind()).or_insert(0) += 1;
+        if let DoneLedgerSimEvent::ReleasedAll {
+            committed, failed, ..
+        } = event
+        {
+            *event_counts
+                .entry(DoneLedgerSimEventKind::Released)
+                .or_insert(0) += committed;
+            *event_counts
+                .entry(DoneLedgerSimEventKind::ReleasedCommitFailed)
+                .or_insert(0) += failed;
+        }
+    }
+
     fn drain_all_pending(
         &mut self,
         event_counts: &mut BTreeMap<DoneLedgerSimEventKind, usize>,
@@ -579,6 +602,9 @@ impl DoneLedgerSim {
             sorted_batches.reverse();
         }
 
+        let mut committed = 0usize;
+        let mut failed = 0usize;
+
         for (op_id, batch) in sorted_batches {
             match batch.handle.wait() {
                 Ok(receipt) => {
@@ -589,15 +615,24 @@ impl DoneLedgerSim {
                         &receipt,
                         &empty_snapshot,
                     );
+                    committed += 1;
                     all_violations.extend(violations);
                 }
                 Err(_) => {
                     self.oracle.abort(op_id);
+                    failed += 1;
                 }
             }
         }
 
-        (DoneLedgerSimEvent::ReleasedAll { count }, all_violations)
+        (
+            DoneLedgerSimEvent::ReleasedAll {
+                count,
+                committed,
+                failed,
+            },
+            all_violations,
+        )
     }
 
     // ── Random op generation ─────────────────────────────────────────

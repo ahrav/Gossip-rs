@@ -202,7 +202,11 @@ pub enum DoneLedgerSimEvent {
     ReleasedCommitFailed { op_id: PendingWriteId },
 
     /// All pending writes were released.
-    ReleasedAll { count: usize },
+    ReleasedAll {
+        count: usize,
+        committed: usize,
+        failed: usize,
+    },
 
     /// No pending writes to release.
     ReleaseNoop,
