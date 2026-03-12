@@ -6,6 +6,16 @@
 
 use std::fmt;
 
+/// Known advisory lock keys for PostgreSQL migration runners.
+///
+/// Each PostgreSQL persistence backend acquires a transaction-scoped advisory
+/// lock during migration. Keys must be globally unique within any database
+/// instance that hosts multiple gossip-rs backends.
+pub const ADVISORY_LOCK_KEYS: &[(&str, i64)] = &[
+    ("GSDLPGM1", 0x4753444c_50474d31), // done-ledger
+    ("GFPGMIG1", 0x47465047_4d494731), // findings
+];
+
 /// Labels the migration step that produced a PostgreSQL driver error.
 ///
 /// Paired with a driver error in a crate-specific migration error type
@@ -49,6 +59,14 @@ impl fmt::Display for MigrationOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisory_lock_keys_are_globally_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for &(label, key) in super::ADVISORY_LOCK_KEYS {
+            assert!(seen.insert(key), "duplicate advisory lock key for {label}");
+        }
+    }
 
     #[test]
     fn migration_operation_display_matches_sql_step_names() {

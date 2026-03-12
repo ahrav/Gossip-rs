@@ -145,76 +145,55 @@ pub const OBSERVATIONS_TENANT_OVID_HASH_INDEX: &str = "observations_tenant_ovid_
 /// Index name for run/shard provenance lookups.
 pub const OBSERVATIONS_TENANT_RUN_SHARD_INDEX: &str = "observations_tenant_run_shard_idx";
 
-/// Minimal schema plan for the current findings write model.
+/// Validate a contracts-layer batch against the schema constraints.
 ///
-/// The type is intentionally zero-sized because the current backend exposes a
-/// single canonical schema shape. If future storage surfaces add new durable
-/// tables, they should become new constants and projection types rather than
-/// optional toggles on this plan.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FindingsSchemaPlan;
+/// Runs the observation-identity invariant check before any Postgres-specific
+/// integer conversions happen, so projection failures only need to handle
+/// storage-boundary representation issues.
+///
+/// Referential integrity (occurrence→finding, observation→occurrence) is
+/// **not** checked here because batches may legitimately reference parents
+/// that are already persisted but absent from the current batch. The real
+/// enforcement point is the PostgreSQL foreign-key constraints on the
+/// durable tables.
+pub fn validate_findings_batch(
+    batch: FindingsUpsertBatch<'_>,
+) -> Result<(), FindingsPgSchemaError> {
+    batch.validate_observation_identity()?;
+    Ok(())
+}
 
-impl FindingsSchemaPlan {
-    /// Construct the canonical findings schema plan.
-    #[inline]
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
+/// Project a contracts-layer batch into Postgres-ready primitive row types.
+///
+/// Each projected layer preserves the input slice order, which lets later
+/// SQL binders expand arrays in a stable row order without extra
+/// reindexing.
+pub fn project_findings_batch(
+    batch: FindingsUpsertBatch<'_>,
+) -> Result<ProjectedFindingsBatch, FindingsPgSchemaError> {
+    validate_findings_batch(batch)?;
 
-    /// Validate a contracts-layer batch against the schema plan.
-    ///
-    /// Runs the observation-identity invariant check before any Postgres-specific
-    /// integer conversions happen, so projection failures only need to handle
-    /// storage-boundary representation issues.
-    ///
-    /// Referential integrity (occurrence→finding, observation→occurrence) is
-    /// **not** checked here because batches may legitimately reference parents
-    /// that are already persisted but absent from the current batch. The real
-    /// enforcement point is the PostgreSQL foreign-key constraints on the
-    /// durable tables.
-    pub fn validate_batch(
-        self,
-        batch: FindingsUpsertBatch<'_>,
-    ) -> Result<(), FindingsPgSchemaError> {
-        let _ = self;
-        batch.validate_observation_identity()?;
-        Ok(())
-    }
+    let findings = batch
+        .findings()
+        .iter()
+        .map(FindingRow::from_record)
+        .collect();
+    let occurrences = batch
+        .occurrences()
+        .iter()
+        .map(OccurrenceRow::from_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let observations = batch
+        .observations()
+        .iter()
+        .map(ObservationRow::from_record)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    /// Project a contracts-layer batch into Postgres-ready primitive row types.
-    ///
-    /// Each projected layer preserves the input slice order, which lets later
-    /// SQL binders expand arrays in a stable row order without extra
-    /// reindexing.
-    pub fn project_batch(
-        self,
-        batch: FindingsUpsertBatch<'_>,
-    ) -> Result<ProjectedFindingsBatch, FindingsPgSchemaError> {
-        self.validate_batch(batch)?;
-
-        let findings = batch
-            .findings()
-            .iter()
-            .map(FindingRow::from_record)
-            .collect();
-        let occurrences = batch
-            .occurrences()
-            .iter()
-            .map(OccurrenceRow::from_record)
-            .collect::<Result<Vec<_>, _>>()?;
-        let observations = batch
-            .observations()
-            .iter()
-            .map(ObservationRow::from_record)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(ProjectedFindingsBatch {
-            findings,
-            occurrences,
-            observations,
-        })
-    }
+    Ok(ProjectedFindingsBatch {
+        findings,
+        occurrences,
+        observations,
+    })
 }
 
 /// Postgres-ready row projection for [`FINDINGS_TABLE`].
@@ -379,6 +358,7 @@ impl ProjectedFindingsBatch {
 mod tests {
     use std::{collections::HashSet, num::NonZeroU64};
 
+    use crate::types::{PgU64ConversionError, pg_bigint_to_u64_bits};
     use gossip_contracts::{
         connector::Location,
         identity::{
@@ -390,9 +370,6 @@ mod tests {
             FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord, OvidHash,
         },
     };
-    use gossip_done_ledger_postgres::schema as done_ledger_schema;
-
-    use crate::types::{PgU64ConversionError, pg_bigint_to_u64_bits};
 
     use super::*;
 
@@ -661,8 +638,7 @@ mod tests {
 
     #[test]
     fn project_batch_returns_empty_projection_for_empty_batch() {
-        let projected = FindingsSchemaPlan::new()
-            .project_batch(FindingsUpsertBatch::default())
+        let projected = project_findings_batch(FindingsUpsertBatch::default())
             .expect("empty batch should project");
 
         assert!(projected.is_empty());
@@ -684,9 +660,7 @@ mod tests {
         let observations = [observation.clone()];
         let batch = FindingsUpsertBatch::new(&findings, &occurrences, &observations);
 
-        let projected = FindingsSchemaPlan::new()
-            .project_batch(batch)
-            .expect("valid batch should project");
+        let projected = project_findings_batch(batch).expect("valid batch should project");
 
         assert_eq!(projected.total_rows(), 3);
         assert_eq!(projected.findings(), &[FindingRow::from_record(&finding)]);
@@ -711,9 +685,7 @@ mod tests {
         let observations = [observation];
         let batch = FindingsUpsertBatch::new(&findings, &occurrences, &observations);
 
-        FindingsSchemaPlan::new()
-            .validate_batch(batch)
-            .expect("canonical batch should pass validation");
+        validate_findings_batch(batch).expect("canonical batch should pass validation");
     }
 
     #[test]
@@ -730,7 +702,7 @@ mod tests {
 
         // Per the FindingsSink contract, references may be "persisted or
         // in-batch". project_batch should accept this incremental batch.
-        let result = FindingsSchemaPlan::new().project_batch(batch);
+        let result = project_findings_batch(batch);
         assert!(
             result.is_ok(),
             "incremental batch with already-durable parent should project, got: {result:?}"
@@ -742,13 +714,5 @@ mod tests {
         let bytes = MIGRATION_ADVISORY_LOCK_KEY.to_be_bytes();
         let ascii = std::str::from_utf8(&bytes).expect("lock key bytes should be ASCII");
         assert_eq!(ascii, "GFPGMIG1");
-    }
-
-    #[test]
-    fn migration_advisory_lock_key_is_distinct_from_done_ledger() {
-        assert_ne!(
-            MIGRATION_ADVISORY_LOCK_KEY,
-            done_ledger_schema::MIGRATION_ADVISORY_LOCK_KEY
-        );
     }
 }

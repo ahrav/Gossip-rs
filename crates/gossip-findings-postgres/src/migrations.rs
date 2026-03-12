@@ -224,7 +224,8 @@ pub fn apply_migrations(
     // `lock_timeout` guards only the DDL path. Advisory-lock waits stay
     // unbounded so concurrent startup paths serialize instead of spuriously
     // failing after the timeout budget expires.
-    let timeout_ms = lock_timeout.as_millis();
+    // PostgreSQL lock_timeout accepts millisecond values up to i32::MAX (~24.8 days).
+    let timeout_ms = lock_timeout.as_millis().min(i32::MAX as u128);
     tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_ms}ms'"))
         .map_err(|e| FindingsPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 

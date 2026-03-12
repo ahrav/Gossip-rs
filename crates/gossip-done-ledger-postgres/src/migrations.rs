@@ -241,7 +241,8 @@ pub fn apply_migrations(
     // the timeout to this transaction only.  Set *after* the advisory
     // lock so the timeout applies only to DDL, not to the advisory
     // lock wait itself.
-    let timeout_ms = lock_timeout.as_millis();
+    // PostgreSQL lock_timeout accepts millisecond values up to i32::MAX (~24.8 days).
+    let timeout_ms = lock_timeout.as_millis().min(i32::MAX as u128);
     tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_ms}ms'"))
         .map_err(|e| DoneLedgerPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
