@@ -250,6 +250,26 @@ impl DoneLedgerSimEventKind {
     ];
 }
 
+// Compile-time exhaustiveness guard: adding a variant to the enum without
+// updating ALL causes a non-exhaustive match error here.
+const _: () = {
+    const fn _exhaustive(k: DoneLedgerSimEventKind) -> usize {
+        match k {
+            DoneLedgerSimEventKind::UpsertCommitted => 0,
+            DoneLedgerSimEventKind::UpsertPending => 1,
+            DoneLedgerSimEventKind::UpsertSubmitFailed => 2,
+            DoneLedgerSimEventKind::UpsertCommitFailed => 3,
+            DoneLedgerSimEventKind::GetOk => 4,
+            DoneLedgerSimEventKind::Released => 5,
+            DoneLedgerSimEventKind::ReleasedCommitFailed => 6,
+            DoneLedgerSimEventKind::ReleasedAll => 7,
+            DoneLedgerSimEventKind::ReleaseNoop => 8,
+            DoneLedgerSimEventKind::FaultConfigured => 9,
+        }
+    }
+    assert!(DoneLedgerSimEventKind::ALL.len() == 10);
+};
+
 impl DoneLedgerSimEvent {
     /// Map to the histogram discriminant.
     pub fn kind(&self) -> DoneLedgerSimEventKind {

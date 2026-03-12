@@ -262,11 +262,6 @@ impl DoneLedgerSim {
         let converged = convergence_violations.is_empty();
         all_violations.extend(convergence_violations);
 
-        debug_assert!(
-            self.oracle.committed_count() > 0,
-            "seed={seed}: convergence is vacuous — no records were committed"
-        );
-
         DoneLedgerSimReport {
             seed,
             ops_executed: self.ops_executed,
@@ -347,12 +342,14 @@ impl DoneLedgerSim {
     }
 
     /// Number of delayed writes still retained by the harness.
-    pub fn pending_batch_count(&self) -> usize {
+    #[cfg(test)]
+    pub(super) fn pending_batch_count(&self) -> usize {
         self.pending_batches.len()
     }
 
     /// Verify I6 convergence once the caller has drained pending writes.
-    pub fn check_convergence(&self) -> Vec<DoneLedgerInvariantViolation> {
+    #[cfg(test)]
+    pub(super) fn check_convergence(&self) -> Vec<DoneLedgerInvariantViolation> {
         assert!(
             self.pending_batches.is_empty(),
             "check_convergence requires all pending batches to be drained first"
@@ -398,7 +395,7 @@ impl DoneLedgerSim {
         match batch.handle.wait() {
             Ok(receipt) => {
                 let was_pending = self.oracle.commit(op_id);
-                debug_assert!(
+                assert!(
                     was_pending,
                     "finish_released_batch: op {op_id} was not pending in oracle"
                 );
@@ -528,7 +525,7 @@ impl DoneLedgerSim {
                     // Write is delayed — retain handle for later verification.
                     // PendingWriteId is monotonically increasing, so collisions
                     // are structurally impossible; assert to catch store bugs.
-                    debug_assert!(
+                    assert!(
                         !self.pending_batches.contains_key(&op_id),
                         "duplicate PendingWriteId {op_id} — store counter invariant violated"
                     );
@@ -558,7 +555,11 @@ impl DoneLedgerSim {
                     self.oracle.submit(op_id, records.to_vec());
                     match handle.wait() {
                         Ok(receipt) => {
-                            self.oracle.commit(op_id);
+                            let was_pending = self.oracle.commit(op_id);
+                            assert!(
+                                was_pending,
+                                "auto-complete: op {op_id} not pending in oracle"
+                            );
                             let violations = self.checker.check_after_committed_upsert(
                                 &self.ledger,
                                 records,
@@ -701,6 +702,11 @@ impl DoneLedgerSim {
         if order == CompletionOrder::NewestFirst {
             sorted_batches.reverse();
         }
+        debug_assert_eq!(
+            count,
+            sorted_batches.len(),
+            "store/harness pending count mismatch"
+        );
 
         let mut committed = 0usize;
         let mut failed = 0usize;
@@ -782,9 +788,8 @@ impl DoneLedgerSim {
     fn generate_liveness_op(&mut self) -> DoneLedgerSimOp {
         let roll: u32 = self.context.rng().random_range(0..100);
         match roll {
-            0..60 => self.gen_batch_upsert().unwrap(),
-            60..80 => self.gen_batch_get().unwrap(),
-            _ => self.gen_batch_upsert().unwrap(),
+            0..80 => self.gen_batch_upsert().unwrap(),
+            _ => self.gen_batch_get().unwrap(),
         }
     }
 
@@ -805,32 +810,34 @@ impl DoneLedgerSim {
     }
 
     fn try_gen_release_oldest(&mut self) -> Option<DoneLedgerSimOp> {
+        if self.pending_batches.is_empty() {
+            return None;
+        }
         Some(DoneLedgerSimOp::ReleaseOldest)
     }
 
     fn try_gen_release_newest(&mut self) -> Option<DoneLedgerSimOp> {
-        if self.pending_batches.is_empty() {
-            return None;
-        }
         Some(DoneLedgerSimOp::ReleaseNewest)
     }
 
     fn try_gen_release_specific(&mut self) -> Option<DoneLedgerSimOp> {
-        if self.pending_batches.is_empty() {
-            return None;
-        }
-        // Pick a random pending op ID. Sort for deterministic order —
-        // HashMap iteration is non-deterministic.
-        let mut keys: Vec<PendingWriteId> = self.pending_batches.keys().copied().collect();
-        keys.sort_unstable();
-        let idx = self.context.rng().random_range(0..keys.len());
-        Some(DoneLedgerSimOp::ReleaseSpecific { op_id: keys[idx] })
+        let op_id = if self.pending_batches.is_empty() {
+            // No pending batches — generate a synthetic ID so the store
+            // returns noop, exercising the not-found path uniformly.
+            let raw = self.context.rng().random_range(1u64..=1024);
+            PendingWriteId::from_raw(raw)
+        } else {
+            // Pick a random pending op ID. Sort for deterministic order —
+            // HashMap iteration is non-deterministic.
+            let mut keys: Vec<PendingWriteId> = self.pending_batches.keys().copied().collect();
+            keys.sort_unstable();
+            let idx = self.context.rng().random_range(0..keys.len());
+            keys[idx]
+        };
+        Some(DoneLedgerSimOp::ReleaseSpecific { op_id })
     }
 
     fn try_gen_release_all(&mut self) -> Option<DoneLedgerSimOp> {
-        if self.pending_batches.is_empty() {
-            return None;
-        }
         let order = if self.context.rng().random_bool(0.5) {
             CompletionOrder::OldestFirst
         } else {

@@ -68,19 +68,32 @@ where
                     let mut local_counts = BTreeMap::new();
 
                     for seed in chunk {
-                        let report = runner(seed);
-                        for (kind, count) in report.event_counts {
-                            *local_counts.entry(kind).or_insert(0) += count;
-                        }
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner(seed)));
+                        match result {
+                            Ok(report) => {
+                                for (kind, count) in report.event_counts {
+                                    *local_counts.entry(kind).or_insert(0) += count;
+                                }
 
-                        if !report.violations.is_empty() || !report.converged {
-                            local_failures.push((
-                                seed,
-                                format!(
-                                    "converged={} violations={:#?}",
-                                    report.converged, report.violations
-                                ),
-                            ));
+                                if !report.violations.is_empty() || !report.converged {
+                                    local_failures.push((
+                                        seed,
+                                        format!(
+                                            "converged={} violations={:#?}",
+                                            report.converged, report.violations
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(panic_val) => {
+                                let msg = panic_val
+                                    .downcast_ref::<String>()
+                                    .map(|s| s.as_str())
+                                    .or_else(|| panic_val.downcast_ref::<&str>().copied())
+                                    .unwrap_or("(non-string panic)");
+                                local_failures.push((seed, format!("PANIC: {msg}")));
+                            }
                         }
                     }
 
@@ -90,14 +103,7 @@ where
             .collect();
 
         for handle in handles {
-            let (local_failures, local_counts) = handle.join().unwrap_or_else(|panic_val| {
-                let msg = panic_val
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic_val.downcast_ref::<&str>().copied())
-                    .unwrap_or("(non-string panic)");
-                panic!("simulation thread panicked: {msg}");
-            });
+            let (local_failures, local_counts) = handle.join().expect("simulation thread aborted");
             failures.extend(local_failures);
             for (kind, count) in local_counts {
                 *aggregate_counts.entry(kind).or_insert(0) += count;
