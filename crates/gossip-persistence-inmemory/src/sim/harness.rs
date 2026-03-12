@@ -343,15 +343,21 @@ impl DoneLedgerSim {
             DoneLedgerSimOp::ReleaseSpecific { op_id } => self.exec_release_specific(*op_id),
             DoneLedgerSimOp::ReleaseAll { order } => self.exec_release_all(*order),
             DoneLedgerSimOp::InjectSubmitFailure { count } => {
-                let _ = self.ledger.fail_next_submissions(*count);
+                self.ledger
+                    .fail_next_submissions(*count)
+                    .expect("fail_next_submissions should not fail on InMemoryDoneLedger");
                 (DoneLedgerSimEvent::FaultConfigured, Vec::new())
             }
             DoneLedgerSimOp::InjectCommitFailure { count } => {
-                let _ = self.ledger.fail_next_commits(*count);
+                self.ledger
+                    .fail_next_commits(*count)
+                    .expect("fail_next_commits should not fail on InMemoryDoneLedger");
                 (DoneLedgerSimEvent::FaultConfigured, Vec::new())
             }
             DoneLedgerSimOp::InjectDelay { count } => {
-                let _ = self.ledger.delay_next_writes(*count);
+                self.ledger
+                    .delay_next_writes(*count)
+                    .expect("delay_next_writes should not fail on InMemoryDoneLedger");
                 (DoneLedgerSimEvent::FaultConfigured, Vec::new())
             }
         }
@@ -501,7 +507,7 @@ impl DoneLedgerSim {
                 }
             }
             Ok(None) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
-            Err(_) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
+            Err(e) => panic!("release_next failed on InMemoryDoneLedger: {e}"),
         }
     }
 
@@ -543,7 +549,7 @@ impl DoneLedgerSim {
                 }
             }
             Ok(false) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
-            Err(_) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
+            Err(e) => panic!("release_specific failed on InMemoryDoneLedger: {e}"),
         }
     }
 
@@ -693,8 +699,10 @@ impl DoneLedgerSim {
         if self.pending_batches.is_empty() {
             return None;
         }
-        // Pick a random pending op ID.
-        let keys: Vec<PendingWriteId> = self.pending_batches.keys().copied().collect();
+        // Pick a random pending op ID. Sort for deterministic order —
+        // HashMap iteration is non-deterministic.
+        let mut keys: Vec<PendingWriteId> = self.pending_batches.keys().copied().collect();
+        keys.sort_unstable();
         let idx = self.context.rng().random_range(0..keys.len());
         Some(DoneLedgerSimOp::ReleaseSpecific { op_id: keys[idx] })
     }
@@ -731,13 +739,19 @@ impl DoneLedgerSim {
         use super::should_inject;
 
         if should_inject(self.context.rng(), self.fault_config.submit_fail_ppm) {
-            let _ = self.ledger.fail_next_submissions(1);
+            self.ledger
+                .fail_next_submissions(1)
+                .expect("fail_next_submissions should not fail on InMemoryDoneLedger");
         }
         if should_inject(self.context.rng(), self.fault_config.commit_fail_ppm) {
-            let _ = self.ledger.fail_next_commits(1);
+            self.ledger
+                .fail_next_commits(1)
+                .expect("fail_next_commits should not fail on InMemoryDoneLedger");
         }
         if should_inject(self.context.rng(), self.fault_config.delay_ppm) {
-            let _ = self.ledger.delay_next_writes(1);
+            self.ledger
+                .delay_next_writes(1)
+                .expect("delay_next_writes should not fail on InMemoryDoneLedger");
         }
     }
 

@@ -6,10 +6,11 @@
 //! phase drains all pending writes, the oracle's committed state must
 //! match the ledger snapshot for every key.
 //!
-//! This catches merge bugs that per-step invariant checks cannot detect:
-//! the oracle is an independent re-implementation of the lattice join,
-//! so any divergence between the oracle and the ledger reveals a bug in
-//! one or both.
+//! The oracle verifies **sequence-level** correctness — that the harness
+//! applies operations in the right order, commits and aborts the right
+//! batches, and that the final state converges. It delegates to the same
+//! `DoneLedgerRecord::merge` the production ledger uses; merge-algorithm
+//! correctness is covered by dedicated tests on the contracts crate.
 
 use std::collections::HashMap;
 
