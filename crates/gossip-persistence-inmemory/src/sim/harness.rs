@@ -287,6 +287,14 @@ impl DoneLedgerSim {
             .expect("set_auto_complete should not fail on InMemoryDoneLedger");
 
         for batch_idx in 0..batch_count {
+            // Inject PPM-based faults between batches when configured.
+            // This exercises the interaction between submit failures,
+            // delays, and out-of-order release — the scenario most
+            // likely to reveal merge races.
+            if !self.fault_config.is_fault_free() {
+                self.maybe_inject_faults();
+            }
+
             let op = DoneLedgerSimOp::BatchUpsert {
                 records: self.build_swizzle_clog_batch(batch_idx),
             };
@@ -299,15 +307,42 @@ impl DoneLedgerSim {
             .ledger
             .pending_ids()
             .expect("pending_ids should not fail on InMemoryDoneLedger");
+
+        // Cross-check: the ledger's pending set must match the harness's
+        // tracking exactly. A mismatch means either the ledger lost track
+        // of a delayed write or the harness failed to record one.
+        {
+            let mut harness_ids: Vec<PendingWriteId> =
+                self.pending_batches.keys().copied().collect();
+            harness_ids.sort_unstable();
+            let mut ledger_ids = pending_ids.clone();
+            ledger_ids.sort_unstable();
+            assert_eq!(
+                harness_ids, ledger_ids,
+                "seed={seed}: ledger.pending_ids() and pending_batches diverge — \
+                 harness={harness_ids:?}, ledger={ledger_ids:?}"
+            );
+        }
+
         pending_ids.shuffle(self.context.rng());
 
         let mut fail_release = vec![false; pending_ids.len()];
         for should_fail in &mut fail_release {
             *should_fail = self.context.rng().random_bool(0.25);
         }
+        // Guarantee at least one failure so the commit-failure path is
+        // always exercised.
         if !pending_ids.is_empty() && !fail_release.iter().any(|flag| *flag) {
             let fail_idx = self.context.rng().random_range(0..fail_release.len());
             fail_release[fail_idx] = true;
+        }
+        // Guarantee at least one success so the convergence check is
+        // non-vacuous (committed_count > 0). With 25% failure rate and
+        // 10 batches P(all-fail) ≈ 1e-6 — rare but possible over many
+        // CI runs.
+        if pending_ids.len() >= 2 && fail_release.iter().all(|flag| *flag) {
+            let pass_idx = self.context.rng().random_range(0..fail_release.len());
+            fail_release[pass_idx] = false;
         }
 
         for (op_id, should_fail) in pending_ids.into_iter().zip(fail_release.into_iter()) {
@@ -327,8 +362,12 @@ impl DoneLedgerSim {
         let converged = convergence_violations.is_empty();
         all_violations.extend(convergence_violations);
 
+        // Under fault-free conditions the at-least-one-success guarantee
+        // (above) ensures non-vacuous convergence. Under Stormy/Radioactive,
+        // residual PPM commit failures can legitimately cause all commits
+        // to fail, so the assertion is only meaningful when faults are off.
         debug_assert!(
-            self.oracle.committed_count() > 0,
+            !self.fault_config.is_fault_free() || self.oracle.committed_count() > 0,
             "seed={seed}: convergence is vacuous — no records were committed"
         );
 
@@ -810,6 +849,9 @@ impl DoneLedgerSim {
     }
 
     fn try_gen_release_oldest(&mut self) -> Option<DoneLedgerSimOp> {
+        // Guarded: avoids burning retry budget on a guaranteed noop.
+        // ReleaseNoop coverage comes from try_gen_release_newest (below)
+        // which is intentionally unguarded.
         if self.pending_batches.is_empty() {
             return None;
         }
@@ -817,10 +859,15 @@ impl DoneLedgerSim {
     }
 
     fn try_gen_release_newest(&mut self) -> Option<DoneLedgerSimOp> {
+        // Intentionally unguarded: when the queue is empty this
+        // produces a ReleaseNoop event, ensuring coverage of that
+        // event kind in the histogram (DoneLedgerSimEventKind::ALL).
         Some(DoneLedgerSimOp::ReleaseNewest)
     }
 
     fn try_gen_release_specific(&mut self) -> Option<DoneLedgerSimOp> {
+        // Intentionally unguarded: generates a synthetic ID when empty
+        // so the store's not-found path is exercised uniformly.
         let op_id = if self.pending_batches.is_empty() {
             // No pending batches — generate a synthetic ID so the store
             // returns noop, exercising the not-found path uniformly.
@@ -838,6 +885,9 @@ impl DoneLedgerSim {
     }
 
     fn try_gen_release_all(&mut self) -> Option<DoneLedgerSimOp> {
+        // Intentionally unguarded: releasing an empty queue produces
+        // a trivial ReleasedAll { count: 0 } — harmless and exercises
+        // the zero-pending path.
         let order = if self.context.rng().random_bool(0.5) {
             CompletionOrder::OldestFirst
         } else {

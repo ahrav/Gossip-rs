@@ -31,6 +31,9 @@ struct SweepOutcome {
     seed_count: usize,
     failures: Vec<(u64, String)>,
     aggregate_counts: BTreeMap<DoneLedgerSimEventKind, usize>,
+    /// Wall-clock duration. Retained for diagnostic output; not asserted
+    /// in tests to avoid CI flakiness.
+    #[allow(dead_code)]
     elapsed: Duration,
 }
 
@@ -217,7 +220,7 @@ fn arb_done_ledger_sim_op() -> impl Strategy<Value = DoneLedgerSimOp> {
             .prop_map(|ovid_indices| DoneLedgerSimOp::BatchGet { ovid_indices }),
         1 => Just(DoneLedgerSimOp::ReleaseOldest),
         1 => Just(DoneLedgerSimOp::ReleaseNewest),
-        1 => arb_completion_order()
+        2 => arb_completion_order()
             .prop_map(|order| DoneLedgerSimOp::ReleaseAll { order }),
         1 => (1u64..=32)
             .prop_map(|raw| DoneLedgerSimOp::ReleaseSpecific {
@@ -244,6 +247,9 @@ fn run_op_sequence(seed: u64, level: FaultLevel, ops: &[DoneLedgerSimOp]) {
         );
     }
 
+    // A single ReleaseAll is sufficient: exec_release_all calls
+    // pending_batches.drain() which is total in single-threaded
+    // execution — no new writes can arrive during the drain.
     if sim.pending_batch_count() > 0 {
         let (event, violations) = sim.step(DoneLedgerSimOp::ReleaseAll {
             order: CompletionOrder::OldestFirst,
@@ -283,11 +289,6 @@ fn done_ledger_sim_stormy_sweep() {
     });
     assert_no_failures("done_ledger_sim_stormy_sweep", &outcome);
     assert_event_coverage(&outcome);
-    assert!(
-        outcome.elapsed < Duration::from_secs(10),
-        "stormy sweep took {:?}, expected <10s",
-        outcome.elapsed
-    );
 }
 
 #[test]
@@ -319,6 +320,33 @@ fn done_ledger_sim_swizzle_clog_sweep() {
             > 0,
         "swizzle-clog should exercise at least one commit failure"
     );
+}
+
+#[test]
+fn done_ledger_sim_swizzle_clog_stormy_sweep() {
+    if cfg!(miri) {
+        return;
+    }
+
+    let outcome = run_seed_sweep(SWIZZLE_SWEEP_SEEDS, |seed| {
+        DoneLedgerSim::new(seed, FaultLevel::Stormy).run_swizzle_clog(SWIZZLE_BATCHES)
+    });
+    assert_no_failures("done_ledger_sim_swizzle_clog_stormy_sweep", &outcome);
+}
+
+#[test]
+fn done_ledger_sim_radioactive_smoke() {
+    if cfg!(miri) {
+        return;
+    }
+
+    // Small always-on smoke test for Radioactive fault level.
+    // The full sweep below is #[ignore] for CI speed; this exercises
+    // the same code path with minimal seeds to catch regressions.
+    let outcome = run_seed_sweep(5, |seed| {
+        DoneLedgerSim::new(seed, FaultLevel::Radioactive).run(200, 0)
+    });
+    assert_no_failures("done_ledger_sim_radioactive_smoke", &outcome);
 }
 
 #[test]
