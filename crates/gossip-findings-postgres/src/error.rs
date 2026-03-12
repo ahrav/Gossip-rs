@@ -86,8 +86,7 @@ pub enum FindingsPgMigrationError {
 impl FindingsPgMigrationError {
     /// Wrap a PostgreSQL driver error with the operation that produced it.
     ///
-    /// No callers yet — the migration runner that will use this constructor
-    /// has not been implemented. Matches the sibling crate's API surface
+    /// Matches the sibling crate's API surface
     /// (`DoneLedgerPgMigrationError::postgres`).
     pub(crate) fn postgres(op: MigrationOperation, source: postgres::Error) -> Self {
         Self::Postgres {
