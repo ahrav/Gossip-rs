@@ -1772,20 +1772,20 @@ fn schema_rejects_empty_error_code() {
     assert_check_violation(&err);
 }
 
-// ── COALESCE fallback coverage ──────────────────────────────────────────
+// ── ON CONFLICT error_code coverage ─────────────────────────────────────
 //
-// The SQL `ON CONFLICT` error_code merge uses `COALESCE(winner, loser)`.
-// When the provenance winner has a NULL error_code, COALESCE falls back
-// to the loser's error_code. This path is unreachable through Rust-side
-// `batch_upsert` (which validates that non-scanned rows always carry an
-// error_code), so it must be exercised via raw SQL.
+// The SQL `ON CONFLICT` merge uses `COALESCE(winner, loser)` for
+// `error_code`, but PostgreSQL enforces CHECK constraints on the incoming
+// tuple before the update branch can reuse the existing row's value.
+// That means a non-scanned `EXCLUDED` row with `error_code = NULL` is
+// rejected before the fallback arm can run.
 
-/// Verifies the COALESCE fallback: when the provenance winner carries a
-/// NULL `error_code` and the loser carries a non-NULL one, the merged
-/// row inherits the loser's error_code.
+/// Verifies that `ON CONFLICT DO UPDATE` does not repair an invalid
+/// non-scanned incoming row before `done_ledger_entries_status_shape_ck`
+/// fires.
 #[test]
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
-fn sql_coalesce_fallback_picks_non_null_error_code() {
+fn sql_on_conflict_rejects_invalid_non_scanned_excluded_row() {
     let mut client = test_client();
 
     // Insert initial row: non-scanned status with error_code and finished_at=100.
@@ -1801,8 +1801,9 @@ fn sql_coalesce_fallback_picks_non_null_error_code() {
     .expect("initial insert should succeed");
 
     // Upsert with same key, same status, later finished_at (wins provenance),
-    // but NULL error_code. COALESCE should fall back to existing row's code.
-    client
+    // but NULL error_code. PostgreSQL rejects the incoming row before the
+    // conflict update can evaluate COALESCE against the existing row.
+    let err = client
         .execute(
             &format!(
                 "INSERT INTO {t} (tenant_id, policy_hash, ovid_hash, status, bytes_scanned, \
@@ -1837,29 +1838,8 @@ fn sql_coalesce_fallback_picks_non_null_error_code() {
                 &None::<String>, // NULL error_code on the winner
             ],
         )
-        .expect("COALESCE upsert should succeed");
-
-    let rows = client
-        .query(
-            &format!(
-                "SELECT error_code FROM {} WHERE tenant_id = $1 AND policy_hash = $2 AND ovid_hash = $3",
-                crate::schema::DONE_LEDGER_ENTRIES_TABLE
-            ),
-            &[
-                &vec![0xAAu8; 32] as &(dyn postgres::types::ToSql + Sync),
-                &vec![0xBBu8; 32],
-                &vec![0xCCu8; 32],
-            ],
-        )
-        .expect("query should succeed");
-
-    assert_eq!(rows.len(), 1);
-    let error_code: Option<String> = rows[0].get("error_code");
-    assert_eq!(
-        error_code.as_deref(),
-        Some("ORIGINAL_ERR"),
-        "COALESCE should fall back to the loser's non-NULL error_code"
-    );
+        .expect_err("invalid non-scanned EXCLUDED row should violate the shape constraint");
+    assert_constraint_violation(&err, "status_shape");
 }
 
 /// Verifies the reverse path: when the existing (loser) has a non-NULL
