@@ -537,21 +537,24 @@ fn concurrent_migrations_both_succeed() {
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let barrier_a = Arc::clone(&barrier);
     let barrier_b = Arc::clone(&barrier);
-    let url_a = url.clone();
-    let url_b = url.clone();
-    let url_verify = url;
+    let url_verify = url.clone();
 
-    let worker = |db_url: String, barrier: Arc<std::sync::Barrier>| {
+    // Connect both clients on the main thread so a connection failure
+    // panics immediately rather than stranding the peer at the barrier.
+    let client_a = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("first worker should connect to shared test database");
+    let client_b = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("second worker should connect to shared test database");
+
+    let worker = |mut client: postgres::Client, barrier: Arc<std::sync::Barrier>| {
         std::thread::spawn(move || {
-            let mut client = postgres::Client::connect(&db_url, postgres::NoTls)
-                .expect("worker should connect to shared test database");
             barrier.wait();
             apply_all_migrations(&mut client)
         })
     };
 
-    let thread_a = worker(url_a, barrier_a);
-    let thread_b = worker(url_b, barrier_b);
+    let thread_a = worker(client_a, barrier_a);
+    let thread_b = worker(client_b, barrier_b);
 
     thread_a
         .join()
