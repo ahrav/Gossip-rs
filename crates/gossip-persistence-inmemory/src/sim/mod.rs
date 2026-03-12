@@ -154,6 +154,19 @@ pub enum DoneLedgerSimOp {
     InjectDelay { count: usize },
 }
 
+impl DoneLedgerSimOp {
+    /// Returns `true` for ops that configure fault injection counters
+    /// (as opposed to data or release operations).
+    pub fn is_fault_injection(&self) -> bool {
+        matches!(
+            self,
+            Self::InjectSubmitFailure { .. }
+                | Self::InjectCommitFailure { .. }
+                | Self::InjectDelay { .. }
+        )
+    }
+}
+
 // ── DoneLedgerSimEvent ───────────────────────────────────────────────
 
 /// Outcomes produced by executing a [`DoneLedgerSimOp`].
@@ -170,6 +183,9 @@ pub enum DoneLedgerSimEvent {
 
     /// `batch_upsert` failed at submission time (injected failure).
     UpsertSubmitFailed,
+
+    /// `batch_upsert` succeeded but commit failed at auto-complete time.
+    UpsertCommitFailed { op_id: PendingWriteId },
 
     /// `batch_get` returned results.
     GetOk {
@@ -203,6 +219,7 @@ pub enum DoneLedgerSimEventKind {
     UpsertCommitted,
     UpsertPending,
     UpsertSubmitFailed,
+    UpsertCommitFailed,
     GetOk,
     Released,
     ReleasedCommitFailed,
@@ -218,6 +235,7 @@ impl DoneLedgerSimEvent {
             Self::UpsertCommitted { .. } => DoneLedgerSimEventKind::UpsertCommitted,
             Self::UpsertPending { .. } => DoneLedgerSimEventKind::UpsertPending,
             Self::UpsertSubmitFailed => DoneLedgerSimEventKind::UpsertSubmitFailed,
+            Self::UpsertCommitFailed { .. } => DoneLedgerSimEventKind::UpsertCommitFailed,
             Self::GetOk { .. } => DoneLedgerSimEventKind::GetOk,
             Self::Released { .. } => DoneLedgerSimEventKind::Released,
             Self::ReleasedCommitFailed { .. } => DoneLedgerSimEventKind::ReleasedCommitFailed,

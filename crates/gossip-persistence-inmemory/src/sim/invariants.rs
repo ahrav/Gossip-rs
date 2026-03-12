@@ -70,7 +70,7 @@ pub enum DoneLedgerInvariantViolation {
     /// differs from the oracle's expected state.
     LatticeConvergence {
         key: DoneLedgerKey,
-        oracle: Box<DoneLedgerRecord>,
+        oracle: Option<Box<DoneLedgerRecord>>,
         actual: Option<Box<DoneLedgerRecord>>,
     },
 
@@ -183,7 +183,8 @@ impl DoneLedgerInvariantChecker {
     /// Check invariants after a committed upsert.
     ///
     /// Verifies I1 (status monotonicity), I2 (bytes_scanned monotonicity),
-    /// I3 (commit durability), I8 (provenance fidelity), and I9 (receipt accuracy).
+    /// I3 (commit durability), I8 (provenance fidelity), I9 (receipt accuracy),
+    /// and I10 (idempotent upsert when incoming matches pre-existing state).
     ///
     /// `pre_snapshot` is the `batch_get` result for the affected keys
     /// *before* the upsert was submitted.
@@ -281,6 +282,13 @@ impl DoneLedgerInvariantChecker {
                     &current,
                     &mut violations,
                 );
+
+                // I10: Idempotent upsert — when the deduped incoming record
+                // is identical to the pre-existing record, durable state
+                // must not change.
+                if *pre_record == deduped_incoming {
+                    violations.extend(self.check_idempotent_upsert(*key, pre_record, &current));
+                }
             }
         }
 

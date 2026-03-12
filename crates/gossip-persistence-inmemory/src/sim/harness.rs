@@ -388,6 +388,12 @@ impl DoneLedgerSim {
 
                 if pending_ids.contains(&op_id) {
                     // Write is delayed — retain handle for later verification.
+                    // PendingWriteId is monotonically increasing, so collisions
+                    // are structurally impossible; assert to catch store bugs.
+                    debug_assert!(
+                        !self.pending_batches.contains_key(&op_id),
+                        "duplicate PendingWriteId {op_id} — store counter invariant violated"
+                    );
                     self.pending_batches.insert(
                         op_id,
                         PendingBatch {
@@ -420,7 +426,7 @@ impl DoneLedgerSim {
                                 records,
                                 &pre_snapshot,
                             );
-                            (DoneLedgerSimEvent::UpsertSubmitFailed, violations)
+                            (DoneLedgerSimEvent::UpsertCommitFailed { op_id }, violations)
                         }
                     }
                 }
@@ -480,9 +486,13 @@ impl DoneLedgerSim {
                         }
                     }
                 } else {
-                    // Released an op we don't have a handle for — shouldn't
-                    // happen, but handle gracefully.
-                    (DoneLedgerSimEvent::ReleaseNoop, Vec::new())
+                    // The store released an op the harness never tracked.
+                    // This violates the invariant that every delayed write
+                    // is recorded in pending_batches at submission time.
+                    panic!(
+                        "release_next returned op_id {op_id} which has no \
+                         entry in pending_batches — harness tracking bug"
+                    );
                 }
             }
             Ok(None) => (DoneLedgerSimEvent::ReleaseNoop, Vec::new()),
@@ -539,10 +549,16 @@ impl DoneLedgerSim {
         // Empty snapshot for delayed writes (stale pre-snapshot).
         let empty_snapshot: Vec<Option<DoneLedgerRecord>> = Vec::new();
 
-        // Sort by op_id to match the store's release order.
+        // Sort by op_id to match the store's release order. The store
+        // applies oldest-first or newest-first depending on `order`;
+        // the oracle must commit in the same sequence so tie-breaking
+        // in DoneLedgerRecord::merge produces identical results.
         let mut sorted_batches: Vec<(PendingWriteId, PendingBatch)> =
             self.pending_batches.drain().collect();
         sorted_batches.sort_by_key(|(id, _)| *id);
+        if order == CompletionOrder::NewestFirst {
+            sorted_batches.reverse();
+        }
 
         for (op_id, batch) in sorted_batches {
             match batch.handle.wait() {
@@ -602,8 +618,12 @@ impl DoneLedgerSim {
             };
 
             if let Some(op) = op {
-                // PPM-based fault injection between ops.
-                if faults_enabled {
+                // PPM-based fault injection between ops, but only when the
+                // generated op is not already a fault injection. This
+                // prevents doubling fault pressure: explicit inject ops
+                // (25% of the distribution) set up counters, while PPM
+                // injection adds background noise between data/release ops.
+                if faults_enabled && !op.is_fault_injection() {
                     self.maybe_inject_faults();
                 }
                 return op;
@@ -779,6 +799,11 @@ impl PersistenceSim for DoneLedgerSim {
 mod tests {
     use super::*;
 
+    use gossip_contracts::identity::{FenceEpoch, LogicalTime, RunId, ShardId};
+    use gossip_contracts::persistence::{
+        DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus,
+    };
+
     #[test]
     fn sunny_day_run_completes_without_violations() {
         let sim = DoneLedgerSim::new(42, FaultLevel::SunnyDay);
@@ -890,6 +915,98 @@ mod tests {
         );
         assert!(violations.is_empty(), "release violations: {violations:?}");
         assert!(sim.pending_batches.is_empty());
+    }
+
+    #[test]
+    fn commit_failure_at_auto_complete_emits_distinct_event() {
+        // When auto-complete commit fails, the event should distinguish
+        // it from a submit failure so the event histogram is accurate
+        // and the op_id context is preserved.
+        let mut sim = DoneLedgerSim::new(99, FaultLevel::SunnyDay);
+
+        // Inject commit failure (not submit failure).
+        sim.step(DoneLedgerSimOp::InjectCommitFailure { count: 1 });
+
+        // Batch upsert auto-completes but commit fails.
+        let rec = sim.generate_random_record();
+        let (event, _) = sim.step(DoneLedgerSimOp::BatchUpsert { records: vec![rec] });
+
+        // Should NOT be UpsertSubmitFailed — that's a different failure mode.
+        assert!(
+            !matches!(event, DoneLedgerSimEvent::UpsertSubmitFailed),
+            "commit failure at auto-complete should not emit UpsertSubmitFailed, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn release_all_newest_first_oracle_matches_ledger_order() {
+        // When exec_release_all is called with NewestFirst, the oracle
+        // must commit batches in the same order the ledger applied them.
+        // Currently the oracle always uses ascending op_id (oldest-first),
+        // which can diverge from the ledger when merge has tie-breaking.
+        let mut sim = DoneLedgerSim::new(42, FaultLevel::SunnyDay);
+
+        // Delay two writes.
+        sim.step(DoneLedgerSimOp::InjectDelay { count: 2 });
+
+        // Submit two batches for the SAME key with identical rank/timestamps
+        // but different RunId (provenance). Merge tie-breaks on
+        // finished_at > started_at, so tie → existing record wins.
+        let key = DoneLedgerKey::new(sim.tenant, sim.policy, sim.ovid_pool[0]);
+        let prov1 = DoneLedgerProvenance::new(
+            RunId::from_raw(100),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(500),
+            LogicalTime::from_raw(600),
+        );
+        let prov2 = DoneLedgerProvenance::new(
+            RunId::from_raw(200),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(500),
+            LogicalTime::from_raw(600),
+        );
+
+        let rec1 =
+            DoneLedgerRecord::try_new(key, DoneLedgerStatus::ScannedClean, 100, 0, prov1, None)
+                .unwrap();
+        let rec2 =
+            DoneLedgerRecord::try_new(key, DoneLedgerStatus::ScannedClean, 100, 0, prov2, None)
+                .unwrap();
+
+        // Submit both — they become pending.
+        let (e1, _) = sim.step(DoneLedgerSimOp::BatchUpsert {
+            records: vec![rec1],
+        });
+        assert!(
+            matches!(e1, DoneLedgerSimEvent::UpsertPending { .. }),
+            "expected pending, got {e1:?}"
+        );
+        let (e2, _) = sim.step(DoneLedgerSimOp::BatchUpsert {
+            records: vec![rec2],
+        });
+        assert!(
+            matches!(e2, DoneLedgerSimEvent::UpsertPending { .. }),
+            "expected pending, got {e2:?}"
+        );
+        assert_eq!(sim.pending_batches.len(), 2);
+
+        // Release all with NewestFirst — ledger applies op2 before op1.
+        let (_, violations) = sim.step(DoneLedgerSimOp::ReleaseAll {
+            order: CompletionOrder::NewestFirst,
+        });
+        assert!(
+            violations.is_empty(),
+            "release_all should not produce violations: {violations:?}"
+        );
+
+        // Verify convergence: oracle and ledger should agree.
+        let convergence_violations = sim.oracle.verify_convergence(&sim.ledger);
+        assert!(
+            convergence_violations.is_empty(),
+            "oracle/ledger divergence after NewestFirst release: {convergence_violations:?}"
+        );
     }
 
     #[test]

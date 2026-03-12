@@ -51,9 +51,12 @@ impl DoneLedgerOracle {
 
     /// Commit a pending batch: merge its records into the committed map.
     ///
-    /// Uses [`DoneLedgerRecord::merge`] — structurally identical to
-    /// what `InMemoryDoneLedger` does internally — so the oracle acts
-    /// as an independent reference implementation.
+    /// Delegates to [`DoneLedgerRecord::merge`] — the same join primitive
+    /// the production ledger uses. This is intentional: the oracle verifies
+    /// that the *harness applies operations in the correct sequence*, not
+    /// that the merge algorithm itself is correct. Merge correctness is
+    /// covered by dedicated unit and property-based tests on
+    /// `DoneLedgerRecord`.
     ///
     /// Returns `false` if `op_id` was not in the pending set (already
     /// committed or aborted).
@@ -142,7 +145,7 @@ impl DoneLedgerOracle {
                     if oracle_record != *ledger_record {
                         violations.push(DoneLedgerInvariantViolation::LatticeConvergence {
                             key: *key,
-                            oracle: Box::new(oracle_record.clone()),
+                            oracle: Some(Box::new(oracle_record.clone())),
                             actual: Some(Box::new((*ledger_record).clone())),
                         });
                     }
@@ -150,7 +153,7 @@ impl DoneLedgerOracle {
                 None => {
                     violations.push(DoneLedgerInvariantViolation::LatticeConvergence {
                         key: *key,
-                        oracle: Box::new(oracle_record.clone()),
+                        oracle: Some(Box::new(oracle_record.clone())),
                         actual: None,
                     });
                 }
@@ -166,7 +169,7 @@ impl DoneLedgerOracle {
                 // oracle's commit path.
                 violations.push(DoneLedgerInvariantViolation::LatticeConvergence {
                     key,
-                    oracle: Box::new(record.clone()),
+                    oracle: None,
                     actual: Some(Box::new(record.clone())),
                 });
             }
@@ -293,6 +296,43 @@ mod tests {
         // Oracle has nothing committed — should detect divergence.
         let violations = oracle.verify_convergence(&ledger);
         assert!(!violations.is_empty());
+    }
+
+    #[test]
+    fn convergence_violation_distinguishes_oracle_from_ledger_state() {
+        use gossip_contracts::persistence::{CommitHandle, DoneLedger};
+
+        let oracle = DoneLedgerOracle::new();
+        let ledger = InMemoryDoneLedger::new();
+
+        // Write a record to the ledger without going through the oracle.
+        let rec = make_record(1, DoneLedgerStatus::ScannedClean, 100, 0, 200);
+        let handle = ledger.batch_upsert(&[rec]).unwrap();
+        let _receipt = handle.wait().unwrap();
+
+        // Oracle has no committed state — should detect divergence.
+        let violations = oracle.verify_convergence(&ledger);
+        assert!(!violations.is_empty());
+
+        // When the oracle never committed a key but the ledger has it,
+        // the violation's oracle field should be None.
+        for v in &violations {
+            if let DoneLedgerInvariantViolation::LatticeConvergence {
+                oracle: oracle_rec,
+                actual,
+                ..
+            } = v
+            {
+                assert!(
+                    oracle_rec.is_none(),
+                    "oracle field should be None for keys the oracle never committed"
+                );
+                assert!(
+                    actual.is_some(),
+                    "ledger has this key, actual should be Some"
+                );
+            }
+        }
     }
 
     #[test]
