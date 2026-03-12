@@ -110,19 +110,24 @@ fn resolve<T>(value: Option<T>, default: Option<T>, field: &str) -> T {
         .unwrap_or_else(|| panic!("default fixture for {field} must be present"))
 }
 
-fn expected_columns(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+fn expected_columns(entries: &[(&str, &str, bool)]) -> BTreeMap<String, (String, bool)> {
     entries
         .iter()
-        .map(|(name, ty)| ((*name).to_owned(), (*ty).to_owned()))
+        .map(|(name, ty, nullable)| ((*name).to_owned(), ((*ty).to_owned(), *nullable)))
         .collect()
 }
 
-fn assert_has_expected_indexes(actual: &BTreeSet<String>, expected: &[&str]) {
-    for name in expected {
-        assert!(
-            actual.contains(*name),
-            "expected index {name:?} to exist; actual indexes: {actual:?}"
-        );
+fn assert_has_expected_indexes(actual: &BTreeMap<String, String>, expected: &[(&str, &[&str])]) {
+    for (name, columns) in expected {
+        let def = actual
+            .get(*name)
+            .unwrap_or_else(|| panic!("expected index {name:?} to exist; actual: {actual:?}"));
+        for col in *columns {
+            assert!(
+                def.contains(col),
+                "index {name:?} should contain column {col:?}; actual definition: {def:?}"
+            );
+        }
     }
 }
 
@@ -138,10 +143,10 @@ fn table_exists(client: &mut Client, table: &str) -> bool {
         .is_some()
 }
 
-fn table_columns(client: &mut Client, table: &str) -> BTreeMap<String, String> {
+fn table_columns(client: &mut Client, table: &str) -> BTreeMap<String, (String, bool)> {
     client
         .query(
-            "SELECT column_name, data_type
+            "SELECT column_name, data_type, is_nullable
              FROM information_schema.columns
              WHERE table_schema = 'public' AND table_name = $1
              ORDER BY ordinal_position",
@@ -149,21 +154,26 @@ fn table_columns(client: &mut Client, table: &str) -> BTreeMap<String, String> {
         )
         .expect("column introspection query should succeed")
         .into_iter()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .map(|row| {
+            let name: String = row.get(0);
+            let data_type: String = row.get(1);
+            let nullable: String = row.get(2);
+            (name, (data_type, nullable == "YES"))
+        })
         .collect()
 }
 
-fn table_index_names(client: &mut Client, table: &str) -> BTreeSet<String> {
+fn table_indexes(client: &mut Client, table: &str) -> BTreeMap<String, String> {
     client
         .query(
-            "SELECT indexname
+            "SELECT indexname, indexdef
              FROM pg_indexes
              WHERE schemaname = 'public' AND tablename = $1",
             &[&table],
         )
         .expect("index introspection query should succeed")
         .into_iter()
-        .map(|row| row.get::<_, String>(0))
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
         .collect()
 }
 
@@ -419,11 +429,11 @@ fn migration_creates_findings_table() {
     assert_eq!(
         table_columns(&mut client, schema::FINDINGS_TABLE),
         expected_columns(&[
-            ("tenant_id", "bytea"),
-            ("finding_id", "bytea"),
-            ("stable_item_id", "bytea"),
-            ("rule_fingerprint", "bytea"),
-            ("secret_hash", "bytea"),
+            ("tenant_id", "bytea", false),
+            ("finding_id", "bytea", false),
+            ("stable_item_id", "bytea", false),
+            ("rule_fingerprint", "bytea", false),
+            ("secret_hash", "bytea", false),
         ])
     );
 }
@@ -437,12 +447,12 @@ fn migration_creates_occurrences_table() {
     assert_eq!(
         table_columns(&mut client, schema::OCCURRENCES_TABLE),
         expected_columns(&[
-            ("tenant_id", "bytea"),
-            ("occurrence_id", "bytea"),
-            ("finding_id", "bytea"),
-            ("object_version_id", "bytea"),
-            ("byte_offset", "bigint"),
-            ("byte_length", "bigint"),
+            ("tenant_id", "bytea", false),
+            ("occurrence_id", "bytea", false),
+            ("finding_id", "bytea", false),
+            ("object_version_id", "bytea", false),
+            ("byte_offset", "bigint", false),
+            ("byte_length", "bigint", false),
         ])
     );
 }
@@ -456,17 +466,17 @@ fn migration_creates_observations_table() {
     assert_eq!(
         table_columns(&mut client, schema::OBSERVATIONS_TABLE),
         expected_columns(&[
-            ("tenant_id", "bytea"),
-            ("observation_id", "bytea"),
-            ("occurrence_id", "bytea"),
-            ("policy_hash", "bytea"),
-            ("ovid_hash", "bytea"),
-            ("run_id", "bigint"),
-            ("shard_id", "bigint"),
-            ("fence_epoch", "bigint"),
-            ("seen_at", "bigint"),
-            ("location_display", "text"),
-            ("location_url", "text"),
+            ("tenant_id", "bytea", false),
+            ("observation_id", "bytea", false),
+            ("occurrence_id", "bytea", false),
+            ("policy_hash", "bytea", false),
+            ("ovid_hash", "bytea", false),
+            ("run_id", "bigint", false),
+            ("shard_id", "bigint", false),
+            ("fence_epoch", "bigint", false),
+            ("seen_at", "bigint", false),
+            ("location_display", "text", true),
+            ("location_url", "text", true),
         ])
     );
 }
@@ -592,9 +602,9 @@ fn migration_creates_history_table() {
     assert_eq!(
         table_columns(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
         expected_columns(&[
-            ("version", "text"),
-            ("checksum", "bytea"),
-            ("applied_at", "timestamp with time zone"),
+            ("version", "text", false),
+            ("checksum", "bytea", false),
+            ("applied_at", "timestamp with time zone", false),
         ])
     );
 }
@@ -605,13 +615,19 @@ fn migration_creates_history_table() {
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn findings_table_has_expected_indexes() {
     let mut client = test_client();
-    let indexes = table_index_names(&mut client, schema::FINDINGS_TABLE);
+    let indexes = table_indexes(&mut client, schema::FINDINGS_TABLE);
 
     assert_has_expected_indexes(
         &indexes,
         &[
-            schema::FINDINGS_TENANT_SECRET_HASH_INDEX,
-            schema::FINDINGS_TENANT_STABLE_ITEM_ID_INDEX,
+            (
+                schema::FINDINGS_TENANT_SECRET_HASH_INDEX,
+                &["tenant_id", "secret_hash", "finding_id"],
+            ),
+            (
+                schema::FINDINGS_TENANT_STABLE_ITEM_ID_INDEX,
+                &["tenant_id", "stable_item_id", "finding_id"],
+            ),
         ],
     );
 }
@@ -620,13 +636,19 @@ fn findings_table_has_expected_indexes() {
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn occurrences_table_has_expected_indexes() {
     let mut client = test_client();
-    let indexes = table_index_names(&mut client, schema::OCCURRENCES_TABLE);
+    let indexes = table_indexes(&mut client, schema::OCCURRENCES_TABLE);
 
     assert_has_expected_indexes(
         &indexes,
         &[
-            schema::OCCURRENCES_TENANT_FINDING_ID_INDEX,
-            schema::OCCURRENCES_TENANT_OBJECT_VERSION_ID_INDEX,
+            (
+                schema::OCCURRENCES_TENANT_FINDING_ID_INDEX,
+                &["tenant_id", "finding_id", "occurrence_id"],
+            ),
+            (
+                schema::OCCURRENCES_TENANT_OBJECT_VERSION_ID_INDEX,
+                &["tenant_id", "object_version_id", "occurrence_id"],
+            ),
         ],
     );
 }
@@ -635,15 +657,30 @@ fn occurrences_table_has_expected_indexes() {
 #[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn observations_table_has_expected_indexes() {
     let mut client = test_client();
-    let indexes = table_index_names(&mut client, schema::OBSERVATIONS_TABLE);
+    let indexes = table_indexes(&mut client, schema::OBSERVATIONS_TABLE);
     assert_has_expected_indexes(
         &indexes,
         &[
-            schema::OBSERVATIONS_TENANT_SEEN_AT_INDEX,
-            schema::OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX,
-            schema::OBSERVATIONS_TENANT_OCCURRENCE_ID_INDEX,
-            schema::OBSERVATIONS_TENANT_OVID_HASH_INDEX,
-            schema::OBSERVATIONS_TENANT_RUN_SHARD_INDEX,
+            (
+                schema::OBSERVATIONS_TENANT_SEEN_AT_INDEX,
+                &["tenant_id", "seen_at", "observation_id"],
+            ),
+            (
+                schema::OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX,
+                &["tenant_id", "policy_hash", "seen_at", "observation_id"],
+            ),
+            (
+                schema::OBSERVATIONS_TENANT_OCCURRENCE_ID_INDEX,
+                &["tenant_id", "occurrence_id", "observation_id"],
+            ),
+            (
+                schema::OBSERVATIONS_TENANT_OVID_HASH_INDEX,
+                &["tenant_id", "ovid_hash", "observation_id"],
+            ),
+            (
+                schema::OBSERVATIONS_TENANT_RUN_SHARD_INDEX,
+                &["tenant_id", "run_id", "shard_id", "observation_id"],
+            ),
         ],
     );
 }
