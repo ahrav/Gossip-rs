@@ -62,9 +62,17 @@ mod tests {
 
     #[test]
     fn advisory_lock_keys_are_globally_unique() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen_keys = std::collections::HashSet::new();
+        let mut seen_labels = std::collections::HashSet::new();
         for &(label, key) in super::ADVISORY_LOCK_KEYS {
-            assert!(seen.insert(key), "duplicate advisory lock key for {label}");
+            assert!(
+                seen_keys.insert(key),
+                "duplicate advisory lock key for {label}"
+            );
+            assert!(
+                seen_labels.insert(label),
+                "duplicate advisory lock label: {label}"
+            );
         }
     }
 
