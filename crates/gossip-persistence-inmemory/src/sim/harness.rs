@@ -29,10 +29,10 @@ use gossip_contracts::{
 use rand::Rng;
 
 use super::{
-    DoneLedgerSimEvent, DoneLedgerSimEventKind, DoneLedgerSimOp, FaultLevel, PersistenceSim,
-    SimContext,
     invariants::{DoneLedgerInvariantChecker, DoneLedgerInvariantViolation},
     oracle::DoneLedgerOracle,
+    DoneLedgerSimEvent, DoneLedgerSimEventKind, DoneLedgerSimOp, FaultLevel, PersistenceSim,
+    SimContext,
 };
 use crate::{CompletionOrder, InMemoryDoneLedger, InMemoryDoneLedgerHandle, PendingWriteId};
 
@@ -969,8 +969,8 @@ mod tests {
     fn release_all_newest_first_oracle_matches_ledger_order() {
         // When exec_release_all is called with NewestFirst, the oracle
         // must commit batches in the same order the ledger applied them.
-        // Currently the oracle always uses ascending op_id (oldest-first),
-        // which can diverge from the ledger when merge has tie-breaking.
+        // This test guards that release-order logic so oracle convergence
+        // stays aligned with ledger merge tie-breaking.
         let mut sim = DoneLedgerSim::new(42, FaultLevel::SunnyDay);
 
         // Delay two writes.
