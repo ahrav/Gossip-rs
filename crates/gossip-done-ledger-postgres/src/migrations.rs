@@ -285,7 +285,9 @@ fn apply_or_verify_migration(
 
     if let Some(row) = row {
         // Migration already applied — verify the embedded SQL has not changed.
-        let found_checksum: Vec<u8> = row.get(0);
+        let found_checksum: Vec<u8> = row.try_get(0).map_err(|e| {
+            DoneLedgerPgMigrationError::postgres(MigrationOperation::QueryMigration, e)
+        })?;
         verify_stored_checksum(version, expected_checksum, &found_checksum)?;
         return Ok(());
     }

@@ -268,7 +268,9 @@ fn apply_or_verify_migration(
         .map_err(|e| FindingsPgMigrationError::postgres(MigrationOperation::QueryMigration, e))?;
 
     if let Some(row) = row {
-        let found_checksum: Vec<u8> = row.get(0);
+        let found_checksum: Vec<u8> = row.try_get(0).map_err(|e| {
+            FindingsPgMigrationError::postgres(MigrationOperation::QueryMigration, e)
+        })?;
         verify_stored_checksum(version, expected_checksum, &found_checksum)?;
         return Ok(());
     }
