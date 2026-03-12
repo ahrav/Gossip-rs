@@ -1,0 +1,1048 @@
+//! Live-PostgreSQL integration tests for the findings schema and migration
+//! runner.
+//!
+//! These tests require either Docker (for testcontainers) or an external
+//! PostgreSQL advertised through `GOSSIP_POSTGRES_TEST_URL`. They are marked
+//! `#[ignore]` so routine `cargo test` runs skip them cleanly.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use postgres::Client;
+use postgres::error::{DbError, SqlState};
+
+use crate::schema;
+use crate::test_postgres::{create_test_db, test_client, test_client_bare};
+use crate::{
+    EmbeddedMigration, FindingsPgMigrationError, MIGRATIONS, apply_all_migrations, apply_migrations,
+};
+
+/// Field overrides for a `findings` row. `None` means "use the valid default".
+#[derive(Default)]
+struct FindingOverrides {
+    tenant_id: Option<Vec<u8>>,
+    finding_id: Option<Vec<u8>>,
+    stable_item_id: Option<Vec<u8>>,
+    rule_fingerprint: Option<Vec<u8>>,
+    secret_hash: Option<Vec<u8>>,
+}
+
+impl FindingOverrides {
+    fn defaults() -> Self {
+        Self {
+            tenant_id: Some(bytes32(0x10)),
+            finding_id: Some(bytes32(0x11)),
+            stable_item_id: Some(bytes32(0x12)),
+            rule_fingerprint: Some(bytes32(0x13)),
+            secret_hash: Some(bytes32(0x14)),
+        }
+    }
+}
+
+/// Field overrides for an `occurrences` row. `None` means "use the valid default".
+#[derive(Default)]
+struct OccurrenceOverrides {
+    tenant_id: Option<Vec<u8>>,
+    occurrence_id: Option<Vec<u8>>,
+    finding_id: Option<Vec<u8>>,
+    object_version_id: Option<Vec<u8>>,
+    byte_offset: Option<i64>,
+    byte_length: Option<i64>,
+}
+
+impl OccurrenceOverrides {
+    fn defaults() -> Self {
+        Self {
+            tenant_id: Some(bytes32(0x10)),
+            occurrence_id: Some(bytes32(0x21)),
+            finding_id: Some(bytes32(0x11)),
+            object_version_id: Some(bytes32(0x22)),
+            byte_offset: Some(128),
+            byte_length: Some(64),
+        }
+    }
+}
+
+/// Field overrides for an `observations` row. `None` means "use the valid default".
+#[derive(Default)]
+struct ObservationOverrides {
+    tenant_id: Option<Vec<u8>>,
+    observation_id: Option<Vec<u8>>,
+    occurrence_id: Option<Vec<u8>>,
+    policy_hash: Option<Vec<u8>>,
+    ovid_hash: Option<Vec<u8>>,
+    run_id: Option<i64>,
+    shard_id: Option<i64>,
+    fence_epoch: Option<i64>,
+    seen_at: Option<i64>,
+    location_display: Option<Option<String>>,
+    location_url: Option<Option<String>>,
+}
+
+impl ObservationOverrides {
+    fn defaults() -> Self {
+        Self {
+            tenant_id: Some(bytes32(0x10)),
+            observation_id: Some(bytes32(0x31)),
+            occurrence_id: Some(bytes32(0x21)),
+            policy_hash: Some(bytes32(0x32)),
+            ovid_hash: Some(bytes32(0x33)),
+            run_id: Some(4_096),
+            shard_id: Some(8_192),
+            fence_epoch: Some(16_384),
+            seen_at: Some(32_768),
+            location_display: Some(Some("src/findings/example.txt:42".to_owned())),
+            location_url: Some(Some(
+                "https://example.test/findings/example.txt#L42".to_owned(),
+            )),
+        }
+    }
+}
+
+fn bytes32(fill: u8) -> Vec<u8> {
+    vec![fill; 32]
+}
+
+fn resolve<T>(value: Option<T>, default: Option<T>, field: &str) -> T {
+    value
+        .or(default)
+        .unwrap_or_else(|| panic!("default fixture for {field} must be present"))
+}
+
+fn expected_columns(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(name, ty)| ((*name).to_owned(), (*ty).to_owned()))
+        .collect()
+}
+
+fn expected_index_names(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+fn assert_has_expected_indexes(actual: &BTreeSet<String>, expected: &[&str]) {
+    for name in expected {
+        assert!(
+            actual.contains(*name),
+            "expected index {name:?} to exist; actual indexes: {actual:?}"
+        );
+    }
+}
+
+fn table_exists(client: &mut Client, table: &str) -> bool {
+    client
+        .query_opt(
+            "SELECT 1
+             FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name = $1",
+            &[&table],
+        )
+        .expect("table existence query should succeed")
+        .is_some()
+}
+
+fn table_columns(client: &mut Client, table: &str) -> BTreeMap<String, String> {
+    client
+        .query(
+            "SELECT column_name, data_type
+             FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = $1
+             ORDER BY ordinal_position",
+            &[&table],
+        )
+        .expect("column introspection query should succeed")
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect()
+}
+
+fn table_index_names(client: &mut Client, table: &str) -> BTreeSet<String> {
+    client
+        .query(
+            "SELECT indexname
+             FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = $1",
+            &[&table],
+        )
+        .expect("index introspection query should succeed")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
+fn table_foreign_keys(client: &mut Client, table: &str) -> BTreeMap<String, String> {
+    client
+        .query(
+            "SELECT c.conname, pg_get_constraintdef(c.oid)
+             FROM pg_constraint AS c
+             JOIN pg_class AS rel ON rel.oid = c.conrelid
+             JOIN pg_namespace AS nsp ON nsp.oid = rel.relnamespace
+             WHERE nsp.nspname = 'public' AND rel.relname = $1 AND c.contype = 'f'
+             ORDER BY c.conname",
+            &[&table],
+        )
+        .expect("foreign-key introspection query should succeed")
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect()
+}
+
+fn findings_tables(client: &mut Client) -> BTreeSet<String> {
+    client
+        .query(
+            "SELECT table_name
+             FROM information_schema.tables
+             WHERE table_schema = 'public'
+             ORDER BY table_name",
+            &[],
+        )
+        .expect("table enumeration query should succeed")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .filter(|table| {
+            matches!(
+                table.as_str(),
+                schema::FINDINGS_TABLE
+                    | schema::OCCURRENCES_TABLE
+                    | schema::OBSERVATIONS_TABLE
+                    | schema::SCHEMA_MIGRATIONS_TABLE
+            )
+        })
+        .collect()
+}
+
+fn row_count(client: &mut Client, table: &str) -> i64 {
+    client
+        .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+        .expect("row count query should succeed")
+        .get(0)
+}
+
+fn assert_sqlstate<'a>(err: &'a postgres::Error, expected: &'static SqlState) -> &'a DbError {
+    let db_err = err.as_db_error().expect("expected server-side DbError");
+    assert_eq!(
+        *db_err.code(),
+        *expected,
+        "expected SQLSTATE {:?}, got: {db_err}",
+        expected
+    );
+    db_err
+}
+
+fn assert_check_violation(err: &postgres::Error) {
+    let _ = assert_sqlstate(err, &SqlState::CHECK_VIOLATION);
+}
+
+fn assert_unique_violation(err: &postgres::Error) {
+    let _ = assert_sqlstate(err, &SqlState::UNIQUE_VIOLATION);
+}
+
+fn assert_fk_violation(err: &postgres::Error) {
+    let _ = assert_sqlstate(err, &SqlState::FOREIGN_KEY_VIOLATION);
+}
+
+fn assert_constraint_name(err: &postgres::Error, expected: &str) {
+    let db_err = err.as_db_error().expect("expected server-side DbError");
+    assert_eq!(
+        db_err.constraint(),
+        Some(expected),
+        "expected constraint {expected:?}, got {:?}",
+        db_err.constraint()
+    );
+}
+
+fn try_insert_finding(
+    client: &mut Client,
+    overrides: FindingOverrides,
+) -> Result<u64, postgres::Error> {
+    let defaults = FindingOverrides::defaults();
+    let tenant_id = resolve(overrides.tenant_id, defaults.tenant_id, "tenant_id");
+    let finding_id = resolve(overrides.finding_id, defaults.finding_id, "finding_id");
+    let stable_item_id = resolve(
+        overrides.stable_item_id,
+        defaults.stable_item_id,
+        "stable_item_id",
+    );
+    let rule_fingerprint = resolve(
+        overrides.rule_fingerprint,
+        defaults.rule_fingerprint,
+        "rule_fingerprint",
+    );
+    let secret_hash = resolve(overrides.secret_hash, defaults.secret_hash, "secret_hash");
+
+    client.execute(
+        &format!(
+            "INSERT INTO {} (
+                tenant_id,
+                finding_id,
+                stable_item_id,
+                rule_fingerprint,
+                secret_hash
+            ) VALUES ($1, $2, $3, $4, $5)",
+            schema::FINDINGS_TABLE
+        ),
+        &[
+            &tenant_id,
+            &finding_id,
+            &stable_item_id,
+            &rule_fingerprint,
+            &secret_hash,
+        ],
+    )
+}
+
+fn try_insert_occurrence(
+    client: &mut Client,
+    overrides: OccurrenceOverrides,
+) -> Result<u64, postgres::Error> {
+    let defaults = OccurrenceOverrides::defaults();
+    let tenant_id = resolve(overrides.tenant_id, defaults.tenant_id, "tenant_id");
+    let occurrence_id = resolve(
+        overrides.occurrence_id,
+        defaults.occurrence_id,
+        "occurrence_id",
+    );
+    let finding_id = resolve(overrides.finding_id, defaults.finding_id, "finding_id");
+    let object_version_id = resolve(
+        overrides.object_version_id,
+        defaults.object_version_id,
+        "object_version_id",
+    );
+    let byte_offset = resolve(overrides.byte_offset, defaults.byte_offset, "byte_offset");
+    let byte_length = resolve(overrides.byte_length, defaults.byte_length, "byte_length");
+
+    client.execute(
+        &format!(
+            "INSERT INTO {} (
+                tenant_id,
+                occurrence_id,
+                finding_id,
+                object_version_id,
+                byte_offset,
+                byte_length
+            ) VALUES ($1, $2, $3, $4, $5, $6)",
+            schema::OCCURRENCES_TABLE
+        ),
+        &[
+            &tenant_id,
+            &occurrence_id,
+            &finding_id,
+            &object_version_id,
+            &byte_offset,
+            &byte_length,
+        ],
+    )
+}
+
+fn try_insert_observation(
+    client: &mut Client,
+    overrides: ObservationOverrides,
+) -> Result<u64, postgres::Error> {
+    let defaults = ObservationOverrides::defaults();
+    let tenant_id = resolve(overrides.tenant_id, defaults.tenant_id, "tenant_id");
+    let observation_id = resolve(
+        overrides.observation_id,
+        defaults.observation_id,
+        "observation_id",
+    );
+    let occurrence_id = resolve(
+        overrides.occurrence_id,
+        defaults.occurrence_id,
+        "occurrence_id",
+    );
+    let policy_hash = resolve(overrides.policy_hash, defaults.policy_hash, "policy_hash");
+    let ovid_hash = resolve(overrides.ovid_hash, defaults.ovid_hash, "ovid_hash");
+    let run_id = resolve(overrides.run_id, defaults.run_id, "run_id");
+    let shard_id = resolve(overrides.shard_id, defaults.shard_id, "shard_id");
+    let fence_epoch = resolve(overrides.fence_epoch, defaults.fence_epoch, "fence_epoch");
+    let seen_at = resolve(overrides.seen_at, defaults.seen_at, "seen_at");
+    let location_display = resolve(
+        overrides.location_display,
+        defaults.location_display,
+        "location_display",
+    );
+    let location_url = resolve(
+        overrides.location_url,
+        defaults.location_url,
+        "location_url",
+    );
+
+    client.execute(
+        &format!(
+            "INSERT INTO {} (
+                tenant_id,
+                observation_id,
+                occurrence_id,
+                policy_hash,
+                ovid_hash,
+                run_id,
+                shard_id,
+                fence_epoch,
+                seen_at,
+                location_display,
+                location_url
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            schema::OBSERVATIONS_TABLE
+        ),
+        &[
+            &tenant_id,
+            &observation_id,
+            &occurrence_id,
+            &policy_hash,
+            &ovid_hash,
+            &run_id,
+            &shard_id,
+            &fence_epoch,
+            &seen_at,
+            &location_display,
+            &location_url,
+        ],
+    )
+}
+
+fn insert_valid_finding(client: &mut Client) {
+    try_insert_finding(client, FindingOverrides::default())
+        .expect("default findings row should insert cleanly");
+}
+
+fn insert_valid_occurrence(client: &mut Client) {
+    insert_valid_finding(client);
+    try_insert_occurrence(client, OccurrenceOverrides::default())
+        .expect("default occurrences row should insert cleanly");
+}
+
+// ── Migration runner ──────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn migration_creates_findings_table() {
+    let mut client = test_client();
+
+    assert!(table_exists(&mut client, schema::FINDINGS_TABLE));
+    assert_eq!(
+        table_columns(&mut client, schema::FINDINGS_TABLE),
+        expected_columns(&[
+            ("tenant_id", "bytea"),
+            ("finding_id", "bytea"),
+            ("stable_item_id", "bytea"),
+            ("rule_fingerprint", "bytea"),
+            ("secret_hash", "bytea"),
+        ])
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn migration_creates_occurrences_table() {
+    let mut client = test_client();
+
+    assert!(table_exists(&mut client, schema::OCCURRENCES_TABLE));
+    assert_eq!(
+        table_columns(&mut client, schema::OCCURRENCES_TABLE),
+        expected_columns(&[
+            ("tenant_id", "bytea"),
+            ("occurrence_id", "bytea"),
+            ("finding_id", "bytea"),
+            ("object_version_id", "bytea"),
+            ("byte_offset", "bigint"),
+            ("byte_length", "bigint"),
+        ])
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn migration_creates_observations_table() {
+    let mut client = test_client();
+
+    assert!(table_exists(&mut client, schema::OBSERVATIONS_TABLE));
+    assert_eq!(
+        table_columns(&mut client, schema::OBSERVATIONS_TABLE),
+        expected_columns(&[
+            ("tenant_id", "bytea"),
+            ("observation_id", "bytea"),
+            ("occurrence_id", "bytea"),
+            ("policy_hash", "bytea"),
+            ("ovid_hash", "bytea"),
+            ("run_id", "bigint"),
+            ("shard_id", "bigint"),
+            ("fence_epoch", "bigint"),
+            ("seen_at", "bigint"),
+            ("location_display", "text"),
+            ("location_url", "text"),
+        ])
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn migration_is_idempotent() {
+    let mut client = test_client_bare();
+
+    apply_all_migrations(&mut client).expect("initial migration run should succeed");
+    apply_all_migrations(&mut client).expect("second migration run should be idempotent");
+
+    assert_eq!(
+        row_count(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
+        MIGRATIONS.len() as i64
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn migration_detects_checksum_mismatch() {
+    let mut client = test_client_bare();
+    apply_all_migrations(&mut client).expect("initial migration run should succeed");
+
+    let tampered = [EmbeddedMigration::new(
+        "0001_findings_schema",
+        "SELECT 1; -- tampered",
+    )];
+    let err = apply_migrations(&mut client, &tampered, Duration::from_secs(5))
+        .expect_err("checksum mismatch should fail re-application");
+
+    match err {
+        FindingsPgMigrationError::ChecksumMismatch { version, .. } => {
+            assert_eq!(version, "0001_findings_schema");
+        }
+        FindingsPgMigrationError::Postgres { source, .. } => {
+            panic!("expected ChecksumMismatch, got Postgres error: {source}");
+        }
+        FindingsPgMigrationError::CorruptedHistoryRecord { version, found_len } => {
+            panic!(
+                "expected ChecksumMismatch, got CorruptedHistoryRecord: version={version}, len={found_len}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn persisted_checksum_tamper_is_detected_on_reapply() {
+    let mut client = test_client_bare();
+    apply_all_migrations(&mut client).expect("initial migration run should succeed");
+
+    let updated = client
+        .execute(
+            &format!(
+                "UPDATE {} SET checksum = decode(repeat('00', {}), 'hex') WHERE version = $1",
+                schema::SCHEMA_MIGRATIONS_TABLE,
+                blake3::OUT_LEN,
+            ),
+            &[&"0001_findings_schema"],
+        )
+        .expect("checksum tamper update should succeed");
+    assert_eq!(updated, 1, "expected to tamper exactly one history row");
+
+    let err = apply_all_migrations(&mut client)
+        .expect_err("tampered checksum should fail re-application");
+    match err {
+        FindingsPgMigrationError::ChecksumMismatch { version, .. } => {
+            assert_eq!(version, "0001_findings_schema");
+        }
+        FindingsPgMigrationError::Postgres { source, .. } => {
+            panic!("expected ChecksumMismatch, got Postgres error: {source}");
+        }
+        FindingsPgMigrationError::CorruptedHistoryRecord { version, found_len } => {
+            panic!(
+                "expected ChecksumMismatch, got CorruptedHistoryRecord: version={version}, len={found_len}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn concurrent_migrations_both_succeed() {
+    let url = create_test_db();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let barrier_a = Arc::clone(&barrier);
+    let barrier_b = Arc::clone(&barrier);
+    let url_a = url.clone();
+    let url_b = url;
+
+    let worker = |db_url: String, barrier: Arc<std::sync::Barrier>| {
+        std::thread::spawn(move || {
+            let mut client = postgres::Client::connect(&db_url, postgres::NoTls)
+                .expect("worker should connect to shared test database");
+            barrier.wait();
+            apply_all_migrations(&mut client)
+        })
+    };
+
+    let thread_a = worker(url_a, barrier_a);
+    let thread_b = worker(url_b, barrier_b);
+
+    thread_a
+        .join()
+        .expect("first migration thread should not panic")
+        .expect("first migration thread should succeed");
+    thread_b
+        .join()
+        .expect("second migration thread should not panic")
+        .expect("second migration thread should succeed");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn bare_db_has_no_findings_tables() {
+    let mut client = test_client_bare();
+    assert!(findings_tables(&mut client).is_empty());
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn migration_creates_history_table() {
+    let mut client = test_client();
+
+    assert!(table_exists(&mut client, schema::SCHEMA_MIGRATIONS_TABLE));
+    assert_eq!(
+        table_columns(&mut client, schema::SCHEMA_MIGRATIONS_TABLE),
+        expected_columns(&[
+            ("version", "text"),
+            ("checksum", "bytea"),
+            ("applied_at", "timestamp with time zone"),
+        ])
+    );
+}
+
+// ── Schema verification ───────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_table_has_expected_indexes() {
+    let mut client = test_client();
+    let indexes = table_index_names(&mut client, schema::FINDINGS_TABLE);
+
+    assert_has_expected_indexes(
+        &indexes,
+        &[
+            schema::FINDINGS_TENANT_SECRET_HASH_INDEX,
+            schema::FINDINGS_TENANT_STABLE_ITEM_ID_INDEX,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_table_has_expected_indexes() {
+    let mut client = test_client();
+    let indexes = table_index_names(&mut client, schema::OCCURRENCES_TABLE);
+
+    assert_has_expected_indexes(
+        &indexes,
+        &[
+            schema::OCCURRENCES_TENANT_FINDING_ID_INDEX,
+            schema::OCCURRENCES_TENANT_OBJECT_VERSION_ID_INDEX,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_table_has_expected_indexes() {
+    let mut client = test_client();
+    let indexes = table_index_names(&mut client, schema::OBSERVATIONS_TABLE);
+    let expected = expected_index_names(&[
+        schema::OBSERVATIONS_TENANT_SEEN_AT_INDEX,
+        schema::OBSERVATIONS_TENANT_POLICY_SEEN_AT_INDEX,
+        schema::OBSERVATIONS_TENANT_OCCURRENCE_ID_INDEX,
+        schema::OBSERVATIONS_TENANT_OVID_HASH_INDEX,
+        schema::OBSERVATIONS_TENANT_RUN_SHARD_INDEX,
+    ]);
+
+    for name in expected {
+        assert!(
+            indexes.contains(&name),
+            "expected index {name:?} to exist; actual indexes: {indexes:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_has_no_policy_hash_column() {
+    let mut client = test_client();
+    let columns = table_columns(&mut client, schema::OCCURRENCES_TABLE);
+    assert!(!columns.contains_key("policy_hash"));
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_has_policy_hash_column() {
+    let mut client = test_client();
+    let columns = table_columns(&mut client, schema::OBSERVATIONS_TABLE);
+    assert!(columns.contains_key("policy_hash"));
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn foreign_key_cascade_from_findings() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    try_insert_occurrence(&mut client, OccurrenceOverrides::default())
+        .expect("default occurrence should insert once parent finding exists");
+
+    assert_eq!(row_count(&mut client, schema::OCCURRENCES_TABLE), 1);
+    client
+        .execute(&format!("DELETE FROM {}", schema::FINDINGS_TABLE), &[])
+        .expect("deleting parent findings should succeed");
+    assert_eq!(row_count(&mut client, schema::OCCURRENCES_TABLE), 0);
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn foreign_key_cascade_from_occurrences() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    try_insert_observation(&mut client, ObservationOverrides::default())
+        .expect("default observation should insert once parent occurrence exists");
+
+    assert_eq!(row_count(&mut client, schema::OBSERVATIONS_TABLE), 1);
+    client
+        .execute(&format!("DELETE FROM {}", schema::OCCURRENCES_TABLE), &[])
+        .expect("deleting parent occurrences should succeed");
+    assert_eq!(row_count(&mut client, schema::OBSERVATIONS_TABLE), 0);
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn migration_creates_foreign_keys() {
+    let mut client = test_client();
+
+    let occurrence_fks = table_foreign_keys(&mut client, schema::OCCURRENCES_TABLE);
+    let observation_fks = table_foreign_keys(&mut client, schema::OBSERVATIONS_TABLE);
+
+    let occurrence_fk = occurrence_fks
+        .get("occurrences_finding_fk")
+        .expect("occurrences -> findings FK should exist");
+    assert!(
+        occurrence_fk.contains("FOREIGN KEY (tenant_id, finding_id) REFERENCES findings(tenant_id, finding_id) ON DELETE CASCADE")
+    );
+
+    let observation_fk = observation_fks
+        .get("observations_occurrence_fk")
+        .expect("observations -> occurrences FK should exist");
+    assert!(
+        observation_fk.contains("FOREIGN KEY (tenant_id, occurrence_id) REFERENCES occurrences(tenant_id, occurrence_id) ON DELETE CASCADE")
+    );
+
+    let occurrence_err = try_insert_occurrence(&mut client, OccurrenceOverrides::default())
+        .expect_err("occurrence insert without parent finding should fail");
+    assert_fk_violation(&occurrence_err);
+    assert_constraint_name(&occurrence_err, "occurrences_finding_fk");
+
+    let observation_err = try_insert_observation(&mut client, ObservationOverrides::default())
+        .expect_err("observation insert without parent occurrence should fail");
+    assert_fk_violation(&observation_err);
+    assert_constraint_name(&observation_err, "observations_occurrence_fk");
+}
+
+// ── Constraint enforcement ────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_rejects_short_bytea() {
+    let mut client = test_client();
+    let err = try_insert_finding(
+        &mut client,
+        FindingOverrides {
+            tenant_id: Some(vec![0x10; 31]),
+            ..Default::default()
+        },
+    )
+    .expect_err("31-byte tenant_id should violate findings length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "findings_tenant_id_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_rejects_short_bytea() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            occurrence_id: Some(vec![0x21; 31]),
+            ..Default::default()
+        },
+    )
+    .expect_err("31-byte occurrence_id should violate occurrences length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "occurrences_occurrence_id_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_short_bytea() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            policy_hash: Some(vec![0x32; 31]),
+            ..Default::default()
+        },
+    )
+    .expect_err("31-byte policy_hash should violate observations length checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_policy_hash_len_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_rejects_negative_byte_offset() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            byte_offset: Some(-1),
+            ..Default::default()
+        },
+    )
+    .expect_err("negative byte_offset should violate occurrences checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "occurrences_byte_offset_nonnegative_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_rejects_zero_byte_length() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            byte_length: Some(0),
+            ..Default::default()
+        },
+    )
+    .expect_err("zero byte_length should violate occurrences checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "occurrences_byte_length_positive_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_negative_fence_epoch() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            fence_epoch: Some(-1),
+            ..Default::default()
+        },
+    )
+    .expect_err("negative fence_epoch should violate observations checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_fence_epoch_nonnegative_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_rejects_negative_seen_at() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            seen_at: Some(-1),
+            ..Default::default()
+        },
+    )
+    .expect_err("negative seen_at should violate observations checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_seen_at_nonnegative_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_accepts_negative_run_id() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let tenant_id = bytes32(0x10);
+    let observation_id = bytes32(0x41);
+
+    let inserted = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            observation_id: Some(observation_id.clone()),
+            run_id: Some(i64::MIN),
+            ..Default::default()
+        },
+    )
+    .expect("negative run_id must remain valid for bit-pattern storage");
+    assert_eq!(inserted, 1);
+
+    let stored: i64 = client
+        .query_one(
+            &format!(
+                "SELECT run_id FROM {} WHERE tenant_id = $1 AND observation_id = $2",
+                schema::OBSERVATIONS_TABLE
+            ),
+            &[&tenant_id, &observation_id],
+        )
+        .expect("stored observation should be queryable")
+        .get(0);
+    assert_eq!(stored, i64::MIN);
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_accepts_negative_shard_id() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let tenant_id = bytes32(0x10);
+    let observation_id = bytes32(0x42);
+
+    let inserted = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            observation_id: Some(observation_id.clone()),
+            shard_id: Some(i64::MIN + 1),
+            ..Default::default()
+        },
+    )
+    .expect("negative shard_id must remain valid for bit-pattern storage");
+    assert_eq!(inserted, 1);
+
+    let stored: i64 = client
+        .query_one(
+            &format!(
+                "SELECT shard_id FROM {} WHERE tenant_id = $1 AND observation_id = $2",
+                schema::OBSERVATIONS_TABLE
+            ),
+            &[&tenant_id, &observation_id],
+        )
+        .expect("stored observation should be queryable")
+        .get(0);
+    assert_eq!(stored, i64::MIN + 1);
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_location_display_size_limit() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            location_display: Some(Some("x".repeat(4_097))),
+            ..Default::default()
+        },
+    )
+    .expect_err("4097-byte location_display should violate observations checks");
+
+    assert_check_violation(&err);
+    assert_constraint_name(&err, "observations_location_display_ck");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_location_url_accepts_null() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    let tenant_id = bytes32(0x10);
+    let observation_id = bytes32(0x43);
+
+    let inserted = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            observation_id: Some(observation_id.clone()),
+            location_display: Some(None),
+            location_url: Some(None),
+            ..Default::default()
+        },
+    )
+    .expect("NULL location fields should remain valid");
+    assert_eq!(inserted, 1);
+
+    let row = client
+        .query_one(
+            &format!(
+                "SELECT location_display, location_url
+                 FROM {}
+                 WHERE tenant_id = $1 AND observation_id = $2",
+                schema::OBSERVATIONS_TABLE
+            ),
+            &[&tenant_id, &observation_id],
+        )
+        .expect("stored observation should be queryable");
+    let stored_display: Option<String> = row.get(0);
+    let stored_url: Option<String> = row.get(1);
+    assert!(stored_display.is_none());
+    assert!(stored_url.is_none());
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_natural_unique_prevents_duplicates() {
+    let mut client = test_client();
+    try_insert_finding(&mut client, FindingOverrides::default())
+        .expect("first findings row should insert cleanly");
+
+    let err = try_insert_finding(
+        &mut client,
+        FindingOverrides {
+            finding_id: Some(bytes32(0x15)),
+            ..Default::default()
+        },
+    )
+    .expect_err("duplicate findings natural key should fail");
+
+    assert_unique_violation(&err);
+    assert_constraint_name(&err, "findings_natural_unique");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn occurrences_natural_unique_prevents_duplicates() {
+    let mut client = test_client();
+    insert_valid_finding(&mut client);
+    try_insert_occurrence(&mut client, OccurrenceOverrides::default())
+        .expect("first occurrences row should insert cleanly");
+
+    let err = try_insert_occurrence(
+        &mut client,
+        OccurrenceOverrides {
+            occurrence_id: Some(bytes32(0x23)),
+            ..Default::default()
+        },
+    )
+    .expect_err("duplicate occurrences natural key should fail");
+
+    assert_unique_violation(&err);
+    assert_constraint_name(&err, "occurrences_natural_unique");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn observations_natural_unique_prevents_duplicates() {
+    let mut client = test_client();
+    insert_valid_occurrence(&mut client);
+    try_insert_observation(&mut client, ObservationOverrides::default())
+        .expect("first observations row should insert cleanly");
+
+    let err = try_insert_observation(
+        &mut client,
+        ObservationOverrides {
+            observation_id: Some(bytes32(0x34)),
+            ..Default::default()
+        },
+    )
+    .expect_err("duplicate observations natural key should fail");
+
+    assert_unique_violation(&err);
+    assert_constraint_name(&err, "observations_natural_unique");
+}
