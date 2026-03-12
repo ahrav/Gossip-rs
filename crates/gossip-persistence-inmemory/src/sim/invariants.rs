@@ -1,6 +1,6 @@
 //! Per-step invariant checker for the done-ledger simulation.
 //!
-//! Verifies invariants I1–I6 and I8–I10 after every operation. Each
+//! Verifies invariants I1–I10 after every operation. Each
 //! invariant is checked by a dedicated method that accepts the operation
 //! context (keys involved, result, pre-operation snapshot) and returns
 //! violations.
@@ -15,7 +15,7 @@
 //! | I4 | SubmitRollback | After failed submission |
 //! | I5 | CommitRollback | After failed commit |
 //! | I6 | LatticeConvergence | Liveness phase only (via oracle) |
-//! | — | *(I7 reserved for findings-layer invariants)* | — |
+//! | I7 | ReadConsistency | After batch_get |
 //! | I8 | ProvenanceFidelity | After committed upsert |
 //! | I9 | ReceiptAccuracy | After committed upsert |
 //! | I10 | IdempotentUpsert | After committed upsert of identical records |

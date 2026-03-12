@@ -20,5 +20,6 @@ rand_chacha = { version = "0.9", optional = true }
 
 [dev-dependencies]
 gossip-contracts = { workspace = true, features = ["test-support"] }
+proptest.workspace = true
 rand = "0.9"
 rand_chacha = "0.9"
