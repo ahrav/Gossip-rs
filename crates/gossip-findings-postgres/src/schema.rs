@@ -241,15 +241,31 @@ impl OccurrenceRow {
     /// # Errors
     ///
     /// Returns [`FindingsPgSchemaError::PgU64Conversion`] when either ordered
-    /// `BIGINT` field exceeds PostgreSQL's signed range.
+    /// `BIGINT` field exceeds PostgreSQL's signed range, or
+    /// [`FindingsPgSchemaError::SpanOverflow`] when the combined span
+    /// (`byte_offset + byte_length`) exceeds `i64::MAX`, mirroring the SQL
+    /// `occurrences_span_no_overflow_ck` constraint.
     pub fn from_record(record: &OccurrenceRecord) -> Result<Self, FindingsPgSchemaError> {
+        let byte_offset = u64_to_pg_bigint_checked(record.byte_offset(), "byte_offset")?;
+        let byte_length = u64_to_pg_bigint_checked(record.byte_length().get(), "byte_length")?;
+
+        // Mirror the SQL constraint: byte_offset + byte_length <= i64::MAX.
+        // Both values are non-negative i64, so checked_add returning None
+        // means the combined span exceeds the BIGINT range.
+        if byte_offset.checked_add(byte_length).is_none() {
+            return Err(FindingsPgSchemaError::SpanOverflow {
+                byte_offset,
+                byte_length,
+            });
+        }
+
         Ok(Self {
             tenant_id: *record.tenant_id().as_bytes(),
             occurrence_id: *record.occurrence_id().as_bytes(),
             finding_id: *record.finding_id().as_bytes(),
             object_version_id: *record.object_version_id().as_bytes(),
-            byte_offset: u64_to_pg_bigint_checked(record.byte_offset(), "byte_offset")?,
-            byte_length: u64_to_pg_bigint_checked(record.byte_length().get(), "byte_length")?,
+            byte_offset,
+            byte_length,
         })
     }
 }
@@ -447,7 +463,8 @@ mod tests {
     fn occurrence_row_from_record_projects_bigint_fields() {
         let tenant_id = TenantId::from_bytes([0x11; 32]);
         let finding = finding_record(tenant_id);
-        let record = occurrence_record(tenant_id, finding.finding_id(), i64::MAX as u64, 7);
+        // byte_offset + byte_length must not exceed i64::MAX (SQL span constraint).
+        let record = occurrence_record(tenant_id, finding.finding_id(), i64::MAX as u64 - 7, 7);
         let row = OccurrenceRow::from_record(&record).expect("boundary values should project");
 
         assert_eq!(row.tenant_id, *record.tenant_id().as_bytes());
@@ -457,7 +474,7 @@ mod tests {
             row.object_version_id,
             *record.object_version_id().as_bytes()
         );
-        assert_eq!(row.byte_offset, i64::MAX);
+        assert_eq!(row.byte_offset, i64::MAX - 7);
         assert_eq!(row.byte_length, 7);
     }
 
@@ -707,6 +724,39 @@ mod tests {
             result.is_ok(),
             "incremental batch with already-durable parent should project, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn occurrence_row_rejects_span_exceeding_bigint_max() {
+        // byte_offset and byte_length each fit in i64, but their sum exceeds
+        // i64::MAX — mirroring the SQL occurrences_span_no_overflow_ck
+        // constraint.
+        let tenant_id = TenantId::from_bytes([0x11; 32]);
+        let finding = finding_record(tenant_id);
+        let record = occurrence_record(tenant_id, finding.finding_id(), i64::MAX as u64 - 1, 3);
+
+        let err = OccurrenceRow::from_record(&record)
+            .expect_err("span overflow should be rejected at the Rust layer");
+        assert_eq!(
+            err,
+            FindingsPgSchemaError::SpanOverflow {
+                byte_offset: i64::MAX - 1,
+                byte_length: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn occurrence_row_accepts_span_at_bigint_max_boundary() {
+        // byte_offset + byte_length == i64::MAX is the largest valid span.
+        let tenant_id = TenantId::from_bytes([0x11; 32]);
+        let finding = finding_record(tenant_id);
+        let record = occurrence_record(tenant_id, finding.finding_id(), i64::MAX as u64 - 1, 1);
+
+        let row = OccurrenceRow::from_record(&record)
+            .expect("span exactly at i64::MAX boundary should be accepted");
+        assert_eq!(row.byte_offset, i64::MAX - 1);
+        assert_eq!(row.byte_length, 1);
     }
 
     #[test]

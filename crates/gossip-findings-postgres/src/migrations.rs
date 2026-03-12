@@ -189,7 +189,9 @@ pub fn apply_all_migrations(client: &mut Client) -> Result<(), FindingsPgMigrati
 ///
 /// `lock_timeout` caps how long DDL statements wait for conflicting locks. The
 /// timeout is formatted in milliseconds in `SET LOCAL lock_timeout`, so
-/// sub-second precision is preserved. A zero duration disables the timeout.
+/// sub-second precision is preserved. Non-zero sub-millisecond durations are
+/// clamped to 1ms to prevent silent timeout disabling. A zero duration
+/// explicitly disables the timeout.
 ///
 /// ## Transaction protocol
 ///
@@ -225,7 +227,15 @@ pub fn apply_migrations(
     // unbounded so concurrent startup paths serialize instead of spuriously
     // failing after the timeout budget expires.
     // PostgreSQL lock_timeout accepts millisecond values up to i32::MAX (~24.8 days).
-    let timeout_ms = lock_timeout.as_millis().min(i32::MAX as u128);
+    // Clamp non-zero sub-millisecond durations to 1ms so that truncation
+    // does not silently disable the timeout (PostgreSQL treats '0ms' as
+    // "wait indefinitely").
+    let raw_ms = lock_timeout.as_millis();
+    let timeout_ms = if raw_ms == 0 && !lock_timeout.is_zero() {
+        1
+    } else {
+        raw_ms.min(i32::MAX as u128)
+    };
     tx.batch_execute(&format!("SET LOCAL lock_timeout = '{timeout_ms}ms'"))
         .map_err(|e| FindingsPgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
@@ -315,7 +325,7 @@ fn verify_stored_checksum(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, time::Duration};
 
     use crate::schema::{
         FINDINGS_TABLE, FINDINGS_TENANT_SECRET_HASH_INDEX, FINDINGS_TENANT_STABLE_ITEM_ID_INDEX,
@@ -548,6 +558,47 @@ mod tests {
             !observations_sql.contains("CHECK (run_id >= 0)")
                 && !observations_sql.contains("CHECK (shard_id >= 0)"),
             "run_id and shard_id must not gain non-negative CHECK constraints"
+        );
+    }
+
+    #[test]
+    fn sub_millisecond_nonzero_lock_timeout_does_not_truncate_to_zero() {
+        // Duration::as_millis() truncates sub-millisecond values (e.g. 500µs → 0ms).
+        // PostgreSQL interprets lock_timeout = '0ms' as "wait indefinitely", so a
+        // non-zero sub-millisecond duration must clamp to at least 1ms.
+        let duration = Duration::from_micros(500);
+        assert!(!duration.is_zero(), "precondition: duration is non-zero");
+
+        // Mirror the clamping logic from apply_migrations.
+        let raw_ms = duration.as_millis();
+        let timeout_ms = if raw_ms == 0 && !duration.is_zero() {
+            1
+        } else {
+            raw_ms.min(i32::MAX as u128)
+        };
+
+        assert_ne!(
+            timeout_ms, 0,
+            "non-zero sub-millisecond duration must not produce a zero timeout \
+             (PostgreSQL treats '0ms' as no timeout)"
+        );
+        assert_eq!(timeout_ms, 1, "sub-millisecond clamp should produce 1ms");
+    }
+
+    #[test]
+    fn zero_lock_timeout_disables_timeout() {
+        let duration = Duration::ZERO;
+
+        let raw_ms = duration.as_millis();
+        let timeout_ms = if raw_ms == 0 && !duration.is_zero() {
+            1
+        } else {
+            raw_ms.min(i32::MAX as u128)
+        };
+
+        assert_eq!(
+            timeout_ms, 0,
+            "explicit zero duration should disable timeout"
         );
     }
 }
