@@ -130,7 +130,16 @@ impl SimulatedEtcdKV {
     /// Use [`Self::tick`] for normal time advancement; this method lets
     /// the simulation driver position the clock before an explicit
     /// [`Self::expire_due_leases`] call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `t < self.now` — simulation time must be monotonic.
     pub fn set_time(&mut self, t: u64) {
+        assert!(
+            t >= self.now,
+            "SimulatedEtcdKV time must be monotonic (attempted {t}, current {})",
+            self.now
+        );
         self.now = t;
     }
 
@@ -240,11 +249,15 @@ impl SimulatedEtcdKV {
         }
 
         let staged = self.stage_success_ops(&request.success)?;
-        if !staged.changed {
+        if staged.ops.is_empty() {
             return Ok(build_txn_response(self.revision, true, Vec::new()));
         }
 
-        let revision = self.bump_revision();
+        let revision = if staged.changed {
+            self.bump_revision()
+        } else {
+            self.revision
+        };
         let responses = self.apply_staged_txn(staged, revision);
         Ok(build_txn_response(revision, true, responses))
     }
@@ -1550,6 +1563,59 @@ mod tests {
             op_responses.len(),
             2,
             "response count must match request op count"
+        );
+    }
+
+    /// No-op delete (deleting a non-existent key) must still produce a
+    /// ResponseDeleteRange with deleted=0 in the per-op responses.
+    #[test]
+    fn noop_delete_still_produces_response_entry() {
+        let mut kv = SimulatedEtcdKV::new(107);
+
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(
+                        b"ghost",
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then(vec![TxnOp::delete(b"ghost", None)]),
+            )
+            .expect("txn should succeed");
+        assert!(resp.succeeded());
+
+        // Even though nothing was deleted, the response must contain one
+        // entry per request op.
+        assert_eq!(
+            resp.op_responses().len(),
+            1,
+            "no-op delete must still emit one response entry"
+        );
+    }
+
+    /// A multi-op txn must produce one response header per op (i.e., the
+    /// header must not be moved-from after the first op).
+    #[test]
+    fn multi_op_txn_produces_header_per_response() {
+        let mut kv = SimulatedEtcdKV::new(108);
+
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(b"a", CompareOp::Equal, 0)])
+                    .and_then(vec![
+                        TxnOp::put(b"a", b"1", None),
+                        TxnOp::put(b"b", b"2", None),
+                        TxnOp::put(b"c", b"3", None),
+                    ]),
+            )
+            .expect("txn should succeed");
+        assert!(resp.succeeded());
+        assert_eq!(
+            resp.op_responses().len(),
+            3,
+            "3-op txn must produce 3 response entries"
         );
     }
 }
