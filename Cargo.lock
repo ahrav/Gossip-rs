@@ -1367,6 +1367,7 @@ dependencies = [
  "blake3",
  "gossip-contracts",
  "gossip-pg-common",
+ "gossip-stdx",
  "postgres",
  "proptest",
 ]

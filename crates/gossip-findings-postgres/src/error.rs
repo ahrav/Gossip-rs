@@ -109,6 +109,9 @@ pub enum FindingsPgError {
         tenant_id: TenantId,
         observation_id: ObservationId,
     },
+    /// A foreign-key constraint was violated (e.g., inserting an occurrence
+    /// that references a nonexistent finding).
+    ReferentialIntegrityViolation { table: &'static str, detail: String },
 }
 
 impl fmt::Display for FindingsPgError {
@@ -175,6 +178,9 @@ impl fmt::Display for FindingsPgError {
                 f,
                 "policy-scoped observation identity conflict for tenant {tenant_id} and observation {observation_id}"
             ),
+            Self::ReferentialIntegrityViolation { table, detail } => {
+                write!(f, "referential integrity violation on {table}: {detail}")
+            }
         }
     }
 }
@@ -190,7 +196,8 @@ impl Error for FindingsPgError {
             | Self::CountOutOfRange { .. }
             | Self::FindingConflict { .. }
             | Self::OccurrenceConflict { .. }
-            | Self::ObservationConflict { .. } => None,
+            | Self::ObservationConflict { .. }
+            | Self::ReferentialIntegrityViolation { .. } => None,
         }
     }
 }

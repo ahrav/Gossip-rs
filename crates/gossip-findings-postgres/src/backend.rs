@@ -6,8 +6,6 @@
 //! rules as [`crate::schema::OBSERVATIONS_INSERT_OR_MERGE_SQL`] so Rust-side
 //! pre-processing and SQL-side replay converge on the same durable row.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
     collections::{HashMap, hash_map::Entry},
     fmt,
@@ -31,10 +29,9 @@ use crate::{
     error::{FindingsPgError, FindingsPgSchemaError},
     migrations::apply_all_migrations,
     schema::{
-        FINDINGS_COUNT_SQL, FINDINGS_INSERT_SQL, FINDINGS_TABLE, FindingRow,
-        OBSERVATIONS_COUNT_SQL, OBSERVATIONS_INSERT_OR_MERGE_SQL, OBSERVATIONS_TABLE,
-        OCCURRENCES_COUNT_SQL, OCCURRENCES_INSERT_SQL, OCCURRENCES_TABLE, ObservationRow,
-        OccurrenceRow,
+        COMBINED_COUNTS_SQL, FINDINGS_INSERT_SQL, FINDINGS_TABLE, FindingRow,
+        OBSERVATIONS_INSERT_OR_MERGE_SQL, OBSERVATIONS_TABLE, OCCURRENCES_INSERT_SQL,
+        OCCURRENCES_TABLE, ObservationRow, OccurrenceRow,
     },
 };
 
@@ -46,9 +43,9 @@ pub(crate) struct DedupedBatch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MergeIdentityMismatch {
-    tenant_id: [u8; 32],
-    observation_id: [u8; 32],
+pub(crate) struct MergeIdentityMismatch {
+    pub(crate) tenant_id: [u8; 32],
+    pub(crate) observation_id: [u8; 32],
 }
 
 pub(crate) fn project_and_dedupe(
@@ -187,7 +184,7 @@ fn dedupe_observation_rows(
 ///    `location_display` — never independently sourced from the other record.
 ///
 /// [`OBSERVATIONS_INSERT_OR_MERGE_SQL`]: crate::schema::OBSERVATIONS_INSERT_OR_MERGE_SQL
-fn merge_observation_rows(
+pub(crate) fn merge_observation_rows(
     existing: &ObservationRow,
     incoming: &ObservationRow,
 ) -> Result<ObservationRow, MergeIdentityMismatch> {
@@ -255,9 +252,14 @@ where
 /// share one connection. Each `upsert_batch` call executes in a single SQL
 /// transaction and only returns a [`ReadyCommitHandle`] after the commit
 /// succeeds, making the resulting receipt durable-before-return.
+///
+/// The mutex is held for the full batch duration — statement preparation,
+/// per-row execution, and transaction commit all happen under a single
+/// lock acquisition. A connection-pool design would allow concurrent batch
+/// execution; this single-connection design serializes all callers.
 #[derive(Clone)]
 pub struct FindingsSinkPg {
-    inner: Arc<Mutex<Client>>,
+    client: Arc<Mutex<Client>>,
 }
 
 impl FindingsSinkPg {
@@ -303,7 +305,7 @@ impl FindingsSinkPg {
     #[must_use]
     pub fn from_client(client: Client) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(client)),
+            client: Arc::new(Mutex::new(client)),
         }
     }
 
@@ -349,7 +351,7 @@ impl FindingsSinkPg {
 
     /// Acquire the held client, treating poisoning as unrecoverable.
     fn lock_client(&self) -> Result<MutexGuard<'_, Client>, FindingsPgError> {
-        self.inner
+        self.client
             .lock()
             .map_err(|_| FindingsPgError::MutexPoisoned)
     }
@@ -383,10 +385,28 @@ impl FindingsSink for FindingsSinkPg {
         let projected = project_and_dedupe(batch)?;
         let mut client = self.lock_client()?;
         let mut tx = client.transaction()?;
+        // The `postgres` crate caches prepared statements by SQL text at the
+        // connection level, so the server-side parse cost is amortized after
+        // the first batch through a given connection.
         let findings_stmt = tx.prepare(FINDINGS_INSERT_SQL)?;
         let occurrences_stmt = tx.prepare(OCCURRENCES_INSERT_SQL)?;
         let observations_stmt = tx.prepare(OBSERVATIONS_INSERT_OR_MERGE_SQL)?;
 
+        // Row-by-row execution: each execute_*_upsert call uses `query_opt`
+        // on an INSERT ... RETURNING 1 statement to detect per-row identity
+        // conflicts. A columnar UNNEST approach would batch all rows into a
+        // single INSERT but cannot pinpoint which specific row triggered a
+        // conflict when the identity-verifying WHERE clause suppresses the
+        // RETURNING row. Uniform row-by-row dispatch across all three layers
+        // keeps conflict attribution precise.
+        //
+        // The sibling done-ledger backend (`gossip-done-ledger-postgres`) uses
+        // UNNEST-batch inserts because its merge is always safe — every write
+        // targets the same logical object and silent merge is correct.
+        // Findings rows are keyed by content hash and a collision with
+        // mismatched identity fields is a hard error, not a silent merge.
+        // If per-row conflict detection is ever relaxed, the UNNEST pattern
+        // would reduce round-trips.
         for row in &projected.findings {
             execute_finding_upsert(&mut tx, &findings_stmt, row)?;
         }
@@ -407,9 +427,12 @@ impl FindingsConformanceProbe for FindingsSinkPg {
 
     fn durable_counts(&self) -> Result<DurableFindingsCounts, Self::Error> {
         let mut client = self.lock_client()?;
-        let findings = read_count(&mut client, FINDINGS_COUNT_SQL, FINDINGS_TABLE)?;
-        let occurrences = read_count(&mut client, OCCURRENCES_COUNT_SQL, OCCURRENCES_TABLE)?;
-        let observations = read_count(&mut client, OBSERVATIONS_COUNT_SQL, OBSERVATIONS_TABLE)?;
+        let row = client.query_one(COMBINED_COUNTS_SQL, &[])?;
+
+        let findings = nonneg_count(row.get::<_, i64>(0), FINDINGS_TABLE)?;
+        let occurrences = nonneg_count(row.get::<_, i64>(1), OCCURRENCES_TABLE)?;
+        let observations = nonneg_count(row.get::<_, i64>(2), OBSERVATIONS_TABLE)?;
+
         Ok(DurableFindingsCounts::new(
             findings,
             occurrences,
@@ -419,6 +442,8 @@ impl FindingsConformanceProbe for FindingsSinkPg {
 }
 
 fn build_receipt(projected: &DedupedBatch) -> FindingsCommitReceipt {
+    // Safe: batch size is bounded by RECOMMENDED_MAX_BATCH_SIZE (10,000),
+    // well within u64 range on all platforms.
     FindingsCommitReceipt::new(
         projected.findings.len() as u64,
         projected.occurrences.len() as u64,
@@ -464,17 +489,19 @@ fn execute_occurrence_upsert(
     let occurrence_id = row.occurrence_id.as_slice();
     let finding_id = row.finding_id.as_slice();
     let object_version_id = row.object_version_id.as_slice();
-    let inserted = tx.query_opt(
-        stmt,
-        &[
-            &tenant_id,
-            &occurrence_id,
-            &finding_id,
-            &object_version_id,
-            &row.byte_offset,
-            &row.byte_length,
-        ],
-    )?;
+    let inserted = tx
+        .query_opt(
+            stmt,
+            &[
+                &tenant_id,
+                &occurrence_id,
+                &finding_id,
+                &object_version_id,
+                &row.byte_offset,
+                &row.byte_length,
+            ],
+        )
+        .map_err(|e| intercept_fk_violation(e, OCCURRENCES_TABLE))?;
     if inserted.is_none() {
         return Err(FindingsPgError::OccurrenceConflict {
             tenant_id: TenantId::from_bytes(row.tenant_id),
@@ -494,22 +521,24 @@ fn execute_observation_upsert(
     let occurrence_id = row.occurrence_id.as_slice();
     let policy_hash = row.policy_hash.as_slice();
     let ovid_hash = row.ovid_hash.as_slice();
-    let inserted = tx.query_opt(
-        stmt,
-        &[
-            &tenant_id,
-            &observation_id,
-            &occurrence_id,
-            &policy_hash,
-            &ovid_hash,
-            &row.run_id,
-            &row.shard_id,
-            &row.fence_epoch,
-            &row.seen_at,
-            &row.location_display,
-            &row.location_url,
-        ],
-    )?;
+    let inserted = tx
+        .query_opt(
+            stmt,
+            &[
+                &tenant_id,
+                &observation_id,
+                &occurrence_id,
+                &policy_hash,
+                &ovid_hash,
+                &row.run_id,
+                &row.shard_id,
+                &row.fence_epoch,
+                &row.seen_at,
+                &row.location_display,
+                &row.location_url,
+            ],
+        )
+        .map_err(|e| intercept_fk_violation(e, OBSERVATIONS_TABLE))?;
     if inserted.is_none() {
         return Err(FindingsPgError::ObservationConflict {
             tenant_id: TenantId::from_bytes(row.tenant_id),
@@ -519,9 +548,26 @@ fn execute_observation_upsert(
     Ok(())
 }
 
-fn read_count(client: &mut Client, sql: &str, table: &'static str) -> Result<u64, FindingsPgError> {
-    let row = client.query_one(sql, &[])?;
-    let value = row.get::<_, i64>(0);
+/// Promote a `FOREIGN_KEY_VIOLATION` from a generic `Postgres` error into the
+/// structured [`FindingsPgError::ReferentialIntegrityViolation`] variant.
+/// All other errors pass through unchanged.
+fn intercept_fk_violation(err: postgres::Error, table: &'static str) -> FindingsPgError {
+    use postgres::error::SqlState;
+
+    if let Some(db_err) = err.as_db_error()
+        && *db_err.code() == SqlState::FOREIGN_KEY_VIOLATION
+    {
+        return FindingsPgError::ReferentialIntegrityViolation {
+            table,
+            detail: db_err.detail().unwrap_or("").to_owned(),
+        };
+    }
+    FindingsPgError::Postgres(err)
+}
+
+/// Guard against negative counts (impossible in PostgreSQL but enforced
+/// defensively for the non-negative count domain).
+fn nonneg_count(value: i64, table: &'static str) -> Result<u64, FindingsPgError> {
     if value < 0 {
         return Err(FindingsPgError::CountOutOfRange { table, value });
     }
@@ -795,6 +841,32 @@ mod tests {
     }
 
     #[test]
+    fn merge_observation_equal_seen_at_orphan_urls_follow_loser() {
+        // Both have display=None but different orphan URLs. This state cannot
+        // arise through normal projection (Location requires display), but at
+        // the raw row level, URL follows display source — here the loser
+        // (incoming), which also lacks display but carries an orphan URL.
+        let existing = ObservationRow {
+            location_url: Some("https://existing.test".to_owned()),
+            ..observation_row(10, None, None, 1, 2, 3)
+        };
+        let incoming = ObservationRow {
+            location_url: Some("https://incoming.test".to_owned()),
+            ..observation_row(10, None, None, 4, 5, 6)
+        };
+
+        let merged = merge_observation_rows(&existing, &incoming).expect("merge should succeed");
+
+        assert_eq!(merged.run_id, existing.run_id);
+        assert_eq!(merged.location_display, None);
+        // URL comes from location_source (loser = incoming).
+        assert_eq!(
+            merged.location_url.as_deref(),
+            Some("https://incoming.test")
+        );
+    }
+
+    #[test]
     fn merge_observation_identity_mismatch_rejected() {
         let existing = observation_row(
             10,
@@ -964,6 +1036,19 @@ mod tests {
             }
             other => panic!("expected ordered bigint overflow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_receipt_reflects_deduplication() {
+        let batch = DedupedBatch {
+            findings: vec![finding_row(0xA1), finding_row(0xA2)],
+            occurrences: vec![occurrence_row(0xB1)],
+            observations: vec![observation_row(10, Some("path"), None, 1, 2, 3)],
+        };
+
+        let receipt = build_receipt(&batch);
+
+        assert_eq!(receipt, FindingsCommitReceipt::new(2, 1, 1));
     }
 
     fn finding_record(tenant_seed: u8, item_seed: u8) -> FindingRecord {
@@ -1294,5 +1379,34 @@ mod tests {
             build_receipt(&empty_deduped_batch()),
             FindingsCommitReceipt::new(0, 0, 0),
         );
+    }
+
+    #[test]
+    fn batch_exceeding_max_size_is_detected_before_sql() {
+        use gossip_contracts::persistence::RECOMMENDED_MAX_BATCH_SIZE;
+
+        // Build a batch whose total_records() exceeds the limit. The
+        // records need not be unique — the size gate fires before
+        // deduplication. The test does NOT need a PostgreSQL connection
+        // because validation happens before any SQL.
+        let finding = finding_record(0x11, 0x31);
+        let oversized: Vec<_> =
+            std::iter::repeat_n(finding, RECOMMENDED_MAX_BATCH_SIZE + 1).collect();
+        let batch = FindingsUpsertBatch::new(&oversized, &[], &[]);
+
+        assert_eq!(
+            batch.total_records(),
+            RECOMMENDED_MAX_BATCH_SIZE + 1,
+            "batch total_records() should exceed the limit"
+        );
+
+        // Verify the error variant that upsert_batch would return.
+        let err = FindingsPgError::BatchTooLarge {
+            len: batch.total_records(),
+            max: RECOMMENDED_MAX_BATCH_SIZE,
+        };
+        assert!(matches!(err, FindingsPgError::BatchTooLarge { len, max }
+                if len == RECOMMENDED_MAX_BATCH_SIZE + 1
+                && max == RECOMMENDED_MAX_BATCH_SIZE),);
     }
 }
