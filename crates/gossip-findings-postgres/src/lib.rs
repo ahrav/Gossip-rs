@@ -16,12 +16,16 @@
 //!   [`FindingsPgSchemaError`],
 //! - canonical table, column, and index names plus row projections and
 //!   write-path SQL constants in [`schema`],
+//! - Rust-side batch projection, tenant validation, duplicate folding, and
+//!   observation-merge helpers in `backend`,
 //! - forward-only checksum-verified embedded migrations in [`migrations`],
 //! - and `u64` ↔ `BIGINT` conversion helpers in [`types`].
 //!
-//! The crate deliberately stops at the storage boundary. Write-path batching,
-//! query APIs, and backend conformance wiring live in follow-on crates or
-//! modules that consume these primitives.
+//! The crate deliberately stops short of a concrete
+//! [`FindingsSink`](gossip_contracts::persistence::FindingsSink)
+//! implementation. It provides the schema, migrations, conversion helpers,
+//! and Rust-side write-path preprocessing that a backend can compose into an
+//! actual sink.
 //!
 //! ## Path to conformance
 //!
@@ -47,6 +51,7 @@
 
 #![forbid(unsafe_code)]
 
+mod backend;
 mod error;
 pub mod migrations;
 pub mod schema;

@@ -190,7 +190,7 @@ pub fn policy(seed: u8) -> crate::identity::PolicyHash {
     crate::identity::PolicyHash::from_bytes([seed; 32])
 }
 
-/// Deterministic [`OvidHash`](crate::persistence::OvidHash) from a seed byte.
+/// Deterministic [`OvidHash`] from a seed byte.
 pub fn ovid(seed: u8) -> crate::persistence::OvidHash {
     crate::persistence::OvidHash::from_bytes([seed; 32])
 }
@@ -202,6 +202,7 @@ pub fn ovid(seed: u8) -> crate::persistence::OvidHash {
 use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId};
 use crate::persistence::{
     DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus,
+    ObservationRecord, OvidHash,
 };
 
 /// Construct a [`DoneLedgerProvenance`] from raw `u64` fields.
@@ -261,6 +262,41 @@ pub fn done_record(
         .validate()
         .expect("test record should pass full validation");
     record
+}
+
+/// Construct an [`ObservationRecord`] while preserving a caller-supplied
+/// stored observation id.
+///
+/// This is useful for downstream tests that need to exercise batch-level
+/// identity validation on persisted rows reconstructed from untrusted storage.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors the observation durable row shape"
+)]
+pub fn observation_record_with_stored_id(
+    tenant_id: crate::identity::TenantId,
+    stored_observation_id: crate::identity::ObservationId,
+    occurrence_id: crate::identity::OccurrenceId,
+    policy_hash: crate::identity::PolicyHash,
+    ovid_hash: OvidHash,
+    run_id: RunId,
+    shard_id: ShardId,
+    fence_epoch: FenceEpoch,
+    seen_at: LogicalTime,
+    location: Option<crate::connector::Location>,
+) -> ObservationRecord {
+    ObservationRecord::from_persisted_unchecked(
+        tenant_id,
+        stored_observation_id,
+        occurrence_id,
+        policy_hash,
+        ovid_hash,
+        run_id,
+        shard_id,
+        fence_epoch,
+        seen_at,
+        location,
+    )
 }
 
 /// Minimal error type for [`CommitHandle`](crate::persistence::CommitHandle)

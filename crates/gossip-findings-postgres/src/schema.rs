@@ -18,9 +18,9 @@
 //!   logical counter ordering. Equality-only identifiers (`run_id`, `shard_id`)
 //!   use bit-pattern storage where ordering is irrelevant.
 
-use gossip_contracts::persistence::{
-    FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
-};
+use std::fmt;
+
+use gossip_contracts::persistence::{FindingRecord, ObservationRecord, OccurrenceRecord};
 
 use crate::{
     FindingsPgSchemaError,
@@ -145,67 +145,28 @@ pub const OBSERVATIONS_TENANT_OVID_HASH_INDEX: &str = "observations_tenant_ovid_
 /// Index name for run/shard provenance lookups.
 pub const OBSERVATIONS_TENANT_RUN_SHARD_INDEX: &str = "observations_tenant_run_shard_idx";
 
-/// Validate a contracts-layer batch against the schema constraints.
-///
-/// Runs the observation-identity invariant check before any Postgres-specific
-/// integer conversions happen, so projection failures only need to handle
-/// storage-boundary representation issues.
-///
-/// Referential integrity (occurrence→finding, observation→occurrence) is
-/// **not** checked here because batches may legitimately reference parents
-/// that are already persisted but absent from the current batch. The real
-/// enforcement point is the PostgreSQL foreign-key constraints on the
-/// durable tables.
-pub(crate) fn validate_findings_batch(
-    batch: FindingsUpsertBatch<'_>,
-) -> Result<(), FindingsPgSchemaError> {
-    batch.validate_observation_identity()?;
-    Ok(())
-}
-
-/// Project a contracts-layer batch into Postgres-ready primitive row types.
-///
-/// Each projected layer preserves the input slice order, which lets later
-/// SQL binders expand arrays in a stable row order without extra
-/// reindexing.
-pub fn project_findings_batch(
-    batch: FindingsUpsertBatch<'_>,
-) -> Result<ProjectedFindingsBatch, FindingsPgSchemaError> {
-    validate_findings_batch(batch)?;
-
-    let findings = batch
-        .findings()
-        .iter()
-        .map(FindingRow::from_record)
-        .collect();
-    let occurrences = batch
-        .occurrences()
-        .iter()
-        .map(OccurrenceRow::from_record)
-        .collect::<Result<Vec<_>, _>>()?;
-    let observations = batch
-        .observations()
-        .iter()
-        .map(ObservationRow::from_record)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(ProjectedFindingsBatch {
-        findings,
-        occurrences,
-        observations,
-    })
-}
-
 /// Postgres-ready row projection for [`FINDINGS_TABLE`].
 ///
 /// Field order matches [`FINDINGS_INSERT_COLUMNS`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FindingRow {
     pub tenant_id: [u8; 32],
     pub finding_id: [u8; 32],
     pub stable_item_id: [u8; 32],
     pub rule_fingerprint: [u8; 32],
     pub secret_hash: [u8; 32],
+}
+
+impl fmt::Debug for FindingRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FindingRow")
+            .field("tenant_id", &self.tenant_id)
+            .field("finding_id", &self.finding_id)
+            .field("stable_item_id", &self.stable_item_id)
+            .field("rule_fingerprint", &self.rule_fingerprint)
+            .field("secret_hash", &"[redacted]")
+            .finish()
+    }
 }
 
 impl FindingRow {
@@ -326,50 +287,6 @@ impl ObservationRow {
     }
 }
 
-/// Fully projected findings batch ready for SQL binding.
-///
-/// Each vector contains one table layer in the same relative order as the
-/// source batch so callers can derive per-column bind arrays without having to
-/// reconstruct row order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProjectedFindingsBatch {
-    findings: Vec<FindingRow>,
-    occurrences: Vec<OccurrenceRow>,
-    observations: Vec<ObservationRow>,
-}
-
-impl ProjectedFindingsBatch {
-    /// Projected finding rows.
-    #[must_use]
-    pub fn findings(&self) -> &[FindingRow] {
-        &self.findings
-    }
-
-    /// Projected occurrence rows.
-    #[must_use]
-    pub fn occurrences(&self) -> &[OccurrenceRow] {
-        &self.occurrences
-    }
-
-    /// Projected observation rows.
-    #[must_use]
-    pub fn observations(&self) -> &[ObservationRow] {
-        &self.observations
-    }
-
-    /// Returns `true` when every projected layer is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.findings.is_empty() && self.occurrences.is_empty() && self.observations.is_empty()
-    }
-
-    /// Total number of projected rows across all three layers.
-    #[must_use]
-    pub fn total_rows(&self) -> usize {
-        self.findings.len() + self.occurrences.len() + self.observations.len()
-    }
-}
-
 /// Idempotent finding insert with natural-key verification on conflict.
 ///
 /// The `DO UPDATE ... WHERE` form intentionally returns no row when the same
@@ -436,8 +353,22 @@ RETURNING 1
 /// Observation upsert with monotonic merge semantics.
 ///
 /// The `CASE` expressions must stay in lockstep with the Rust-side
-/// observation-merge helper so that in-memory deduplication and PostgreSQL
-/// replay produce identical durable rows for the same inputs.
+/// `merge_observation_rows` helper (in `backend.rs`) so that in-memory
+/// deduplication and PostgreSQL replay produce identical durable rows for
+/// the same inputs.
+///
+/// ## Merge-rule invariants (must converge with Rust)
+///
+/// 1. **Provenance winner**: `EXCLUDED.seen_at >` wins; on tie,
+///    `observations.location_display IS NULL AND EXCLUDED.location_display
+///    IS NOT NULL` wins.
+/// 2. **`seen_at`**: `GREATEST(observations.seen_at, EXCLUDED.seen_at)`.
+/// 3. **Provenance triple** `(run_id, shard_id, fence_epoch)`: all three
+///    CASE arms use the identical winner predicate — never mixed.
+/// 4. **`location_display`**: COALESCE from winner then loser.
+/// 5. **`location_url`**: follows whichever record contributed
+///    `location_display` — the nested CASE gates on `location_display IS
+///    NOT NULL`, never independently COALESCEs across records.
 ///
 /// ## Provenance triple
 ///
@@ -560,9 +491,7 @@ mod tests {
             RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
             key_secret_hash,
         },
-        persistence::{
-            FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord, OvidHash,
-        },
+        persistence::{FindingRecord, ObservationRecord, OccurrenceRecord, OvidHash},
     };
 
     use super::*;
@@ -838,79 +767,6 @@ mod tests {
         ] {
             assert_non_empty_unique(columns);
         }
-    }
-
-    #[test]
-    fn project_batch_returns_empty_projection_for_empty_batch() {
-        let projected = project_findings_batch(FindingsUpsertBatch::default())
-            .expect("empty batch should project");
-
-        assert!(projected.is_empty());
-        assert_eq!(projected.total_rows(), 0);
-        assert!(projected.findings().is_empty());
-        assert!(projected.occurrences().is_empty());
-        assert!(projected.observations().is_empty());
-    }
-
-    #[test]
-    fn project_batch_validates_and_projects_all_rows() {
-        let tenant_id = TenantId::from_bytes([0x11; 32]);
-        let finding = finding_record(tenant_id);
-        let occurrence = occurrence_record(tenant_id, finding.finding_id(), 3, 4);
-        let observation = observation_record(tenant_id, occurrence.occurrence_id(), 12, 13)
-            .with_location(Location::try_new("repo/path".into(), None).expect("valid location"));
-        let findings = [finding.clone()];
-        let occurrences = [occurrence.clone()];
-        let observations = [observation.clone()];
-        let batch = FindingsUpsertBatch::new(&findings, &occurrences, &observations);
-
-        let projected = project_findings_batch(batch).expect("valid batch should project");
-
-        assert_eq!(projected.total_rows(), 3);
-        assert_eq!(projected.findings(), &[FindingRow::from_record(&finding)]);
-        assert_eq!(
-            projected.occurrences(),
-            &[OccurrenceRow::from_record(&occurrence).expect("projection should succeed")]
-        );
-        assert_eq!(
-            projected.observations(),
-            &[ObservationRow::from_record(&observation).expect("projection should succeed")]
-        );
-    }
-
-    #[test]
-    fn validate_batch_accepts_canonical_batches_built_from_public_contracts() {
-        let tenant_id = TenantId::from_bytes([0x11; 32]);
-        let finding = finding_record(tenant_id);
-        let occurrence = occurrence_record(tenant_id, finding.finding_id(), 3, 4);
-        let observation = observation_record(tenant_id, occurrence.occurrence_id(), 12, 13);
-        let findings = [finding];
-        let occurrences = [occurrence];
-        let observations = [observation];
-        let batch = FindingsUpsertBatch::new(&findings, &occurrences, &observations);
-
-        validate_findings_batch(batch).expect("canonical batch should pass validation");
-    }
-
-    #[test]
-    fn project_batch_accepts_incremental_submission_without_parent_finding() {
-        // Simulate an incremental write: the parent FindingRecord was already
-        // persisted in a prior batch, so this batch contains only an
-        // OccurrenceRecord referencing that finding_id.
-        let tenant_id = TenantId::from_bytes([0x11; 32]);
-        let finding = finding_record(tenant_id);
-        let occurrence = occurrence_record(tenant_id, finding.finding_id(), 3, 4);
-        let occurrences = [occurrence];
-        // No findings in this batch — they're already durable.
-        let batch = FindingsUpsertBatch::new(&[], &occurrences, &[]);
-
-        // Per the FindingsSink contract, references may be "persisted or
-        // in-batch". project_batch should accept this incremental batch.
-        let result = project_findings_batch(batch);
-        assert!(
-            result.is_ok(),
-            "incremental batch with already-durable parent should project, got: {result:?}"
-        );
     }
 
     #[test]

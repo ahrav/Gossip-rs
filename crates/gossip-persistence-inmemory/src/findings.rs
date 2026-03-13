@@ -10,7 +10,7 @@ use gossip_contracts::{
     persistence::{
         CommitHandle, DurableFindingsCounts, FindingRecord, FindingsCommitReceipt,
         FindingsConformanceProbe, FindingsSink, FindingsUpsertBatch, ObservationRecord,
-        OccurrenceRecord, PersistenceInputError,
+        OccurrenceRecord,
     },
 };
 
@@ -82,7 +82,7 @@ impl StoreBackend for FindingsBackend {
 ///   Identity fields must match; `seen_at` and location may change across
 ///   retries or reruns.
 /// - **Single-tenant batches**: all records in a batch must belong to the
-///   same tenant ([`PersistenceInputError::InconsistentTenant`]).
+///   same tenant ([`gossip_contracts::persistence::PersistenceInputError::InconsistentTenant`]).
 ///
 /// Cloning and fault-injection semantics are identical to
 /// [`InMemoryDoneLedger`](crate::InMemoryDoneLedger) — see its docs.
@@ -352,7 +352,7 @@ impl FindingsSink for InMemoryFindingsSink {
         // integrity checks that need the union of durable and same-batch rows
         // to determine whether parent records exist.
         batch.validate_observation_identity()?;
-        validate_batch_tenant_consistency(batch)?;
+        batch.validate_tenant_consistency()?;
 
         let payload = FindingsPayload {
             findings: batch.findings().to_vec(),
@@ -367,49 +367,6 @@ impl FindingsSink for InMemoryFindingsSink {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Validate the single-tenant invariant: all records in the batch must share
-/// the same `tenant_id`.
-///
-/// This check is intentionally separated from referential integrity validation
-/// because it does not require durable state access — it can be performed
-/// before acquiring the lock. Referential checks remain in
-/// [`apply_findings_payload`], where the backend can consider both
-/// already-durable parents and rows staged by the current batch.
-fn validate_batch_tenant_consistency(
-    batch: FindingsUpsertBatch<'_>,
-) -> Result<(), PersistenceInputError> {
-    let expected_tenant = batch
-        .findings()
-        .first()
-        .map(FindingRecord::tenant_id)
-        .or_else(|| batch.occurrences().first().map(OccurrenceRecord::tenant_id))
-        .or_else(|| {
-            batch
-                .observations()
-                .first()
-                .map(ObservationRecord::tenant_id)
-        });
-
-    if let Some(expected_tenant) = expected_tenant
-        && (batch
-            .findings()
-            .iter()
-            .any(|finding| finding.tenant_id() != expected_tenant)
-            || batch
-                .occurrences()
-                .iter()
-                .any(|occurrence| occurrence.tenant_id() != expected_tenant)
-            || batch
-                .observations()
-                .iter()
-                .any(|observation| observation.tenant_id() != expected_tenant))
-    {
-        return Err(PersistenceInputError::InconsistentTenant);
-    }
-
-    Ok(())
-}
 
 /// Apply a findings payload to the durable state with full integrity checks.
 ///
