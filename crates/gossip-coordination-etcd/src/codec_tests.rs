@@ -89,6 +89,15 @@ fn owner_value_round_trips() {
 }
 
 #[test]
+fn owner_value_with_u64_max_fields_round_trips() {
+    let encoded = encode_owner_value(WorkerId::from_raw(u64::MAX), FenceEpoch::from_raw(u64::MAX));
+    let decoded = decode_owner_value(&encoded).expect("owner value should decode");
+
+    assert_eq!(decoded.worker, WorkerId::from_raw(u64::MAX));
+    assert_eq!(decoded.fence, FenceEpoch::from_raw(u64::MAX));
+}
+
+#[test]
 fn owner_value_decode_rejects_zero_fence_epoch() {
     let encoded = encode_owner_value(WorkerId::from_raw(7), FenceEpoch::from_raw(0));
     let result = decode_owner_value(&encoded);
@@ -182,6 +191,39 @@ fn decode_run_record_rejects_trailing_bytes() {
     blob.push(0xff);
 
     let error = decode_run_record(&blob).expect_err("trailing bytes must fail");
+    assert!(matches!(
+        error,
+        EtcdCodecError::TrailingBytes { remaining: 1 }
+    ));
+}
+
+#[test]
+fn decode_shard_record_rejects_trailing_bytes() {
+    let (mut record, mut slab) = sample_active_child_shard_record(CursorSemantics::Completed);
+    let mut blob = encode_shard_record(&record, &slab).expect("valid record encodes");
+    blob.push(0xff);
+
+    let mut decode_slab = ByteSlab::with_capacity(4096);
+    let error = decode_shard_record(&blob, &mut decode_slab).expect_err("trailing bytes must fail");
+    assert!(matches!(
+        error,
+        EtcdCodecError::TrailingBytes { remaining: 1 }
+    ));
+    assert_eq!(
+        decode_slab.live_count(),
+        0,
+        "trailing-byte rejection must not leave staged allocations behind"
+    );
+
+    release_shard_record(&mut record, &mut slab);
+}
+
+#[test]
+fn decode_owner_value_rejects_trailing_bytes() {
+    let mut blob = encode_owner_value(WorkerId::from_raw(7), FenceEpoch::from_raw(42));
+    blob.push(0xff);
+
+    let error = decode_owner_value(&blob).expect_err("trailing bytes must fail");
     assert!(matches!(
         error,
         EtcdCodecError::TrailingBytes { remaining: 1 }
@@ -854,6 +896,36 @@ fn decoder_read_vec_valid() {
 }
 
 #[test]
+fn decoder_read_vec_accepts_max_field_size() {
+    let payload = vec![0xAB; MAX_FIELD_SIZE];
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    push_u32(&mut buf, MAX_FIELD_SIZE as u32);
+    buf.extend_from_slice(&payload);
+
+    let mut d = Decoder::new(&buf);
+    assert_eq!(d.read_vec().unwrap(), payload);
+    assert!(
+        d.finish().is_ok(),
+        "decoder should consume the full payload"
+    );
+}
+
+#[test]
+fn decoder_read_vec_preserves_zero_filled_payload() {
+    let payload = vec![0; 32];
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    push_u32(&mut buf, payload.len() as u32);
+    buf.extend_from_slice(&payload);
+
+    let mut d = Decoder::new(&buf);
+    assert_eq!(d.read_vec().unwrap(), payload);
+    assert!(
+        d.finish().is_ok(),
+        "decoder should consume the full payload"
+    );
+}
+
+#[test]
 fn decoder_read_vec_truncated_body() {
     let mut buf = Vec::new();
     push_u32(&mut buf, 10);
@@ -1143,6 +1215,145 @@ fn run_record_at_op_log_cap_round_trips() {
     let encoded = encode_run_record(&record);
     let decoded = decode_run_record(&encoded).expect("at-cap run record must decode");
     assert_eq!(decoded, record);
+}
+
+#[test]
+fn shard_record_with_empty_key_range_round_trips() {
+    let tenant = TenantId::from_bytes([0xD1; 32]);
+    let run = RunId::from_raw(0xD100);
+    let shard = ShardId::from_raw(0xD1);
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let spec = ShardSpecRef::with_range_and_metadata(b"", b"", b"empty-range");
+    let mut record = ShardRecord::new_active(
+        tenant,
+        run,
+        shard,
+        spec,
+        CursorSemantics::Completed,
+        &mut slab,
+    )
+    .expect("shard record should fit in slab");
+    record.assert_invariants(&slab);
+
+    let encoded = encode_shard_record(&record, &slab).expect("valid record encodes");
+    let mut decode_slab = ByteSlab::with_capacity(4096);
+    let mut decoded =
+        decode_shard_record(&encoded, &mut decode_slab).expect("shard record should decode");
+
+    assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
+    assert_eq!(decoded.spec.key_range_start(&decode_slab), b"");
+    assert_eq!(decoded.spec.key_range_end(&decode_slab), b"");
+
+    release_shard_record(&mut record, &mut slab);
+    release_shard_record(&mut decoded, &mut decode_slab);
+}
+
+#[test]
+fn shard_record_with_empty_metadata_round_trips() {
+    let tenant = TenantId::from_bytes([0xD2; 32]);
+    let run = RunId::from_raw(0xD200);
+    let shard = ShardId::from_raw(0xD2);
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let spec = ShardSpecRef::with_range_and_metadata(b"aa", b"zz", b"");
+    let mut record = ShardRecord::new_active_with_cursor(
+        tenant,
+        run,
+        shard,
+        spec,
+        CursorUpdate::with_last_key(b"mm"),
+        CursorSemantics::Completed,
+        &mut slab,
+    )
+    .expect("shard record should fit in slab");
+    record.assert_invariants(&slab);
+
+    let encoded = encode_shard_record(&record, &slab).expect("valid record encodes");
+    let mut decode_slab = ByteSlab::with_capacity(4096);
+    let mut decoded =
+        decode_shard_record(&encoded, &mut decode_slab).expect("shard record should decode");
+
+    assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
+    assert_eq!(decoded.spec.metadata(&decode_slab), b"");
+
+    release_shard_record(&mut record, &mut slab);
+    release_shard_record(&mut decoded, &mut decode_slab);
+}
+
+#[test]
+fn shard_record_with_zero_op_log_entries_round_trips() {
+    let tenant = TenantId::from_bytes([0xD3; 32]);
+    let run = RunId::from_raw(0xD300);
+    let shard = ShardId::from_raw(0xD3);
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let spec = ShardSpecRef::with_range_and_metadata(b"aa", b"zz", b"zero-op-log");
+    let mut record = ShardRecord::new_active(
+        tenant,
+        run,
+        shard,
+        spec,
+        CursorSemantics::Dispatched,
+        &mut slab,
+    )
+    .expect("shard record should fit in slab");
+    record.assert_invariants(&slab);
+
+    let encoded = encode_shard_record(&record, &slab).expect("valid record encodes");
+    let mut decode_slab = ByteSlab::with_capacity(4096);
+    let mut decoded =
+        decode_shard_record(&encoded, &mut decode_slab).expect("shard record should decode");
+
+    assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
+    assert_eq!(decoded.op_log.len(), 0);
+
+    release_shard_record(&mut record, &mut slab);
+    release_shard_record(&mut decoded, &mut decode_slab);
+}
+
+#[test]
+fn shard_record_with_u64_max_run_and_shard_ids_round_trips() {
+    let tenant = TenantId::from_bytes([0xD4; 32]);
+    let run = RunId::from_raw(u64::MAX);
+    let shard = ShardId::from_raw(u64::MAX);
+    let parent = ShardId::from_raw(17);
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let mut record = ShardRecord::new_split_child(
+        tenant,
+        run,
+        shard,
+        ShardSpecRef::with_range_and_metadata(b"lo", b"hi", b"max-ids"),
+        CursorUpdate::with_token(b"mid", b"tok"),
+        CursorSemantics::Completed,
+        parent,
+        &mut slab,
+    )
+    .expect("shard record should fit in slab");
+    record.lease = Some(LeaseHolder::new(
+        WorkerId::from_raw(u64::MAX),
+        LogicalTime::from_raw(u64::MAX),
+    ));
+    record.fence_epoch = FenceEpoch::from_raw(u64::MAX);
+    record.op_log.push_back_overwrite(OpLogEntry::new(
+        OpId::from_raw(u64::MAX),
+        OpKind::Checkpoint,
+        OpResult::Completed,
+        u64::MAX,
+        LogicalTime::from_raw(u64::MAX),
+    ));
+    record.assert_invariants(&slab);
+
+    let encoded = encode_shard_record(&record, &slab).expect("valid record encodes");
+    let mut decode_slab = ByteSlab::with_capacity(4096);
+    let mut decoded =
+        decode_shard_record(&encoded, &mut decode_slab).expect("shard record should decode");
+
+    assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
+
+    release_shard_record(&mut record, &mut slab);
+    release_shard_record(&mut decoded, &mut decode_slab);
 }
 
 // ---------------------------------------------------------------------------
