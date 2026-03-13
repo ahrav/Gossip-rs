@@ -22,6 +22,6 @@ postgres = "0.19"
 blake3 = "1.8"
 
 [dev-dependencies]
-testcontainers.workspace = true
 proptest.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
+gossip-pg-common = { workspace = true, features = ["test-support"] }

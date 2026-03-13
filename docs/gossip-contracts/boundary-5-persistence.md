@@ -12,14 +12,16 @@
 > `gossip-done-ledger-postgres`
 > (`crates/gossip-done-ledger-postgres/src/`). Shared `u64 ↔ BIGINT` conversion
 > types, embedded migration descriptors, migration configuration, shared runner
-> functions, checksum verification, `PgMigrationError`, and `MigrationOperation`
-> live in `gossip-pg-common` (`crates/gossip-pg-common/src/`). Findings PostgreSQL schema,
+> functions, checksum verification, `PgMigrationError`, `MigrationOperation`,
+> and the shared PostgreSQL integration-test lifecycle helpers live in
+> `gossip-pg-common` (`crates/gossip-pg-common/src/`). Findings PostgreSQL schema,
 > migrations, and type-mapping support live in `gossip-findings-postgres`
 > (`crates/gossip-findings-postgres/src/`); that crate provides the canonical
 > findings schema plan (table/index/column constants plus row projections),
 > a findings-specific migration set plus thin wrappers around the shared
-> advisory-locked checksum-verifying runner, and findings-specific type-mapping
-> support, but it does not implement `FindingsSink`.
+> advisory-locked checksum-verifying runner and shared PostgreSQL test-support
+> lifecycle, and findings-specific type-mapping support, but it does not
+> implement `FindingsSink`.
 
 Boundary 5 defines the persistence contracts for three subsystems:
 
@@ -133,9 +135,9 @@ Non-negotiables (project-wide):
 
 | Crate | Scope | Notes |
 |------|-------|-------|
-| `gossip-pg-common` | Shared PostgreSQL type-mapping and migration primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), `EmbeddedMigration`, `MigrationConfig`, `PgMigrationError`, checksum-verification helpers, the shared advisory-locked migration runner, and the `MigrationOperation` enum. All PostgreSQL persistence backends depend on this crate instead of duplicating these primitives. |
-| `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits and provides the done-ledger migration set plus thin wrappers around the shared forward-only runner. Migration application remains checksum-verified, advisory-locked, and transaction-scoped, so migration SQL cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
-| `gossip-findings-postgres` | Findings PostgreSQL schema, migrations, and type-mapping support | Provides findings-specific schema constants, row projections, and the findings migration set plus thin wrappers around the shared advisory-locked checksum-verifying runner. The crate does not implement `FindingsSink`; it provides the storage-boundary support that the backend will build on. |
+| `gossip-pg-common` | Shared PostgreSQL type-mapping, migration, and test-support primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), `EmbeddedMigration`, `MigrationConfig`, `PgMigrationError`, checksum-verification helpers, the shared advisory-locked migration runner, the `MigrationOperation` enum, and the shared PostgreSQL integration-test lifecycle (`create_test_db`, `test_client_bare`, `test_client_with`) used by the Postgres persistence crates. All PostgreSQL persistence backends depend on this crate instead of duplicating these primitives. |
+| `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits and provides the done-ledger migration set plus thin wrappers around the shared forward-only runner and shared PostgreSQL test-support lifecycle. Migration application remains checksum-verified, advisory-locked, and transaction-scoped, so migration SQL cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
+| `gossip-findings-postgres` | Findings PostgreSQL schema, migrations, and type-mapping support | Provides findings-specific schema constants, row projections, and the findings migration set plus thin wrappers around the shared advisory-locked checksum-verifying runner and shared PostgreSQL test-support lifecycle. The crate does not implement `FindingsSink`; it provides the storage-boundary support that the backend will build on. |
 
 ---
 

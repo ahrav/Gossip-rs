@@ -1355,7 +1355,6 @@ dependencies = [
  "gossip-stdx",
  "postgres",
  "proptest",
- "testcontainers",
 ]
 
 [[package]]
@@ -1367,7 +1366,6 @@ dependencies = [
  "gossip-pg-common",
  "postgres",
  "proptest",
- "testcontainers",
 ]
 
 [[package]]
@@ -1398,6 +1396,7 @@ dependencies = [
  "gossip-contracts",
  "postgres",
  "proptest",
+ "testcontainers",
 ]
 
 [[package]]
