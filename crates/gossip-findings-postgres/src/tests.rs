@@ -1616,13 +1616,18 @@ fn upsert_batch_rolls_back_on_conflict_error() {
         None,
     );
 
-    let _err = backend
+    let err = backend
         .upsert_batch(FindingsUpsertBatch::new(
             &[new_finding],
             &[],
             &[bad_observation],
         ))
         .expect_err("batch with FK violation should fail");
+
+    match err {
+        crate::FindingsPgError::ReferentialIntegrityViolation { .. } => {}
+        other => panic!("expected ReferentialIntegrityViolation, got {other:?}"),
+    }
 
     let counts_after = backend
         .durable_counts()
@@ -1691,15 +1696,17 @@ fn upsert_batch_detects_observation_identity_conflict_against_persisted_rows() {
         .durable_counts()
         .expect("counts should succeed before conflict");
 
-    // Construct a conflicting observation: same tenant_id and observation_id,
-    // but different policy_hash. The SQL identity-verifying WHERE clause
-    // checks policy_hash, so this will trigger ObservationConflict.
+    // Construct a conflicting observation: same tenant_id and observation_id
+    // (since observation_id is derived from tenant + policy + occurrence,
+    // those three must stay the same to hit the primary key conflict), but
+    // different ovid_hash. The SQL WHERE clause verifies ovid_hash, so a
+    // mismatch suppresses the RETURNING row, triggering ObservationConflict.
     let conflicting = observation_record_with_stored_id(
         tenant_id,
         observation.observation_id(),
         observation.occurrence_id(),
-        PolicyHash::from_bytes([0x99; 32]),
-        observation.ovid_hash(),
+        observation.policy_hash(),
+        OvidHash::from_bytes([0x99; 32]),
         observation.run_id(),
         observation.shard_id(),
         observation.fence_epoch(),

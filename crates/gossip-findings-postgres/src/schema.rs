@@ -482,9 +482,9 @@ pub const OBSERVATIONS_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM observati
 /// three columns (`findings_count`, `occurrences_count`, `observations_count`).
 pub const COMBINED_COUNTS_SQL: &str = "\
     SELECT \
-        (SELECT COUNT(*)::BIGINT FROM findings), \
-        (SELECT COUNT(*)::BIGINT FROM occurrences), \
-        (SELECT COUNT(*)::BIGINT FROM observations)";
+        (SELECT COUNT(*)::BIGINT FROM findings) AS findings_count, \
+        (SELECT COUNT(*)::BIGINT FROM occurrences) AS occurrences_count, \
+        (SELECT COUNT(*)::BIGINT FROM observations) AS observations_count";
 
 /// Remove all durable findings-layer rows in foreign-key order.
 pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, findings";

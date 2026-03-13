@@ -387,7 +387,10 @@ impl FindingsSink for FindingsSinkPg {
         let mut tx = client.transaction()?;
         // The `postgres` crate caches prepared statements by SQL text at the
         // connection level, so the server-side parse cost is amortized after
-        // the first batch through a given connection.
+        // the first batch through a given connection. The per-call map lookup
+        // is negligible relative to network round-trip time; pre-preparing
+        // statements outside the transaction would avoid it but adds
+        // complexity without measurable throughput gain at current batch rates.
         let findings_stmt = tx.prepare(FINDINGS_INSERT_SQL)?;
         let occurrences_stmt = tx.prepare(OCCURRENCES_INSERT_SQL)?;
         let observations_stmt = tx.prepare(OBSERVATIONS_INSERT_OR_MERGE_SQL)?;
@@ -425,6 +428,14 @@ impl FindingsSink for FindingsSinkPg {
 impl FindingsConformanceProbe for FindingsSinkPg {
     type Error = FindingsPgError;
 
+    /// Return global row counts across all tenants in the database.
+    ///
+    /// The conformance harness design assumes a clean database containing
+    /// exactly one tenant's data — callers must call
+    /// [`truncate_all_for_tests`](Self::truncate_all_for_tests) before each
+    /// conformance run. No `WHERE tenant_id = ?` filter is applied because
+    /// the [`FindingsConformanceProbe`] trait signature does not carry a
+    /// tenant parameter.
     fn durable_counts(&self) -> Result<DurableFindingsCounts, Self::Error> {
         let mut client = self.lock_client()?;
         let row = client.query_one(COMBINED_COUNTS_SQL, &[])?;
@@ -441,6 +452,13 @@ impl FindingsConformanceProbe for FindingsSinkPg {
     }
 }
 
+/// Build a commit receipt from the deduplicated batch.
+///
+/// Counts reflect the **post-dedup batch size** — the number of unique rows
+/// submitted to the database in this batch — not the net-new rows inserted.
+/// Idempotent replays of identical data report the same counts as the
+/// original write. Callers that need net-new semantics must compare
+/// before/after snapshots via [`FindingsConformanceProbe::durable_counts`].
 fn build_receipt(projected: &DedupedBatch) -> FindingsCommitReceipt {
     // Safe: batch size is bounded by RECOMMENDED_MAX_BATCH_SIZE (10,000),
     // well within u64 range on all platforms.
