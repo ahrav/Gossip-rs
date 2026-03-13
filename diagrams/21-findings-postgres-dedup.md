@@ -48,7 +48,7 @@ flowchart TB
     input -->|"step 1"| validate-obs
     validate-obs{{"validate_observation_identity()<br/>Stored observation IDs must match<br/>canonical BLAKE3 derivation"}}
     validate-obs -->|"mismatch"| err-obs["InvalidObservationIdentity"]
-    validate-obs -->|"pass"| validate-tenant
+    validate-obs -->|"step 2"| validate-tenant
 
     validate-tenant{{"validate_tenant_consistency()<br/>All records across all three<br/>layers must share one TenantId"}}
     validate-tenant -->|"mismatch"| err-tenant["InconsistentTenant"]
@@ -155,11 +155,11 @@ flowchart TB
 
 Summary:
 
-| Layer | Duplicate, same content | Duplicate, different content | Duplicate, identity fields match |
+| Layer | Duplicate, same content | Duplicate, identity fields differ | Duplicate, identity fields match, mutable fields differ |
 |:---|:---|:---|:---|
 | **Findings** | Silently collapse | `FindingConflict` error | N/A (no merge layer) |
 | **Occurrences** | Silently collapse | `OccurrenceConflict` error | N/A (no merge layer) |
-| **Observations** | Merge (winner = existing) | N/A | Merge via winner-selection |
+| **Observations** | Merge (winner = existing) | `ObservationConflict` error | Merge via winner-selection |
 
 A content conflict on an immutable layer indicates a content-address collision --
 a derivation bug upstream, not normal operation.
@@ -278,7 +278,7 @@ flowchart LR
 
     subgraph rust ["Rust: project_and_dedupe"]
         direction TB
-        fold["Fold 3 rows &rarr; 1 row<br/>Winner: seen_at=20 (run 9)<br/>seen_at = max(10,20,15) = 20<br/>location from run 9"]
+        fold["Fold 3 rows → 1 row<br/>Winner: seen_at=20 (run 9)<br/>seen_at = max(10,20,15) = 20<br/>location from run 9"]
     end
 
     subgraph sql ["SQL: ON CONFLICT DO UPDATE"]

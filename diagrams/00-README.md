@@ -139,8 +139,7 @@ graph TD
 17. `12-split-operations.md` — Dynamic work distribution via shard splitting
 
 **Deep dive into shard algebra** (after split operations):
-18. `12-split-operations.md` — Split operations and coverage validation
-19. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
+18. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
 
 ## File Index
 
