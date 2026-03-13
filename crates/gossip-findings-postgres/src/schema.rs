@@ -23,7 +23,6 @@ use gossip_contracts::persistence::{
 };
 
 use crate::{
-    FindingsPgSchemaError,
     types::{u64_to_pg_bigint_bits, u64_to_pg_bigint_checked},
     FindingsPgSchemaError,
 };
@@ -936,7 +935,7 @@ mod tests {
         assert!(FINDINGS_INSERT_SQL.contains(FINDINGS_TABLE));
         assert!(OCCURRENCES_INSERT_SQL.contains(OCCURRENCES_TABLE));
         assert!(OBSERVATIONS_INSERT_OR_MERGE_SQL.contains(OBSERVATIONS_TABLE));
-        assert!(SELECT_FINDINGS_COUNT_SQL.contains(FINDINGS_TABLE));
+        assert!(FINDINGS_COUNT_SQL.contains(FINDINGS_TABLE));
         assert!(OCCURRENCES_COUNT_SQL.contains(OCCURRENCES_TABLE));
         assert!(OBSERVATIONS_COUNT_SQL.contains(OBSERVATIONS_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(OBSERVATIONS_TABLE));
@@ -1062,7 +1061,7 @@ mod tests {
     #[test]
     fn count_sql_constants_cast_to_bigint() {
         for sql in [
-            SELECT_FINDINGS_COUNT_SQL,
+            FINDINGS_COUNT_SQL,
             OCCURRENCES_COUNT_SQL,
             OBSERVATIONS_COUNT_SQL,
         ] {
