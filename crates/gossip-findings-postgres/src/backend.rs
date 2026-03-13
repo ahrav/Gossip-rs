@@ -586,10 +586,8 @@ fn intercept_fk_violation(err: postgres::Error, table: &'static str) -> Findings
 /// Guard against negative counts (impossible in PostgreSQL but enforced
 /// defensively for the non-negative count domain).
 fn nonneg_count(value: i64, table: &'static str) -> Result<u64, FindingsPgError> {
-    if value < 0 {
-        return Err(FindingsPgError::CountOutOfRange { table, value });
-    }
-    Ok(value as u64)
+    crate::types::pg_bigint_nonnegative_to_u64(value, table)
+        .map_err(|_| FindingsPgError::CountOutOfRange { table, value })
 }
 
 #[cfg(test)]
@@ -1405,8 +1403,10 @@ mod tests {
 
         // Build a batch whose total_records() exceeds the limit. The
         // records need not be unique — the size gate fires before
-        // deduplication. The test does NOT need a PostgreSQL connection
-        // because validation happens before any SQL.
+        // deduplication. The production `upsert_batch` path is covered
+        // by the `upsert_batch_rejects_oversized_batch` integration test;
+        // this unit test verifies `total_records()` counting without a
+        // PostgreSQL connection.
         let finding = finding_record(0x11, 0x31);
         let oversized: Vec<_> =
             std::iter::repeat_n(finding, RECOMMENDED_MAX_BATCH_SIZE + 1).collect();
@@ -1417,14 +1417,5 @@ mod tests {
             RECOMMENDED_MAX_BATCH_SIZE + 1,
             "batch total_records() should exceed the limit"
         );
-
-        // Verify the error variant that upsert_batch would return.
-        let err = FindingsPgError::BatchTooLarge {
-            len: batch.total_records(),
-            max: RECOMMENDED_MAX_BATCH_SIZE,
-        };
-        assert!(matches!(err, FindingsPgError::BatchTooLarge { len, max }
-                if len == RECOMMENDED_MAX_BATCH_SIZE + 1
-                && max == RECOMMENDED_MAX_BATCH_SIZE),);
     }
 }
