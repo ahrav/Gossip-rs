@@ -9,13 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use gossip_contracts::persistence::run_findings_conformance;
 use postgres::Client;
 use postgres::error::{DbError, SqlState};
 
 use crate::schema;
 use crate::test_postgres::{create_test_db, test_client, test_client_bare};
 use crate::{
-    EmbeddedMigration, FindingsPgMigrationError, MIGRATIONS, apply_all_migrations, apply_migrations,
+    EmbeddedMigration, FindingsPgMigrationError, FindingsSinkPg, MIGRATIONS, apply_all_migrations,
+    apply_migrations,
 };
 
 /// Field overrides for a `findings` row. `None` means "use the valid default".
@@ -1468,4 +1470,13 @@ fn observations_round_trip_all_columns() {
         row.get::<_, Option<String>>(10),
         defaults.location_url.unwrap()
     );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_sink_pg_passes_findings_conformance() {
+    let backend = FindingsSinkPg::from_client(test_client());
+
+    run_findings_conformance(&backend)
+        .expect("FindingsSinkPg should satisfy the findings conformance harness");
 }

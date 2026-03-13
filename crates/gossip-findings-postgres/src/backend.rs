@@ -1,4 +1,4 @@
-//! Rust-side batch projection, deduplication, and observation merge helpers.
+//! PostgreSQL findings backend and Rust-side batch preprocessing helpers.
 //!
 //! The PostgreSQL backend folds duplicate rows within a single submitted batch
 //! before issuing SQL so `INSERT ... ON CONFLICT` sees at most one row per
@@ -8,17 +8,34 @@
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{HashMap, hash_map::Entry};
-use std::hash::Hash;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    fmt,
+    hash::Hash,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use gossip_contracts::{
     identity::{FindingId, ObservationId, OccurrenceId, TenantId},
-    persistence::FindingsUpsertBatch,
+    persistence::{
+        DurableFindingsCounts, FindingsCommitReceipt, FindingsConformanceProbe, FindingsSink,
+        FindingsUpsertBatch, RECOMMENDED_MAX_BATCH_SIZE, ReadyCommitHandle,
+    },
 };
+#[cfg(feature = "test-utils")]
+use postgres::NoTls;
+use postgres::{Client, Statement, Transaction};
 
 use crate::{
     error::{FindingsPgError, FindingsPgSchemaError},
-    schema::{FindingRow, ObservationRow, OccurrenceRow},
+    migrations::apply_all_migrations,
+    schema::{
+        FINDINGS_COUNT_SQL, FINDINGS_INSERT_SQL, FINDINGS_TABLE, FindingRow,
+        OBSERVATIONS_COUNT_SQL, OBSERVATIONS_INSERT_OR_MERGE_SQL, OBSERVATIONS_TABLE,
+        OCCURRENCES_COUNT_SQL, OCCURRENCES_INSERT_SQL, OCCURRENCES_TABLE, ObservationRow,
+        OccurrenceRow,
+    },
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -232,6 +249,285 @@ where
         .collect()
 }
 
+/// Synchronous PostgreSQL implementation of [`FindingsSink`].
+///
+/// Internally wraps a single `postgres::Client` in `Arc<Mutex<_>>` so clones
+/// share one connection. Each `upsert_batch` call executes in a single SQL
+/// transaction and only returns a [`ReadyCommitHandle`] after the commit
+/// succeeds, making the resulting receipt durable-before-return.
+#[derive(Clone)]
+pub struct FindingsSinkPg {
+    inner: Arc<Mutex<Client>>,
+}
+
+impl FindingsSinkPg {
+    /// Connect to PostgreSQL without applying migrations.
+    ///
+    /// Uses `NoTls` and is intended for local development and integration
+    /// tests. Production callers should construct their own client with the
+    /// desired TLS configuration and pass it to [`from_client`](Self::from_client).
+    ///
+    /// Requires the `test-utils` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FindingsPgError::Postgres`] on connection failure.
+    #[cfg(feature = "test-utils")]
+    pub fn connect(database_url: &str) -> Result<Self, FindingsPgError> {
+        let client = Client::connect(database_url, NoTls)?;
+        Ok(Self::from_client(client))
+    }
+
+    /// Connect to PostgreSQL and apply embedded findings migrations.
+    ///
+    /// Equivalent to [`connect`](Self::connect) followed by
+    /// [`apply_migrations`](Self::apply_migrations). Uses `NoTls`, so it is
+    /// intended for tests and local development only.
+    ///
+    /// Requires the `test-utils` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FindingsPgError::Postgres`] on connection failure or
+    /// [`FindingsPgError::Migration`] if schema migration fails.
+    #[cfg(feature = "test-utils")]
+    pub fn connect_and_migrate(database_url: &str) -> Result<Self, FindingsPgError> {
+        let client = Client::connect(database_url, NoTls)?;
+        let backend = Self::from_client(client);
+        backend.apply_migrations()?;
+        Ok(backend)
+    }
+
+    /// Wrap an already-connected PostgreSQL client.
+    #[inline]
+    #[must_use]
+    pub fn from_client(client: Client) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(client)),
+        }
+    }
+
+    /// Apply all embedded migrations using the held client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FindingsPgError::Migration`] on SQL/checksum failure or
+    /// [`FindingsPgError::MutexPoisoned`] if the internal mutex was poisoned.
+    pub fn apply_migrations(&self) -> Result<(), FindingsPgError> {
+        let mut client = self.lock_client()?;
+        apply_all_migrations(&mut client)?;
+        Ok(())
+    }
+
+    /// Validate the held connection by asking the driver to ping the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FindingsPgError::Postgres`] when the connection is not usable,
+    /// or [`FindingsPgError::MutexPoisoned`] if the internal mutex was poisoned.
+    pub fn validate_connection(&self, timeout: Duration) -> Result<(), FindingsPgError> {
+        let mut client = self.lock_client()?;
+        client.is_valid(timeout)?;
+        Ok(())
+    }
+
+    /// Remove all rows from the durable findings tables.
+    ///
+    /// Requires the `test-utils` feature because cross-crate integration tests
+    /// use this helper to reset backend state between runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FindingsPgError::Postgres`] on SQL failure or
+    /// [`FindingsPgError::MutexPoisoned`] if the internal mutex was poisoned.
+    #[cfg(feature = "test-utils")]
+    pub fn truncate_all_for_tests(&self) -> Result<(), FindingsPgError> {
+        let mut client = self.lock_client()?;
+        client.batch_execute(crate::schema::TRUNCATE_ALL_SQL)?;
+        Ok(())
+    }
+
+    /// Acquire the held client, treating poisoning as unrecoverable.
+    fn lock_client(&self) -> Result<MutexGuard<'_, Client>, FindingsPgError> {
+        self.inner
+            .lock()
+            .map_err(|_| FindingsPgError::MutexPoisoned)
+    }
+}
+
+impl fmt::Debug for FindingsSinkPg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FindingsSinkPg").finish_non_exhaustive()
+    }
+}
+
+impl FindingsSink for FindingsSinkPg {
+    type Error = FindingsPgError;
+    type CommitHandle = ReadyCommitHandle<FindingsCommitReceipt, FindingsPgError>;
+
+    fn upsert_batch(
+        &self,
+        batch: FindingsUpsertBatch<'_>,
+    ) -> Result<Self::CommitHandle, Self::Error> {
+        let total_records = batch.total_records();
+        if total_records > RECOMMENDED_MAX_BATCH_SIZE {
+            return Err(FindingsPgError::BatchTooLarge {
+                len: total_records,
+                max: RECOMMENDED_MAX_BATCH_SIZE,
+            });
+        }
+        if batch.is_empty() {
+            return Ok(ReadyCommitHandle::ok(FindingsCommitReceipt::new(0, 0, 0)));
+        }
+
+        let projected = project_and_dedupe(batch)?;
+        let mut client = self.lock_client()?;
+        let mut tx = client.transaction()?;
+        let findings_stmt = tx.prepare(FINDINGS_INSERT_SQL)?;
+        let occurrences_stmt = tx.prepare(OCCURRENCES_INSERT_SQL)?;
+        let observations_stmt = tx.prepare(OBSERVATIONS_INSERT_OR_MERGE_SQL)?;
+
+        for row in &projected.findings {
+            execute_finding_upsert(&mut tx, &findings_stmt, row)?;
+        }
+        for row in &projected.occurrences {
+            execute_occurrence_upsert(&mut tx, &occurrences_stmt, row)?;
+        }
+        for row in &projected.observations {
+            execute_observation_upsert(&mut tx, &observations_stmt, row)?;
+        }
+
+        tx.commit()?;
+        Ok(ReadyCommitHandle::ok(build_receipt(&projected)))
+    }
+}
+
+impl FindingsConformanceProbe for FindingsSinkPg {
+    type Error = FindingsPgError;
+
+    fn durable_counts(&self) -> Result<DurableFindingsCounts, Self::Error> {
+        let mut client = self.lock_client()?;
+        let findings = read_count(&mut client, FINDINGS_COUNT_SQL, FINDINGS_TABLE)?;
+        let occurrences = read_count(&mut client, OCCURRENCES_COUNT_SQL, OCCURRENCES_TABLE)?;
+        let observations = read_count(&mut client, OBSERVATIONS_COUNT_SQL, OBSERVATIONS_TABLE)?;
+        Ok(DurableFindingsCounts::new(
+            findings,
+            occurrences,
+            observations,
+        ))
+    }
+}
+
+fn build_receipt(projected: &DedupedBatch) -> FindingsCommitReceipt {
+    FindingsCommitReceipt::new(
+        projected.findings.len() as u64,
+        projected.occurrences.len() as u64,
+        projected.observations.len() as u64,
+    )
+}
+
+fn execute_finding_upsert(
+    tx: &mut Transaction<'_>,
+    stmt: &Statement,
+    row: &FindingRow,
+) -> Result<(), FindingsPgError> {
+    let tenant_id = row.tenant_id.as_slice();
+    let finding_id = row.finding_id.as_slice();
+    let stable_item_id = row.stable_item_id.as_slice();
+    let rule_fingerprint = row.rule_fingerprint.as_slice();
+    let secret_hash = row.secret_hash.as_slice();
+    let inserted = tx.query_opt(
+        stmt,
+        &[
+            &tenant_id,
+            &finding_id,
+            &stable_item_id,
+            &rule_fingerprint,
+            &secret_hash,
+        ],
+    )?;
+    if inserted.is_none() {
+        return Err(FindingsPgError::FindingConflict {
+            tenant_id: TenantId::from_bytes(row.tenant_id),
+            finding_id: FindingId::from_bytes(row.finding_id),
+        });
+    }
+    Ok(())
+}
+
+fn execute_occurrence_upsert(
+    tx: &mut Transaction<'_>,
+    stmt: &Statement,
+    row: &OccurrenceRow,
+) -> Result<(), FindingsPgError> {
+    let tenant_id = row.tenant_id.as_slice();
+    let occurrence_id = row.occurrence_id.as_slice();
+    let finding_id = row.finding_id.as_slice();
+    let object_version_id = row.object_version_id.as_slice();
+    let inserted = tx.query_opt(
+        stmt,
+        &[
+            &tenant_id,
+            &occurrence_id,
+            &finding_id,
+            &object_version_id,
+            &row.byte_offset,
+            &row.byte_length,
+        ],
+    )?;
+    if inserted.is_none() {
+        return Err(FindingsPgError::OccurrenceConflict {
+            tenant_id: TenantId::from_bytes(row.tenant_id),
+            occurrence_id: OccurrenceId::from_bytes(row.occurrence_id),
+        });
+    }
+    Ok(())
+}
+
+fn execute_observation_upsert(
+    tx: &mut Transaction<'_>,
+    stmt: &Statement,
+    row: &ObservationRow,
+) -> Result<(), FindingsPgError> {
+    let tenant_id = row.tenant_id.as_slice();
+    let observation_id = row.observation_id.as_slice();
+    let occurrence_id = row.occurrence_id.as_slice();
+    let policy_hash = row.policy_hash.as_slice();
+    let ovid_hash = row.ovid_hash.as_slice();
+    let inserted = tx.query_opt(
+        stmt,
+        &[
+            &tenant_id,
+            &observation_id,
+            &occurrence_id,
+            &policy_hash,
+            &ovid_hash,
+            &row.run_id,
+            &row.shard_id,
+            &row.fence_epoch,
+            &row.seen_at,
+            &row.location_display,
+            &row.location_url,
+        ],
+    )?;
+    if inserted.is_none() {
+        return Err(FindingsPgError::ObservationConflict {
+            tenant_id: TenantId::from_bytes(row.tenant_id),
+            observation_id: ObservationId::from_bytes(row.observation_id),
+        });
+    }
+    Ok(())
+}
+
+fn read_count(client: &mut Client, sql: &str, table: &'static str) -> Result<u64, FindingsPgError> {
+    let row = client.query_one(sql, &[])?;
+    let value = row.get::<_, i64>(0);
+    if value < 0 {
+        return Err(FindingsPgError::CountOutOfRange { table, value });
+    }
+    Ok(value as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -243,8 +539,8 @@ mod tests {
             TenantSecretKey, key_secret_hash,
         },
         persistence::{
-            FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
-            PersistenceInputError,
+            FindingRecord, FindingsCommitReceipt, FindingsUpsertBatch, ObservationRecord,
+            OccurrenceRecord, PersistenceInputError,
         },
         test_util::{observation_record_with_stored_id, ovid},
     };
@@ -255,8 +551,8 @@ mod tests {
     };
 
     use super::{
-        dedupe_findings_rows, dedupe_observation_rows, dedupe_occurrence_rows,
-        merge_observation_rows, project_and_dedupe,
+        DedupedBatch, build_receipt, dedupe_findings_rows, dedupe_observation_rows,
+        dedupe_occurrence_rows, merge_observation_rows, project_and_dedupe,
     };
 
     #[test]
@@ -768,6 +1064,14 @@ mod tests {
         }
     }
 
+    fn empty_deduped_batch() -> DedupedBatch {
+        DedupedBatch {
+            findings: Vec::new(),
+            occurrences: Vec::new(),
+            observations: Vec::new(),
+        }
+    }
+
     fn assert_finding_conflict(err: FindingsPgError, tenant_id: TenantId, finding_id: FindingId) {
         match err {
             FindingsPgError::FindingConflict {
@@ -965,6 +1269,30 @@ mod tests {
         assert_eq!(
             dedupe_observation_rows(std::slice::from_ref(&obs)).unwrap(),
             vec![obs]
+        );
+    }
+
+    #[test]
+    fn build_receipt_uses_deduped_lengths() {
+        let finding = finding_record(0x11, 0x31);
+        let occurrence = occurrence_record(0x11, finding.finding_id(), 0x41, 10, 4);
+        let observation =
+            observation_record(0x11, occurrence.occurrence_id(), 0x51, 0x61, 1, 2, 3, 10);
+        let batch = project_and_dedupe(FindingsUpsertBatch::new(
+            std::slice::from_ref(&finding),
+            std::slice::from_ref(&occurrence),
+            std::slice::from_ref(&observation),
+        ))
+        .expect("batch should dedupe");
+
+        assert_eq!(build_receipt(&batch), FindingsCommitReceipt::new(1, 1, 1),);
+    }
+
+    #[test]
+    fn build_receipt_reports_zero_for_empty_batch() {
+        assert_eq!(
+            build_receipt(&empty_deduped_batch()),
+            FindingsCommitReceipt::new(0, 0, 0),
         );
     }
 }

@@ -1,16 +1,18 @@
-//! PostgreSQL findings support: schema, migrations, and `u64` ↔ `BIGINT`
+//! PostgreSQL findings backend, schema, migrations, and `u64` ↔ `BIGINT`
 //! conversion helpers.
 //!
 //! The findings persistence contract stores three normalized layers:
 //! stable finding identity, version-scoped occurrences, and policy-scoped
-//! observations. This crate owns the PostgreSQL-facing pieces needed to map
-//! that contract into SQL without yet implementing a concrete
-//! [`FindingsSink`](gossip_contracts::persistence::FindingsSink) backend.
+//! observations. This crate owns both the PostgreSQL-facing schema/migration
+//! pieces and the concrete [`FindingsSinkPg`] backend that maps the
+//! contracts-layer model into SQL.
 //!
 //! ## Scope
 //!
 //! This crate includes:
 //!
+//! - the concrete [`FindingsSinkPg`] implementation of
+//!   [`FindingsSink`](gossip_contracts::persistence::FindingsSink),
 //! - findings-specific backend, migration, and schema-projection error types
 //!   in [`FindingsPgError`], [`FindingsPgMigrationError`], and
 //!   [`FindingsPgSchemaError`],
@@ -21,11 +23,11 @@
 //! - forward-only checksum-verified embedded migrations in [`migrations`],
 //! - and `u64` ↔ `BIGINT` conversion helpers in [`types`].
 //!
-//! The crate deliberately stops short of a concrete
-//! [`FindingsSink`](gossip_contracts::persistence::FindingsSink)
-//! implementation. It provides the schema, migrations, conversion helpers,
-//! and Rust-side write-path preprocessing that a backend can compose into an
-//! actual sink.
+//! Production callers typically provide their own TLS-enabled
+//! [`postgres::Client`] and construct [`FindingsSinkPg`] via
+//! [`FindingsSinkPg::from_client`]. The `test-utils` feature additionally
+//! exposes plaintext convenience constructors for local development and test
+//! setups.
 //!
 //! ## Path to conformance
 //!
@@ -57,6 +59,7 @@ pub mod migrations;
 pub mod schema;
 pub mod types;
 
+pub use backend::FindingsSinkPg;
 pub use error::{
     FindingsPgError, FindingsPgMigrationError, FindingsPgSchemaError, MigrationOperation,
 };
