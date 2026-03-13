@@ -226,7 +226,7 @@ impl fmt::Display for MigrationOperation {
 /// Derives the table name from [`MigrationConfig`] so schema renames stay
 /// compiler-visible instead of silently drifting across string literals.
 #[must_use]
-pub fn create_migrations_table_sql(config: MigrationConfig) -> String {
+pub(crate) fn create_migrations_table_sql(config: MigrationConfig) -> String {
     format!(
         r#"
 CREATE TABLE IF NOT EXISTS {table} (
@@ -241,7 +241,7 @@ CREATE TABLE IF NOT EXISTS {table} (
 
 /// Build the `SELECT checksum` query for a single migration version.
 #[must_use]
-pub fn select_migration_checksum_sql(config: MigrationConfig) -> String {
+pub(crate) fn select_migration_checksum_sql(config: MigrationConfig) -> String {
     format!(
         "SELECT checksum FROM {table} WHERE version = $1",
         table = config.history_table()
@@ -250,7 +250,7 @@ pub fn select_migration_checksum_sql(config: MigrationConfig) -> String {
 
 /// Build the `INSERT` statement that records a newly-applied migration.
 #[must_use]
-pub fn insert_migration_sql(config: MigrationConfig) -> String {
+pub(crate) fn insert_migration_sql(config: MigrationConfig) -> String {
     format!(
         "INSERT INTO {table}(version, checksum) VALUES ($1, $2)",
         table = config.history_table()
@@ -317,11 +317,12 @@ pub fn apply_all_migrations(
 /// ## Transaction protocol
 ///
 /// 1. Begin a transaction.
-/// 2. Acquire `pg_advisory_xact_lock` to serialize concurrent runners.
-/// 3. Set `lock_timeout` so DDL does not block forever on table-level locks.
-/// 4. Bootstrap the history table with `CREATE TABLE IF NOT EXISTS`.
-/// 5. For each migration: apply if absent, or verify the stored checksum.
-/// 6. Commit. On any error PostgreSQL rolls the transaction back.
+/// 2. Clear inherited `lock_timeout` so the advisory lock wait is unbounded.
+/// 3. Acquire `pg_advisory_xact_lock` to serialize concurrent runners.
+/// 4. Set `lock_timeout` so DDL does not block forever on table-level locks.
+/// 5. Bootstrap the history table with `CREATE TABLE IF NOT EXISTS`.
+/// 6. For each migration: apply if absent, or verify the stored checksum.
+/// 7. Commit. On any error PostgreSQL rolls the transaction back.
 ///
 /// # Errors
 ///
@@ -336,24 +337,32 @@ pub fn apply_migrations(
         .transaction()
         .map_err(|e| PgMigrationError::postgres(MigrationOperation::Configure, e))?;
 
-    // The advisory lock is taken before any DDL or timeout configuration so
-    // every migration runner follows the same serialization rule, including
-    // the very first bootstrap on an empty database.
+    // Clear any inherited session-level lock_timeout so the advisory lock
+    // wait is truly unbounded. Pooled or reused connections may carry a
+    // non-zero lock_timeout from prior use, and PostgreSQL applies
+    // lock_timeout to advisory lock acquisition.
+    tx.batch_execute("SET LOCAL lock_timeout = '0'")
+        .map_err(|e| PgMigrationError::postgres(MigrationOperation::Configure, e))?;
+
+    // The advisory lock serialises concurrent migration runners (including
+    // the very first bootstrap on an empty database). The wait is
+    // intentionally unbounded: concurrent startup paths must queue rather
+    // than spuriously failing if the DDL timeout budget expires.
     tx.query_one(
         "SELECT pg_advisory_xact_lock($1)",
         &[&config.advisory_lock_key()],
     )
     .map_err(|e| PgMigrationError::postgres(MigrationOperation::AdvisoryLock, e))?;
 
-    // `lock_timeout` guards only the DDL path. Advisory-lock waits stay
-    // unbounded so concurrent startup paths serialize instead of spuriously
-    // failing after the timeout budget expires.
+    // Apply the caller's DDL lock_timeout now that serialisation is held.
     // PostgreSQL lock_timeout accepts millisecond values up to i32::MAX (~24.8 days).
     // Clamp non-zero sub-millisecond durations to 1ms so that truncation
     // does not silently disable the timeout (PostgreSQL treats '0ms' as
     // "wait indefinitely").
     let raw_ms = lock_timeout.as_millis();
-    let timeout_ms = if raw_ms == 0 && !lock_timeout.is_zero() {
+    let timeout_ms: u128 = if lock_timeout.is_zero() {
+        0
+    } else if raw_ms == 0 {
         1
     } else {
         raw_ms.min(i32::MAX as u128)
