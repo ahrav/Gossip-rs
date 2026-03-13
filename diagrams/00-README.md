@@ -55,6 +55,7 @@ graph TD
     SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
     PCC[19-persistence-contracts.md<br/>Traits, data model, lattice,<br/>OVID, receipts<br/>5 diagrams]
     ECP[20-etcd-coordinator-persistence.md<br/>Keyspace, codec, backend,<br/>delegation, wire format<br/>5 diagrams]
+    FPD[21-findings-postgres-dedup.md<br/>Batch dedup, observation merge,<br/>dual convergence<br/>4 diagrams]
 
     R --> SO
     SO --> BD
@@ -78,6 +79,7 @@ graph TD
     SE --> SP
     BD --> PCC
     PCC --> ECP
+    PCC --> FPD
     PC --> PCC
 
     style R fill:#F3F4F6,stroke:#374151
@@ -100,6 +102,7 @@ graph TD
     style SE fill:#FEE2E2,stroke:#991B1B
     style PCC fill:#EDE9FE,stroke:#5B21B6
     style ECP fill:#DCFCE7,stroke:#166534
+    style FPD fill:#EDE9FE,stroke:#5B21B6
 ```
 
 ### Suggested Reading Paths
@@ -120,23 +123,24 @@ graph TD
 **Deep dive into persistence and connectors** (after coordination or identity):
 6. `08-pagecommit-typestate.md` — Compile-time safety for atomic commits
 7. `19-persistence-contracts.md` — Traits, data model, lattice, OVID, receipts
-8. `09-circuit-breaker.md` — Failure isolation for external APIs
-9. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
-10. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
-11. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
-12. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
+8. `21-findings-postgres-dedup.md` — Batch dedup, observation merge, dual convergence
+9. `09-circuit-breaker.md` — Failure isolation for external APIs
+10. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
+11. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
+12. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
+13. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
 
 **Deep dive into etcd coordination persistence** (after persistence):
-13. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
+14. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
 
 **Cross-cutting concerns** (after any deep dive):
-14. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
-15. `11-tenant-isolation.md` — Cryptographic multi-tenancy
-16. `12-split-operations.md` — Dynamic work distribution via shard splitting
+15. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
+16. `11-tenant-isolation.md` — Cryptographic multi-tenancy
+17. `12-split-operations.md` — Dynamic work distribution via shard splitting
 
 **Deep dive into shard algebra** (after split operations):
-17. `12-split-operations.md` — Split operations and coverage validation
-18. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
+18. `12-split-operations.md` — Split operations and coverage validation
+19. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
 
 ## File Index
 
@@ -162,7 +166,8 @@ graph TD
 | 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |
 | 19  | `19-persistence-contracts.md`        | 5        | B5               | Trait hierarchy, findings data model, done-ledger lattice, OVID, receipts |
 | 20  | `20-etcd-coordinator-persistence.md` | 5        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
-|     | **Total**                            | **93**   |                  |                                                                           |
+| 21  | `21-findings-postgres-dedup.md`      | 4        | B5               | Batch dedup pipeline, per-layer conflict rules, observation merge, dual convergence |
+|     | **Total**                            | **97**   |                  |                                                                           |
 
 ## Implementation Status Legend
 
@@ -214,6 +219,7 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `18-streaming-split-estimation.md`   | `crates/gossip-connectors/src/split_estimator.rs`, `common.rs`; `crates/gossip-contracts/src/connector/api.rs` (choose_split_point)                                                                                             |
 | `19-persistence-contracts.md`        | `crates/gossip-contracts/src/persistence/commit.rs`, `findings.rs`, `done_ledger.rs`, `ovid.rs`, `page_commit.rs`, `error.rs`, `conformance.rs`; `crates/gossip-persistence-inmemory/src/`                                      |
 | `20-etcd-coordinator-persistence.md` | `crates/gossip-coordination-etcd/src/backend.rs`, `keyspace.rs`, `codec.rs`, `config.rs`, `error.rs`; `crates/gossip-coordination/src/traits.rs`, `in_memory.rs`                                                                |
+| `21-findings-postgres-dedup.md`      | `crates/gossip-findings-postgres/src/backend.rs`, `schema.rs`; `crates/gossip-contracts/src/persistence/findings.rs`; `crates/gossip-persistence-inmemory/src/findings.rs`                                                       |
 
 ## Source Code References
 
@@ -230,6 +236,7 @@ The diagrams reference source code in the main [gossip-rs](https://github.com/ah
 | `gossip-contracts`    | `crates/gossip-contracts/src/persistence/`  | B5: Persistence                                                                                                       |
 | `gossip-coordination-etcd` | `crates/gossip-coordination-etcd/`     | B2: Coordination (etcd backend)                                                                                       |
 | `gossip-persistence-inmemory` | `crates/gossip-persistence-inmemory/` | B5: Persistence (in-memory backend)                                                                                  |
+| `gossip-findings-postgres` | `crates/gossip-findings-postgres/`     | B5: Persistence (findings PostgreSQL backend)                                                                         |
 
 ## Rendering
 
