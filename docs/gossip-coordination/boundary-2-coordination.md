@@ -111,6 +111,7 @@ The module provides seven core capabilities:
 | `backend/run_management.rs` | `RunManagement` and `AsyncRunManagement` impl: create/register/terminate runs, unpark shards, claim candidates |
 | `backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` impl: acquire/renew/checkpoint/split operations |
 | `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
+| `sim_etcd_kv.rs` | Feature-gated in-memory model of the etcd KV subset used by coordination: point reads, prefix scans, CAS transactions, revision metadata, and lease-backed expiry for deterministic simulation |
 | `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, shard count limits, and bounded split fanout |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction plus typed exact-key wrappers for run/shard records, ownership, and active indexes |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
