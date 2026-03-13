@@ -4,14 +4,30 @@
 //! compare-and-swap transactions, and lease-backed key expiry. This module
 //! models that subset in-process so deterministic simulations can exercise
 //! the production transaction shapes without a live etcd server.
+//!
+//! # Fidelity gaps
+//!
+//! This model is intentionally simplified. Known divergences from real etcd:
+//!
+//! - **`DuplicateMutation`** — `put(k) → delete(k) → put(k)` in a single
+//!   transaction is rejected, whereas real etcd allows it. The coordination
+//!   backend never issues such patterns.
+//! - **`lease_grant` does not advance revision** — real etcd bumps the global
+//!   revision on every lease grant; this model only bumps on KV mutations.
+//! - **Global revision starts at 0** — real etcd starts at 1. The first
+//!   mutating transaction produces revision 1 in both systems.
+//! - **Lease expiry boundary** — a lease with TTL *t* granted at time *T*
+//!   expires when `now >= T + t` (i.e., alive for exactly *t* ticks). Real
+//!   etcd uses a comparable but not identical heartbeat-based mechanism.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use etcd_client::proto::{
-    PbCompare, PbCompareTarget, PbDeleteRequest, PbKeyValue, PbLeaseGrantResponse,
-    PbLeaseRevokeResponse, PbPutRequest, PbRangeRequest, PbRangeResponse, PbResponseHeader,
-    PbTargetUnion, PbTxnOpRequest, PbTxnRequest, PbTxnResponse,
+    PbCompare, PbCompareTarget, PbDeleteRequest, PbDeleteResponse, PbKeyValue,
+    PbLeaseGrantResponse, PbLeaseRevokeResponse, PbPutRequest, PbPutResponse, PbRangeRequest,
+    PbRangeResponse, PbResponseHeader, PbResponseOp, PbTargetUnion, PbTxnOpRequest,
+    PbTxnOpResponse, PbTxnRequest, PbTxnResponse,
 };
 use etcd_client::{CompareOp, GetOptions, LeaseGrantResponse, LeaseRevokeResponse, Txn};
 use rand::Rng;
@@ -28,6 +44,7 @@ pub struct SimulatedEtcdKV {
     leases: HashMap<i64, LeaseState>,
     next_lease_id: i64,
     now: u64,
+    next_expiry: u64,
     fault_config: SimEtcdFaultConfig,
     rng: ChaCha8Rng,
 }
@@ -48,6 +65,7 @@ impl SimulatedEtcdKV {
             leases: HashMap::new(),
             next_lease_id: 1,
             now: 0,
+            next_expiry: u64::MAX,
             fault_config,
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
@@ -65,6 +83,62 @@ impl SimulatedEtcdKV {
         self.now
     }
 
+    /// Number of live keys in the store (no side effects, no expiry).
+    #[must_use]
+    pub fn key_count(&self) -> usize {
+        self.kvs.len()
+    }
+
+    /// Number of active leases (no side effects, no expiry).
+    #[must_use]
+    pub fn lease_count(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Whether the store contains the given key (no side effects, no expiry).
+    #[must_use]
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.kvs.contains_key(key)
+    }
+
+    /// All keys sharing the given prefix, in lexicographic order.
+    ///
+    /// Pure inspection — does not trigger lease expiry.
+    #[must_use]
+    pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<&[u8]> {
+        self.kvs
+            .range(prefix.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, _)| k.as_slice())
+            .collect()
+    }
+
+    /// Summary of a single lease, if it exists.
+    ///
+    /// Pure inspection — does not trigger lease expiry.
+    #[must_use]
+    pub fn lease_info(&self, lease_id: i64) -> Option<LeaseInfo> {
+        self.leases.get(&lease_id).map(|ls| LeaseInfo {
+            ttl: ls.ttl,
+            expires_at: ls.expires_at,
+            attached_key_count: ls.attached_keys.len(),
+        })
+    }
+
+    /// Set the logical clock without triggering lease expiry.
+    ///
+    /// Use [`Self::tick`] for normal time advancement; this method lets
+    /// the simulation driver position the clock before an explicit
+    /// [`Self::expire_due_leases`] call.
+    pub fn set_time(&mut self, t: u64) {
+        self.now = t;
+    }
+
+    /// Replace the fault configuration mid-simulation.
+    pub fn set_fault_config(&mut self, config: SimEtcdFaultConfig) {
+        self.fault_config = config;
+    }
+
     /// Linearizable get over the modeled keyspace.
     pub fn get(
         &mut self,
@@ -72,7 +146,10 @@ impl SimulatedEtcdKV {
         options: Option<GetOptions>,
     ) -> Result<etcd_client::GetResponse, SimEtcdError> {
         self.expire_due_leases();
-        if self.fault_config.should_fail_get(&mut self.rng) {
+        if self
+            .fault_config
+            .should_fail(SimEtcdOperation::Get, &mut self.rng)
+        {
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::Get,
             });
@@ -133,7 +210,10 @@ impl SimulatedEtcdKV {
     /// Atomic compare-and-swap transaction over the modeled keyspace.
     pub fn txn(&mut self, txn: Txn) -> Result<etcd_client::TxnResponse, SimEtcdError> {
         self.expire_due_leases();
-        if self.fault_config.should_fail_txn(&mut self.rng) {
+        if self
+            .fault_config
+            .should_fail(SimEtcdOperation::Txn, &mut self.rng)
+        {
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::Txn,
             });
@@ -156,23 +236,26 @@ impl SimulatedEtcdKV {
                 self.evaluate_compare(compare)
             })?;
         if !compares_succeeded {
-            return Ok(build_txn_response(self.revision, false));
+            return Ok(build_txn_response(self.revision, false, Vec::new()));
         }
 
         let staged = self.stage_success_ops(&request.success)?;
         if !staged.changed {
-            return Ok(build_txn_response(self.revision, true));
+            return Ok(build_txn_response(self.revision, true, Vec::new()));
         }
 
         let revision = self.bump_revision();
-        self.apply_staged_txn(staged, revision);
-        Ok(build_txn_response(revision, true))
+        let responses = self.apply_staged_txn(staged, revision);
+        Ok(build_txn_response(revision, true, responses))
     }
 
     /// Grant a new lease with a fixed TTL in simulation ticks.
     pub fn lease_grant(&mut self, ttl: i64) -> Result<LeaseGrantResponse, SimEtcdError> {
         self.expire_due_leases();
-        if self.fault_config.should_fail_lease_grant(&mut self.rng) {
+        if self
+            .fault_config
+            .should_fail(SimEtcdOperation::LeaseGrant, &mut self.rng)
+        {
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::LeaseGrant,
             });
@@ -187,17 +270,20 @@ impl SimulatedEtcdKV {
             .checked_add(1)
             .ok_or(SimEtcdError::LeaseIdExhausted)?;
 
+        let ttl_u64 = u64::try_from(ttl).expect("TTL validated positive");
+        let expires_at = self
+            .now
+            .checked_add(ttl_u64)
+            .expect("lease expiry overflow");
         self.leases.insert(
             lease_id,
             LeaseState {
-                ttl,
-                expires_at: self
-                    .now
-                    .checked_add(ttl as u64)
-                    .expect("lease expiry overflow"),
+                ttl: ttl_u64,
+                expires_at,
                 attached_keys: BTreeSet::new(),
             },
         );
+        self.next_expiry = self.next_expiry.min(expires_at);
 
         Ok(build_lease_grant_response(self.revision, lease_id, ttl))
     }
@@ -207,7 +293,7 @@ impl SimulatedEtcdKV {
         self.expire_due_leases();
         if self
             .fault_config
-            .should_fail_lease_keep_alive(&mut self.rng)
+            .should_fail(SimEtcdOperation::LeaseKeepAlive, &mut self.rng)
         {
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::LeaseKeepAlive,
@@ -220,29 +306,31 @@ impl SimulatedEtcdKV {
             .ok_or(SimEtcdError::LeaseNotFound { lease_id })?;
         lease.expires_at = self
             .now
-            .checked_add(lease.ttl as u64)
+            .checked_add(lease.ttl)
             .expect("lease keep-alive overflow");
+        self.next_expiry = self.next_expiry.min(lease.expires_at);
         Ok(())
     }
 
     /// Revoke a lease and delete all keys still attached to it.
     pub fn lease_revoke(&mut self, lease_id: i64) -> Result<LeaseRevokeResponse, SimEtcdError> {
         self.expire_due_leases();
-        if self.fault_config.should_fail_lease_revoke(&mut self.rng) {
+        if self
+            .fault_config
+            .should_fail(SimEtcdOperation::LeaseRevoke, &mut self.rng)
+        {
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::LeaseRevoke,
             });
         }
 
         let deleted_any = self.remove_lease_and_keys(lease_id)?;
+        self.debug_assert_no_stale_lease_keys(lease_id);
         let revision = if deleted_any {
             self.bump_revision()
         } else {
             self.revision
         };
-        if deleted_any {
-            self.prune_revoked_keys(lease_id);
-        }
 
         Ok(build_lease_revoke_response(revision))
     }
@@ -415,13 +503,34 @@ impl SimulatedEtcdKV {
 
     /// Replay staged operations in the order they were recorded, matching
     /// etcd's sequential execution of transaction success ops.
-    fn apply_staged_txn(&mut self, staged: StagedTxn, revision: i64) {
+    fn apply_staged_txn(&mut self, staged: StagedTxn, revision: i64) -> Vec<PbResponseOp> {
+        let header = Some(response_header(revision));
+        let mut responses = Vec::with_capacity(staged.ops.len());
         for op in staged.ops {
             match op {
-                StagedOp::Put(put) => self.put_key(put, revision),
-                StagedOp::Delete(key) => self.delete_key(&key),
+                StagedOp::Put(put) => {
+                    self.put_key(put, revision);
+                    responses.push(PbResponseOp {
+                        response: Some(PbTxnOpResponse::ResponsePut(PbPutResponse {
+                            header,
+                            prev_kv: None,
+                        })),
+                    });
+                }
+                StagedOp::Delete(key) => {
+                    let existed = self.kvs.contains_key(&key);
+                    self.delete_key(&key);
+                    responses.push(PbResponseOp {
+                        response: Some(PbTxnOpResponse::ResponseDeleteRange(PbDeleteResponse {
+                            header,
+                            deleted: i64::from(existed),
+                            prev_kvs: Vec::new(),
+                        })),
+                    });
+                }
             }
         }
+        responses
     }
 
     fn put_key(&mut self, put: StagedPut, revision: i64) {
@@ -476,37 +585,37 @@ impl SimulatedEtcdKV {
             .leases
             .remove(&lease_id)
             .ok_or(SimEtcdError::LeaseNotFound { lease_id })?;
-        let deleted_any = lease.attached_keys.iter().any(|key| {
-            self.kvs
-                .get(key)
+        let mut deleted_any = false;
+        for key in lease.attached_keys {
+            if self
+                .kvs
+                .get(&key)
                 .is_some_and(|entry| entry.lease_id == lease_id)
-        });
-        if deleted_any {
-            for key in lease.attached_keys {
-                if self
-                    .kvs
-                    .get(&key)
-                    .is_some_and(|entry| entry.lease_id == lease_id)
-                {
-                    self.kvs.remove(&key);
-                }
+            {
+                self.kvs.remove(&key);
+                deleted_any = true;
             }
         }
         Ok(deleted_any)
     }
 
-    fn prune_revoked_keys(&mut self, lease_id: i64) {
-        let stale: Vec<Vec<u8>> = self
-            .kvs
-            .iter()
-            .filter_map(|(key, entry)| (entry.lease_id == lease_id).then_some(key.clone()))
-            .collect();
-        for key in stale {
-            self.kvs.remove(&key);
-        }
+    fn debug_assert_no_stale_lease_keys(&self, lease_id: i64) {
+        debug_assert!(
+            !self.kvs.values().any(|e| e.lease_id == lease_id),
+            "stale keys referencing revoked lease {lease_id}"
+        );
     }
 
-    fn expire_due_leases(&mut self) {
+    /// Expire all leases whose TTL has elapsed at the current logical time.
+    ///
+    /// Called automatically by every mutating operation. Exposed publicly so
+    /// the simulation driver can decouple clock advancement ([`Self::set_time`])
+    /// from expiry processing.
+    pub fn expire_due_leases(&mut self) {
+        if self.now < self.next_expiry {
+            return;
+        }
+
         let mut expired: Vec<i64> = self
             .leases
             .iter()
@@ -518,13 +627,23 @@ impl SimulatedEtcdKV {
             let deleted_any = match self.remove_lease_and_keys(lease_id) {
                 Ok(deleted_any) => deleted_any,
                 Err(SimEtcdError::LeaseNotFound { .. }) => false,
-                Err(err) => panic!("internal lease expiry failed: {err}"),
+                Err(_) => {
+                    debug_assert!(false, "unexpected error during lease expiry");
+                    continue;
+                }
             };
+            self.debug_assert_no_stale_lease_keys(lease_id);
             if deleted_any {
-                self.prune_revoked_keys(lease_id);
-                self.revision = self.revision.saturating_add(1);
+                self.bump_revision();
             }
         }
+
+        self.next_expiry = self
+            .leases
+            .values()
+            .map(|ls| ls.expires_at)
+            .min()
+            .unwrap_or(u64::MAX);
     }
 
     /// Resolve the set of keys matching an etcd key+range_end pair.
@@ -561,7 +680,7 @@ impl SimulatedEtcdKV {
     }
 
     fn bump_revision(&mut self) -> i64 {
-        self.revision = self.revision.saturating_add(1);
+        self.revision = self.revision.checked_add(1).expect("revision overflow");
         self.revision
     }
 }
@@ -592,9 +711,20 @@ impl KvEntry {
     }
 }
 
+/// Read-only snapshot of a single lease's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseInfo {
+    /// TTL in simulation ticks.
+    pub ttl: u64,
+    /// Absolute tick at which the lease expires.
+    pub expires_at: u64,
+    /// Number of keys currently attached to this lease.
+    pub attached_key_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeaseState {
-    ttl: i64,
+    ttl: u64,
     expires_at: u64,
     attached_keys: BTreeSet<Vec<u8>>,
 }
@@ -618,6 +748,11 @@ enum StagedOp {
 /// Operations are recorded in the order they appear in the request so that
 /// `apply_staged_txn` can replay them sequentially — matching real etcd's
 /// in-order execution of success ops.
+///
+/// Limitation: `all_put_keys` is never cleared, so `put(k) → delete(k) →
+/// put(k)` within a single transaction is rejected with `DuplicateMutation`.
+/// Real etcd allows this sequence. The simplification is acceptable because
+/// the coordination backend never issues such patterns.
 #[derive(Debug, Default)]
 struct StagedTxn {
     ops: Vec<StagedOp>,
@@ -677,24 +812,15 @@ impl SimEtcdFaultConfig {
         self
     }
 
-    fn should_fail_get(&self, rng: &mut ChaCha8Rng) -> bool {
-        should_inject(rng, self.get_failure_ppm)
-    }
-
-    fn should_fail_txn(&self, rng: &mut ChaCha8Rng) -> bool {
-        should_inject(rng, self.txn_failure_ppm)
-    }
-
-    fn should_fail_lease_grant(&self, rng: &mut ChaCha8Rng) -> bool {
-        should_inject(rng, self.lease_grant_failure_ppm)
-    }
-
-    fn should_fail_lease_keep_alive(&self, rng: &mut ChaCha8Rng) -> bool {
-        should_inject(rng, self.lease_keep_alive_failure_ppm)
-    }
-
-    fn should_fail_lease_revoke(&self, rng: &mut ChaCha8Rng) -> bool {
-        should_inject(rng, self.lease_revoke_failure_ppm)
+    fn should_fail(&self, op: SimEtcdOperation, rng: &mut ChaCha8Rng) -> bool {
+        let ppm = match op {
+            SimEtcdOperation::Get => self.get_failure_ppm,
+            SimEtcdOperation::Txn => self.txn_failure_ppm,
+            SimEtcdOperation::LeaseGrant => self.lease_grant_failure_ppm,
+            SimEtcdOperation::LeaseKeepAlive => self.lease_keep_alive_failure_ppm,
+            SimEtcdOperation::LeaseRevoke => self.lease_revoke_failure_ppm,
+        };
+        should_inject(rng, ppm)
     }
 }
 
@@ -762,11 +888,15 @@ fn build_get_response(
     })
 }
 
-fn build_txn_response(revision: i64, succeeded: bool) -> etcd_client::TxnResponse {
+fn build_txn_response(
+    revision: i64,
+    succeeded: bool,
+    responses: Vec<PbResponseOp>,
+) -> etcd_client::TxnResponse {
     etcd_client::TxnResponse(PbTxnResponse {
         header: Some(response_header(revision)),
         succeeded,
-        responses: Vec::new(),
+        responses,
     })
 }
 
@@ -1188,6 +1318,193 @@ mod tests {
         assert!(
             resp.kvs().is_empty(),
             "reversed range should return empty set"
+        );
+    }
+
+    /// delete(k) + put(k) in the same txn resets create_revision to the
+    /// txn's revision, proving the key is treated as a fresh create.
+    #[test]
+    fn txn_delete_then_put_same_key_resets_create_revision() {
+        let mut kv = SimulatedEtcdKV::new(106);
+        put_absent(&mut kv, b"k", b"v1");
+
+        let original = get_exact(&mut kv, b"k");
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::mod_revision(
+                        b"k",
+                        CompareOp::Equal,
+                        original.mod_revision(),
+                    )])
+                    .and_then(vec![
+                        TxnOp::delete(b"k", None),
+                        TxnOp::put(b"k", b"v2", None),
+                    ]),
+            )
+            .expect("delete-then-put txn should succeed");
+        assert!(resp.succeeded());
+
+        let recreated = get_exact(&mut kv, b"k");
+        assert_eq!(
+            recreated.create_revision(),
+            resp.header().unwrap().revision(),
+            "create_revision should equal the txn revision (fresh create)"
+        );
+        assert_eq!(recreated.version(), 1);
+        assert_eq!(recreated.value(), b"v2");
+    }
+
+    /// A txn with empty when/and_then branches is a no-op that does not
+    /// advance the global revision.
+    #[test]
+    fn txn_with_empty_success_branch_does_not_bump_revision() {
+        let mut kv = SimulatedEtcdKV::new(107);
+        put_absent(&mut kv, b"anchor", b"v");
+        let rev_before = kv.revision();
+
+        let resp = kv.txn(Txn::new()).expect("empty txn should succeed");
+        assert!(resp.succeeded());
+        assert_eq!(
+            kv.revision(),
+            rev_before,
+            "empty txn must not advance revision"
+        );
+    }
+
+    /// Deleting a key that does not exist is a no-op that does not advance
+    /// the global revision.
+    #[test]
+    fn txn_delete_nonexistent_key_does_not_bump_revision() {
+        let mut kv = SimulatedEtcdKV::new(108);
+        put_absent(&mut kv, b"anchor", b"v");
+        let rev_before = kv.revision();
+
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(
+                        b"ghost",
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then(vec![TxnOp::delete(b"ghost", None)]),
+            )
+            .expect("delete-nonexistent txn should succeed");
+        assert!(resp.succeeded());
+        assert_eq!(
+            kv.revision(),
+            rev_before,
+            "deleting a nonexistent key must not advance revision"
+        );
+    }
+
+    /// `Compare::version(key, Greater, 0)` succeeds when the key exists
+    /// (version >= 1) and fails for absent keys (version == 0).
+    #[test]
+    fn compare_version_greater_detects_key_existence() {
+        let mut kv = SimulatedEtcdKV::new(200);
+        put_absent(&mut kv, b"present", b"val");
+
+        let exists = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::version(b"present", CompareOp::Greater, 0)])
+                    .and_then(vec![TxnOp::put(b"present", b"val2", None)]),
+            )
+            .expect("txn should succeed");
+        assert!(exists.succeeded(), "version > 0 should match existing key");
+
+        let absent = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::version(b"missing", CompareOp::Greater, 0)])
+                    .and_then(vec![TxnOp::put(b"missing", b"v", None)]),
+            )
+            .expect("txn should succeed");
+        assert!(
+            !absent.succeeded(),
+            "version > 0 should fail for absent key"
+        );
+    }
+
+    /// `Compare::value(key, Equal, val)` matches against the stored byte
+    /// payload and rejects mismatches.
+    #[test]
+    fn compare_value_equal_matches_stored_bytes() {
+        let mut kv = SimulatedEtcdKV::new(201);
+        put_absent(&mut kv, b"k", b"expected");
+
+        let matched = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::value(b"k", CompareOp::Equal, b"expected")])
+                    .and_then(vec![TxnOp::put(b"k", b"updated", None)]),
+            )
+            .expect("txn should succeed");
+        assert!(matched.succeeded(), "value compare should match");
+
+        let mismatched = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::value(b"k", CompareOp::Equal, b"wrong")])
+                    .and_then(vec![TxnOp::put(b"k", b"never", None)]),
+            )
+            .expect("txn should succeed");
+        assert!(
+            !mismatched.succeeded(),
+            "value compare should reject mismatch"
+        );
+    }
+
+    /// `Compare::lease(key, Equal, lease_id)` matches the lease attached to
+    /// a key via `PutOptions::with_lease`.
+    #[test]
+    fn compare_lease_equal_matches_attached_lease() {
+        let mut kv = SimulatedEtcdKV::new(202);
+        let lease = kv.lease_grant(30).expect("lease grant should succeed");
+
+        kv.txn(
+            Txn::new()
+                .when(vec![Compare::create_revision(
+                    b"leased",
+                    CompareOp::Equal,
+                    0,
+                )])
+                .and_then(vec![TxnOp::put(
+                    b"leased",
+                    b"val",
+                    Some(PutOptions::new().with_lease(lease.id())),
+                )]),
+        )
+        .expect("leased put should succeed");
+
+        let matched = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::lease(
+                        b"leased",
+                        CompareOp::Equal,
+                        lease.id(),
+                    )])
+                    .and_then(vec![TxnOp::put(b"leased", b"val2", None)]),
+            )
+            .expect("txn should succeed");
+        assert!(
+            matched.succeeded(),
+            "lease compare should match attached lease"
+        );
+
+        let wrong_lease = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::lease(b"leased", CompareOp::Equal, 9999)])
+                    .and_then(vec![TxnOp::put(b"leased", b"never", None)]),
+            )
+            .expect("txn should succeed");
+        assert!(
+            !wrong_lease.succeeded(),
+            "lease compare should reject wrong lease id"
         );
     }
 }
