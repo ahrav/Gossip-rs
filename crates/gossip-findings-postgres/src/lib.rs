@@ -11,10 +11,11 @@
 //!
 //! This crate includes:
 //!
-//! - findings-specific migration and schema-projection error types in
-//!   [`FindingsPgMigrationError`] and [`FindingsPgSchemaError`],
-//! - canonical table, column, and index names plus row projections in
-//!   [`schema`],
+//! - findings-specific backend, migration, and schema-projection error types
+//!   in [`FindingsPgError`], [`FindingsPgMigrationError`], and
+//!   [`FindingsPgSchemaError`],
+//! - canonical table, column, and index names plus row projections and
+//!   write-path SQL constants in [`schema`],
 //! - forward-only checksum-verified embedded migrations in [`migrations`],
 //! - and `u64` ↔ `BIGINT` conversion helpers in [`types`].
 //!
@@ -51,10 +52,16 @@ pub mod migrations;
 pub mod schema;
 pub mod types;
 
-pub use error::{FindingsPgMigrationError, FindingsPgSchemaError, MigrationOperation};
+pub use error::{
+    FindingsPgError, FindingsPgMigrationError, FindingsPgSchemaError, MigrationOperation,
+};
 #[cfg(feature = "test-utils")]
 pub use migrations::connect_and_apply_migrations;
 pub use migrations::{EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations};
+pub use schema::{
+    FINDINGS_INSERT_SQL, OBSERVATIONS_COUNT_SQL, OBSERVATIONS_INSERT_OR_MERGE_SQL,
+    OCCURRENCES_COUNT_SQL, OCCURRENCES_INSERT_SQL, SELECT_FINDINGS_COUNT_SQL, TRUNCATE_ALL_SQL,
+};
 pub use types::{
     PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
     u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,

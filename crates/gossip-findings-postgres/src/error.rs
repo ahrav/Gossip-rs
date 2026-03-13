@@ -1,14 +1,19 @@
-//! Error types for findings-specific PostgreSQL schema projection and migration
-//! work.
+//! Error types for findings-specific PostgreSQL schema projection, backend, and
+//! migration work.
 //!
 //! Schema-plan code uses [`FindingsPgSchemaError`] to surface contract
 //! validation failures and storage-boundary conversion problems. Migration code
 //! uses [`FindingsPgMigrationError`] to distinguish driver/SQL failures from
-//! checksum-integrity violations in embedded migrations.
+//! checksum-integrity violations in embedded migrations. Backend code uses
+//! [`FindingsPgError`] to unify schema, migration, SQL-driver, and identity
+//! conflict failures behind a single `FindingsSink` error surface.
 
 use std::{error::Error, fmt};
 
-use gossip_contracts::persistence::PersistenceInputError;
+use gossip_contracts::{
+    identity::{FindingId, ObservationId, OccurrenceId, TenantId},
+    persistence::PersistenceInputError,
+};
 pub use gossip_pg_common::migration::{
     MigrationOperation, PgMigrationError as FindingsPgMigrationError,
 };
@@ -74,9 +79,150 @@ impl From<PgU64ConversionError> for FindingsPgSchemaError {
     }
 }
 
+/// Unified backend error for the PostgreSQL findings implementation.
+#[derive(Debug)]
+pub enum FindingsPgError {
+    /// PostgreSQL client failure.
+    Postgres(postgres::Error),
+    /// Embedded migration application failed.
+    Migration(FindingsPgMigrationError),
+    /// Internal client mutex was poisoned by a panic.
+    MutexPoisoned,
+    /// Input batch exceeded the recommended maximum.
+    BatchTooLarge { len: usize, max: usize },
+    /// Batch validation or row projection failed before SQL mutation.
+    Schema(FindingsPgSchemaError),
+    /// A persisted row count did not fit the non-negative count domain.
+    CountOutOfRange { table: &'static str, value: i64 },
+    /// A finding primary key mapped to a different immutable natural key.
+    FindingConflict {
+        tenant_id: TenantId,
+        finding_id: FindingId,
+    },
+    /// An occurrence primary key mapped to a different immutable natural key.
+    OccurrenceConflict {
+        tenant_id: TenantId,
+        occurrence_id: OccurrenceId,
+    },
+    /// An observation primary key mapped to a different immutable natural key.
+    ObservationConflict {
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+    },
+}
+
+impl fmt::Display for FindingsPgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Postgres(source) => {
+                if let Some(db_err) = source.as_db_error() {
+                    write!(
+                        f,
+                        "postgres findings operation failed: {} ({})",
+                        db_err.severity(),
+                        db_err.code().code()
+                    )
+                } else {
+                    write!(f, "postgres findings connection/protocol error")
+                }
+            }
+            Self::Migration(source) => write!(f, "postgres findings migration failed: {source}"),
+            Self::MutexPoisoned => f.write_str("postgres findings client mutex is poisoned"),
+            Self::BatchTooLarge { len, max } => {
+                write!(f, "findings batch too large: {len} records (limit {max})")
+            }
+            Self::Schema(source) => {
+                write!(f, "invalid findings batch for postgres backend: {source}")
+            }
+            Self::CountOutOfRange { table, value } => {
+                write!(f, "stored count for {table} out of range: {value}")
+            }
+            Self::FindingConflict {
+                tenant_id,
+                finding_id,
+            } => write!(
+                f,
+                "content-addressed finding identity conflict for tenant {tenant_id} and finding {finding_id}"
+            ),
+            Self::OccurrenceConflict {
+                tenant_id,
+                occurrence_id,
+            } => write!(
+                f,
+                "content-addressed occurrence identity conflict for tenant {tenant_id} and occurrence {occurrence_id}"
+            ),
+            Self::ObservationConflict {
+                tenant_id,
+                observation_id,
+            } => write!(
+                f,
+                "policy-scoped observation identity conflict for tenant {tenant_id} and observation {observation_id}"
+            ),
+        }
+    }
+}
+
+impl Error for FindingsPgError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Postgres(source) => Some(source),
+            Self::Migration(source) => Some(source),
+            Self::Schema(source) => Some(source),
+            Self::MutexPoisoned
+            | Self::BatchTooLarge { .. }
+            | Self::CountOutOfRange { .. }
+            | Self::FindingConflict { .. }
+            | Self::OccurrenceConflict { .. }
+            | Self::ObservationConflict { .. } => None,
+        }
+    }
+}
+
+impl From<postgres::Error> for FindingsPgError {
+    fn from(value: postgres::Error) -> Self {
+        Self::Postgres(value)
+    }
+}
+
+impl From<FindingsPgMigrationError> for FindingsPgError {
+    fn from(value: FindingsPgMigrationError) -> Self {
+        Self::Migration(value)
+    }
+}
+
+impl From<FindingsPgSchemaError> for FindingsPgError {
+    fn from(value: FindingsPgSchemaError) -> Self {
+        Self::Schema(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gossip_contracts::{
+        identity::{FindingId, ObservationId, OccurrenceId, TenantId},
+        persistence::RECOMMENDED_MAX_BATCH_SIZE,
+    };
+
+    fn tenant_id() -> TenantId {
+        TenantId::from_bytes([0x11; 32])
+    }
+
+    fn finding_id() -> FindingId {
+        FindingId::from_bytes([0x22; 32])
+    }
+
+    fn occurrence_id() -> OccurrenceId {
+        OccurrenceId::from_bytes([0x33; 32])
+    }
+
+    fn observation_id() -> ObservationId {
+        ObservationId::from_bytes([0x44; 32])
+    }
+
+    fn timeout_postgres_error() -> postgres::Error {
+        postgres::Error::__private_api_timeout()
+    }
 
     #[test]
     fn schema_error_display_uses_persistence_source_message() {
@@ -200,5 +346,214 @@ mod tests {
         };
 
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn backend_error_display_redacts_connection_details_for_postgres_errors() {
+        let err = FindingsPgError::Postgres(timeout_postgres_error());
+
+        assert_eq!(
+            err.to_string(),
+            "postgres findings connection/protocol error"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_describes_migration_failures() {
+        let err = FindingsPgError::Migration(FindingsPgMigrationError::ChecksumMismatch {
+            version: "0001_findings_schema",
+            expected_hex: "aa".repeat(32),
+            found_hex: "bb".repeat(32),
+        });
+
+        let msg = err.to_string();
+        assert!(msg.contains("postgres findings migration failed"));
+        assert!(msg.contains("0001_findings_schema"));
+    }
+
+    #[test]
+    fn backend_error_display_describes_mutex_poisoning() {
+        let err = FindingsPgError::MutexPoisoned;
+
+        assert_eq!(
+            err.to_string(),
+            "postgres findings client mutex is poisoned"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_describes_batch_limits() {
+        let err = FindingsPgError::BatchTooLarge {
+            len: RECOMMENDED_MAX_BATCH_SIZE + 1,
+            max: RECOMMENDED_MAX_BATCH_SIZE,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "findings batch too large: {} records (limit {})",
+                RECOMMENDED_MAX_BATCH_SIZE + 1,
+                RECOMMENDED_MAX_BATCH_SIZE
+            )
+        );
+    }
+
+    #[test]
+    fn backend_error_display_describes_schema_failures() {
+        let err = FindingsPgError::Schema(FindingsPgSchemaError::Persistence(
+            PersistenceInputError::Empty { field: "tenant_id" },
+        ));
+
+        assert_eq!(
+            err.to_string(),
+            "invalid findings batch for postgres backend: tenant_id must not be empty"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_describes_out_of_range_counts() {
+        let err = FindingsPgError::CountOutOfRange {
+            table: "findings",
+            value: -1,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "stored count for findings out of range: -1"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_describes_finding_conflicts() {
+        let err = FindingsPgError::FindingConflict {
+            tenant_id: tenant_id(),
+            finding_id: finding_id(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("content-addressed finding identity conflict"));
+        assert!(msg.contains("TenantId(11111111..)"));
+        assert!(msg.contains("FindingId(22222222..)"));
+    }
+
+    #[test]
+    fn backend_error_display_describes_occurrence_conflicts() {
+        let err = FindingsPgError::OccurrenceConflict {
+            tenant_id: tenant_id(),
+            occurrence_id: occurrence_id(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("content-addressed occurrence identity conflict"));
+        assert!(msg.contains("TenantId(11111111..)"));
+        assert!(msg.contains("OccurrenceId(33333333..)"));
+    }
+
+    #[test]
+    fn backend_error_display_describes_observation_conflicts() {
+        let err = FindingsPgError::ObservationConflict {
+            tenant_id: tenant_id(),
+            observation_id: observation_id(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("policy-scoped observation identity conflict"));
+        assert!(msg.contains("TenantId(11111111..)"));
+        assert!(msg.contains("ObservationId(44444444..)"));
+    }
+
+    #[test]
+    fn backend_error_source_exposes_wrapped_errors() {
+        let postgres = FindingsPgError::Postgres(timeout_postgres_error());
+        let migration = FindingsPgError::Migration(FindingsPgMigrationError::ChecksumMismatch {
+            version: "0001_findings_schema",
+            expected_hex: "aa".repeat(32),
+            found_hex: "bb".repeat(32),
+        });
+        let schema = FindingsPgError::Schema(FindingsPgSchemaError::Persistence(
+            PersistenceInputError::Empty { field: "tenant_id" },
+        ));
+
+        assert_eq!(
+            postgres
+                .source()
+                .expect("postgres variant should expose source")
+                .to_string(),
+            "timeout waiting for server"
+        );
+        assert_eq!(
+            migration
+                .source()
+                .expect("migration variant should expose source")
+                .to_string(),
+            FindingsPgMigrationError::ChecksumMismatch {
+                version: "0001_findings_schema",
+                expected_hex: "aa".repeat(32),
+                found_hex: "bb".repeat(32),
+            }
+            .to_string()
+        );
+        assert_eq!(
+            schema
+                .source()
+                .expect("schema variant should expose source")
+                .to_string(),
+            "tenant_id must not be empty"
+        );
+    }
+
+    #[test]
+    fn backend_error_source_is_none_for_non_wrapped_variants() {
+        let cases = [
+            FindingsPgError::MutexPoisoned,
+            FindingsPgError::BatchTooLarge { len: 11, max: 10 },
+            FindingsPgError::CountOutOfRange {
+                table: "findings",
+                value: -1,
+            },
+            FindingsPgError::FindingConflict {
+                tenant_id: tenant_id(),
+                finding_id: finding_id(),
+            },
+            FindingsPgError::OccurrenceConflict {
+                tenant_id: tenant_id(),
+                occurrence_id: occurrence_id(),
+            },
+            FindingsPgError::ObservationConflict {
+                tenant_id: tenant_id(),
+                observation_id: observation_id(),
+            },
+        ];
+
+        for err in cases {
+            assert!(err.source().is_none(), "{err} should not expose a source");
+        }
+    }
+
+    #[test]
+    fn backend_error_from_postgres_wraps_postgres_variant() {
+        let err = FindingsPgError::from(timeout_postgres_error());
+
+        assert!(matches!(err, FindingsPgError::Postgres(_)));
+    }
+
+    #[test]
+    fn backend_error_from_migration_wraps_migration_variant() {
+        let err = FindingsPgError::from(FindingsPgMigrationError::CorruptedHistoryRecord {
+            version: "0001_findings_schema",
+            found_len: 7,
+        });
+
+        assert!(matches!(err, FindingsPgError::Migration(_)));
+    }
+
+    #[test]
+    fn backend_error_from_schema_wraps_schema_variant() {
+        let err = FindingsPgError::from(FindingsPgSchemaError::SpanOverflow {
+            byte_offset: i64::MAX - 1,
+            byte_length: 3,
+        });
+
+        assert!(matches!(err, FindingsPgError::Schema(_)));
     }
 }

@@ -370,6 +370,142 @@ impl ProjectedFindingsBatch {
     }
 }
 
+/// Idempotent finding insert with natural-key verification on conflict.
+///
+/// The `DO UPDATE ... WHERE` form intentionally returns no row when the same
+/// `(tenant_id, finding_id)` maps to different immutable identity fields. The
+/// backend uses that `query_opt` miss to surface
+/// [`crate::FindingsPgError::FindingConflict`] instead of silently accepting
+/// drift.
+///
+/// Bind parameters:
+/// 1. `tenant_id`
+/// 2. `finding_id`
+/// 3. `stable_item_id`
+/// 4. `rule_fingerprint`
+/// 5. `secret_hash`
+pub const FINDINGS_INSERT_SQL: &str = r#"
+INSERT INTO findings (
+    tenant_id, finding_id, stable_item_id, rule_fingerprint, secret_hash
+) VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (tenant_id, finding_id) DO UPDATE
+SET stable_item_id = findings.stable_item_id
+WHERE findings.stable_item_id = EXCLUDED.stable_item_id
+  AND findings.rule_fingerprint = EXCLUDED.rule_fingerprint
+  AND findings.secret_hash = EXCLUDED.secret_hash
+RETURNING 1
+"#;
+
+/// Idempotent occurrence insert with natural-key verification on conflict.
+///
+/// Like [`FINDINGS_INSERT_SQL`], this uses `DO UPDATE ... WHERE` to turn a
+/// primary-key collision with mismatched natural-key fields into a missing
+/// `RETURNING` row rather than a silent `DO NOTHING`.
+///
+/// Bind parameters:
+/// 1. `tenant_id`
+/// 2. `occurrence_id`
+/// 3. `finding_id`
+/// 4. `object_version_id`
+/// 5. `byte_offset`
+/// 6. `byte_length`
+pub const OCCURRENCES_INSERT_SQL: &str = r#"
+INSERT INTO occurrences (
+    tenant_id, occurrence_id, finding_id, object_version_id, byte_offset, byte_length
+) VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (tenant_id, occurrence_id) DO UPDATE
+SET finding_id = occurrences.finding_id
+WHERE occurrences.finding_id = EXCLUDED.finding_id
+  AND occurrences.object_version_id = EXCLUDED.object_version_id
+  AND occurrences.byte_offset = EXCLUDED.byte_offset
+  AND occurrences.byte_length = EXCLUDED.byte_length
+RETURNING 1
+"#;
+
+/// Observation upsert with monotonic merge semantics.
+///
+/// The `CASE` expressions must stay in lockstep with the Rust-side
+/// observation-merge helper so that in-memory deduplication and PostgreSQL
+/// replay produce identical durable rows for the same inputs.
+///
+/// Bind parameters:
+/// 1. `tenant_id`
+/// 2. `observation_id`
+/// 3. `occurrence_id`
+/// 4. `policy_hash`
+/// 5. `ovid_hash`
+/// 6. `run_id`
+/// 7. `shard_id`
+/// 8. `fence_epoch`
+/// 9. `seen_at`
+/// 10. `location_display`
+/// 11. `location_url`
+pub const OBSERVATIONS_INSERT_OR_MERGE_SQL: &str = r#"
+INSERT INTO observations (
+    tenant_id, observation_id, occurrence_id, policy_hash, ovid_hash,
+    run_id, shard_id, fence_epoch, seen_at, location_display, location_url
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (tenant_id, observation_id) DO UPDATE
+SET
+    run_id = CASE
+        WHEN EXCLUDED.seen_at > observations.seen_at
+          OR (EXCLUDED.seen_at = observations.seen_at
+              AND observations.location_display IS NULL
+              AND EXCLUDED.location_display IS NOT NULL)
+            THEN EXCLUDED.run_id
+        ELSE observations.run_id
+    END,
+    shard_id = CASE
+        WHEN EXCLUDED.seen_at > observations.seen_at
+          OR (EXCLUDED.seen_at = observations.seen_at
+              AND observations.location_display IS NULL
+              AND EXCLUDED.location_display IS NOT NULL)
+            THEN EXCLUDED.shard_id
+        ELSE observations.shard_id
+    END,
+    fence_epoch = CASE
+        WHEN EXCLUDED.seen_at > observations.seen_at
+          OR (EXCLUDED.seen_at = observations.seen_at
+              AND observations.location_display IS NULL
+              AND EXCLUDED.location_display IS NOT NULL)
+            THEN EXCLUDED.fence_epoch
+        ELSE observations.fence_epoch
+    END,
+    seen_at = GREATEST(observations.seen_at, EXCLUDED.seen_at),
+    location_display = CASE
+        WHEN EXCLUDED.seen_at > observations.seen_at
+            THEN COALESCE(EXCLUDED.location_display, observations.location_display)
+        WHEN EXCLUDED.seen_at < observations.seen_at
+            THEN COALESCE(observations.location_display, EXCLUDED.location_display)
+        WHEN observations.location_display IS NULL AND EXCLUDED.location_display IS NOT NULL
+            THEN EXCLUDED.location_display
+        ELSE COALESCE(observations.location_display, EXCLUDED.location_display)
+    END,
+    location_url = CASE
+        WHEN EXCLUDED.seen_at > observations.seen_at
+            THEN COALESCE(EXCLUDED.location_url, observations.location_url)
+        WHEN EXCLUDED.seen_at < observations.seen_at
+            THEN COALESCE(observations.location_url, EXCLUDED.location_url)
+        WHEN observations.location_display IS NULL AND EXCLUDED.location_display IS NOT NULL
+            THEN EXCLUDED.location_url
+        ELSE COALESCE(observations.location_url, EXCLUDED.location_url)
+    END
+WHERE observations.occurrence_id = EXCLUDED.occurrence_id
+  AND observations.policy_hash = EXCLUDED.policy_hash
+  AND observations.ovid_hash = EXCLUDED.ovid_hash
+RETURNING 1
+"#;
+
+/// Count all durable finding rows.
+pub const SELECT_FINDINGS_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM findings";
+/// Count all durable occurrence rows.
+pub const OCCURRENCES_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM occurrences";
+/// Count all durable observation rows.
+pub const OBSERVATIONS_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM observations";
+
+/// Remove all durable findings-layer rows in foreign-key order.
+pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, findings";
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, num::NonZeroU64};
@@ -442,6 +578,15 @@ mod tests {
             assert!(
                 seen.insert(*column),
                 "column list contains duplicate entry: {column}"
+            );
+        }
+    }
+
+    fn assert_sql_contains_all(sql: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                sql.contains(needle),
+                "expected SQL to contain {needle:?}, but it was:\n{sql}"
             );
         }
     }
@@ -757,6 +902,127 @@ mod tests {
             .expect("span exactly at i64::MAX boundary should be accepted");
         assert_eq!(row.byte_offset, i64::MAX - 1);
         assert_eq!(row.byte_length, 1);
+    }
+
+    #[test]
+    fn write_sql_constants_reference_canonical_table_names() {
+        assert!(FINDINGS_INSERT_SQL.contains(FINDINGS_TABLE));
+        assert!(OCCURRENCES_INSERT_SQL.contains(OCCURRENCES_TABLE));
+        assert!(OBSERVATIONS_INSERT_OR_MERGE_SQL.contains(OBSERVATIONS_TABLE));
+        assert!(SELECT_FINDINGS_COUNT_SQL.contains(FINDINGS_TABLE));
+        assert!(OCCURRENCES_COUNT_SQL.contains(OCCURRENCES_TABLE));
+        assert!(OBSERVATIONS_COUNT_SQL.contains(OBSERVATIONS_TABLE));
+        assert!(TRUNCATE_ALL_SQL.contains(OBSERVATIONS_TABLE));
+        assert!(TRUNCATE_ALL_SQL.contains(OCCURRENCES_TABLE));
+        assert!(TRUNCATE_ALL_SQL.contains(FINDINGS_TABLE));
+    }
+
+    #[test]
+    fn findings_insert_sql_uses_identity_verifying_conflict_update() {
+        assert_sql_contains_all(
+            FINDINGS_INSERT_SQL,
+            &[
+                "ON CONFLICT (tenant_id, finding_id) DO UPDATE",
+                "SET stable_item_id = findings.stable_item_id",
+                "WHERE findings.stable_item_id = EXCLUDED.stable_item_id",
+                "AND findings.rule_fingerprint = EXCLUDED.rule_fingerprint",
+                "AND findings.secret_hash = EXCLUDED.secret_hash",
+                "RETURNING 1",
+            ],
+        );
+        assert!(
+            !FINDINGS_INSERT_SQL.contains("DO NOTHING"),
+            "finding upsert must detect identity mismatches rather than skipping them"
+        );
+    }
+
+    #[test]
+    fn occurrences_insert_sql_uses_identity_verifying_conflict_update() {
+        assert_sql_contains_all(
+            OCCURRENCES_INSERT_SQL,
+            &[
+                "ON CONFLICT (tenant_id, occurrence_id) DO UPDATE",
+                "SET finding_id = occurrences.finding_id",
+                "WHERE occurrences.finding_id = EXCLUDED.finding_id",
+                "AND occurrences.object_version_id = EXCLUDED.object_version_id",
+                "AND occurrences.byte_offset = EXCLUDED.byte_offset",
+                "AND occurrences.byte_length = EXCLUDED.byte_length",
+                "RETURNING 1",
+            ],
+        );
+        assert!(
+            !OCCURRENCES_INSERT_SQL.contains("DO NOTHING"),
+            "occurrence upsert must detect identity mismatches rather than skipping them"
+        );
+    }
+
+    #[test]
+    fn observations_insert_sql_uses_monotonic_merge_keywords() {
+        assert_sql_contains_all(
+            OBSERVATIONS_INSERT_OR_MERGE_SQL,
+            &[
+                "ON CONFLICT (tenant_id, observation_id) DO UPDATE",
+                "seen_at = GREATEST(observations.seen_at, EXCLUDED.seen_at)",
+                "location_display = CASE",
+                "location_url = CASE",
+                "COALESCE",
+                "RETURNING 1",
+            ],
+        );
+    }
+
+    #[test]
+    fn observations_insert_sql_uses_correct_location_display_coalesce_branch() {
+        assert!(
+            OBSERVATIONS_INSERT_OR_MERGE_SQL.contains(
+                "ELSE COALESCE(observations.location_display, EXCLUDED.location_display)"
+            ),
+            "location_display fallback must use EXCLUDED.location_display"
+        );
+        assert!(
+            !OBSERVATIONS_INSERT_OR_MERGE_SQL
+                .contains("ELSE COALESCE(observations.location_display, EXCLUDED.location_url)"),
+            "location_display fallback must not reference EXCLUDED.location_url"
+        );
+        assert!(
+            OBSERVATIONS_INSERT_OR_MERGE_SQL
+                .contains("ELSE COALESCE(observations.location_url, EXCLUDED.location_url)"),
+            "location_url fallback must preserve the URL column"
+        );
+    }
+
+    #[test]
+    fn observations_insert_sql_verifies_observation_identity_fields() {
+        assert_sql_contains_all(
+            OBSERVATIONS_INSERT_OR_MERGE_SQL,
+            &[
+                "WHERE observations.occurrence_id = EXCLUDED.occurrence_id",
+                "AND observations.policy_hash = EXCLUDED.policy_hash",
+                "AND observations.ovid_hash = EXCLUDED.ovid_hash",
+            ],
+        );
+    }
+
+    #[test]
+    fn count_sql_constants_cast_to_bigint() {
+        for sql in [
+            SELECT_FINDINGS_COUNT_SQL,
+            OCCURRENCES_COUNT_SQL,
+            OBSERVATIONS_COUNT_SQL,
+        ] {
+            assert!(
+                sql.contains("COUNT(*)::BIGINT"),
+                "count SQL must cast COUNT(*) to BIGINT: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_all_sql_uses_child_first_order() {
+        assert_eq!(
+            TRUNCATE_ALL_SQL,
+            "TRUNCATE TABLE observations, occurrences, findings"
+        );
     }
 
     #[test]
