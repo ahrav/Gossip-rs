@@ -218,6 +218,32 @@ fn decode_shard_record_rejects_trailing_bytes() {
     release_shard_record(&mut record, &mut slab);
 }
 
+/// Truncating even a single byte from a valid shard record blob must fail
+/// decode and leave the decode slab untouched. The two-phase decode path
+/// (wire parse into `OwnedShardRecord`, then slab materialization via
+/// `StagedShardAllocations`) must not leak partial allocations when
+/// truncation causes an early exit.
+#[test]
+fn decode_shard_record_rejects_truncated_blob() {
+    let (mut record, mut slab) = sample_active_child_shard_record(CursorSemantics::Completed);
+    let blob = encode_shard_record(&record, &slab).expect("valid record encodes");
+
+    let mut decode_slab = ByteSlab::with_capacity(4096);
+    let error = decode_shard_record(&blob[..blob.len() - 1], &mut decode_slab)
+        .expect_err("truncated blob must fail");
+    assert!(
+        matches!(error, EtcdCodecError::Truncated { .. }),
+        "expected Truncated error, got: {error:?}"
+    );
+    assert_eq!(
+        decode_slab.live_count(),
+        0,
+        "truncation must not leave staged allocations behind"
+    );
+
+    release_shard_record(&mut record, &mut slab);
+}
+
 #[test]
 fn decode_owner_value_rejects_trailing_bytes() {
     let mut blob = encode_owner_value(WorkerId::from_raw(7), FenceEpoch::from_raw(42));
@@ -897,13 +923,22 @@ fn decoder_read_vec_valid() {
 
 #[test]
 fn decoder_read_vec_accepts_max_field_size() {
+    // The boundary condition is: read_vec accepts length == MAX_FIELD_SIZE
+    // (strict `>` guard). We must supply the full payload since the decoder
+    // reads exactly `len` bytes, but only check the returned length to
+    // avoid an O(1 MiB) byte comparison.
     let payload = vec![0xAB; MAX_FIELD_SIZE];
     let mut buf = Vec::with_capacity(4 + payload.len());
     push_u32(&mut buf, MAX_FIELD_SIZE as u32);
     buf.extend_from_slice(&payload);
 
     let mut d = Decoder::new(&buf);
-    assert_eq!(d.read_vec().unwrap(), payload);
+    let result = d.read_vec();
+    assert!(
+        result.is_ok(),
+        "MAX_FIELD_SIZE must be accepted, got: {result:?}"
+    );
+    assert_eq!(result.unwrap().len(), MAX_FIELD_SIZE);
     assert!(
         d.finish().is_ok(),
         "decoder should consume the full payload"
@@ -1218,13 +1253,13 @@ fn run_record_at_op_log_cap_round_trips() {
 }
 
 #[test]
-fn shard_record_with_empty_key_range_round_trips() {
+fn shard_record_with_unbounded_key_range_round_trips() {
     let tenant = TenantId::from_bytes([0xD1; 32]);
     let run = RunId::from_raw(0xD100);
     let shard = ShardId::from_raw(0xD1);
 
     let mut slab = ByteSlab::with_capacity(4096);
-    let spec = ShardSpecRef::with_range_and_metadata(b"", b"", b"empty-range");
+    let spec = ShardSpecRef::with_range_and_metadata(b"", b"", b"unbounded-range");
     let mut record = ShardRecord::new_active(
         tenant,
         run,
