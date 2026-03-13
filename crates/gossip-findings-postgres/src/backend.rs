@@ -13,7 +13,7 @@ use std::hash::Hash;
 
 use gossip_contracts::{
     identity::{FindingId, ObservationId, OccurrenceId, TenantId},
-    persistence::{FindingsUpsertBatch, PersistenceInputError},
+    persistence::FindingsUpsertBatch,
 };
 
 use crate::{
@@ -40,7 +40,9 @@ pub(crate) fn project_and_dedupe(
     batch
         .validate_observation_identity()
         .map_err(FindingsPgSchemaError::Persistence)?;
-    ensure_consistent_tenant(batch).map_err(FindingsPgSchemaError::Persistence)?;
+    batch
+        .validate_tenant_consistency()
+        .map_err(FindingsPgSchemaError::Persistence)?;
 
     let findings = batch
         .findings()
@@ -63,40 +65,6 @@ pub(crate) fn project_and_dedupe(
         occurrences: dedupe_occurrence_rows(&occurrences)?,
         observations: dedupe_observation_rows(&observations)?,
     })
-}
-
-fn ensure_consistent_tenant(batch: FindingsUpsertBatch<'_>) -> Result<(), PersistenceInputError> {
-    let expected_tenant = batch
-        .findings()
-        .first()
-        .map(|record| record.tenant_id())
-        .or_else(|| batch.occurrences().first().map(|record| record.tenant_id()))
-        .or_else(|| {
-            batch
-                .observations()
-                .first()
-                .map(|record| record.tenant_id())
-        });
-
-    if let Some(expected_tenant) = expected_tenant {
-        for finding in batch.findings() {
-            if finding.tenant_id() != expected_tenant {
-                return Err(PersistenceInputError::InconsistentTenant);
-            }
-        }
-        for occurrence in batch.occurrences() {
-            if occurrence.tenant_id() != expected_tenant {
-                return Err(PersistenceInputError::InconsistentTenant);
-            }
-        }
-        for observation in batch.observations() {
-            if observation.tenant_id() != expected_tenant {
-                return Err(PersistenceInputError::InconsistentTenant);
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn dedupe_findings_rows(rows: &[FindingRow]) -> Result<Vec<FindingRow>, FindingsPgError> {
@@ -179,6 +147,29 @@ fn dedupe_observation_rows(
     Ok(drain_in_order(merged, order, "observations"))
 }
 
+/// Merge two observation rows sharing the same primary key.
+///
+/// Winner selection mirrors [`OBSERVATIONS_INSERT_OR_MERGE_SQL`]: the row with
+/// the higher `seen_at` wins provenance fields (`run_id`, `shard_id`,
+/// `fence_epoch`). On equal `seen_at`, the row that has a `location_display`
+/// wins if the other lacks one (tiebreaker). `seen_at` itself always takes
+/// the max. Location fields follow whichever row contributed
+/// `location_display` — the URL is never sourced from a different row than
+/// the display path.
+///
+/// ## Merge-rule invariants (must converge with SQL)
+///
+/// 1. **Provenance winner**: `seen_at >` wins; on tie,
+///    `location_display IS NULL` (existing) + `IS NOT NULL` (incoming) wins.
+/// 2. **`seen_at`**: always `max(existing, incoming)`.
+/// 3. **Provenance triple** `(run_id, shard_id, fence_epoch)`: all three
+///    sourced from the winner — never mixed across records.
+/// 4. **`location_display`**: sourced from the winner; if the winner lacks
+///    it, falls back to the loser.
+/// 5. **`location_url`**: follows whichever record contributed
+///    `location_display` — never independently sourced from the other record.
+///
+/// [`OBSERVATIONS_INSERT_OR_MERGE_SQL`]: crate::schema::OBSERVATIONS_INSERT_OR_MERGE_SQL
 fn merge_observation_rows(
     existing: &ObservationRow,
     incoming: &ObservationRow,
@@ -200,43 +191,17 @@ fn merge_observation_rows(
             && existing.location_display.is_none()
             && incoming.location_display.is_some());
 
-    let location_display = if incoming.seen_at > existing.seen_at {
-        incoming
-            .location_display
-            .clone()
-            .or_else(|| existing.location_display.clone())
-    } else if incoming.seen_at < existing.seen_at {
-        existing
-            .location_display
-            .clone()
-            .or_else(|| incoming.location_display.clone())
-    } else if existing.location_display.is_none() && incoming.location_display.is_some() {
-        incoming.location_display.clone()
+    let (winner, loser) = if use_incoming_provenance {
+        (incoming, existing)
     } else {
-        existing
-            .location_display
-            .clone()
-            .or_else(|| incoming.location_display.clone())
+        (existing, incoming)
     };
 
-    let location_url = if incoming.seen_at > existing.seen_at {
-        if incoming.location_display.is_some() {
-            incoming.location_url.clone()
-        } else {
-            existing.location_url.clone()
-        }
-    } else if incoming.seen_at < existing.seen_at {
-        if existing.location_display.is_some() {
-            existing.location_url.clone()
-        } else {
-            incoming.location_url.clone()
-        }
-    } else if existing.location_display.is_none() && incoming.location_display.is_some() {
-        incoming.location_url.clone()
-    } else if existing.location_display.is_some() {
-        existing.location_url.clone()
+    // URL follows whichever row contributed location_display.
+    let location_source = if winner.location_display.is_some() {
+        winner
     } else {
-        incoming.location_url.clone()
+        loser
     };
 
     Ok(ObservationRow {
@@ -245,24 +210,12 @@ fn merge_observation_rows(
         occurrence_id: existing.occurrence_id,
         policy_hash: existing.policy_hash,
         ovid_hash: existing.ovid_hash,
-        run_id: if use_incoming_provenance {
-            incoming.run_id
-        } else {
-            existing.run_id
-        },
-        shard_id: if use_incoming_provenance {
-            incoming.shard_id
-        } else {
-            existing.shard_id
-        },
-        fence_epoch: if use_incoming_provenance {
-            incoming.fence_epoch
-        } else {
-            existing.fence_epoch
-        },
+        run_id: winner.run_id,
+        shard_id: winner.shard_id,
+        fence_epoch: winner.fence_epoch,
         seen_at: existing.seen_at.max(incoming.seen_at),
-        location_display,
-        location_url,
+        location_display: location_source.location_display.clone(),
+        location_url: location_source.location_url.clone(),
     })
 }
 
@@ -284,7 +237,6 @@ mod tests {
     use std::num::NonZeroU64;
 
     use gossip_contracts::{
-        connector::Location,
         identity::{
             FenceEpoch, FindingId, LogicalTime, NormHash, ObjectVersionId, ObservationId,
             OccurrenceId, PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId,
@@ -304,7 +256,7 @@ mod tests {
 
     use super::{
         dedupe_findings_rows, dedupe_observation_rows, dedupe_occurrence_rows,
-        ensure_consistent_tenant, merge_observation_rows, project_and_dedupe,
+        merge_observation_rows, project_and_dedupe,
     };
 
     #[test]
@@ -642,20 +594,22 @@ mod tests {
     }
 
     #[test]
-    fn ensure_consistent_tenant_rejects_mixed_tenants() {
+    fn consistent_tenant_rejects_mixed_tenants() {
         let finding_a = finding_record(0x11, 0x31);
         let finding_b = finding_record(0x12, 0x32);
         let findings = [finding_a, finding_b];
 
-        let err = ensure_consistent_tenant(FindingsUpsertBatch::new(&findings, &[], &[]))
+        let err = FindingsUpsertBatch::new(&findings, &[], &[])
+            .validate_tenant_consistency()
             .expect_err("mixed tenants should fail");
 
         assert_eq!(err, PersistenceInputError::InconsistentTenant);
     }
 
     #[test]
-    fn ensure_consistent_tenant_accepts_empty_batch() {
-        ensure_consistent_tenant(FindingsUpsertBatch::default())
+    fn consistent_tenant_accepts_empty_batch() {
+        FindingsUpsertBatch::default()
+            .validate_tenant_consistency()
             .expect("empty batch should be valid");
     }
 
@@ -862,13 +816,122 @@ mod tests {
     }
 
     #[test]
-    fn merge_observation_location_helpers_build_valid_location() {
-        let location = Location::try_new(
-            "repo/path".into(),
-            Some("https://example.test/repo/path".into()),
-        )
-        .expect("location fixture should be valid");
+    fn consistent_tenant_rejects_cross_layer_mismatch() {
+        let finding = finding_record(0x11, 0x31);
+        let occurrence = occurrence_record(0x12, finding.finding_id(), 0x41, 10, 4);
+        // tenant 0x11 in findings, 0x12 in occurrences
+        let err = project_and_dedupe(FindingsUpsertBatch::new(&[finding], &[occurrence], &[]))
+            .expect_err("cross-layer tenant mismatch should fail");
 
-        assert_eq!(location.display(), "repo/path");
+        match err {
+            FindingsPgError::Schema(FindingsPgSchemaError::Persistence(
+                PersistenceInputError::InconsistentTenant,
+            )) => {}
+            other => panic!("expected InconsistentTenant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consistent_tenant_rejects_observation_layer_mismatch() {
+        let finding = finding_record(0x11, 0x31);
+        let occurrence = occurrence_record(0x11, finding.finding_id(), 0x41, 10, 4);
+        // Observation uses tenant 0x12 while finding+occurrence use 0x11.
+        let observation =
+            observation_record(0x12, occurrence.occurrence_id(), 0x51, 0x61, 1, 2, 3, 10);
+        let err = project_and_dedupe(FindingsUpsertBatch::new(
+            &[finding],
+            &[occurrence],
+            &[observation],
+        ))
+        .expect_err("observation-layer tenant mismatch should fail");
+
+        match err {
+            FindingsPgError::Schema(FindingsPgSchemaError::Persistence(
+                PersistenceInputError::InconsistentTenant,
+            )) => {}
+            other => panic!("expected InconsistentTenant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_observation_winner_has_display_but_no_url() {
+        let existing = observation_row(10, None, Some("https://existing.test"), 1, 2, 3);
+        let incoming = observation_row(11, Some("incoming/path"), None, 4, 5, 6);
+        let merged = merge_observation_rows(&existing, &incoming).expect("merge should succeed");
+
+        // Winner (incoming, higher seen_at) has display, so URL comes from winner too.
+        assert_eq!(merged.location_display.as_deref(), Some("incoming/path"));
+        assert_eq!(merged.location_url, None);
+    }
+
+    #[test]
+    fn merge_observation_loser_has_display_but_no_url() {
+        let existing = observation_row(10, Some("existing/path"), None, 1, 2, 3);
+        let incoming = observation_row(11, None, Some("https://incoming.test"), 4, 5, 6);
+        let merged = merge_observation_rows(&existing, &incoming).expect("merge should succeed");
+
+        // Winner (incoming, higher seen_at) has no display, so location
+        // falls back to loser (existing) which has display but no URL.
+        assert_eq!(merged.run_id, incoming.run_id);
+        assert_eq!(merged.location_display.as_deref(), Some("existing/path"));
+        assert_eq!(merged.location_url, None);
+    }
+
+    #[test]
+    fn dedupe_empty_inputs_return_empty() {
+        assert_eq!(dedupe_findings_rows(&[]).unwrap(), vec![]);
+        assert_eq!(dedupe_occurrence_rows(&[]).unwrap(), vec![]);
+        assert_eq!(dedupe_observation_rows(&[]).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn dedupe_observation_rows_three_way_merge() {
+        // Three observations with the same key but different seen_at values.
+        // Oldest has location, middle has no location, newest has different location.
+        let oldest = observation_row(8, Some("oldest/path"), Some("https://oldest.test"), 1, 2, 3);
+        let middle = observation_row(10, None, None, 4, 5, 6);
+        let newest = observation_row(
+            12,
+            Some("newest/path"),
+            Some("https://newest.test"),
+            7,
+            8,
+            9,
+        );
+
+        let deduped =
+            dedupe_observation_rows(&[oldest, middle, newest]).expect("3-way merge should succeed");
+
+        assert_eq!(deduped.len(), 1);
+        let merged = &deduped[0];
+        // Newest wins provenance.
+        assert_eq!(merged.run_id, 7);
+        assert_eq!(merged.shard_id, 8);
+        assert_eq!(merged.fence_epoch, 9);
+        assert_eq!(merged.seen_at, 12);
+        // Newest has location_display, so location comes from newest.
+        assert_eq!(merged.location_display.as_deref(), Some("newest/path"));
+        assert_eq!(merged.location_url.as_deref(), Some("https://newest.test"));
+    }
+
+    #[test]
+    fn dedupe_single_element_passes_through() {
+        let f = finding_row(0x21);
+        assert_eq!(
+            dedupe_findings_rows(std::slice::from_ref(&f)).unwrap(),
+            vec![f]
+        );
+
+        let o = occurrence_row(0x31);
+        assert_eq!(
+            dedupe_occurrence_rows(std::slice::from_ref(&o)).unwrap(),
+            vec![o]
+        );
+
+        let obs = observation_row(10, Some("p"), Some("u"), 1, 2, 3);
+        assert_eq!(
+            dedupe_observation_rows(std::slice::from_ref(&obs)).unwrap(),
+            vec![obs]
+        );
     }
 }

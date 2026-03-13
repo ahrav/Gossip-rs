@@ -627,27 +627,13 @@ impl<'a> FindingsUpsertBatch<'a> {
         Ok(())
     }
 
-    /// Total number of records across all three layers.
-    #[inline]
-    #[must_use]
-    pub const fn total_records(self) -> usize {
-        self.findings.len() + self.occurrences.len() + self.observations.len()
-    }
-
-    /// Validate intra-batch referential integrity and tenant consistency.
+    /// Validate that all records in the batch share the same `tenant_id`.
     ///
-    /// Checks that:
-    /// 1. Every `OccurrenceRecord.finding_id` references a `FindingRecord`
-    ///    in this batch.
-    /// 2. Every `ObservationRecord.occurrence_id` references an
-    ///    `OccurrenceRecord` in this batch.
-    /// 3. All records across all three layers share the same `tenant_id`.
-    ///
-    /// This is a COLD-path diagnostic tool — backends may call it in debug
-    /// mode or tests. It validates within-batch closure only; cross-batch
-    /// references to already-persisted records cannot be checked here.
-    pub fn validate_referential_integrity(self) -> Result<(), PersistenceInputError> {
-        // Tenant consistency: all records must share the same tenant.
+    /// Multi-tenant batches are rejected because backends rely on
+    /// single-tenant isolation for partition routing, index scans, and
+    /// row-level security. Cost is O(n) across all three layers, bounded
+    /// by [`RECOMMENDED_MAX_BATCH_SIZE`](super::RECOMMENDED_MAX_BATCH_SIZE).
+    pub fn validate_tenant_consistency(self) -> Result<(), PersistenceInputError> {
         let expected_tenant = self
             .findings
             .first()
@@ -672,6 +658,31 @@ impl<'a> FindingsUpsertBatch<'a> {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Total number of records across all three layers.
+    #[inline]
+    #[must_use]
+    pub const fn total_records(self) -> usize {
+        self.findings.len() + self.occurrences.len() + self.observations.len()
+    }
+
+    /// Validate intra-batch referential integrity and tenant consistency.
+    ///
+    /// Checks that:
+    /// 1. All records across all three layers share the same `tenant_id`.
+    /// 2. Every `OccurrenceRecord.finding_id` references a `FindingRecord`
+    ///    in this batch.
+    /// 3. Every `ObservationRecord.occurrence_id` references an
+    ///    `OccurrenceRecord` in this batch.
+    ///
+    /// This is a COLD-path diagnostic tool — backends may call it in debug
+    /// mode or tests. It validates within-batch closure only; cross-batch
+    /// references to already-persisted records cannot be checked here.
+    pub fn validate_referential_integrity(self) -> Result<(), PersistenceInputError> {
+        self.validate_tenant_consistency()?;
 
         // Referential integrity: occurrences → findings, observations → occurrences.
         let finding_ids: HashSet<_> = self.findings.iter().map(|f| f.finding_id()).collect();
