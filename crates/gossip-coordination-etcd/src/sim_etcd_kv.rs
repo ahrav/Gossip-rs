@@ -491,13 +491,14 @@ impl SimulatedEtcdKV {
             }
         }
 
-        for key in &keys_to_delete {
-            staged.ops.push(StagedOp::Delete(key.clone()));
+        let keys: Vec<Vec<u8>> = keys_to_delete.into_iter().collect();
+        for key in &keys {
             staged.pending_puts.remove(key);
         }
-        if !keys_to_delete.is_empty() {
+        if !keys.is_empty() {
             staged.changed = true;
         }
+        staged.ops.push(StagedOp::DeleteRange(keys));
         Ok(())
     }
 
@@ -517,13 +518,18 @@ impl SimulatedEtcdKV {
                         })),
                     });
                 }
-                StagedOp::Delete(key) => {
-                    let existed = self.kvs.contains_key(&key);
-                    self.delete_key(&key);
+                StagedOp::DeleteRange(keys) => {
+                    let mut deleted = 0i64;
+                    for key in keys {
+                        if self.kvs.contains_key(&key) {
+                            deleted += 1;
+                        }
+                        self.delete_key(&key);
+                    }
                     responses.push(PbResponseOp {
                         response: Some(PbTxnOpResponse::ResponseDeleteRange(PbDeleteResponse {
                             header,
-                            deleted: i64::from(existed),
+                            deleted,
                             prev_kvs: Vec::new(),
                         })),
                     });
@@ -740,7 +746,8 @@ struct StagedPut {
 #[derive(Debug)]
 enum StagedOp {
     Put(StagedPut),
-    Delete(Vec<u8>),
+    /// All keys matched by a single delete-range request, applied as one batch.
+    DeleteRange(Vec<Vec<u8>>),
 }
 
 /// Accumulated state for a transaction's success branch.
@@ -1505,6 +1512,44 @@ mod tests {
         assert!(
             !wrong_lease.succeeded(),
             "lease compare should reject wrong lease id"
+        );
+    }
+
+    /// A single delete-range request matching N keys must produce exactly one
+    /// response entry with `deleted == N`, not N entries with `deleted == 1`.
+    #[test]
+    fn delete_range_produces_one_response_per_request_op() {
+        let mut kv = SimulatedEtcdKV::new(106);
+        put_absent(&mut kv, b"/pfx/a", b"1");
+        put_absent(&mut kv, b"/pfx/b", b"2");
+        put_absent(&mut kv, b"/pfx/c", b"3");
+
+        // Txn: always-true compare, one put, one delete-range matching 3 keys.
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(
+                        b"sentinel",
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then(vec![
+                        TxnOp::put(b"sentinel", b"v", None),
+                        TxnOp::delete(
+                            b"/pfx/",
+                            Some(etcd_client::DeleteOptions::new().with_prefix()),
+                        ),
+                    ]),
+            )
+            .expect("txn should succeed");
+        assert!(resp.succeeded());
+
+        // Request had 2 ops → response must have exactly 2 entries.
+        let op_responses = resp.op_responses();
+        assert_eq!(
+            op_responses.len(),
+            2,
+            "response count must match request op count"
         );
     }
 }
