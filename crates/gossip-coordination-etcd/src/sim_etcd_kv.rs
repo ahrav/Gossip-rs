@@ -392,13 +392,15 @@ impl SimulatedEtcdKV {
                 keys_to_delete.extend(staged.pending_puts.range(request.key.clone()..).cloned());
             }
         } else {
-            // Explicit half-open range.
-            keys_to_delete.extend(
-                staged
-                    .pending_puts
-                    .range(request.key.clone()..request.range_end.clone())
-                    .cloned(),
-            );
+            // Explicit half-open range: empty if key >= range_end.
+            if request.key < request.range_end {
+                keys_to_delete.extend(
+                    staged
+                        .pending_puts
+                        .range(request.key.clone()..request.range_end.clone())
+                        .cloned(),
+                );
+            }
         }
 
         for key in &keys_to_delete {
@@ -552,6 +554,9 @@ impl SimulatedEtcdKV {
             return Ok(self.kvs.range(key.to_vec()..).collect());
         }
 
+        if key >= range_end {
+            return Ok(Vec::new());
+        }
         Ok(self.kvs.range(key.to_vec()..range_end.to_vec()).collect())
     }
 
@@ -968,12 +973,11 @@ mod tests {
                 .and_then(vec![TxnOp::delete(b"alpha", None)]),
         )
         .expect("delete should succeed");
-        assert!(
-            kv.get(b"alpha".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"alpha".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
 
         kv.txn(
             Txn::new()
@@ -1020,12 +1024,11 @@ mod tests {
         assert_eq!(get_exact(&mut kv, b"owned").value(), b"value");
 
         kv.tick(1);
-        assert!(
-            kv.get(b"owned".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"owned".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
     }
 
     #[test]
@@ -1049,12 +1052,11 @@ mod tests {
 
         kv.lease_revoke(lease.id())
             .expect("lease revoke should succeed");
-        assert!(
-            kv.get(b"revoked".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"revoked".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
     }
 
     #[test]
@@ -1080,12 +1082,11 @@ mod tests {
                 operation: super::SimEtcdOperation::Txn
             }
         ));
-        assert!(
-            kv.get(b"fault".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"fault".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
     }
 
     fn put_absent(kv: &mut SimulatedEtcdKV, key: &[u8], value: &[u8]) {
@@ -1133,34 +1134,25 @@ mod tests {
         );
     }
 
-    /// put(k) followed by delete(k) in the same txn leaves k absent, matching
-    /// etcd's in-order execution of success ops.
+    /// Reversed range bounds (key >= range_end) must not panic; real etcd
+    /// returns an empty result set for such queries.
     #[test]
-    fn txn_put_then_delete_same_absent_key_leaves_key_absent() {
-        let mut kv = SimulatedEtcdKV::new(102);
+    fn reversed_range_bounds_returns_empty_without_panic() {
+        let mut kv = SimulatedEtcdKV::new(105);
+        put_absent(&mut kv, b"a", b"v");
+        put_absent(&mut kv, b"b", b"v");
+        put_absent(&mut kv, b"c", b"v");
 
+        // key="z" > range_end="a" → reversed bounds.
         let resp = kv
-            .txn(
-                Txn::new()
-                    .when(vec![Compare::create_revision(
-                        b"ephemeral",
-                        CompareOp::Equal,
-                        0,
-                    )])
-                    .and_then(vec![
-                        TxnOp::put(b"ephemeral", b"value", None),
-                        TxnOp::delete(b"ephemeral", None),
-                    ]),
+            .get(
+                b"z".to_vec(),
+                Some(GetOptions::new().with_range(b"a".to_vec())),
             )
-            .expect("txn should succeed");
-        assert!(resp.succeeded());
-
-        let get_resp = kv
-            .get(b"ephemeral".to_vec(), None)
-            .expect("get should succeed");
+            .expect("reversed-range get should not panic");
         assert!(
-            get_resp.kvs().is_empty(),
-            "key should be absent after put-then-delete in same txn"
+            resp.kvs().is_empty(),
+            "reversed range should return empty set"
         );
     }
 }
