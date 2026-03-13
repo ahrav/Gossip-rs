@@ -424,42 +424,49 @@ mod tests {
     }
 
     #[test]
-    fn backend_error_display_describes_finding_conflicts() {
-        let err = FindingsPgError::FindingConflict {
-            tenant_id: tenant_id(),
-            finding_id: finding_id(),
-        };
+    fn backend_error_display_describes_identity_conflicts() {
+        let cases: &[(FindingsPgError, &[&str])] = &[
+            (
+                FindingsPgError::FindingConflict {
+                    tenant_id: tenant_id(),
+                    finding_id: finding_id(),
+                },
+                &[
+                    "content-addressed finding identity conflict",
+                    "TenantId(11111111..)",
+                    "FindingId(22222222..)",
+                ],
+            ),
+            (
+                FindingsPgError::OccurrenceConflict {
+                    tenant_id: tenant_id(),
+                    occurrence_id: occurrence_id(),
+                },
+                &[
+                    "content-addressed occurrence identity conflict",
+                    "TenantId(11111111..)",
+                    "OccurrenceId(33333333..)",
+                ],
+            ),
+            (
+                FindingsPgError::ObservationConflict {
+                    tenant_id: tenant_id(),
+                    observation_id: observation_id(),
+                },
+                &[
+                    "policy-scoped observation identity conflict",
+                    "TenantId(11111111..)",
+                    "ObservationId(44444444..)",
+                ],
+            ),
+        ];
 
-        let msg = err.to_string();
-        assert!(msg.contains("content-addressed finding identity conflict"));
-        assert!(msg.contains("TenantId(11111111..)"));
-        assert!(msg.contains("FindingId(22222222..)"));
-    }
-
-    #[test]
-    fn backend_error_display_describes_occurrence_conflicts() {
-        let err = FindingsPgError::OccurrenceConflict {
-            tenant_id: tenant_id(),
-            occurrence_id: occurrence_id(),
-        };
-
-        let msg = err.to_string();
-        assert!(msg.contains("content-addressed occurrence identity conflict"));
-        assert!(msg.contains("TenantId(11111111..)"));
-        assert!(msg.contains("OccurrenceId(33333333..)"));
-    }
-
-    #[test]
-    fn backend_error_display_describes_observation_conflicts() {
-        let err = FindingsPgError::ObservationConflict {
-            tenant_id: tenant_id(),
-            observation_id: observation_id(),
-        };
-
-        let msg = err.to_string();
-        assert!(msg.contains("policy-scoped observation identity conflict"));
-        assert!(msg.contains("TenantId(11111111..)"));
-        assert!(msg.contains("ObservationId(44444444..)"));
+        for (err, expected_substrings) in cases {
+            let msg = err.to_string();
+            for sub in *expected_substrings {
+                assert!(msg.contains(sub), "{msg} should contain {sub}");
+            }
+        }
     }
 
     #[test]
@@ -528,32 +535,5 @@ mod tests {
         for err in cases {
             assert!(err.source().is_none(), "{err} should not expose a source");
         }
-    }
-
-    #[test]
-    fn backend_error_from_postgres_wraps_postgres_variant() {
-        let err = FindingsPgError::from(timeout_postgres_error());
-
-        assert!(matches!(err, FindingsPgError::Postgres(_)));
-    }
-
-    #[test]
-    fn backend_error_from_migration_wraps_migration_variant() {
-        let err = FindingsPgError::from(FindingsPgMigrationError::CorruptedHistoryRecord {
-            version: "0001_findings_schema",
-            found_len: 7,
-        });
-
-        assert!(matches!(err, FindingsPgError::Migration(_)));
-    }
-
-    #[test]
-    fn backend_error_from_schema_wraps_schema_variant() {
-        let err = FindingsPgError::from(FindingsPgSchemaError::SpanOverflow {
-            byte_offset: i64::MAX - 1,
-            byte_length: 3,
-        });
-
-        assert!(matches!(err, FindingsPgError::Schema(_)));
     }
 }

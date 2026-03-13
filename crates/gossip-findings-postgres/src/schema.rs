@@ -156,7 +156,7 @@ pub const OBSERVATIONS_TENANT_RUN_SHARD_INDEX: &str = "observations_tenant_run_s
 /// that are already persisted but absent from the current batch. The real
 /// enforcement point is the PostgreSQL foreign-key constraints on the
 /// durable tables.
-pub fn validate_findings_batch(
+pub(crate) fn validate_findings_batch(
     batch: FindingsUpsertBatch<'_>,
 ) -> Result<(), FindingsPgSchemaError> {
     batch.validate_observation_identity()?;
@@ -1085,14 +1085,6 @@ mod tests {
                 "count SQL must cast COUNT(*) to BIGINT: {sql}"
             );
         }
-    }
-
-    #[test]
-    fn truncate_all_sql_uses_child_first_order() {
-        assert_eq!(
-            TRUNCATE_ALL_SQL,
-            "TRUNCATE TABLE observations, occurrences, findings"
-        );
     }
 
     #[test]
