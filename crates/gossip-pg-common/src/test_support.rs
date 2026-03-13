@@ -3,6 +3,14 @@
 //! The module provisions one maintenance endpoint per test binary, either from
 //! `GOSSIP_POSTGRES_TEST_URL` or from a `postgres:16-alpine` testcontainer,
 //! then creates a fresh database per test for isolation.
+//!
+//! # Database lifecycle
+//!
+//! Test databases are **not** dropped after use. For testcontainer-backed runs
+//! this is harmless — the container is destroyed when the process exits. When
+//! `GOSSIP_POSTGRES_TEST_URL` points at an external persistent instance,
+//! databases accumulate across invocations. Operators of shared CI instances
+//! should periodically prune databases matching the `test_*` prefix.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -168,6 +176,10 @@ fn connection_string_for_db(base_url: &str, db_name: &str) -> String {
 /// Handles both compact (`dbname=postgres`) and spaced (`dbname = postgres`)
 /// forms. Uses quote-aware tokenization so that `dbname=` fragments embedded
 /// inside single-quoted parameter values are not falsely matched.
+///
+/// When `dbname` is present the entire string is rebuilt in canonical
+/// `key=value` form (no spaces around `=`). This intentional normalization
+/// produces a consistent format that libpq accepts identically.
 fn rewrite_keyword_connection_string(base_url: &str, db_name: &str) -> String {
     let pairs = keyword_value_pairs(base_url);
     if pairs.iter().any(|(key, _)| *key == "dbname") {
@@ -247,19 +259,24 @@ fn keyword_value_pairs(input: &str) -> Vec<(&str, &str)> {
 }
 
 /// Replace the database component in a libpq connection URI.
+///
+/// When the query string already contains `dbname=`, only that parameter is
+/// rewritten — the path is left as-is so the returned URI preserves the
+/// structural form of the input (no spurious path segment injected).
 fn rewrite_uri_connection_string(base_url: &str, db_name: &str) -> String {
     let (without_query, query) = match base_url.split_once('?') {
         Some((head, tail)) => (head, Some(tail)),
         None => (base_url, None),
     };
-    let rewritten_path = rewrite_uri_path(without_query, db_name);
 
     match query {
-        Some(query) => format!(
-            "{rewritten_path}?{}",
-            rewrite_uri_query_dbname(query, db_name)
-        ),
-        None => rewritten_path,
+        Some(q) if q.split('&').any(|p| p.starts_with("dbname=")) => {
+            format!("{without_query}?{}", rewrite_uri_query_dbname(q, db_name))
+        }
+        Some(q) => {
+            format!("{}?{q}", rewrite_uri_path(without_query, db_name))
+        }
+        None => rewrite_uri_path(without_query, db_name),
     }
 }
 
@@ -334,11 +351,15 @@ mod tests {
 
     #[test]
     fn uri_connection_string_rewrites_dbname_query_parameter() {
+        // libpq gives `dbname=` query parameters precedence over the path
+        // segment. When the query string carries `dbname=`, only that parameter
+        // is rewritten; the path is left untouched to preserve the input URI
+        // structure.
         let input = "postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable&dbname=postgres";
         let rewritten = rewrite_uri_connection_string(input, "test_4");
         assert_eq!(
             rewritten,
-            "postgresql://postgres:postgres@localhost:5432/test_4?sslmode=disable&dbname=test_4"
+            "postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable&dbname=test_4"
         );
     }
 
@@ -400,6 +421,16 @@ mod tests {
         assert!(
             rewritten.contains("dbname=test_dbs"),
             "function must still append dbname even with malformed input"
+        );
+    }
+
+    #[test]
+    fn uri_no_path_with_dbname_query_param_preserves_structure() {
+        let input = "postgresql://postgres:postgres@localhost:5432?dbname=postgres";
+        let rewritten = rewrite_uri_connection_string(input, "test_nopath");
+        assert_eq!(
+            rewritten, "postgresql://postgres:postgres@localhost:5432?dbname=test_nopath",
+            "URI with no path but dbname= in query should not inject a path segment"
         );
     }
 
