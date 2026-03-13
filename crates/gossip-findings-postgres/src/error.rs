@@ -126,7 +126,24 @@ impl fmt::Display for FindingsPgError {
                     write!(f, "postgres findings connection/protocol error")
                 }
             }
-            Self::Migration(source) => write!(f, "postgres findings migration failed: {source}"),
+            Self::Migration(source) => match source {
+                FindingsPgMigrationError::Postgres { operation, source } => {
+                    if let Some(db_err) = source.as_db_error() {
+                        write!(
+                            f,
+                            "postgres findings migration {operation} failed: {} ({})",
+                            db_err.severity(),
+                            db_err.code().code()
+                        )
+                    } else {
+                        write!(
+                            f,
+                            "postgres findings migration {operation} connection/protocol error"
+                        )
+                    }
+                }
+                other => write!(f, "postgres findings migration failed: {other}"),
+            },
             Self::MutexPoisoned => f.write_str("postgres findings client mutex is poisoned"),
             Self::BatchTooLarge { len, max } => {
                 write!(f, "findings batch too large: {len} records (limit {max})")
@@ -355,6 +372,23 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "postgres findings connection/protocol error"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_redacts_migration_wrapped_postgres_errors() {
+        // A migration-wrapped postgres error must redact the same way as a
+        // direct postgres error — the raw `postgres::Error` text ("timeout
+        // waiting for server") must not appear in the Display output.
+        let err = FindingsPgError::Migration(FindingsPgMigrationError::postgres(
+            MigrationOperation::Connect,
+            timeout_postgres_error(),
+        ));
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("timeout waiting for server"),
+            "migration-wrapped postgres error must not leak raw driver text, got: {msg}"
         );
     }
 
