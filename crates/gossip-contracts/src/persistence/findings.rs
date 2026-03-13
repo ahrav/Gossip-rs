@@ -611,9 +611,10 @@ impl<'a> FindingsUpsertBatch<'a> {
     ///
     /// Only observations are checked because `FindingRecord` and
     /// `OccurrenceRecord` always derive their IDs at construction — no
-    /// caller-supplied ID is accepted. `ObservationRecord::from_persisted()`
-    /// is the only path that accepts a stored ID, making observations the
-    /// only layer where mismatch is possible.
+    /// caller-supplied ID is accepted. Any constructor that accepts a
+    /// stored observation id (`from_persisted`, and in test builds
+    /// `from_persisted_unchecked`) can introduce a mismatch, making
+    /// observations the only layer where batch-level validation is needed.
     ///
     /// Note: this does **not** check referential integrity or tenant
     /// consistency — call

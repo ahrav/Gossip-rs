@@ -878,6 +878,39 @@ mod tests {
     }
 
     #[test]
+    fn merge_observation_winner_url_without_display_follows_loser_location() {
+        // ObservationRow::from_record couples display and URL through the
+        // Location type (display is always present when location exists), so
+        // url-without-display cannot arise through the normal projection path.
+        // At the raw row level, the merge rule "URL follows display source"
+        // means the winner's orphaned URL is intentionally not carried forward.
+        let existing = observation_row(
+            10,
+            Some("existing/path"),
+            Some("https://existing.test"),
+            1,
+            2,
+            3,
+        );
+        let incoming = ObservationRow {
+            location_display: None,
+            location_url: Some("https://incoming-orphan.test".to_owned()),
+            ..observation_row(11, None, None, 4, 5, 6)
+        };
+
+        let merged = merge_observation_rows(&existing, &incoming).expect("merge should succeed");
+
+        // Incoming wins provenance (higher seen_at).
+        assert_eq!(merged.run_id, incoming.run_id);
+        // Winner has no display, so location falls back to loser.
+        assert_eq!(merged.location_display.as_deref(), Some("existing/path"));
+        assert_eq!(
+            merged.location_url.as_deref(),
+            Some("https://existing.test")
+        );
+    }
+
+    #[test]
     fn dedupe_empty_inputs_return_empty() {
         assert_eq!(dedupe_findings_rows(&[]).unwrap(), vec![]);
         assert_eq!(dedupe_occurrence_rows(&[]).unwrap(), vec![]);
