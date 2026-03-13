@@ -97,7 +97,7 @@ impl SimulatedEtcdKV {
             });
         }
 
-        let matched = self.matching_keys(&request.key, &request.range_end, true)?;
+        let matched = self.matching_keys(&request.key, &request.range_end)?;
         let filtered: Vec<_> = matched
             .into_iter()
             .filter(|(_, entry)| passes_revision_filters(&request, entry))
@@ -346,44 +346,79 @@ impl SimulatedEtcdKV {
                 lease_id: request.lease,
             });
         }
-        if !staged.touched_keys.insert(request.key.clone()) {
+        if !staged.all_put_keys.insert(request.key.clone()) {
             return Err(SimEtcdError::DuplicateMutation {
                 key: request.key.clone(),
             });
         }
-        staged.puts.push(StagedPut {
+        staged.pending_puts.insert(request.key.clone());
+        staged.ops.push(StagedOp::Put(StagedPut {
             key: request.key.clone(),
             value: request.value.clone(),
             lease_id: request.lease,
-        });
+        }));
         staged.changed = true;
         Ok(())
     }
 
+    /// Stage delete operations, resolving against both the pre-transaction
+    /// store and any previously staged puts (so that `put(k)` followed by
+    /// `delete(k)` in the same txn correctly targets k).
     fn stage_delete(
         &self,
         request: &PbDeleteRequest,
         staged: &mut StagedTxn,
     ) -> Result<(), SimEtcdError> {
-        let matched = self.matching_keys(&request.key, &request.range_end, false)?;
+        let mut keys_to_delete: BTreeSet<Vec<u8>> = BTreeSet::new();
+
+        // Match against pre-transaction store.
+        let matched = self.matching_keys(&request.key, &request.range_end)?;
         for (key, _) in matched {
-            if !staged.touched_keys.insert(key.clone()) {
-                return Err(SimEtcdError::DuplicateMutation { key: key.clone() });
-            }
-            staged.deleted_keys.insert(key.clone());
+            keys_to_delete.insert(key.clone());
         }
-        if !staged.deleted_keys.is_empty() {
+
+        // Also match against previously staged puts so that a delete can
+        // target a key created by an earlier put in the same transaction.
+        if request.range_end.is_empty() {
+            // Point delete.
+            if staged.pending_puts.contains(&request.key) {
+                keys_to_delete.insert(request.key.clone());
+            }
+        } else if request.range_end == [0] {
+            // From-key or all-keys sentinel.
+            if request.key.is_empty() {
+                keys_to_delete.extend(staged.pending_puts.iter().cloned());
+            } else {
+                keys_to_delete.extend(staged.pending_puts.range(request.key.clone()..).cloned());
+            }
+        } else {
+            // Explicit half-open range.
+            keys_to_delete.extend(
+                staged
+                    .pending_puts
+                    .range(request.key.clone()..request.range_end.clone())
+                    .cloned(),
+            );
+        }
+
+        for key in &keys_to_delete {
+            staged.ops.push(StagedOp::Delete(key.clone()));
+            staged.pending_puts.remove(key);
+        }
+        if !keys_to_delete.is_empty() {
             staged.changed = true;
         }
         Ok(())
     }
 
+    /// Replay staged operations in the order they were recorded, matching
+    /// etcd's sequential execution of transaction success ops.
     fn apply_staged_txn(&mut self, staged: StagedTxn, revision: i64) {
-        for key in staged.deleted_keys {
-            self.delete_key(&key);
-        }
-        for put in staged.puts {
-            self.put_key(put, revision);
+        for op in staged.ops {
+            match op {
+                StagedOp::Put(put) => self.put_key(put, revision),
+                StagedOp::Delete(key) => self.delete_key(&key),
+            }
         }
     }
 
@@ -489,11 +524,17 @@ impl SimulatedEtcdKV {
         }
     }
 
+    /// Resolve the set of keys matching an etcd key+range_end pair.
+    ///
+    /// `range_end` semantics follow the etcd v3 API:
+    /// - empty → point lookup on `key`
+    /// - `[0]` + empty key → all keys
+    /// - `[0]` + non-empty key → all keys >= `key` (from-key scan)
+    /// - otherwise → half-open range `[key, range_end)`
     fn matching_keys<'a>(
         &'a self,
         key: &[u8],
         range_end: &[u8],
-        treat_nonempty_sentinel_as_prefix: bool,
     ) -> Result<Vec<(&'a Vec<u8>, &'a KvEntry)>, SimEtcdError> {
         if range_end.is_empty() {
             return Ok(self
@@ -506,13 +547,6 @@ impl SimulatedEtcdKV {
         if range_end == [0] {
             if key.is_empty() {
                 return Ok(self.kvs.iter().collect());
-            }
-            if treat_nonempty_sentinel_as_prefix {
-                return Ok(self
-                    .kvs
-                    .range(key.to_vec()..)
-                    .take_while(|(candidate, _)| candidate.starts_with(key))
-                    .collect());
             }
             return Ok(self.kvs.range(key.to_vec()..).collect());
         }
@@ -566,11 +600,28 @@ struct StagedPut {
     lease_id: i64,
 }
 
+/// Single staged operation in execution order.
+#[derive(Debug)]
+enum StagedOp {
+    Put(StagedPut),
+    Delete(Vec<u8>),
+}
+
+/// Accumulated state for a transaction's success branch.
+///
+/// Operations are recorded in the order they appear in the request so that
+/// `apply_staged_txn` can replay them sequentially — matching real etcd's
+/// in-order execution of success ops.
 #[derive(Debug, Default)]
 struct StagedTxn {
-    puts: Vec<StagedPut>,
-    deleted_keys: BTreeSet<Vec<u8>>,
-    touched_keys: BTreeSet<Vec<u8>>,
+    ops: Vec<StagedOp>,
+    /// Keys staged for put that have not yet been cancelled by a later delete.
+    /// Used so that `stage_delete` can resolve against previously staged puts
+    /// in addition to the pre-transaction store.
+    pending_puts: BTreeSet<Vec<u8>>,
+    /// Keys already staged for put (including those later deleted).
+    /// Guards against two puts to the same key in the same transaction.
+    all_put_keys: BTreeSet<Vec<u8>>,
     changed: bool,
 }
 
@@ -916,12 +967,11 @@ mod tests {
                 .and_then(vec![TxnOp::delete(b"alpha", None)]),
         )
         .expect("delete should succeed");
-        assert!(
-            kv.get(b"alpha".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"alpha".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
 
         kv.txn(
             Txn::new()
@@ -968,12 +1018,11 @@ mod tests {
         assert_eq!(get_exact(&mut kv, b"owned").value(), b"value");
 
         kv.tick(1);
-        assert!(
-            kv.get(b"owned".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"owned".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
     }
 
     #[test]
@@ -997,12 +1046,11 @@ mod tests {
 
         kv.lease_revoke(lease.id())
             .expect("lease revoke should succeed");
-        assert!(
-            kv.get(b"revoked".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"revoked".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
     }
 
     #[test]
@@ -1028,12 +1076,11 @@ mod tests {
                 operation: super::SimEtcdOperation::Txn
             }
         ));
-        assert!(
-            kv.get(b"fault".to_vec(), None)
-                .expect("get should succeed")
-                .kvs()
-                .is_empty()
-        );
+        assert!(kv
+            .get(b"fault".to_vec(), None)
+            .expect("get should succeed")
+            .kvs()
+            .is_empty());
     }
 
     fn put_absent(kv: &mut SimulatedEtcdKV, key: &[u8], value: &[u8]) {
@@ -1052,5 +1099,63 @@ mod tests {
             .into_iter()
             .next()
             .expect("key should exist")
+    }
+
+    /// `with_from_key()` (range_end=[0]) returns all keys >= the start key,
+    /// not just keys sharing the start key's prefix.
+    #[test]
+    fn from_key_get_returns_all_keys_gte_start() {
+        let mut kv = SimulatedEtcdKV::new(101);
+        put_absent(&mut kv, b"/a/1", b"a1");
+        put_absent(&mut kv, b"/a/2", b"a2");
+        put_absent(&mut kv, b"/b/1", b"b1");
+        put_absent(&mut kv, b"/c/1", b"c1");
+
+        let resp = kv
+            .get(b"/a/".to_vec(), Some(GetOptions::new().with_from_key()))
+            .expect("from_key get should succeed");
+
+        let keys: Vec<Vec<u8>> = resp.kvs().iter().map(|kv| kv.key().to_vec()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                b"/a/1".to_vec(),
+                b"/a/2".to_vec(),
+                b"/b/1".to_vec(),
+                b"/c/1".to_vec(),
+            ],
+            "from_key should return ALL keys >= start, not just prefix matches"
+        );
+    }
+
+    /// put(k) followed by delete(k) in the same txn leaves k absent, matching
+    /// etcd's in-order execution of success ops.
+    #[test]
+    fn txn_put_then_delete_same_absent_key_leaves_key_absent() {
+        let mut kv = SimulatedEtcdKV::new(102);
+
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(
+                        b"ephemeral",
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then(vec![
+                        TxnOp::put(b"ephemeral", b"value", None),
+                        TxnOp::delete(b"ephemeral", None),
+                    ]),
+            )
+            .expect("txn should succeed");
+        assert!(resp.succeeded());
+
+        let get_resp = kv
+            .get(b"ephemeral".to_vec(), None)
+            .expect("get should succeed");
+        assert!(
+            get_resp.kvs().is_empty(),
+            "key should be absent after put-then-delete in same txn"
+        );
     }
 }
