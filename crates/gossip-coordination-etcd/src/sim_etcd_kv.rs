@@ -29,7 +29,7 @@ use etcd_client::proto::{
     PbRangeResponse, PbResponseHeader, PbResponseOp, PbTargetUnion, PbTxnOpRequest,
     PbTxnOpResponse, PbTxnRequest, PbTxnResponse,
 };
-use etcd_client::{CompareOp, GetOptions, LeaseGrantResponse, LeaseRevokeResponse, Txn};
+use etcd_client::{CompareOp, GetOptions, LeaseGrantResponse, LeaseRevokeResponse, Txn, TxnOp};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -164,8 +164,16 @@ impl SimulatedEtcdKV {
             });
         }
 
-        let mut request: PbRangeRequest = options.unwrap_or_default().into();
-        request.key = key.into();
+        let PbTxnRequest { mut success, .. } =
+            Txn::new().and_then(vec![TxnOp::get(key, options)]).into();
+        let request: PbRangeRequest = match success
+            .pop()
+            .and_then(|op| op.request)
+            .expect("TxnOp::get must produce a range request payload")
+        {
+            PbTxnOpRequest::RequestRange(request) => request,
+            _ => unreachable!("TxnOp::get must build a range request"),
+        };
 
         if request.revision > 0 {
             return Err(SimEtcdError::UnsupportedGetOption {
@@ -1049,6 +1057,23 @@ mod tests {
             .expect("count-only prefix scan should succeed");
         assert!(count_only.kvs().is_empty());
         assert_eq!(count_only.count(), 3);
+    }
+
+    #[test]
+    fn prefix_scan_with_trailing_slash_excludes_sibling_stems() {
+        let mut kv = SimulatedEtcdKV::new(109);
+        put_absent(&mut kv, b"/runs/1/shards/0001", b"record");
+        put_absent(&mut kv, b"/runs/1/shards_active/0001", b"active");
+
+        let response = kv
+            .get(
+                b"/runs/1/shards/".to_vec(),
+                Some(GetOptions::new().with_prefix().with_keys_only()),
+            )
+            .expect("prefix scan should succeed");
+        let keys: Vec<Vec<u8>> = response.kvs().iter().map(|kv| kv.key().to_vec()).collect();
+
+        assert_eq!(keys, vec![b"/runs/1/shards/0001".to_vec()]);
     }
 
     #[test]

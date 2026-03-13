@@ -42,12 +42,16 @@ use gossip_coordination::{
     hash_register_shards_payload, hash_unpark_payload, shard_limit_violation, validate_manifest,
 };
 
-use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
+use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator, SyncEtcdLike};
 use super::{CasOutcome, MAX_SHARDS_PER_ETCD_TXN, TxnBuilder, cas_retry_delay};
 use crate::codec::{encode_run_record, encode_shard_record_into};
 use crate::keyspace::{ShardActiveIndexKey, ShardOwnerKey};
+#[cfg(any(test, feature = "test-support"))]
+use crate::sim_coordinator::SimEtcdCoordinator;
 
-impl RunManagement for EtcdCoordinator {
+macro_rules! impl_sync_run_management {
+    ($coord:ty) => {
+        impl RunManagement for $coord {
     /// Create a new run in `Initializing` status.
     ///
     /// Uses a single CAS transaction guarded by key absence to prevent
@@ -61,6 +65,7 @@ impl RunManagement for EtcdCoordinator {
         run: RunId,
         config: RunConfig,
     ) -> Result<RunRecord, CreateRunError> {
+        self.sync_logical_time(now);
         config.assert_valid();
 
         let record = RunRecord {
@@ -84,6 +89,9 @@ impl RunManagement for EtcdCoordinator {
             CreateRunError::BackendError(super::map_etcd_err("create_run.txn", err))
         })?;
         if let CasOutcome::Committed(created) = outcome {
+            self.refresh_cached_run_state(tenant, run).map_err(|err| {
+                CreateRunError::BackendError(super::map_etcd_err("create_run.refresh_cache", err))
+            })?;
             return Ok(created);
         }
         Err(CreateRunError::RunAlreadyExists { run })
@@ -113,6 +121,7 @@ impl RunManagement for EtcdCoordinator {
         shards: &[InitialShardInput<'_>],
         op_id: OpId,
     ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError> {
+        self.sync_logical_time(now);
         if shards.len() > MAX_SHARDS_PER_ETCD_TXN {
             return Err(RegisterShardsError::ResourceExhausted {
                 resource: "etcd_txn_ops",
@@ -121,7 +130,7 @@ impl RunManagement for EtcdCoordinator {
 
         let payload_hash = hash_register_shards_payload(shards);
 
-        self.cas_retry(
+        let result = self.cas_retry(
             |this, _attempt| {
                 let persisted_run = match this.load_run_record(tenant, run) {
                     Ok(Some(run_record)) => run_record,
@@ -319,7 +328,14 @@ impl RunManagement for EtcdCoordinator {
                     "CAS retry budget exhausted",
                 )))
             },
-        )
+        )?;
+        self.refresh_cached_run_state(tenant, run).map_err(|err| {
+            RegisterShardsError::BackendError(super::map_etcd_err(
+                "register_shards.refresh_cache",
+                err,
+            ))
+        })?;
+        Ok(result)
     }
 
     /// Load a run record by exact key. Returns `GetRunError::RunNotFound` if
@@ -352,6 +368,7 @@ impl RunManagement for EtcdCoordinator {
         tenant: TenantId,
         run: RunId,
     ) -> Result<RunProgress, GetRunError> {
+        self.sync_logical_time(now);
         let _ = self.get_run(tenant, run)?;
         let shards = self.scan_run_shards(tenant, run).map_err(|err| {
             GetRunError::BackendError(super::map_etcd_err("get_run_progress.scan", err))
@@ -382,6 +399,7 @@ impl RunManagement for EtcdCoordinator {
         filter: ShardFilter,
         out: &mut Vec<ShardSummary>,
     ) -> Result<(), GetRunError> {
+        self.sync_logical_time(now);
         let _ = self.get_run(tenant, run)?;
         let shards = self.scan_run_shards(tenant, run).map_err(|err| {
             GetRunError::BackendError(super::map_etcd_err("list_shards_into.scan", err))
@@ -435,6 +453,7 @@ impl RunManagement for EtcdCoordinator {
         run: RunId,
         candidates: &mut Vec<ShardId>,
     ) -> Result<Option<LogicalTime>, GetRunError> {
+        self.sync_logical_time(_now);
         let _ = self.get_run(tenant, run)?;
 
         // Keys-only scan of the active-shard index to find unleased candidates.
@@ -504,7 +523,16 @@ impl RunManagement for EtcdCoordinator {
         run: RunId,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
-        self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CompleteRun)
+        self.sync_logical_time(now);
+        let result =
+            self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CompleteRun)?;
+        self.refresh_cached_run_state(tenant, run).map_err(|err| {
+            RunTransitionError::BackendError(super::map_etcd_err(
+                "complete_run.refresh_cache",
+                err,
+            ))
+        })?;
+        Ok(result)
     }
 
     /// Transition an `Active` run to `Failed`. Requires the active-run
@@ -516,7 +544,15 @@ impl RunManagement for EtcdCoordinator {
         run: RunId,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
-        self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::FailRun)
+        self.sync_logical_time(now);
+        let result = self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::FailRun)?;
+        self.refresh_cached_run_state(tenant, run).map_err(|err| {
+            RunTransitionError::BackendError(super::map_etcd_err(
+                "fail_run.refresh_cache",
+                err,
+            ))
+        })?;
+        Ok(result)
     }
 
     /// Transition an `Initializing` or `Active` run to `Cancelled`.
@@ -531,7 +567,16 @@ impl RunManagement for EtcdCoordinator {
         run: RunId,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
-        self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CancelRun)
+        self.sync_logical_time(now);
+        let result =
+            self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CancelRun)?;
+        self.refresh_cached_run_state(tenant, run).map_err(|err| {
+            RunTransitionError::BackendError(super::map_etcd_err(
+                "cancel_run.refresh_cache",
+                err,
+            ))
+        })?;
+        Ok(result)
     }
 
     /// Re-activate a parked shard, making it available for claiming.
@@ -555,10 +600,11 @@ impl RunManagement for EtcdCoordinator {
         key: ShardKey,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, UnparkError> {
+        self.sync_logical_time(now);
         let payload_hash = hash_unpark_payload(&key);
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
 
-        self.cas_retry(
+        let result = self.cas_retry(
             |this, _attempt| {
                 let persisted = match this.load_shard_record(tenant, key) {
                     Ok(Some(shard)) => shard,
@@ -730,11 +776,15 @@ impl RunManagement for EtcdCoordinator {
                     "CAS retry budget exhausted",
                 )))
             },
-        )
+        )?;
+        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
+            UnparkError::BackendError(super::map_etcd_err("unpark.refresh_cache", err))
+        })?;
+        Ok(result)
     }
-}
+        }
 
-impl ShardClaiming for EtcdCoordinator {
+        impl ShardClaiming for $coord {
     /// Claim the next available shard using the default round-robin
     /// strategy.
     ///
@@ -762,7 +812,13 @@ impl ShardClaiming for EtcdCoordinator {
         self.claim_candidates_scratch = candidates;
         result
     }
+        }
+    };
 }
+
+impl_sync_run_management!(EtcdCoordinator);
+#[cfg(any(test, feature = "test-support"))]
+impl_sync_run_management!(SimEtcdCoordinator);
 
 impl AsyncRunManagement for AsyncEtcdCoordinator {
     async fn create_run(

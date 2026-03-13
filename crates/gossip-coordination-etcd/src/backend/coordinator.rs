@@ -74,6 +74,133 @@ use super::{
 #[cfg(any(test, feature = "test-support"))]
 use super::test_support::EtcdTestFaultState;
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) trait SyncEtcdLike {
+    fn fail_unimplemented<T>(&self, operation: &'static str) -> T;
+
+    fn sync_logical_time(&self, _now: LogicalTime) {}
+
+    fn refresh_cached_run_state(
+        &mut self,
+        _tenant: TenantId,
+        _run: RunId,
+    ) -> Result<(), EtcdCoordinatorError> {
+        Ok(())
+    }
+
+    fn cas_retry<T, E>(
+        &mut self,
+        attempt: impl FnMut(&mut Self, usize) -> Result<CasOutcome<T>, E>,
+        on_exhaustion: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E>;
+
+    fn load_shard_and_validate_lease<E>(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        map_not_found: impl FnOnce(ShardKey) -> E,
+        map_load_error: impl FnOnce(EtcdCoordinatorError) -> E,
+        map_stale_fence: impl FnOnce(
+            gossip_coordination::FenceEpoch,
+            gossip_coordination::FenceEpoch,
+        ) -> E,
+    ) -> Result<PersistedShard, E>
+    where
+        E: From<gossip_coordination::CoordError>;
+
+    fn etcd_get(
+        &self,
+        key: Vec<u8>,
+        options: Option<GetOptions>,
+    ) -> Result<etcd_client::GetResponse, EtcdCoordinatorError>;
+
+    fn etcd_txn(&self, txn: Txn) -> Result<etcd_client::TxnResponse, EtcdCoordinatorError>;
+
+    fn etcd_lease_grant(
+        &self,
+        ttl: i64,
+    ) -> Result<etcd_client::LeaseGrantResponse, EtcdCoordinatorError>;
+
+    fn etcd_lease_keep_alive_once(&self, lease_id: i64) -> Result<(), EtcdCoordinatorError>;
+
+    fn etcd_lease_revoke(
+        &self,
+        lease_id: i64,
+    ) -> Result<etcd_client::LeaseRevokeResponse, EtcdCoordinatorError>;
+
+    fn load_run_record(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<Option<PersistedRun>, EtcdCoordinatorError>;
+
+    fn load_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<PersistedTenantShardCount>, EtcdCoordinatorError>;
+
+    fn prepare_tenant_shard_count_mutation(
+        &self,
+        tenant: TenantId,
+        additional: usize,
+    ) -> Result<TenantShardCountMutation, EtcdCoordinatorError>;
+
+    fn load_shard_record(
+        &self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<Option<PersistedShard>, EtcdCoordinatorError>;
+
+    fn scan_run_shards(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<Vec<PersistedShard>, EtcdCoordinatorError>;
+
+    fn count_available_lightweight(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<CapacityHint, EtcdCoordinatorError>;
+
+    fn count_persisted_shards_under_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<usize, EtcdCoordinatorError>;
+
+    fn transition_run_terminal(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+        op_kind: RunOpKind,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
+
+    fn best_effort_revoke_lease(&self, lease_id: i64);
+
+    fn load_run_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<PersistedRun, InfraError>;
+
+    fn load_shard_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<PersistedShard, InfraError>;
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_replace_fault_if_armed(&mut self, _tenant: TenantId, _key: ShardKey) {}
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_residual_fault_if_armed(&mut self, _tenant: TenantId, _key: ShardKey) {}
+}
+
 // ---------------------------------------------------------------------------
 // EtcdCoordinator — sync wrapper
 // ---------------------------------------------------------------------------
@@ -1248,9 +1375,9 @@ impl EtcdCoordinator {
 impl TxnBuilder {
     /// Execute the assembled transaction through the sync coordinator and
     /// translate etcd success/failure into a CAS retry outcome.
-    pub(super) fn execute<T>(
+    pub(crate) fn execute<T, C: SyncEtcdLike>(
         self,
-        coordinator: &EtcdCoordinator,
+        coordinator: &C,
         on_success: T,
     ) -> Result<CasOutcome<T>, EtcdCoordinatorError> {
         let response = coordinator.etcd_txn(self.build())?;
@@ -1259,6 +1386,173 @@ impl TxnBuilder {
         } else {
             Ok(CasOutcome::RetryNeeded)
         }
+    }
+}
+
+impl SyncEtcdLike for EtcdCoordinator {
+    fn fail_unimplemented<T>(&self, operation: &'static str) -> T {
+        EtcdCoordinator::fail_unimplemented(self, operation)
+    }
+
+    fn cas_retry<T, E>(
+        &mut self,
+        attempt: impl FnMut(&mut Self, usize) -> Result<CasOutcome<T>, E>,
+        on_exhaustion: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        EtcdCoordinator::cas_retry(self, attempt, on_exhaustion)
+    }
+
+    fn load_shard_and_validate_lease<E>(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        map_not_found: impl FnOnce(ShardKey) -> E,
+        map_load_error: impl FnOnce(EtcdCoordinatorError) -> E,
+        map_stale_fence: impl FnOnce(
+            gossip_coordination::FenceEpoch,
+            gossip_coordination::FenceEpoch,
+        ) -> E,
+    ) -> Result<PersistedShard, E>
+    where
+        E: From<gossip_coordination::CoordError>,
+    {
+        EtcdCoordinator::load_shard_and_validate_lease(
+            self,
+            now,
+            tenant,
+            lease,
+            map_not_found,
+            map_load_error,
+            map_stale_fence,
+        )
+    }
+
+    fn etcd_get(
+        &self,
+        key: Vec<u8>,
+        options: Option<GetOptions>,
+    ) -> Result<etcd_client::GetResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_get(self, key, options)
+    }
+
+    fn etcd_txn(&self, txn: Txn) -> Result<etcd_client::TxnResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_txn(self, txn)
+    }
+
+    fn etcd_lease_grant(
+        &self,
+        ttl: i64,
+    ) -> Result<etcd_client::LeaseGrantResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_lease_grant(self, ttl)
+    }
+
+    fn etcd_lease_keep_alive_once(&self, lease_id: i64) -> Result<(), EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_lease_keep_alive_once(self, lease_id)
+    }
+
+    fn etcd_lease_revoke(
+        &self,
+        lease_id: i64,
+    ) -> Result<etcd_client::LeaseRevokeResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_lease_revoke(self, lease_id)
+    }
+
+    fn load_run_record(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<Option<PersistedRun>, EtcdCoordinatorError> {
+        EtcdCoordinator::load_run_record(self, tenant, run)
+    }
+
+    fn load_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<PersistedTenantShardCount>, EtcdCoordinatorError> {
+        EtcdCoordinator::load_tenant_shard_count(self, tenant)
+    }
+
+    fn prepare_tenant_shard_count_mutation(
+        &self,
+        tenant: TenantId,
+        additional: usize,
+    ) -> Result<TenantShardCountMutation, EtcdCoordinatorError> {
+        EtcdCoordinator::prepare_tenant_shard_count_mutation(self, tenant, additional)
+    }
+
+    fn load_shard_record(
+        &self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<Option<PersistedShard>, EtcdCoordinatorError> {
+        EtcdCoordinator::load_shard_record(self, tenant, key)
+    }
+
+    fn scan_run_shards(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<Vec<PersistedShard>, EtcdCoordinatorError> {
+        EtcdCoordinator::scan_run_shards(self, tenant, run)
+    }
+
+    fn count_available_lightweight(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<CapacityHint, EtcdCoordinatorError> {
+        EtcdCoordinator::count_available_lightweight(self, tenant, run)
+    }
+
+    fn count_persisted_shards_under_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<usize, EtcdCoordinatorError> {
+        EtcdCoordinator::count_persisted_shards_under_prefix(self, prefix)
+    }
+
+    fn transition_run_terminal(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+        op_kind: RunOpKind,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+        EtcdCoordinator::transition_run_terminal(self, now, tenant, run, op_id, op_kind)
+    }
+
+    fn best_effort_revoke_lease(&self, lease_id: i64) {
+        EtcdCoordinator::best_effort_revoke_lease(self, lease_id);
+    }
+
+    fn load_run_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<PersistedRun, InfraError> {
+        EtcdCoordinator::load_run_checked(self, context, tenant, run)
+    }
+
+    fn load_shard_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<PersistedShard, InfraError> {
+        EtcdCoordinator::load_shard_checked(self, context, tenant, key)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_replace_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
+        EtcdCoordinator::inject_split_replace_fault_if_armed(self, tenant, key);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_residual_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
+        EtcdCoordinator::inject_split_residual_fault_if_armed(self, tenant, key);
     }
 }
 

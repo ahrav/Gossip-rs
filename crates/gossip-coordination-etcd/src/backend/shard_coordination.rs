@@ -63,11 +63,13 @@ use gossip_coordination::{
 
 use crate::codec::{encode_owner_value_into, encode_shard_record, encode_shard_record_into};
 
-use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
+use super::coordinator::{AsyncEtcdCoordinator, EtcdCoordinator, SyncEtcdLike};
 use super::{
     CasOutcome, PersistedShard, TxnBuilder, build_shard_owner_cas, cas_retry_delay,
     split_replace_replay_child_ids, validate_loaded_shard_lease,
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::sim_coordinator::SimEtcdCoordinator;
 
 /// Project a persisted shard record into the caller's [`AcquireScratch`]
 /// buffer and build the [`AcquireResultView`].
@@ -108,7 +110,9 @@ fn build_acquire_result<'a>(
     }
 }
 
-impl CoordinationBackend for EtcdCoordinator {
+macro_rules! impl_sync_coordination_backend {
+    ($coord:ty) => {
+        impl CoordinationBackend for $coord {
     /// Atomically take ownership of a shard, restoring its persisted state
     /// into `out`.
     ///
@@ -140,6 +144,7 @@ impl CoordinationBackend for EtcdCoordinator {
         worker: WorkerId,
         out: &'a mut AcquireScratch,
     ) -> Result<AcquireResultView<'a>, AcquireError> {
+        self.sync_logical_time(now);
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
 
@@ -323,6 +328,9 @@ impl CoordinationBackend for EtcdCoordinator {
             },
         )?;
 
+        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
+            AcquireError::BackendError(super::map_etcd_err("acquire.refresh_cache", err))
+        })?;
         Ok(build_acquire_result(out, &persisted, lease, capacity))
     }
 
@@ -349,6 +357,7 @@ impl CoordinationBackend for EtcdCoordinator {
         tenant: TenantId,
         lease: &Lease,
     ) -> Result<RenewResult, RenewError> {
+        self.sync_logical_time(now);
         let key = lease.shard_key();
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
@@ -360,7 +369,7 @@ impl CoordinationBackend for EtcdCoordinator {
             .map_err(RenewError::BackendError)?;
         let lease_duration = run_record.record.config.lease_duration();
 
-        self.cas_retry(
+        let result = self.cas_retry(
             |this, _attempt| {
                 let persisted = this.load_shard_and_validate_lease(
                     now,
@@ -458,7 +467,11 @@ impl CoordinationBackend for EtcdCoordinator {
                     "CAS retry budget exhausted",
                 )))
             },
-        )
+        )?;
+        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
+            RenewError::BackendError(super::map_etcd_err("renew.refresh_cache", err))
+        })?;
+        Ok(result)
     }
 
     /// Persist a new cursor position for an owned shard.
@@ -479,12 +492,13 @@ impl CoordinationBackend for EtcdCoordinator {
         new_cursor: &CursorUpdate<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CheckpointError> {
+        self.sync_logical_time(now);
         let key = lease.shard_key();
         let payload_hash = hash_checkpoint_payload(new_cursor);
         let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
         let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
 
-        self.cas_retry(
+        let result = self.cas_retry(
             |this, _attempt| {
                 let persisted = match this.load_shard_record(tenant, key) {
                     Ok(Some(shard)) => shard,
@@ -581,7 +595,11 @@ impl CoordinationBackend for EtcdCoordinator {
                      and terminal status",
                 )))
             },
-        )
+        )?;
+        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
+            CheckpointError::BackendError(super::map_etcd_err("checkpoint.refresh_cache", err))
+        })?;
+        Ok(result)
     }
 
     /// Mark a shard as completed with a final cursor position.
@@ -596,6 +614,7 @@ impl CoordinationBackend for EtcdCoordinator {
         _final_cursor: &CursorUpdate<'_>,
         _op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteError> {
+        self.sync_logical_time(_now);
         self.fail_unimplemented("complete")
     }
 
@@ -611,6 +630,7 @@ impl CoordinationBackend for EtcdCoordinator {
         _reason: ParkReason,
         _op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, ParkError> {
+        self.sync_logical_time(_now);
         self.fail_unimplemented("park_shard")
     }
 
@@ -642,6 +662,7 @@ impl CoordinationBackend for EtcdCoordinator {
         plan: SplitReplacePlan<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
+        self.sync_logical_time(now);
         let key = lease.shard_key();
         let payload_hash = hash_split_replace_payload(&plan);
 
@@ -651,7 +672,7 @@ impl CoordinationBackend for EtcdCoordinator {
         let mut child_index_ops: Vec<TxnOp> = Vec::with_capacity(cap);
         let mut child_absent_compares: Vec<Compare> = Vec::with_capacity(cap);
 
-        self.cas_retry(
+        let result = self.cas_retry(
             |this, _attempt| {
                 let persisted = match this.load_shard_record(tenant, key) {
                     Ok(Some(shard)) => shard,
@@ -940,7 +961,14 @@ impl CoordinationBackend for EtcdCoordinator {
                      terminal status, and derived-ID collision",
                 )))
             },
-        )
+        )?;
+        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
+            SplitReplaceError::BackendError(super::map_etcd_err(
+                "split_replace.refresh_cache",
+                err,
+            ))
+        })?;
+        Ok(result)
     }
 
     /// Shrink an owned shard's key range and spawn a residual shard
@@ -968,10 +996,11 @@ impl CoordinationBackend for EtcdCoordinator {
         plan: SplitResidualPlan<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
+        self.sync_logical_time(now);
         let key = lease.shard_key();
         let payload_hash = hash_split_residual_payload(&plan);
 
-        self.cas_retry(
+        let result = self.cas_retry(
             |this, _attempt| {
                 let persisted = match this.load_shard_record(tenant, key) {
                     Ok(Some(shard)) => shard,
@@ -1213,9 +1242,22 @@ impl CoordinationBackend for EtcdCoordinator {
                      terminal status, and derived-ID collision",
                 )))
             },
-        )
+        )?;
+        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
+            SplitResidualError::BackendError(super::map_etcd_err(
+                "split_residual.refresh_cache",
+                err,
+            ))
+        })?;
+        Ok(result)
     }
+        }
+    };
 }
+
+impl_sync_coordination_backend!(EtcdCoordinator);
+#[cfg(any(test, feature = "test-support"))]
+impl_sync_coordination_backend!(SimEtcdCoordinator);
 
 impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
     async fn acquire_and_restore_into<'a>(

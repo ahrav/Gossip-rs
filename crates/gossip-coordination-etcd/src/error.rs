@@ -24,6 +24,8 @@ use std::fmt;
 use crate::codec::EtcdCodecError;
 use crate::config::EtcdCoordinatorConfigError;
 use crate::keyspace::EtcdKeyspaceError;
+#[cfg(any(test, feature = "test-support"))]
+use crate::sim_etcd_kv::SimEtcdError;
 
 /// Labels the etcd RPC or codec stage that failed.
 ///
@@ -97,6 +99,12 @@ pub enum EtcdCoordinatorError {
         operation: EtcdOperation,
         source: etcd_client::Error,
     },
+    /// A simulated etcd operation failed during the given operation.
+    #[cfg(any(test, feature = "test-support"))]
+    Simulated {
+        operation: EtcdOperation,
+        source: SimEtcdError,
+    },
 }
 
 impl fmt::Display for EtcdCoordinatorError {
@@ -111,6 +119,10 @@ impl fmt::Display for EtcdCoordinatorError {
             Self::Etcd { operation, source } => {
                 write!(f, "etcd {operation} operation failed: {source}")
             }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Simulated { operation, source } => {
+                write!(f, "simulated etcd {operation} operation failed: {source}")
+            }
         }
     }
 }
@@ -123,6 +135,8 @@ impl std::error::Error for EtcdCoordinatorError {
             Self::RuntimeBuild(err) => Some(err),
             Self::Codec { source, .. } => Some(source),
             Self::Etcd { source, .. } => Some(source),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Simulated { source, .. } => Some(source),
         }
     }
 }
