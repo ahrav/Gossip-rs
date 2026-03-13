@@ -9,7 +9,9 @@
 use std::{error::Error, fmt};
 
 use gossip_contracts::persistence::PersistenceInputError;
-pub use gossip_pg_common::migration::MigrationOperation;
+pub use gossip_pg_common::migration::{
+    MigrationOperation, PgMigrationError as FindingsPgMigrationError,
+};
 
 use crate::types::PgU64ConversionError;
 
@@ -69,83 +71,6 @@ impl From<PersistenceInputError> for FindingsPgSchemaError {
 impl From<PgU64ConversionError> for FindingsPgSchemaError {
     fn from(value: PgU64ConversionError) -> Self {
         Self::PgU64Conversion(value)
-    }
-}
-
-/// Error type for findings PostgreSQL schema migrations.
-#[derive(Debug)]
-pub enum FindingsPgMigrationError {
-    /// PostgreSQL driver or SQL execution error, tagged with the operation
-    /// that failed.
-    Postgres {
-        /// Which migration step produced the error.
-        operation: MigrationOperation,
-        /// The underlying driver error.
-        source: postgres::Error,
-    },
-    /// An already-applied migration's embedded SQL no longer matches the
-    /// checksum recorded in the database.
-    ChecksumMismatch {
-        /// Version string of the migration with the mismatched checksum.
-        version: &'static str,
-        /// BLAKE3 hex digest of the embedded SQL text.
-        expected_hex: String,
-        /// BLAKE3 hex digest recorded in the migrations table.
-        found_hex: String,
-    },
-    /// The stored checksum length is invalid for a BLAKE3 digest.
-    CorruptedHistoryRecord {
-        /// Version string of the migration with the corrupted checksum.
-        version: &'static str,
-        /// Actual byte length of the stored checksum.
-        found_len: usize,
-    },
-}
-
-impl FindingsPgMigrationError {
-    /// Wrap a PostgreSQL driver error with the operation that produced it.
-    ///
-    /// Matches the sibling crate's API surface
-    /// (`DoneLedgerPgMigrationError::postgres`).
-    pub(crate) fn postgres(op: MigrationOperation, source: postgres::Error) -> Self {
-        Self::Postgres {
-            operation: op,
-            source,
-        }
-    }
-}
-
-impl fmt::Display for FindingsPgMigrationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Postgres {
-                operation, source, ..
-            } => write!(
-                f,
-                "postgres findings migration {operation} failed: {source}"
-            ),
-            Self::ChecksumMismatch {
-                version,
-                expected_hex,
-                found_hex,
-            } => write!(
-                f,
-                "migration checksum mismatch for version {version}: expected {expected_hex}, found {found_hex}"
-            ),
-            Self::CorruptedHistoryRecord { version, found_len } => write!(
-                f,
-                "corrupted migration history: version {version} checksum is {found_len} bytes, expected 32"
-            ),
-        }
-    }
-}
-
-impl Error for FindingsPgMigrationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Postgres { source, .. } => Some(source),
-            Self::ChecksumMismatch { .. } | Self::CorruptedHistoryRecord { .. } => None,
-        }
     }
 }
 

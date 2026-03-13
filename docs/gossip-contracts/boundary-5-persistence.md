@@ -11,14 +11,15 @@
 > PostgreSQL done-ledger backend, schema, migrations, and conversion helpers live in
 > `gossip-done-ledger-postgres`
 > (`crates/gossip-done-ledger-postgres/src/`). Shared `u64 ↔ BIGINT` conversion
-> types and migration primitives live in `gossip-pg-common`
-> (`crates/gossip-pg-common/src/`). Findings PostgreSQL schema,
+> types, embedded migration descriptors, migration configuration, shared runner
+> functions, checksum verification, `PgMigrationError`, and `MigrationOperation`
+> live in `gossip-pg-common` (`crates/gossip-pg-common/src/`). Findings PostgreSQL schema,
 > migrations, and type-mapping support live in `gossip-findings-postgres`
 > (`crates/gossip-findings-postgres/src/`); that crate provides the canonical
 > findings schema plan (table/index/column constants plus row projections),
-> an embedded forward-only migration runner with advisory locking and checksum
-> verification, and findings-specific type-mapping support, but it does not
-> implement `FindingsSink`.
+> a findings-specific migration set plus thin wrappers around the shared
+> advisory-locked checksum-verifying runner, and findings-specific type-mapping
+> support, but it does not implement `FindingsSink`.
 
 Boundary 5 defines the persistence contracts for three subsystems:
 
@@ -132,9 +133,9 @@ Non-negotiables (project-wide):
 
 | Crate | Scope | Notes |
 |------|-------|-------|
-| `gossip-pg-common` | Shared PostgreSQL type-mapping and migration primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), and the `MigrationOperation` enum. All PostgreSQL persistence backends depend on this crate instead of duplicating these types. |
-| `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits, applies forward-only migrations with checksum verification and advisory locking, and documents that transaction-scoped migrations cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
-| `gossip-findings-postgres` | Findings PostgreSQL schema, migrations, and type-mapping support | Provides findings-specific schema/migration error types, canonical table/index/column constants, Postgres-ready row projections for `FindingRecord`, `OccurrenceRecord`, and `ObservationRecord`, and an embedded forward-only migration runner with advisory locking plus checksum verification. The crate does not implement `FindingsSink`; it provides the storage-boundary support that the backend will build on. |
+| `gossip-pg-common` | Shared PostgreSQL type-mapping and migration primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), `EmbeddedMigration`, `MigrationConfig`, `PgMigrationError`, checksum-verification helpers, the shared advisory-locked migration runner, and the `MigrationOperation` enum. All PostgreSQL persistence backends depend on this crate instead of duplicating these primitives. |
+| `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits and provides the done-ledger migration set plus thin wrappers around the shared forward-only runner. Migration application remains checksum-verified, advisory-locked, and transaction-scoped, so migration SQL cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
+| `gossip-findings-postgres` | Findings PostgreSQL schema, migrations, and type-mapping support | Provides findings-specific schema constants, row projections, and the findings migration set plus thin wrappers around the shared advisory-locked checksum-verifying runner. The crate does not implement `FindingsSink`; it provides the storage-boundary support that the backend will build on. |
 
 ---
 
