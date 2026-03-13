@@ -476,6 +476,10 @@ INSERT INTO observations (
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (tenant_id, observation_id) DO UPDATE
 SET
+    -- Provenance-winner predicate (seen_at > location tiebreak) is repeated per
+    -- column because ON CONFLICT DO UPDATE SET does not support CTEs or local
+    -- variables. All CASE arms MUST use the identical condition so every
+    -- provenance field is sourced from the same winner.
     run_id = CASE
         WHEN EXCLUDED.seen_at > observations.seen_at
           OR (EXCLUDED.seen_at = observations.seen_at
@@ -1092,5 +1096,79 @@ mod tests {
         let bytes = MIGRATION_ADVISORY_LOCK_KEY.to_be_bytes();
         let ascii = std::str::from_utf8(&bytes).expect("lock key bytes should be ASCII");
         assert_eq!(ascii, "GFPGMIG1");
+    }
+
+    #[test]
+    fn findings_insert_sql_contains_all_insert_columns() {
+        for col in FINDINGS_INSERT_COLUMNS {
+            assert!(
+                FINDINGS_INSERT_SQL.contains(col),
+                "FINDINGS_INSERT_SQL missing column {col:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn occurrences_insert_sql_contains_all_insert_columns() {
+        for col in OCCURRENCES_INSERT_COLUMNS {
+            assert!(
+                OCCURRENCES_INSERT_SQL.contains(col),
+                "OCCURRENCES_INSERT_SQL missing column {col:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn observations_insert_sql_contains_all_insert_columns() {
+        for col in OBSERVATIONS_INSERT_COLUMNS {
+            assert!(
+                OBSERVATIONS_INSERT_OR_MERGE_SQL.contains(col),
+                "OBSERVATIONS_INSERT_OR_MERGE_SQL missing column {col:?}"
+            );
+        }
+    }
+
+    /// Scan SQL for `$N` bind parameters and return the highest N.
+    fn max_bind_param(sql: &str) -> usize {
+        let mut max = 0usize;
+        for (i, _) in sql.match_indices('$') {
+            let num_str: String = sql[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = num_str.parse::<usize>() {
+                max = max.max(n);
+            }
+        }
+        max
+    }
+
+    #[test]
+    fn sql_bind_param_counts_match_column_counts() {
+        assert_eq!(
+            max_bind_param(FINDINGS_INSERT_SQL),
+            FINDINGS_INSERT_COLUMNS.len(),
+            "FINDINGS_INSERT_SQL bind-param count mismatch"
+        );
+        assert_eq!(
+            max_bind_param(OCCURRENCES_INSERT_SQL),
+            OCCURRENCES_INSERT_COLUMNS.len(),
+            "OCCURRENCES_INSERT_SQL bind-param count mismatch"
+        );
+        assert_eq!(
+            max_bind_param(OBSERVATIONS_INSERT_OR_MERGE_SQL),
+            OBSERVATIONS_INSERT_COLUMNS.len(),
+            "OBSERVATIONS_INSERT_OR_MERGE_SQL bind-param count mismatch"
+        );
+    }
+
+    #[test]
+    fn observations_location_url_tiebreaker_uses_display_as_presence_proxy() {
+        // location_display is the proxy for "has location data" because
+        // Location::try_new always requires a display string.
+        assert!(
+            OBSERVATIONS_INSERT_OR_MERGE_SQL.contains("observations.location_display IS NULL"),
+            "tie-breaker must check location_display, not location_url"
+        );
     }
 }

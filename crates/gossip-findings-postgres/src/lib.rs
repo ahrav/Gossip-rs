@@ -58,11 +58,6 @@ pub use error::{
 #[cfg(feature = "test-utils")]
 pub use migrations::connect_and_apply_migrations;
 pub use migrations::{EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations};
-pub use schema::{
-    FINDINGS_COUNT_SQL, FINDINGS_INSERT_SQL, OBSERVATIONS_COUNT_SQL,
-    OBSERVATIONS_INSERT_OR_MERGE_SQL, OCCURRENCES_COUNT_SQL, OCCURRENCES_INSERT_SQL,
-    TRUNCATE_ALL_SQL,
-};
 pub use types::{
     PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
     u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
