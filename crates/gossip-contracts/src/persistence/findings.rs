@@ -394,6 +394,43 @@ impl ObservationRecord {
         Ok(record)
     }
 
+    /// Reconstruct an observation record from persisted storage without
+    /// revalidating the stored observation id.
+    ///
+    /// This constructor exists only for test code and downstream test-support
+    /// helpers that need to model corrupted or untrusted persisted rows before
+    /// batch-level validation runs.
+    #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test-only helper mirrors the flat durable row shape"
+    )]
+    pub(crate) fn from_persisted_unchecked(
+        tenant_id: TenantId,
+        stored_observation_id: ObservationId,
+        occurrence_id: OccurrenceId,
+        policy_hash: PolicyHash,
+        ovid_hash: OvidHash,
+        run_id: RunId,
+        shard_id: ShardId,
+        fence_epoch: FenceEpoch,
+        seen_at: LogicalTime,
+        location: Option<Location>,
+    ) -> Self {
+        Self {
+            tenant_id,
+            observation_id: stored_observation_id,
+            occurrence_id,
+            policy_hash,
+            ovid_hash,
+            run_id,
+            shard_id,
+            fence_epoch,
+            seen_at,
+            location,
+        }
+    }
+
     /// Verify that the stored `observation_id` still matches the canonical
     /// derivation from `(tenant, policy_hash, occurrence_id)`.
     pub fn validate_identity(&self) -> Result<(), PersistenceInputError> {
