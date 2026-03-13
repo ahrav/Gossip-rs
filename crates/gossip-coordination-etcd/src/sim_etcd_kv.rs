@@ -1134,6 +1134,37 @@ mod tests {
         );
     }
 
+    /// put(k) followed by delete(k) in the same txn leaves k absent, matching
+    /// etcd's in-order execution of success ops.
+    #[test]
+    fn txn_put_then_delete_same_absent_key_leaves_key_absent() {
+        let mut kv = SimulatedEtcdKV::new(102);
+
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(
+                        b"ephemeral",
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then(vec![
+                        TxnOp::put(b"ephemeral", b"value", None),
+                        TxnOp::delete(b"ephemeral", None),
+                    ]),
+            )
+            .expect("txn should succeed");
+        assert!(resp.succeeded());
+
+        let get_resp = kv
+            .get(b"ephemeral".to_vec(), None)
+            .expect("get should succeed");
+        assert!(
+            get_resp.kvs().is_empty(),
+            "key should be absent after put-then-delete in same txn"
+        );
+    }
+
     /// Reversed range bounds (key >= range_end) must not panic; real etcd
     /// returns an empty result set for such queries.
     #[test]
