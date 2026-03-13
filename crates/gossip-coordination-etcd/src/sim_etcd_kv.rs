@@ -968,11 +968,12 @@ mod tests {
                 .and_then(vec![TxnOp::delete(b"alpha", None)]),
         )
         .expect("delete should succeed");
-        assert!(kv
-            .get(b"alpha".to_vec(), None)
-            .expect("get should succeed")
-            .kvs()
-            .is_empty());
+        assert!(
+            kv.get(b"alpha".to_vec(), None)
+                .expect("get should succeed")
+                .kvs()
+                .is_empty()
+        );
 
         kv.txn(
             Txn::new()
@@ -1019,11 +1020,12 @@ mod tests {
         assert_eq!(get_exact(&mut kv, b"owned").value(), b"value");
 
         kv.tick(1);
-        assert!(kv
-            .get(b"owned".to_vec(), None)
-            .expect("get should succeed")
-            .kvs()
-            .is_empty());
+        assert!(
+            kv.get(b"owned".to_vec(), None)
+                .expect("get should succeed")
+                .kvs()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1047,11 +1049,12 @@ mod tests {
 
         kv.lease_revoke(lease.id())
             .expect("lease revoke should succeed");
-        assert!(kv
-            .get(b"revoked".to_vec(), None)
-            .expect("get should succeed")
-            .kvs()
-            .is_empty());
+        assert!(
+            kv.get(b"revoked".to_vec(), None)
+                .expect("get should succeed")
+                .kvs()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1077,11 +1080,12 @@ mod tests {
                 operation: super::SimEtcdOperation::Txn
             }
         ));
-        assert!(kv
-            .get(b"fault".to_vec(), None)
-            .expect("get should succeed")
-            .kvs()
-            .is_empty());
+        assert!(
+            kv.get(b"fault".to_vec(), None)
+                .expect("get should succeed")
+                .kvs()
+                .is_empty()
+        );
     }
 
     fn put_absent(kv: &mut SimulatedEtcdKV, key: &[u8], value: &[u8]) {
