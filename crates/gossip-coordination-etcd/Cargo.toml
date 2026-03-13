@@ -10,7 +10,14 @@ description = "etcd-backed coordination backend for gossip-coordination"
 [features]
 default = []
 tls = ["etcd-client/tls"]
-test-support = ["gossip-coordination/test-support", "gossip-contracts/test-support"]
+test-support = [
+    "gossip-coordination/test-support",
+    "gossip-contracts/test-support",
+    "etcd-client/pub-response-field",
+    "etcd-client/build-server",
+    "dep:rand",
+    "dep:rand_chacha",
+]
 
 [dependencies]
 gossip-coordination.workspace = true
@@ -19,10 +26,15 @@ gossip-stdx.workspace = true
 etcd-client = { version = "0.18", default-features = false }
 tokio = { version = "1", features = ["rt", "time", "sync", "net"] }
 tracing.workspace = true
+rand = { version = "0.9", optional = true }
+rand_chacha = { version = "0.9", optional = true }
 
 [dev-dependencies]
 gossip-coordination = { workspace = true, features = ["test-support"] }
 gossip-contracts = { workspace = true, features = ["test-support"] }
+etcd-client = { version = "0.18", default-features = false, features = ["pub-response-field", "build-server"] }
 rstest.workspace = true
 proptest.workspace = true
 testcontainers.workspace = true
+rand = "0.9"
+rand_chacha = "0.9"
