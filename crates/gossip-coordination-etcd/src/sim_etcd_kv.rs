@@ -519,6 +519,7 @@ impl SimulatedEtcdKV {
                 Err(err) => panic!("internal lease expiry failed: {err}"),
             };
             if deleted_any {
+                self.prune_revoked_keys(lease_id);
                 self.revision = self.revision.saturating_add(1);
             }
         }

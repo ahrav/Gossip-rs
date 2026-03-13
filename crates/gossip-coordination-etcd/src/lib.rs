@@ -20,7 +20,7 @@
 //!
 //! # Architecture
 //!
-//! The crate is structured in five internal modules:
+//! The crate is structured in six internal modules:
 //!
 //! - **`config`** — Validated connection parameters (endpoints, namespace
 //!   prefix, shard limits, tuning). Construction normalizes whitespace and
@@ -42,6 +42,11 @@
 //!   shard-owner bindings persisted to etcd.
 //! - **`error`** — Unified error types covering configuration validation,
 //!   Tokio runtime creation, codec failures, and etcd RPC errors.
+//! - **`sim_etcd_kv`** *(compiled under `cfg(test)` or `feature =
+//!   "test-support"`)* — In-memory model of the etcd KV subset (point
+//!   reads, prefix scans, CAS transactions, lease semantics) for
+//!   deterministic simulation without a live etcd server. Includes
+//!   seeded fault injection via [`sim_etcd_kv::SimEtcdFaultConfig`].
 //!
 //! # Build requirements
 //!
