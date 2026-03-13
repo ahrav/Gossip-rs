@@ -10,7 +10,8 @@ description = "Shared PostgreSQL type-mapping and migration primitives for gossi
 [lib]
 
 [dependencies]
-# Pure Rust types and inline conversion functions — no runtime dependencies.
+postgres = "0.19"
+blake3 = "1.8"
 
 [dev-dependencies]
 proptest.workspace = true

@@ -12,9 +12,15 @@
 //! | Module | Responsibility |
 //! |--------|----------------|
 //! | [`types`] | `u64 ↔ BIGINT` conversion error and helper functions |
-//! | [`migration`] | [`MigrationOperation`](migration::MigrationOperation) taxonomy shared by all migration runners |
+//! | [`migration`] | Shared embedded migration runner, checksum verification, and migration error types |
 
 #![forbid(unsafe_code)]
 
 pub mod migration;
 pub mod types;
+
+pub use migration::{
+    EmbeddedMigration, MigrationConfig, MigrationOperation, PgMigrationError, apply_all_migrations,
+    apply_migrations,
+};
+pub use types::PgU64ConversionError;

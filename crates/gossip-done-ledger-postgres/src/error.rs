@@ -10,101 +10,11 @@
 use std::{error::Error, fmt};
 
 use gossip_contracts::persistence::PersistenceInputError;
-pub use gossip_pg_common::migration::MigrationOperation;
+pub use gossip_pg_common::migration::{
+    MigrationOperation, PgMigrationError as DoneLedgerPgMigrationError,
+};
 
 use crate::types::PgU64ConversionError;
-
-/// Error type for schema migration operations.
-///
-/// There are three failure classes:
-///
-/// - **Driver errors** — connection failures, SQL syntax errors, constraint
-///   violations, or transaction conflicts raised by PostgreSQL during
-///   migration execution. Each carries a [`MigrationOperation`] tag
-///   identifying which step failed.
-///
-/// - **Checksum mismatches** — the BLAKE3 hash of an embedded migration's
-///   SQL text no longer matches the hash recorded in the
-///   `done_ledger_schema_migrations` history table. This catches accidental
-///   in-place edits to an already-applied migration file, which would leave
-///   the running schema out of sync with the embedded SQL.
-///
-/// - **Corrupted history records** — the stored checksum blob has an
-///   unexpected byte length, indicating data corruption or a manual edit
-///   to the migration history table.
-#[derive(Debug)]
-pub enum DoneLedgerPgMigrationError {
-    /// PostgreSQL driver or SQL execution error, tagged with the operation
-    /// that failed.
-    Postgres {
-        /// Which migration step produced the error.
-        operation: MigrationOperation,
-        /// The underlying driver error.
-        source: postgres::Error,
-    },
-    /// An already-applied migration's embedded SQL has changed since it was
-    /// first applied. The `expected_hex` field is the BLAKE3 hash of the
-    /// current embedded SQL; `found_hex` is the hash stored in the database
-    /// when the migration was first executed.
-    ChecksumMismatch {
-        /// Version string of the migration with the mismatched checksum.
-        version: &'static str,
-        /// BLAKE3 hex digest of the embedded SQL text (what the code expects).
-        expected_hex: String,
-        /// BLAKE3 hex digest recorded in the history table (what was applied).
-        found_hex: String,
-    },
-    /// The stored checksum for an already-applied migration has an unexpected
-    /// byte length, indicating data corruption or a manual edit to the
-    /// migration history table.
-    CorruptedHistoryRecord {
-        /// Version string of the migration with the corrupted checksum.
-        version: &'static str,
-        /// Actual byte length of the stored checksum (expected 32).
-        found_len: usize,
-    },
-}
-
-impl DoneLedgerPgMigrationError {
-    /// Wrap a PostgreSQL driver error with the operation that produced it.
-    pub(crate) fn postgres(op: MigrationOperation, source: postgres::Error) -> Self {
-        Self::Postgres {
-            operation: op,
-            source,
-        }
-    }
-}
-
-impl fmt::Display for DoneLedgerPgMigrationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Postgres {
-                operation, source, ..
-            } => write!(f, "postgres migration {operation} failed: {source}"),
-            Self::ChecksumMismatch {
-                version,
-                expected_hex,
-                found_hex,
-            } => write!(
-                f,
-                "migration checksum mismatch for version {version}: expected {expected_hex}, found {found_hex}"
-            ),
-            Self::CorruptedHistoryRecord { version, found_len } => write!(
-                f,
-                "corrupted migration history: version {version} checksum is {found_len} bytes, expected 32"
-            ),
-        }
-    }
-}
-
-impl Error for DoneLedgerPgMigrationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Postgres { source, .. } => Some(source),
-            Self::ChecksumMismatch { .. } | Self::CorruptedHistoryRecord { .. } => None,
-        }
-    }
-}
 
 /// Conversion failures at the Rust ↔ PostgreSQL storage boundary.
 ///
