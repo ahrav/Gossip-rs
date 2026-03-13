@@ -25,6 +25,7 @@ use gossip_contracts::persistence::{
 use crate::{
     FindingsPgSchemaError,
     types::{u64_to_pg_bigint_bits, u64_to_pg_bigint_checked},
+    FindingsPgSchemaError,
 };
 
 /// Durable findings table storing policy-independent finding identity.
@@ -428,6 +429,24 @@ RETURNING 1
 /// observation-merge helper so that in-memory deduplication and PostgreSQL
 /// replay produce identical durable rows for the same inputs.
 ///
+/// ## Provenance triple
+///
+/// `(run_id, shard_id, fence_epoch)` always move as a unit — all three
+/// columns come from whichever observation wins the `seen_at` tie-break.
+/// `fence_epoch` is **not** independently max-tracked because doing so
+/// would produce an incoherent record whose epoch belongs to a different
+/// run/shard than the one stored. In the coordination layer `fence_epoch`
+/// is monotonic per shard; here it is provenance metadata that records
+/// _which_ epoch the observation was created under.
+///
+/// ## Location pairing
+///
+/// `location_display` and `location_url` are sourced as a unit from the
+/// same observation record. The fallback chain is:
+/// provenance winner → existing → incoming. `location_url` follows
+/// whichever record provided `location_display`, never the other record's
+/// URL, to avoid pairing a display string with an unrelated URL.
+///
 /// Bind parameters:
 /// 1. `tenant_id`
 /// 2. `observation_id`
@@ -483,12 +502,21 @@ SET
     END,
     location_url = CASE
         WHEN EXCLUDED.seen_at > observations.seen_at
-            THEN COALESCE(EXCLUDED.location_url, observations.location_url)
+            THEN CASE
+                WHEN EXCLUDED.location_display IS NOT NULL THEN EXCLUDED.location_url
+                ELSE observations.location_url
+            END
         WHEN EXCLUDED.seen_at < observations.seen_at
-            THEN COALESCE(observations.location_url, EXCLUDED.location_url)
+            THEN CASE
+                WHEN observations.location_display IS NOT NULL THEN observations.location_url
+                ELSE EXCLUDED.location_url
+            END
         WHEN observations.location_display IS NULL AND EXCLUDED.location_display IS NOT NULL
             THEN EXCLUDED.location_url
-        ELSE COALESCE(observations.location_url, EXCLUDED.location_url)
+        ELSE CASE
+            WHEN observations.location_display IS NOT NULL THEN observations.location_url
+            ELSE EXCLUDED.location_url
+        END
     END
 WHERE observations.occurrence_id = EXCLUDED.occurrence_id
   AND observations.policy_hash = EXCLUDED.policy_hash
@@ -497,7 +525,7 @@ RETURNING 1
 "#;
 
 /// Count all durable finding rows.
-pub const SELECT_FINDINGS_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM findings";
+pub const FINDINGS_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM findings";
 /// Count all durable occurrence rows.
 pub const OCCURRENCES_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM occurrences";
 /// Count all durable observation rows.
@@ -510,13 +538,12 @@ pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, fi
 mod tests {
     use std::{collections::HashSet, num::NonZeroU64};
 
-    use crate::types::{PgU64ConversionError, pg_bigint_to_u64_bits};
+    use crate::types::{pg_bigint_to_u64_bits, PgU64ConversionError};
     use gossip_contracts::{
         connector::Location,
         identity::{
-            FenceEpoch, FindingId, LogicalTime, NormHash, ObjectVersionId, PolicyHash,
-            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
-            key_secret_hash,
+            key_secret_hash, FenceEpoch, FindingId, LogicalTime, NormHash, ObjectVersionId,
+            PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
         },
         persistence::{
             FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord, OvidHash,
@@ -984,10 +1011,39 @@ mod tests {
                 .contains("ELSE COALESCE(observations.location_display, EXCLUDED.location_url)"),
             "location_display fallback must not reference EXCLUDED.location_url"
         );
+        // location_url follows the same source as location_display — it does
+        // not use independent COALESCE. The display-gated CASE ensures the url
+        // and display always come from the same observation record.
         assert!(
             OBSERVATIONS_INSERT_OR_MERGE_SQL
-                .contains("ELSE COALESCE(observations.location_url, EXCLUDED.location_url)"),
-            "location_url fallback must preserve the URL column"
+                .contains("WHEN EXCLUDED.location_display IS NOT NULL THEN EXCLUDED.location_url"),
+            "location_url must follow incoming display source in incoming-wins branch"
+        );
+        assert!(
+            OBSERVATIONS_INSERT_OR_MERGE_SQL.contains(
+                "WHEN observations.location_display IS NOT NULL THEN observations.location_url"
+            ),
+            "location_url must follow existing display source in existing-wins branch"
+        );
+    }
+
+    #[test]
+    fn observations_insert_sql_pairs_location_url_with_display_source() {
+        // location_url must follow whichever record provided location_display,
+        // never independently COALESCE to the other record's URL. Independent
+        // COALESCE can pair a display string from one observation with a URL
+        // from a different observation — incoherent provenance.
+        assert!(
+            !OBSERVATIONS_INSERT_OR_MERGE_SQL
+                .contains("COALESCE(EXCLUDED.location_url, observations.location_url)"),
+            "location_url must not independently fall back to the other record's URL \
+             when the incoming record wins provenance — url must follow display source"
+        );
+        assert!(
+            !OBSERVATIONS_INSERT_OR_MERGE_SQL
+                .contains("COALESCE(observations.location_url, EXCLUDED.location_url)"),
+            "location_url must not independently fall back to the other record's URL \
+             when the existing record wins provenance — url must follow display source"
         );
     }
 
