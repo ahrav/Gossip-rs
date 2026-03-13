@@ -23,8 +23,8 @@ use gossip_contracts::persistence::{
 };
 
 use crate::{
-    types::{u64_to_pg_bigint_bits, u64_to_pg_bigint_checked},
     FindingsPgSchemaError,
+    types::{u64_to_pg_bigint_bits, u64_to_pg_bigint_checked},
 };
 
 /// Durable findings table storing policy-independent finding identity.
@@ -378,6 +378,17 @@ impl ProjectedFindingsBatch {
 /// [`crate::FindingsPgError::FindingConflict`] instead of silently accepting
 /// drift.
 ///
+/// ## Write-amplification tradeoff
+///
+/// The no-op `SET stable_item_id = findings.stable_item_id` creates a new row
+/// version on every true-duplicate replay even though no data changes.
+/// PostgreSQL does not distinguish "SET to same value" from a real mutation,
+/// so dead tuples accumulate until `VACUUM` reclaims them. This is the
+/// necessary cost of the conflict-detection pattern: `DO NOTHING` would
+/// suppress the `RETURNING` row for _both_ matches and mismatches, breaking
+/// the caller's ability to distinguish idempotent replays from identity
+/// conflicts. The same tradeoff applies to [`OCCURRENCES_INSERT_SQL`].
+///
 /// Bind parameters:
 /// 1. `tenant_id`
 /// 2. `finding_id`
@@ -537,12 +548,13 @@ pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, fi
 mod tests {
     use std::{collections::HashSet, num::NonZeroU64};
 
-    use crate::types::{pg_bigint_to_u64_bits, PgU64ConversionError};
+    use crate::types::{PgU64ConversionError, pg_bigint_to_u64_bits};
     use gossip_contracts::{
         connector::Location,
         identity::{
-            key_secret_hash, FenceEpoch, FindingId, LogicalTime, NormHash, ObjectVersionId,
-            PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
+            FenceEpoch, FindingId, LogicalTime, NormHash, ObjectVersionId, PolicyHash,
+            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
+            key_secret_hash,
         },
         persistence::{
             FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord, OvidHash,
@@ -932,12 +944,15 @@ mod tests {
 
     #[test]
     fn write_sql_constants_reference_canonical_table_names() {
-        assert!(FINDINGS_INSERT_SQL.contains(FINDINGS_TABLE));
-        assert!(OCCURRENCES_INSERT_SQL.contains(OCCURRENCES_TABLE));
-        assert!(OBSERVATIONS_INSERT_OR_MERGE_SQL.contains(OBSERVATIONS_TABLE));
-        assert!(FINDINGS_COUNT_SQL.contains(FINDINGS_TABLE));
-        assert!(OCCURRENCES_COUNT_SQL.contains(OCCURRENCES_TABLE));
-        assert!(OBSERVATIONS_COUNT_SQL.contains(OBSERVATIONS_TABLE));
+        // INSERT/UPSERT statements use "INTO <table>".
+        assert!(FINDINGS_INSERT_SQL.contains(&format!("INTO {FINDINGS_TABLE}")));
+        assert!(OCCURRENCES_INSERT_SQL.contains(&format!("INTO {OCCURRENCES_TABLE}")));
+        assert!(OBSERVATIONS_INSERT_OR_MERGE_SQL.contains(&format!("INTO {OBSERVATIONS_TABLE}")));
+        // COUNT statements use "FROM <table>".
+        assert!(FINDINGS_COUNT_SQL.contains(&format!("FROM {FINDINGS_TABLE}")));
+        assert!(OCCURRENCES_COUNT_SQL.contains(&format!("FROM {OCCURRENCES_TABLE}")));
+        assert!(OBSERVATIONS_COUNT_SQL.contains(&format!("FROM {OBSERVATIONS_TABLE}")));
+        // TRUNCATE references all three tables.
         assert!(TRUNCATE_ALL_SQL.contains(OBSERVATIONS_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(OCCURRENCES_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(FINDINGS_TABLE));
