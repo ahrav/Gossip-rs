@@ -62,6 +62,8 @@ mod codec;
 mod config;
 mod error;
 mod keyspace;
+#[cfg(any(test, feature = "test-support"))]
+pub mod sim_etcd_kv;
 
 pub use backend::{AsyncEtcdCoordinator, EtcdCoordinator};
 #[cfg(any(test, feature = "test-support"))]
