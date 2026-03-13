@@ -1324,7 +1324,7 @@ fn shard_record_with_u64_max_run_and_shard_ids_round_trips() {
         tenant,
         run,
         shard,
-        ShardSpecRef::with_range_and_metadata(b"lo", b"hi", b"max-ids"),
+        ShardSpecRef::with_range_and_metadata(b"hi", b"lo", b"max-ids"),
         CursorUpdate::with_token(b"mid", b"tok"),
         CursorSemantics::Completed,
         parent,
