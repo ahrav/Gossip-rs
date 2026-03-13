@@ -9,10 +9,16 @@ description = "Shared PostgreSQL type-mapping and migration primitives for gossi
 
 [lib]
 
+[features]
+default = []
+test-support = ["dep:testcontainers"]
+
 [dependencies]
 postgres = "0.19"
 blake3 = "1.8"
+testcontainers = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
+testcontainers.workspace = true

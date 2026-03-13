@@ -13,10 +13,13 @@
 //! |--------|----------------|
 //! | [`types`] | `u64 ↔ BIGINT` conversion error and helper functions |
 //! | [`migration`] | Shared embedded migration runner, checksum verification, and migration error types |
+//! | [`test_support`] | Shared PostgreSQL testcontainer lifecycle and isolated test-database helpers |
 
 #![forbid(unsafe_code)]
 
 pub mod migration;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod types;
 
 pub use migration::{
