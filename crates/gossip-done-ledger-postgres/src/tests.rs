@@ -197,7 +197,6 @@ fn persisted_checksum_tamper_is_detected_on_reapply() {
 
 // ── DoneLedger backend behavior ───────────────────────────────────────────
 
-#[path = "tests/merge_parity_proptest.rs"]
 mod merge_parity_proptest;
 
 /// Run the contract-defined conformance suite against the PostgreSQL backend.

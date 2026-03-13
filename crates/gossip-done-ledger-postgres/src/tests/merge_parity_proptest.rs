@@ -357,6 +357,11 @@ fn arb_higher_status_case() -> BoxedStrategy<MergeParityCase> {
 /// Same status for both records, but the incoming record has a strictly
 /// later `finished_at`. This isolates the second tier of the tie-breaking
 /// rule (latest `finished_at` wins when statuses are equal).
+///
+/// Uses `prop_flat_map` so `incoming_started_at` is drawn uniformly from
+/// `0..=incoming_finished_at` rather than clamped from a wider range. This
+/// avoids collapsing most values to `incoming_finished_at` when the
+/// combined existing timestamps produce a small `incoming_finished_at`.
 fn arb_later_finished_case() -> BoxedStrategy<MergeParityCase> {
     (
         arb_key_seeds(),
@@ -364,59 +369,51 @@ fn arb_later_finished_case() -> BoxedStrategy<MergeParityCase> {
         arb_raw_record_spec(),
         arb_raw_record_spec(),
         prop_oneof![Just(0u64), Just(PG_BIGINT_MAX - 3_000u64)],
-        (
-            0u64..=2_000u64,
-            0u64..=200u64,
-            1u64..=200u64,
-            0u64..=2_400u64,
-        ),
+        (0u64..=2_000u64, 0u64..=200u64, 1u64..=200u64),
     )
-        .prop_map(
+        .prop_flat_map(
             |(
                 key_seeds,
                 status,
                 existing_raw_record,
                 incoming_raw_record,
                 base_offset,
-                (
-                    existing_started_at_raw,
-                    existing_duration,
-                    later_finished_gap,
-                    incoming_started_raw,
-                ),
+                (existing_started_at_raw, existing_duration, later_finished_gap),
             )| {
                 let existing_started_at = base_offset + existing_started_at_raw;
                 let existing_finished_at = existing_started_at + existing_duration;
                 let incoming_finished_at = existing_finished_at + later_finished_gap;
-                let incoming_started_at =
-                    (base_offset + incoming_started_raw).min(incoming_finished_at);
 
-                debug_assert!(
-                    incoming_finished_at > existing_finished_at,
-                    "LaterFinishedAt requires strictly later finished_at"
-                );
+                // Draw incoming_started_at uniformly from valid range
+                // instead of clamping a wider range.
+                (0u64..=incoming_finished_at).prop_map(move |incoming_started_at| {
+                    debug_assert!(
+                        incoming_finished_at > existing_finished_at,
+                        "LaterFinishedAt requires strictly later finished_at"
+                    );
 
-                MergeParityCase {
-                    scenario: MergeScenario::LaterFinishedAt,
-                    existing: build_generated_record(
-                        key_seeds,
-                        status,
-                        raw_record_with_timing(
-                            existing_raw_record,
-                            existing_started_at,
-                            existing_finished_at,
+                    MergeParityCase {
+                        scenario: MergeScenario::LaterFinishedAt,
+                        existing: build_generated_record(
+                            key_seeds,
+                            status,
+                            raw_record_with_timing(
+                                existing_raw_record,
+                                existing_started_at,
+                                existing_finished_at,
+                            ),
                         ),
-                    ),
-                    incoming: build_generated_record(
-                        key_seeds,
-                        status,
-                        raw_record_with_timing(
-                            incoming_raw_record,
-                            incoming_started_at,
-                            incoming_finished_at,
+                        incoming: build_generated_record(
+                            key_seeds,
+                            status,
+                            raw_record_with_timing(
+                                incoming_raw_record,
+                                incoming_started_at,
+                                incoming_finished_at,
+                            ),
                         ),
-                    ),
-                }
+                    }
+                })
             },
         )
         .boxed()
@@ -646,19 +643,23 @@ fn run_sql_merge_order(
 /// The core parity assertion: compute the expected result via
 /// `DoneLedgerRecord::merge` (Rust), then compare field-by-field against
 /// the actual result from [`run_sql_merge_order`] (PostgreSQL).
+///
+/// Returns the SQL merge result on success so callers can perform
+/// additional assertions without a redundant database round-trip.
 fn assert_sql_merge_matches_rust_merge(
     backend: &DoneLedgerPg,
     existing: &DoneLedgerRecord,
     incoming: &DoneLedgerRecord,
     scenario: MergeScenario,
     order_label: &str,
-) -> Result<(), TestCaseError> {
+) -> Result<DoneLedgerRecord, TestCaseError> {
     let context = format!("{scenario:?}/{order_label}");
     let expected = existing
         .merge(incoming)
         .map_err(|err| prop_failure(&format!("{context}: rust merge failed"), err))?;
     let actual = run_sql_merge_order(backend, existing, incoming)?;
-    assert_record_fields_match(&expected, &actual, &context)
+    assert_record_fields_match(&expected, &actual, &context)?;
+    Ok(actual)
 }
 
 /// Property test: for randomly generated record pairs, the SQL
@@ -706,7 +707,7 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
                 .set(saw_later_started.get() || case.scenario == MergeScenario::LaterStartedAt);
             saw_exact_tie.set(saw_exact_tie.get() || case.scenario == MergeScenario::ExactTie);
 
-            assert_sql_merge_matches_rust_merge(
+            let sql_existing_first = assert_sql_merge_matches_rust_merge(
                 &backend,
                 &case.existing,
                 &case.incoming,
@@ -727,11 +728,11 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
             // preserve the first-written (existing) record's provenance.
             // This checks the contract directly rather than via the Rust
             // merge, catching bugs where both Rust and SQL agree on the
-            // *wrong* answer.
+            // *wrong* answer. Reuses the result from the first parity
+            // check to avoid a redundant database round-trip.
             if case.scenario == MergeScenario::ExactTie {
-                let sql_result = run_sql_merge_order(&backend, &case.existing, &case.incoming)?;
                 prop_assert_eq!(
-                    sql_result.provenance(),
+                    sql_existing_first.provenance(),
                     case.existing.provenance(),
                     "ExactTie: SQL should preserve existing record's provenance"
                 );
@@ -742,9 +743,16 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
         .expect("SQL and Rust merge parity proptest should pass");
 
     // Coverage assertions require enough cases to hit every scenario arm.
-    // When running locally with the auto-clamped minimum (4 cases), skip
-    // these checks — they are validated in CI at higher case counts.
-    if case_count >= 100 {
+    // With fewer than 100 cases (e.g., the local default of 4), the
+    // weighted scenario distribution cannot reliably exercise all five
+    // status variants and all four targeted scenarios. Set PROPTEST_CASES
+    // or run under CI to enable these checks.
+    if case_count < 100 {
+        eprintln!(
+            "note: coverage assertions skipped (case_count={case_count} < 100). \
+             Set PROPTEST_CASES=256 or run under CI to enable."
+        );
+    } else {
         let seen_statuses = seen_statuses.into_inner();
         let expected_statuses: HashSet<_> = ALL_STATUSES.into_iter().collect();
         assert_eq!(
