@@ -391,7 +391,7 @@ graph LR
 
 The retention index uses `finished_at DESC` because the most common query
 pattern is "newest completions first." The trailing `ovid_hash` column makes
-the index _covering_ for the primary key, so retention scans operate as
+the index *covering* for the primary key, so retention scans operate as
 index-only scans without hitting the heap.
 
 The provenance index enables operational debugging: "which rows did a specific
