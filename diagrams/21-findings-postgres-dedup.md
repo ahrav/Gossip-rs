@@ -465,7 +465,7 @@ relationships.
 | `crates/gossip-findings-postgres/src/backend.rs` | `FindingsSinkPg` struct, `FindingsSink` impl, `project_and_dedupe`, per-layer dedup functions, `merge_observation_rows`, `drain_in_order` |
 | `crates/gossip-findings-postgres/src/schema.rs` | Row projections (`FindingRow`, `OccurrenceRow`, `ObservationRow`), SQL constants (`FINDINGS_INSERT_SQL`, `OCCURRENCES_INSERT_SQL`, `OBSERVATIONS_INSERT_OR_MERGE_SQL`, `COMBINED_COUNTS_SQL`, `COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL`, `LIST_FINDINGS_NEEDING_TRIAGE_SQL`), table/column/index names |
 | `crates/gossip-findings-postgres/src/read_api.rs` | `ObservationCountByPolicy`, `PendingTriageFinding` result types |
-| `crates/gossip-findings-postgres/src/error.rs` | `FindingsPgError` (13 variants), `FindingsPgSchemaError` (3 variants) |
+| `crates/gossip-findings-postgres/src/error.rs` | `FindingsPgError` (12 variants), `FindingsPgSchemaError` (3 variants) |
 | `crates/gossip-contracts/src/persistence/findings.rs` | `FindingRecord`, `OccurrenceRecord`, `ObservationRecord`, `FindingsUpsertBatch`, `validate_observation_identity()`, `validate_tenant_consistency()` |
 | `crates/gossip-contracts/src/persistence/conformance.rs` | `FindingsConformanceProbe`, `DurableFindingsCounts`, `run_findings_conformance` |
 | `crates/gossip-persistence-inmemory/src/findings.rs` | Reference in-memory backend implementing the same validate-then-mutate pattern and merge rules |

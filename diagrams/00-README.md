@@ -172,7 +172,7 @@ graph TD
 | 20  | `20-etcd-coordinator-persistence.md` | 5        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
 | 21  | `21-findings-postgres-dedup.md`      | 5        | B5               | Batch dedup pipeline, per-layer conflict rules, observation merge, dual convergence, read API surface |
 | 22  | `22-done-ledger-postgres.md`         | 7        | B5               | Backend architecture, batch upsert pipeline, provenance winner-selection, SQL schema/indexes, BIGINT encoding, error hierarchy |
-|     | **Total**                            | **105**  |                  |                                                                           |
+|     | **Total**                            | **106**  |                  |                                                                           |
 
 ## Implementation Status Legend
 

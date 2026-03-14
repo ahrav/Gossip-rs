@@ -292,7 +292,7 @@ property tests in `merge_parity_proptest.rs`.
 | 2 | **bytes_scanned**: non-regressing | `.max()` | `GREATEST(EXCLUDED.bytes_scanned, ...)` |
 | 3 | **findings_count**: status-dependent | Match on merged status: `ScannedClean → 0`, `ScannedWithFindings → max(existing, incoming, 1)`, other → `max` | 3-branch `CASE` on merged status values `10`, `11`, else |
 | 4 | **Provenance winner**: `status > finished_at > started_at` | Three-condition boolean | Repeated CASE predicate across 6 columns (`run_id`, `shard_id`, `fence_epoch`, `started_at`, `finished_at`, `error_code`) |
-| 5 | **Provenance fields**: all from same winner | Single `winner` binding | All 6 CASE arms use the identical 3-part predicate |
+| 5 | **Provenance fields**: all from same winner | Single `winner` binding | The first 5 CASE arms (`run_id`, `shard_id`, `fence_epoch`, `started_at`, `finished_at`) use the identical 3-part predicate; `error_code` has an additional initial `IN (10, 11) THEN NULL` guard |
 | 6 | **error_code**: cleared for scanned status | `None` when merged status is scanned | `CASE WHEN ... IN (10, 11) THEN NULL` |
 
 ### Why the SQL repeats the CASE predicate 6 times
@@ -353,7 +353,7 @@ The schema enforces three categories of constraints:
 
 The status-shape constraint is the most important:
 
-```
+```sql
 (status = 10 AND findings_count = 0 AND error_code IS NULL)       -- ScannedClean
 OR (status = 11 AND findings_count > 0 AND error_code IS NULL)    -- ScannedWithFindings
 OR (status IN (1, 2, 3) AND error_code IS NOT NULL)               -- Failure/Skip
@@ -523,8 +523,8 @@ The `batch_get` method preserves the caller's requested order. PostgreSQL
 returns matching rows in arbitrary order, so the Rust caller restores
 positional alignment:
 
-1. Execute `SELECT ... WHERE ovid_hash = ANY($3::bytea[])` in a single
-   round-trip.
+1. Execute `SELECT ... WHERE tenant_id = $1 AND policy_hash = $2 AND ovid_hash = ANY($3::bytea[])`
+   in a single round-trip.
 2. Index results into a `HashMap<OvidHash, DoneLedgerRecord>`.
 3. Project back onto the input `ovid_hashes` slice, yielding `None` for
    missing keys and duplicated results for duplicated inputs.
