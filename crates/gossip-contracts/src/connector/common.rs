@@ -11,6 +11,8 @@
 //! | [`PageBuf`] | Non-empty typed page container |
 //! | [`PageState`] | Terminal vs resumable page completion state |
 //! | [`PageShapeError`] | Page validation failure taxonomy |
+//! | [`PagingCapabilities`] | Optional paging behavior flags for a connector family |
+//! | [`KeyedPageItem`] | Trait for items that participate in ordered page emission |
 //! | [`validate_filled_page`] | Validates ordering, uniqueness, and shard bounds |
 //!
 //! ## Bound semantics
@@ -199,7 +201,7 @@ pub enum PageShapeError {
     /// Two adjacent keys were identical.
     DuplicateKeys { index: usize },
     /// An item key fell outside the shard's half-open `[start, end)` bounds.
-    KeyOutsideShardBounds { index: usize },
+    KeyOutsideShardBounds { index: usize, below_start: bool },
     /// Both shard bounds are present but start >= end.
     InvertedBounds,
 }
@@ -217,8 +219,18 @@ impl fmt::Display for PageShapeError {
             Self::DuplicateKeys { index } => {
                 write!(f, "page item keys must be unique (index {index})")
             }
-            Self::KeyOutsideShardBounds { index } => {
-                write!(f, "page item key is outside shard bounds (index {index})")
+            Self::KeyOutsideShardBounds { index, below_start } => {
+                if *below_start {
+                    write!(
+                        f,
+                        "page item key is below shard start bound (index {index})"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "page item key is at or above shard end bound (index {index})"
+                    )
+                }
             }
             Self::InvertedBounds => f.write_str("shard bounds are inverted (start >= end)"),
         }
@@ -233,10 +245,9 @@ impl std::error::Error for PageShapeError {}
 /// `ShardSpec::key_range_start()` / `key_range_end()`: empty slices mean the
 /// bound is unbounded. Validation rules:
 ///
-/// - when both bounds are present, `start < end` (rejects inverted bounds);
 /// - page is non-empty;
-/// - keys are strictly increasing;
-/// - duplicate keys are rejected;
+/// - when both bounds are present, `start < end` (rejects inverted bounds);
+/// - keys are strictly increasing (duplicates are rejected);
 /// - keys stay within the half-open interval `[start, end)`.
 ///
 /// # Errors
@@ -254,12 +265,20 @@ pub fn validate_filled_page<T: KeyedPageItem>(
     let mut previous = first.item_key().as_bytes();
 
     if !shard_start.is_empty() && previous < shard_start {
-        return Err(PageShapeError::KeyOutsideShardBounds { index: 0 });
+        return Err(PageShapeError::KeyOutsideShardBounds {
+            index: 0,
+            below_start: true,
+        });
     }
     if !shard_end.is_empty() && previous >= shard_end {
-        return Err(PageShapeError::KeyOutsideShardBounds { index: 0 });
+        return Err(PageShapeError::KeyOutsideShardBounds {
+            index: 0,
+            below_start: false,
+        });
     }
 
+    // Strictly increasing keys guarantee all subsequent items exceed the first,
+    // which was already verified against shard_start.
     for (offset, item) in rest.iter().enumerate() {
         let index = offset + 1;
         let key = item.item_key().as_bytes();
@@ -269,7 +288,10 @@ pub fn validate_filled_page<T: KeyedPageItem>(
             std::cmp::Ordering::Greater => {}
         }
         if !shard_end.is_empty() && key >= shard_end {
-            return Err(PageShapeError::KeyOutsideShardBounds { index });
+            return Err(PageShapeError::KeyOutsideShardBounds {
+                index,
+                below_start: false,
+            });
         }
         previous = key;
     }

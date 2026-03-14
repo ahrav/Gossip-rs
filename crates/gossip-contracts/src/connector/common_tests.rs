@@ -51,9 +51,13 @@ fn arb_sorted_unique_keys(min: usize, max: usize) -> impl Strategy<Value = Vec<V
     PageShapeError::DuplicateKeys { index: 1 },
     "page item keys must be unique (index 1)"
 )]
-#[case::out_of_bounds(
-    PageShapeError::KeyOutsideShardBounds { index: 0 },
-    "page item key is outside shard bounds (index 0)"
+#[case::out_of_bounds_below(
+    PageShapeError::KeyOutsideShardBounds { index: 0, below_start: true },
+    "page item key is below shard start bound (index 0)"
+)]
+#[case::out_of_bounds_above(
+    PageShapeError::KeyOutsideShardBounds { index: 0, below_start: false },
+    "page item key is at or above shard end bound (index 0)"
 )]
 #[case::inverted_bounds(
     PageShapeError::InvertedBounds,
@@ -181,10 +185,20 @@ fn validate_filled_page_rejects_inverted_shard_bounds() {
     );
 }
 
+#[test]
+fn validate_filled_page_rejects_equal_shard_bounds() {
+    // Equal bounds define an empty half-open interval [x, x) — no key can satisfy it.
+    let items = scan_items(&[b"m"]);
+    assert_eq!(
+        validate_filled_page(&items, b"m", b"m"),
+        Err(PageShapeError::InvertedBounds)
+    );
+}
+
 #[rstest]
-#[case::before_start(scan_items(&[b"a", b"b"]), b"b", b"", PageShapeError::KeyOutsideShardBounds { index: 0 })]
-#[case::at_end(scan_items(&[b"a", b"c"]), b"", b"c", PageShapeError::KeyOutsideShardBounds { index: 1 })]
-#[case::single_at_end(scan_items(&[b"z"]), b"a", b"z", PageShapeError::KeyOutsideShardBounds { index: 0 })]
+#[case::before_start(scan_items(&[b"a", b"b"]), b"b", b"", PageShapeError::KeyOutsideShardBounds { index: 0, below_start: true })]
+#[case::at_end(scan_items(&[b"a", b"c"]), b"", b"c", PageShapeError::KeyOutsideShardBounds { index: 1, below_start: false })]
+#[case::single_at_end(scan_items(&[b"z"]), b"a", b"z", PageShapeError::KeyOutsideShardBounds { index: 0, below_start: false })]
 fn validate_filled_page_rejects_out_of_bounds_keys(
     #[case] items: Vec<ScanItem>,
     #[case] start: &[u8],
