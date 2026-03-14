@@ -16,6 +16,17 @@ The crate provides four core capabilities:
   `TypeName(len=N, hash=XXXXXXXX..)` via truncated BLAKE3, never raw
   bytes.
 
+- **Shared paging vocabulary** -- `PageBuf`, `PageState`,
+  `PagingCapabilities`, `KeyedPageItem`, and `validate_filled_page`
+  provide the page shape and validation rules that connector families
+  reuse for ordered shard traversal.
+
+- **Family contract modules** -- `ordered.rs` defines the
+  `OrderedContentSource` trait and its family-specific capability flags.
+  This is the first step away from a one-trait-fits-all connector
+  surface while the old driver stack is still present elsewhere in the
+  runtime.
+
 - **Connector method surface** -- each concrete connector exposes `caps`,
   `choose_split_point`, `open`, and `read_range` as
   inherent methods with shared signatures. `ConnectorCapabilities`
@@ -28,8 +39,10 @@ The crate provides four core capabilities:
 | File                | Role                                                                         |
 | ------------------- | ---------------------------------------------------------------------------- |
 | `mod.rs`            | Module root, re-exports all public types from sub-modules                    |
-| `types.rs`          | Toxic-byte wrappers, `Cursor`, `ScanItem`, `Budgets`, `ToxicDigest`         |
-| `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`, traits |
+| `types.rs`          | Toxic-byte wrappers, `Cursor`, `ScanItem`, `Budgets`, `ToxicDigest`          |
+| `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`         |
+| `common.rs`         | Shared page container/state types, paging capability flags, and page validation |
+| `ordered.rs`        | Ordered-content family contract layered on shared paging vocabulary          |
 
 #### Implementation layer (`crates/gossip-connectors/`)
 
