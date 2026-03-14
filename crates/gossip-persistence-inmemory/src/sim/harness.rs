@@ -45,8 +45,9 @@ use crate::{CompletionOrder, InMemoryDoneLedger, InMemoryDoneLedgerHandle, Pendi
 /// Overlapping keys force merge contention.
 const OVID_POOL_SIZE: usize = 50;
 
-/// Test-only mirror of the shared key-pool width so sibling property tests
-/// generate upserts and reads against the same key space as the harness.
+/// Test-only mirror of the shared key-pool width so property tests in the
+/// `tests` module generate upserts and reads against the same key space as
+/// the harness.
 #[cfg(test)]
 pub(super) const PROPTEST_OVID_POOL_SIZE: usize = OVID_POOL_SIZE;
 
@@ -740,7 +741,7 @@ impl DoneLedgerSim {
         if order == CompletionOrder::NewestFirst {
             sorted_batches.reverse();
         }
-        debug_assert_eq!(
+        assert_eq!(
             count,
             sorted_batches.len(),
             "store/harness pending count mismatch"
@@ -754,7 +755,9 @@ impl DoneLedgerSim {
             match event.kind() {
                 DoneLedgerSimEventKind::Released => committed += 1,
                 DoneLedgerSimEventKind::ReleasedCommitFailed => failed += 1,
-                _ => {}
+                other => unreachable!(
+                    "finish_released_batch returned unexpected event kind {other:?} for op_id {op_id}"
+                ),
             }
             all_violations.extend(violations);
         }

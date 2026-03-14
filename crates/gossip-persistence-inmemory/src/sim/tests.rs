@@ -36,12 +36,43 @@ struct SweepOutcome {
 
 #[derive(Debug, Clone)]
 pub(super) struct RecordSpec {
+    /// Index into the shared ovid pool; must be < PROPTEST_OVID_POOL_SIZE.
     pub(super) ovid_index: usize,
     pub(super) status: DoneLedgerStatus,
     pub(super) bytes_scanned: u64,
     pub(super) findings_count: u32,
     pub(super) started_at: u64,
     pub(super) duration: u64,
+}
+
+impl RecordSpec {
+    /// Validated constructor. Derives `findings_count` from `status` and
+    /// `bytes_scanned` to enforce the status/findings invariant in one place.
+    fn new(
+        ovid_index: usize,
+        status: DoneLedgerStatus,
+        bytes_scanned: u64,
+        started_at: u64,
+        duration: u64,
+    ) -> Self {
+        assert!(
+            ovid_index < PROPTEST_OVID_POOL_SIZE,
+            "ovid_index {ovid_index} out of bounds (pool size {PROPTEST_OVID_POOL_SIZE})"
+        );
+        let findings_count = match status {
+            DoneLedgerStatus::ScannedClean => 0,
+            DoneLedgerStatus::ScannedWithFindings => ((bytes_scanned % 5) + 1) as u32,
+            _ => (bytes_scanned % 4) as u32,
+        };
+        Self {
+            ovid_index,
+            status,
+            bytes_scanned,
+            findings_count,
+            started_at,
+            duration,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,19 +234,7 @@ fn arb_record_spec() -> impl Strategy<Value = RecordSpec> {
     )
         .prop_map(
             |(ovid_index, status, bytes_scanned, started_at, duration)| {
-                let findings_count = match status {
-                    DoneLedgerStatus::ScannedClean => 0,
-                    DoneLedgerStatus::ScannedWithFindings => ((bytes_scanned % 5) + 1) as u32,
-                    _ => (bytes_scanned % 4) as u32,
-                };
-                RecordSpec {
-                    ovid_index,
-                    status,
-                    bytes_scanned,
-                    findings_count,
-                    started_at,
-                    duration,
-                }
+                RecordSpec::new(ovid_index, status, bytes_scanned, started_at, duration)
             },
         )
 }
@@ -248,7 +267,10 @@ fn materialize_record(sim: &mut DoneLedgerSim, spec: &RecordSpec) -> DoneLedgerR
 }
 
 fn map_batch_get_indices(raw_indices: &[usize], seen_ovid_indices: &BTreeSet<usize>) -> Vec<usize> {
-    debug_assert!(!raw_indices.is_empty());
+    assert!(
+        !raw_indices.is_empty(),
+        "map_batch_get_indices called with empty raw_indices"
+    );
 
     let result: Vec<usize> = if seen_ovid_indices.is_empty() {
         raw_indices
@@ -261,7 +283,7 @@ fn map_batch_get_indices(raw_indices: &[usize], seen_ovid_indices: &BTreeSet<usi
             .iter()
             .map(|idx| {
                 // ~20% of reads target arbitrary pool keys to detect delayed-write
-                // leaks for keys the oracle has no record of.
+                // leaks on indices the oracle may have no record of.
                 if idx % 5 == 0 {
                     idx % PROPTEST_OVID_POOL_SIZE
                 } else {
@@ -271,8 +293,15 @@ fn map_batch_get_indices(raw_indices: &[usize], seen_ovid_indices: &BTreeSet<usi
             .collect()
     };
 
-    debug_assert_eq!(result.len(), raw_indices.len());
-    debug_assert!(result.iter().all(|&i| i < PROPTEST_OVID_POOL_SIZE));
+    assert_eq!(
+        result.len(),
+        raw_indices.len(),
+        "output length diverged from input"
+    );
+    assert!(
+        result.iter().all(|&i| i < PROPTEST_OVID_POOL_SIZE),
+        "mapped index out of bounds: {result:?}, pool_size={PROPTEST_OVID_POOL_SIZE}"
+    );
     result
 }
 
@@ -338,12 +367,14 @@ fn assert_get_presence(event: super::DoneLedgerSimEvent, expect_some: bool, cont
 }
 
 /// Injects a delay fault, upserts a pending record, and verifies it is
-/// invisible to reads while still pending.
+/// invisible to reads while still pending. Returns the pending write's
+/// `op_id` so callers can verify identity continuity through subsequent
+/// fault-prefix steps.
 fn fault_prefix_delayed_write(
     sim: &mut DoneLedgerSim,
     seen_ovid_indices: &mut BTreeSet<usize>,
     spec: &RecordSpec,
-) {
+) -> PendingWriteId {
     seen_ovid_indices.insert(spec.ovid_index);
 
     let event = step_clean(
@@ -361,10 +392,10 @@ fn fault_prefix_delayed_write(
         },
         "fault prefix delayed upsert",
     );
-    assert!(matches!(
-        event,
-        super::DoneLedgerSimEvent::UpsertPending { .. }
-    ));
+    let op_id = match event {
+        super::DoneLedgerSimEvent::UpsertPending { op_id } => op_id,
+        other => panic!("fault prefix delayed upsert: expected UpsertPending, got {other:?}"),
+    };
 
     let event = step_clean(
         sim,
@@ -374,11 +405,18 @@ fn fault_prefix_delayed_write(
         "fault prefix read while pending",
     );
     assert_get_presence(event, false, "fault prefix read while pending");
+
+    op_id
 }
 
 /// Injects a commit failure, releases the oldest pending write (which fails),
-/// and verifies the record remains invisible.
-fn fault_prefix_commit_failure(sim: &mut DoneLedgerSim, spec: &RecordSpec) {
+/// and verifies the record remains invisible. Asserts that the released
+/// `op_id` matches `expected_op_id` to confirm identity continuity.
+fn fault_prefix_commit_failure(
+    sim: &mut DoneLedgerSim,
+    spec: &RecordSpec,
+    expected_op_id: PendingWriteId,
+) {
     let event = step_clean(
         sim,
         DoneLedgerSimOp::InjectCommitFailure { count: 1 },
@@ -391,10 +429,16 @@ fn fault_prefix_commit_failure(sim: &mut DoneLedgerSim, spec: &RecordSpec) {
         DoneLedgerSimOp::ReleaseOldest,
         "fault prefix release delayed write",
     );
-    assert!(matches!(
-        event,
-        super::DoneLedgerSimEvent::ReleasedCommitFailed { .. }
-    ));
+    let op_id = match event {
+        super::DoneLedgerSimEvent::ReleasedCommitFailed { op_id } => op_id,
+        other => panic!(
+            "fault prefix release delayed write: expected ReleasedCommitFailed, got {other:?}"
+        ),
+    };
+    assert_eq!(
+        op_id, expected_op_id,
+        "fault prefix commit failure: op_id mismatch (got {op_id:?}, expected {expected_op_id:?})"
+    );
 
     let event = step_clean(
         sim,
@@ -438,17 +482,10 @@ fn exercise_fault_prefix(sim: &mut DoneLedgerSim, seen_ovid_indices: &mut BTreeS
     //
     // Uses ovid pool slot 0 so random ops can overlap with it, exercising
     // merge contention on a key that already has fault-prefix write history.
-    let retry_spec = RecordSpec {
-        ovid_index: 0,
-        status: DoneLedgerStatus::ScannedWithFindings,
-        bytes_scanned: 512,
-        findings_count: 3,
-        started_at: 10,
-        duration: 5,
-    };
+    let retry_spec = RecordSpec::new(0, DoneLedgerStatus::ScannedWithFindings, 512, 10, 5);
 
-    fault_prefix_delayed_write(sim, seen_ovid_indices, &retry_spec);
-    fault_prefix_commit_failure(sim, &retry_spec);
+    let pending_op_id = fault_prefix_delayed_write(sim, seen_ovid_indices, &retry_spec);
+    fault_prefix_commit_failure(sim, &retry_spec, pending_op_id);
     fault_prefix_successful_retry(sim, &retry_spec);
 }
 
@@ -475,9 +512,9 @@ fn run_op_sequence(seed: u64, level: FaultLevel, ops: &[ProptestOp]) {
         );
     }
 
-    // A single ReleaseAll is sufficient: exec_release_all calls
-    // pending_batches.drain() which is total in single-threaded
-    // execution — no new writes can arrive during the drain.
+    // A single ReleaseAll is sufficient: in single-threaded execution
+    // no new step() calls can interleave, so the store releases all
+    // pending writes and the harness drains its bookkeeping in one pass.
     if sim.pending_batch_count() > 0 {
         let (event, violations) = sim.step(DoneLedgerSimOp::ReleaseAll {
             order: CompletionOrder::OldestFirst,
@@ -485,6 +522,11 @@ fn run_op_sequence(seed: u64, level: FaultLevel, ops: &[ProptestOp]) {
         assert!(
             violations.is_empty(),
             "seed={seed}, level={level:?}: drain event={event:?}, violations={violations:?}"
+        );
+        assert_eq!(
+            sim.pending_batch_count(),
+            0,
+            "seed={seed}, level={level:?}: ReleaseAll did not drain all pending writes"
         );
     }
 
@@ -602,7 +644,8 @@ proptest! {
 
     // Shrinking note: the materialization layer (ProptestOp -> DoneLedgerSimOp)
     // means shrunk sequences produce different RunId values than the original
-    // failure. Seed-based replay (seed=N in assertion messages) is the primary
+    // failure, which can alter merge tie-breaking and mask the root cause.
+    // Seed-based replay (seed=N in assertion messages) is the primary
     // debugging mechanism, not proptest's minimal counterexamples.
     #[test]
     fn prop_done_ledger_state_machine(
@@ -612,4 +655,75 @@ proptest! {
     ) {
         run_op_sequence(seed, level, &ops);
     }
+}
+
+/// Compile-time exhaustiveness check: if a new variant is added to
+/// DoneLedgerSimOp, this match becomes non-exhaustive, forcing the
+/// author to extend ProptestOp and materialize_op.
+const _: () = {
+    fn _variant_check(op: &DoneLedgerSimOp) {
+        match op {
+            DoneLedgerSimOp::BatchUpsert { .. } => {}
+            DoneLedgerSimOp::BatchGet { .. } => {}
+            DoneLedgerSimOp::ReleaseOldest => {}
+            DoneLedgerSimOp::ReleaseNewest => {}
+            DoneLedgerSimOp::ReleaseSpecific { .. } => {}
+            DoneLedgerSimOp::ReleaseAll { .. } => {}
+            DoneLedgerSimOp::InjectSubmitFailure { .. } => {}
+            DoneLedgerSimOp::InjectCommitFailure { .. } => {}
+            DoneLedgerSimOp::InjectDelay { .. } => {}
+        }
+    }
+};
+
+#[test]
+fn map_batch_get_indices_empty_seen_uses_modulo() {
+    let seen = BTreeSet::new();
+    let raw = vec![0, 1, PROPTEST_OVID_POOL_SIZE, PROPTEST_OVID_POOL_SIZE + 3];
+    let result = map_batch_get_indices(&raw, &seen);
+    assert_eq!(result, vec![0, 1, 0, 3]);
+}
+
+#[test]
+fn map_batch_get_indices_nonempty_seen_biases_toward_seen_keys() {
+    let seen: BTreeSet<usize> = [5, 10, 15].into_iter().collect();
+    let raw: Vec<usize> = (0..100).collect();
+    let result = map_batch_get_indices(&raw, &seen);
+
+    let from_seen = result.iter().filter(|i| seen.contains(i)).count();
+    // ~80% should hit seen keys (indices where idx % 5 != 0).
+    assert!(
+        from_seen >= 60,
+        "expected >=60 seen-key hits in 100 indices, got {from_seen}"
+    );
+    assert!(result.iter().all(|&i| i < PROPTEST_OVID_POOL_SIZE));
+}
+
+#[test]
+fn map_batch_get_indices_single_seen_element_no_divide_by_zero() {
+    let seen: BTreeSet<usize> = [7].into_iter().collect();
+    let raw = vec![0, 1, 2, 5, 10];
+    let result = map_batch_get_indices(&raw, &seen);
+    // idx % 5 == 0 → full pool modulo; others → seen[idx % 1] == 7
+    assert_eq!(result[0], 0); // 0 % 5 == 0 → 0 % 50 = 0
+    assert_eq!(result[1], 7); // 1 % 5 != 0 → seen[0] = 7
+    assert_eq!(result[2], 7); // 2 % 5 != 0 → seen[0] = 7
+    assert_eq!(result[3], 5); // 5 % 5 == 0 → 5 % 50 = 5
+    assert_eq!(result[4], 10); // 10 % 5 == 0 → 10 % 50 = 10
+}
+
+#[test]
+fn map_batch_get_indices_all_outputs_in_bounds() {
+    let seen: BTreeSet<usize> = (0..PROPTEST_OVID_POOL_SIZE).step_by(3).collect();
+    let raw: Vec<usize> = (0..500).collect();
+    let result = map_batch_get_indices(&raw, &seen);
+    assert_eq!(result.len(), raw.len());
+    assert!(
+        result.iter().all(|&i| i < PROPTEST_OVID_POOL_SIZE),
+        "out-of-bounds index found: {:?}",
+        result
+            .iter()
+            .filter(|&&i| i >= PROPTEST_OVID_POOL_SIZE)
+            .collect::<Vec<_>>()
+    );
 }
