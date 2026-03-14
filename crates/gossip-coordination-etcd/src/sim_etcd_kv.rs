@@ -43,12 +43,14 @@ use etcd_client::proto::{
 };
 use etcd_client::{CompareOp, GetOptions, LeaseGrantResponse, LeaseRevokeResponse, Txn, TxnOp};
 use gossip_coordination::sim::FaultLevel;
+use gossip_stdx::{FNV_OFFSET, fnv_mix_byte, fnv_mix_bytes, fnv_mix_u64};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
+use crate::config::DEFAULT_OPTIMISTIC_TXN_RETRIES;
+
 const PPM_MAX: u32 = 1_000_000;
-const DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS: usize = 8;
 
 /// In-memory etcd model for deterministic simulation.
 #[derive(Debug, Clone)]
@@ -64,7 +66,7 @@ pub struct SimulatedEtcdKV {
     active_retry_exhaustion: Option<ActiveRetryExhaustion>,
     /// Suppresses immediate re-arming after a forced retry-exhaustion burst.
     /// Cleared once a different txn fingerprint arrives.
-    recent_retry_exhaustion: Option<Vec<u8>>,
+    recent_retry_exhaustion: Option<u64>,
     rng: ChaCha8Rng,
 }
 
@@ -259,16 +261,27 @@ impl SimulatedEtcdKV {
         self.maybe_inject_lease_ttl_race();
 
         let request: PbTxnRequest = txn.into();
-        let fingerprint = txn_fingerprint(&request);
-        self.clear_retry_exhaustion_for_other_txn(&fingerprint);
         if !request.failure.is_empty() {
             return Err(SimEtcdError::UnsupportedTxnOp {
                 detail: "failure branches are not modeled",
             });
         }
-        if self.consume_retry_exhaustion(&fingerprint) {
-            return Ok(build_txn_response(self.revision, false, Vec::new()));
-        }
+
+        let retry_exhaustion_possible = self.active_retry_exhaustion.is_some()
+            || self.recent_retry_exhaustion.is_some()
+            || (self.fault_config.retry_exhaustion_ppm > 0
+                && self.fault_config.retry_exhaustion_attempts > 0);
+
+        let fingerprint = if retry_exhaustion_possible {
+            let fp = txn_fingerprint(&request);
+            self.clear_retry_exhaustion_for_other_txn(fp);
+            if self.consume_retry_exhaustion(fp) {
+                return Ok(build_txn_response(self.revision, false, Vec::new()));
+            }
+            Some(fp)
+        } else {
+            None
+        };
 
         let compares_succeeded = request
             .compare
@@ -282,10 +295,10 @@ impl SimulatedEtcdKV {
         if !compares_succeeded {
             return Ok(build_txn_response(self.revision, false, Vec::new()));
         }
-        if self.fault_config.should_cas_compare_fail(&mut self.rng) {
+        if !request.compare.is_empty() && self.fault_config.should_cas_compare_fail(&mut self.rng) {
             return Ok(build_txn_response(self.revision, false, Vec::new()));
         }
-        if self.maybe_arm_retry_exhaustion(&request, &fingerprint) {
+        if fingerprint.is_some_and(|fp| self.maybe_arm_retry_exhaustion(&request, fp)) {
             return Ok(build_txn_response(self.revision, false, Vec::new()));
         }
 
@@ -402,6 +415,11 @@ impl SimulatedEtcdKV {
         self.expire_due_leases();
     }
 
+    /// Advance the clock by one tick and expire any newly-due leases.
+    ///
+    /// Only leases within one tick of expiry are affected. Firings where
+    /// no lease is near its deadline are benign no-ops that preserve
+    /// clock monotonicity without mutating KV state.
     fn maybe_inject_lease_ttl_race(&mut self) {
         if !self.fault_config.should_lease_ttl_race(&mut self.rng) {
             return;
@@ -413,7 +431,7 @@ impl SimulatedEtcdKV {
         self.expire_due_leases();
     }
 
-    fn clear_retry_exhaustion_for_other_txn(&mut self, fingerprint: &[u8]) {
+    fn clear_retry_exhaustion_for_other_txn(&mut self, fingerprint: u64) {
         if self
             .active_retry_exhaustion
             .as_ref()
@@ -423,14 +441,13 @@ impl SimulatedEtcdKV {
         }
         if self
             .recent_retry_exhaustion
-            .as_ref()
             .is_some_and(|recent| recent != fingerprint)
         {
             self.recent_retry_exhaustion = None;
         }
     }
 
-    fn consume_retry_exhaustion(&mut self, fingerprint: &[u8]) -> bool {
+    fn consume_retry_exhaustion(&mut self, fingerprint: u64) -> bool {
         let Some(fault) = self.active_retry_exhaustion.as_mut() else {
             return false;
         };
@@ -443,19 +460,25 @@ impl SimulatedEtcdKV {
         }
         fault.remaining_failures -= 1;
         if fault.remaining_failures == 0 {
-            self.recent_retry_exhaustion = Some(fingerprint.to_vec());
+            self.recent_retry_exhaustion = Some(fingerprint);
             self.active_retry_exhaustion = None;
         }
         true
     }
 
-    fn maybe_arm_retry_exhaustion(&mut self, request: &PbTxnRequest, fingerprint: &[u8]) -> bool {
+    fn maybe_arm_retry_exhaustion(&mut self, request: &PbTxnRequest, fingerprint: u64) -> bool {
+        debug_assert!(
+            self.fault_config.retry_exhaustion_ppm == 0
+                || self.fault_config.retry_exhaustion_attempts > 0,
+            "retry_exhaustion_attempts is 0 but retry_exhaustion_ppm is nonzero; \
+             the fault will never fire"
+        );
+
         if request.compare.is_empty()
             || request.success.is_empty()
             || self.fault_config.retry_exhaustion_attempts == 0
             || self
                 .recent_retry_exhaustion
-                .as_ref()
                 .is_some_and(|recent| recent == fingerprint)
             || !self.fault_config.should_retry_exhaust(&mut self.rng)
         {
@@ -470,11 +493,11 @@ impl SimulatedEtcdKV {
             .retry_exhaustion_attempts
             .saturating_sub(1);
         if remaining_failures == 0 {
-            self.recent_retry_exhaustion = Some(fingerprint.to_vec());
+            self.recent_retry_exhaustion = Some(fingerprint);
             self.active_retry_exhaustion = None;
         } else {
             self.active_retry_exhaustion = Some(ActiveRetryExhaustion {
-                txn_fingerprint: fingerprint.to_vec(),
+                txn_fingerprint: fingerprint,
                 remaining_failures,
             });
             self.recent_retry_exhaustion = None;
@@ -892,7 +915,7 @@ struct LeaseState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRetryExhaustion {
-    txn_fingerprint: Vec<u8>,
+    txn_fingerprint: u64,
     remaining_failures: usize,
 }
 
@@ -964,7 +987,7 @@ impl SimEtcdFaultConfig {
                 uncertain_commit_ppm: 20_000,
                 lease_ttl_race_ppm: 50_000,
                 retry_exhaustion_ppm: 10_000,
-                retry_exhaustion_attempts: DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS,
+                retry_exhaustion_attempts: DEFAULT_OPTIMISTIC_TXN_RETRIES,
                 ..Self::default()
             },
             FaultLevel::Radioactive => Self {
@@ -972,7 +995,7 @@ impl SimEtcdFaultConfig {
                 uncertain_commit_ppm: 100_000,
                 lease_ttl_race_ppm: 150_000,
                 retry_exhaustion_ppm: 50_000,
-                retry_exhaustion_attempts: DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS,
+                retry_exhaustion_attempts: DEFAULT_OPTIMISTIC_TXN_RETRIES,
                 ..Self::default()
             },
         }
@@ -1190,49 +1213,43 @@ fn should_inject(rng: &mut ChaCha8Rng, ppm: u32) -> bool {
     rng.random_range(0u32..PPM_MAX) < ppm
 }
 
-/// Keys-only fingerprint for one logical CAS request.
+/// Structural FNV-1a fingerprint for one logical CAS request.
 ///
-/// Only the key set and op-type discriminants are included. Values,
-/// revisions, and boolean flags are deliberately excluded because the
-/// coordinator rebuilds transactions from scratch on each retry,
-/// re-reading current state, so value-dependent fields can legitimately
-/// differ across retries of the same logical operation.
-fn txn_fingerprint(request: &PbTxnRequest) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_len(&mut out, request.compare.len());
+/// Hashes only the key set, compare target types, compare operators,
+/// and success op-type discriminants. Values, revisions, and boolean
+/// flags are deliberately excluded because the coordinator rebuilds
+/// transactions from scratch on each retry, re-reading current state,
+/// so value-dependent fields can legitimately differ across retries of
+/// the same logical operation.
+fn txn_fingerprint(request: &PbTxnRequest) -> u64 {
+    let mut sig = FNV_OFFSET;
+    fnv_mix_u64(&mut sig, request.compare.len() as u64);
     for compare in &request.compare {
-        push_bytes(&mut out, &compare.key);
+        fnv_mix_bytes(&mut sig, &compare.key);
+        fnv_mix_byte(&mut sig, compare.result as u8);
+        fnv_mix_byte(&mut sig, compare.target as u8);
     }
 
-    push_len(&mut out, request.success.len());
+    fnv_mix_u64(&mut sig, request.success.len() as u64);
     for op in &request.success {
         match op.request.as_ref() {
             Some(PbTxnOpRequest::RequestPut(put)) => {
-                out.push(10);
-                push_bytes(&mut out, &put.key);
+                fnv_mix_byte(&mut sig, 10);
+                fnv_mix_bytes(&mut sig, &put.key);
             }
             Some(PbTxnOpRequest::RequestDeleteRange(delete)) => {
-                out.push(11);
-                push_bytes(&mut out, &delete.key);
+                fnv_mix_byte(&mut sig, 11);
+                fnv_mix_bytes(&mut sig, &delete.key);
             }
             Some(PbTxnOpRequest::RequestRange(range)) => {
-                out.push(12);
-                push_bytes(&mut out, &range.key);
+                fnv_mix_byte(&mut sig, 12);
+                fnv_mix_bytes(&mut sig, &range.key);
             }
-            Some(PbTxnOpRequest::RequestTxn(_)) => out.push(13),
-            None => out.push(254),
+            Some(PbTxnOpRequest::RequestTxn(_)) => fnv_mix_byte(&mut sig, 13),
+            None => fnv_mix_byte(&mut sig, 254),
         }
     }
-    out
-}
-
-fn push_len(out: &mut Vec<u8>, len: usize) {
-    out.extend_from_slice(&(len as u64).to_le_bytes());
-}
-
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    push_len(out, bytes.len());
-    out.extend_from_slice(bytes);
+    sig
 }
 
 fn passes_revision_filters(request: &PbRangeRequest, entry: &KvEntry) -> bool {
@@ -1291,10 +1308,8 @@ fn compare_bytes(actual: &[u8], expected: &[u8], op: CompareOp) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS, SimEtcdError, SimEtcdFaultConfig,
-        SimulatedEtcdKV,
-    };
+    use super::{SimEtcdError, SimEtcdFaultConfig, SimulatedEtcdKV};
+    use crate::config::DEFAULT_OPTIMISTIC_TXN_RETRIES;
     use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
     use gossip_coordination::sim::FaultLevel;
 
@@ -1560,7 +1575,7 @@ mod tests {
         assert_eq!(stormy.retry_exhaustion_ppm, 10_000);
         assert_eq!(
             stormy.retry_exhaustion_attempts,
-            DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS
+            DEFAULT_OPTIMISTIC_TXN_RETRIES
         );
 
         let radioactive = SimEtcdFaultConfig::for_level(FaultLevel::Radioactive);
@@ -1570,7 +1585,7 @@ mod tests {
         assert_eq!(radioactive.retry_exhaustion_ppm, 50_000);
         assert_eq!(
             radioactive.retry_exhaustion_attempts,
-            DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS
+            DEFAULT_OPTIMISTIC_TXN_RETRIES
         );
     }
 
@@ -2080,6 +2095,158 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cas_compare_fault_does_not_reject_compare_free_txn() {
+        let mut kv = SimulatedEtcdKV::with_fault_config(
+            11,
+            SimEtcdFaultConfig::default().with_cas_compare_failure_ppm(1_000_000),
+        );
+
+        let resp = kv
+            .txn(Txn::new().and_then(vec![TxnOp::put(b"no-compare", b"value", None)]))
+            .expect("compare-free txn must not be rejected by CAS fault");
+        assert!(
+            resp.succeeded(),
+            "compare-free txn must succeed even with 100% CAS fault rate"
+        );
+        assert_eq!(
+            get_exact(&mut kv, b"no-compare").value(),
+            b"value",
+            "compare-free txn must write the key"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_with_single_attempt_fires_once() {
+        let mut kv = SimulatedEtcdKV::with_fault_config(
+            12,
+            SimEtcdFaultConfig::default()
+                .with_retry_exhaustion_ppm(1_000_000)
+                .with_retry_exhaustion_attempts(1),
+        );
+        let txn = || {
+            Txn::new()
+                .when(vec![Compare::create_revision(
+                    b"single-retry",
+                    CompareOp::Equal,
+                    0,
+                )])
+                .and_then(vec![TxnOp::put(b"single-retry", b"value", None)])
+        };
+
+        let first = kv.txn(txn()).expect("first txn should return response");
+        assert!(
+            !first.succeeded(),
+            "attempts=1 must fail on the arming call"
+        );
+
+        let second = kv.txn(txn()).expect("second txn should return response");
+        assert!(
+            second.succeeded(),
+            "recent suppression must prevent re-arming after a 1-attempt burst"
+        );
+        assert_eq!(get_exact(&mut kv, b"single-retry").value(), b"value");
+    }
+
+    #[test]
+    fn lease_ttl_race_expires_lease_during_keep_alive() {
+        let mut kv = SimulatedEtcdKV::new(13);
+        let lease = kv.lease_grant(1).expect("lease grant should succeed");
+        kv.txn(
+            Txn::new()
+                .when(vec![Compare::create_revision(
+                    b"keep-alive-race",
+                    CompareOp::Equal,
+                    0,
+                )])
+                .and_then(vec![TxnOp::put(
+                    b"keep-alive-race",
+                    b"value",
+                    Some(PutOptions::new().with_lease(lease.id())),
+                )]),
+        )
+        .expect("leased put should succeed");
+
+        kv.set_fault_config(SimEtcdFaultConfig::default().with_lease_ttl_race_ppm(1_000_000));
+
+        let err = kv
+            .lease_keep_alive_once(lease.id())
+            .expect_err("keep-alive should fail after TTL-race expires the lease");
+        assert!(
+            matches!(err, SimEtcdError::LeaseNotFound { .. }),
+            "expected LeaseNotFound, got {err:?}"
+        );
+        assert!(
+            kv.get(b"keep-alive-race".to_vec(), None)
+                .expect("get should succeed")
+                .kvs()
+                .is_empty(),
+            "attached key must be deleted when lease expires during keep-alive"
+        );
+    }
+
+    #[test]
+    fn set_fault_config_clears_active_retry_exhaustion() {
+        let mut kv = SimulatedEtcdKV::with_fault_config(
+            14,
+            SimEtcdFaultConfig::default()
+                .with_retry_exhaustion_ppm(1_000_000)
+                .with_retry_exhaustion_attempts(5),
+        );
+        let txn = || {
+            Txn::new()
+                .when(vec![Compare::create_revision(
+                    b"clear-retry",
+                    CompareOp::Equal,
+                    0,
+                )])
+                .and_then(vec![TxnOp::put(b"clear-retry", b"value", None)])
+        };
+
+        let first = kv.txn(txn()).expect("first txn should return response");
+        let second = kv.txn(txn()).expect("second txn should return response");
+        assert!(!first.succeeded());
+        assert!(!second.succeeded());
+
+        kv.set_fault_config(SimEtcdFaultConfig::default());
+
+        let after_clear = kv
+            .txn(txn())
+            .expect("txn after config reset should return response");
+        assert!(
+            after_clear.succeeded(),
+            "set_fault_config must clear active retry-exhaustion state"
+        );
+        assert_eq!(get_exact(&mut kv, b"clear-retry").value(), b"value");
+    }
+
+    #[test]
+    fn sunny_day_never_injects_faults() {
+        let mut kv = SimulatedEtcdKV::with_fault_config(
+            42,
+            SimEtcdFaultConfig::for_level(FaultLevel::SunnyDay),
+        );
+
+        for i in 0..100u32 {
+            let key = format!("sunny-{i}");
+            let resp = kv
+                .txn(
+                    Txn::new()
+                        .when(vec![Compare::create_revision(
+                            key.as_bytes(),
+                            CompareOp::Equal,
+                            0,
+                        )])
+                        .and_then(vec![TxnOp::put(key.as_bytes(), b"v", None)]),
+                )
+                .unwrap_or_else(|e| panic!("SunnyDay txn #{i} returned error: {e}"));
+            assert!(
+                resp.succeeded(),
+                "SunnyDay txn #{i} failed — no faults should fire at zero PPM"
+            );
+        }
+    }
+
     // ---- Property-based tests ----
 
     mod proptests {
@@ -2118,11 +2285,34 @@ mod tests {
             prop::collection::vec(arb_kv_op(), count)
         }
 
+        fn arb_fault_config() -> impl Strategy<Value = SimEtcdFaultConfig> {
+            (
+                0u32..=200_000,
+                0u32..=200_000,
+                0u32..=200_000,
+                0u32..=200_000,
+                0usize..=5,
+            )
+                .prop_map(|(cas, uncertain, lease, retry, attempts)| {
+                    SimEtcdFaultConfig::default()
+                        .with_cas_compare_failure_ppm(cas)
+                        .with_uncertain_commit_ppm(uncertain)
+                        .with_lease_ttl_race_ppm(lease)
+                        .with_retry_exhaustion_ppm(retry)
+                        .with_retry_exhaustion_attempts(attempts)
+                })
+        }
+
         proptest! {
-            /// Global revision must never decrease across any operation sequence.
+            /// Global revision must never decrease across any operation sequence,
+            /// even under randomized fault injection.
             #[test]
-            fn revision_monotonically_increases(ops in arb_kv_ops(1..50), seed in any::<u64>()) {
-                let mut kv = SimulatedEtcdKV::new(seed);
+            fn revision_monotonically_increases(
+                ops in arb_kv_ops(1..50),
+                seed in any::<u64>(),
+                fault_config in arb_fault_config(),
+            ) {
+                let mut kv = SimulatedEtcdKV::with_fault_config(seed, fault_config);
                 let mut prev_rev = kv.revision();
 
                 for op in ops {
@@ -2162,10 +2352,14 @@ mod tests {
             }
 
             /// The key_count accessor must always equal the number of keys
-            /// retrievable via a full-range scan.
+            /// retrievable via a full-range scan, even under fault injection.
             #[test]
-            fn key_count_matches_full_range_scan(ops in arb_kv_ops(1..30), seed in any::<u64>()) {
-                let mut kv = SimulatedEtcdKV::new(seed);
+            fn key_count_matches_full_range_scan(
+                ops in arb_kv_ops(1..30),
+                seed in any::<u64>(),
+                fault_config in arb_fault_config(),
+            ) {
+                let mut kv = SimulatedEtcdKV::with_fault_config(seed, fault_config);
 
                 for op in ops {
                     match op {
