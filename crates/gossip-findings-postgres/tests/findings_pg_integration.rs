@@ -8,14 +8,13 @@ use common::{LivePgHarness, sample_fixture};
 
 /// Run these live integration tests with:
 ///
-/// `cargo test -p gossip-findings-postgres --features test-utils --test findings_pg_integration -- --ignored`
+/// `cargo test -p gossip-findings-postgres --features test-utils --test findings_pg_integration`
 ///
 /// Optionally point them at a different Postgres instance with:
 ///
 /// `GOSSIP_POSTGRES_TEST_URL='host=127.0.0.1 user=postgres password=postgres dbname=postgres'`
 
 #[test]
-#[ignore = "requires a live Postgres instance"]
 fn live_pg_harness_round_trips_fixture_and_inspection_helpers() {
     let mut harness = LivePgHarness::new();
     assert_eq!(harness.durable_counts(), DurableFindingsCounts::default());

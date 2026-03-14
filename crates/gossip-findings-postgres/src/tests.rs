@@ -2,8 +2,8 @@
 //! runner.
 //!
 //! These tests require either Docker (for testcontainers) or an external
-//! PostgreSQL advertised through `GOSSIP_POSTGRES_TEST_URL`. They are marked
-//! `#[ignore]` so routine `cargo test` runs skip them cleanly.
+//! PostgreSQL advertised through `GOSSIP_POSTGRES_TEST_URL`. Each test gets an
+//! isolated database via `gossip_pg_common::test_support::create_test_db()`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -440,7 +440,7 @@ fn insert_valid_occurrence(client: &mut Client) {
 // ── Migration runner ──────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migration_creates_findings_table() {
     let mut client = test_client();
 
@@ -458,7 +458,7 @@ fn migration_creates_findings_table() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migration_creates_occurrences_table() {
     let mut client = test_client();
 
@@ -477,7 +477,7 @@ fn migration_creates_occurrences_table() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migration_creates_observations_table() {
     let mut client = test_client();
 
@@ -501,7 +501,7 @@ fn migration_creates_observations_table() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migration_is_idempotent() {
     let mut client = test_client_bare();
 
@@ -523,7 +523,7 @@ fn migration_is_idempotent() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migration_detects_checksum_mismatch() {
     let mut client = test_client_bare();
     apply_all_migrations(&mut client).expect("initial migration run should succeed");
@@ -542,7 +542,7 @@ fn migration_detects_checksum_mismatch() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn persisted_checksum_tamper_is_detected_on_reapply() {
     let mut client = test_client_bare();
     apply_all_migrations(&mut client).expect("initial migration run should succeed");
@@ -568,7 +568,7 @@ fn persisted_checksum_tamper_is_detected_on_reapply() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn concurrent_migrations_both_succeed() {
     let url = create_test_db();
     let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -621,14 +621,14 @@ fn concurrent_migrations_both_succeed() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn bare_db_has_no_findings_tables() {
     let mut client = test_client_bare();
     assert!(findings_tables(&mut client).is_empty());
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migration_creates_history_table() {
     let mut client = test_client();
 
@@ -646,7 +646,7 @@ fn migration_creates_history_table() {
 // ── Schema verification ───────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_table_has_expected_indexes() {
     let mut client = test_client();
     let indexes = table_indexes(&mut client, schema::FINDINGS_TABLE);
@@ -667,7 +667,7 @@ fn findings_table_has_expected_indexes() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_table_has_expected_indexes() {
     let mut client = test_client();
     let indexes = table_indexes(&mut client, schema::OCCURRENCES_TABLE);
@@ -688,7 +688,7 @@ fn occurrences_table_has_expected_indexes() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_table_has_expected_indexes() {
     let mut client = test_client();
     let indexes = table_indexes(&mut client, schema::OBSERVATIONS_TABLE);
@@ -720,7 +720,7 @@ fn observations_table_has_expected_indexes() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_has_no_policy_hash_column() {
     let mut client = test_client();
     let columns = table_columns(&mut client, schema::OCCURRENCES_TABLE);
@@ -728,7 +728,7 @@ fn occurrences_has_no_policy_hash_column() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_has_policy_hash_column() {
     let mut client = test_client();
     let columns = table_columns(&mut client, schema::OBSERVATIONS_TABLE);
@@ -736,7 +736,7 @@ fn observations_has_policy_hash_column() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn foreign_key_cascade_from_findings() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -760,7 +760,7 @@ fn foreign_key_cascade_from_findings() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn foreign_key_cascade_from_occurrences() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -784,7 +784,7 @@ fn foreign_key_cascade_from_occurrences() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migration_creates_foreign_keys() {
     let mut client = test_client();
 
@@ -819,7 +819,7 @@ fn migration_creates_foreign_keys() {
 // ── Constraint enforcement ────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_rejects_short_bytea() {
     let mut client = test_client();
     let err = try_insert_finding(
@@ -836,7 +836,7 @@ fn findings_rejects_short_bytea() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_rejects_long_bytea() {
     let mut client = test_client();
     let err = try_insert_finding(
@@ -853,7 +853,7 @@ fn findings_rejects_long_bytea() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_rejects_short_bytea() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -871,7 +871,7 @@ fn occurrences_rejects_short_bytea() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_rejects_long_bytea() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -889,7 +889,7 @@ fn occurrences_rejects_long_bytea() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_short_bytea() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -907,7 +907,7 @@ fn observations_rejects_short_bytea() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_long_bytea() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -925,7 +925,7 @@ fn observations_rejects_long_bytea() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_rejects_negative_byte_offset() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -943,7 +943,7 @@ fn occurrences_rejects_negative_byte_offset() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_rejects_zero_byte_length() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -961,7 +961,7 @@ fn occurrences_rejects_zero_byte_length() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_span_overflow_rejected_by_sql() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -980,7 +980,7 @@ fn occurrences_span_overflow_rejected_by_sql() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_negative_fence_epoch() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -998,7 +998,7 @@ fn observations_rejects_negative_fence_epoch() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_negative_seen_at() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1016,7 +1016,7 @@ fn observations_rejects_negative_seen_at() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_accepts_negative_run_id() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1050,7 +1050,7 @@ fn observations_accepts_negative_run_id() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_accepts_negative_shard_id() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1084,7 +1084,7 @@ fn observations_accepts_negative_shard_id() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_location_display_size_limit() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1102,7 +1102,7 @@ fn observations_location_display_size_limit() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_location_url_size_limit() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1120,7 +1120,7 @@ fn observations_location_url_size_limit() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_empty_location_display() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1138,7 +1138,7 @@ fn observations_rejects_empty_location_display() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_empty_location_url() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1156,7 +1156,7 @@ fn observations_rejects_empty_location_url() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_location_url_accepts_null() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1195,7 +1195,7 @@ fn observations_location_url_accepts_null() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_natural_unique_prevents_duplicates() {
     let mut client = test_client();
     try_insert_finding(&mut client, FindingOverrides::default())
@@ -1215,7 +1215,7 @@ fn findings_natural_unique_prevents_duplicates() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_natural_unique_prevents_duplicates() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -1236,7 +1236,7 @@ fn occurrences_natural_unique_prevents_duplicates() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_natural_unique_prevents_duplicates() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1259,7 +1259,7 @@ fn observations_natural_unique_prevents_duplicates() {
 // ── Additional bytea length constraint tests ──────────────────────────────
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_rejects_short_secret_hash() {
     let mut client = test_client();
     let err = try_insert_finding(
@@ -1276,7 +1276,7 @@ fn findings_rejects_short_secret_hash() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_rejects_long_secret_hash() {
     let mut client = test_client();
     let err = try_insert_finding(
@@ -1293,7 +1293,7 @@ fn findings_rejects_long_secret_hash() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_rejects_short_finding_id() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -1311,7 +1311,7 @@ fn occurrences_rejects_short_finding_id() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_rejects_long_finding_id() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -1329,7 +1329,7 @@ fn occurrences_rejects_long_finding_id() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_short_ovid_hash() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1347,7 +1347,7 @@ fn observations_rejects_short_ovid_hash() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_rejects_long_ovid_hash() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1367,7 +1367,7 @@ fn observations_rejects_long_ovid_hash() {
 // ── Round-trip read-back tests ────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_round_trip_all_columns() {
     let mut client = test_client();
     try_insert_finding(&mut client, FindingOverrides::default())
@@ -1396,7 +1396,7 @@ fn findings_round_trip_all_columns() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn occurrences_round_trip_all_columns() {
     let mut client = test_client();
     insert_valid_finding(&mut client);
@@ -1431,7 +1431,7 @@ fn occurrences_round_trip_all_columns() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn observations_round_trip_all_columns() {
     let mut client = test_client();
     insert_valid_occurrence(&mut client);
@@ -1475,7 +1475,7 @@ fn observations_round_trip_all_columns() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn findings_sink_pg_passes_findings_conformance() {
     let mut client = test_client();
     client
@@ -1488,7 +1488,7 @@ fn findings_sink_pg_passes_findings_conformance() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn upsert_batch_returns_zero_receipt_for_empty_batch() {
     use gossip_contracts::persistence::{
         CommitHandle, FindingsCommitReceipt, FindingsSink, FindingsUpsertBatch,
@@ -1504,7 +1504,7 @@ fn upsert_batch_returns_zero_receipt_for_empty_batch() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn upsert_batch_rejects_oversized_batch() {
     use gossip_contracts::persistence::{
         FindingsSink, FindingsUpsertBatch, RECOMMENDED_MAX_BATCH_SIZE,
@@ -1541,18 +1541,16 @@ fn upsert_batch_rejects_oversized_batch() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn upsert_batch_rolls_back_on_conflict_error() {
     use gossip_contracts::identity::{
-        FenceEpoch, LogicalTime, NormHash, ObjectVersionId, ObservationId, OccurrenceId,
-        PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
-        key_secret_hash,
+        FenceEpoch, LogicalTime, NormHash, ObjectVersionId, OccurrenceId, PolicyHash,
+        RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey, key_secret_hash,
     };
     use gossip_contracts::persistence::{
         CommitHandle, FindingRecord, FindingsConformanceProbe, FindingsSink, FindingsUpsertBatch,
-        OccurrenceRecord, OvidHash,
+        ObservationRecord, OccurrenceRecord, OvidHash,
     };
-    use gossip_contracts::test_util::observation_record_with_stored_id;
 
     let backend = FindingsSinkPg::from_client(test_client());
 
@@ -1602,10 +1600,8 @@ fn upsert_batch_rolls_back_on_conflict_error() {
         ),
     );
     let bad_occurrence_id = OccurrenceId::from_bytes([0xFF; 32]);
-    let bad_observation_id = ObservationId::from_bytes([0xEE; 32]);
-    let bad_observation = observation_record_with_stored_id(
+    let bad_observation = ObservationRecord::new(
         tenant_id,
-        bad_observation_id,
         bad_occurrence_id,
         PolicyHash::from_bytes([0x77; 32]),
         OvidHash::from_bytes([0x88; 32]),
@@ -1613,7 +1609,6 @@ fn upsert_batch_rolls_back_on_conflict_error() {
         ShardId::from_raw(2),
         FenceEpoch::from_raw(3),
         LogicalTime::from_raw(10),
-        None,
     );
 
     let err = backend
@@ -1640,7 +1635,7 @@ fn upsert_batch_rolls_back_on_conflict_error() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn upsert_batch_detects_observation_identity_conflict_against_persisted_rows() {
     use gossip_contracts::identity::{
         FenceEpoch, LogicalTime, NormHash, ObjectVersionId, PolicyHash, RuleFingerprint, RunId,

@@ -1,9 +1,10 @@
 //! Shared live-PostgreSQL integration-test support for findings backend checks.
+//!
+//! Each test gets an isolated database via `gossip_pg_common::test_support`,
+//! backed by either Docker (testcontainers) or an external instance advertised
+//! through `GOSSIP_POSTGRES_TEST_URL`.
 
-use std::{
-    slice,
-    sync::{Mutex, MutexGuard, OnceLock},
-};
+use std::slice;
 
 use gossip_contracts::{
     connector::{Location, VersionId},
@@ -23,53 +24,25 @@ use gossip_findings_postgres::{
         OCCURRENCES_COUNT_SQL, OCCURRENCES_TABLE,
     },
 };
+use gossip_pg_common::test_support::create_test_db;
 use postgres::{Client, NoTls};
 
-const DEFAULT_TEST_DATABASE_URL: &str =
-    "host=127.0.0.1 user=postgres password=postgres dbname=postgres";
-
-fn test_database_url() -> String {
-    std::env::var("GOSSIP_POSTGRES_TEST_URL")
-        .unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.to_owned())
-}
-
-fn global_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 pub struct LivePgHarness {
-    _guard: MutexGuard<'static, ()>,
     backend: FindingsSinkPg,
     inspector: Client,
 }
 
 impl LivePgHarness {
-    /// Connect to a live PostgreSQL instance, apply migrations, and truncate
-    /// the findings tables under a process-wide test lock.
+    /// Provision a fresh isolated database, apply migrations, and open an
+    /// independent inspector connection.
     pub fn new() -> Self {
-        let guard = match global_test_lock().lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                // A previous test panicked while holding the lock. Recover the
-                // guard so subsequent tests can still truncate and start fresh.
-                poisoned.into_inner()
-            }
-        };
-        let database_url = test_database_url();
+        let database_url = create_test_db();
         let backend = FindingsSinkPg::connect_and_migrate(&database_url)
-            .expect("connect_and_migrate should succeed against live postgres");
-        backend
-            .truncate_all_for_tests()
-            .expect("truncate_all_for_tests should succeed before each integration test");
+            .expect("connect_and_migrate should succeed against test database");
         let inspector = Client::connect(&database_url, NoTls)
-            .expect("inspector connection should succeed against live postgres");
+            .expect("inspector connection should succeed against test database");
 
-        Self {
-            _guard: guard,
-            backend,
-            inspector,
-        }
+        Self { backend, inspector }
     }
 
     /// Return the backend under test.
