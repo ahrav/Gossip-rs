@@ -8,7 +8,12 @@ enumeration and read model. The contract lives in
 `crates/gossip-contracts/src/connector/`; concrete implementations live in
 `crates/gossip-connectors/`.
 
-The crate provides four core capabilities:
+The crate provides three core capabilities:
+
+- **Shared paging vocabulary** -- reusable page-shape contracts
+  (`PageBuf`, `PageState`, `PagingCapabilities`, `KeyedPageItem`) and
+  validation helpers (`validate_filled_page`) for ordered enumeration
+  families.
 
 - **Toxic-byte value types** -- validated wrappers (`ItemKey`, `ItemRef`,
   `TokenBytes`) that enforce non-empty bytes, hard size bounds, and
@@ -28,6 +33,7 @@ The crate provides four core capabilities:
 | File                | Role                                                                         |
 | ------------------- | ---------------------------------------------------------------------------- |
 | `mod.rs`            | Module root, re-exports all public types from sub-modules                    |
+| `common.rs`         | Shared paging vocabulary: `PageBuf`, `PageState`, `PagingCapabilities`, `KeyedPageItem`, page validation |
 | `types.rs`          | Toxic-byte wrappers, `Cursor`, `ScanItem`, `Budgets`, `ToxicDigest`         |
 | `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`, traits |
 
