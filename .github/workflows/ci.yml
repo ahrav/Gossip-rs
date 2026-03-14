@@ -151,6 +151,7 @@ jobs:
       - name: Build tests
         run: >-
           cargo nextest run
+          --workspace
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
@@ -160,6 +161,7 @@ jobs:
       - name: Run tests
         run: >-
           cargo nextest run
+          --workspace
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
