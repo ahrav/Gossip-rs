@@ -150,11 +150,11 @@ pub const OBSERVATIONS_TENANT_RUN_SHARD_INDEX: &str = "observations_tenant_run_s
 /// Field order matches [`FINDINGS_INSERT_COLUMNS`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct FindingRow {
-    pub tenant_id: [u8; 32],
-    pub finding_id: [u8; 32],
-    pub stable_item_id: [u8; 32],
-    pub rule_fingerprint: [u8; 32],
-    pub secret_hash: [u8; 32],
+    pub(crate) tenant_id: [u8; 32],
+    pub(crate) finding_id: [u8; 32],
+    pub(crate) stable_item_id: [u8; 32],
+    pub(crate) rule_fingerprint: [u8; 32],
+    pub(crate) secret_hash: [u8; 32],
 }
 
 impl fmt::Debug for FindingRow {
@@ -188,12 +188,12 @@ impl FindingRow {
 /// Field order matches [`OCCURRENCES_INSERT_COLUMNS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OccurrenceRow {
-    pub tenant_id: [u8; 32],
-    pub occurrence_id: [u8; 32],
-    pub finding_id: [u8; 32],
-    pub object_version_id: [u8; 32],
-    pub byte_offset: i64,
-    pub byte_length: i64,
+    pub(crate) tenant_id: [u8; 32],
+    pub(crate) occurrence_id: [u8; 32],
+    pub(crate) finding_id: [u8; 32],
+    pub(crate) object_version_id: [u8; 32],
+    pub(crate) byte_offset: i64,
+    pub(crate) byte_length: i64,
 }
 
 impl OccurrenceRow {
@@ -236,17 +236,17 @@ impl OccurrenceRow {
 /// Field order matches [`OBSERVATIONS_INSERT_COLUMNS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationRow {
-    pub tenant_id: [u8; 32],
-    pub observation_id: [u8; 32],
-    pub occurrence_id: [u8; 32],
-    pub policy_hash: [u8; 32],
-    pub ovid_hash: [u8; 32],
-    pub run_id: i64,
-    pub shard_id: i64,
-    pub fence_epoch: i64,
-    pub seen_at: i64,
-    pub location_display: Option<String>,
-    pub location_url: Option<String>,
+    pub(crate) tenant_id: [u8; 32],
+    pub(crate) observation_id: [u8; 32],
+    pub(crate) occurrence_id: [u8; 32],
+    pub(crate) policy_hash: [u8; 32],
+    pub(crate) ovid_hash: [u8; 32],
+    pub(crate) run_id: i64,
+    pub(crate) shard_id: i64,
+    pub(crate) fence_epoch: i64,
+    pub(crate) seen_at: i64,
+    pub(crate) location_display: Option<String>,
+    pub(crate) location_url: Option<String>,
 }
 
 impl ObservationRow {
@@ -485,6 +485,83 @@ pub const COMBINED_COUNTS_SQL: &str = "\
         (SELECT COUNT(*)::BIGINT FROM findings) AS findings_count, \
         (SELECT COUNT(*)::BIGINT FROM occurrences) AS occurrences_count, \
         (SELECT COUNT(*)::BIGINT FROM observations) AS observations_count";
+
+/// Count durable observations for one tenant, grouped by policy hash.
+///
+/// The `tenant_id` column is omitted from both `SELECT` and `GROUP BY`
+/// because `WHERE tenant_id = $1` already constrains every row to a single
+/// tenant. The Rust decoder reconstructs it from the input parameter,
+/// avoiding a redundant per-row BYTEA decode.
+///
+/// Bind parameters:
+/// 1. `tenant_id`
+pub const COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL: &str = r#"
+SELECT policy_hash, COUNT(*)::BIGINT AS observation_count
+FROM observations
+WHERE tenant_id = $1
+GROUP BY policy_hash
+ORDER BY policy_hash ASC
+"#;
+
+/// Return the latest observation row for each finding for one tenant.
+///
+/// The inner `DISTINCT ON (f.finding_id)` query selects the most recent
+/// observation per finding, then the outer query re-sorts those rows by
+/// overall recency for the tenant. Because the outer `ORDER BY` differs
+/// from the inner `DISTINCT ON` ordering, PostgreSQL materializes the full
+/// per-tenant result set before applying `LIMIT`. At high finding counts
+/// per tenant, consider denormalizing the "latest observation" pointer.
+///
+/// ## Ordering caveat
+///
+/// The secondary tiebreaker `observation_id DESC` is a lexicographic BYTEA
+/// sort over a content-addressed hash. When two findings share the same
+/// `seen_at` value, their relative order is deterministic but semantically
+/// arbitrary — callers cannot predict which finding appears first. The
+/// ordering may also change if a tied finding receives a new observation
+/// (which changes its `observation_id`). Callers that paginate via
+/// `OFFSET` should be aware of potential row shifts between pages when
+/// ties exist.
+///
+/// ## Performance characteristics
+///
+/// The inner subquery joins `findings`, `occurrences`, and `observations`
+/// for the entire tenant, sorts on `(finding_id, seen_at DESC,
+/// observation_id DESC)` to satisfy the `DISTINCT ON`, then the outer
+/// query re-sorts the surviving rows by `(seen_at DESC, observation_id
+/// DESC)` before applying `LIMIT`. The existing indexes
+/// (`occurrences_tenant_finding_id_idx`, `observations_tenant_occurrence_id_idx`)
+/// cover the join columns but not the combined `DISTINCT ON` sort, so
+/// PostgreSQL performs an in-memory sort over the full tenant join result.
+///
+/// This is acceptable for the current placeholder usage (see
+/// [`PendingTriageFinding`](crate::read_api::PendingTriageFinding)), but a
+/// `LATERAL` join rewrite that pushes `LIMIT` into the per-finding
+/// subquery should be evaluated when this becomes a production query path.
+///
+/// Bind parameters:
+/// 1. `tenant_id`
+/// 2. `limit`
+pub const LIST_FINDINGS_NEEDING_TRIAGE_SQL: &str = r#"
+SELECT latest.finding_id, latest.stable_item_id,
+       latest.occurrence_id, latest.observation_id, latest.policy_hash,
+       latest.seen_at, latest.location_display, latest.location_url
+FROM (
+    SELECT DISTINCT ON (f.finding_id)
+        f.finding_id, f.stable_item_id,
+        o.occurrence_id, ob.observation_id, ob.policy_hash,
+        ob.seen_at, ob.location_display, ob.location_url
+    FROM findings AS f
+    INNER JOIN occurrences AS o
+        ON o.tenant_id = f.tenant_id AND o.finding_id = f.finding_id
+    INNER JOIN observations AS ob
+        ON ob.tenant_id = o.tenant_id AND ob.occurrence_id = o.occurrence_id
+    WHERE f.tenant_id = $1
+    ORDER BY f.finding_id, ob.seen_at DESC, ob.observation_id DESC
+) AS latest
+ORDER BY latest.seen_at DESC, latest.observation_id DESC
+LIMIT $2
+"#;
 
 /// Remove all durable findings-layer rows in foreign-key order.
 pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, findings";
@@ -830,6 +907,84 @@ mod tests {
         assert!(TRUNCATE_ALL_SQL.contains(OBSERVATIONS_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(OCCURRENCES_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(FINDINGS_TABLE));
+    }
+
+    #[test]
+    fn count_observations_by_tenant_policy_sql_contains_grouped_count_shape() {
+        assert_sql_contains_all(
+            COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL,
+            &[
+                "COUNT(*)::BIGINT AS observation_count",
+                "FROM observations",
+                "WHERE tenant_id = $1",
+                "GROUP BY policy_hash",
+                "ORDER BY policy_hash ASC",
+            ],
+        );
+        assert!(
+            !COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL.contains("GROUP BY tenant_id"),
+            "tenant_id must not appear in GROUP BY — it is constant via WHERE tenant_id = $1"
+        );
+    }
+
+    #[test]
+    fn list_findings_needing_triage_sql_contains_distinct_on_and_limit() {
+        assert_sql_contains_all(
+            LIST_FINDINGS_NEEDING_TRIAGE_SQL,
+            &[
+                "SELECT DISTINCT ON (f.finding_id)",
+                "FROM findings AS f",
+                "INNER JOIN occurrences AS o",
+                "INNER JOIN observations AS ob",
+                "WHERE f.tenant_id = $1",
+                "ORDER BY latest.seen_at DESC, latest.observation_id DESC",
+                "LIMIT $2",
+            ],
+        );
+    }
+
+    #[test]
+    fn list_findings_needing_triage_sql_does_not_project_tenant_id() {
+        // tenant_id is reconstructed from the input parameter in the Rust
+        // decoder, so it must not appear in the SELECT projection. The
+        // WHERE / JOIN clauses still reference it for filtering.
+        let outer_select = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("SELECT latest.")
+            .expect("outer SELECT should exist");
+        let from_clause = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("FROM (")
+            .expect("FROM subquery should exist");
+        let outer_projection = &LIST_FINDINGS_NEEDING_TRIAGE_SQL[outer_select..from_clause];
+        assert!(
+            !outer_projection.contains("tenant_id"),
+            "outer SELECT must not project tenant_id: {outer_projection}"
+        );
+
+        let inner_select = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("SELECT DISTINCT ON")
+            .expect("inner SELECT should exist");
+        let inner_from = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("FROM findings AS f")
+            .expect("inner FROM should exist");
+        let inner_projection = &LIST_FINDINGS_NEEDING_TRIAGE_SQL[inner_select..inner_from];
+        assert!(
+            !inner_projection.contains("tenant_id"),
+            "inner SELECT must not project tenant_id: {inner_projection}"
+        );
+    }
+
+    #[test]
+    fn list_findings_needing_triage_sql_orders_distinct_on_column_first() {
+        let inner_order = "ORDER BY f.finding_id, ob.seen_at DESC, ob.observation_id DESC";
+
+        assert!(
+            LIST_FINDINGS_NEEDING_TRIAGE_SQL.contains("DISTINCT ON (f.finding_id)"),
+            "query must keep DISTINCT ON over finding_id"
+        );
+        assert!(
+            LIST_FINDINGS_NEEDING_TRIAGE_SQL.contains(inner_order),
+            "inner ORDER BY must start with the DISTINCT ON column"
+        );
     }
 
     #[test]

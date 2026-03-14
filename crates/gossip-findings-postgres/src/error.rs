@@ -18,7 +18,7 @@ pub use gossip_pg_common::migration::{
     MigrationOperation, PgMigrationError as FindingsPgMigrationError,
 };
 
-use crate::types::PgU64ConversionError;
+use crate::types::{PgByteDecodeError, PgU64ConversionError};
 
 /// Schema validation and row-projection failures for findings persistence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,8 +92,17 @@ pub enum FindingsPgError {
     BatchTooLarge { len: usize, max: usize },
     /// Batch validation or row projection failed before SQL mutation.
     Schema(FindingsPgSchemaError),
-    /// A persisted row count did not fit the non-negative count domain.
-    CountOutOfRange { table: &'static str, value: i64 },
+    /// BYTEA column decode: unexpected byte length.
+    ByteDecode(PgByteDecodeError),
+    /// Query limit exceeds the non-negative `BIGINT` bound (`i64::MAX`).
+    LimitOutOfRange { limit: usize },
+    /// Non-negative `BIGINT` decode failed while reading SQL results.
+    /// This is the read-path analog: it catches decode failures when
+    /// converting `BIGINT` columns from query rows back to `u64`. The
+    /// write-path equivalent flows through
+    /// [`Schema(FindingsPgSchemaError::PgU64Conversion(..))`](FindingsPgError::Schema)
+    /// during batch projection.
+    PgU64Conversion(PgU64ConversionError),
     /// A finding primary key mapped to a different immutable natural key.
     FindingConflict {
         tenant_id: TenantId,
@@ -154,9 +163,11 @@ impl fmt::Display for FindingsPgError {
             Self::Schema(source) => {
                 write!(f, "invalid findings batch for postgres backend: {source}")
             }
-            Self::CountOutOfRange { table, value } => {
-                write!(f, "stored count for {table} out of range: {value}")
+            Self::ByteDecode(source) => write!(f, "{source}"),
+            Self::LimitOutOfRange { limit } => {
+                write!(f, "query limit {limit} exceeds PostgreSQL BIGINT range")
             }
+            Self::PgU64Conversion(source) => write!(f, "{source}"),
             Self::FindingConflict {
                 tenant_id,
                 finding_id,
@@ -191,9 +202,11 @@ impl Error for FindingsPgError {
             Self::Postgres(source) => Some(source),
             Self::Migration(source) => Some(source),
             Self::Schema(source) => Some(source),
+            Self::PgU64Conversion(source) => Some(source),
+            Self::ByteDecode(source) => Some(source),
             Self::MutexPoisoned
             | Self::BatchTooLarge { .. }
-            | Self::CountOutOfRange { .. }
+            | Self::LimitOutOfRange { .. }
             | Self::FindingConflict { .. }
             | Self::OccurrenceConflict { .. }
             | Self::ObservationConflict { .. }
@@ -220,9 +233,22 @@ impl From<FindingsPgSchemaError> for FindingsPgError {
     }
 }
 
+impl From<PgU64ConversionError> for FindingsPgError {
+    fn from(value: PgU64ConversionError) -> Self {
+        Self::PgU64Conversion(value)
+    }
+}
+
+impl From<PgByteDecodeError> for FindingsPgError {
+    fn from(value: PgByteDecodeError) -> Self {
+        Self::ByteDecode(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PgByteDecodeError;
     use gossip_contracts::{
         identity::{FindingId, ObservationId, OccurrenceId, TenantId},
         persistence::RECOMMENDED_MAX_BATCH_SIZE,
@@ -452,16 +478,53 @@ mod tests {
     }
 
     #[test]
-    fn backend_error_display_describes_out_of_range_counts() {
-        let err = FindingsPgError::CountOutOfRange {
-            table: "findings",
-            value: -1,
+    fn backend_error_display_delegates_to_byte_decode_source() {
+        let inner = PgByteDecodeError::InvalidByteLength {
+            field: "tenant_id",
+            expected: 32,
+            actual: 31,
         };
+        let err = FindingsPgError::ByteDecode(inner);
+
+        assert_eq!(err.to_string(), inner.to_string());
+    }
+
+    #[test]
+    fn backend_error_display_describes_limit_out_of_range() {
+        let err = FindingsPgError::LimitOutOfRange { limit: usize::MAX };
 
         assert_eq!(
             err.to_string(),
-            "stored count for findings out of range: -1"
+            format!("query limit {} exceeds PostgreSQL BIGINT range", usize::MAX)
         );
+    }
+
+    #[test]
+    fn backend_error_display_uses_pg_u64_conversion_source_message() {
+        let inner = PgU64ConversionError::NegativeStoredValue {
+            field: "seen_at",
+            value: -1,
+        };
+        let expected = inner.to_string();
+        let err = FindingsPgError::PgU64Conversion(inner);
+
+        assert_eq!(err.to_string(), expected);
+    }
+
+    #[test]
+    fn backend_error_from_pg_u64_conversion_uses_direct_variant() {
+        let err = FindingsPgError::from(PgU64ConversionError::NegativeStoredValue {
+            field: "seen_at",
+            value: -1,
+        });
+
+        assert!(matches!(
+            err,
+            FindingsPgError::PgU64Conversion(PgU64ConversionError::NegativeStoredValue {
+                field: "seen_at",
+                value: -1
+            })
+        ));
     }
 
     #[test]
@@ -548,6 +611,16 @@ mod tests {
                 .to_string(),
             "tenant_id must not be empty"
         );
+        assert_eq!(
+            FindingsPgError::PgU64Conversion(PgU64ConversionError::NegativeStoredValue {
+                field: "seen_at",
+                value: -1,
+            })
+            .source()
+            .expect("conversion variant should expose source")
+            .to_string(),
+            "stored value -1 for field seen_at is negative but the schema requires non-negative BIGINT"
+        );
     }
 
     #[test]
@@ -555,10 +628,7 @@ mod tests {
         let cases = [
             FindingsPgError::MutexPoisoned,
             FindingsPgError::BatchTooLarge { len: 11, max: 10 },
-            FindingsPgError::CountOutOfRange {
-                table: "findings",
-                value: -1,
-            },
+            FindingsPgError::LimitOutOfRange { limit: usize::MAX },
             FindingsPgError::FindingConflict {
                 tenant_id: tenant_id(),
                 finding_id: finding_id(),

@@ -58,8 +58,8 @@ use crate::{
     migrations::apply_all_migrations,
     schema::{BATCH_GET_SQL, UPSERT_SQL},
     types::{
-        pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits, u64_to_pg_bigint_bits,
-        u64_to_pg_bigint_checked,
+        decode_fixed_32, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
+        u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
     },
 };
 
@@ -481,15 +481,22 @@ fn collect_columns(records: &[DoneLedgerRecord]) -> Result<UpsertColumns, DoneLe
 /// or `DoneLedgerPgError::Conversion`, indicating data corruption or
 /// schema drift.
 ///
-/// Each BYTEA column allocates a `Vec<u8>` (the `postgres` crate's return
-/// type for `row.try_get`). This is a WARM-path cost accepted for simplicity;
-/// a crate-local newtype with a `FromSql` impl would eliminate 3
-/// allocations per row if profiling shows this is material.
+/// BYTEA columns are decoded as borrowed `&[u8]` slices via
+/// `row.try_get::<_, &[u8]>`, which reads directly from the row buffer
+/// without heap allocation.
 fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
-    let tenant_id = TenantId::from_bytes(decode_fixed_32(row.try_get("tenant_id")?, "tenant_id")?);
-    let policy_hash =
-        PolicyHash::from_bytes(decode_fixed_32(row.try_get("policy_hash")?, "policy_hash")?);
-    let ovid_hash = OvidHash::from_bytes(decode_fixed_32(row.try_get("ovid_hash")?, "ovid_hash")?);
+    let tenant_id = TenantId::from_bytes(decode_fixed_32(
+        row.try_get::<_, &[u8]>("tenant_id")?,
+        "tenant_id",
+    )?);
+    let policy_hash = PolicyHash::from_bytes(decode_fixed_32(
+        row.try_get::<_, &[u8]>("policy_hash")?,
+        "policy_hash",
+    )?);
+    let ovid_hash = OvidHash::from_bytes(decode_fixed_32(
+        row.try_get::<_, &[u8]>("ovid_hash")?,
+        "ovid_hash",
+    )?);
 
     let status_rank: i16 = row.try_get("status")?;
     let status_rank_u8 = u8::try_from(status_rank)
@@ -553,20 +560,6 @@ fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
         })?;
 
     Ok(record)
-}
-
-/// Convert a variable-length `BYTEA` column value into a fixed 32-byte
-/// array, or return `InvalidByteLength` if the stored blob has the wrong
-/// size.
-fn decode_fixed_32(bytes: Vec<u8>, field: &'static str) -> Result<[u8; 32], DoneLedgerPgError> {
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
-        DoneLedgerPgConversionError::InvalidByteLength {
-            field,
-            expected: 32,
-            actual: bytes.len(),
-        }
-        .into()
-    })
 }
 
 #[cfg(test)]

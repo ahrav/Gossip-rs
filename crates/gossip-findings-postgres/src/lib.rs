@@ -16,10 +16,11 @@
 //! - findings-specific backend, migration, and schema-projection error types
 //!   in [`FindingsPgError`], [`FindingsPgMigrationError`], and
 //!   [`FindingsPgSchemaError`],
-//! - canonical table, column, and index names plus row projections and
-//!   write-path SQL constants in [`schema`],
+//! - canonical table, column, and index names plus write- and read-path SQL
+//!   constants in [`schema`],
 //! - Rust-side batch projection, tenant validation, duplicate folding, and
 //!   observation-merge helpers in `backend`,
+//! - typed result rows for the current query-plane surface in [`read_api`],
 //! - forward-only checksum-verified embedded migrations in [`migrations`],
 //! - and `u64` ↔ `BIGINT` conversion helpers in [`types`].
 //!
@@ -56,6 +57,7 @@
 mod backend;
 mod error;
 pub mod migrations;
+pub mod read_api;
 pub mod schema;
 pub mod types;
 
@@ -66,6 +68,7 @@ pub use error::{
 #[cfg(feature = "test-utils")]
 pub use migrations::connect_and_apply_migrations;
 pub use migrations::{EmbeddedMigration, MIGRATIONS, apply_all_migrations, apply_migrations};
+pub use read_api::{ObservationCountByPolicy, PendingTriageFinding};
 pub use types::{
     PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
     u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
