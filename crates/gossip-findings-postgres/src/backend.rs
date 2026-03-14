@@ -35,6 +35,7 @@ use crate::{
         OBSERVATIONS_INSERT_OR_MERGE_SQL, OBSERVATIONS_TABLE, OCCURRENCES_INSERT_SQL,
         OCCURRENCES_TABLE, ObservationRow, OccurrenceRow,
     },
+    types::decode_fixed_32,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -359,7 +360,7 @@ impl FindingsSinkPg {
     /// # Errors
     ///
     /// Returns [`FindingsPgError::Postgres`] on query failure,
-    /// [`FindingsPgError::InvalidByteLength`] when a stored identity column is
+    /// [`FindingsPgError::ByteDecode`] when a stored identity column is
     /// not 32 bytes, [`FindingsPgError::PgU64Conversion`] when a non-negative
     /// `BIGINT` result is invalid, or [`FindingsPgError::MutexPoisoned`] if the
     /// internal mutex was poisoned.
@@ -369,14 +370,17 @@ impl FindingsSinkPg {
     ) -> Result<Vec<ObservationCountByPolicy>, FindingsPgError> {
         let tenant_bytes = tenant_id.as_bytes().as_slice();
         let mut client = self.lock_client()?;
-        let rows = client.query(COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL, &[&tenant_bytes])?;
+        let stmt = client.prepare(COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL)?;
+        let rows = client.query(&stmt, &[&tenant_bytes])?;
 
         let mut counts = Vec::with_capacity(rows.len());
         for row in rows {
-            let tenant_id =
-                TenantId::from_bytes(decode_fixed_32(row.try_get("tenant_id")?, "tenant_id")?);
+            let tenant_id = TenantId::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("tenant_id")?,
+                "tenant_id",
+            )?);
             let policy_hash = PolicyHash::from_bytes(decode_fixed_32(
-                row.try_get("policy_hash")?,
+                row.try_get::<_, &[u8]>("policy_hash")?,
                 "policy_hash",
             )?);
             let observation_count = crate::types::pg_bigint_nonnegative_to_u64(
@@ -413,31 +417,33 @@ impl FindingsSinkPg {
             i64::try_from(limit).map_err(|_| FindingsPgError::LimitOutOfRange { limit })?;
         let tenant_bytes = tenant_id.as_bytes().as_slice();
         let mut client = self.lock_client()?;
-        let rows = client.query(
-            LIST_FINDINGS_NEEDING_TRIAGE_SQL,
-            &[&tenant_bytes, &limit_i64],
-        )?;
+        let stmt = client.prepare(LIST_FINDINGS_NEEDING_TRIAGE_SQL)?;
+        let rows = client.query(&stmt, &[&tenant_bytes, &limit_i64])?;
 
         let mut findings = Vec::with_capacity(rows.len());
         for row in rows {
-            let tenant_id =
-                TenantId::from_bytes(decode_fixed_32(row.try_get("tenant_id")?, "tenant_id")?);
-            let finding_id =
-                FindingId::from_bytes(decode_fixed_32(row.try_get("finding_id")?, "finding_id")?);
+            let tenant_id = TenantId::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("tenant_id")?,
+                "tenant_id",
+            )?);
+            let finding_id = FindingId::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("finding_id")?,
+                "finding_id",
+            )?);
             let stable_item_id = StableItemId::from_bytes(decode_fixed_32(
-                row.try_get("stable_item_id")?,
+                row.try_get::<_, &[u8]>("stable_item_id")?,
                 "stable_item_id",
             )?);
             let occurrence_id = OccurrenceId::from_bytes(decode_fixed_32(
-                row.try_get("occurrence_id")?,
+                row.try_get::<_, &[u8]>("occurrence_id")?,
                 "occurrence_id",
             )?);
             let observation_id = ObservationId::from_bytes(decode_fixed_32(
-                row.try_get("observation_id")?,
+                row.try_get::<_, &[u8]>("observation_id")?,
                 "observation_id",
             )?);
             let policy_hash = PolicyHash::from_bytes(decode_fixed_32(
-                row.try_get("policy_hash")?,
+                row.try_get::<_, &[u8]>("policy_hash")?,
                 "policy_hash",
             )?);
             let seen_at =
@@ -702,22 +708,6 @@ fn nonneg_count(value: i64, table: &'static str) -> Result<u64, FindingsPgError>
         .map_err(|_| FindingsPgError::CountOutOfRange { table, value })
 }
 
-/// Convert a `BYTEA` column value into a fixed 32-byte identity array.
-fn decode_fixed_32(bytes: Vec<u8>, column: &'static str) -> Result<[u8; 32], FindingsPgError> {
-    let actual = bytes.len();
-    if actual != 32 {
-        return Err(FindingsPgError::InvalidByteLength {
-            column,
-            expected: 32,
-            actual,
-        });
-    }
-
-    Ok(bytes
-        .try_into()
-        .expect("decode_fixed_32 length check guarantees 32 bytes"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -741,35 +731,9 @@ mod tests {
     };
 
     use super::{
-        DedupedBatch, build_receipt, decode_fixed_32, dedupe_findings_rows,
-        dedupe_observation_rows, dedupe_occurrence_rows, merge_observation_rows,
-        project_and_dedupe,
+        DedupedBatch, build_receipt, dedupe_findings_rows, dedupe_observation_rows,
+        dedupe_occurrence_rows, merge_observation_rows, project_and_dedupe,
     };
-
-    #[test]
-    fn decode_fixed_32_accepts_exactly_32_bytes() {
-        let bytes = vec![0xAB; 32];
-
-        assert_eq!(
-            decode_fixed_32(bytes, "tenant_id").expect("32-byte value should decode"),
-            [0xAB; 32]
-        );
-    }
-
-    #[test]
-    fn decode_fixed_32_rejects_wrong_length() {
-        let err = decode_fixed_32(vec![0xAB; 31], "tenant_id")
-            .expect_err("31-byte identity column should fail");
-
-        assert!(matches!(
-            err,
-            FindingsPgError::InvalidByteLength {
-                column: "tenant_id",
-                expected: 32,
-                actual: 31
-            }
-        ));
-    }
 
     #[test]
     fn dedupe_preserves_insertion_order() {

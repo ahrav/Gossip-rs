@@ -11,7 +11,7 @@
 //!
 //! | Module | Responsibility |
 //! |--------|----------------|
-//! | [`types`] | `u64 ↔ BIGINT` conversion error and helper functions |
+//! | [`types`] | `u64 ↔ BIGINT` conversion, `BYTEA` decode helpers, and associated error types |
 //! | [`migration`] | Shared embedded migration runner, checksum verification, and migration error types |
 //! | [`test_support`] | Shared PostgreSQL testcontainer lifecycle and isolated test-database helpers |
 
@@ -26,4 +26,4 @@ pub use migration::{
     EmbeddedMigration, MigrationConfig, MigrationOperation, PgMigrationError, apply_all_migrations,
     apply_migrations,
 };
-pub use types::PgU64ConversionError;
+pub use types::{PgByteDecodeError, PgU64ConversionError, decode_fixed_32};

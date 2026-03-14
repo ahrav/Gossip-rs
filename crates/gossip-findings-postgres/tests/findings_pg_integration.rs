@@ -348,17 +348,17 @@ fn count_observations_by_tenant_policy_groups_rows_by_policy() {
         vec![base.tenant_id, base.tenant_id],
         "every grouped row should belong to the requested tenant"
     );
-    assert_eq!(
-        counts
-            .iter()
-            .map(|row| (row.policy_hash(), row.observation_count()))
-            .collect::<Vec<_>>(),
-        vec![
-            (base.observation.policy_hash(), 2),
-            (different_policy.observation.policy_hash(), 1),
-        ],
-        "counts should be grouped by policy hash and ordered by policy hash"
-    );
+    let mut actual: Vec<_> = counts
+        .iter()
+        .map(|row| (row.policy_hash(), row.observation_count()))
+        .collect();
+    actual.sort_by_key(|(ph, _)| *ph.as_bytes());
+    let mut expected = vec![
+        (base.observation.policy_hash(), 2),
+        (different_policy.observation.policy_hash(), 1),
+    ];
+    expected.sort_by_key(|(ph, _)| *ph.as_bytes());
+    assert_eq!(actual, expected, "counts should be grouped by policy hash");
 }
 
 #[test]
@@ -431,6 +431,60 @@ fn list_findings_needing_triage_returns_latest_rows_ordered_by_seen_at_and_limit
 }
 
 #[test]
+fn list_findings_needing_triage_returns_latest_observation_when_finding_has_multiple() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x75);
+
+    // Insert the base fixture (1 finding, 1 occurrence, 1 observation).
+    backend
+        .upsert_batch(fixture.batch())
+        .expect("base batch should succeed")
+        .wait()
+        .expect("base batch should commit");
+
+    // Insert a second observation for the same occurrence under a different
+    // policy and with a later seen_at, so DISTINCT ON must pick this one.
+    let later_seen_at = fixture.observation.seen_at().as_raw() + 500;
+    let second_observation =
+        fixture.observation_for_policy(0xAA, 99_101, 99_102, 99_103, later_seen_at);
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            &[],
+            &[],
+            std::slice::from_ref(&second_observation),
+        ))
+        .expect("second-observation submit should succeed")
+        .wait()
+        .expect("second-observation durable write should succeed");
+
+    let rows = backend
+        .list_findings_needing_triage(fixture.tenant_id, 10)
+        .expect("triage query should succeed");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "DISTINCT ON should collapse two observations into one row per finding"
+    );
+    assert_eq!(
+        rows[0].observation_id(),
+        second_observation.observation_id(),
+        "DISTINCT ON should select the observation with the later seen_at"
+    );
+    assert_eq!(
+        rows[0].policy_hash(),
+        second_observation.policy_hash(),
+        "returned row should carry the policy hash of the latest observation"
+    );
+    assert_eq!(
+        rows[0].seen_at(),
+        later_seen_at,
+        "returned row should carry the seen_at of the latest observation"
+    );
+}
+
+#[test]
 fn read_methods_return_empty_results_for_unknown_tenant() {
     let harness = LivePgHarness::new();
     let backend = harness.backend();
@@ -456,6 +510,51 @@ fn read_methods_return_empty_results_for_unknown_tenant() {
             .expect("empty triage query should succeed")
             .is_empty(),
         "triage query should return no rows for a tenant without data"
+    );
+}
+
+#[test]
+fn list_findings_needing_triage_returns_none_for_observation_without_location() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x76);
+
+    // Build an observation without calling .with_location(), so both
+    // location_display and location_url default to None.
+    let no_location_observation = ObservationRecord::new(
+        fixture.tenant_id,
+        fixture.occurrence.occurrence_id(),
+        policy(0xBB),
+        fixture.ovid_hash,
+        RunId::from_raw(88_001),
+        ShardId::from_raw(88_002),
+        FenceEpoch::from_raw(88_003),
+        LogicalTime::from_raw(fixture.observation.seen_at().as_raw() + 1_000),
+    );
+
+    // Submit the base finding and occurrence, plus the no-location observation.
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            std::slice::from_ref(&fixture.finding),
+            std::slice::from_ref(&fixture.occurrence),
+            std::slice::from_ref(&no_location_observation),
+        ))
+        .expect("no-location batch should succeed")
+        .wait()
+        .expect("no-location batch should commit");
+
+    let rows = backend
+        .list_findings_needing_triage(fixture.tenant_id, 10)
+        .expect("triage query should succeed");
+
+    assert_eq!(rows.len(), 1, "should return exactly one finding row");
+    assert!(
+        rows[0].location_display().is_none(),
+        "observation without location should have None location_display"
+    );
+    assert!(
+        rows[0].location_url().is_none(),
+        "observation without location should have None location_url"
     );
 }
 

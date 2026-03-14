@@ -212,4 +212,34 @@ mod tests {
         assert_eq!(row.location_display(), Some("safe/path.txt"));
         assert_eq!(row.location_url(), Some("https://example.invalid/path"));
     }
+
+    #[test]
+    fn pending_triage_finding_none_location_fields_round_trip() {
+        let tenant_id = TenantId::from_bytes([0x11; 32]);
+        let finding_id = FindingId::from_bytes([0x22; 32]);
+        let stable_item_id = StableItemId::from_bytes([0x33; 32]);
+        let occurrence_id = OccurrenceId::from_bytes([0x44; 32]);
+        let observation_id = ObservationId::from_bytes([0x55; 32]);
+        let policy_hash = PolicyHash::from_bytes([0x66; 32]);
+        let row = PendingTriageFinding::new(
+            tenant_id,
+            finding_id,
+            stable_item_id,
+            occurrence_id,
+            observation_id,
+            policy_hash,
+            99,
+            None,
+            None,
+        );
+
+        assert!(
+            row.location_display().is_none(),
+            "None location_display should round-trip as None"
+        );
+        assert!(
+            row.location_url().is_none(),
+            "None location_url should round-trip as None"
+        );
+    }
 }

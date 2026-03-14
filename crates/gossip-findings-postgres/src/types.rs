@@ -14,6 +14,6 @@
 //! continue to resolve without change.
 
 pub use gossip_pg_common::types::{
-    PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
-    u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
+    PgByteDecodeError, PgU64ConversionError, decode_fixed_32, pg_bigint_nonnegative_to_u64,
+    pg_bigint_to_u64_bits, u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
 };

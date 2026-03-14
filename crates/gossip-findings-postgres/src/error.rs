@@ -18,7 +18,7 @@ pub use gossip_pg_common::migration::{
     MigrationOperation, PgMigrationError as FindingsPgMigrationError,
 };
 
-use crate::types::PgU64ConversionError;
+use crate::types::{PgByteDecodeError, PgU64ConversionError};
 
 /// Schema validation and row-projection failures for findings persistence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,11 +93,7 @@ pub enum FindingsPgError {
     /// Batch validation or row projection failed before SQL mutation.
     Schema(FindingsPgSchemaError),
     /// BYTEA column decode: unexpected byte length.
-    InvalidByteLength {
-        column: &'static str,
-        expected: usize,
-        actual: usize,
-    },
+    ByteDecode(PgByteDecodeError),
     /// Query limit exceeds PostgreSQL's signed `BIGINT` range.
     LimitOutOfRange { limit: usize },
     /// Non-negative `BIGINT` decode failed while reading SQL results.
@@ -169,14 +165,7 @@ impl fmt::Display for FindingsPgError {
             Self::Schema(source) => {
                 write!(f, "invalid findings batch for postgres backend: {source}")
             }
-            Self::InvalidByteLength {
-                column,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "column {column}: expected {expected} bytes, got {actual}"
-            ),
+            Self::ByteDecode(source) => write!(f, "{source}"),
             Self::LimitOutOfRange { limit } => {
                 write!(f, "query limit {limit} exceeds PostgreSQL BIGINT range")
             }
@@ -219,9 +208,9 @@ impl Error for FindingsPgError {
             Self::Migration(source) => Some(source),
             Self::Schema(source) => Some(source),
             Self::PgU64Conversion(source) => Some(source),
+            Self::ByteDecode(source) => Some(source),
             Self::MutexPoisoned
             | Self::BatchTooLarge { .. }
-            | Self::InvalidByteLength { .. }
             | Self::LimitOutOfRange { .. }
             | Self::CountOutOfRange { .. }
             | Self::FindingConflict { .. }
@@ -256,9 +245,16 @@ impl From<PgU64ConversionError> for FindingsPgError {
     }
 }
 
+impl From<PgByteDecodeError> for FindingsPgError {
+    fn from(value: PgByteDecodeError) -> Self {
+        Self::ByteDecode(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PgByteDecodeError;
     use gossip_contracts::{
         identity::{FindingId, ObservationId, OccurrenceId, TenantId},
         persistence::RECOMMENDED_MAX_BATCH_SIZE,
@@ -488,17 +484,15 @@ mod tests {
     }
 
     #[test]
-    fn backend_error_display_describes_invalid_byte_length() {
-        let err = FindingsPgError::InvalidByteLength {
-            column: "tenant_id",
+    fn backend_error_display_delegates_to_byte_decode_source() {
+        let inner = PgByteDecodeError::InvalidByteLength {
+            field: "tenant_id",
             expected: 32,
             actual: 31,
         };
+        let err = FindingsPgError::ByteDecode(inner);
 
-        assert_eq!(
-            err.to_string(),
-            "column tenant_id: expected 32 bytes, got 31"
-        );
+        assert_eq!(err.to_string(), inner.to_string());
     }
 
     #[test]
@@ -653,11 +647,6 @@ mod tests {
         let cases = [
             FindingsPgError::MutexPoisoned,
             FindingsPgError::BatchTooLarge { len: 11, max: 10 },
-            FindingsPgError::InvalidByteLength {
-                column: "tenant_id",
-                expected: 32,
-                actual: 31,
-            },
             FindingsPgError::LimitOutOfRange { limit: usize::MAX },
             FindingsPgError::CountOutOfRange {
                 table: "findings",

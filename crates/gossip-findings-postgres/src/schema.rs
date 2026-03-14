@@ -507,6 +507,22 @@ ORDER BY policy_hash ASC
 /// per-tenant result set before applying `LIMIT`. At high finding counts
 /// per tenant, consider denormalizing the "latest observation" pointer.
 ///
+/// ## Performance characteristics
+///
+/// The inner subquery joins `findings`, `occurrences`, and `observations`
+/// for the entire tenant, sorts on `(finding_id, seen_at DESC,
+/// observation_id DESC)` to satisfy the `DISTINCT ON`, then the outer
+/// query re-sorts the surviving rows by `(seen_at DESC, observation_id
+/// DESC)` before applying `LIMIT`. The existing indexes
+/// (`occurrences_tenant_finding_id_idx`, `observations_tenant_occurrence_id_idx`)
+/// cover the join columns but not the combined `DISTINCT ON` sort, so
+/// PostgreSQL performs an in-memory sort over the full tenant join result.
+///
+/// This is acceptable for the current placeholder usage (see
+/// [`PendingTriageFinding`](crate::read_api::PendingTriageFinding)), but a
+/// `LATERAL` join rewrite that pushes `LIMIT` into the per-finding
+/// subquery should be evaluated when this becomes a production query path.
+///
 /// Bind parameters:
 /// 1. `tenant_id`
 /// 2. `limit`
