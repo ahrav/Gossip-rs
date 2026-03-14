@@ -1,7 +1,8 @@
 //! Ordered-content connector family contract.
 //!
 //! This module defines the first concrete source family built on top of the
-//! shared paging vocabulary from [`super::common`]. It models sources whose
+//! shared paging vocabulary ([`PageBuf`], [`super::PageState`]). It models
+//! sources whose worker loop is naturally:
 //! worker loop is naturally:
 //!
 //! 1. fill a bounded ordered page of [`ScanItem`] values,
@@ -40,25 +41,42 @@ pub struct OrderedContentCapabilities {
 /// Implementations enumerate [`ScanItem`] values in canonical source order and
 /// expose the corresponding bytes through [`open`](Self::open) and optionally
 /// [`read_range`](Self::read_range).
+///
+/// ## Mutability
+///
+/// Methods take `&mut self` because implementations typically maintain mutable
+/// internal state: connection handles, cached pagination position, directory
+/// iterators, or index structures built lazily on first call. For concurrent
+/// multi-shard enumeration, clone the source instance or wrap in
+/// `Arc<Mutex<dyn OrderedContentSource>>`.
 pub trait OrderedContentSource: Send {
     /// Returns the ordered-content features this source supports.
     fn capabilities(&self) -> OrderedContentCapabilities;
 
     /// Fill one bounded page of ordered content items within `shard`.
+    ///
+    /// Returns `Ok(Some(page))` with a non-empty page of items, or `Ok(None)`
+    /// to signal terminal completion when no in-scope items remain (the empty
+    /// terminal call in the two-call shard completion pattern).
     fn fill_page(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
         budgets: Budgets,
-    ) -> Result<PageBuf<ScanItem>, EnumerateError>;
+    ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError>;
 
     /// Suggest a split point strictly inside the remaining shard suffix.
+    ///
+    /// Returns `Ok(None)` when the source does not support split hints
+    /// (the default) or has no suggestion for the current position.
     fn choose_split_point(
         &mut self,
-        shard: &ShardSpec,
-        cursor: &Cursor,
-        budgets: Budgets,
-    ) -> Result<Option<ItemKey>, EnumerateError>;
+        _shard: &ShardSpec,
+        _cursor: &Cursor,
+        _budgets: Budgets,
+    ) -> Result<Option<ItemKey>, EnumerateError> {
+        Ok(None)
+    }
 
     /// Open the full content for an item.
     fn open(
@@ -68,13 +86,24 @@ pub trait OrderedContentSource: Send {
     ) -> Result<Box<dyn io::Read + Send>, ReadError>;
 
     /// Read a byte range from item content.
+    ///
+    /// Returns the number of bytes written into `dst`, which may be less than
+    /// `dst.len()`. Returns `Ok(0)` when `offset` is at or past the end of
+    /// item content. Implementations must return an error if `offset + dst.len()`
+    /// would overflow `u64`.
+    ///
+    /// Sources that do not advertise
+    /// [`range_read`](OrderedContentCapabilities::range_read) return
+    /// [`ReadError::unsupported`] (the default).
     fn read_range(
         &mut self,
-        item_ref: &ItemRef,
-        offset: u64,
-        dst: &mut [u8],
-        budgets: Budgets,
-    ) -> Result<usize, ReadError>;
+        _item_ref: &ItemRef,
+        _offset: u64,
+        _dst: &mut [u8],
+        _budgets: Budgets,
+    ) -> Result<usize, ReadError> {
+        Err(ReadError::unsupported("range_read"))
+    }
 }
 
 #[cfg(test)]
@@ -93,17 +122,8 @@ mod tests {
             _shard: &ShardSpec,
             _cursor: &Cursor,
             _budgets: Budgets,
-        ) -> Result<PageBuf<ScanItem>, EnumerateError> {
+        ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
             Err(EnumerateError::permanent("stub"))
-        }
-
-        fn choose_split_point(
-            &mut self,
-            _shard: &ShardSpec,
-            _cursor: &Cursor,
-            _budgets: Budgets,
-        ) -> Result<Option<ItemKey>, EnumerateError> {
-            Ok(None)
         }
 
         fn open(
@@ -111,16 +131,6 @@ mod tests {
             _item_ref: &ItemRef,
             _budgets: Budgets,
         ) -> Result<Box<dyn io::Read + Send>, ReadError> {
-            Err(ReadError::permanent("stub"))
-        }
-
-        fn read_range(
-            &mut self,
-            _item_ref: &ItemRef,
-            _offset: u64,
-            _dst: &mut [u8],
-            _budgets: Budgets,
-        ) -> Result<usize, ReadError> {
             Err(ReadError::permanent("stub"))
         }
     }
@@ -140,5 +150,11 @@ mod tests {
 
         assert_send::<StubSource>();
         assert_source::<StubSource>();
+    }
+
+    #[test]
+    fn ordered_content_source_is_object_safe() {
+        fn assert_object_safe(_: &dyn OrderedContentSource) {}
+        let _ = assert_object_safe;
     }
 }

@@ -10,8 +10,6 @@
 //!
 //! The connector contract surface is split into focused layers:
 //!
-//! - `common.rs` defines the shared paging vocabulary
-//!   ([`PageBuf`], [`PageState`], [`PagingCapabilities`], page validation).
 //! - `types.rs` defines validated value wrappers, item metadata/value
 //!   invariants (including toxic-byte redaction and size bounds), and
 //!   [`ToxicDigest`].
@@ -19,15 +17,15 @@
 //!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
 //!   `ConnectorCapabilities`).
 //! - `common.rs` defines shared paging vocabulary reused across connector
-//!   families (`PageBuf`, `PageState`, `PagingCapabilities`,
-//!   `KeyedPageItem`, `validate_filled_page`).
+//!   families ([`PageBuf`], [`PageState`], [`PagingCapabilities`],
+//!   [`KeyedPageItem`], [`validate_filled_page`]).
 //! - `ordered.rs` defines the ordered-content family contract
-//!   (`ordered::OrderedContentCapabilities`,
-//!   `ordered::OrderedContentSource`).
+//!   ([`ordered::OrderedContentCapabilities`],
+//!   [`ordered::OrderedContentSource`]).
 //!
-//! `api.rs` and `types.rs` remain internal organization units; their public
-//! items are re-exported here so runtime crates keep a single import boundary
-//! while family-specific contracts stay namespaced.
+//! `api.rs`, `common.rs`, and `types.rs` remain internal organization units;
+//! their public items are re-exported here so runtime crates keep a single
+//! import boundary while family-specific contracts stay namespaced.
 //!
 //! ## Invariants
 //!
@@ -72,7 +70,7 @@
 //! policy) live in runtime crates.
 
 mod api;
-pub mod common;
+mod common;
 pub mod ordered;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.

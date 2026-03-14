@@ -8,7 +8,7 @@ enumeration and read model. The contract lives in
 `crates/gossip-contracts/src/connector/`; concrete implementations live in
 `crates/gossip-connectors/`.
 
-The crate provides three core capabilities:
+The crate provides four core capabilities:
 
 - **Shared paging vocabulary** -- reusable page-shape contracts
   (`PageBuf`, `PageState`, `PagingCapabilities`, `KeyedPageItem`) and
@@ -21,16 +21,10 @@ The crate provides three core capabilities:
   `TypeName(len=N, hash=XXXXXXXX..)` via truncated BLAKE3, never raw
   bytes.
 
-- **Shared paging vocabulary** -- `PageBuf`, `PageState`,
-  `PagingCapabilities`, `KeyedPageItem`, and `validate_filled_page`
-  provide the page shape and validation rules that connector families
-  reuse for ordered shard traversal.
-
 - **Family contract modules** -- `ordered.rs` defines the
   `OrderedContentSource` trait and its family-specific capability flags.
-  This is the first step away from a one-trait-fits-all connector
-  surface while the old driver stack is still present elsewhere in the
-  runtime.
+  This is the first family-specific contract surface layered on top of
+  the shared paging vocabulary.
 
 - **Connector method surface** -- each concrete connector exposes `caps`,
   `choose_split_point`, `open`, and `read_range` as

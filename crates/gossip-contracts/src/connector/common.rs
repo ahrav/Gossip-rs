@@ -125,6 +125,15 @@ impl<'a, T> IntoIterator for &'a PageBuf<T> {
     }
 }
 
+impl<T> IntoIterator for PageBuf<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
 /// Whether a page completes the current enumeration scope or requires resume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageState {
@@ -170,6 +179,9 @@ pub struct PagingCapabilities {
 /// Trait for items that participate in ordered page emission.
 pub trait KeyedPageItem {
     /// Returns the ordered key used for page progression.
+    ///
+    /// Must be deterministic: successive calls on the same receiver must return
+    /// an identical `ItemKey`. Validation and paging logic depend on key stability.
     fn item_key(&self) -> &ItemKey;
 
     /// Returns the optional item byte-size estimate used for budget tracking.
