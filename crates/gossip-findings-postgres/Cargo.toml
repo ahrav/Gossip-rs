@@ -26,3 +26,8 @@ proptest.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
 gossip-pg-common = { workspace = true, features = ["test-support"] }
 gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
+
+[[test]]
+name = "findings_pg_integration"
+path = "tests/findings_pg_integration.rs"
+required-features = ["test-utils"]
