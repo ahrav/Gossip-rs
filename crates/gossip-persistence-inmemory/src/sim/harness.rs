@@ -45,6 +45,11 @@ use crate::{CompletionOrder, InMemoryDoneLedger, InMemoryDoneLedgerHandle, Pendi
 /// Overlapping keys force merge contention.
 const OVID_POOL_SIZE: usize = 50;
 
+/// Test-only mirror of the shared key-pool width so sibling property tests
+/// generate upserts and reads against the same key space as the harness.
+#[cfg(test)]
+pub(super) const PROPTEST_OVID_POOL_SIZE: usize = OVID_POOL_SIZE;
+
 /// First N safety ops suppress fault injection to allow initial state
 /// population.
 const WARMUP_OPS: usize = 5;
@@ -1003,6 +1008,22 @@ impl DoneLedgerSim {
             error_code,
         )
         .unwrap()
+    }
+
+    /// Build a record against the harness key pool using test-supplied fields.
+    #[cfg(test)]
+    pub(super) fn build_test_record(
+        &mut self,
+        spec: &super::tests::RecordSpec,
+    ) -> DoneLedgerRecord {
+        self.build_record(
+            spec.ovid_index,
+            spec.status,
+            spec.bytes_scanned,
+            spec.findings_count,
+            spec.started_at,
+            spec.started_at + spec.duration,
+        )
     }
 
     // ── Record generation ────────────────────────────────────────────
