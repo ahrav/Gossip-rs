@@ -22,6 +22,13 @@
 //! - `ordered.rs` defines the ordered-content family contract
 //!   ([`ordered::OrderedContentCapabilities`],
 //!   [`ordered::OrderedContentSource`]).
+//! - `git.rs` defines the Git family contract
+//!   ([`git::RepoKey`], [`git::RepoLocator`], [`git::GitRepoTarget`],
+//!   [`git::GitSelection`], [`git::LocalMirror`],
+//!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
+//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
+//!   [`git::GitRepoDiscoverySource`],
+//!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]).
 //!
 //! `api.rs`, `common.rs`, and `types.rs` remain internal organization units;
 //! their public items are re-exported here so runtime crates keep a single
@@ -57,6 +64,12 @@
 //! - Connector feature flags: [`ConnectorCapabilities`]
 //! - Ordered-content family contract: [`ordered::OrderedContentCapabilities`],
 //!   [`ordered::OrderedContentSource`]
+//! - Git family types and contracts: [`git::RepoKey`], [`git::RepoLocator`],
+//!   [`git::GitRepoTarget`], [`git::GitSelection`], [`git::LocalMirror`],
+//!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
+//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
+//!   [`git::GitRepoDiscoverySource`],
+//!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]
 //!
 //! These types are intentionally composable: a connector validates once at the
 //! boundary, then hands strongly-typed values across crate boundaries without
@@ -71,11 +84,15 @@
 
 mod api;
 mod common;
+pub mod git;
 pub mod ordered;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
 pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
+// Re-export for use by `define_connector_error!` macro via `$crate::connector::` path.
+#[doc(hidden)]
+pub use api::fmt_sanitized_message;
 pub use common::{
     KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, validate_filled_page,
 };

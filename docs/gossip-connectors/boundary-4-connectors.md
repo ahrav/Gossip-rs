@@ -27,6 +27,10 @@ The crate provides four core capabilities:
   `Ok(Some(page))` delivers a non-empty page, `Ok(None)` signals terminal
   completion when no in-scope items remain (`PageBuf` enforces non-empty,
   so the `Option` wrapper carries the empty-terminal signal).
+  `git.rs` defines the Git family's three-trait pipeline:
+  `GitRepoDiscoverySource` (frontier discovery), `GitMirrorManager`
+  (local mirror acquisition), and `GitRepoExecutor` (whole-repo
+  execution). These operate on repositories rather than individual items.
 
 - **Connector method surface** -- each concrete connector exposes `caps`,
   `choose_split_point`, `open`, and `read_range` as
@@ -44,6 +48,7 @@ The crate provides four core capabilities:
 | `types.rs`          | Toxic-byte wrappers, `Cursor`, `ScanItem`, `Budgets`, `ToxicDigest`         |
 | `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`         |
 | `ordered.rs`        | Ordered-content family contract: `OrderedContentSource` trait (`fill_page` → `Ok(None)` terminal), `OrderedContentCapabilities` flags |
+| `git.rs`            | Git family contract: `GitRepoDiscoverySource`, `GitMirrorManager`, `GitRepoExecutor` traits; `RepoKey`, `RepoLocator`, `GitSelection`, `LocalMirror`, `GitExecutionLimits`, `GitRunOutcome`, `GitRunError` types |
 
 #### Implementation layer (`crates/gossip-connectors/`)
 

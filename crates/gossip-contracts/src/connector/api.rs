@@ -85,7 +85,8 @@ impl fmt::Display for ErrorClass {
 /// these ranges form the full set for which [`char::is_control()`] returns
 /// `true`.
 #[inline]
-fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
+#[doc(hidden)]
+pub fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
     for ch in message.chars() {
         if ch.is_control() && !matches!(ch, '\t' | '\n' | '\r') {
             f.write_str("\u{FFFD}")?;
@@ -111,24 +112,26 @@ fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Resu
 /// - Accessors: `class()`, `message()`, `retry_after_ms()`, `is_retryable()`, `into_message()`
 /// - Constructors: `retryable()`, `rate_limited()`, `permanent()`
 /// - Traits: `Clone`, `Debug`, `PartialEq`, `Eq`, `Display`, `Error`
+#[macro_export]
+#[doc(hidden)]
 macro_rules! define_connector_error {
     (
         $(#[$meta:meta])*
         $name:ident
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[derive(Clone, PartialEq, Eq)]
         pub struct $name {
-            class: ErrorClass,
-            message: String,
-            retry_after_ms: Option<u64>,
+            class: $crate::connector::ErrorClass,
+            message: ::std::string::String,
+            retry_after_ms: ::core::option::Option<u64>,
         }
 
         impl $name {
             /// Returns the retryability classification for this failure.
             #[inline]
             #[must_use]
-            pub fn class(&self) -> ErrorClass {
+            pub fn class(&self) -> $crate::connector::ErrorClass {
                 self.class
             }
 
@@ -148,12 +151,12 @@ macro_rules! define_connector_error {
             /// policies. A value of `0` is passed through without normalization.
             #[inline]
             #[must_use]
-            pub fn retry_after_ms(&self) -> Option<u64> {
+            pub fn retry_after_ms(&self) -> ::core::option::Option<u64> {
                 self.retry_after_ms
             }
 
             /// Returns `true` when the error is classified as
-            /// [`Retryable`](ErrorClass::Retryable).
+            /// [`Retryable`](crate::connector::ErrorClass::Retryable).
             ///
             /// Convenience shorthand for `self.class().is_retryable()`.
             #[inline]
@@ -165,68 +168,86 @@ macro_rules! define_connector_error {
             /// Consumes the error and returns the owned diagnostic message.
             #[inline]
             #[must_use]
-            pub fn into_message(self) -> String {
+            pub fn into_message(self) -> ::std::string::String {
                 self.message
             }
 
-            /// Construct a retryable error without a backoff hint.
+            /// Constructs a retryable error without a backoff hint.
             ///
             /// Use for transient failures where the connector has no opinion on
             /// when to retry (e.g., a generic network timeout).
             #[must_use]
-            pub fn retryable(message: impl Into<String>) -> Self {
+            pub fn retryable(message: impl ::core::convert::Into<::std::string::String>) -> Self {
                 Self {
-                    class: ErrorClass::Retryable,
+                    class: $crate::connector::ErrorClass::Retryable,
                     message: message.into(),
-                    retry_after_ms: None,
+                    retry_after_ms: ::core::option::Option::None,
                 }
             }
 
-            /// Construct a retryable error with a connector-supplied backoff hint.
+            /// Constructs a retryable error with a connector-supplied backoff hint.
             ///
             /// Typical source: an HTTP `Retry-After` header or equivalent API signal.
             /// The `retry_after_ms` value is stored as-is (including `0`) with no
             /// clamping or normalization -- that is the runtime's responsibility.
             #[must_use]
-            pub fn rate_limited(message: impl Into<String>, retry_after_ms: u64) -> Self {
+            pub fn rate_limited(
+                message: impl ::core::convert::Into<::std::string::String>,
+                retry_after_ms: u64,
+            ) -> Self {
                 Self {
-                    class: ErrorClass::Retryable,
+                    class: $crate::connector::ErrorClass::Retryable,
                     message: message.into(),
-                    retry_after_ms: Some(retry_after_ms),
+                    retry_after_ms: ::core::option::Option::Some(retry_after_ms),
                 }
             }
 
-            /// Construct a permanent error.
+            /// Constructs a permanent error.
             ///
             /// Use when the failure will persist until something external changes
             /// (credentials, permissions, resource existence). The runtime should
             /// not retry blindly; typical follow-up is to park the shard or skip
             /// the item with a diagnostic reason.
             #[must_use]
-            pub fn permanent(message: impl Into<String>) -> Self {
+            pub fn permanent(
+                message: impl ::core::convert::Into<::std::string::String>,
+            ) -> Self {
                 Self {
-                    class: ErrorClass::Permanent,
+                    class: $crate::connector::ErrorClass::Permanent,
                     message: message.into(),
-                    retry_after_ms: None,
+                    retry_after_ms: ::core::option::Option::None,
                 }
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 write!(f, "{}: ", self.class)?;
-                fmt_sanitized_message(f, &self.message)?;
-                if let Some(retry_after_ms) = self.retry_after_ms {
+                $crate::connector::fmt_sanitized_message(f, &self.message)?;
+                if let ::core::option::Option::Some(retry_after_ms) = self.retry_after_ms {
                     write!(f, " (retry_after_ms={})", retry_after_ms)?;
                 }
-                Ok(())
+                ::core::result::Result::Ok(())
+            }
+        }
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.debug_struct(stringify!($name))
+                    .field("class", &self.class)
+                    .field(
+                        "message",
+                        &$crate::connector::ToxicDigest::of_bytes(self.message.as_bytes()),
+                    )
+                    .field("retry_after_ms", &self.retry_after_ms)
+                    .finish()
             }
         }
 
         /// Boundary-terminal: the underlying cause (IO, HTTP, parse errors) is
         /// flattened into `message` at construction time. Connectors should log
         /// the original error before constructing this type.
-        impl std::error::Error for $name {}
+        impl ::std::error::Error for $name {}
     };
 }
 
@@ -268,7 +289,7 @@ define_connector_error! {
 }
 
 impl ReadError {
-    /// Construct a permanent read error for an unsupported operation.
+    /// Constructs a permanent read error for an unsupported operation.
     ///
     /// Convenience for capability mismatches discovered at call time -- for
     /// example, a range-read attempt against a connector that does not
