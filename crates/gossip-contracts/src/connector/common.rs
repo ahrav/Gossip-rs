@@ -10,8 +10,6 @@
 //! |------|------|
 //! | [`PageBuf`] | Non-empty typed page container |
 //! | [`PageState`] | Terminal vs resumable page completion state |
-//! | [`PagingCapabilities`] | Optional paging behavior flags |
-//! | [`KeyedPageItem`] | Ordered-key contract for page items |
 //! | [`PageShapeError`] | Page validation failure taxonomy |
 //! | [`validate_filled_page`] | Validates ordering, uniqueness, and shard bounds |
 //!
