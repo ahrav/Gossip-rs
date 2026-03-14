@@ -25,6 +25,12 @@
 //!   revision increment. CAS correctness is unaffected (no interleaving
 //!   within `expire_due_leases`), but revision numbers will be inflated
 //!   relative to production.
+//! - **Injected faults** — four fault types (CAS compare miss, uncertain
+//!   commit, lease-TTL race, retry-exhaustion burst) simulate failure
+//!   modes that occur organically only with concurrent writers or network
+//!   partitions. The single-threaded simulator cannot produce these
+//!   naturally, so they are injected probabilistically via
+//!   [`SimEtcdFaultConfig`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -36,11 +42,13 @@ use etcd_client::proto::{
     PbTxnOpResponse, PbTxnRequest, PbTxnResponse,
 };
 use etcd_client::{CompareOp, GetOptions, LeaseGrantResponse, LeaseRevokeResponse, Txn, TxnOp};
+use gossip_coordination::sim::FaultLevel;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 const PPM_MAX: u32 = 1_000_000;
+const DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS: usize = 8;
 
 /// In-memory etcd model for deterministic simulation.
 #[derive(Debug, Clone)]
@@ -52,6 +60,11 @@ pub struct SimulatedEtcdKV {
     now: u64,
     next_expiry: u64,
     fault_config: SimEtcdFaultConfig,
+    /// Active sustained-contention burst for one logical CAS request.
+    active_retry_exhaustion: Option<ActiveRetryExhaustion>,
+    /// Suppresses immediate re-arming after a forced retry-exhaustion burst.
+    /// Cleared once a different txn fingerprint arrives.
+    recent_retry_exhaustion: Option<Vec<u8>>,
     rng: ChaCha8Rng,
 }
 
@@ -73,6 +86,8 @@ impl SimulatedEtcdKV {
             now: 0,
             next_expiry: u64::MAX,
             fault_config,
+            active_retry_exhaustion: None,
+            recent_retry_exhaustion: None,
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
     }
@@ -150,8 +165,13 @@ impl SimulatedEtcdKV {
     }
 
     /// Replace the fault configuration mid-simulation.
+    ///
+    /// Clears any in-progress retry-exhaustion burst so the new config
+    /// takes effect from a clean state.
     pub fn set_fault_config(&mut self, config: SimEtcdFaultConfig) {
         self.fault_config = config;
+        self.active_retry_exhaustion = None;
+        self.recent_retry_exhaustion = None;
     }
 
     /// Linearizable get over the modeled keyspace.
@@ -236,12 +256,18 @@ impl SimulatedEtcdKV {
                 operation: SimEtcdOperation::Txn,
             });
         }
+        self.maybe_inject_lease_ttl_race();
 
         let request: PbTxnRequest = txn.into();
+        let fingerprint = txn_fingerprint(&request);
+        self.clear_retry_exhaustion_for_other_txn(&fingerprint);
         if !request.failure.is_empty() {
             return Err(SimEtcdError::UnsupportedTxnOp {
                 detail: "failure branches are not modeled",
             });
+        }
+        if self.consume_retry_exhaustion(&fingerprint) {
+            return Ok(build_txn_response(self.revision, false, Vec::new()));
         }
 
         let compares_succeeded = request
@@ -256,6 +282,12 @@ impl SimulatedEtcdKV {
         if !compares_succeeded {
             return Ok(build_txn_response(self.revision, false, Vec::new()));
         }
+        if self.fault_config.should_cas_compare_fail(&mut self.rng) {
+            return Ok(build_txn_response(self.revision, false, Vec::new()));
+        }
+        if self.maybe_arm_retry_exhaustion(&request, &fingerprint) {
+            return Ok(build_txn_response(self.revision, false, Vec::new()));
+        }
 
         let staged = self.stage_success_ops(&request.success)?;
         if staged.ops.is_empty() {
@@ -268,6 +300,9 @@ impl SimulatedEtcdKV {
             self.revision
         };
         let responses = self.apply_staged_txn(staged, revision);
+        if self.fault_config.should_uncertain_commit(&mut self.rng) {
+            return Err(SimEtcdError::UncertainCommit);
+        }
         Ok(build_txn_response(revision, true, responses))
     }
 
@@ -318,6 +353,7 @@ impl SimulatedEtcdKV {
                 operation: SimEtcdOperation::LeaseKeepAlive,
             });
         }
+        self.maybe_inject_lease_ttl_race();
 
         let lease = self
             .leases
@@ -364,6 +400,86 @@ impl SimulatedEtcdKV {
             .checked_add(dt)
             .expect("SimulatedEtcdKV clock overflow");
         self.expire_due_leases();
+    }
+
+    fn maybe_inject_lease_ttl_race(&mut self) {
+        if !self.fault_config.should_lease_ttl_race(&mut self.rng) {
+            return;
+        }
+        self.now = self
+            .now
+            .checked_add(1)
+            .expect("SimulatedEtcdKV clock overflow");
+        self.expire_due_leases();
+    }
+
+    fn clear_retry_exhaustion_for_other_txn(&mut self, fingerprint: &[u8]) {
+        if self
+            .active_retry_exhaustion
+            .as_ref()
+            .is_some_and(|fault| fault.txn_fingerprint != fingerprint)
+        {
+            self.active_retry_exhaustion = None;
+        }
+        if self
+            .recent_retry_exhaustion
+            .as_ref()
+            .is_some_and(|recent| recent != fingerprint)
+        {
+            self.recent_retry_exhaustion = None;
+        }
+    }
+
+    fn consume_retry_exhaustion(&mut self, fingerprint: &[u8]) -> bool {
+        let Some(fault) = self.active_retry_exhaustion.as_mut() else {
+            return false;
+        };
+        if fault.txn_fingerprint != fingerprint {
+            return false;
+        }
+        if fault.remaining_failures == 0 {
+            self.active_retry_exhaustion = None;
+            return false;
+        }
+        fault.remaining_failures -= 1;
+        if fault.remaining_failures == 0 {
+            self.recent_retry_exhaustion = Some(fingerprint.to_vec());
+            self.active_retry_exhaustion = None;
+        }
+        true
+    }
+
+    fn maybe_arm_retry_exhaustion(&mut self, request: &PbTxnRequest, fingerprint: &[u8]) -> bool {
+        if request.compare.is_empty()
+            || request.success.is_empty()
+            || self.fault_config.retry_exhaustion_attempts == 0
+            || self
+                .recent_retry_exhaustion
+                .as_ref()
+                .is_some_and(|recent| recent == fingerprint)
+            || !self.fault_config.should_retry_exhaust(&mut self.rng)
+        {
+            return false;
+        }
+
+        // When `retry_exhaustion_attempts == 1` the arming call itself is the
+        // sole failure — remaining_failures is 0, so we transition directly
+        // to cooldown without entering the Armed state.
+        let remaining_failures = self
+            .fault_config
+            .retry_exhaustion_attempts
+            .saturating_sub(1);
+        if remaining_failures == 0 {
+            self.recent_retry_exhaustion = Some(fingerprint.to_vec());
+            self.active_retry_exhaustion = None;
+        } else {
+            self.active_retry_exhaustion = Some(ActiveRetryExhaustion {
+                txn_fingerprint: fingerprint.to_vec(),
+                remaining_failures,
+            });
+            self.recent_retry_exhaustion = None;
+        }
+        true
     }
 
     fn evaluate_compare(&self, compare: &PbCompare) -> Result<bool, SimEtcdError> {
@@ -775,6 +891,12 @@ struct LeaseState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRetryExhaustion {
+    txn_fingerprint: Vec<u8>,
+    remaining_failures: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StagedPut {
     key: Vec<u8>,
     value: Vec<u8>,
@@ -820,9 +942,42 @@ pub struct SimEtcdFaultConfig {
     lease_grant_failure_ppm: u32,
     lease_keep_alive_failure_ppm: u32,
     lease_revoke_failure_ppm: u32,
+    cas_compare_failure_ppm: u32,
+    uncertain_commit_ppm: u32,
+    lease_ttl_race_ppm: u32,
+    retry_exhaustion_ppm: u32,
+    retry_exhaustion_attempts: usize,
 }
 
 impl SimEtcdFaultConfig {
+    /// Progressive etcd-layer faults for the given simulation severity.
+    ///
+    /// The retry-exhaustion window defaults to the coordinator's standard
+    /// optimistic retry budget (8 attempts). Callers using a custom retry
+    /// budget should override it with [`with_retry_exhaustion_attempts`](Self::with_retry_exhaustion_attempts).
+    #[must_use]
+    pub fn for_level(level: FaultLevel) -> Self {
+        match level {
+            FaultLevel::SunnyDay => Self::default(),
+            FaultLevel::Stormy => Self {
+                cas_compare_failure_ppm: 100_000,
+                uncertain_commit_ppm: 20_000,
+                lease_ttl_race_ppm: 50_000,
+                retry_exhaustion_ppm: 10_000,
+                retry_exhaustion_attempts: DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS,
+                ..Self::default()
+            },
+            FaultLevel::Radioactive => Self {
+                cas_compare_failure_ppm: 300_000,
+                uncertain_commit_ppm: 100_000,
+                lease_ttl_race_ppm: 150_000,
+                retry_exhaustion_ppm: 50_000,
+                retry_exhaustion_attempts: DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS,
+                ..Self::default()
+            },
+        }
+    }
+
     /// Override the get-failure rate.
     #[must_use]
     pub fn with_get_failure_ppm(mut self, ppm: u32) -> Self {
@@ -858,6 +1013,41 @@ impl SimEtcdFaultConfig {
         self
     }
 
+    /// Override the simulated CAS-contention rate.
+    #[must_use]
+    pub fn with_cas_compare_failure_ppm(mut self, ppm: u32) -> Self {
+        self.cas_compare_failure_ppm = validate_ppm(ppm);
+        self
+    }
+
+    /// Override the uncertain-commit rate.
+    #[must_use]
+    pub fn with_uncertain_commit_ppm(mut self, ppm: u32) -> Self {
+        self.uncertain_commit_ppm = validate_ppm(ppm);
+        self
+    }
+
+    /// Override the lease-expiry race rate.
+    #[must_use]
+    pub fn with_lease_ttl_race_ppm(mut self, ppm: u32) -> Self {
+        self.lease_ttl_race_ppm = validate_ppm(ppm);
+        self
+    }
+
+    /// Override the sustained CAS-contention rate used to exhaust retries.
+    #[must_use]
+    pub fn with_retry_exhaustion_ppm(mut self, ppm: u32) -> Self {
+        self.retry_exhaustion_ppm = validate_ppm(ppm);
+        self
+    }
+
+    /// Override the number of compare-fail responses used to exhaust retries.
+    #[must_use]
+    pub fn with_retry_exhaustion_attempts(mut self, attempts: usize) -> Self {
+        self.retry_exhaustion_attempts = attempts;
+        self
+    }
+
     fn should_fail(&self, op: SimEtcdOperation, rng: &mut ChaCha8Rng) -> bool {
         let ppm = match op {
             SimEtcdOperation::Get => self.get_failure_ppm,
@@ -867,6 +1057,22 @@ impl SimEtcdFaultConfig {
             SimEtcdOperation::LeaseRevoke => self.lease_revoke_failure_ppm,
         };
         should_inject(rng, ppm)
+    }
+
+    fn should_cas_compare_fail(&self, rng: &mut ChaCha8Rng) -> bool {
+        should_inject(rng, self.cas_compare_failure_ppm)
+    }
+
+    fn should_uncertain_commit(&self, rng: &mut ChaCha8Rng) -> bool {
+        should_inject(rng, self.uncertain_commit_ppm)
+    }
+
+    fn should_lease_ttl_race(&self, rng: &mut ChaCha8Rng) -> bool {
+        should_inject(rng, self.lease_ttl_race_ppm)
+    }
+
+    fn should_retry_exhaust(&self, rng: &mut ChaCha8Rng) -> bool {
+        should_inject(rng, self.retry_exhaustion_ppm)
     }
 }
 
@@ -884,6 +1090,7 @@ pub enum SimEtcdOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimEtcdError {
     FaultInjected { operation: SimEtcdOperation },
+    UncertainCommit,
     InvalidLeaseTtl { ttl: i64 },
     LeaseNotFound { lease_id: i64 },
     LeaseIdExhausted,
@@ -900,6 +1107,9 @@ impl fmt::Display for SimEtcdError {
         match self {
             Self::FaultInjected { operation } => {
                 write!(f, "fault injected while handling {:?}", operation)
+            }
+            Self::UncertainCommit => {
+                f.write_str("transaction committed but the client observed an uncertain outcome")
             }
             Self::InvalidLeaseTtl { ttl } => {
                 write!(f, "lease TTL must be positive, got {ttl}")
@@ -980,6 +1190,51 @@ fn should_inject(rng: &mut ChaCha8Rng, ppm: u32) -> bool {
     rng.random_range(0u32..PPM_MAX) < ppm
 }
 
+/// Keys-only fingerprint for one logical CAS request.
+///
+/// Only the key set and op-type discriminants are included. Values,
+/// revisions, and boolean flags are deliberately excluded because the
+/// coordinator rebuilds transactions from scratch on each retry,
+/// re-reading current state, so value-dependent fields can legitimately
+/// differ across retries of the same logical operation.
+fn txn_fingerprint(request: &PbTxnRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_len(&mut out, request.compare.len());
+    for compare in &request.compare {
+        push_bytes(&mut out, &compare.key);
+    }
+
+    push_len(&mut out, request.success.len());
+    for op in &request.success {
+        match op.request.as_ref() {
+            Some(PbTxnOpRequest::RequestPut(put)) => {
+                out.push(10);
+                push_bytes(&mut out, &put.key);
+            }
+            Some(PbTxnOpRequest::RequestDeleteRange(delete)) => {
+                out.push(11);
+                push_bytes(&mut out, &delete.key);
+            }
+            Some(PbTxnOpRequest::RequestRange(range)) => {
+                out.push(12);
+                push_bytes(&mut out, &range.key);
+            }
+            Some(PbTxnOpRequest::RequestTxn(_)) => out.push(13),
+            None => out.push(254),
+        }
+    }
+    out
+}
+
+fn push_len(out: &mut Vec<u8>, len: usize) {
+    out.extend_from_slice(&(len as u64).to_le_bytes());
+}
+
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    push_len(out, bytes.len());
+    out.extend_from_slice(bytes);
+}
+
 fn passes_revision_filters(request: &PbRangeRequest, entry: &KvEntry) -> bool {
     if request.min_mod_revision > 0 && entry.mod_revision < request.min_mod_revision {
         return false;
@@ -1036,8 +1291,12 @@ fn compare_bytes(actual: &[u8], expected: &[u8], op: CompareOp) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SimEtcdError, SimEtcdFaultConfig, SimulatedEtcdKV};
+    use super::{
+        DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS, SimEtcdError, SimEtcdFaultConfig,
+        SimulatedEtcdKV,
+    };
     use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
+    use gossip_coordination::sim::FaultLevel;
 
     #[test]
     fn prefix_scan_is_lexicographic_and_supports_keys_only_and_count_only() {
@@ -1284,6 +1543,165 @@ mod tests {
                 .kvs()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn fault_level_profiles_match_progressive_rates() {
+        let sunny = SimEtcdFaultConfig::for_level(FaultLevel::SunnyDay);
+        assert_eq!(sunny.cas_compare_failure_ppm, 0);
+        assert_eq!(sunny.uncertain_commit_ppm, 0);
+        assert_eq!(sunny.lease_ttl_race_ppm, 0);
+        assert_eq!(sunny.retry_exhaustion_ppm, 0);
+
+        let stormy = SimEtcdFaultConfig::for_level(FaultLevel::Stormy);
+        assert_eq!(stormy.cas_compare_failure_ppm, 100_000);
+        assert_eq!(stormy.uncertain_commit_ppm, 20_000);
+        assert_eq!(stormy.lease_ttl_race_ppm, 50_000);
+        assert_eq!(stormy.retry_exhaustion_ppm, 10_000);
+        assert_eq!(
+            stormy.retry_exhaustion_attempts,
+            DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS
+        );
+
+        let radioactive = SimEtcdFaultConfig::for_level(FaultLevel::Radioactive);
+        assert_eq!(radioactive.cas_compare_failure_ppm, 300_000);
+        assert_eq!(radioactive.uncertain_commit_ppm, 100_000);
+        assert_eq!(radioactive.lease_ttl_race_ppm, 150_000);
+        assert_eq!(radioactive.retry_exhaustion_ppm, 50_000);
+        assert_eq!(
+            radioactive.retry_exhaustion_attempts,
+            DEFAULT_SIM_ETCD_RETRY_EXHAUSTION_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn cas_compare_fault_rejects_without_mutating_state() {
+        let mut kv = SimulatedEtcdKV::with_fault_config(
+            7,
+            SimEtcdFaultConfig::default().with_cas_compare_failure_ppm(1_000_000),
+        );
+
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(
+                        b"fault-cas",
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then(vec![TxnOp::put(b"fault-cas", b"value", None)]),
+            )
+            .expect("CAS contention fault should surface as a compare miss");
+
+        assert!(!resp.succeeded(), "fault should reject the CAS");
+        assert!(
+            kv.get(b"fault-cas".to_vec(), None)
+                .expect("get should succeed")
+                .kvs()
+                .is_empty(),
+            "rejected CAS must not mutate store state"
+        );
+    }
+
+    #[test]
+    fn uncertain_commit_applies_state_before_returning_error() {
+        let mut kv = SimulatedEtcdKV::with_fault_config(
+            8,
+            SimEtcdFaultConfig::default().with_uncertain_commit_ppm(1_000_000),
+        );
+
+        let err = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(
+                        b"uncertain",
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then(vec![TxnOp::put(b"uncertain", b"value", None)]),
+            )
+            .expect_err("uncertain commit should hide the committed response");
+        assert!(matches!(err, SimEtcdError::UncertainCommit));
+        assert_eq!(
+            get_exact(&mut kv, b"uncertain").value(),
+            b"value",
+            "uncertain commit must still apply the staged mutation"
+        );
+    }
+
+    #[test]
+    fn lease_ttl_race_can_expire_keys_between_read_and_write() {
+        let mut kv = SimulatedEtcdKV::new(9);
+        let lease = kv.lease_grant(1).expect("lease grant should succeed");
+        kv.txn(
+            Txn::new()
+                .when(vec![Compare::create_revision(b"racy", CompareOp::Equal, 0)])
+                .and_then(vec![TxnOp::put(
+                    b"racy",
+                    b"value",
+                    Some(PutOptions::new().with_lease(lease.id())),
+                )]),
+        )
+        .expect("initial leased put should succeed");
+        kv.set_fault_config(SimEtcdFaultConfig::default().with_lease_ttl_race_ppm(1_000_000));
+
+        let resp = kv
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::create_revision(b"racy", CompareOp::Equal, 1)])
+                    .and_then(vec![TxnOp::put(b"other", b"value", None)]),
+            )
+            .expect("lease race should look like a failed CAS");
+
+        assert!(!resp.succeeded(), "expired owner key should break the CAS");
+        assert!(
+            kv.get(b"racy".to_vec(), None)
+                .expect("get should succeed")
+                .kvs()
+                .is_empty(),
+            "lease-race fault must expire attached keys before txn evaluation"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_fault_forces_repeated_compare_failures() {
+        let mut kv = SimulatedEtcdKV::with_fault_config(
+            10,
+            SimEtcdFaultConfig::default()
+                .with_retry_exhaustion_ppm(1_000_000)
+                .with_retry_exhaustion_attempts(3),
+        );
+        let txn = || {
+            Txn::new()
+                .when(vec![Compare::create_revision(
+                    b"retry",
+                    CompareOp::Equal,
+                    0,
+                )])
+                .and_then(vec![TxnOp::put(b"retry", b"value", None)])
+        };
+
+        let first = kv
+            .txn(txn())
+            .expect("first forced contention should return a txn response");
+        let second = kv
+            .txn(txn())
+            .expect("second forced contention should return a txn response");
+        let third = kv
+            .txn(txn())
+            .expect("third forced contention should return a txn response");
+        let fourth = kv
+            .txn(txn())
+            .expect("fault should clear after configured retries");
+
+        assert!(!first.succeeded());
+        assert!(!second.succeeded());
+        assert!(!third.succeeded());
+        assert!(
+            fourth.succeeded(),
+            "txn should commit once forced contention clears"
+        );
+        assert_eq!(get_exact(&mut kv, b"retry").value(), b"value");
     }
 
     fn put_absent(kv: &mut SimulatedEtcdKV, key: &[u8], value: &[u8]) {

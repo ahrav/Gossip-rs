@@ -12,6 +12,7 @@ use std::fmt;
 
 use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::pooled::PooledSpawnedIter;
+use gossip_coordination::sim::FaultLevel;
 use gossip_coordination::{
     LogicalTime, RunId, RunRecord, ShardId, ShardKey, ShardRecord, TenantId,
 };
@@ -67,6 +68,17 @@ impl SimEtcdCoordinator {
             config,
             SimulatedEtcdKV::with_fault_config(seed, fault_config),
         )
+    }
+
+    /// Create a simulation coordinator with a preset fault-severity profile.
+    pub fn with_fault_level(
+        config: EtcdCoordinatorConfig,
+        seed: u64,
+        level: FaultLevel,
+    ) -> Result<Self, EtcdCoordinatorError> {
+        let fault_config = SimEtcdFaultConfig::for_level(level)
+            .with_retry_exhaustion_attempts(config.optimistic_txn_retries());
+        Self::with_fault_config(config, seed, fault_config)
     }
 
     pub fn with_kv(
@@ -548,15 +560,38 @@ mod tests {
         CoordinationSim, FaultLevel, SimEvent, SimIntrospection, SimOp,
     };
     use gossip_coordination::{
-        AcquireScratch, CheckpointError, CoordinationBackend, IdempotentOutcome, InitialShardInput,
-        ParkReason, RunConfig, RunManagement, RunStatus, ShardClaiming, ShardFilter, ShardStatus,
-        ShardSummary,
+        AcquireScratch, CheckpointError, CoordinationBackend, IdempotentOutcome, InfraError,
+        InitialShardInput, ParkReason, RunConfig, RunManagement, RunStatus, ShardClaiming,
+        ShardFilter, ShardStatus, ShardSummary,
     };
 
+    fn test_config(namespace: &str) -> EtcdCoordinatorConfig {
+        EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], namespace)
+            .expect("hard-coded sim config must be valid")
+    }
+
     fn test_backend(seed: u64) -> SimEtcdCoordinator {
-        let config =
-            EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/sim-etcd-tests")
-                .expect("hard-coded sim config must be valid");
+        SimEtcdCoordinator::with_fault_level(
+            test_config("/gossip/sim-etcd-tests"),
+            seed,
+            FaultLevel::SunnyDay,
+        )
+        .expect("sim coordinator should construct")
+    }
+
+    fn test_backend_with_tuning(
+        seed: u64,
+        owner_lease_ttl_secs: i64,
+        optimistic_txn_retries: usize,
+    ) -> SimEtcdCoordinator {
+        let config = EtcdCoordinatorConfig::new_with_tuning(
+            ["http://127.0.0.1:2379"],
+            "/gossip/sim-etcd-tuned-tests",
+            owner_lease_ttl_secs,
+            optimistic_txn_retries,
+            8,
+        )
+        .expect("hard-coded tuned sim config must be valid");
         SimEtcdCoordinator::new(config, seed).expect("sim coordinator should construct")
     }
 
@@ -1423,6 +1458,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkpoint_replays_after_uncertain_commit() {
+        let mut backend = test_backend(66);
+        let key = seed_single_shard_run(&mut backend);
+        let mut scratch = AcquireScratch::new();
+        let acquire = backend
+            .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+            .expect("acquire should succeed");
+        let lease = acquire.lease;
+        let cursor = CursorUpdate::new(b"mid");
+        let op_id = OpId::from_raw(131);
+        backend
+            .set_fault_config(SimEtcdFaultConfig::default().with_uncertain_commit_ppm(1_000_000));
+
+        let first = backend.checkpoint(now(4), test_tenant(), &lease, &cursor, op_id);
+        assert!(
+            matches!(
+                first,
+                Err(CheckpointError::BackendError(InfraError::Transient {
+                    ref operation,
+                    ..
+                }))
+                    if operation == "checkpoint.txn"
+            ),
+            "uncertain commit should surface as a transient txn failure, got: {first:?}"
+        );
+
+        let replay = backend
+            .checkpoint(now(5), test_tenant(), &lease, &cursor, op_id)
+            .expect("retry should resolve through op-log replay");
+        assert!(matches!(replay, IdempotentOutcome::Replayed(())));
+    }
+
     // ---- Lease expiry via list_active_runs_into ----
 
     #[test]
@@ -1485,6 +1553,81 @@ mod tests {
                 .owner
                 .is_none(),
             "cached owner must be cleared after lease expiry via list_active_runs_into"
+        );
+    }
+
+    #[test]
+    fn lease_ttl_race_rejects_checkpoint_on_boundary() {
+        let mut backend = test_backend(72);
+        let key = seed_single_shard_run(&mut backend);
+        let mut scratch = AcquireScratch::new();
+        let acquire = backend
+            .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+            .expect("acquire should succeed");
+        let lease = acquire.lease;
+
+        let owner_key = backend
+            .keyspace()
+            .shard_owner_key(test_tenant(), key.run(), key.shard())
+            .into_bytes();
+        let resp = backend
+            .kv
+            .borrow_mut()
+            .get(owner_key, None)
+            .expect("owner lookup should succeed");
+        let etcd_lease_id = resp.kvs().first().expect("owner must exist").lease();
+        let info = backend.lease_info(etcd_lease_id).expect("lease must exist");
+        let boundary_time = info.expires_at - 1;
+        backend.set_fault_config(SimEtcdFaultConfig::default().with_lease_ttl_race_ppm(1_000_000));
+
+        let result = backend.checkpoint(
+            now(boundary_time),
+            test_tenant(),
+            &lease,
+            &CursorUpdate::new(b"racy"),
+            OpId::from_raw(132),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CheckpointError::StaleFence { .. } | CheckpointError::LeaseExpired { .. })
+            ),
+            "lease-expiry race should reject the checkpoint, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_fault_surfaces_checkpoint_exhaustion_path() {
+        let mut backend = test_backend_with_tuning(73, 60, 2);
+        let key = seed_single_shard_run(&mut backend);
+        let mut scratch = AcquireScratch::new();
+        let acquire = backend
+            .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+            .expect("acquire should succeed");
+        let lease = acquire.lease;
+        backend.set_fault_config(
+            SimEtcdFaultConfig::default()
+                .with_retry_exhaustion_ppm(1_000_000)
+                .with_retry_exhaustion_attempts(2),
+        );
+
+        let result = backend.checkpoint(
+            now(4),
+            test_tenant(),
+            &lease,
+            &CursorUpdate::new(b"retry"),
+            OpId::from_raw(133),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CheckpointError::BackendError(InfraError::Transient {
+                    ref operation,
+                    ref message,
+                })) if operation == "checkpoint"
+                    && message.contains("CAS retry budget exhausted")
+            ),
+            "retry exhaustion should hit checkpoint's exhaustion path, got: {result:?}"
         );
     }
 

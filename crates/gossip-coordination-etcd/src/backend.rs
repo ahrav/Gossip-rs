@@ -612,6 +612,7 @@ pub(crate) fn map_etcd_err(
         #[cfg(any(test, feature = "test-support"))]
         EtcdCoordinatorError::Simulated { source, .. } => match source {
             crate::sim_etcd_kv::SimEtcdError::FaultInjected { .. }
+            | crate::sim_etcd_kv::SimEtcdError::UncertainCommit
             | crate::sim_etcd_kv::SimEtcdError::LeaseNotFound { .. } => {
                 gossip_coordination::InfraError::transient(operation, err)
             }
