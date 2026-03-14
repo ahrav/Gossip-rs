@@ -341,6 +341,7 @@ dependencies = [
  "gossip-coordination",
  "gossip-stdx",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
