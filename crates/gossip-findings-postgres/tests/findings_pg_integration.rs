@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use gossip_contracts::{
     identity::key_secret_hash,
     persistence::{
@@ -59,15 +57,39 @@ fn same_record_inserted_twice_creates_no_duplicates() {
         .wait()
         .expect("second durable write should succeed");
 
-    assert_eq!(first_receipt.finding_count(), 1);
-    assert_eq!(first_receipt.occurrence_count(), 1);
-    assert_eq!(first_receipt.observation_count(), 1);
+    assert_eq!(
+        first_receipt.finding_count(),
+        1,
+        "first receipt should report exactly one finding"
+    );
+    assert_eq!(
+        first_receipt.occurrence_count(),
+        1,
+        "first receipt should report exactly one occurrence"
+    );
+    assert_eq!(
+        first_receipt.observation_count(),
+        1,
+        "first receipt should report exactly one observation"
+    );
 
     // Receipt counts reflect the deduplicated batch shape (see `build_receipt`),
     // not net-new rows. An idempotent replay still reports (1, 1, 1).
-    assert_eq!(second_receipt.finding_count(), 1);
-    assert_eq!(second_receipt.occurrence_count(), 1);
-    assert_eq!(second_receipt.observation_count(), 1);
+    assert_eq!(
+        second_receipt.finding_count(),
+        1,
+        "deduplicated replay should report same finding count"
+    );
+    assert_eq!(
+        second_receipt.occurrence_count(),
+        1,
+        "deduplicated replay should report same occurrence count"
+    );
+    assert_eq!(
+        second_receipt.observation_count(),
+        1,
+        "deduplicated replay should report same observation count"
+    );
 
     assert_eq!(
         harness.durable_counts(),
@@ -119,23 +141,33 @@ fn two_observations_for_same_occurrence_under_different_policies_both_exist() {
         .observation_rows_for_occurrence(fixture.tenant_id, fixture.occurrence.occurrence_id());
     assert_eq!(rows.len(), 2, "two policy-scoped observations should exist");
 
-    let policy_hashes: HashSet<Vec<u8>> = rows.iter().map(|row| row.policy_hash.clone()).collect();
-    let expected_policy_a = fixture.observation.policy_hash().as_bytes().to_vec();
-    let expected_policy_b = second_policy_observation.policy_hash().as_bytes().to_vec();
-    assert_eq!(policy_hashes.len(), 2);
-    assert!(policy_hashes.contains(&expected_policy_a));
-    assert!(policy_hashes.contains(&expected_policy_b));
+    let mut policy_hashes: Vec<Vec<u8>> = rows.iter().map(|row| row.policy_hash.clone()).collect();
+    policy_hashes.sort();
+    let mut expected_policies = vec![
+        fixture.observation.policy_hash().as_bytes().to_vec(),
+        second_policy_observation.policy_hash().as_bytes().to_vec(),
+    ];
+    expected_policies.sort();
+    assert_eq!(
+        policy_hashes, expected_policies,
+        "both policy hashes should be stored for the same occurrence"
+    );
 
-    let observation_ids: HashSet<Vec<u8>> =
+    let mut observation_ids: Vec<Vec<u8>> =
         rows.iter().map(|row| row.observation_id.clone()).collect();
-    let expected_observation_a = fixture.observation.observation_id().as_bytes().to_vec();
-    let expected_observation_b = second_policy_observation
-        .observation_id()
-        .as_bytes()
-        .to_vec();
-    assert_eq!(observation_ids.len(), 2);
-    assert!(observation_ids.contains(&expected_observation_a));
-    assert!(observation_ids.contains(&expected_observation_b));
+    observation_ids.sort();
+    let mut expected_observations = vec![
+        fixture.observation.observation_id().as_bytes().to_vec(),
+        second_policy_observation
+            .observation_id()
+            .as_bytes()
+            .to_vec(),
+    ];
+    expected_observations.sort();
+    assert_eq!(
+        observation_ids, expected_observations,
+        "both observation IDs should be stored for the same occurrence"
+    );
 }
 
 #[test]
@@ -178,7 +210,11 @@ fn no_raw_secret_bytes_are_persisted_in_any_inserted_columns() {
 
     let stored_observations = harness
         .observation_rows_for_occurrence(fixture.tenant_id, fixture.occurrence.occurrence_id());
-    assert_eq!(stored_observations.len(), 1);
+    assert_eq!(
+        stored_observations.len(),
+        1,
+        "exactly one observation should be stored"
+    );
     assert_eq!(
         stored_observations[0].location_display.as_deref(),
         Some(fixture.safe_location_display.as_str()),

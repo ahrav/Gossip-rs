@@ -459,11 +459,17 @@ fn assert_no_forbidden_bytes(
         if forbidden.is_empty() {
             continue;
         }
+        let matched = actual
+            .windows(forbidden.len())
+            .any(|window| window == forbidden.as_slice());
         assert!(
-            !actual
-                .windows(forbidden.len())
-                .any(|window| window == forbidden),
-            "{table}.{column} stored forbidden bytes"
+            !matched,
+            "{table}.{column} contains forbidden byte sequence \
+             (forbidden[..{}]={:02x?}, actual[..{}]={:02x?})",
+            forbidden.len().min(8),
+            &forbidden[..forbidden.len().min(8)],
+            actual.len().min(16),
+            &actual[..actual.len().min(16)],
         );
     }
 }
