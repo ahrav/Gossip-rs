@@ -254,7 +254,7 @@ jobs:
           ETCD_INITIAL_CLUSTER_TOKEN: gossip-rs-ci-cluster
           ETCD_INITIAL_CLUSTER_STATE: new
         options: >-
-          --health-cmd "etcdctl endpoint health"
+          --health-cmd "etcdctl --endpoints=http://localhost:2379 endpoint health"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -457,11 +457,15 @@ jobs:
           tool: cargo-nextest
 
       - name: Run tests (debug)
-        run: cargo nextest run --all-features --profile nightly
+        run: >-
+          cargo nextest run --all-features --profile nightly
+          --exclude gossip-coordination-etcd
       - name: Run doctests (debug)
         run: cargo test --all-features --doc
       - name: Run tests (release)
-        run: cargo nextest run --all-features --release --profile nightly
+        run: >-
+          cargo nextest run --all-features --release --profile nightly
+          --exclude gossip-coordination-etcd
       - name: Run doctests (release)
         run: cargo test --all-features --release --doc
 
@@ -699,7 +703,7 @@ jobs:
   nightly-summary:
     name: Nightly Summary
     if: always() && github.event_name == 'schedule'
-    needs: [test-full-harness, miri, kani, loom, asan, fuzz-nightly]
+    needs: [test-full-harness, test-etcd, test-postgres, miri, kani, loom, asan, fuzz-nightly]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
