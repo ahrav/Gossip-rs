@@ -128,7 +128,12 @@ impl SimEtcdCoordinator {
         out: &mut Vec<RunId>,
     ) -> Result<(), EtcdCoordinatorError> {
         // Expire any due leases before scanning active runs.
-        self.kv.borrow_mut().expire_due_leases();
+        // Buffer expired IDs for deferred cache invalidation — identical
+        // to the buffering in sync_logical_time_inner.
+        let expired_ids = self.kv.borrow_mut().expire_due_leases();
+        if !expired_ids.is_empty() {
+            self.expired_lease_buffer.borrow_mut().extend(expired_ids);
+        }
         <Self as SyncEtcdLike>::list_active_runs_into(self, tenant, out)
     }
 
@@ -177,9 +182,10 @@ impl SimEtcdCoordinator {
         if expired.is_empty() {
             return;
         }
+        let expired_set: std::collections::HashSet<i64> = expired.iter().copied().collect();
         for persisted in self.shard_cache.values_mut() {
             if let Some(ref owner) = persisted.owner
-                && expired.contains(&owner.lease_id)
+                && expired_set.contains(&owner.lease_id)
             {
                 persisted.owner = None;
             }
@@ -529,6 +535,7 @@ impl fmt::Debug for SimEtcdCoordinator {
 #[cfg(test)]
 mod tests {
     use super::SimEtcdCoordinator;
+    use crate::sim_etcd_kv::SimEtcdFaultConfig;
     use crate::{EtcdCoordinatorConfig, decode_owner_value};
     use gossip_contracts::coordination::{
         CursorSemantics, CursorUpdate, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
@@ -1140,7 +1147,32 @@ mod tests {
         assert!(removed.is_empty(), "active runs must not be GC'd");
     }
 
-    // ---- Complete / Park tests (F1) ----
+    // ---- Cache refresh does not mask committed operations ----
+
+    #[test]
+    fn create_run_succeeds_when_cache_refresh_fails() {
+        // With 100% GET failure, refresh_cached_run_state will fail.
+        // create_run's CAS uses only TXN (no GET), so the CAS itself
+        // succeeds. The caller must see success, not a masked BackendError.
+        let fault_config = SimEtcdFaultConfig::default().with_get_failure_ppm(1_000_000);
+        let config =
+            EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/sim-cache-test")
+                .expect("hard-coded sim config must be valid");
+        let mut backend = SimEtcdCoordinator::with_fault_config(config, 71, fault_config.clone())
+            .expect("sim coordinator should construct");
+        let run_config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5))
+            .expect("test run config must be valid");
+
+        let result = backend.create_run(now(1), test_tenant(), test_run(), run_config);
+
+        // The CAS committed the run — the caller must receive the RunRecord.
+        assert!(
+            result.is_ok(),
+            "create_run committed; cache refresh failure must not mask success: {result:?}"
+        );
+    }
+
+    // ---- Complete / Park tests ----
 
     #[test]
     fn full_lifecycle_create_to_complete() {
@@ -1388,6 +1420,71 @@ mod tests {
         assert!(
             matches!(outcome, IdempotentOutcome::Replayed(())),
             "second complete with same op_id must return Replayed"
+        );
+    }
+
+    // ---- Lease expiry via list_active_runs_into ----
+
+    #[test]
+    fn list_active_runs_buffers_expired_lease_ids_for_cache_flush() {
+        let mut backend = test_backend(70);
+        let key = seed_single_shard_run(&mut backend);
+        let mut scratch = AcquireScratch::new();
+        let _acquire = backend
+            .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+            .expect("acquire should succeed");
+
+        // Owner must be cached after acquire.
+        assert!(
+            backend
+                .shard_cache
+                .get(&(test_tenant(), key))
+                .unwrap()
+                .owner
+                .is_some(),
+            "owner must be cached after acquire"
+        );
+
+        // Find the etcd lease expiry time.
+        let owner_key_bytes = backend
+            .keyspace()
+            .shard_owner_key(test_tenant(), key.run(), key.shard())
+            .into_bytes();
+        let resp = backend
+            .kv
+            .borrow_mut()
+            .get(owner_key_bytes, None)
+            .expect("owner lookup should succeed");
+        let etcd_lease_id = resp.kvs().first().expect("owner must exist").lease();
+        let info = backend.lease_info(etcd_lease_id).expect("lease must exist");
+        let expiry_time = info.expires_at + 1;
+
+        // Advance sim clock past TTL, then expire leases via
+        // list_active_runs_into (which calls expire_due_leases internally).
+        backend.kv.borrow_mut().set_time(expiry_time);
+        let mut active_runs = Vec::new();
+        backend
+            .list_active_runs_into(test_tenant(), &mut active_runs)
+            .expect("list_active_runs should succeed");
+
+        // The expired IDs must be buffered so flush_expired_lease_cache
+        // can clear stale owner bindings. Trigger the flush via a &mut self
+        // method. gc_stale_initializing_runs_into calls flush_expired_lease_cache
+        // but won't re-expire leases (clock already at expiry_time).
+        let mut removed = Vec::new();
+        backend
+            .gc_stale_initializing_runs_into(test_tenant(), now(expiry_time), &mut removed)
+            .expect("gc should succeed");
+
+        // Cached owner must be invalidated.
+        assert!(
+            backend
+                .shard_cache
+                .get(&(test_tenant(), key))
+                .unwrap()
+                .owner
+                .is_none(),
+            "cached owner must be cleared after lease expiry via list_active_runs_into"
         );
     }
 

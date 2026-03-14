@@ -89,9 +89,7 @@ macro_rules! impl_sync_run_management {
             CreateRunError::BackendError(super::map_etcd_err("create_run.txn", err))
         })?;
         if let CasOutcome::Committed(created) = outcome {
-            self.refresh_cached_run_state(tenant, run).map_err(|err| {
-                CreateRunError::BackendError(super::map_etcd_err("create_run.refresh_cache", err))
-            })?;
+            self.best_effort_refresh_cached_run_state(tenant, run);
             return Ok(created);
         }
         Err(CreateRunError::RunAlreadyExists { run })
@@ -329,12 +327,7 @@ macro_rules! impl_sync_run_management {
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, run).map_err(|err| {
-            RegisterShardsError::BackendError(super::map_etcd_err(
-                "register_shards.refresh_cache",
-                err,
-            ))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, run);
         Ok(result)
     }
 
@@ -448,12 +441,12 @@ macro_rules! impl_sync_run_management {
     /// ordering.
     fn collect_claim_candidates_into(
         &self,
-        _now: LogicalTime,
+        now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         candidates: &mut Vec<ShardId>,
     ) -> Result<Option<LogicalTime>, GetRunError> {
-        self.sync_logical_time(_now);
+        self.sync_logical_time(now);
         let _ = self.get_run(tenant, run)?;
 
         // Keys-only scan of the active-shard index to find unleased candidates.
@@ -526,12 +519,7 @@ macro_rules! impl_sync_run_management {
         self.sync_logical_time(now);
         let result =
             self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CompleteRun)?;
-        self.refresh_cached_run_state(tenant, run).map_err(|err| {
-            RunTransitionError::BackendError(super::map_etcd_err(
-                "complete_run.refresh_cache",
-                err,
-            ))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, run);
         Ok(result)
     }
 
@@ -546,12 +534,7 @@ macro_rules! impl_sync_run_management {
     ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
         self.sync_logical_time(now);
         let result = self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::FailRun)?;
-        self.refresh_cached_run_state(tenant, run).map_err(|err| {
-            RunTransitionError::BackendError(super::map_etcd_err(
-                "fail_run.refresh_cache",
-                err,
-            ))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, run);
         Ok(result)
     }
 
@@ -570,12 +553,7 @@ macro_rules! impl_sync_run_management {
         self.sync_logical_time(now);
         let result =
             self.transition_run_terminal(now, tenant, run, op_id, RunOpKind::CancelRun)?;
-        self.refresh_cached_run_state(tenant, run).map_err(|err| {
-            RunTransitionError::BackendError(super::map_etcd_err(
-                "cancel_run.refresh_cache",
-                err,
-            ))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, run);
         Ok(result)
     }
 
@@ -777,9 +755,7 @@ macro_rules! impl_sync_run_management {
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            UnparkError::BackendError(super::map_etcd_err("unpark.refresh_cache", err))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(result)
     }
         }

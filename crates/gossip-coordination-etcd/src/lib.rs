@@ -17,7 +17,7 @@
 //! All three share the same coordination validation and transaction shapes,
 //! differing only in transport and execution model.
 //!
-//! Both use etcd transactions for fenced hot-path mutations, publish
+//! The etcd-backed entrypoints use etcd transactions for fenced hot-path mutations, publish
 //! worker-visible active-run/shard indexes, garbage-collect stale
 //! partially created runs, and use real etcd leases for ephemeral
 //! shard-owner bindings.

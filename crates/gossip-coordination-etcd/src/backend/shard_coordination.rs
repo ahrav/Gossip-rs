@@ -330,9 +330,7 @@ macro_rules! impl_sync_coordination_backend {
             },
         )?;
 
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            AcquireError::BackendError(super::map_etcd_err("acquire.refresh_cache", err))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(build_acquire_result(out, &persisted, lease, capacity))
     }
 
@@ -470,9 +468,7 @@ macro_rules! impl_sync_coordination_backend {
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            RenewError::BackendError(super::map_etcd_err("renew.refresh_cache", err))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(result)
     }
 
@@ -598,9 +594,7 @@ macro_rules! impl_sync_coordination_backend {
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            CheckpointError::BackendError(super::map_etcd_err("checkpoint.refresh_cache", err))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(result)
     }
 
@@ -609,7 +603,8 @@ macro_rules! impl_sync_coordination_backend {
     /// Validates the lease, checks cursor monotonicity and bounds, then
     /// CAS-updates the shard record: sets status to `Done` (terminal),
     /// applies the final cursor, clears the lease, and deletes the owner
-    /// key and active-index entry. The orphan etcd lease expires via TTL.
+    /// key and active-index entry. The owner's etcd lease is revoked
+    /// best-effort after a committed CAS to avoid orphan lease pressure.
     ///
     /// Idempotent: replays with the same `op_id` and matching payload hash
     /// return [`IdempotentOutcome::Replayed`] without re-applying.
@@ -684,6 +679,7 @@ macro_rules! impl_sync_coordination_backend {
                     .owner
                     .as_ref()
                     .expect("validated owner must have binding");
+                let owner_etcd_lease = owner.lease_id;
                 encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
 
                 let shard_record_key =
@@ -707,10 +703,14 @@ macro_rules! impl_sync_coordination_backend {
                             .shard_active_index_key(tenant, key.run(), key.shard())
                             .into_bytes(),
                     );
-                txn.execute(this, IdempotentOutcome::Executed(()))
+                let outcome = txn.execute(this, IdempotentOutcome::Executed(()))
                     .map_err(|err| {
                         CompleteError::BackendError(super::map_etcd_err("complete.txn", err))
-                    })
+                    })?;
+                if matches!(outcome, CasOutcome::Committed(_)) {
+                    this.best_effort_revoke_lease(owner_etcd_lease);
+                }
+                Ok(outcome)
             },
             |this| {
                 let persisted = this
@@ -727,16 +727,15 @@ macro_rules! impl_sync_coordination_backend {
                     |presented, current| CompleteError::StaleFence { presented, current },
                 )?;
 
-                Err(CompleteError::BackendError(InfraError::transient(
+                Err(CompleteError::BackendError(InfraError::corruption(
                     "complete",
                     "CAS retry budget exhausted after ruling out replay, stale fence, \
-                     and terminal status",
+                     and terminal status — lease-exclusive operation should not face \
+                     legitimate contention",
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            CompleteError::BackendError(super::map_etcd_err("complete.refresh_cache", err))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(result)
     }
 
@@ -745,7 +744,8 @@ macro_rules! impl_sync_coordination_backend {
     /// Validates the lease, then CAS-updates the shard record: sets status
     /// to `Parked`, records the [`ParkReason`], clears the lease, and
     /// deletes the owner key and active-index entry. No cursor update is
-    /// applied. The orphan etcd lease expires via TTL.
+    /// applied. The owner's etcd lease is revoked best-effort after a
+    /// committed CAS to avoid orphan lease pressure.
     ///
     /// Idempotent: replays with the same `op_id` and matching payload hash
     /// return [`IdempotentOutcome::Replayed`] without re-applying.
@@ -811,6 +811,7 @@ macro_rules! impl_sync_coordination_backend {
                     .owner
                     .as_ref()
                     .expect("validated owner must have binding");
+                let owner_etcd_lease = owner.lease_id;
                 encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
 
                 let shard_record_key =
@@ -834,10 +835,14 @@ macro_rules! impl_sync_coordination_backend {
                             .shard_active_index_key(tenant, key.run(), key.shard())
                             .into_bytes(),
                     );
-                txn.execute(this, IdempotentOutcome::Executed(()))
+                let outcome = txn.execute(this, IdempotentOutcome::Executed(()))
                     .map_err(|err| {
                         ParkError::BackendError(super::map_etcd_err("park_shard.txn", err))
-                    })
+                    })?;
+                if matches!(outcome, CasOutcome::Committed(_)) {
+                    this.best_effort_revoke_lease(owner_etcd_lease);
+                }
+                Ok(outcome)
             },
             |this| {
                 let persisted = this
@@ -854,16 +859,15 @@ macro_rules! impl_sync_coordination_backend {
                     |presented, current| ParkError::StaleFence { presented, current },
                 )?;
 
-                Err(ParkError::BackendError(InfraError::transient(
+                Err(ParkError::BackendError(InfraError::corruption(
                     "park_shard",
                     "CAS retry budget exhausted after ruling out replay, stale fence, \
-                     and terminal status",
+                     and terminal status — lease-exclusive operation should not face \
+                     legitimate contention",
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            ParkError::BackendError(super::map_etcd_err("park_shard.refresh_cache", err))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(result)
     }
 
@@ -1199,12 +1203,7 @@ macro_rules! impl_sync_coordination_backend {
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            SplitReplaceError::BackendError(super::map_etcd_err(
-                "split_replace.refresh_cache",
-                err,
-            ))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(result)
     }
 
@@ -1482,12 +1481,7 @@ macro_rules! impl_sync_coordination_backend {
                 )))
             },
         )?;
-        self.refresh_cached_run_state(tenant, key.run()).map_err(|err| {
-            SplitResidualError::BackendError(super::map_etcd_err(
-                "split_residual.refresh_cache",
-                err,
-            ))
-        })?;
+        self.best_effort_refresh_cached_run_state(tenant, key.run());
         Ok(result)
     }
         }

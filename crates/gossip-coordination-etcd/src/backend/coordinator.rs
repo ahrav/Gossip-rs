@@ -89,6 +89,23 @@ pub(crate) trait SyncEtcdLike: Sized {
         Ok(())
     }
 
+    /// Best-effort cache refresh after a committed CAS transaction.
+    ///
+    /// If the refresh fails (e.g., fault-injected KV error in the sim
+    /// backend), the failure is logged but not propagated. The CAS already
+    /// committed — the caller must receive the successful result. The
+    /// cache will be repopulated on the next mutation or explicit refresh.
+    fn best_effort_refresh_cached_run_state(&mut self, tenant: TenantId, run: RunId) {
+        if let Err(err) = self.refresh_cached_run_state(tenant, run) {
+            tracing::warn!(
+                %err,
+                %tenant,
+                ?run,
+                "post-commit cache refresh failed; cache is stale until next mutation",
+            );
+        }
+    }
+
     /// Backoff strategy between CAS retry attempts.
     /// Default: real sleep with exponential backoff + jitter.
     /// Simulation overrides to no-op (deterministic, no real contention).
