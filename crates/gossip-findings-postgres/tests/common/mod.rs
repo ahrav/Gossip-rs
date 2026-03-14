@@ -48,9 +48,14 @@ impl LivePgHarness {
     /// Connect to a live PostgreSQL instance, apply migrations, and truncate
     /// the findings tables under a process-wide test lock.
     pub fn new() -> Self {
-        let guard = global_test_lock()
-            .lock()
-            .expect("global test lock poisoned");
+        let guard = match global_test_lock().lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                // A previous test panicked while holding the lock. Recover the
+                // guard so subsequent tests can still truncate and start fresh.
+                poisoned.into_inner()
+            }
+        };
         let database_url = test_database_url();
         let backend = FindingsSinkPg::connect_and_migrate(&database_url)
             .expect("connect_and_migrate should succeed against live postgres");
