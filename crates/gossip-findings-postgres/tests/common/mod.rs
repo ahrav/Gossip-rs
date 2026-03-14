@@ -476,6 +476,9 @@ fn assert_no_forbidden_bytes(
 
 fn assert_no_forbidden_text(column: &'static str, actual: &str, forbidden_fragments: &[&str]) {
     for forbidden in forbidden_fragments {
+        if forbidden.is_empty() {
+            continue;
+        }
         assert!(
             !actual.contains(forbidden),
             "{column} leaked forbidden text fragment: {forbidden:?}"
