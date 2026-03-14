@@ -369,7 +369,9 @@ fn batch_upsert_merges_duplicate_keys_before_persist() {
         .expect("commit should succeed");
     assert_eq!(receipt.record_count(), 1);
     assert_eq!(receipt.scanned_count(), 1);
-    assert_eq!(receipt.findings_count(), 8);
+    // ScannedWithFindings merge only counts findings from ScannedWithFindings
+    // contributors; the FailedRetryable record's findings_count=8 is ignored.
+    assert_eq!(receipt.findings_count(), 1);
 
     let fetched = backend
         .batch_get(tenant(3), policy(4), &[ovid(21)])
@@ -380,7 +382,7 @@ fn batch_upsert_merges_duplicate_keys_before_persist() {
 
     assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
     assert_eq!(merged.bytes_scanned(), 900);
-    assert_eq!(merged.findings_count(), 8);
+    assert_eq!(merged.findings_count(), 1);
     assert_eq!(merged.error_code(), None);
     assert_eq!(merged.provenance(), scanned.provenance());
 }
