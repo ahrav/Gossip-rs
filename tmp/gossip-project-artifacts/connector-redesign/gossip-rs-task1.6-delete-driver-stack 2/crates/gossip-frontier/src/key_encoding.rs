@@ -1,0 +1,735 @@
+//! Core key-encoding primitives for shard algebra.
+//!
+//! Shards partition the keyspace into half-open intervals `[start, end)` over
+//! lexicographically ordered byte strings (the same model used by Bigtable,
+//! Spanner, and FoundationDB).
+//!
+//! This module provides:
+//!
+//! - **Ordering contract and buffer** ([`KeyEncoding`], [`KeyBuf`]) -- a trait
+//!   that connectors implement so their typed keys produce byte encodings whose
+//!   lexicographic order matches logical order, plus a reusable stack buffer
+//!   that key arithmetic writes into. The coordinator itself never touches this
+//!   trait; it works with raw `&[u8]` boundaries.
+//!
+//! - **Typed key schemas** -- [`PathKey`], [`ManifestRowKey`], and
+//!   [`decode_manifest_row_key`] provide canonical encodings and decoding
+//!   for current shard-algebra consumers.
+//!
+//! - **ShardSpec bridge helpers** -- fallible constructors that translate
+//!   typed key inputs into owned [`ShardSpec`] values while preserving
+//!   coordination-side validation and error semantics.
+//!
+//! - **Key arithmetic** -- three pure functions for computing boundary keys
+//!   during split planning:
+//!   - [`prefix_successor`]: exclusive upper bound for a prefix scan
+//!     (analogous to FoundationDB `strinc` / CockroachDB `Key.PrefixEnd`).
+//!   - [`key_successor`]: minimal strict successor of an arbitrary key,
+//!     respecting the [`MAX_KEY_SIZE`] ceiling.
+//!   - [`byte_midpoint`]: approximate bisection point between two keys,
+//!     used by the split planner to halve a shard's range.
+//!
+//!   All three return `Option` -- `None` signals that the requested successor
+//!   or midpoint does not exist within representable bounds.
+//!
+//! - **Error type** ([`PrefixShardError`]) -- models the failure modes when
+//!   converting a user-supplied prefix into a bounded key range.
+//!
+//! # Zero-allocation calling convention (key arithmetic)
+//!
+//! The key arithmetic helpers take a mutable [`KeyBuf`] supplied by the caller and
+//! return a slice borrowed from that buffer. The returned slice remains valid
+//! only until the same buffer is written again. Callers that need to retain a
+//! key across later operations must copy it.
+//!
+//! # Scope boundary
+//!
+//! This module handles local, single-key arithmetic only.
+//! Whole-partition invariants (coverage, disjointness, child ordering across
+//! sibling shards) are validated in [`gossip_contracts::coordination::shard_spec`].
+
+use core::fmt;
+use gossip_contracts::coordination::shard_spec::{
+    MAX_KEY_SIZE, ShardArena, ShardSpec, ShardSpecHandle, ShardSpecInputError, ShardSpecRef,
+};
+use gossip_contracts::coordination::{key_successor_into, prefix_successor_into};
+use gossip_stdx::SlabFull;
+
+/// Reusable stack buffer for shard-key arithmetic.
+///
+/// The buffer owns fixed-capacity storage and tracks the active key prefix via
+/// `len`. Bytes after `len` are scratch space and not part of the logical key.
+///
+/// Capacity is `MAX_KEY_SIZE + 1` to allow `byte_midpoint`'s internal
+/// carry-expanded arithmetic sum.
+#[derive(Clone)]
+pub struct KeyBuf {
+    buf: [u8; Self::CAPACITY],
+    len: usize,
+}
+
+impl KeyBuf {
+    /// Maximum number of bytes this buffer can hold.
+    pub const CAPACITY: usize = MAX_KEY_SIZE + 1;
+
+    /// Create an empty key buffer.
+    pub fn new() -> Self {
+        Self {
+            buf: [0u8; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// View the active key bytes.
+    ///
+    /// The returned slice borrows this buffer and is invalidated by the next
+    /// mutating write to the same `KeyBuf`.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Active byte length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no bytes are active.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Copy `src` into this buffer and set the active length.
+    ///
+    /// This overwrites the active prefix `[0..src.len())`. Bytes beyond the new
+    /// length are left unchanged and remain scratch space.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src.len() > Self::CAPACITY`.
+    pub fn copy_from_slice(&mut self, src: &[u8]) {
+        assert!(
+            src.len() <= Self::CAPACITY,
+            "key bytes exceed KeyBuf capacity: {} > {}",
+            src.len(),
+            Self::CAPACITY
+        );
+        self.buf[..src.len()].copy_from_slice(src);
+        self.len = src.len();
+    }
+}
+
+impl Default for KeyBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for KeyBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyBuf")
+            .field("len", &self.len)
+            .field("bytes", &self.as_bytes())
+            .finish()
+    }
+}
+
+/// Trait for key types that encode into lexicographically ordered bytes.
+///
+/// # Ordering contract
+///
+/// ```text
+/// a < b  (logical ordering)  =>  encode(a) < encode(b)  (byte lex ordering)
+/// ```
+///
+/// This invariant is load-bearing: cursor monotonicity, shard range-membership
+/// checks, and deterministic split planning all rely on it. Violating it
+/// silently corrupts range boundaries.
+///
+/// # Canonicality
+///
+/// Implementations must be canonical and deterministic:
+/// - Logically equal keys must encode to identical byte strings.
+/// - A single key must not encode differently across calls.
+///
+/// These properties ensure that key comparisons are stable regardless of when
+/// or where they happen (local planner, coordinator, or across restarts).
+///
+/// # Usage
+///
+/// Connectors implement this trait for their domain-specific key types (e.g.,
+/// file paths, manifest row IDs). The coordinator never calls `encode_into`
+/// directly -- it operates on raw `&[u8]` boundaries produced by the shard
+/// builder or split planner.
+///
+/// # Buffer contract
+///
+/// Implementations must write a complete canonical encoding into `buf` whose
+/// length does not exceed [`KeyBuf::CAPACITY`]. Calling
+/// [`KeyBuf::copy_from_slice`] satisfies this contract.
+pub trait KeyEncoding: Sized {
+    /// Encode this key into bytes that preserve logical ordering under
+    /// lexicographic byte comparison.
+    fn encode_into(&self, buf: &mut KeyBuf);
+}
+
+/// UTF-8 path key encoded as identity bytes.
+///
+/// # Invariants
+///
+/// Encoding is exactly `path.as_bytes()`: no separator rewriting, Unicode
+/// normalization, or case folding.
+///
+/// # Trade-off
+///
+/// This keeps encoding deterministic and allocation-free, but logically
+/// equivalent filesystem paths with different textual forms compare as
+/// different keys. Callers that need canonical path semantics must normalize
+/// before constructing [`PathKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathKey<'a> {
+    path: &'a str,
+}
+
+impl<'a> PathKey<'a> {
+    /// Create a path key from UTF-8 path text.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `path` is empty or if `path.len()` exceeds [`MAX_KEY_SIZE`].
+    pub const fn new(path: &'a str) -> Self {
+        assert!(!path.is_empty(), "PathKey path must not be empty");
+        assert!(
+            path.len() <= MAX_KEY_SIZE,
+            "PathKey path exceeds MAX_KEY_SIZE"
+        );
+        Self { path }
+    }
+
+    /// Return a reference to the underlying UTF-8 path.
+    pub const fn as_str(self) -> &'a str {
+        self.path
+    }
+}
+
+impl KeyEncoding for PathKey<'_> {
+    fn encode_into(&self, buf: &mut KeyBuf) {
+        buf.copy_from_slice(self.path.as_bytes());
+    }
+}
+
+/// Fixed-width manifest row key encoded as `(manifest_id, row)` in big-endian
+/// `u64`s.
+///
+/// Lexicographic byte ordering matches tuple ordering: compare by
+/// `manifest_id` first, then by `row`. The fixed 16-byte layout avoids
+/// delimiters/varints and keeps decode cost constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ManifestRowKey {
+    manifest_id: u64,
+    row: u64,
+}
+
+impl ManifestRowKey {
+    /// Fixed encoded width in bytes: 8-byte manifest ID + 8-byte row.
+    pub const ENCODED_LEN: usize = 16;
+
+    /// Create a manifest row key.
+    pub const fn new(manifest_id: u64, row: u64) -> Self {
+        Self { manifest_id, row }
+    }
+
+    /// Manifest identifier component.
+    pub const fn manifest_id(self) -> u64 {
+        self.manifest_id
+    }
+
+    /// Row component.
+    pub const fn row(self) -> u64 {
+        self.row
+    }
+}
+
+impl KeyEncoding for ManifestRowKey {
+    fn encode_into(&self, buf: &mut KeyBuf) {
+        let mut tmp = [0u8; Self::ENCODED_LEN];
+        tmp[..8].copy_from_slice(&self.manifest_id.to_be_bytes());
+        tmp[8..].copy_from_slice(&self.row.to_be_bytes());
+        buf.copy_from_slice(&tmp);
+    }
+}
+
+/// Decode a fixed-width [`ManifestRowKey`] byte encoding.
+///
+/// Returns a [`ManifestRowKey`] when `key` is exactly
+/// [`ManifestRowKey::ENCODED_LEN`] bytes containing two big-endian `u64`
+/// fields. Returns `None` for any other length.
+///
+/// This function validates framing only; semantic checks (for example,
+/// monotonic row ranges) are performed by higher-level helpers.
+pub fn decode_manifest_row_key(key: &[u8]) -> Option<ManifestRowKey> {
+    if key.len() != ManifestRowKey::ENCODED_LEN {
+        return None;
+    }
+    let manifest_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+    let row = u64::from_be_bytes(key[8..].try_into().unwrap());
+    Some(ManifestRowKey::new(manifest_id, row))
+}
+
+/// Error returned by `*_into` helpers when build or arena allocation fails.
+///
+/// The two-phase `*_into` helpers first build a borrowed `ShardSpecRef`,
+/// then allocate it in a [`ShardArena`]. This enum distinguishes between
+/// build-time validation failures (`Build`) and arena capacity exhaustion
+/// (`SlabFull`). The generic parameter `E` is the build error type, which
+/// varies by constructor (e.g., [`ShardSpecInputError`] for range/manifest,
+/// [`PrefixShardError`] for prefix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardIntoError<E> {
+    /// The spec failed validation before allocation was attempted.
+    Build(E),
+    /// The arena has no remaining capacity for this spec.
+    SlabFull(SlabFull),
+}
+
+impl<E: fmt::Display> fmt::Display for ShardIntoError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build(err) => write!(f, "{err}"),
+            Self::SlabFull(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ShardIntoError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Build(err) => Some(err),
+            Self::SlabFull(err) => Some(err),
+        }
+    }
+}
+
+/// Construct a borrowed [`ShardSpecRef`] from typed start/end boundaries.
+///
+/// `start` and `end` are encoded into caller-provided scratch buffers, and
+/// validation is delegated to [`ShardSpec::validate_ref`].
+/// Returned range bytes borrow from `start_buf`/`end_buf`; reusing either
+/// buffer invalidates those views.
+///
+/// # Errors
+///
+/// Returns [`ShardSpecInputError`] when the encoded range fails validation:
+/// inverted bounds, keys exceeding [`MAX_KEY_SIZE`], or oversized metadata.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_keys_ref<'a, Start: KeyEncoding, End: KeyEncoding>(
+    start: &Start,
+    end: &End,
+    metadata: &'a [u8],
+    start_buf: &'a mut KeyBuf,
+    end_buf: &'a mut KeyBuf,
+) -> Result<ShardSpecRef<'a>, ShardSpecInputError> {
+    start.encode_into(start_buf);
+    end.encode_into(end_buf);
+    let spec = ShardSpecRef::new(start_buf.as_bytes(), end_buf.as_bytes(), metadata);
+    ShardSpec::validate_ref(spec)?;
+    Ok(spec)
+}
+
+/// Build a spec from typed keys then allocate it in [`ShardArena`].
+///
+/// Combines [`shard_spec_from_keys_ref`] validation with arena allocation.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- encoded range fails validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
+pub fn shard_spec_from_keys_into<Start: KeyEncoding, End: KeyEncoding>(
+    arena: &mut ShardArena,
+    start: &Start,
+    end: &End,
+    metadata: &[u8],
+    start_buf: &mut KeyBuf,
+    end_buf: &mut KeyBuf,
+) -> Result<ShardSpecHandle, ShardIntoError<ShardSpecInputError>> {
+    let spec = shard_spec_from_keys_ref(start, end, metadata, start_buf, end_buf)
+        .map_err(ShardIntoError::Build)?;
+    arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
+}
+
+/// Construct a prefix-bounded [`ShardSpecRef`] as `[prefix, prefix_successor)`.
+///
+/// The returned end bound borrows from `successor_buf`.
+///
+/// # Errors
+///
+/// Returns [`PrefixShardError`] when the prefix is empty, exceeds
+/// [`MAX_KEY_SIZE`], has no lexicographic successor (all `0xFF`), or when
+/// the derived spec fails downstream validation.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_prefix_ref<'a>(
+    prefix: &'a [u8],
+    metadata: &'a [u8],
+    successor_buf: &'a mut KeyBuf,
+) -> Result<ShardSpecRef<'a>, PrefixShardError> {
+    if prefix.is_empty() {
+        return Err(PrefixShardError::EmptyPrefix);
+    }
+    if prefix.len() > MAX_KEY_SIZE {
+        return Err(PrefixShardError::PrefixTooLarge {
+            size: prefix.len(),
+            max: MAX_KEY_SIZE,
+        });
+    }
+
+    let end = prefix_successor(prefix, successor_buf).ok_or(PrefixShardError::NoSuccessor)?;
+    let spec = ShardSpecRef::new(prefix, end, metadata);
+    ShardSpec::validate_ref(spec).map_err(PrefixShardError::from)?;
+    Ok(spec)
+}
+
+/// Build a prefix spec then allocate it in [`ShardArena`].
+///
+/// Combines [`shard_spec_from_prefix_ref`] validation with arena allocation.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- prefix fails validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
+pub fn shard_spec_from_prefix_into(
+    arena: &mut ShardArena,
+    prefix: &[u8],
+    metadata: &[u8],
+    successor_buf: &mut KeyBuf,
+) -> Result<ShardSpecHandle, ShardIntoError<PrefixShardError>> {
+    let spec = shard_spec_from_prefix_ref(prefix, metadata, successor_buf)
+        .map_err(ShardIntoError::Build)?;
+    arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
+}
+
+/// Construct a same-manifest [`ShardSpecRef`] from a half-open row range.
+///
+/// Encodes `(manifest_id, start_row)` and `(manifest_id, end_row)` as
+/// [`ManifestRowKey`] boundaries. Returned start/end bounds borrow from
+/// `start_buf` and `end_buf`.
+///
+/// # Errors
+///
+/// Returns [`ShardSpecInputError`] when `start_row >= end_row` (inverted
+/// range) or the encoded keys fail downstream spec validation.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_manifest_range_ref<'a>(
+    manifest_id: u64,
+    start_row: u64,
+    end_row: u64,
+    metadata: &'a [u8],
+    start_buf: &'a mut KeyBuf,
+    end_buf: &'a mut KeyBuf,
+) -> Result<ShardSpecRef<'a>, ShardSpecInputError> {
+    let start = ManifestRowKey::new(manifest_id, start_row);
+    let end = ManifestRowKey::new(manifest_id, end_row);
+    shard_spec_from_keys_ref(&start, &end, metadata, start_buf, end_buf)
+}
+
+/// Build a manifest-range spec then allocate it in [`ShardArena`].
+///
+/// Combines [`shard_spec_from_manifest_range_ref`] validation with arena
+/// allocation.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- row range fails validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
+pub fn shard_spec_from_manifest_range_into(
+    arena: &mut ShardArena,
+    manifest_id: u64,
+    start_row: u64,
+    end_row: u64,
+    metadata: &[u8],
+    start_buf: &mut KeyBuf,
+    end_buf: &mut KeyBuf,
+) -> Result<ShardSpecHandle, ShardIntoError<ShardSpecInputError>> {
+    let spec = shard_spec_from_manifest_range_ref(
+        manifest_id,
+        start_row,
+        end_row,
+        metadata,
+        start_buf,
+        end_buf,
+    )
+    .map_err(ShardIntoError::Build)?;
+    arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
+}
+
+/// Compute the lexicographic successor of a byte prefix.
+///
+/// Returns the smallest byte string strictly greater than `prefix` that also
+/// acts as an exclusive upper bound for *every* key that starts with `prefix`.
+/// Formally, if `Some(succ)` is returned then for every key `k`:
+///
+/// ```text
+/// k.starts_with(prefix)  =>  k < succ
+/// ```
+///
+/// # Algorithm
+///
+/// 1. Find the rightmost byte that is not `0xFF`.
+/// 2. Truncate the prefix to include that byte, discarding the trailing
+///    `0xFF` suffix.
+/// 3. Increment the last remaining byte by one.
+///
+/// Truncation is essential: incrementing the full key without truncating
+/// trailing `0xFF` bytes first would produce a longer string via carry
+/// propagation that is not a tight upper bound (it would leave a gap).
+/// Truncation + increment produces the shortest possible successor.
+///
+/// # Returns `None`
+///
+/// - Empty prefix: no bytes to increment.
+/// - All-`0xFF` prefix: the prefix already covers the top of the keyspace;
+///   there is no byte string that can serve as an exclusive upper bound.
+/// - Prefix length exceeds [`KeyBuf::CAPACITY`].
+///
+/// # Output buffer semantics
+///
+/// The returned slice aliases `buf`; reusing `buf` for another operation
+/// overwrites that output.
+///
+/// # Complexity
+///
+/// `O(prefix.len())` time, no heap allocation.
+///
+/// # Examples
+///
+/// ```text
+/// let mut buf = KeyBuf::new();
+/// prefix_successor(b"abc", &mut buf)     => Some(b"abd")
+/// prefix_successor(b"ab\xff", &mut buf)  => Some(b"ac")      // trailing 0xFF stripped
+/// prefix_successor(b"\xff", &mut buf)    => None              // top of keyspace
+/// prefix_successor(b"", &mut buf)        => None              // nothing to increment
+/// ```
+pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
+    // Delegate to the canonical implementation in gossip-contracts::coordination::cursor.
+    // The block limits the mutable borrow of buf.buf so we can set buf.len afterwards.
+    let result_len = {
+        let scratch: &mut [u8; MAX_KEY_SIZE] = (&mut buf.buf[..MAX_KEY_SIZE]).try_into().unwrap();
+        prefix_successor_into(prefix, scratch)?.len()
+    };
+    buf.len = result_len;
+    Some(buf.as_bytes())
+}
+
+/// Compute a midpoint key in the open interval `(a, b)`.
+///
+/// Designed for split planning to bisect a shard's key range. The caller can
+/// then create two child shards covering `[parent_start, mid)` and
+/// `[mid, parent_end)`.
+///
+/// # Algorithm
+///
+/// The shorter input is right-padded with `0x00` to
+/// `max_len = max(a.len(), b.len())`, then the function executes this exact
+/// sequence:
+///
+/// 1. **Add** padded `a + b` from LSB to MSB with carry, yielding
+///    `max_len` or `max_len + 1` bytes.
+/// 2. **Halve** that sum by long division from MSB to LSB.
+/// 3. **Try overflow-normalized candidate**: when the quotient is
+///    `max_len + 1` bytes and begins with `0x00`, drop exactly that one
+///    leading byte and return it if `a < candidate < b`.
+/// 4. **Try fixed-width candidate**: test the unmodified quotient bytes and
+///    return them if they do not exceed [`MAX_KEY_SIZE`] and `a < candidate < b`.
+/// 5. **Fallback successor**: if both arithmetic candidates fail, compute
+///    `key_successor(a)` and return it only if it remains `< b`.
+///
+/// No other canonicalization is applied (notably, no general leading-zero
+/// trimming).
+///
+/// The successor fallback handles dense lexicographic ranges where the
+/// arithmetic midpoint lands on a boundary, e.g. `[0x01]..[0x02]` returns
+/// `[0x01, 0x00]`.
+///
+/// # Returns `None`
+///
+/// - `a >= b` (precondition violated; includes both-empty inputs).
+/// - Either input exceeds [`MAX_KEY_SIZE`].
+/// - Neither arithmetic candidate is strictly inside `(a, b)`, and
+///   `key_successor(a)` is missing or `>= b`.
+///
+/// # Output buffer semantics
+///
+/// The returned midpoint aliases `out`; subsequent writes to `out` replace it.
+///
+/// # Complexity
+///
+/// `O(max(a.len(), b.len()))` time using stack-resident scratch buffers
+/// (bounded by [`KeyBuf::CAPACITY`]), with no heap allocation.
+pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a [u8]> {
+    if a >= b {
+        return None;
+    }
+
+    let max_len = a.len().max(b.len());
+    if max_len == 0 || max_len > MAX_KEY_SIZE {
+        return None;
+    }
+
+    // Phase 1: Big-endian addition from LSB to MSB with direct positional writes.
+    let mut sum = KeyBuf::new();
+    let mut carry: u16 = 0;
+    for idx in (0..max_len).rev() {
+        let a_byte = if idx < a.len() { u16::from(a[idx]) } else { 0 };
+        let b_byte = if idx < b.len() { u16::from(b[idx]) } else { 0 };
+        let total = a_byte + b_byte + carry;
+        sum.buf[idx + 1] = (total & 0xFF) as u8;
+        carry = total >> 8;
+    }
+    sum.buf[0] = carry as u8;
+    sum.len = max_len + 1;
+
+    // Phase 2: Divide by 2 from MSB to LSB.
+    let mut remainder: u16 = 0;
+    for idx in 0..sum.len {
+        let value = (remainder << 8) | u16::from(sum.buf[idx]);
+        sum.buf[idx] = (value / 2) as u8;
+        remainder = value % 2;
+    }
+
+    // Phase 3: Validate arithmetic candidates.
+    if sum.len == max_len + 1 && sum.buf[0] == 0 {
+        let normalized = &sum.buf[1..sum.len];
+        if normalized > a && normalized < b {
+            out.copy_from_slice(normalized);
+            return Some(out.as_bytes());
+        }
+    }
+
+    let arithmetic = &sum.buf[..sum.len];
+    if arithmetic.len() <= MAX_KEY_SIZE && arithmetic > a && arithmetic < b {
+        out.copy_from_slice(arithmetic);
+        return Some(out.as_bytes());
+    }
+
+    // Phase 4: If neither arithmetic candidate is interior, use the minimal
+    // strict successor of `a`.
+    let mut successor_buf = KeyBuf::new();
+    let successor = key_successor(a, &mut successor_buf)?;
+    if successor < b {
+        out.copy_from_slice(successor);
+        return Some(out.as_bytes());
+    }
+
+    None
+}
+
+/// Compute the smallest representable key that is strictly greater than `key`.
+///
+/// This primitive derives an exclusive
+/// end-bound from an inclusive key, subject to the system-wide key size
+/// limit ([`MAX_KEY_SIZE`] = 4 KiB).
+///
+/// # Strategy
+///
+/// | Condition | Action | Rationale |
+/// |---|---|---|
+/// | `key.len() < MAX_KEY_SIZE` | Append `0x00` | Minimal extension: `key` is a proper prefix of `key \|\| [0x00]`, so it sorts immediately after `key` but before any other extension sharing the same prefix. |
+/// | `key.len() == MAX_KEY_SIZE` | Delegate to [`prefix_successor`] | Cannot grow; must increment in place. |
+/// | `key.len() > MAX_KEY_SIZE` | Return `None` | Key already violates the size ceiling. |
+///
+/// Appending `0x00` is preferred over incrementing because it never fails
+/// (any byte string can be extended with a zero byte), whereas incrementing
+/// fails for the all-`0xFF` case.
+///
+/// # Returns `None`
+///
+/// - Key exceeds `MAX_KEY_SIZE`.
+/// - Key is exactly `MAX_KEY_SIZE` bytes and all bytes are `0xFF` (no
+///   successor exists within the representable keyspace).
+///
+/// # Output buffer semantics
+///
+/// The returned slice aliases `buf`; reusing `buf` overwrites that output.
+///
+/// # Complexity
+///
+/// `O(key.len())` time, no heap allocation.
+pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
+    // Delegate to the canonical implementation in gossip-contracts::coordination::cursor.
+    // The block limits the mutable borrow of buf.buf so we can set buf.len afterwards.
+    let result_len = {
+        let scratch: &mut [u8; MAX_KEY_SIZE] = (&mut buf.buf[..MAX_KEY_SIZE]).try_into().unwrap();
+        key_successor_into(key, scratch)?.len()
+    };
+    buf.len = result_len;
+    Some(buf.as_bytes())
+}
+
+/// Error for invalid prefix-based shard operations.
+///
+/// Models failures when converting a user-supplied byte prefix into a valid
+/// `[prefix, prefix_successor)` key range for shard construction. Each variant
+/// represents a distinct failure mode, ordered roughly from cheapest to most
+/// expensive to detect:
+///
+/// 1. [`EmptyPrefix`](Self::EmptyPrefix) -- trivially invalid.
+/// 2. [`PrefixTooLarge`](Self::PrefixTooLarge) -- violates the system key-size ceiling.
+/// 3. [`NoSuccessor`](Self::NoSuccessor) -- the prefix is valid but has no
+///    lexicographic successor (all `0xFF`), so the half-open range cannot be
+///    bounded.
+/// 4. [`InvalidShardSpec`](Self::InvalidShardSpec) -- the derived range failed
+///    downstream validation in [`ShardSpec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PrefixShardError {
+    /// Prefix cannot be empty for prefix-only shard operations.
+    EmptyPrefix,
+    /// Prefix exceeds the shard-key size ceiling ([`MAX_KEY_SIZE`]).
+    PrefixTooLarge {
+        /// Actual prefix size in bytes.
+        size: usize,
+        /// Maximum allowed key size in bytes.
+        max: usize,
+    },
+    /// Prefix has no lexicographic successor (all bytes are `0xFF`), so the
+    /// exclusive end-bound of the half-open range cannot be computed.
+    NoSuccessor,
+    /// The derived key range passed local validation but failed downstream
+    /// [`ShardSpec`] construction.
+    InvalidShardSpec(ShardSpecInputError),
+}
+
+impl fmt::Display for PrefixShardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPrefix => write!(f, "prefix shard requires a non-empty prefix"),
+            Self::PrefixTooLarge { size, max } => {
+                write!(f, "prefix too large ({size} bytes, max {max})")
+            }
+            Self::NoSuccessor => {
+                write!(
+                    f,
+                    "prefix has no lexicographic successor (all bytes are 0xFF)"
+                )
+            }
+            Self::InvalidShardSpec(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for PrefixShardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidShardSpec(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ShardSpecInputError> for PrefixShardError {
+    fn from(value: ShardSpecInputError) -> Self {
+        Self::InvalidShardSpec(value)
+    }
+}
+
+#[cfg(test)]
+#[path = "key_encoding_tests.rs"]
+mod tests;

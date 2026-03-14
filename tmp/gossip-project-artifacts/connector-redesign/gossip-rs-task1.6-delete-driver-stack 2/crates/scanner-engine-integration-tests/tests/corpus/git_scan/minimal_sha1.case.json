@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "scanner_pkg_version": "dev",
+  "git_commit": null,
+  "target": "local",
+  "scenario_seed": 1,
+  "schedule_seed": 7,
+  "run_config": {
+    "workers": 1,
+    "max_steps": 0,
+    "stability_runs": 1,
+    "trace_capacity": 128
+  },
+  "scenario": {
+    "schema_version": 1,
+    "repo": {
+      "object_format": "Sha1",
+      "refs": [
+        {
+          "name": [
+            114, 101, 102, 115, 47, 104, 101, 97, 100, 115, 47, 109, 97, 105, 110
+          ],
+          "tip": {
+            "bytes": [
+              1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+              1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+            ]
+          },
+          "watermark": null
+        }
+      ],
+      "commits": [
+        {
+          "oid": {
+            "bytes": [
+              1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+              1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+            ]
+          },
+          "parents": [],
+          "tree": {
+            "bytes": [
+              2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+              2, 2, 2, 2, 2, 2, 2, 2, 2, 2
+            ]
+          },
+          "generation": 1
+        }
+      ],
+      "trees": [
+        {
+          "oid": {
+            "bytes": [
+              2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+              2, 2, 2, 2, 2, 2, 2, 2, 2, 2
+            ]
+          },
+          "entries": [
+            {
+              "name": [102, 105, 108, 101, 46, 116, 120, 116],
+              "mode": 33188,
+              "oid": {
+                "bytes": [
+                  3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+                  3, 3, 3, 3, 3, 3, 3, 3, 3, 3
+                ]
+              },
+              "kind": "Blob"
+            }
+          ]
+        }
+      ],
+      "blobs": [
+        {
+          "oid": {
+            "bytes": [
+              3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+              3, 3, 3, 3, 3, 3, 3, 3, 3, 3
+            ]
+          },
+          "bytes": [104, 101, 108, 108, 111]
+        }
+      ]
+    },
+    "artifacts": null
+  },
+  "fault_plan": {
+    "resources": []
+  },
+  "failure": {
+    "kind": "OracleMismatch",
+    "message": "corpus",
+    "step": 0
+  },
+  "trace": {
+    "ring": [
+      {"Decision": {"code": 65536}},
+      {"StageEnter": {"stage_id": 1}},
+      {"StageExit": {"stage_id": 1, "items": 1}},
+      {"Decision": {"code": 65536}},
+      {"StageEnter": {"stage_id": 2}},
+      {"StageExit": {"stage_id": 2, "items": 1}},
+      {"Decision": {"code": 65536}},
+      {"StageEnter": {"stage_id": 3}},
+      {"StageExit": {"stage_id": 3, "items": 1}},
+      {"Decision": {"code": 65536}},
+      {"StageEnter": {"stage_id": 4}},
+      {"StageExit": {"stage_id": 4, "items": 1}},
+      {"Decision": {"code": 65536}},
+      {"StageEnter": {"stage_id": 5}},
+      {"StageExit": {"stage_id": 5, "items": 0}}
+    ],
+    "full": null
+  }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "scanner-git-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
+scanner-git = { path = ".." }
+tempfile = "3"
+
+[[bin]]
+name = "fuzz_pack_exec"
+path = "fuzz_targets/fuzz_pack_exec.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pack_inflate_stream"
+path = "fuzz_targets/fuzz_pack_inflate_stream.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pack_parse_delta"
+path = "fuzz_targets/fuzz_pack_parse_delta.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pack_delta_into"
+path = "fuzz_targets/fuzz_pack_delta_into.rs"
+doc = false
+
+[workspace]

@@ -1,0 +1,8 @@
+{
+  "_fixture_note": "Synthetic Docker config with base64 auth payload.",
+  "auths": {
+    "registry.example.com": {
+      "auth": "dXNlcjpnaHBfMDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6"
+    }
+  }
+}

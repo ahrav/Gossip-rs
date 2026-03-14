@@ -1,0 +1,17 @@
+[package]
+name = "gossip-frontier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Shard algebra: key encoding, hints, and builder for gossip-rs"
+
+[dependencies]
+gossip-contracts.workspace = true
+gossip-stdx.workspace = true
+
+[dev-dependencies]
+gossip-contracts = { workspace = true, features = ["test-support"] }
+proptest = "1.10"
+rstest = "0.25"

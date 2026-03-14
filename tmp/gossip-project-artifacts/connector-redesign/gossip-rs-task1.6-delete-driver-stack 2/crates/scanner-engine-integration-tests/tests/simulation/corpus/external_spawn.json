@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "seed": 246,
+  "case": {
+    "exec_cfg": {
+      "workers": 1,
+      "steal_tries": 2,
+      "seed": 246,
+      "wake_on_hoard_threshold": 32
+    },
+    "resources": [],
+    "programs": [
+      {
+        "name": "external_spawn_root",
+        "code": [
+          {
+            "Spawn": {
+              "program": 1,
+              "placement": "External"
+            }
+          }
+        ]
+      },
+      {
+        "name": "external_spawn_child",
+        "code": [
+          "Complete"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "tid": 0,
+        "program": 0,
+        "pc": 0
+      }
+    ],
+    "initial_runnable": [
+      0
+    ],
+    "external_events": [],
+    "max_steps": 20
+  },
+  "driver_choices": [],
+  "expected_trace_hash": 4328634305663835317,
+  "failure": {
+    "kind": "Timeout",
+    "step": 8,
+    "message": "corpus artifact"
+  }
+}
