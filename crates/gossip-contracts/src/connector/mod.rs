@@ -17,8 +17,8 @@
 //!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
 //!   `ConnectorCapabilities`).
 //! - `common.rs` defines shared paging vocabulary reused across connector
-//!   families ([`PageBuf`], [`PageState`], [`PagingCapabilities`],
-//!   [`KeyedPageItem`], [`validate_filled_page`]).
+//!   families and exposed at [`common`] ([`PageBuf`], [`PageState`],
+//!   [`PagingCapabilities`], [`KeyedPageItem`], [`validate_filled_page`]).
 //! - `ordered.rs` defines the ordered-content family contract
 //!   ([`ordered::OrderedContentCapabilities`],
 //!   [`ordered::OrderedContentSource`]).
@@ -30,9 +30,16 @@
 //!   [`git::GitRepoDiscoverySource`],
 //!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]).
 //!
-//! `api.rs`, `common.rs`, and `types.rs` remain internal organization units;
-//! their public items are re-exported here so runtime crates keep a single
-//! import boundary while family-specific contracts stay namespaced.
+//! `api.rs` and `types.rs` remain internal organization units; their public
+//! items are re-exported here so runtime crates keep a single import boundary
+//! for shared nouns and error taxonomy. [`common`] is public because the paging
+//! vocabulary is reused across families, while the family contracts stay
+//! namespaced under [`ordered`] and [`git`].
+//!
+//! Family modules compose from the shared layers instead of inheriting a
+//! single universal connector model: [`ordered`] and [`git`] depend on
+//! [`common`], `types.rs`, and `api.rs` for paging, value wrappers, and error
+//! classification.
 //!
 //! ## Invariants
 //!
@@ -83,7 +90,7 @@
 //! policy) live in runtime crates.
 
 mod api;
-mod common;
+pub mod common;
 pub mod git;
 pub mod ordered;
 mod types;
