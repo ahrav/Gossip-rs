@@ -1456,14 +1456,14 @@ fn terminate_run_generator_targets_multiple_runs() {
     );
 }
 
-/// The second admin op after `with_workers_and_shards` must not collide
-/// with the hard-coded `OpId::from_raw(1)` used by `register_shards`.
+/// Admin op-IDs allocated by `next_admin_op_id()` must not collide with
+/// the op-ID that `with_workers_and_shards` uses for `register_shards`.
 ///
-/// `admin_next_op` starts at 0 and is not advanced by
-/// `with_workers_and_shards`, so the sequence is:
-///   0 (first admin) → 1 (second admin).
-/// If `register_shards` also used raw 1, the second admin op on the same
-/// run hits `OpIdConflict` in the run-level op-log.
+/// `with_workers_and_shards` consumes one admin op-ID for the initial
+/// `register_shards` call, so subsequent admin operations (unpark,
+/// run-terminal) must receive distinct IDs from the same partition.
+/// A regression (e.g. reverting to a hardcoded literal) would cause the
+/// second admin op on the same run to hit `OpIdConflict`.
 #[test]
 fn second_admin_op_does_not_collide_with_topology_seeding() {
     let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
