@@ -307,15 +307,12 @@ pub struct StoredObservationRow {
 /// tests.
 pub struct FindingsFixture {
     pub tenant_id: TenantId,
-    pub stable_item_id: StableItemId,
-    pub rule_fingerprint: RuleFingerprint,
     pub tenant_secret_key: TenantSecretKey,
     pub norm_hash: NormHash,
     pub raw_secret: Vec<u8>,
     pub unsafe_context: String,
     pub safe_location_display: String,
     pub safe_location_url: String,
-    pub object_version_id: ObjectVersionId,
     pub ovid_hash: OvidHash,
     pub finding: FindingRecord,
     pub occurrence: OccurrenceRecord,
@@ -419,15 +416,12 @@ pub fn sample_fixture(seed: u8) -> FindingsFixture {
 
     FindingsFixture {
         tenant_id,
-        stable_item_id,
-        rule_fingerprint,
         tenant_secret_key,
         norm_hash,
         raw_secret,
         unsafe_context,
         safe_location_display,
         safe_location_url,
-        object_version_id,
         ovid_hash,
         finding,
         occurrence,
@@ -465,11 +459,17 @@ fn assert_no_forbidden_bytes(
         if forbidden.is_empty() {
             continue;
         }
+        let matched = actual
+            .windows(forbidden.len())
+            .any(|window| window == forbidden.as_slice());
         assert!(
-            !actual
-                .windows(forbidden.len())
-                .any(|window| window == forbidden),
-            "{table}.{column} stored forbidden bytes"
+            !matched,
+            "{table}.{column} contains forbidden byte sequence \
+             (forbidden[..{}]={:02x?}, actual[..{}]={:02x?})",
+            forbidden.len().min(8),
+            &forbidden[..forbidden.len().min(8)],
+            actual.len().min(16),
+            &actual[..actual.len().min(16)],
         );
     }
 }

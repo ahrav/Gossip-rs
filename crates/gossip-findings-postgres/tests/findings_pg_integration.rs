@@ -1,5 +1,9 @@
-use gossip_contracts::persistence::{
-    CommitHandle, DurableFindingsCounts, FindingsSink, FindingsUpsertBatch,
+use gossip_contracts::{
+    identity::key_secret_hash,
+    persistence::{
+        CommitHandle, DurableFindingsCounts, FindingsSink, FindingsUpsertBatch,
+        conformance::run_findings_conformance,
+    },
 };
 
 mod common;
@@ -15,104 +19,182 @@ use common::{LivePgHarness, sample_fixture};
 /// `GOSSIP_POSTGRES_TEST_URL='host=127.0.0.1 user=postgres password=postgres dbname=postgres'`
 
 #[test]
-fn live_pg_harness_round_trips_fixture_and_inspection_helpers() {
+fn findings_pg_passes_findings_conformance_suite() {
     let mut harness = LivePgHarness::new();
-    assert_eq!(harness.durable_counts(), DurableFindingsCounts::default());
 
+    run_findings_conformance(harness.backend())
+        .unwrap_or_else(|err| panic!("postgres findings conformance failed: {err}"));
+
+    let counts = harness.durable_counts();
+    assert!(
+        counts.findings >= 1,
+        "conformance should persist at least one finding"
+    );
+    assert!(
+        counts.occurrences >= 1,
+        "conformance should persist at least one occurrence"
+    );
+    assert!(
+        counts.observations >= 1,
+        "conformance should persist at least one observation"
+    );
+}
+
+#[test]
+fn same_record_inserted_twice_creates_no_duplicates() {
+    let mut harness = LivePgHarness::new();
+    let backend = harness.backend();
     let fixture = sample_fixture(0x31);
-    assert_eq!(fixture.finding.stable_item_id(), fixture.stable_item_id);
-    assert_eq!(fixture.finding.rule_fingerprint(), fixture.rule_fingerprint);
-    assert_eq!(
-        fixture.occurrence.object_version_id(),
-        fixture.object_version_id
-    );
-    assert_eq!(fixture.observation.ovid_hash(), fixture.ovid_hash);
 
-    let second_policy_observation =
-        fixture.observation_for_policy(0x77, 99_001, 99_002, 99_003, 99_004);
-    assert_eq!(
-        second_policy_observation.occurrence_id(),
-        fixture.occurrence.occurrence_id(),
-    );
-    assert_ne!(
-        second_policy_observation.policy_hash(),
-        fixture.observation.policy_hash(),
-    );
-    assert_ne!(
-        second_policy_observation.observation_id(),
-        fixture.observation.observation_id(),
-    );
-
-    harness
-        .backend()
+    let first_receipt = backend
         .upsert_batch(fixture.batch())
-        .expect("fixture submit should succeed")
+        .expect("first submit should succeed")
         .wait()
-        .expect("fixture durable write should succeed");
+        .expect("first durable write should succeed");
+    let second_receipt = backend
+        .upsert_batch(fixture.batch())
+        .expect("second submit should succeed")
+        .wait()
+        .expect("second durable write should succeed");
+
+    assert_eq!(
+        first_receipt.finding_count(),
+        1,
+        "first receipt should report exactly one finding"
+    );
+    assert_eq!(
+        first_receipt.occurrence_count(),
+        1,
+        "first receipt should report exactly one occurrence"
+    );
+    assert_eq!(
+        first_receipt.observation_count(),
+        1,
+        "first receipt should report exactly one observation"
+    );
+
+    // Receipt counts reflect the deduplicated batch shape (see `build_receipt`),
+    // not net-new rows. An idempotent replay still reports (1, 1, 1).
+    assert_eq!(
+        second_receipt.finding_count(),
+        1,
+        "deduplicated replay should report same finding count"
+    );
+    assert_eq!(
+        second_receipt.occurrence_count(),
+        1,
+        "deduplicated replay should report same occurrence count"
+    );
+    assert_eq!(
+        second_receipt.observation_count(),
+        1,
+        "deduplicated replay should report same observation count"
+    );
 
     assert_eq!(
         harness.durable_counts(),
-        DurableFindingsCounts::new(1, 1, 1)
+        DurableFindingsCounts::new(1, 1, 1),
+        "replaying the same batch must not create duplicate durable rows"
     );
+}
 
-    let rows = harness
-        .observation_rows_for_occurrence(fixture.tenant_id, fixture.occurrence.occurrence_id());
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].observation_id,
-        fixture.observation.observation_id().as_bytes().to_vec(),
-    );
-    assert_eq!(
-        rows[0].policy_hash,
-        fixture.observation.policy_hash().as_bytes().to_vec(),
-    );
-    assert_eq!(
-        rows[0].location_display.as_deref(),
-        Some(fixture.safe_location_display.as_str()),
-    );
-    assert_eq!(
-        rows[0].location_url.as_deref(),
-        Some(fixture.safe_location_url.as_str()),
-    );
+#[test]
+fn two_observations_for_same_occurrence_under_different_policies_both_exist() {
+    let mut harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x41);
 
-    // Persist the second observation (different policy, same occurrence) and
-    // verify the multi-row ordering of observation_rows_for_occurrence.
-    let second_batch =
-        FindingsUpsertBatch::new(&[], &[], std::slice::from_ref(&second_policy_observation));
-    harness
-        .backend()
-        .upsert_batch(second_batch)
-        .expect("second observation submit should succeed")
+    backend
+        .upsert_batch(fixture.batch())
+        .expect("initial submit should succeed")
         .wait()
-        .expect("second observation durable write should succeed");
+        .expect("initial durable write should succeed");
+
+    let second_policy_observation = fixture.observation_for_policy(
+        0x77,
+        99_001,
+        99_002,
+        99_003,
+        fixture.observation.seen_at().as_raw() + 500,
+    );
+
+    // Submit only the new observation — the parent finding and occurrence
+    // already exist from the initial batch. This exercises the code path
+    // where an observation arrives without its parent in the same batch.
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            &[],
+            &[],
+            std::slice::from_ref(&second_policy_observation),
+        ))
+        .expect("second-policy submit should succeed")
+        .wait()
+        .expect("second-policy durable write should succeed");
 
     assert_eq!(
         harness.durable_counts(),
         DurableFindingsCounts::new(1, 1, 2),
+        "same occurrence under different policies must produce two observations but only one finding and one occurrence"
     );
 
     let rows = harness
         .observation_rows_for_occurrence(fixture.tenant_id, fixture.occurrence.occurrence_id());
-    assert_eq!(rows.len(), 2, "both observations should be stored");
-    // policy 0x35 < 0x77 in ascending order.
-    assert_eq!(
-        rows[0].policy_hash,
+    assert_eq!(rows.len(), 2, "two policy-scoped observations should exist");
+
+    let mut policy_hashes: Vec<Vec<u8>> = rows.iter().map(|row| row.policy_hash.clone()).collect();
+    policy_hashes.sort();
+    let mut expected_policies = vec![
         fixture.observation.policy_hash().as_bytes().to_vec(),
-    );
-    assert_eq!(
-        rows[1].policy_hash,
         second_policy_observation.policy_hash().as_bytes().to_vec(),
+    ];
+    expected_policies.sort();
+    assert_eq!(
+        policy_hashes, expected_policies,
+        "both policy hashes should be stored for the same occurrence"
     );
 
+    let mut observation_ids: Vec<Vec<u8>> =
+        rows.iter().map(|row| row.observation_id.clone()).collect();
+    observation_ids.sort();
+    let mut expected_observations = vec![
+        fixture.observation.observation_id().as_bytes().to_vec(),
+        second_policy_observation
+            .observation_id()
+            .as_bytes()
+            .to_vec(),
+    ];
+    expected_observations.sort();
     assert_eq!(
-        harness.finding_secret_hashes(fixture.tenant_id),
-        vec![fixture.finding.secret_hash().as_bytes().to_vec()],
+        observation_ids, expected_observations,
+        "both observation IDs should be stored for the same occurrence"
+    );
+}
+
+#[test]
+fn no_raw_secret_bytes_are_persisted_in_any_inserted_columns() {
+    let mut harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x61);
+
+    backend
+        .upsert_batch(fixture.batch())
+        .expect("submit should succeed")
+        .wait()
+        .expect("durable write should succeed");
+
+    let expected_secret_hash = key_secret_hash(&fixture.tenant_secret_key, &fixture.norm_hash);
+    let stored_secret_hashes = harness.finding_secret_hashes(fixture.tenant_id);
+    assert_eq!(
+        stored_secret_hashes,
+        vec![expected_secret_hash.as_bytes().to_vec()],
+        "the keyed secret hash should be stored exactly once"
     );
 
     // Only 32-byte values go in forbidden_byte_values — they match the width
-    // of binary columns. The 57-byte raw_secret would pass the sliding-window
-    // check vacuously (windows(57) on a 32-byte column is empty). Its exposure
-    // is caught by the forbidden_text_fragments check below instead.
+    // of binary columns. The variable-length raw_secret passes the
+    // sliding-window check vacuously (windows(N) on a shorter column is
+    // empty). Raw-secret exposure is caught by the forbidden_text_fragments
+    // check below instead.
     harness.assert_no_forbidden_material(
         fixture.tenant_id,
         &[
@@ -124,5 +206,23 @@ fn live_pg_harness_round_trips_fixture_and_inspection_helpers() {
                 .expect("fixture raw secret must be valid utf-8"),
             fixture.unsafe_context.as_str(),
         ],
+    );
+
+    let stored_observations = harness
+        .observation_rows_for_occurrence(fixture.tenant_id, fixture.occurrence.occurrence_id());
+    assert_eq!(
+        stored_observations.len(),
+        1,
+        "exactly one observation should be stored"
+    );
+    assert_eq!(
+        stored_observations[0].location_display.as_deref(),
+        Some(fixture.safe_location_display.as_str()),
+        "only the safe display location should be stored"
+    );
+    assert_eq!(
+        stored_observations[0].location_url.as_deref(),
+        Some(fixture.safe_location_url.as_str()),
+        "only the safe location URL should be stored"
     );
 }
