@@ -14,14 +14,13 @@ use common::{LivePgHarness, sample_fixture};
 
 /// Run these live integration tests with:
 ///
-/// `cargo test -p gossip-findings-postgres --features test-utils -- --ignored`
+/// `cargo test -p gossip-findings-postgres --features test-utils --test findings_pg_integration`
 ///
 /// Optionally point them at a different Postgres instance with:
 ///
 /// `GOSSIP_POSTGRES_TEST_URL='host=127.0.0.1 user=postgres password=postgres dbname=postgres'`
 
 #[test]
-#[ignore = "requires a live Postgres instance"]
 fn findings_pg_passes_findings_conformance_suite() {
     let mut harness = LivePgHarness::new();
 
@@ -44,7 +43,6 @@ fn findings_pg_passes_findings_conformance_suite() {
 }
 
 #[test]
-#[ignore = "requires a live Postgres instance"]
 fn same_record_inserted_twice_creates_no_duplicates() {
     let mut harness = LivePgHarness::new();
     let backend = harness.backend();
@@ -65,7 +63,8 @@ fn same_record_inserted_twice_creates_no_duplicates() {
     assert_eq!(first_receipt.occurrence_count(), 1);
     assert_eq!(first_receipt.observation_count(), 1);
 
-    // Receipt counts acknowledge the deduplicated batch shape, not net-new rows.
+    // Receipt counts reflect the deduplicated batch shape (see `build_receipt`),
+    // not net-new rows. An idempotent replay still reports (1, 1, 1).
     assert_eq!(second_receipt.finding_count(), 1);
     assert_eq!(second_receipt.occurrence_count(), 1);
     assert_eq!(second_receipt.observation_count(), 1);
@@ -78,7 +77,6 @@ fn same_record_inserted_twice_creates_no_duplicates() {
 }
 
 #[test]
-#[ignore = "requires a live Postgres instance"]
 fn two_observations_for_same_occurrence_under_different_policies_both_exist() {
     let mut harness = LivePgHarness::new();
     let backend = harness.backend();
@@ -97,15 +95,15 @@ fn two_observations_for_same_occurrence_under_different_policies_both_exist() {
         99_003,
         fixture.observation.seen_at().as_raw() + 500,
     );
-    let findings = [fixture.finding.clone()];
-    let occurrences = [fixture.occurrence.clone()];
-    let observations = [second_policy_observation.clone()];
 
+    // Submit only the new observation — the parent finding and occurrence
+    // already exist from the initial batch. This exercises the code path
+    // where an observation arrives without its parent in the same batch.
     backend
         .upsert_batch(FindingsUpsertBatch::new(
-            &findings,
-            &occurrences,
-            &observations,
+            &[],
+            &[],
+            std::slice::from_ref(&second_policy_observation),
         ))
         .expect("second-policy submit should succeed")
         .wait()
@@ -141,7 +139,6 @@ fn two_observations_for_same_occurrence_under_different_policies_both_exist() {
 }
 
 #[test]
-#[ignore = "requires a live Postgres instance"]
 fn no_raw_secret_bytes_are_persisted_in_any_inserted_columns() {
     let mut harness = LivePgHarness::new();
     let backend = harness.backend();
@@ -161,10 +158,14 @@ fn no_raw_secret_bytes_are_persisted_in_any_inserted_columns() {
         "the keyed secret hash should be stored exactly once"
     );
 
+    // Only 32-byte values go in forbidden_byte_values — they match the width
+    // of binary columns. The variable-length raw_secret passes the
+    // sliding-window check vacuously (windows(N) on a shorter column is
+    // empty). Raw-secret exposure is caught by the forbidden_text_fragments
+    // check below instead.
     harness.assert_no_forbidden_material(
         fixture.tenant_id,
         &[
-            fixture.raw_secret.clone(),
             fixture.norm_hash.as_bytes().to_vec(),
             fixture.tenant_secret_key.as_bytes().to_vec(),
         ],
