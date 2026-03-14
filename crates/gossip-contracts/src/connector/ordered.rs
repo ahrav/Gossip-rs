@@ -157,4 +157,32 @@ mod tests {
         fn assert_object_safe(_: &dyn OrderedContentSource) {}
         let _ = assert_object_safe;
     }
+
+    #[test]
+    fn default_choose_split_point_returns_none() {
+        let shard = ShardSpec::unbounded();
+        let cursor = Cursor::initial();
+        let budgets = Budgets::try_new(1, 1, None).unwrap();
+        let mut src = StubSource;
+        assert_eq!(
+            src.choose_split_point(&shard, &cursor, budgets).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn default_read_range_returns_unsupported() {
+        let item_ref = ItemRef::try_from_vec(vec![1]).unwrap();
+        let budgets = Budgets::try_new(1, 1, None).unwrap();
+        let mut src = StubSource;
+        let err = src
+            .read_range(&item_ref, 0, &mut [0u8; 4], budgets)
+            .unwrap_err();
+        assert!(!err.is_retryable());
+        assert!(
+            err.message().contains("range_read"),
+            "expected 'range_read' in message, got: {}",
+            err.message()
+        );
+    }
 }

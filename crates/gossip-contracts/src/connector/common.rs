@@ -125,6 +125,8 @@ impl<'a, T> IntoIterator for &'a PageBuf<T> {
     }
 }
 
+/// Owned iteration consumes the items and discards the [`PageState`].
+/// Use [`PageBuf::into_parts`] when both items and completion state are needed.
 impl<T> IntoIterator for PageBuf<T> {
     type Item = T;
     type IntoIter = std::vec::IntoIter<T>;
