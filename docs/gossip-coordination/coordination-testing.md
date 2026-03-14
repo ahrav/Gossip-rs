@@ -29,7 +29,7 @@ shard-limit rejection paths, derived-ID collision handling, and deterministic
 split-atomicity aborts via test-only owner-drop fault injection. The binary
 codec (`codec.rs`) has dedicated round-trip fuzz targets and proptest coverage
 for `ShardRecord` serialization in `codec_tests.rs`. Deterministic simulator
-tests now also cover the in-process etcd path via `SimulatedEtcdKV` and
+tests cover the in-process etcd path via `SimulatedEtcdKV` and
 `SimEtcdCoordinator`, including compare-miss contention, uncertain commits,
 lease-expiry races, and retry-exhaustion bursts. The ignored local-etcd tests
 remain the coverage layer for live gRPC transport and real-member integration.

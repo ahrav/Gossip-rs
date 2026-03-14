@@ -25,12 +25,13 @@
 //!   revision increment. CAS correctness is unaffected (no interleaving
 //!   within `expire_due_leases`), but revision numbers will be inflated
 //!   relative to production.
-//! - **Injected faults** — four fault types (CAS compare miss, uncertain
-//!   commit, lease-TTL race, retry-exhaustion burst) simulate failure
-//!   modes that occur organically only with concurrent writers or network
-//!   partitions. The single-threaded simulator cannot produce these
-//!   naturally, so they are injected probabilistically via
-//!   [`SimEtcdFaultConfig`].
+//! - **Injected faults** — four structural fault types (CAS compare miss,
+//!   uncertain commit, lease-TTL race, retry-exhaustion burst) simulate
+//!   failure modes that occur organically only with concurrent writers or
+//!   network partitions. The five per-operation transport faults (get, txn,
+//!   lease-grant, keep-alive, revoke) layer on top. The single-threaded
+//!   simulator cannot produce these naturally, so they are injected
+//!   probabilistically via [`SimEtcdFaultConfig`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -63,9 +64,12 @@ pub struct SimulatedEtcdKV {
     next_expiry: u64,
     fault_config: SimEtcdFaultConfig,
     /// Active sustained-contention burst for one logical CAS request.
+    /// See `recent_retry_exhaustion` for the cooldown state that follows.
     active_retry_exhaustion: Option<ActiveRetryExhaustion>,
     /// Suppresses immediate re-arming after a forced retry-exhaustion burst.
-    /// Cleared once a different txn fingerprint arrives.
+    /// Cleared once a different txn fingerprint arrives. Together with
+    /// `active_retry_exhaustion`, forms a three-state machine:
+    /// Idle → Armed (remaining > 0) → Cooldown (this field set).
     recent_retry_exhaustion: Option<u64>,
     rng: ChaCha8Rng,
 }
@@ -430,11 +434,12 @@ impl SimulatedEtcdKV {
         self.expire_due_leases();
     }
 
-    /// Advance the clock by one tick and expire any newly-due leases.
+    /// Advance the clock by one tick and run the full lease-expiry sweep.
     ///
-    /// Only leases within one tick of expiry are affected. Firings where
-    /// no lease is near its deadline are benign no-ops that preserve
-    /// clock monotonicity without mutating KV state.
+    /// Simulates a scenario where a lease expires between the caller's read
+    /// and the CAS evaluation. Firings where no lease is due at the new
+    /// time are benign no-ops that preserve clock monotonicity without
+    /// mutating KV state.
     fn maybe_inject_lease_ttl_race(&mut self) {
         if !self.fault_config.should_lease_ttl_race(&mut self.rng) {
             return;
@@ -983,8 +988,8 @@ impl SimEtcdFaultConfig {
     /// Progressive etcd-layer faults for the given simulation severity.
     ///
     /// The retry-exhaustion window defaults to the coordinator's standard
-    /// optimistic retry budget (8 attempts). Callers using a custom retry
-    /// budget should override it with [`with_retry_exhaustion_attempts`](Self::with_retry_exhaustion_attempts).
+    /// optimistic retry budget. Callers using a custom retry budget should
+    /// override it with [`with_retry_exhaustion_attempts`](Self::with_retry_exhaustion_attempts).
     #[must_use]
     pub fn for_level(level: FaultLevel) -> Self {
         match level {
@@ -1065,9 +1070,16 @@ impl SimEtcdFaultConfig {
     }
 
     /// Override the sustained CAS-contention rate used to exhaust retries.
+    ///
+    /// When `ppm > 0` and no explicit attempt count has been set,
+    /// auto-defaults to the coordinator's standard optimistic retry budget
+    /// so the fault is never silently disabled.
     #[must_use]
     pub fn with_retry_exhaustion_ppm(mut self, ppm: u32) -> Self {
         self.retry_exhaustion_ppm = validate_ppm(ppm);
+        if ppm > 0 && self.retry_exhaustion_attempts == 0 {
+            self.retry_exhaustion_attempts = DEFAULT_OPTIMISTIC_TXN_RETRIES;
+        }
         self
     }
 
@@ -2357,6 +2369,56 @@ mod tests {
         );
     }
 
+    /// With `attempts=1` and 100% ppm, a CAS txn enters cooldown
+    /// immediately. Cooldown suppresses re-arming for the same fingerprint.
+    /// When a *different* txn arrives, it clears the cooldown, allowing
+    /// the original fingerprint to be re-armed on its next appearance.
+    #[test]
+    fn retry_exhaustion_cooldown_cleared_by_different_txn() {
+        let fault = SimEtcdFaultConfig::default()
+            .with_retry_exhaustion_ppm(1_000_000) // 100% arm rate
+            .with_retry_exhaustion_attempts(1); // immediate cooldown
+
+        let alpha_txn = || {
+            Txn::new()
+                .when(vec![Compare::create_revision(
+                    b"alpha".as_slice(),
+                    CompareOp::Equal,
+                    0,
+                )])
+                .and_then(vec![TxnOp::put(b"alpha", b"v", None)])
+        };
+
+        // Control: without intervention, cooldown protects the same fingerprint.
+        let mut kv = SimulatedEtcdKV::with_fault_config(300, fault.clone());
+        let resp = kv.txn(alpha_txn()).expect("txn should return response");
+        assert!(!resp.succeeded(), "alpha should fail (burst armed)");
+        let resp = kv.txn(alpha_txn()).expect("txn should return response");
+        assert!(
+            resp.succeeded(),
+            "alpha should succeed — cooldown suppresses re-arming"
+        );
+
+        // Test: a different txn clears the cooldown, allowing re-arming.
+        let mut kv = SimulatedEtcdKV::with_fault_config(300, fault);
+        let resp = kv.txn(alpha_txn()).expect("txn should return response");
+        assert!(!resp.succeeded(), "alpha should fail (burst armed)");
+
+        // Plain put (different fingerprint) clears the cooldown.
+        let beta = Txn::new()
+            .when(Vec::new())
+            .and_then(vec![TxnOp::put(b"beta", b"v", None)]);
+        let resp = kv.txn(beta).expect("txn should return response");
+        assert!(resp.succeeded(), "plain put should always succeed");
+
+        // Alpha now fails again — cooldown was cleared, fresh burst armed.
+        let resp = kv.txn(alpha_txn()).expect("txn should return response");
+        assert!(
+            !resp.succeeded(),
+            "alpha should fail — cooldown cleared by different txn, fresh burst armed"
+        );
+    }
+
     // ---- Property-based tests ----
 
     mod proptests {
@@ -2366,10 +2428,23 @@ mod tests {
         /// Generates a random KV operation sequence.
         #[derive(Debug, Clone)]
         enum KvOp {
-            Put { key: Vec<u8>, value: Vec<u8> },
-            Delete { key: Vec<u8> },
-            Get { key: Vec<u8> },
+            Put {
+                key: Vec<u8>,
+                value: Vec<u8>,
+            },
+            Delete {
+                key: Vec<u8>,
+            },
+            Get {
+                key: Vec<u8>,
+            },
             Tick(u64),
+            /// Create-if-absent CAS transaction — exercises `cas_compare_failure`
+            /// and `retry_exhaustion` fault paths that plain puts cannot reach.
+            CasPut {
+                key: Vec<u8>,
+                value: Vec<u8>,
+            },
         }
 
         fn arb_key() -> impl Strategy<Value = Vec<u8>> {
@@ -2386,6 +2461,7 @@ mod tests {
                 2 => arb_key().prop_map(|key| KvOp::Delete { key }),
                 2 => arb_key().prop_map(|key| KvOp::Get { key }),
                 1 => (1u64..=5).prop_map(KvOp::Tick),
+                2 => (arb_key(), arb_value()).prop_map(|(key, value)| KvOp::CasPut { key, value }),
             ]
         }
 
@@ -2461,6 +2537,16 @@ mod tests {
                                 prev_rev = rev;
                             }
                         }
+                        KvOp::CasPut { key, value } => {
+                            let txn = Txn::new()
+                                .when(vec![Compare::create_revision(key.clone(), CompareOp::Equal, 0)])
+                                .and_then(vec![TxnOp::put(key, value, None)]);
+                            if let Ok(resp) = kv.txn(txn) {
+                                let rev = resp.header().unwrap().revision();
+                                prop_assert!(rev >= prev_rev, "revision went backwards: {} -> {}", prev_rev, rev);
+                                prev_rev = rev;
+                            }
+                        }
                         KvOp::Tick(dt) => {
                             kv.tick(dt);
                         }
@@ -2495,6 +2581,13 @@ mod tests {
                             );
                         }
                         KvOp::Get { .. } => {}
+                        KvOp::CasPut { key, value } => {
+                            let _ = kv.txn(
+                                Txn::new()
+                                    .when(vec![Compare::create_revision(key.clone(), CompareOp::Equal, 0)])
+                                    .and_then(vec![TxnOp::put(key, value, None)]),
+                            );
+                        }
                         KvOp::Tick(dt) => { kv.tick(dt); }
                     }
                 }

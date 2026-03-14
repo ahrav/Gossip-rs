@@ -1334,7 +1334,7 @@ mod tests {
         );
     }
 
-    // ---- Lease expiry correctness (F4) ----
+    // ---- Lease expiry correctness ----
 
     #[test]
     fn lease_expiry_rejects_checkpoint() {
