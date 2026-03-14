@@ -233,10 +233,14 @@ manual-release operations while the invariant checker validates every step.
 
 - `done_ledger_sim_sunny_day` is the fast single-seed sanity check.
 - `done_ledger_sim_stormy_sweep` runs 100 seeds x 500 ops and asserts zero
-  violations, full event-kind coverage, and a sub-10-second runtime budget.
+  violations and full event-kind coverage.
 - `done_ledger_sim_swizzle_clog_sweep` submits overlapping delayed batches,
   releases them in PRNG-shuffled order, injects commit failures on a subset,
   and checks that the oracle still converges with the ledger.
+- `done_ledger_sim_swizzle_clog_stormy_sweep` runs the same swizzle-clog
+  workload under `Stormy` fault level (background submit and commit failures).
+- `done_ledger_sim_radioactive_smoke` is a small always-on smoke test (5 seeds)
+  for the `Radioactive` fault level, catching regressions without CI cost.
 - `done_ledger_sim_radioactive` is an ignored 50-seed stress sweep for the
   highest fault tier.
 - `prop_done_ledger_state_machine` generates shrinkable `DoneLedgerSimOp`

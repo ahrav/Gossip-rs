@@ -216,7 +216,7 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `16-cursor-resume-strategy.md`       | `crates/gossip-contracts/src/connector/types.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`                                                                                        |
 | `17-filesystem-walk-state-machine.md`| `crates/gossip-connectors/src/filesystem.rs` (WalkState, WalkFrame, WalkToken, should_skip_subtree)                                                                                                                             |
 | `18-streaming-split-estimation.md`   | `crates/gossip-connectors/src/split_estimator.rs`, `common.rs`; `crates/gossip-contracts/src/connector/api.rs` (choose_split_point)                                                                                             |
-| `19-persistence-contracts.md`        | `crates/gossip-contracts/src/persistence/commit.rs`, `findings.rs`, `done_ledger.rs`, `ovid.rs`, `page_commit.rs`, `error.rs`, `conformance.rs`; `crates/gossip-persistence-inmemory/src/`                                      |
+| `19-persistence-contracts.md`        | `crates/gossip-contracts/src/persistence/commit.rs`, `findings.rs`, `done_ledger.rs`, `ovid.rs`, `page_commit.rs`, `error.rs`, `conformance.rs`; `crates/gossip-persistence-inmemory/src/`; `crates/gossip-pg-common/src/`; `crates/gossip-done-ledger-postgres/src/`; `crates/gossip-findings-postgres/src/` |
 | `20-etcd-coordinator-persistence.md` | `crates/gossip-coordination-etcd/src/backend.rs`, `keyspace.rs`, `codec.rs`, `config.rs`, `error.rs`; `crates/gossip-coordination/src/traits.rs`, `in_memory.rs`                                                                |
 | `21-findings-postgres-dedup.md`      | `crates/gossip-findings-postgres/src/backend.rs`, `schema.rs`; `crates/gossip-contracts/src/persistence/findings.rs`; `crates/gossip-persistence-inmemory/src/findings.rs`                                                       |
 
@@ -235,6 +235,8 @@ The diagrams reference source code in the main [gossip-rs](https://github.com/ah
 | `gossip-contracts`    | `crates/gossip-contracts/src/persistence/`  | B5: Persistence                                                                                                       |
 | `gossip-coordination-etcd` | `crates/gossip-coordination-etcd/`     | B2: Coordination (etcd backend)                                                                                       |
 | `gossip-persistence-inmemory` | `crates/gossip-persistence-inmemory/` | B5: Persistence (in-memory backend)                                                                                  |
+| `gossip-pg-common`         | `crates/gossip-pg-common/`             | B5: Persistence (shared PostgreSQL primitives)                                                                        |
+| `gossip-done-ledger-postgres` | `crates/gossip-done-ledger-postgres/` | B5: Persistence (done-ledger PostgreSQL backend)                                                                    |
 | `gossip-findings-postgres` | `crates/gossip-findings-postgres/`     | B5: Persistence (findings PostgreSQL backend)                                                                         |
 
 ## Rendering
