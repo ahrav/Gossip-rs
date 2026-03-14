@@ -56,7 +56,7 @@ graph TB
 
         DL["DoneLedger<br/>type Error<br/>type CommitHandle<br/>fn batch_get(tenant, policy, &amp;[OvidHash]) → Vec&lt;Option&lt;Record&gt;&gt;<br/>fn batch_upsert(&amp;[DoneLedgerRecord]) → CommitHandle"]
         FS["FindingsSink<br/>type Error<br/>type CommitHandle<br/>fn upsert_batch(FindingsUpsertBatch) → CommitHandle"]
-        FCP["FindingsConformanceProbe (test-only)<br/>fn durable_counts() → DurableFindingsCounts"]
+        FCP["FindingsConformanceProbe (conformance-only)<br/>type Error<br/>fn durable_counts() → Result&lt;DurableFindingsCounts, Error&gt;"]
 
         CONF["run_conformance()<br/>Done-ledger checks (4)<br/>Findings checks (4)<br/>Redaction checks (3)"]
 
@@ -112,7 +112,7 @@ The trait hierarchy summarized:
 | `ReadyCommitHandle<R, E>` | Sync adapter wrapping `Result<R, E>` | (implements `CommitHandle`) |
 | `DoneLedger` | Deduplication store | `Error`, `CommitHandle` (receipt = `DoneLedgerCommitReceipt`) |
 | `FindingsSink` | Findings persistence | `Error`, `CommitHandle` (receipt = `FindingsCommitReceipt`) |
-| `FindingsConformanceProbe` | Test-only read surface | `Error` |
+| `FindingsConformanceProbe` | Conformance-only read surface (pub, not referenced by production code paths) | `Error` |
 
 ### Conformance harness
 
@@ -152,7 +152,7 @@ graph TB
     end
 
     subgraph layer2 ["Layer 2: Version-Specific Occurrence"]
-        OR["OccurrenceRecord<br/>finding_id: FindingId<br/>occurrence_id: OccurrenceId<br/>object_version_id: ObjectVersionId<br/>byte_offset: u64<br/>byte_length: NonZeroU64"]
+        OR["OccurrenceRecord<br/>tenant_id: TenantId<br/>finding_id: FindingId<br/>occurrence_id: OccurrenceId<br/>object_version_id: ObjectVersionId<br/>byte_offset: u64<br/>byte_length: NonZeroU64"]
         OID["OccurrenceId = BLAKE3(<br/>  finding_id,<br/>  object_version_id,<br/>  byte_offset,<br/>  byte_length<br/>)"]
     end
 
@@ -446,7 +446,7 @@ graph TB
 
     subgraph backends ["Backends"]
         INMEM["InMemoryDoneLedger<br/>InMemoryFindingsSink<br/>(reference implementation)"]
-        FUTURE["Production backends<br/>(etcd, ScyllaDB, PostgreSQL)"]
+        PG["DoneLedgerPg<br/>FindingsSinkPg<br/>(PostgreSQL backends)"]
     end
 
     IDS --> B5
@@ -461,8 +461,8 @@ graph TB
 
     INMEM -.->|"implements"| DL_MOD
     INMEM -.->|"implements"| FS_MOD
-    FUTURE -.->|"implements"| DL_MOD
-    FUTURE -.->|"implements"| FS_MOD
+    PG -.->|"implements"| DL_MOD
+    PG -.->|"implements"| FS_MOD
 
     style IDS fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
     style CONN fill:#FEE2E2,stroke:#991B1B,color:#991B1B
@@ -476,7 +476,7 @@ graph TB
     style CONFORM fill:#EDE9FE,stroke:#5B21B6,color:#5B21B6
 
     style INMEM fill:#F3F4F6,stroke:#374151,color:#374151
-    style FUTURE fill:#F3F4F6,stroke:#374151,color:#6B7280
+    style PG fill:#F3F4F6,stroke:#374151,color:#374151
 ```
 
 ### Key design invariants
@@ -508,6 +508,8 @@ graph TB
   hierarchy that persistence record types depend on
 - [Boundary Dependency Graph](02-boundary-dependency-graph.md) — how B5
   Persistence depends on B1 Identity and B2 Coordination
+- [Findings PostgreSQL Dedup](21-findings-postgres-dedup.md) — batch dedup
+  pipeline, observation merge decision tree, and dual-convergence property
 
 ## Source Code References
 
@@ -522,3 +524,6 @@ graph TB
 | `crates/gossip-contracts/src/persistence/error.rs` | `PersistenceInputError` shared validation errors |
 | `crates/gossip-contracts/src/persistence/conformance.rs` | `run_conformance()`, `FindingsConformanceProbe`, conformance report |
 | `crates/gossip-persistence-inmemory/src/` | Reference implementation: `InMemoryDoneLedger`, `InMemoryFindingsSink` |
+| `crates/gossip-pg-common/src/` | Shared `u64 ↔ BIGINT` conversion, `BYTEA` decoding, migration runner, test-support lifecycle |
+| `crates/gossip-done-ledger-postgres/src/` | `DoneLedgerPg`: PostgreSQL done-ledger backend with monotonic upsert |
+| `crates/gossip-findings-postgres/src/` | `FindingsSinkPg`: PostgreSQL findings backend with batch dedup and tenant-scoped read APIs |
