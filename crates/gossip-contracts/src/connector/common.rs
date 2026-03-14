@@ -116,15 +116,6 @@ impl<T> PageBuf<T> {
     }
 }
 
-impl<T> IntoIterator for PageBuf<T> {
-    type Item = T;
-    type IntoIter = std::vec::IntoIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter()
-    }
-}
-
 impl<'a, T> IntoIterator for &'a PageBuf<T> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
@@ -137,7 +128,10 @@ impl<'a, T> IntoIterator for &'a PageBuf<T> {
 /// Whether a page completes the current enumeration scope or requires resume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageState {
-    /// More items remain; the supplied cursor resumes from the next request.
+    /// The caller must resume with the supplied cursor. A resume cursor does
+    /// not guarantee another in-scope item will be returned on the next call;
+    /// connectors may emit a cursor at a boundary-crossing page and signal
+    /// completion on the subsequent (possibly empty) call.
     HasMore { cursor: Cursor },
     /// This page is terminal for the current enumeration scope.
     Complete,
