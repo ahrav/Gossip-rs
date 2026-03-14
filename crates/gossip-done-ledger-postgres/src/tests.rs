@@ -1,8 +1,8 @@
 //! Integration tests for the PostgreSQL done-ledger schema and migration runner.
 //!
 //! All tests in this module require a running PostgreSQL instance (either via
-//! Docker/testcontainers or an external `GOSSIP_POSTGRES_TEST_URL`). They are marked
-//! `#[ignore]` so that `cargo test` without Docker skips them cleanly.
+//! Docker/testcontainers or an external `GOSSIP_POSTGRES_TEST_URL`). Each test
+//! gets an isolated database via `gossip_pg_common::test_support::create_test_db()`.
 //!
 //! ## Test categories
 //!
@@ -19,12 +19,12 @@
 //! ## Running
 //!
 //! ```bash
-//! # With Docker:
-//! cargo test -p gossip-done-ledger-postgres -- --ignored
+//! # With Docker (testcontainers auto-starts postgres):
+//! cargo test -p gossip-done-ledger-postgres
 //!
 //! # With an external PostgreSQL (needs CREATE DATABASE privilege):
 //! GOSSIP_POSTGRES_TEST_URL="host=localhost user=postgres password=postgres" \
-//!   cargo test -p gossip-done-ledger-postgres -- --ignored
+//!   cargo test -p gossip-done-ledger-postgres
 //! ```
 
 use crate::test_postgres::{test_client, test_client_bare};
@@ -45,7 +45,7 @@ use gossip_contracts::{
 /// Applying the full migration set twice must leave exactly one history row
 /// per migration — the second pass is a no-op.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn migrations_are_idempotent() {
     let mut client = test_client_bare();
 
@@ -74,7 +74,7 @@ fn migrations_are_idempotent() {
 /// version must fail with `ChecksumMismatch`. This guards against accidental
 /// edits to already-applied migration files.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn checksum_mismatch_is_detected() {
     let mut client = test_client_bare();
 
@@ -109,7 +109,7 @@ fn checksum_mismatch_is_detected() {
 /// succeed without deadlock. The advisory lock serialises them; the second
 /// thread sees all migrations already applied and becomes a no-op.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn concurrent_migrations_both_succeed() {
     // Create a single bare database — both threads target the same DB.
     let url = crate::test_postgres::create_test_db();
@@ -143,7 +143,7 @@ fn concurrent_migrations_both_succeed() {
 }
 
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn provisioned_database_url_is_connectable() {
     let url = crate::test_postgres::create_test_db();
     let mut client =
@@ -160,7 +160,7 @@ fn provisioned_database_url_is_connectable() {
 /// migration history (e.g., manual SQL edits) rather than the migration
 /// SQL text itself, complementing [`checksum_mismatch_is_detected`].
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn persisted_checksum_tamper_is_detected_on_reapply() {
     let mut client = test_client_bare();
 
@@ -204,7 +204,7 @@ mod merge_parity_proptest;
 /// The suite verifies idempotent upsert, fail→scan dominance, scan→fail
 /// dominance, and `batch_get` positional semantics (4 checks total).
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn done_ledger_backend_passes_conformance_suite() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -219,7 +219,7 @@ fn done_ledger_backend_passes_conformance_suite() {
 /// `batch_get` with an empty `ovid_hashes` slice must return an empty vec
 /// without issuing a SQL query.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn batch_get_empty_input_returns_empty_vec() {
     let backend = DoneLedgerPg::from_client(test_client());
     let fetched = backend
@@ -230,7 +230,7 @@ fn batch_get_empty_input_returns_empty_vec() {
 
 /// Querying a key that was never written must produce `[None]`, not an error.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn batch_get_nonexistent_key_returns_none() {
     let backend = DoneLedgerPg::from_client(test_client());
     let fetched = backend
@@ -242,7 +242,7 @@ fn batch_get_nonexistent_key_returns_none() {
 
 /// Upserting an empty slice must succeed and return a zero-count receipt.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn batch_upsert_empty_input_returns_zero_receipt() {
     let backend = DoneLedgerPg::from_client(test_client());
     let receipt = backend
@@ -259,7 +259,7 @@ fn batch_upsert_empty_input_returns_zero_receipt() {
 /// input `ovid_hashes` slice — including `None` for absent keys and
 /// duplicated `Some` entries when the same key appears multiple times.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn batch_get_preserves_positional_alignment_with_duplicates() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -326,7 +326,7 @@ fn batch_get_preserves_positional_alignment_with_duplicates() {
 /// SQL mutation. The receipt should report 1 record (not 2), and the
 /// persisted row must reflect the lattice-merge result.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn batch_upsert_merges_duplicate_keys_before_persist() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -388,7 +388,7 @@ fn batch_upsert_merges_duplicate_keys_before_persist() {
 /// `batch_get` with more than `RECOMMENDED_MAX_BATCH_SIZE` ovid hashes
 /// must be rejected before issuing any SQL.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn batch_get_rejects_oversized_input() {
     let backend = DoneLedgerPg::from_client(test_client());
     let too_many: Vec<_> = (0..=RECOMMENDED_MAX_BATCH_SIZE)
@@ -406,7 +406,7 @@ fn batch_get_rejects_oversized_input() {
 /// `batch_upsert` with more than `RECOMMENDED_MAX_BATCH_SIZE` records
 /// must be rejected before issuing any SQL.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn batch_upsert_rejects_oversized_input() {
     let backend = DoneLedgerPg::from_client(test_client());
     let record = done_record(
@@ -438,7 +438,7 @@ fn batch_upsert_rejects_oversized_input() {
 /// `dedupe_and_validate` path). Verifies status promotion, `bytes_scanned`
 /// high-water-mark, `error_code` clearing, and provenance winner selection.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn cross_batch_upsert_exercises_sql_on_conflict_merge() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -512,7 +512,7 @@ fn cross_batch_upsert_exercises_sql_on_conflict_merge() {
 /// record wins provenance (and its associated `error_code`), while
 /// `bytes_scanned` and `findings_count` still take `GREATEST`.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn cross_batch_upsert_equal_status_picks_later_finished_at() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -590,7 +590,7 @@ fn cross_batch_upsert_equal_status_picks_later_finished_at() {
 /// [`sql_greatest_floor_clamp_is_observable_at_sql_level`] exercises it
 /// directly via raw SQL with a zero-count incoming row.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
     let backend = DoneLedgerPg::from_client(test_client());
     backend
@@ -664,7 +664,7 @@ fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
 /// `done_ledger_entries_status_shape_ck` on the incoming tuple before
 /// `ON CONFLICT DO UPDATE` can evaluate `GREATEST(..., 1)`.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn sql_on_conflict_rejects_invalid_scanned_with_findings_excluded_row() {
     let mut client = test_client();
 
@@ -851,7 +851,7 @@ impl RowOverrides {
 
 /// Status value 99 is not in the allowed set {1, 2, 3, 10, 11}.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_invalid_status() {
     let mut client = test_client();
     let err = try_insert(
@@ -867,7 +867,7 @@ fn schema_rejects_invalid_status() {
 
 /// `bytes_scanned` is stored as `BIGINT` but must be non-negative.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_negative_bytes_scanned() {
     let mut client = test_client();
     let err = try_insert(
@@ -888,7 +888,7 @@ fn schema_rejects_negative_bytes_scanned() {
 /// These mirror the Rust-side `DoneLedgerRecord::validate()` rules at
 /// the SQL level.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_enforces_status_shape_constraint() {
     let mut client = test_client();
 
@@ -962,7 +962,7 @@ fn schema_enforces_status_shape_constraint() {
 /// exactly 32 bytes. A 31-byte `tenant_id` must trigger an
 /// `octet_length` CHECK violation.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_invalid_bytea_length() {
     let mut client = test_client();
     let err = try_insert(
@@ -979,7 +979,7 @@ fn schema_rejects_invalid_bytea_length() {
 /// The temporal ordering invariant `finished_at >= started_at` is enforced
 /// at the schema level. Inserting `finished_at < started_at` must fail.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_enforces_finished_at_ge_started_at() {
     let mut client = test_client();
     let err = try_insert(
@@ -996,7 +996,7 @@ fn schema_enforces_finished_at_ge_started_at() {
 
 /// `findings_count` is stored as `INTEGER` and must be non-negative.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_negative_findings_count() {
     let mut client = test_client();
     let err = try_insert(
@@ -1012,7 +1012,7 @@ fn schema_rejects_negative_findings_count() {
 
 /// `fence_epoch` is stored as `BIGINT` and must be non-negative.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_negative_fence_epoch() {
     let mut client = test_client();
     let err = try_insert(
@@ -1028,7 +1028,7 @@ fn schema_rejects_negative_fence_epoch() {
 
 /// `started_at` is stored as `BIGINT` and must be non-negative.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_negative_started_at() {
     let mut client = test_client();
     let err = try_insert(
@@ -1046,7 +1046,7 @@ fn schema_rejects_negative_started_at() {
 /// `error_code` has a max length of 128 bytes. A 129-byte string must be
 /// rejected by the `octet_length(...) BETWEEN 1 AND 128` CHECK.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_oversized_error_code() {
     let mut client = test_client();
     let err = try_insert(
@@ -1064,7 +1064,7 @@ fn schema_rejects_oversized_error_code() {
 /// An empty `error_code` string violates the `octet_length(...) BETWEEN 1
 /// AND 128` CHECK — the minimum length is 1, not 0.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn schema_rejects_empty_error_code() {
     let mut client = test_client();
     let err = try_insert(
@@ -1101,7 +1101,7 @@ fn schema_rejects_empty_error_code() {
 /// non-scanned incoming row before `done_ledger_entries_status_shape_ck`
 /// fires.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn sql_on_conflict_rejects_invalid_non_scanned_excluded_row() {
     let mut client = test_client();
 
@@ -1163,7 +1163,7 @@ fn sql_on_conflict_rejects_invalid_non_scanned_excluded_row() {
 /// `error_code` and the incoming winner also has one, the winner's code
 /// is used directly (COALESCE short-circuits on its first non-NULL arg).
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+
 fn sql_coalesce_winner_error_code_takes_precedence() {
     let mut client = test_client();
 

@@ -678,7 +678,6 @@ fn assert_sql_merge_matches_rust_merge(
 /// scenarios (`HigherStatus`, `LaterFinishedAt`, `LaterStartedAt`,
 /// `ExactTie`) were each exercised at least once.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn sql_on_conflict_merge_matches_rust_merge_proptest() {
     let backend = DoneLedgerPg::from_client(test_client());
     let strategy = arb_merge_parity_case();
