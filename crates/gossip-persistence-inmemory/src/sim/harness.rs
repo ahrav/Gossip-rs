@@ -386,6 +386,27 @@ impl DoneLedgerSim {
         self.pending_batches.len()
     }
 
+    /// Sorted snapshot of currently-pending write IDs. Used by the
+    /// proptest materialization layer to remap `ReleaseSpecific` ops
+    /// to actual pending IDs, ensuring the found-and-released path
+    /// is exercised.
+    #[cfg(test)]
+    pub(super) fn pending_batch_ids_sorted(&self) -> Vec<PendingWriteId> {
+        let mut ids: Vec<PendingWriteId> = self.pending_batches.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Inject PPM-based background faults when the fault level is
+    /// non-SunnyDay. Intended for the proptest op loop so the `FaultLevel`
+    /// parameter produces distinct execution traces at each severity.
+    #[cfg(test)]
+    pub(super) fn inject_background_faults_if_configured(&mut self) {
+        if !self.fault_config.is_fault_free() {
+            self.maybe_inject_faults();
+        }
+    }
+
     /// Verify I6 convergence once the caller has drained pending writes.
     #[cfg(test)]
     pub(super) fn check_convergence(&self) -> Vec<DoneLedgerInvariantViolation> {

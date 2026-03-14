@@ -327,7 +327,20 @@ fn materialize_op(
         },
         ProptestOp::ReleaseOldest => DoneLedgerSimOp::ReleaseOldest,
         ProptestOp::ReleaseNewest => DoneLedgerSimOp::ReleaseNewest,
-        ProptestOp::ReleaseSpecific { op_id } => DoneLedgerSimOp::ReleaseSpecific { op_id: *op_id },
+        ProptestOp::ReleaseSpecific { op_id } => {
+            // Remap to an actual pending ID when possible so the
+            // found-and-released path (exec_release_specific → finish_released_batch)
+            // is exercised. Without remapping, the proptest-generated
+            // ID rarely matches a currently-pending write, reducing
+            // ReleaseSpecific to a near-permanent noop.
+            let pending = sim.pending_batch_ids_sorted();
+            let remapped = if pending.is_empty() {
+                *op_id
+            } else {
+                pending[op_id.as_raw() as usize % pending.len()]
+            };
+            DoneLedgerSimOp::ReleaseSpecific { op_id: remapped }
+        }
         ProptestOp::ReleaseAll { order } => DoneLedgerSimOp::ReleaseAll { order: *order },
         ProptestOp::InjectSubmitFailure { count } => {
             DoneLedgerSimOp::InjectSubmitFailure { count: *count }
@@ -504,6 +517,15 @@ fn run_op_sequence(seed: u64, level: FaultLevel, ops: &[ProptestOp]) {
 
     for (step_idx, op) in ops.iter().enumerate() {
         let materialized = materialize_op(&mut sim, &mut seen_ovid_indices, op);
+
+        // PPM-based background fault injection between data/release ops.
+        // Mirrors generate_random_op's behavior so the FaultLevel parameter
+        // produces distinct execution traces at each severity. Skipped for
+        // explicit fault injection ops to avoid doubling fault pressure.
+        if !materialized.is_fault_injection() {
+            sim.inject_background_faults_if_configured();
+        }
+
         let (event, violations) = sim.step(materialized);
         assert!(
             violations.is_empty(),
