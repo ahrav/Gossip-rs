@@ -375,10 +375,6 @@ impl FindingsSinkPg {
 
         let mut counts = Vec::with_capacity(rows.len());
         for row in rows {
-            let tenant_id = TenantId::from_bytes(decode_fixed_32(
-                row.try_get::<_, &[u8]>("tenant_id")?,
-                "tenant_id",
-            )?);
             let policy_hash = PolicyHash::from_bytes(decode_fixed_32(
                 row.try_get::<_, &[u8]>("policy_hash")?,
                 "policy_hash",
@@ -403,6 +399,15 @@ impl FindingsSinkPg {
     /// returns the latest observation for each finding and orders the result by
     /// observation recency.
     ///
+    /// ## Ordering
+    ///
+    /// Results are ordered by `seen_at DESC`. When two findings share the same
+    /// `seen_at`, the secondary tiebreaker is `observation_id DESC` — a
+    /// lexicographic BYTEA sort over a content-addressed hash. This makes the
+    /// ordering deterministic but semantically arbitrary for tied timestamps.
+    /// Callers paging via `OFFSET` may see row shifts between pages when ties
+    /// exist.
+    ///
     /// # Errors
     ///
     /// Returns [`FindingsPgError::LimitOutOfRange`] when `limit` exceeds the
@@ -422,10 +427,6 @@ impl FindingsSinkPg {
 
         let mut findings = Vec::with_capacity(rows.len());
         for row in rows {
-            let tenant_id = TenantId::from_bytes(decode_fixed_32(
-                row.try_get::<_, &[u8]>("tenant_id")?,
-                "tenant_id",
-            )?);
             let finding_id = FindingId::from_bytes(decode_fixed_32(
                 row.try_get::<_, &[u8]>("finding_id")?,
                 "finding_id",

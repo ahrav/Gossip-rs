@@ -485,6 +485,91 @@ fn list_findings_needing_triage_returns_latest_observation_when_finding_has_mult
 }
 
 #[test]
+fn list_findings_needing_triage_picks_latest_across_multiple_occurrences() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x78);
+
+    // Insert base fixture: finding + occurrence A + observation A.
+    backend
+        .upsert_batch(fixture.batch())
+        .expect("base batch should succeed")
+        .wait()
+        .expect("base batch should commit");
+
+    // Create a second occurrence for the SAME finding with a later observation.
+    let object_version_id_b =
+        ObjectVersionId::from_version_bytes(b"findings-pg-version-second-occurrence");
+    let occurrence_b = OccurrenceRecord::try_new(
+        fixture.tenant_id,
+        fixture.finding.finding_id(),
+        object_version_id_b,
+        5_000,
+        64,
+    )
+    .expect("fixture byte_length is non-zero");
+
+    let ovid_hash_b = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: fixture.finding.stable_item_id(),
+        version: VersionId::Strong(object_version_id_b),
+    });
+
+    let later_seen_at = fixture.observation.seen_at().as_raw() + 1_000;
+    let observation_b = ObservationRecord::new(
+        fixture.tenant_id,
+        occurrence_b.occurrence_id(),
+        policy(0xCC),
+        ovid_hash_b,
+        RunId::from_raw(77_001),
+        ShardId::from_raw(77_002),
+        FenceEpoch::from_raw(77_003),
+        LogicalTime::from_raw(later_seen_at),
+    )
+    .with_location(
+        Location::try_new(
+            "safe/path/second-occ.txt".to_owned(),
+            Some("https://example.invalid/second-occ".to_owned()),
+        )
+        .expect("fixture location should be valid"),
+    );
+
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            &[],
+            std::slice::from_ref(&occurrence_b),
+            std::slice::from_ref(&observation_b),
+        ))
+        .expect("second-occurrence batch should succeed")
+        .wait()
+        .expect("second-occurrence batch should commit");
+
+    let rows = backend
+        .list_findings_needing_triage(fixture.tenant_id, 10)
+        .expect("triage query should succeed");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "DISTINCT ON should collapse both occurrences into one row per finding"
+    );
+    assert_eq!(
+        rows[0].occurrence_id(),
+        occurrence_b.occurrence_id(),
+        "DISTINCT ON should select the occurrence whose observation has the later seen_at"
+    );
+    assert_eq!(
+        rows[0].observation_id(),
+        observation_b.observation_id(),
+        "returned observation_id should match the later observation"
+    );
+    assert_eq!(
+        rows[0].seen_at(),
+        later_seen_at,
+        "returned seen_at should be the later timestamp"
+    );
+}
+
+#[test]
 fn read_methods_return_empty_results_for_unknown_tenant() {
     let harness = LivePgHarness::new();
     let backend = harness.backend();

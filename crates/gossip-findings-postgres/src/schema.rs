@@ -488,13 +488,18 @@ pub const COMBINED_COUNTS_SQL: &str = "\
 
 /// Count durable observations for one tenant, grouped by policy hash.
 ///
+/// The `tenant_id` column is omitted from both `SELECT` and `GROUP BY`
+/// because `WHERE tenant_id = $1` already constrains every row to a single
+/// tenant. The Rust decoder reconstructs it from the input parameter,
+/// avoiding a redundant per-row BYTEA decode.
+///
 /// Bind parameters:
 /// 1. `tenant_id`
 pub const COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL: &str = r#"
-SELECT tenant_id, policy_hash, COUNT(*)::BIGINT AS observation_count
+SELECT policy_hash, COUNT(*)::BIGINT AS observation_count
 FROM observations
 WHERE tenant_id = $1
-GROUP BY tenant_id, policy_hash
+GROUP BY policy_hash
 ORDER BY policy_hash ASC
 "#;
 
@@ -506,6 +511,17 @@ ORDER BY policy_hash ASC
 /// from the inner `DISTINCT ON` ordering, PostgreSQL materializes the full
 /// per-tenant result set before applying `LIMIT`. At high finding counts
 /// per tenant, consider denormalizing the "latest observation" pointer.
+///
+/// ## Ordering caveat
+///
+/// The secondary tiebreaker `observation_id DESC` is a lexicographic BYTEA
+/// sort over a content-addressed hash. When two findings share the same
+/// `seen_at` value, their relative order is deterministic but semantically
+/// arbitrary — callers cannot predict which finding appears first. The
+/// ordering may also change if a tied finding receives a new observation
+/// (which changes its `observation_id`). Callers that paginate via
+/// `OFFSET` should be aware of potential row shifts between pages when
+/// ties exist.
 ///
 /// ## Performance characteristics
 ///
@@ -901,9 +917,13 @@ mod tests {
                 "COUNT(*)::BIGINT AS observation_count",
                 "FROM observations",
                 "WHERE tenant_id = $1",
-                "GROUP BY tenant_id, policy_hash",
+                "GROUP BY policy_hash",
                 "ORDER BY policy_hash ASC",
             ],
+        );
+        assert!(
+            !COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL.contains("GROUP BY tenant_id"),
+            "tenant_id must not appear in GROUP BY — it is constant via WHERE tenant_id = $1"
         );
     }
 

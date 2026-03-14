@@ -308,4 +308,36 @@ mod tests {
             "CorruptedHistoryRecord should have no source error"
         );
     }
+
+    #[test]
+    fn conversion_error_byte_decode_delegates_display() {
+        let inner = PgByteDecodeError::InvalidByteLength {
+            field: "tenant_id",
+            expected: 32,
+            actual: 31,
+        };
+        let err = DoneLedgerPgConversionError::ByteDecode(inner);
+        assert_eq!(
+            err.to_string(),
+            inner.to_string(),
+            "ByteDecode Display should delegate to the inner PgByteDecodeError"
+        );
+    }
+
+    #[test]
+    fn conversion_error_byte_decode_exposes_source() {
+        let inner = PgByteDecodeError::InvalidByteLength {
+            field: "ovid_hash",
+            expected: 32,
+            actual: 0,
+        };
+        let err = DoneLedgerPgConversionError::ByteDecode(inner);
+        let source = err
+            .source()
+            .expect("ByteDecode should expose inner error as source");
+        assert!(
+            source.is::<PgByteDecodeError>(),
+            "source should be PgByteDecodeError"
+        );
+    }
 }
