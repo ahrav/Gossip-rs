@@ -125,6 +125,17 @@ impl<'a, T> IntoIterator for &'a PageBuf<T> {
     }
 }
 
+/// Owned iteration consumes the items and discards the [`PageState`].
+/// Use [`PageBuf::into_parts`] when both items and completion state are needed.
+impl<T> IntoIterator for PageBuf<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
 /// Whether a page completes the current enumeration scope or requires resume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageState {
@@ -159,14 +170,20 @@ impl PageState {
 /// Optional paging behavior flags exposed by a connector family.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PagingCapabilities {
+    /// Whether the family produces strictly ordered page keys.
     pub ordered_keys: bool,
+    /// Whether the family may return connector-opaque resume tokens.
     pub resumable: bool,
+    /// Whether the family can emit split-point hints.
     pub splittable: bool,
 }
 
 /// Trait for items that participate in ordered page emission.
 pub trait KeyedPageItem {
     /// Returns the ordered key used for page progression.
+    ///
+    /// Must be deterministic: successive calls on the same receiver must return
+    /// an identical `ItemKey`. Validation and paging logic depend on key stability.
     fn item_key(&self) -> &ItemKey;
 
     /// Returns the optional item byte-size estimate used for budget tracking.

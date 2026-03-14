@@ -8,7 +8,7 @@ enumeration and read model. The contract lives in
 `crates/gossip-contracts/src/connector/`; concrete implementations live in
 `crates/gossip-connectors/`.
 
-The crate provides three core capabilities:
+The crate provides four core capabilities:
 
 - **Shared paging vocabulary** -- reusable page-shape contracts
   (`PageBuf`, `PageState`, `PagingCapabilities`, `KeyedPageItem`) and
@@ -20,6 +20,13 @@ The crate provides three core capabilities:
   redacted formatting. `Debug`/`Display` output is always
   `TypeName(len=N, hash=XXXXXXXX..)` via truncated BLAKE3, never raw
   bytes.
+
+- **Family contract modules** -- `ordered.rs` defines the
+  `OrderedContentSource` trait and its family-specific capability flags.
+  `fill_page` returns `Result<Option<PageBuf<ScanItem>>, EnumerateError>`:
+  `Ok(Some(page))` delivers a non-empty page, `Ok(None)` signals terminal
+  completion when no in-scope items remain (`PageBuf` enforces non-empty,
+  so the `Option` wrapper carries the empty-terminal signal).
 
 - **Connector method surface** -- each concrete connector exposes `caps`,
   `choose_split_point`, `open`, and `read_range` as
@@ -35,7 +42,8 @@ The crate provides three core capabilities:
 | `mod.rs`            | Module root, re-exports all public types from sub-modules                    |
 | `common.rs`         | Shared paging vocabulary: `PageBuf`, `PageState`, `PagingCapabilities`, `KeyedPageItem`, page validation |
 | `types.rs`          | Toxic-byte wrappers, `Cursor`, `ScanItem`, `Budgets`, `ToxicDigest`         |
-| `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`, traits |
+| `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`         |
+| `ordered.rs`        | Ordered-content family contract: `OrderedContentSource` trait (`fill_page` → `Ok(None)` terminal), `OrderedContentCapabilities` flags |
 
 #### Implementation layer (`crates/gossip-connectors/`)
 

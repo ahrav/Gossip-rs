@@ -50,7 +50,8 @@ pub use blake3;
 // Boundary modules.
 // ---------------------------------------------------------------------------
 
-// Connector boundary: enumeration/read traits and connector registration.
+// Connector boundary: shared paging vocabulary, connector value types, and
+// family-specific contracts.
 // (Module-level docs with intra-doc links live in `connector/mod.rs`.)
 pub mod connector;
 /// Defines the shard data model: key ranges, cursors, split planning, and pooled wrappers.

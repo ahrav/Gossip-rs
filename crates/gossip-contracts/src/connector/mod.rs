@@ -10,17 +10,22 @@
 //!
 //! The connector contract surface is split into focused layers:
 //!
-//! - `common.rs` defines the shared paging vocabulary
-//!   ([`PageBuf`], [`PageState`], [`PagingCapabilities`], page validation).
 //! - `types.rs` defines validated value wrappers, item metadata/value
 //!   invariants (including toxic-byte redaction and size bounds), and
 //!   [`ToxicDigest`].
 //! - `api.rs` defines operation-outcome classification and optional capability
 //!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
 //!   `ConnectorCapabilities`).
+//! - `common.rs` defines shared paging vocabulary reused across connector
+//!   families ([`PageBuf`], [`PageState`], [`PagingCapabilities`],
+//!   [`KeyedPageItem`], [`validate_filled_page`]).
+//! - `ordered.rs` defines the ordered-content family contract
+//!   ([`ordered::OrderedContentCapabilities`],
+//!   [`ordered::OrderedContentSource`]).
 //!
-//! Re-exporting these layers here gives runtime crates a single import boundary
-//! while keeping invariants and policy signaling concerns separated.
+//! `api.rs`, `common.rs`, and `types.rs` remain internal organization units;
+//! their public items are re-exported here so runtime crates keep a single
+//! import boundary while family-specific contracts stay namespaced.
 //!
 //! ## Invariants
 //!
@@ -50,6 +55,8 @@
 //! - Log-safe digest: [`ToxicDigest`]
 //! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
 //! - Connector feature flags: [`ConnectorCapabilities`]
+//! - Ordered-content family contract: [`ordered::OrderedContentCapabilities`],
+//!   [`ordered::OrderedContentSource`]
 //!
 //! These types are intentionally composable: a connector validates once at the
 //! boundary, then hands strongly-typed values across crate boundaries without
@@ -57,12 +64,14 @@
 //!
 //! ## Ownership boundary
 //!
-//! `gossip-contracts` defines value contracts and validation rules only.
-//! Runtime connector implementations and orchestration decisions (retry,
-//! scheduling, backoff policy) live in runtime crates.
+//! `gossip-contracts` defines connector value contracts, shared paging
+//! vocabulary, and family-specific trait surfaces only. Runtime connector
+//! implementations and orchestration decisions (retry, scheduling, backoff
+//! policy) live in runtime crates.
 
 mod api;
 mod common;
+pub mod ordered;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 

@@ -99,6 +99,16 @@ fn page_buf_preserves_state_and_items() {
 }
 
 #[test]
+fn page_buf_supports_consuming_iteration() {
+    let page = PageBuf::try_new(scan_items(&[b"x", b"y", b"z"]), PageState::Complete).unwrap();
+    let keys: Vec<Vec<u8>> = page
+        .into_iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+    assert_eq!(keys, vec![b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]);
+}
+
+#[test]
 fn page_state_reports_completion_and_resume_cursor() {
     let complete = PageState::Complete;
     assert!(complete.is_complete());
