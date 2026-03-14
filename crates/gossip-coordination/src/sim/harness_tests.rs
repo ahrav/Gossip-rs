@@ -725,12 +725,31 @@ fn multi_run_isolation() {
 /// Worker with no prior cursor generates a cursor within spec bounds.
 #[test]
 fn generate_forward_cursor_no_prior() {
-    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
 
     let worker = WorkerId::from_raw(1);
-    let key = sim.shard_keys[0];
+    sim.add_worker(worker);
 
-    // Advance time so acquire works.
+    // Manually seed a shard with spec [b'a', b'z') so cursor range
+    // assertions are independent of the byte-space partitioning in
+    // `with_workers_and_shards`.
+    let run = RunId::from_raw(1);
+    let shard = ShardId::from_raw(1);
+    let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
+    let record = crate::record::ShardRecord::new_active(
+        sim.tenant,
+        run,
+        shard,
+        spec.as_ref(),
+        CursorSemantics::Completed,
+        sim.coordinator.slab_mut(),
+    )
+    .expect("slab large enough for test");
+    sim.coordinator.seed_shard(record);
+    let key = ShardKey::new(run, shard);
+    sim.shard_keys.push(key);
+    sim.active_shard_keys.push(key);
+
     sim.context.advance(1);
 
     // Acquire the shard.
@@ -787,10 +806,29 @@ fn generate_forward_cursor_forward_progress() {
 /// `generate_forward_cursor` returns the previous cursor (idempotent retry).
 #[test]
 fn generate_forward_cursor_range_exhausted() {
-    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
 
     let worker = WorkerId::from_raw(1);
-    let key = sim.shard_keys[0];
+    sim.add_worker(worker);
+
+    // Manually seed a shard with spec [b'a', b'z') so the range-exhaustion
+    // boundary (cursor at b'y', next would be b'z' == range_hi) is testable.
+    let run = RunId::from_raw(1);
+    let shard = ShardId::from_raw(1);
+    let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
+    let record = crate::record::ShardRecord::new_active(
+        sim.tenant,
+        run,
+        shard,
+        spec.as_ref(),
+        CursorSemantics::Completed,
+        sim.coordinator.slab_mut(),
+    )
+    .expect("slab large enough for test");
+    sim.coordinator.seed_shard(record);
+    let key = ShardKey::new(run, shard);
+    sim.shard_keys.push(key);
+    sim.active_shard_keys.push(key);
 
     sim.context.advance(1);
 

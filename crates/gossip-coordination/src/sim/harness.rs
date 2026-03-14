@@ -1144,12 +1144,18 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             return self;
         }
 
+        // Advance the sim clock before each coordinator API call so op_log
+        // entries carry monotonically increasing timestamps.  Without this,
+        // subsequent test operations (which use `self.context.now()`) could
+        // produce timestamps lower than the hardcoded setup values, violating
+        // the non-decreasing op_log invariant (INV-10).
+        self.context.advance(1);
         let run = RunId::from_raw(1);
         let config =
             RunConfig::try_new(CursorSemantics::Completed, DEFAULT_LEASE_DURATION, Some(5))
                 .expect("default simulation run config must be valid");
         self.coordinator
-            .create_run(LogicalTime::from_raw(1), self.tenant, run, config)
+            .create_run(self.context.now(), self.tenant, run, config)
             .unwrap_or_else(|err| {
                 panic!("simulation topology seeding failed to create run {run:?}: {err:?}")
             });
@@ -1175,10 +1181,12 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 )
             })
             .collect();
+
+        self.context.advance(1);
         let outcome = self
             .coordinator
             .register_shards(
-                LogicalTime::from_raw(2),
+                self.context.now(),
                 self.tenant,
                 run,
                 &manifest,
