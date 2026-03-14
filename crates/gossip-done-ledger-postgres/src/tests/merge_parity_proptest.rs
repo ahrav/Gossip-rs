@@ -421,7 +421,7 @@ fn arb_later_finished_case() -> BoxedStrategy<MergeParityCase> {
 }
 
 /// Same status and identical `finished_at`, but the incoming record has a
-/// strictly later `started_at`. This isolates the third and final tier of
+/// strictly later `started_at`. This isolates the third tier of
 /// the tie-breaking rule (latest `started_at` wins when status and
 /// `finished_at` are equal).
 ///

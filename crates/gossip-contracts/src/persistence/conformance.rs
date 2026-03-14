@@ -832,7 +832,9 @@ where
 /// 1. The key is unchanged.
 /// 2. The status is a scanned variant (the lattice join of failed ∨ scanned).
 /// 3. `bytes_scanned` has not regressed below the max of both inputs.
-/// 4. `findings_count` has not regressed below the max of both inputs.
+/// 4. `findings_count` respects the SwF-aware merge rule: only
+///    `ScannedWithFindings` contributors supply findings; `ScannedClean`
+///    forces the count to 0.
 /// 5. The status rank is at least as high as the scanned record's rank.
 ///
 /// These checks collectively verify the join-semilattice merge contract
@@ -872,13 +874,30 @@ fn assert_scanned_dominates(
             ),
         });
     }
-    if actual.findings_count() < failed.findings_count().max(scanned.findings_count()) {
+    let expected_min_findings = match actual.status() {
+        DoneLedgerStatus::ScannedClean => 0,
+        DoneLedgerStatus::ScannedWithFindings => {
+            let failed_swf = if failed.status() == DoneLedgerStatus::ScannedWithFindings {
+                failed.findings_count()
+            } else {
+                0
+            };
+            let scanned_swf = if scanned.status() == DoneLedgerStatus::ScannedWithFindings {
+                scanned.findings_count()
+            } else {
+                0
+            };
+            failed_swf.max(scanned_swf).max(1)
+        }
+        _ => failed.findings_count().max(scanned.findings_count()),
+    };
+    if actual.findings_count() < expected_min_findings {
         return Err(PersistenceConformanceError::DoneLedgerInvariant {
             case,
             message: format!(
                 "findings_count regressed: got {}, expected at least {}",
                 actual.findings_count(),
-                failed.findings_count().max(scanned.findings_count())
+                expected_min_findings
             ),
         });
     }

@@ -80,9 +80,11 @@ impl Error for PgU64ConversionError {}
 /// Encode a `u64` as `BIGINT` by reinterpreting the raw 8-byte representation.
 ///
 /// Infallible: every `u64` value maps to exactly one `i64` bit pattern and
-/// vice versa. The resulting `i64` may be negative, so this encoding must
-/// only be used for columns where SQL never performs ordering or range
-/// comparisons (i.e., equality/grouping-only identifiers).
+/// vice versa. The resulting `i64` may be negative. Most callers use this
+/// for equality/grouping-only columns. The done-ledger provenance-winner
+/// `ROW()` comparison is a deliberate exception: it orders stored BIGINT
+/// values as signed integers, and the Rust merge helper replicates this
+/// via `pg_bigint_bits_sort_key`.
 #[inline]
 #[must_use]
 pub fn u64_to_pg_bigint_bits(value: u64) -> i64 {

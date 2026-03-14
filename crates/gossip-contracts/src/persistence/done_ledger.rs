@@ -49,7 +49,10 @@ use super::{
 
 #[inline]
 pub(crate) fn pg_bigint_bits_sort_key(raw: u64) -> i64 {
-    // Bit-pattern reinterpret — matches u64_to_pg_bigint_bits in gossip-pg-common
+    // Bit-pattern reinterpret to signed i64 — PostgreSQL stores RunId/ShardId
+    // as signed BIGINT via u64_to_pg_bigint_bits, so the provenance-winner
+    // ROW() comparison orders them as signed. This helper replicates that
+    // ordering on the Rust side.
     i64::from_ne_bytes(raw.to_ne_bytes())
 }
 
@@ -624,17 +627,22 @@ impl DoneLedgerRecord {
     /// 5. **`error_code`** — cleared when merged status is scanned; otherwise
     ///    taken from the provenance winner, falling back to the loser.
     ///
-    /// # Debug-mode invariant
+    /// # Preconditions
     ///
-    /// Both records must share the same [`DoneLedgerKey`]. A mismatch triggers
-    /// a `debug_assert` panic in debug builds. In release builds the check is
-    /// elided — callers are expected to have queried by key before merging.
+    /// Both operands must pass [`validate()`](Self::validate). Unvalidated
+    /// records (e.g., non-scanned status with `error_code = None`) break
+    /// associativity because the error_code fallback mechanism can pick
+    /// different losers depending on merge grouping.
     ///
     /// # Errors
     ///
-    /// Returns [`PersistenceInputError`] if the merged fields violate
+    /// Returns [`PersistenceInputError`] if either operand fails
+    /// [`validate()`](Self::validate) or if the merged fields violate
     /// [`DoneLedgerRecord::try_new`] construction invariants.
     pub fn merge(&self, incoming: &DoneLedgerRecord) -> Result<Self, PersistenceInputError> {
+        self.validate()?;
+        incoming.validate()?;
+
         debug_assert_eq!(
             self.key, incoming.key,
             "DoneLedgerRecord::merge requires matching keys: existing={:?}, incoming={:?}",

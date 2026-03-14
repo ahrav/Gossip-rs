@@ -28,6 +28,10 @@ fn lattice_proptest_config() -> ProptestConfig {
     }
 }
 
+/// Independent re-implementation of `DoneLedgerRecord::provenance_winner_key`
+/// via public accessors. Must remain in exact lockstep with the production
+/// method — any divergence means the property tests are not exercising the
+/// real merge logic.
 fn winner_key(record: &DoneLedgerRecord) -> (u8, u64, u64, u64, i64, i64, &[u8]) {
     (
         record.status().rank(),

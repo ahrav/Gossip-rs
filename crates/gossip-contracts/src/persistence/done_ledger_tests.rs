@@ -461,13 +461,13 @@ fn merge_scan_then_fail_keeps_scanned_findings_and_provenance() {
 }
 
 #[test]
-fn merge_error_code_falls_back_to_loser_when_winner_has_none() {
+fn merge_rejects_unvalidated_operand_missing_error_code() {
     let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
-    let fallback_code = DoneLedgerErrorCode::try_new("FALLBACK").unwrap();
+    let error_code = DoneLedgerErrorCode::try_new("TIMEOUT").unwrap();
 
-    // Winner by provenance (higher run_id) but no error_code.
-    // try_new allows None error_code — validation is deferred to validate().
-    let winner = DoneLedgerRecord::try_new(
+    // Constructible via try_new but fails validate(): FailedRetryable
+    // without an error_code.
+    let unvalidated = DoneLedgerRecord::try_new(
         key,
         FailedRetryable,
         100,
@@ -483,8 +483,7 @@ fn merge_error_code_falls_back_to_loser_when_winner_has_none() {
     )
     .unwrap();
 
-    // Loser by provenance (lower run_id) but has an error_code.
-    let loser = DoneLedgerRecord::try_new(
+    let valid = DoneLedgerRecord::try_new(
         key,
         FailedRetryable,
         100,
@@ -496,17 +495,13 @@ fn merge_error_code_falls_back_to_loser_when_winner_has_none() {
             LogicalTime::from_raw(100),
             LogicalTime::from_raw(200),
         ),
-        Some(fallback_code.clone()),
+        Some(error_code),
     )
     .unwrap();
 
-    let merged = winner.merge(&loser).unwrap();
-    assert_eq!(merged.status(), FailedRetryable);
-    assert_eq!(
-        merged.error_code(),
-        Some(&fallback_code),
-        "merge should fall back to loser's error_code when winner has None"
-    );
+    // merge rejects unvalidated operands to preserve associativity.
+    assert!(unvalidated.merge(&valid).is_err());
+    assert!(valid.merge(&unvalidated).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -572,5 +567,61 @@ fn done_record_rejects_failure_status_without_error_code() {
         1,
         2,
         None, // missing error_code
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verify: merge rejects the unvalidated-error_code scenario that previously
+// broke associativity. With validated operands, the fallback path is
+// unreachable for non-scanned statuses (validate() guarantees error_code is
+// Some), so associativity holds.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn merge_rejects_all_operands_in_associativity_counterexample() {
+    let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+
+    // The counterexample that broke associativity before the fix:
+    // A: FailedRetryable, run_id=5, error_code=None (unvalidated).
+    let a = DoneLedgerRecord::try_new(
+        key,
+        FailedRetryable,
+        100,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(5),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        ),
+        None,
+    )
+    .unwrap();
+
+    let b = DoneLedgerRecord::try_new(
+        key,
+        FailedRetryable,
+        100,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(3),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        ),
+        Some(DoneLedgerErrorCode::try_new("ZZZZ").unwrap()),
+    )
+    .unwrap();
+
+    // merge rejects A because it fails validate().
+    assert!(
+        a.merge(&b).is_err(),
+        "merge must reject unvalidated operand A"
+    );
+    assert!(
+        b.merge(&a).is_err(),
+        "merge must reject unvalidated operand A"
     );
 }
