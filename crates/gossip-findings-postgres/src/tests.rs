@@ -9,13 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use gossip_contracts::persistence::run_findings_conformance;
 use postgres::Client;
 use postgres::error::{DbError, SqlState};
 
 use crate::schema;
 use crate::test_postgres::{create_test_db, test_client, test_client_bare};
 use crate::{
-    EmbeddedMigration, FindingsPgMigrationError, MIGRATIONS, apply_all_migrations, apply_migrations,
+    EmbeddedMigration, FindingsPgMigrationError, FindingsSinkPg, MIGRATIONS, apply_all_migrations,
+    apply_migrations,
 };
 
 /// Field overrides for a `findings` row. `None` means "use the valid default".
@@ -191,6 +193,8 @@ fn stored_migration_versions(client: &mut Client) -> BTreeSet<String> {
         .map(|row| row.get::<_, String>(0))
         .collect()
 }
+
+mod merge_parity_proptest;
 
 fn table_foreign_keys(client: &mut Client, table: &str) -> BTreeMap<String, String> {
     client
@@ -1467,5 +1471,270 @@ fn observations_round_trip_all_columns() {
     assert_eq!(
         row.get::<_, Option<String>>(10),
         defaults.location_url.unwrap()
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn findings_sink_pg_passes_findings_conformance() {
+    let mut client = test_client();
+    client
+        .batch_execute(schema::TRUNCATE_ALL_SQL)
+        .expect("pre-conformance truncate should succeed");
+    let backend = FindingsSinkPg::from_client(client);
+
+    run_findings_conformance(&backend)
+        .expect("FindingsSinkPg should satisfy the findings conformance harness");
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn upsert_batch_returns_zero_receipt_for_empty_batch() {
+    use gossip_contracts::persistence::{
+        CommitHandle, FindingsCommitReceipt, FindingsSink, FindingsUpsertBatch,
+    };
+
+    let backend = FindingsSinkPg::from_client(test_client());
+    let handle = backend
+        .upsert_batch(FindingsUpsertBatch::default())
+        .expect("empty batch should succeed");
+    let receipt = handle.wait().expect("empty batch commit should succeed");
+
+    assert_eq!(receipt, FindingsCommitReceipt::new(0, 0, 0));
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn upsert_batch_rejects_oversized_batch() {
+    use gossip_contracts::persistence::{
+        FindingsSink, FindingsUpsertBatch, RECOMMENDED_MAX_BATCH_SIZE,
+    };
+
+    let backend = FindingsSinkPg::from_client(test_client());
+
+    // The batch size check uses total_records() which sums all three layer
+    // slice lengths. Filling the findings slice alone past the limit is
+    // sufficient — the records need not be unique because the size gate
+    // fires before deduplication.
+    let finding = gossip_contracts::persistence::FindingRecord::new(
+        gossip_contracts::identity::TenantId::from_bytes([0x11; 32]),
+        gossip_contracts::identity::StableItemId::from_bytes([0x22; 32]),
+        gossip_contracts::identity::RuleFingerprint::from_bytes([0x33; 32]),
+        gossip_contracts::identity::key_secret_hash(
+            &gossip_contracts::identity::TenantSecretKey::from_bytes([0x44; 32]),
+            &gossip_contracts::identity::NormHash::from_digest([0x55; 32]),
+        ),
+    );
+    let findings: Vec<_> = std::iter::repeat_n(finding, RECOMMENDED_MAX_BATCH_SIZE + 1).collect();
+
+    let err = backend
+        .upsert_batch(FindingsUpsertBatch::new(&findings, &[], &[]))
+        .expect_err("oversized batch should be rejected");
+
+    match err {
+        crate::FindingsPgError::BatchTooLarge { len, max } => {
+            assert_eq!(len, RECOMMENDED_MAX_BATCH_SIZE + 1);
+            assert_eq!(max, RECOMMENDED_MAX_BATCH_SIZE);
+        }
+        other => panic!("expected BatchTooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn upsert_batch_rolls_back_on_conflict_error() {
+    use gossip_contracts::identity::{
+        FenceEpoch, LogicalTime, NormHash, ObjectVersionId, ObservationId, OccurrenceId,
+        PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
+        key_secret_hash,
+    };
+    use gossip_contracts::persistence::{
+        CommitHandle, FindingRecord, FindingsConformanceProbe, FindingsSink, FindingsUpsertBatch,
+        OccurrenceRecord, OvidHash,
+    };
+    use gossip_contracts::test_util::observation_record_with_stored_id;
+
+    let backend = FindingsSinkPg::from_client(test_client());
+
+    let tenant_id = TenantId::from_bytes([0x11; 32]);
+    let finding = FindingRecord::new(
+        tenant_id,
+        StableItemId::from_bytes([0x22; 32]),
+        RuleFingerprint::from_bytes([0x33; 32]),
+        key_secret_hash(
+            &TenantSecretKey::from_bytes([0x44; 32]),
+            &NormHash::from_digest([0x55; 32]),
+        ),
+    );
+    let occurrence = OccurrenceRecord::new(
+        tenant_id,
+        finding.finding_id(),
+        ObjectVersionId::from_bytes([0x66; 32]),
+        100,
+        std::num::NonZeroU64::new(50).unwrap(),
+    );
+
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            &[finding],
+            std::slice::from_ref(&occurrence),
+            &[],
+        ))
+        .expect("initial batch should succeed")
+        .wait()
+        .expect("initial commit should succeed");
+
+    let counts_before = backend
+        .durable_counts()
+        .expect("counts should succeed before error");
+
+    // Construct a batch with a new valid finding and an observation that
+    // references a nonexistent occurrence_id. The finding insert will succeed,
+    // but the observation foreign key constraint will fail, causing the entire
+    // transaction to roll back.
+    let new_finding = FindingRecord::new(
+        tenant_id,
+        StableItemId::from_bytes([0xAA; 32]),
+        RuleFingerprint::from_bytes([0xBB; 32]),
+        key_secret_hash(
+            &TenantSecretKey::from_bytes([0xCC; 32]),
+            &NormHash::from_digest([0xDD; 32]),
+        ),
+    );
+    let bad_occurrence_id = OccurrenceId::from_bytes([0xFF; 32]);
+    let bad_observation_id = ObservationId::from_bytes([0xEE; 32]);
+    let bad_observation = observation_record_with_stored_id(
+        tenant_id,
+        bad_observation_id,
+        bad_occurrence_id,
+        PolicyHash::from_bytes([0x77; 32]),
+        OvidHash::from_bytes([0x88; 32]),
+        RunId::from_raw(1),
+        ShardId::from_raw(2),
+        FenceEpoch::from_raw(3),
+        LogicalTime::from_raw(10),
+        None,
+    );
+
+    let err = backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            &[new_finding],
+            &[],
+            &[bad_observation],
+        ))
+        .expect_err("batch with FK violation should fail");
+
+    match err {
+        crate::FindingsPgError::ReferentialIntegrityViolation { .. } => {}
+        other => panic!("expected ReferentialIntegrityViolation, got {other:?}"),
+    }
+
+    let counts_after = backend
+        .durable_counts()
+        .expect("counts should succeed after rollback");
+
+    assert_eq!(
+        counts_before, counts_after,
+        "transaction rollback should leave durable state unchanged"
+    );
+}
+
+#[test]
+#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
+fn upsert_batch_detects_observation_identity_conflict_against_persisted_rows() {
+    use gossip_contracts::identity::{
+        FenceEpoch, LogicalTime, NormHash, ObjectVersionId, PolicyHash, RuleFingerprint, RunId,
+        ShardId, StableItemId, TenantId, TenantSecretKey, key_secret_hash,
+    };
+    use gossip_contracts::persistence::{
+        CommitHandle, FindingRecord, FindingsConformanceProbe, FindingsSink, FindingsUpsertBatch,
+        ObservationRecord, OccurrenceRecord, OvidHash,
+    };
+    use gossip_contracts::test_util::observation_record_with_stored_id;
+
+    let backend = FindingsSinkPg::from_client(test_client());
+
+    let tenant_id = TenantId::from_bytes([0x11; 32]);
+    let finding = FindingRecord::new(
+        tenant_id,
+        StableItemId::from_bytes([0x22; 32]),
+        RuleFingerprint::from_bytes([0x33; 32]),
+        key_secret_hash(
+            &TenantSecretKey::from_bytes([0x44; 32]),
+            &NormHash::from_digest([0x55; 32]),
+        ),
+    );
+    let occurrence = OccurrenceRecord::new(
+        tenant_id,
+        finding.finding_id(),
+        ObjectVersionId::from_bytes([0x66; 32]),
+        100,
+        std::num::NonZeroU64::new(50).unwrap(),
+    );
+    let observation = ObservationRecord::new(
+        tenant_id,
+        occurrence.occurrence_id(),
+        PolicyHash::from_bytes([0x77; 32]),
+        OvidHash::from_bytes([0x88; 32]),
+        RunId::from_raw(1),
+        ShardId::from_raw(2),
+        FenceEpoch::from_raw(3),
+        LogicalTime::from_raw(10),
+    );
+
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            &[finding],
+            &[occurrence],
+            std::slice::from_ref(&observation),
+        ))
+        .expect("initial batch should succeed")
+        .wait()
+        .expect("initial commit should succeed");
+
+    let counts_before = backend
+        .durable_counts()
+        .expect("counts should succeed before conflict");
+
+    // Construct a conflicting observation: same tenant_id and observation_id
+    // (since observation_id is derived from tenant + policy + occurrence,
+    // those three must stay the same to hit the primary key conflict), but
+    // different ovid_hash. The SQL WHERE clause verifies ovid_hash, so a
+    // mismatch suppresses the RETURNING row, triggering ObservationConflict.
+    let conflicting = observation_record_with_stored_id(
+        tenant_id,
+        observation.observation_id(),
+        observation.occurrence_id(),
+        observation.policy_hash(),
+        OvidHash::from_bytes([0x99; 32]),
+        observation.run_id(),
+        observation.shard_id(),
+        observation.fence_epoch(),
+        observation.seen_at(),
+        None,
+    );
+
+    let err = backend
+        .upsert_batch(FindingsUpsertBatch::new(&[], &[], &[conflicting]))
+        .expect_err("conflicting observation should be rejected");
+
+    match err {
+        crate::FindingsPgError::ObservationConflict {
+            tenant_id: err_tenant,
+            observation_id: err_observation,
+        } => {
+            assert_eq!(err_tenant, tenant_id);
+            assert_eq!(err_observation, observation.observation_id());
+        }
+        other => panic!("expected ObservationConflict, got {other:?}"),
+    }
+
+    let counts_after = backend
+        .durable_counts()
+        .expect("counts should succeed after rollback");
+
+    assert_eq!(
+        counts_before, counts_after,
+        "transaction rollback should leave durable state unchanged"
     );
 }

@@ -25,3 +25,4 @@ blake3 = "1.8"
 proptest.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
 gossip-pg-common = { workspace = true, features = ["test-support"] }
+gossip-stdx = { workspace = true, features = ["stdx-proptest"] }

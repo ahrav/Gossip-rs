@@ -476,6 +476,16 @@ pub const OCCURRENCES_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM occurrence
 /// Count all durable observation rows.
 pub const OBSERVATIONS_COUNT_SQL: &str = "SELECT COUNT(*)::BIGINT FROM observations";
 
+/// Fetch all three table counts in a single round-trip.
+///
+/// Each sub-select returns a `BIGINT` column; the caller reads one row with
+/// three columns (`findings_count`, `occurrences_count`, `observations_count`).
+pub const COMBINED_COUNTS_SQL: &str = "\
+    SELECT \
+        (SELECT COUNT(*)::BIGINT FROM findings) AS findings_count, \
+        (SELECT COUNT(*)::BIGINT FROM occurrences) AS occurrences_count, \
+        (SELECT COUNT(*)::BIGINT FROM observations) AS observations_count";
+
 /// Remove all durable findings-layer rows in foreign-key order.
 pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, findings";
 
@@ -812,6 +822,10 @@ mod tests {
         assert!(FINDINGS_COUNT_SQL.contains(&format!("FROM {FINDINGS_TABLE}")));
         assert!(OCCURRENCES_COUNT_SQL.contains(&format!("FROM {OCCURRENCES_TABLE}")));
         assert!(OBSERVATIONS_COUNT_SQL.contains(&format!("FROM {OBSERVATIONS_TABLE}")));
+        // Combined count references all three tables.
+        assert!(COMBINED_COUNTS_SQL.contains(FINDINGS_TABLE));
+        assert!(COMBINED_COUNTS_SQL.contains(OCCURRENCES_TABLE));
+        assert!(COMBINED_COUNTS_SQL.contains(OBSERVATIONS_TABLE));
         // TRUNCATE references all three tables.
         assert!(TRUNCATE_ALL_SQL.contains(OBSERVATIONS_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(OCCURRENCES_TABLE));
@@ -945,6 +959,28 @@ mod tests {
                 "count SQL must cast COUNT(*) to BIGINT: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn finding_row_debug_redacts_secret_hash() {
+        let row = FindingRow {
+            tenant_id: [0x11; 32],
+            finding_id: [0x22; 32],
+            stable_item_id: [0x33; 32],
+            rule_fingerprint: [0x44; 32],
+            secret_hash: [0xAB; 32],
+        };
+        let debug_output = format!("{row:?}");
+
+        assert!(
+            debug_output.contains("[redacted]"),
+            "Debug output must contain [redacted] for secret_hash, got: {debug_output}"
+        );
+        // 0xAB = 171 — must not appear as a raw array element.
+        assert!(
+            !debug_output.contains("171"),
+            "Debug output must not leak raw secret_hash bytes, got: {debug_output}"
+        );
     }
 
     #[test]

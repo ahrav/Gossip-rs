@@ -14,16 +14,17 @@
 > types, embedded migration descriptors, migration configuration, shared runner
 > functions, checksum verification, `PgMigrationError`, `MigrationOperation`,
 > and the shared PostgreSQL integration-test lifecycle helpers live in
-> `gossip-pg-common` (`crates/gossip-pg-common/src/`). Findings PostgreSQL schema,
-> migrations, type-mapping support, and Rust-side batch-folding helpers live in
+> `gossip-pg-common` (`crates/gossip-pg-common/src/`). Findings PostgreSQL backend,
+> schema, migrations, type-mapping support, and Rust-side batch-folding helpers live in
 > `gossip-findings-postgres`
 > (`crates/gossip-findings-postgres/src/`); that crate provides the canonical
 > findings schema plan (table/index/column constants plus row projections),
 > Rust-side tenant validation and duplicate folding that mirrors the SQL
-> merge rules for observations, a findings-specific migration set plus thin
-> wrappers around the shared advisory-locked checksum-verifying runner and
-> shared PostgreSQL test-support lifecycle, and findings-specific type-mapping
-> support, but it does not implement `FindingsSink`.
+> merge rules for observations, the concrete `FindingsSinkPg` backend and
+> `FindingsConformanceProbe` count reader, a findings-specific migration set
+> plus thin wrappers around the shared advisory-locked checksum-verifying
+> runner and shared PostgreSQL test-support lifecycle, and findings-specific
+> type-mapping support.
 
 Boundary 5 defines the persistence contracts for three subsystems:
 
@@ -139,7 +140,7 @@ Non-negotiables (project-wide):
 |------|-------|-------|
 | `gossip-pg-common` | Shared PostgreSQL type-mapping, migration, and test-support primitives | Owns `PgU64ConversionError`, the four `u64 ↔ BIGINT` conversion helpers (bit-pattern and ordered non-negative modes), `EmbeddedMigration`, `MigrationConfig`, `PgMigrationError`, checksum-verification helpers, the shared advisory-locked migration runner, the `MigrationOperation` enum, and the shared PostgreSQL integration-test lifecycle (`create_test_db`, `test_client_bare`, `test_client_with`) used by the Postgres persistence crates. All PostgreSQL persistence backends depend on this crate instead of duplicating these primitives. |
 | `gossip-done-ledger-postgres` | Synchronous PostgreSQL `DoneLedger` backend plus schema/migration/type-mapping support | Implements monotonic done-ledger upsert semantics with durable-before-return commits and provides the done-ledger migration set plus thin wrappers around the shared forward-only runner and shared PostgreSQL test-support lifecycle. Migration application remains checksum-verified, advisory-locked, and transaction-scoped, so migration SQL cannot use commands that require running outside a transaction block (for example `CREATE INDEX CONCURRENTLY`). Passes `run_done_ledger_conformance`. |
-| `gossip-findings-postgres` | Findings PostgreSQL schema, migrations, type-mapping, and write-path preprocessing support | Provides findings-specific schema constants, row projections, Rust-side tenant validation and duplicate folding that mirrors the observation SQL merge rules, and the findings migration set plus thin wrappers around the shared advisory-locked checksum-verifying runner and shared PostgreSQL test-support lifecycle. The crate does not implement `FindingsSink`; it provides the storage-boundary support that the backend will build on. See [findings-postgres-dedup diagram](../../diagrams/21-findings-postgres-dedup.md) for the batch dedup pipeline, observation merge decision tree, and dual-convergence property. |
+| `gossip-findings-postgres` | Synchronous PostgreSQL `FindingsSink` backend plus schema/migration/type-mapping support | Implements `FindingsSinkPg` with single-transaction findings → occurrences → observations upserts, prepared statement reuse, and a `FindingsConformanceProbe` count reader. The crate also provides findings-specific schema constants, row projections, Rust-side tenant validation and duplicate folding that mirrors the observation SQL merge rules, and the findings migration set plus thin wrappers around the shared advisory-locked checksum-verifying runner and shared PostgreSQL test-support lifecycle. See [findings-postgres-dedup diagram](../../diagrams/21-findings-postgres-dedup.md) for the batch dedup pipeline, observation merge decision tree, and dual-convergence property. |
 
 ---
 
