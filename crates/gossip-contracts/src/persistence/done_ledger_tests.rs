@@ -313,6 +313,19 @@ fn merge_findings_count_is_status_aware() {
         DoneLedgerRecord::try_new(key, ScannedWithFindings, 0, 7, make_provenance(), None).unwrap();
     let merged = c.merge(&d).unwrap();
     assert_eq!(merged.findings_count(), 7);
+
+    // Lower-status counts do not contribute once ScannedWithFindings wins.
+    let e = DoneLedgerRecord::try_new(
+        key,
+        FailedPermanent,
+        0,
+        9,
+        make_provenance(),
+        Some(DoneLedgerErrorCode::try_new("FAILED").unwrap()),
+    )
+    .unwrap();
+    let merged = e.merge(&c).unwrap();
+    assert_eq!(merged.findings_count(), 3);
 }
 
 #[test]
@@ -368,7 +381,7 @@ fn merge_different_keys_panics_in_debug() {
 }
 
 #[test]
-fn merge_fail_then_scan_preserves_metrics_and_provenance() {
+fn merge_fail_then_scan_uses_scanned_findings_and_provenance() {
     let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
     let code = DoneLedgerErrorCode::try_new("IO_TIMEOUT").unwrap();
     let prov_fail = DoneLedgerProvenance::new(
@@ -394,7 +407,7 @@ fn merge_fail_then_scan_preserves_metrics_and_provenance() {
     let merged = failed.merge(&scanned).unwrap();
     assert_eq!(merged.status(), ScannedWithFindings);
     assert_eq!(merged.bytes_scanned(), 9_000);
-    assert_eq!(merged.findings_count(), 7);
+    assert_eq!(merged.findings_count(), 1);
     assert_eq!(
         merged.provenance(),
         prov_scan,
@@ -408,7 +421,7 @@ fn merge_fail_then_scan_preserves_metrics_and_provenance() {
 }
 
 #[test]
-fn merge_scan_then_fail_keeps_scanned_metrics_and_provenance() {
+fn merge_scan_then_fail_keeps_scanned_findings_and_provenance() {
     let key = DoneLedgerKey::new(tenant(4), policy(5), ovid(6));
     let code = DoneLedgerErrorCode::try_new("PERM_DENY").unwrap();
     let prov_scan = DoneLedgerProvenance::new(
@@ -434,7 +447,7 @@ fn merge_scan_then_fail_keeps_scanned_metrics_and_provenance() {
     let merged = scanned.merge(&failed).unwrap();
     assert_eq!(merged.status(), ScannedWithFindings);
     assert_eq!(merged.bytes_scanned(), 8_000);
-    assert_eq!(merged.findings_count(), 5);
+    assert_eq!(merged.findings_count(), 2);
     assert_eq!(
         merged.provenance(),
         prov_scan,
@@ -445,6 +458,50 @@ fn merge_scan_then_fail_keeps_scanned_metrics_and_provenance() {
         None,
         "scanned status clears error code"
     );
+}
+
+#[test]
+fn merge_rejects_unvalidated_operand_missing_error_code() {
+    let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+    let error_code = DoneLedgerErrorCode::try_new("TIMEOUT").unwrap();
+
+    // Constructible via try_new but fails validate(): FailedRetryable
+    // without an error_code.
+    let unvalidated = DoneLedgerRecord::try_new(
+        key,
+        FailedRetryable,
+        100,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(999),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        ),
+        None,
+    )
+    .unwrap();
+
+    let valid = DoneLedgerRecord::try_new(
+        key,
+        FailedRetryable,
+        100,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(1),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        ),
+        Some(error_code),
+    )
+    .unwrap();
+
+    // merge rejects unvalidated operands to preserve associativity.
+    assert!(unvalidated.merge(&valid).is_err());
+    assert!(valid.merge(&unvalidated).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -510,5 +567,61 @@ fn done_record_rejects_failure_status_without_error_code() {
         1,
         2,
         None, // missing error_code
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verify: merge rejects the unvalidated-error_code scenario that previously
+// broke associativity. With validated operands, the fallback path is
+// unreachable for non-scanned statuses (validate() guarantees error_code is
+// Some), so associativity holds.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn merge_rejects_all_operands_in_associativity_counterexample() {
+    let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+
+    // The counterexample that broke associativity before the fix:
+    // A: FailedRetryable, run_id=5, error_code=None (unvalidated).
+    let a = DoneLedgerRecord::try_new(
+        key,
+        FailedRetryable,
+        100,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(5),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        ),
+        None,
+    )
+    .unwrap();
+
+    let b = DoneLedgerRecord::try_new(
+        key,
+        FailedRetryable,
+        100,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(3),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        ),
+        Some(DoneLedgerErrorCode::try_new("ZZZZ").unwrap()),
+    )
+    .unwrap();
+
+    // merge rejects A because it fails validate().
+    assert!(
+        a.merge(&b).is_err(),
+        "merge must reject unvalidated operand A"
+    );
+    assert!(
+        b.merge(&a).is_err(),
+        "merge must reject unvalidated operand A"
     );
 }

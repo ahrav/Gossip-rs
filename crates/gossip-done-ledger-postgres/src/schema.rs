@@ -87,14 +87,16 @@ WHERE tenant_id = $1
 /// - **Status** — lattice-merged via `GREATEST` (higher rank = more
 ///   terminal state). Status discriminants used in the SQL:
 ///   - `10` = `ScannedClean` (resets `findings_count` to 0)
-///   - `11` = `ScannedWithFindings` (clamps `findings_count >= 1`)
+///   - `11` = `ScannedWithFindings` (uses only `ScannedWithFindings`
+///     contributors, clamped to `findings_count >= 1`)
 ///   - `1`, `2`, `3` = non-scanned states (keep `findings_count` max)
 /// - **`bytes_scanned`** — non-regressing (`GREATEST`)
 /// - **`findings_count`** — status-aware: reset, floor, or max depending
 ///   on the merged status (see the `CASE` expression)
 /// - **Provenance** (`run_id`, `shard_id`, `fence_epoch`, `started_at`,
-///   `finished_at`) — winner is selected by status rank, then
-///   `finished_at`, then `started_at` (three-way tie-break)
+///   `finished_at`) — winner is selected by the lexicographically greatest
+///   `(status, finished_at, started_at, fence_epoch, run_id, shard_id,
+///   error_code_bytes)` tuple
 /// - **`error_code`** — cleared (`NULL`) when merged status is scanned;
 ///   otherwise taken from the provenance winner, falling back to the
 ///   loser's error code via `COALESCE`
@@ -133,103 +135,150 @@ ON CONFLICT (tenant_id, policy_hash, ovid_hash) DO UPDATE SET
     findings_count = CASE
         WHEN GREATEST(EXCLUDED.status, done_ledger_entries.status) = 10 THEN 0
         WHEN GREATEST(EXCLUDED.status, done_ledger_entries.status) = 11 THEN
-            GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count, 1)
+            GREATEST(
+                CASE WHEN EXCLUDED.status = 11 THEN EXCLUDED.findings_count ELSE 0 END,
+                CASE
+                    WHEN done_ledger_entries.status = 11
+                    THEN done_ledger_entries.findings_count
+                    ELSE 0
+                END,
+                1
+            )
         ELSE GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count)
     END,
-    -- Provenance-winner predicate (status rank > finished_at > started_at) is
-    -- repeated per column because ON CONFLICT DO UPDATE SET does not support
-    -- CTEs or local variables. All 6 CASE arms MUST use the identical condition
-    -- so every provenance field is sourced from the same winner. Edits to one
-    -- CASE branch must be mirrored in all others. The Rust-side function
-    -- DoneLedgerRecord::merge must remain in exact parity with this logic.
+    -- Provenance winner is the lexicographically greatest
+    -- (status, finished_at, started_at, fence_epoch, run_id, shard_id,
+    -- error_code_bytes) tuple. `run_id` and `shard_id` use the stored BIGINT
+    -- bit pattern as their final tie-break order, matching the Rust helper.
+    -- All 6 CASE arms MUST use the identical predicate so every provenance
+    -- field is sourced from the same winner. Edits to one CASE branch must be
+    -- mirrored in all others. The Rust-side function DoneLedgerRecord::merge
+    -- must remain in exact parity with this logic.
+    --
+    -- The ROW() predicate is repeated verbatim in each CASE arm because
+    -- ON CONFLICT DO UPDATE SET does not support CTEs or local variables.
+    -- PostgreSQL does not guarantee common-subexpression elimination across
+    -- CASE arms, so each comparison may be evaluated independently. ROW()
+    -- comparison itself short-circuits left-to-right, so in practice only
+    -- the first differing field is evaluated per arm.
     run_id = CASE
-        WHEN (
-            EXCLUDED.status > done_ledger_entries.status
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
-            )
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
-                AND EXCLUDED.started_at > done_ledger_entries.started_at
-            )
+        WHEN ROW(
+            EXCLUDED.status,
+            EXCLUDED.finished_at,
+            EXCLUDED.started_at,
+            EXCLUDED.fence_epoch,
+            EXCLUDED.run_id,
+            EXCLUDED.shard_id,
+            convert_to(COALESCE(EXCLUDED.error_code, ''), 'UTF8')
+        ) > ROW(
+            done_ledger_entries.status,
+            done_ledger_entries.finished_at,
+            done_ledger_entries.started_at,
+            done_ledger_entries.fence_epoch,
+            done_ledger_entries.run_id,
+            done_ledger_entries.shard_id,
+            convert_to(COALESCE(done_ledger_entries.error_code, ''), 'UTF8')
         ) THEN EXCLUDED.run_id
         ELSE done_ledger_entries.run_id
     END,
     shard_id = CASE
-        WHEN (
-            EXCLUDED.status > done_ledger_entries.status
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
-            )
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
-                AND EXCLUDED.started_at > done_ledger_entries.started_at
-            )
+        WHEN ROW(
+            EXCLUDED.status,
+            EXCLUDED.finished_at,
+            EXCLUDED.started_at,
+            EXCLUDED.fence_epoch,
+            EXCLUDED.run_id,
+            EXCLUDED.shard_id,
+            convert_to(COALESCE(EXCLUDED.error_code, ''), 'UTF8')
+        ) > ROW(
+            done_ledger_entries.status,
+            done_ledger_entries.finished_at,
+            done_ledger_entries.started_at,
+            done_ledger_entries.fence_epoch,
+            done_ledger_entries.run_id,
+            done_ledger_entries.shard_id,
+            convert_to(COALESCE(done_ledger_entries.error_code, ''), 'UTF8')
         ) THEN EXCLUDED.shard_id
         ELSE done_ledger_entries.shard_id
     END,
     fence_epoch = CASE
-        WHEN (
-            EXCLUDED.status > done_ledger_entries.status
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
-            )
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
-                AND EXCLUDED.started_at > done_ledger_entries.started_at
-            )
+        WHEN ROW(
+            EXCLUDED.status,
+            EXCLUDED.finished_at,
+            EXCLUDED.started_at,
+            EXCLUDED.fence_epoch,
+            EXCLUDED.run_id,
+            EXCLUDED.shard_id,
+            convert_to(COALESCE(EXCLUDED.error_code, ''), 'UTF8')
+        ) > ROW(
+            done_ledger_entries.status,
+            done_ledger_entries.finished_at,
+            done_ledger_entries.started_at,
+            done_ledger_entries.fence_epoch,
+            done_ledger_entries.run_id,
+            done_ledger_entries.shard_id,
+            convert_to(COALESCE(done_ledger_entries.error_code, ''), 'UTF8')
         ) THEN EXCLUDED.fence_epoch
         ELSE done_ledger_entries.fence_epoch
     END,
     started_at = CASE
-        WHEN (
-            EXCLUDED.status > done_ledger_entries.status
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
-            )
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
-                AND EXCLUDED.started_at > done_ledger_entries.started_at
-            )
+        WHEN ROW(
+            EXCLUDED.status,
+            EXCLUDED.finished_at,
+            EXCLUDED.started_at,
+            EXCLUDED.fence_epoch,
+            EXCLUDED.run_id,
+            EXCLUDED.shard_id,
+            convert_to(COALESCE(EXCLUDED.error_code, ''), 'UTF8')
+        ) > ROW(
+            done_ledger_entries.status,
+            done_ledger_entries.finished_at,
+            done_ledger_entries.started_at,
+            done_ledger_entries.fence_epoch,
+            done_ledger_entries.run_id,
+            done_ledger_entries.shard_id,
+            convert_to(COALESCE(done_ledger_entries.error_code, ''), 'UTF8')
         ) THEN EXCLUDED.started_at
         ELSE done_ledger_entries.started_at
     END,
     finished_at = CASE
-        WHEN (
-            EXCLUDED.status > done_ledger_entries.status
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
-            )
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
-                AND EXCLUDED.started_at > done_ledger_entries.started_at
-            )
+        WHEN ROW(
+            EXCLUDED.status,
+            EXCLUDED.finished_at,
+            EXCLUDED.started_at,
+            EXCLUDED.fence_epoch,
+            EXCLUDED.run_id,
+            EXCLUDED.shard_id,
+            convert_to(COALESCE(EXCLUDED.error_code, ''), 'UTF8')
+        ) > ROW(
+            done_ledger_entries.status,
+            done_ledger_entries.finished_at,
+            done_ledger_entries.started_at,
+            done_ledger_entries.fence_epoch,
+            done_ledger_entries.run_id,
+            done_ledger_entries.shard_id,
+            convert_to(COALESCE(done_ledger_entries.error_code, ''), 'UTF8')
         ) THEN EXCLUDED.finished_at
         ELSE done_ledger_entries.finished_at
     END,
     error_code = CASE
         WHEN GREATEST(EXCLUDED.status, done_ledger_entries.status) IN (10, 11) THEN NULL
-        WHEN (
-            EXCLUDED.status > done_ledger_entries.status
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at > done_ledger_entries.finished_at
-            )
-            OR (
-                EXCLUDED.status = done_ledger_entries.status
-                AND EXCLUDED.finished_at = done_ledger_entries.finished_at
-                AND EXCLUDED.started_at > done_ledger_entries.started_at
-            )
+        WHEN ROW(
+            EXCLUDED.status,
+            EXCLUDED.finished_at,
+            EXCLUDED.started_at,
+            EXCLUDED.fence_epoch,
+            EXCLUDED.run_id,
+            EXCLUDED.shard_id,
+            convert_to(COALESCE(EXCLUDED.error_code, ''), 'UTF8')
+        ) > ROW(
+            done_ledger_entries.status,
+            done_ledger_entries.finished_at,
+            done_ledger_entries.started_at,
+            done_ledger_entries.fence_epoch,
+            done_ledger_entries.run_id,
+            done_ledger_entries.shard_id,
+            convert_to(COALESCE(done_ledger_entries.error_code, ''), 'UTF8')
         ) THEN COALESCE(EXCLUDED.error_code, done_ledger_entries.error_code)
         ELSE COALESCE(done_ledger_entries.error_code, EXCLUDED.error_code)
     END

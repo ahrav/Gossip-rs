@@ -5,8 +5,10 @@
 -- This migration stores the full DoneLedgerRecord contract shape.
 --
 -- Mapping rules:
---   * equality/grouping IDs (run_id, shard_id) are stored as raw BIGINT bit
---     patterns and reinterpreted at the Rust boundary;
+--   * identity IDs (run_id, shard_id) are stored as raw BIGINT bit patterns
+--     (reinterpreted from u64) via u64_to_pg_bigint_bits. The provenance-winner
+--     ROW() comparison orders them as signed BIGINT; the Rust merge helper
+--     matches this ordering via pg_bigint_bits_sort_key;
 --   * ordered counters/times (fence_epoch, started_at, finished_at,
 --     bytes_scanned) are stored as non-negative BIGINT so SQL ordering matches
 --     semantic ordering.
@@ -25,8 +27,8 @@ CREATE TABLE done_ledger_entries (
     started_at     BIGINT   NOT NULL CHECK (started_at >= 0),
     finished_at    BIGINT   NOT NULL CHECK (finished_at >= started_at),
 
-    -- Equality / grouping identifiers. Signedness is irrelevant inside SQL for
-    -- these fields because the backend uses only equality/grouping semantics.
+    -- Identity fields stored as raw BIGINT bit patterns (u64 reinterpreted).
+    -- The provenance-winner ROW() comparison orders these as signed BIGINT.
     run_id         BIGINT   NOT NULL,
     shard_id       BIGINT   NOT NULL,
 

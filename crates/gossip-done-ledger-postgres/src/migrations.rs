@@ -105,7 +105,7 @@ mod tests {
     fn migration_checksums_are_stable() {
         let expected: &[(&str, &str)] = &[(
             "0001_done_ledger_entries",
-            "d3fa0005a34d48934210df493a5ad56e3e524c9aff33d8498b9fd16bf50cf3b9",
+            "b51c9d7ebf8fb04ab13d0e1a5acf3aeb064b7dd2f4f757fc5881315553dfcf40",
         )];
 
         assert_eq!(
