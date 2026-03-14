@@ -80,7 +80,7 @@ use crate::codec::{
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::keyspace::{EtcdKey, RunRecordKey, ShardOwnerKey, ShardRecordKey, TenantShardCountKey};
 
-mod coordinator;
+pub(crate) mod coordinator;
 mod run_management;
 mod shard_coordination;
 mod test_support;
@@ -132,7 +132,7 @@ const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 pub(crate) const MAX_CHILDREN_PER_SPLIT_TXN: usize = 39;
 
 /// Outcome of a single CAS attempt within a retry loop.
-enum CasOutcome<T> {
+pub(crate) enum CasOutcome<T> {
     /// Transaction committed successfully.
     Committed(T),
     /// CAS precondition failed; caller should retry after backoff.
@@ -154,14 +154,14 @@ enum CasOutcome<T> {
 /// while eliminating the repeated `Txn::new().when(...).and_then(...)`
 /// ceremony.
 #[derive(Default)]
-struct TxnBuilder {
+pub(crate) struct TxnBuilder {
     compares: Vec<Compare>,
     success_ops: Vec<TxnOp>,
 }
 
 impl TxnBuilder {
     /// Create an empty transaction builder.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -169,7 +169,7 @@ impl TxnBuilder {
     ///
     /// Takes ownership of the caller's `Vec<Compare>`, avoiding a second
     /// allocation that `new() + compare_all()` would incur.
-    fn from_compares(compares: Vec<Compare>) -> Self {
+    pub(crate) fn from_compares(compares: Vec<Compare>) -> Self {
         Self {
             compares,
             success_ops: Vec::new(),
@@ -177,25 +177,25 @@ impl TxnBuilder {
     }
 
     /// Add a single compare clause.
-    fn compare(&mut self, compare: Compare) -> &mut Self {
+    pub(crate) fn compare(&mut self, compare: Compare) -> &mut Self {
         self.compares.push(compare);
         self
     }
 
     /// Add multiple compare clauses.
-    fn compare_all(&mut self, compares: impl IntoIterator<Item = Compare>) -> &mut Self {
+    pub(crate) fn compare_all(&mut self, compares: impl IntoIterator<Item = Compare>) -> &mut Self {
         self.compares.extend(compares);
         self
     }
 
     /// Add a put operation without options.
-    fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> &mut Self {
+    pub(crate) fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> &mut Self {
         self.success_ops.push(TxnOp::put(key, value, None));
         self
     }
 
     /// Add a put operation with explicit options.
-    fn put_with_options(
+    pub(crate) fn put_with_options(
         &mut self,
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
@@ -206,13 +206,13 @@ impl TxnBuilder {
     }
 
     /// Add a delete operation without options.
-    fn delete(&mut self, key: impl Into<Vec<u8>>) -> &mut Self {
+    pub(crate) fn delete(&mut self, key: impl Into<Vec<u8>>) -> &mut Self {
         self.success_ops.push(TxnOp::delete(key, None));
         self
     }
 
     /// Add multiple already-constructed transaction operations.
-    fn ops(&mut self, ops: impl IntoIterator<Item = TxnOp>) -> &mut Self {
+    pub(crate) fn ops(&mut self, ops: impl IntoIterator<Item = TxnOp>) -> &mut Self {
         self.success_ops.extend(ops);
         self
     }
@@ -224,7 +224,7 @@ impl TxnBuilder {
     /// Panics if no compare clauses were added. An empty compare set
     /// produces an unconditional transaction — always a logic error in
     /// CAS-guarded coordination code.
-    fn build(self) -> Txn {
+    pub(crate) fn build(self) -> Txn {
         assert!(
             !self.compares.is_empty(),
             "TxnBuilder::build called with no compare clauses — \
@@ -241,10 +241,10 @@ impl TxnBuilder {
 /// subsequent CAS transaction conditions on this revision to detect
 /// concurrent writes between the read and the write.
 #[derive(Debug)]
-struct PersistedRun {
-    record: RunRecord,
+pub(crate) struct PersistedRun {
+    pub(crate) record: RunRecord,
     /// etcd key modification revision used as a CAS precondition.
-    mod_revision: i64,
+    pub(crate) mod_revision: i64,
 }
 
 /// Decoded per-tenant materialized shard count and its `mod_revision`.
@@ -253,9 +253,9 @@ struct PersistedRun {
 /// tenant (including terminal shards). `mod_revision` is used as a CAS guard
 /// so concurrent shard-creating operations serialize within a tenant.
 #[derive(Clone, Copy, Debug)]
-struct PersistedTenantShardCount {
-    count: u64,
-    mod_revision: i64,
+pub(crate) struct PersistedTenantShardCount {
+    pub(crate) count: u64,
+    pub(crate) mod_revision: i64,
 }
 
 /// Prepared per-tenant shard-count CAS update for one mutation attempt.
@@ -264,11 +264,11 @@ struct PersistedTenantShardCount {
 /// 1. evaluate per-tenant shard-limit checks against `current_count`, and
 /// 2. add the same compare+put pair to the mutation transaction.
 #[derive(Debug)]
-struct TenantShardCountMutation {
-    key: TenantShardCountKey,
-    current_count: usize,
-    next_count: u64,
-    compare: Compare,
+pub(crate) struct TenantShardCountMutation {
+    pub(crate) key: TenantShardCountKey,
+    pub(crate) current_count: usize,
+    pub(crate) next_count: u64,
+    pub(crate) compare: Compare,
 }
 
 /// Decoded owner-key state for a single shard, including the etcd lease
@@ -279,11 +279,11 @@ struct TenantShardCountMutation {
 /// owner key automatically, which the backend detects on the next read
 /// as an absent owner.
 #[derive(Clone, Debug)]
-struct PersistedOwner {
-    binding: OwnerLeaseValue,
+pub(crate) struct PersistedOwner {
+    pub(crate) binding: OwnerLeaseValue,
     /// etcd lease ID attached to the owner key. Revocation of this lease
     /// causes etcd to delete the owner key, signaling ownership loss.
-    lease_id: i64,
+    pub(crate) lease_id: i64,
 }
 
 /// A shard record loaded from etcd with its associated slab, revision,
@@ -300,21 +300,21 @@ struct PersistedOwner {
 /// The `record` borrows from `slab` via `ByteSlot` handles; the `Drop`
 /// impl deallocates pooled fields before the slab itself is freed,
 /// preventing double-free or dangling-slot access.
-struct PersistedShard {
-    record: ShardRecord,
+pub(crate) struct PersistedShard {
+    pub(crate) record: ShardRecord,
     /// Slab backing the pooled fields in `record` (`spec`, `cursor`, `spawned`).
-    slab: ByteSlab,
+    pub(crate) slab: ByteSlab,
     /// etcd key modification revision used as a CAS precondition.
-    mod_revision: i64,
+    pub(crate) mod_revision: i64,
     /// Decoded owner-key binding, present only if the shard has a live
     /// `/owner` key in etcd.
-    owner: Option<PersistedOwner>,
+    pub(crate) owner: Option<PersistedOwner>,
 }
 
 impl PersistedShard {
     /// Returns `true` if the shard has a live owner whose logical lease
     /// has not yet expired at `now`.
-    fn owner_is_live_at(&self, now: LogicalTime) -> bool {
+    pub(crate) fn owner_is_live_at(&self, now: LogicalTime) -> bool {
         self.owner.is_some()
             && self
                 .record
@@ -324,7 +324,7 @@ impl PersistedShard {
 
     /// Re-encode the current owner binding for use as a CAS comparison
     /// value. Returns `None` if there is no owner.
-    fn expected_owner_value(&self) -> Option<Vec<u8>> {
+    pub(crate) fn expected_owner_value(&self) -> Option<Vec<u8>> {
         self.owner
             .as_ref()
             .map(|owner| encode_owner_value(owner.binding.worker, owner.binding.fence))
@@ -332,7 +332,7 @@ impl PersistedShard {
 
     /// Returns `true` if the persisted owner binding matches the
     /// presented lease's worker and fence epoch.
-    fn owner_matches_lease(&self, lease: &Lease) -> bool {
+    pub(crate) fn owner_matches_lease(&self, lease: &Lease) -> bool {
         self.owner.as_ref().is_some_and(|owner| {
             owner.binding.worker == lease.owner() && owner.binding.fence == lease.fence()
         })
@@ -359,7 +359,7 @@ impl Drop for PersistedShard {
 /// rather than an RNG. This avoids adding a CSPRNG or thread-local RNG
 /// dependency for a best-effort delay that only needs approximate
 /// decorrelation between independent callers.
-fn cas_retry_delay(attempt: usize) -> Duration {
+pub(crate) fn cas_retry_delay(attempt: usize) -> Duration {
     let base_ms: u64 = 5;
     let max_ms: u64 = 200;
     let exp_ms = base_ms.saturating_mul(1u64 << attempt.min(6)).min(max_ms);
@@ -422,7 +422,7 @@ fn split_replace_replay_child_ids(
 ///
 /// Sets the run status, records the completion timestamp, pushes an `Ack`
 /// op-log entry, and re-validates all record invariants.
-fn apply_terminal_run_transition(
+pub(crate) fn apply_terminal_run_transition(
     record: &mut RunRecord,
     now: LogicalTime,
     target_status: RunStatus,
@@ -457,7 +457,7 @@ fn apply_terminal_run_transition(
 /// length-prefixed; the slab stores them contiguously. A 3×
 /// multiplier on the blob length plus a fixed 1 KiB pad for small-record
 /// overhead covers typical records without over-allocating.
-fn make_decode_slab(blob_len: usize) -> ByteSlab {
+pub(crate) fn make_decode_slab(blob_len: usize) -> ByteSlab {
     let cap = blob_len
         .saturating_mul(3)
         .saturating_add(1024)
@@ -544,7 +544,7 @@ fn build_root_shard_blob(
 ///
 /// Returns an invariant-violation error if the owner key exists but the
 /// shard record has no lease, or if the worker/fence fields disagree.
-fn validate_owner_consistency(
+pub(crate) fn validate_owner_consistency(
     owner: &PersistedOwner,
     record: &ShardRecord,
 ) -> Result<(), EtcdCoordinatorError> {
@@ -595,7 +595,7 @@ fn visible_now(persisted: &PersistedShard, now: LogicalTime) -> LogicalTime {
 /// - `Config` / `Keyspace` / `RuntimeBuild` → `InfraError::corruption`
 ///   (these are construction-time errors that should never appear at
 ///   runtime, but if they do, they are not retryable)
-fn map_etcd_err(
+pub(crate) fn map_etcd_err(
     operation: &'static str,
     err: EtcdCoordinatorError,
 ) -> gossip_coordination::InfraError {
@@ -609,6 +609,23 @@ fn map_etcd_err(
         EtcdCoordinatorError::Etcd { .. } => {
             gossip_coordination::InfraError::transient(operation, err)
         }
+        #[cfg(any(test, feature = "test-support"))]
+        EtcdCoordinatorError::Simulated { source, .. } => match source {
+            crate::sim_etcd_kv::SimEtcdError::FaultInjected { .. }
+            | crate::sim_etcd_kv::SimEtcdError::LeaseNotFound { .. } => {
+                gossip_coordination::InfraError::transient(operation, err)
+            }
+            crate::sim_etcd_kv::SimEtcdError::InvalidLeaseTtl { .. }
+            | crate::sim_etcd_kv::SimEtcdError::LeaseIdExhausted
+            | crate::sim_etcd_kv::SimEtcdError::DuplicateMutation { .. }
+            | crate::sim_etcd_kv::SimEtcdError::UnsupportedGetOption { .. }
+            | crate::sim_etcd_kv::SimEtcdError::UnsupportedCompare { .. }
+            | crate::sim_etcd_kv::SimEtcdError::UnsupportedTxnOp { .. }
+            | crate::sim_etcd_kv::SimEtcdError::MalformedCompare { .. }
+            | crate::sim_etcd_kv::SimEtcdError::MalformedTxn { .. } => {
+                gossip_coordination::InfraError::corruption(operation, err)
+            }
+        },
     }
 }
 
@@ -680,12 +697,12 @@ fn compare_shard_revision(shard_record_key: ShardRecordKey, mod_revision: i64) -
 }
 
 /// CAS guard: run record key has not been modified since `mod_revision`.
-fn compare_run_revision(run_record_key: RunRecordKey, mod_revision: i64) -> Compare {
+pub(crate) fn compare_run_revision(run_record_key: RunRecordKey, mod_revision: i64) -> Compare {
     Compare::mod_revision(run_record_key, CompareOp::Equal, mod_revision)
 }
 
 /// CAS guard: tenant shard-count key has not changed since `mod_revision`.
-fn compare_tenant_shard_count_revision(
+pub(crate) fn compare_tenant_shard_count_revision(
     counter_key: TenantShardCountKey,
     mod_revision: i64,
 ) -> Compare {
@@ -696,12 +713,12 @@ fn compare_tenant_shard_count_revision(
 ///
 /// Used to ensure a shard or run record is being created for the first
 /// time, preventing double-registration.
-fn compare_absent<K: EtcdKey>(key: K) -> Compare {
+pub(crate) fn compare_absent<K: EtcdKey>(key: K) -> Compare {
     Compare::version(key.into_bytes(), CompareOp::Equal, 0)
 }
 
 /// CAS guard: the key must already exist (etcd version > 0).
-fn compare_present<K: EtcdKey>(key: K) -> Compare {
+pub(crate) fn compare_present<K: EtcdKey>(key: K) -> Compare {
     Compare::version(key.into_bytes(), CompareOp::Greater, 0)
 }
 
@@ -736,7 +753,7 @@ fn decode_owner_binding(
 }
 
 /// Encode a tenant shard counter as 8-byte little-endian `u64`.
-fn encode_tenant_shard_count(count: u64) -> [u8; 8] {
+pub(crate) fn encode_tenant_shard_count(count: u64) -> [u8; 8] {
     count.to_le_bytes()
 }
 
@@ -758,7 +775,7 @@ fn decode_tenant_shard_count(
 }
 
 /// Decode a tenant shard counter KV with its revision metadata.
-fn decode_tenant_shard_count_kv(
+pub(crate) fn decode_tenant_shard_count_kv(
     kv: &etcd_client::KeyValue,
 ) -> Result<PersistedTenantShardCount, EtcdCoordinatorError> {
     Ok(PersistedTenantShardCount {
@@ -768,12 +785,12 @@ fn decode_tenant_shard_count_kv(
 }
 
 /// Convert a `usize` count to `u64`, saturating at `u64::MAX`.
-fn usize_to_u64_saturating(value: usize) -> u64 {
+pub(crate) fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// Convert a `u64` count to `usize`, saturating at `usize::MAX`.
-fn u64_to_usize_saturating(value: u64) -> usize {
+pub(crate) fn u64_to_usize_saturating(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
@@ -781,7 +798,9 @@ fn u64_to_usize_saturating(value: u64) -> usize {
 ///
 /// Combines codec decoding with the structural check that every owner
 /// key must be attached to a real etcd lease (lease ID > 0).
-fn decode_owner_kv(kv: &etcd_client::KeyValue) -> Result<PersistedOwner, EtcdCoordinatorError> {
+pub(crate) fn decode_owner_kv(
+    kv: &etcd_client::KeyValue,
+) -> Result<PersistedOwner, EtcdCoordinatorError> {
     let binding = decode_owner_binding(EtcdOperation::Get, kv.value())?;
     if kv.lease() == 0 {
         return Err(EtcdCoordinatorError::Codec {

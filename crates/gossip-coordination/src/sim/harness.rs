@@ -439,6 +439,9 @@ impl From<ParkError> for RejectionKind {
             ParkError::OpIdConflict { .. } => Self::OpIdConflict,
             ParkError::ShardNotFound { .. } => Self::ShardNotFound,
             ParkError::TenantMismatch { .. } => Self::TenantMismatch,
+            ParkError::BackendError(infra) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
+            }
         }
     }
 }

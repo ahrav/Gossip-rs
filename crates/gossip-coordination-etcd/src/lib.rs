@@ -1,6 +1,6 @@
 //! etcd-backed coordination backend for shard and run lifecycle management.
 //!
-//! This crate provides two entrypoints:
+//! This crate provides three entrypoints:
 //!
 //! - [`EtcdCoordinator`] — sync wrapper that owns a single-threaded Tokio
 //!   runtime. Implements [`CoordinationBackend`], [`RunManagement`], and
@@ -9,18 +9,22 @@
 //! - [`AsyncEtcdCoordinator`] — async core that implements
 //!   [`AsyncCoordinationBackend`] and [`AsyncRunManagement`]. Use this
 //!   when an async runtime is already available (e.g., inside a Tokio task).
+//! - [`SimEtcdCoordinator`] *(compiled under `cfg(test)` or `feature =
+//!   "test-support"`)* — sync coordinator backed by [`sim_etcd_kv::SimulatedEtcdKV`]
+//!   for deterministic simulation and invariant checking without a live etcd
+//!   server.
 //!
-//! Both share the same coordination logic and static helpers, with the
-//! only difference being their execution model.
+//! All three share the same coordination validation and transaction shapes,
+//! differing only in transport and execution model.
 //!
-//! Both use etcd transactions for fenced hot-path mutations, publish
+//! The etcd-backed entrypoints use etcd transactions for fenced hot-path mutations, publish
 //! worker-visible active-run/shard indexes, garbage-collect stale
 //! partially created runs, and use real etcd leases for ephemeral
 //! shard-owner bindings.
 //!
 //! # Architecture
 //!
-//! The crate is structured in six internal modules:
+//! The crate is structured in seven internal modules:
 //!
 //! - **`config`** — Validated connection parameters (endpoints, namespace
 //!   prefix, shard limits, tuning). Construction normalizes whitespace and
@@ -47,6 +51,11 @@
 //!   reads, prefix scans, CAS transactions, lease semantics) for
 //!   deterministic simulation without a live etcd server. Includes
 //!   seeded fault injection via [`sim_etcd_kv::SimEtcdFaultConfig`].
+//! - **`sim_coordinator`** *(compiled under `cfg(test)` or `feature =
+//!   "test-support"`)* — Deterministic coordinator adapter that runs the
+//!   sync etcd coordination logic against [`sim_etcd_kv::SimulatedEtcdKV`]
+//!   and exposes [`gossip_coordination::sim::SimIntrospection`] through a
+//!   decoded cache.
 //!
 //! # Build requirements
 //!
@@ -68,6 +77,8 @@ mod config;
 mod error;
 mod keyspace;
 #[cfg(any(test, feature = "test-support"))]
+pub mod sim_coordinator;
+#[cfg(any(test, feature = "test-support"))]
 pub mod sim_etcd_kv;
 
 pub use backend::{AsyncEtcdCoordinator, EtcdCoordinator};
@@ -83,6 +94,8 @@ pub use keyspace::{
     EtcdKeyspace, EtcdKeyspaceError, RunActiveIndexKey, RunRecordKey, ShardActiveIndexKey,
     ShardOwnerKey, ShardRecordKey,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use sim_coordinator::SimEtcdCoordinator;
 
 #[cfg(test)]
 mod test_etcd;

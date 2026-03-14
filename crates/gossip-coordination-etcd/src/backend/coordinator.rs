@@ -74,6 +74,821 @@ use super::{
 #[cfg(any(test, feature = "test-support"))]
 use super::test_support::EtcdTestFaultState;
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) trait SyncEtcdLike: Sized {
+    fn config(&self) -> &EtcdCoordinatorConfig;
+    fn keyspace(&self) -> &EtcdKeyspace;
+
+    fn sync_logical_time(&self, _now: LogicalTime) {}
+
+    fn refresh_cached_run_state(
+        &mut self,
+        _tenant: TenantId,
+        _run: RunId,
+    ) -> Result<(), EtcdCoordinatorError> {
+        Ok(())
+    }
+
+    /// Best-effort cache refresh after a committed CAS transaction.
+    ///
+    /// If the refresh fails (e.g., fault-injected KV error in the sim
+    /// backend), the failure is logged but not propagated. The CAS already
+    /// committed — the caller must receive the successful result. The
+    /// cache will be repopulated on the next mutation or explicit refresh.
+    fn best_effort_refresh_cached_run_state(&mut self, tenant: TenantId, run: RunId) {
+        if let Err(err) = self.refresh_cached_run_state(tenant, run) {
+            tracing::warn!(
+                %err,
+                %tenant,
+                ?run,
+                "post-commit cache refresh failed; cache is stale until next mutation",
+            );
+        }
+    }
+
+    /// Backoff strategy between CAS retry attempts.
+    /// Default: real sleep with exponential backoff + jitter.
+    /// Simulation overrides to no-op (deterministic, no real contention).
+    fn cas_retry_backoff(&self, attempt: usize) {
+        std::thread::sleep(cas_retry_delay(attempt));
+    }
+
+    /// Hook called when GC successfully deletes a run.
+    /// Simulation overrides to drop cached run state.
+    fn on_gc_run(&mut self, _tenant: TenantId, _run: RunId) {}
+
+    fn cas_retry<T, E>(
+        &mut self,
+        mut attempt: impl FnMut(&mut Self, usize) -> Result<CasOutcome<T>, E>,
+        on_exhaustion: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let max_retries = self.config().optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
+            match attempt(self, attempt_num)? {
+                CasOutcome::Committed(val) => return Ok(val),
+                CasOutcome::RetryNeeded => {
+                    if attempt_num + 1 < max_retries {
+                        self.cas_retry_backoff(attempt_num);
+                    }
+                }
+            }
+        }
+        on_exhaustion(self)
+    }
+
+    fn load_shard_and_validate_lease<E>(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        map_not_found: impl FnOnce(ShardKey) -> E,
+        map_load_error: impl FnOnce(EtcdCoordinatorError) -> E,
+        map_stale_fence: impl FnOnce(
+            gossip_coordination::FenceEpoch,
+            gossip_coordination::FenceEpoch,
+        ) -> E,
+    ) -> Result<PersistedShard, E>
+    where
+        E: From<gossip_coordination::CoordError>,
+    {
+        let key = lease.shard_key();
+        let persisted = match self.load_shard_record(tenant, key) {
+            Ok(Some(shard)) => shard,
+            Ok(None) => return Err(map_not_found(key)),
+            Err(err) => return Err(map_load_error(err)),
+        };
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, map_stale_fence)?;
+        Ok(persisted)
+    }
+
+    fn etcd_get(
+        &self,
+        key: Vec<u8>,
+        options: Option<GetOptions>,
+    ) -> Result<etcd_client::GetResponse, EtcdCoordinatorError>;
+
+    fn etcd_txn(&self, txn: Txn) -> Result<etcd_client::TxnResponse, EtcdCoordinatorError>;
+
+    fn etcd_lease_grant(
+        &self,
+        ttl: i64,
+    ) -> Result<etcd_client::LeaseGrantResponse, EtcdCoordinatorError>;
+
+    fn etcd_lease_keep_alive_once(&self, lease_id: i64) -> Result<(), EtcdCoordinatorError>;
+
+    fn etcd_lease_revoke(
+        &self,
+        lease_id: i64,
+    ) -> Result<etcd_client::LeaseRevokeResponse, EtcdCoordinatorError>;
+
+    fn load_run_record(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<Option<PersistedRun>, EtcdCoordinatorError> {
+        let key = self.keyspace().run_record_key(tenant, run).into_bytes();
+        let response = self.etcd_get(key, None)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+
+        let record =
+            decode_run_record(kv.value()).map_err(|source| EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source,
+            })?;
+
+        if record.tenant != tenant {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "RunRecord",
+                    detail: "run record tenant disagrees with key-path tenant",
+                },
+            });
+        }
+        if record.run != run {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "RunRecord",
+                    detail: "run record run id disagrees with key-path run id",
+                },
+            });
+        }
+
+        Ok(Some(PersistedRun {
+            record,
+            mod_revision: kv.mod_revision(),
+        }))
+    }
+
+    fn load_tenant_shard_count(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<PersistedTenantShardCount>, EtcdCoordinatorError> {
+        let key = self.keyspace().tenant_shard_count_key(tenant).into_bytes();
+        let response = self.etcd_get(key, None)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        Ok(Some(decode_tenant_shard_count_kv(kv)?))
+    }
+
+    fn prepare_tenant_shard_count_mutation(
+        &self,
+        tenant: TenantId,
+        additional: usize,
+    ) -> Result<TenantShardCountMutation, EtcdCoordinatorError> {
+        let counter_key = self.keyspace().tenant_shard_count_key(tenant);
+        let delta = usize_to_u64_saturating(additional);
+        if let Some(counter) = self.load_tenant_shard_count(tenant)? {
+            return Ok(TenantShardCountMutation {
+                key: counter_key.clone(),
+                current_count: u64_to_usize_saturating(counter.count),
+                next_count: counter.count.saturating_add(delta),
+                compare: compare_tenant_shard_count_revision(counter_key, counter.mod_revision),
+            });
+        }
+
+        let scanned =
+            self.count_persisted_shards_under_prefix(self.keyspace().tenant_prefix(tenant))?;
+        Ok(TenantShardCountMutation {
+            key: counter_key.clone(),
+            current_count: scanned,
+            next_count: usize_to_u64_saturating(scanned).saturating_add(delta),
+            compare: compare_absent(counter_key),
+        })
+    }
+
+    fn load_shard_record(
+        &self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<Option<PersistedShard>, EtcdCoordinatorError> {
+        let shard_record_key = self
+            .keyspace()
+            .shard_record_key(tenant, key.run(), key.shard());
+        let owner_key = shard_record_key.owner_key();
+
+        let response = self.etcd_get(
+            shard_record_key.clone().into_bytes(),
+            Some(GetOptions::new().with_prefix()),
+        )?;
+
+        let mut record_kv: Option<&etcd_client::KeyValue> = None;
+        let mut owner_kv: Option<&etcd_client::KeyValue> = None;
+
+        for kv in response.kvs() {
+            if kv.key() == shard_record_key.as_bytes() {
+                record_kv = Some(kv);
+            } else if kv.key() == owner_key.as_bytes() {
+                owner_kv = Some(kv);
+            }
+        }
+
+        let Some(kv) = record_kv else {
+            return Ok(None);
+        };
+
+        let mut slab = make_decode_slab(kv.value().len());
+        let record = decode_shard_record(kv.value(), &mut slab).map_err(|source| {
+            EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source,
+            }
+        })?;
+
+        if record.tenant != tenant {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record tenant disagrees with key-path tenant",
+                },
+            });
+        }
+        if record.run != key.run() {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record run id disagrees with key-path run id",
+                },
+            });
+        }
+        if record.shard != key.shard() {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "shard record shard id disagrees with key-path shard id",
+                },
+            });
+        }
+
+        let mod_revision = kv.mod_revision();
+
+        let owner = match owner_kv {
+            None => None,
+            Some(okv) => Some(decode_owner_kv(okv)?),
+        };
+
+        if let Some(owner) = &owner {
+            validate_owner_consistency(owner, &record)?;
+        }
+
+        Ok(Some(PersistedShard {
+            record,
+            slab,
+            mod_revision,
+            owner,
+        }))
+    }
+
+    fn scan_run_shards(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<Vec<PersistedShard>, EtcdCoordinatorError> {
+        let prefix = self
+            .keyspace()
+            .shard_records_scan_prefix(tenant, run)
+            .into_bytes();
+        let response = self.etcd_get(prefix, Some(GetOptions::new().with_prefix()))?;
+
+        let mut owner_map = HashMap::<ShardOwnerKey, PersistedOwner>::new();
+        let mut record_kvs =
+            Vec::<(ShardRecordKey, Vec<u8>, i64)>::with_capacity(response.kvs().len());
+
+        for kv in response.kvs() {
+            match PersistedShardSubtreeKey::classify(kv.key()) {
+                Some(PersistedShardSubtreeKey::Owner) => {
+                    let owner_key = ShardOwnerKey::from_encoded_key(kv.key()).ok_or_else(|| {
+                        EtcdCoordinatorError::Codec {
+                            operation: EtcdOperation::Get,
+                            source: EtcdCodecError::InvariantViolation {
+                                kind: "OwnerKey",
+                                detail: "owner key under shard scan prefix is malformed",
+                            },
+                        }
+                    })?;
+                    owner_map.insert(owner_key, decode_owner_kv(kv)?);
+                }
+                Some(PersistedShardSubtreeKey::Record) => {
+                    let record_key =
+                        ShardRecordKey::from_encoded_key(kv.key()).ok_or_else(|| {
+                            EtcdCoordinatorError::Codec {
+                                operation: EtcdOperation::Get,
+                                source: EtcdCodecError::InvariantViolation {
+                                    kind: "ShardRecord",
+                                    detail: "shard record key under scan prefix is malformed",
+                                },
+                            }
+                        })?;
+                    record_kvs.push((record_key, kv.value().to_vec(), kv.mod_revision()));
+                }
+                None => {
+                    return Err(EtcdCoordinatorError::Codec {
+                        operation: EtcdOperation::Get,
+                        source: EtcdCodecError::InvariantViolation {
+                            kind: "ShardKey",
+                            detail: "unexpected key found under shard scan prefix",
+                        },
+                    });
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(record_kvs.len());
+        for (record_key, value, mod_revision) in record_kvs {
+            let mut slab = make_decode_slab(value.len());
+            let record = decode_shard_record(&value, &mut slab).map_err(|source| {
+                EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source,
+                }
+            })?;
+
+            if record.tenant != tenant || record.run != run {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "ShardRecord",
+                        detail: "shard record identity disagrees with scan prefix",
+                    },
+                });
+            }
+            let expected_key = self.keyspace().shard_record_key(tenant, run, record.shard);
+            if record_key != expected_key {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "ShardRecord",
+                        detail: "shard record shard id disagrees with key path",
+                    },
+                });
+            }
+
+            let owner = owner_map.remove(&record_key.owner_key());
+
+            if let Some(owner) = &owner {
+                validate_owner_consistency(owner, &record)?;
+            }
+
+            out.push(PersistedShard {
+                record,
+                slab,
+                mod_revision,
+                owner,
+            });
+        }
+
+        if !owner_map.is_empty() {
+            return Err(EtcdCoordinatorError::Codec {
+                operation: EtcdOperation::Get,
+                source: EtcdCodecError::InvariantViolation {
+                    kind: "OwnerKey",
+                    detail: "owner key exists without a corresponding shard record",
+                },
+            });
+        }
+
+        Ok(out)
+    }
+
+    fn scan_tenant_runs(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<PersistedRun>, EtcdCoordinatorError> {
+        let prefix = self.keyspace().run_records_scan_prefix(tenant);
+        let response = self.etcd_get(
+            prefix.as_bytes().to_vec(),
+            Some(GetOptions::new().with_prefix()),
+        )?;
+
+        let mut out = Vec::with_capacity(response.kvs().len());
+        for kv in response.kvs() {
+            let Some(run_from_key) = RunRecordKey::parse_direct_run_id(&prefix, kv.key()) else {
+                continue;
+            };
+            let record =
+                decode_run_record(kv.value()).map_err(|source| EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source,
+                })?;
+            if record.tenant != tenant {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "RunRecord",
+                        detail: "run record tenant disagrees with keyspace tenant",
+                    },
+                });
+            }
+            if record.run != run_from_key {
+                return Err(EtcdCoordinatorError::Codec {
+                    operation: EtcdOperation::Get,
+                    source: EtcdCodecError::InvariantViolation {
+                        kind: "RunRecord",
+                        detail: "run record run id disagrees with key suffix",
+                    },
+                });
+            }
+            out.push(PersistedRun {
+                record,
+                mod_revision: kv.mod_revision(),
+            });
+        }
+        out.sort_unstable_by_key(|persisted| persisted.record.run.as_raw());
+        Ok(out)
+    }
+
+    fn count_available_lightweight(
+        &self,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<CapacityHint, EtcdCoordinatorError> {
+        let active_prefix = self
+            .keyspace()
+            .shards_active_prefix(tenant, run)
+            .into_bytes();
+        let active_response = self.etcd_get(
+            active_prefix,
+            Some(GetOptions::new().with_prefix().with_count_only()),
+        )?;
+        let total_active = u32::try_from(active_response.count()).unwrap_or_else(|_| {
+            tracing::warn!(
+                count = active_response.count(),
+                "etcd active count exceeds u32 range; clamping to u32::MAX"
+            );
+            u32::MAX
+        });
+
+        let shards_prefix = self.keyspace().shard_records_scan_prefix(tenant, run);
+        let keys_response = self.etcd_get(
+            shards_prefix.as_bytes().to_vec(),
+            Some(GetOptions::new().with_prefix().with_keys_only()),
+        )?;
+        let owned_count = u32::try_from(
+            keys_response
+                .kvs()
+                .iter()
+                .filter(|kv| {
+                    ShardOwnerKey::parse_owned_shard(shards_prefix.as_bytes(), kv.key()).is_some()
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+
+        Ok(CapacityHint {
+            available_count: total_active.saturating_sub(owned_count),
+            earliest_deadline: None,
+        })
+    }
+
+    fn count_persisted_shards_under_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<usize, EtcdCoordinatorError> {
+        let response = self.etcd_get(
+            prefix.as_bytes().to_vec(),
+            Some(GetOptions::new().with_prefix().with_keys_only()),
+        )?;
+        Ok(response
+            .kvs()
+            .iter()
+            .filter(|kv| {
+                PersistedShardSubtreeKey::classify(kv.key())
+                    == Some(PersistedShardSubtreeKey::Record)
+            })
+            .count())
+    }
+
+    fn list_active_runs_into(
+        &self,
+        tenant: TenantId,
+        out: &mut Vec<RunId>,
+    ) -> Result<(), EtcdCoordinatorError> {
+        let mut prefix = self.keyspace().runs_active_prefix(tenant);
+        prefix.push('/');
+        let response = self.etcd_get(
+            prefix.as_bytes().to_vec(),
+            Some(GetOptions::new().with_prefix().with_keys_only()),
+        )?;
+        out.clear();
+        for kv in response.kvs() {
+            if let Some(run) = RunActiveIndexKey::parse_direct_run_id(&prefix, kv.key()) {
+                out.push(run);
+            }
+        }
+        out.sort_unstable_by_key(|run| run.as_raw());
+        Ok(())
+    }
+
+    fn gc_stale_initializing_runs_into(
+        &mut self,
+        tenant: TenantId,
+        cutoff: LogicalTime,
+        out: &mut Vec<RunId>,
+    ) -> Result<(), EtcdCoordinatorError> {
+        let mut candidates = self.scan_tenant_runs(tenant)?;
+        candidates.retain(|persisted| {
+            persisted.record.status == RunStatus::Initializing
+                && persisted.record.created_at < cutoff
+        });
+        candidates.sort_by(|left, right| {
+            left.record
+                .created_at
+                .cmp(&right.record.created_at)
+                .then_with(|| left.record.run.as_raw().cmp(&right.record.run.as_raw()))
+        });
+
+        out.clear();
+        for persisted in candidates {
+            let run = persisted.record.run;
+            let run_key = self.keyspace().run_record_key(tenant, run);
+            let active_key = self.keyspace().run_active_index_key(tenant, run);
+            let shard_prefix = self.keyspace().shard_records_scan_prefix(tenant, run);
+            let mut active_shard_prefix = self.keyspace().shards_active_prefix(tenant, run);
+            active_shard_prefix.push('/');
+            let removed_shard_count =
+                self.count_persisted_shards_under_prefix(shard_prefix.clone())?;
+
+            let counter_key = self.keyspace().tenant_shard_count_key(tenant);
+            let (counter_compare, next_count) = if let Some(counter) =
+                self.load_tenant_shard_count(tenant)?
+            {
+                let removed = usize_to_u64_saturating(removed_shard_count);
+                let next = match counter.count.checked_sub(removed) {
+                    Some(n) => n,
+                    None => {
+                        tracing::warn!(
+                            tenant = %tenant,
+                            persisted_count = counter.count,
+                            removed = removed,
+                            "tenant shard counter underflow during GC; \
+                             rebuilding from scan"
+                        );
+                        let scanned = self.count_persisted_shards_under_prefix(
+                            self.keyspace().tenant_prefix(tenant),
+                        )?;
+                        usize_to_u64_saturating(scanned).saturating_sub(removed)
+                    }
+                };
+                (
+                    compare_tenant_shard_count_revision(counter_key.clone(), counter.mod_revision),
+                    next,
+                )
+            } else {
+                let scanned = self
+                    .count_persisted_shards_under_prefix(self.keyspace().tenant_prefix(tenant))?;
+                let next = usize_to_u64_saturating(scanned)
+                    .saturating_sub(usize_to_u64_saturating(removed_shard_count));
+                (compare_absent(counter_key.clone()), next)
+            };
+
+            let mut txn = TxnBuilder::new();
+            txn.compare(compare_run_revision(
+                run_key.clone(),
+                persisted.mod_revision,
+            ))
+            .compare(compare_absent(active_key.clone()))
+            .delete(run_key.into_bytes())
+            .delete(active_key.into_bytes())
+            .ops([
+                TxnOp::delete(
+                    shard_prefix.into_bytes(),
+                    Some(DeleteOptions::new().with_prefix()),
+                ),
+                TxnOp::delete(
+                    active_shard_prefix.into_bytes(),
+                    Some(DeleteOptions::new().with_prefix()),
+                ),
+            ]);
+            txn.compare(counter_compare).put(
+                counter_key.into_bytes(),
+                encode_tenant_shard_count(next_count),
+            );
+
+            let response = self.etcd_txn(txn.build())?;
+            if response.succeeded() {
+                self.on_gc_run(tenant, run);
+                out.push(run);
+            } else {
+                tracing::debug!(
+                    ?run,
+                    "GC: skipped stale run (concurrent activation or revision change)"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn transition_run_terminal(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+        op_kind: RunOpKind,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+        let (target_status, payload_hash, require_active) = match op_kind {
+            RunOpKind::CompleteRun => (RunStatus::Done, hash_complete_run_payload(), true),
+            RunOpKind::FailRun => (RunStatus::Failed, hash_fail_run_payload(), true),
+            RunOpKind::CancelRun => (RunStatus::Cancelled, hash_cancel_run_payload(), false),
+            RunOpKind::RegisterShards => {
+                unreachable!("transition_run_terminal does not handle RegisterShards")
+            }
+        };
+
+        self.cas_retry(
+            |this, _attempt| {
+                let persisted = match this.load_run_record(tenant, run) {
+                    Ok(Some(run_record)) => run_record,
+                    Ok(None) => return Err(RunTransitionError::RunNotFound),
+                    Err(err) => {
+                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
+                            "run_terminal.load_run",
+                            err,
+                        )));
+                    }
+                };
+                let prior_status = persisted.record.status;
+                let mut record = persisted.record;
+
+                if record.tenant != tenant {
+                    return Err(RunTransitionError::TenantMismatch { expected: tenant });
+                }
+                if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
+                    if entry.kind() != op_kind {
+                        return Err(RunTransitionError::BackendError(InfraError::corruption(
+                            "run_terminal.idempotent_replay",
+                            format!(
+                                "kind mismatch: expected {op_kind:?}, got {:?}",
+                                entry.kind()
+                            ),
+                        )));
+                    }
+                    return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
+                }
+                if record.status.is_terminal() {
+                    return Err(RunTransitionError::RunTerminal {
+                        status: record.status,
+                    });
+                }
+                if require_active && record.status != RunStatus::Active {
+                    return Err(RunTransitionError::WrongStatus {
+                        status: record.status,
+                        target: target_status,
+                    });
+                }
+
+                apply_terminal_run_transition(
+                    &mut record,
+                    now,
+                    target_status,
+                    op_id,
+                    op_kind,
+                    payload_hash,
+                );
+                let run_blob = encode_run_record(&record);
+                let run_key = this.keyspace().run_record_key(tenant, run);
+                let active_key = this.keyspace().run_active_index_key(tenant, run);
+                let mut compares = vec![compare_run_revision(
+                    run_key.clone(),
+                    persisted.mod_revision,
+                )];
+                match prior_status {
+                    RunStatus::Active => {
+                        compares.push(compare_present(active_key.clone()));
+                    }
+                    RunStatus::Initializing => {
+                        compares.push(compare_absent(active_key.clone()));
+                    }
+                    RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled => {
+                        unreachable!("terminal statuses return early")
+                    }
+                }
+
+                let mut txn = TxnBuilder::new();
+                txn.compare_all(compares)
+                    .put(run_key.into_bytes(), run_blob)
+                    .delete(active_key.into_bytes());
+                txn.execute(this, IdempotentOutcome::Executed(()))
+                    .map_err(|err| {
+                        RunTransitionError::BackendError(super::map_etcd_err(
+                            "run_terminal.txn",
+                            err,
+                        ))
+                    })
+            },
+            |this| {
+                let persisted = match this.load_run_record(tenant, run) {
+                    Ok(Some(r)) => r,
+                    Ok(None) if !require_active => return Err(RunTransitionError::RunNotFound),
+                    Ok(None) => {
+                        return Err(RunTransitionError::BackendError(InfraError::corruption(
+                            "run_terminal.exhaust.load_run",
+                            format!("run {run:?} missing (expected Active)"),
+                        )));
+                    }
+                    Err(err) => {
+                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
+                            "run_terminal.exhaust.load_run",
+                            err,
+                        )));
+                    }
+                };
+                if persisted.record.tenant != tenant {
+                    return Err(RunTransitionError::TenantMismatch { expected: tenant });
+                }
+                if let Some(entry) = persisted.record.check_op_idempotency(op_id, payload_hash)? {
+                    if entry.kind() != op_kind {
+                        return Err(RunTransitionError::BackendError(InfraError::corruption(
+                            "run_terminal.idempotent_replay",
+                            format!(
+                                "kind mismatch: expected {op_kind:?}, got {:?}",
+                                entry.kind()
+                            ),
+                        )));
+                    }
+                    return Ok(IdempotentOutcome::Replayed(()));
+                }
+                if persisted.record.status.is_terminal() {
+                    return Err(RunTransitionError::RunTerminal {
+                        status: persisted.record.status,
+                    });
+                }
+                if require_active && persisted.record.status != RunStatus::Active {
+                    return Err(RunTransitionError::WrongStatus {
+                        status: persisted.record.status,
+                        target: target_status,
+                    });
+                }
+
+                Err(RunTransitionError::BackendError(InfraError::transient(
+                    "run_terminal",
+                    "CAS retry budget exhausted",
+                )))
+            },
+        )
+    }
+
+    fn best_effort_revoke_lease(&self, lease_id: i64) {
+        if lease_id <= 0 {
+            return;
+        }
+        if let Err(err) = self.etcd_lease_revoke(lease_id) {
+            tracing::warn!(
+                lease_id,
+                %err,
+                ttl_secs = self.config().owner_lease_ttl_secs(),
+                "failed to revoke etcd lease; will expire via TTL",
+            );
+        }
+    }
+
+    fn load_run_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<PersistedRun, InfraError> {
+        match self.load_run_record(tenant, run) {
+            Ok(Some(run_record)) => Ok(run_record),
+            Ok(None) => Err(InfraError::corruption(
+                context,
+                format!("run {run:?} missing"),
+            )),
+            Err(err) => Err(super::map_etcd_err(context, err)),
+        }
+    }
+
+    fn load_shard_checked(
+        &self,
+        context: &'static str,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<PersistedShard, InfraError> {
+        match self.load_shard_record(tenant, key) {
+            Ok(Some(shard)) => Ok(shard),
+            Ok(None) => Err(InfraError::corruption(
+                context,
+                format!("shard {key:?} missing"),
+            )),
+            Err(err) => Err(super::map_etcd_err(context, err)),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_replace_fault_if_armed(&mut self, _tenant: TenantId, _key: ShardKey) {}
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_residual_fault_if_armed(&mut self, _tenant: TenantId, _key: ShardKey) {}
+}
+
 // ---------------------------------------------------------------------------
 // EtcdCoordinator — sync wrapper
 // ---------------------------------------------------------------------------
@@ -221,78 +1036,6 @@ impl EtcdCoordinator {
             })
     }
 
-    /// Panics with a message identifying the unimplemented operation.
-    ///
-    /// Used as a placeholder for coordination operations whose etcd
-    /// persistence logic has not been implemented. Callers should not
-    /// catch this panic — it indicates a code path that must not be
-    /// reached until the operation is persisted.
-    pub(super) fn fail_unimplemented<T>(&self, operation: &'static str) -> T {
-        panic!(
-            "EtcdCoordinator::{operation} is not yet persisted to etcd; \
-             this operation must be implemented before it is callable"
-        );
-    }
-
-    /// Execute a CAS retry loop with exponential backoff and jitter.
-    ///
-    /// Calls `attempt` up to `optimistic_txn_retries` times. On
-    /// [`CasOutcome::RetryNeeded`], sleeps with jittered backoff and
-    /// retries. On [`CasOutcome::Committed`], returns immediately.
-    /// If retries exhaust, calls `on_exhaustion` immediately (no
-    /// additional backoff) to re-read state and produce a domain error
-    /// or panic. Callers that perform network I/O in `on_exhaustion`
-    /// should be aware this executes at peak-contention time.
-    pub(super) fn cas_retry<T, E>(
-        &mut self,
-        mut attempt: impl FnMut(&mut Self, usize) -> Result<CasOutcome<T>, E>,
-        on_exhaustion: impl FnOnce(&mut Self) -> Result<T, E>,
-    ) -> Result<T, E> {
-        let max_retries = self.config.optimistic_txn_retries();
-        for attempt_num in 0..max_retries {
-            match attempt(self, attempt_num)? {
-                CasOutcome::Committed(val) => return Ok(val),
-                CasOutcome::RetryNeeded => {
-                    if attempt_num + 1 < max_retries {
-                        std::thread::sleep(cas_retry_delay(attempt_num));
-                    }
-                }
-            }
-        }
-        on_exhaustion(self)
-    }
-
-    /// Load a shard and validate a presented lease against persisted state.
-    ///
-    /// Combines [`Self::load_shard_record`] with lease validation. Used by
-    /// `renew`, `checkpoint`, `split_replace`, and their exhaustion handlers.
-    pub(super) fn load_shard_and_validate_lease<E>(
-        &self,
-        now: LogicalTime,
-        tenant: TenantId,
-        lease: &Lease,
-        map_not_found: impl FnOnce(ShardKey) -> E,
-        map_load_error: impl FnOnce(EtcdCoordinatorError) -> E,
-        map_stale_fence: impl FnOnce(
-            gossip_coordination::FenceEpoch,
-            gossip_coordination::FenceEpoch,
-        ) -> E,
-    ) -> Result<PersistedShard, E>
-    where
-        E: From<gossip_coordination::CoordError>,
-    {
-        let key = lease.shard_key();
-        let persisted = match self.load_shard_record(tenant, key) {
-            Ok(Some(shard)) => shard,
-            Ok(None) => return Err(map_not_found(key)),
-            Err(err) => {
-                return Err(map_load_error(err));
-            }
-        };
-        validate_loaded_shard_lease(now, tenant, lease, &persisted, map_stale_fence)?;
-        Ok(persisted)
-    }
-
     /// Execute a `get` RPC on the internal single-threaded Tokio runtime.
     pub(super) fn etcd_get(
         &self,
@@ -383,874 +1126,32 @@ impl EtcdCoordinator {
             })
     }
 
-    /// Load a single run record by exact key. Returns `None` if the key
-    /// does not exist in etcd. Cross-validates that the decoded record's
-    /// identity fields match the key-path parameters to detect data
-    /// corruption at the data-access layer.
-    pub(super) fn load_run_record(
-        &self,
-        tenant: TenantId,
-        run: RunId,
-    ) -> Result<Option<PersistedRun>, EtcdCoordinatorError> {
-        let key = self.keyspace.run_record_key(tenant, run).into_bytes();
-        let response = self.etcd_get(key, None)?;
-        let Some(kv) = response.kvs().first() else {
-            return Ok(None);
-        };
-
-        let record =
-            decode_run_record(kv.value()).map_err(|source| EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source,
-            })?;
-
-        if record.tenant != tenant {
-            return Err(EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source: EtcdCodecError::InvariantViolation {
-                    kind: "RunRecord",
-                    detail: "run record tenant disagrees with key-path tenant",
-                },
-            });
-        }
-        if record.run != run {
-            return Err(EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source: EtcdCodecError::InvariantViolation {
-                    kind: "RunRecord",
-                    detail: "run record run id disagrees with key-path run id",
-                },
-            });
-        }
-
-        Ok(Some(PersistedRun {
-            record,
-            mod_revision: kv.mod_revision(),
-        }))
-    }
-
-    /// Load the per-tenant materialized shard counter key.
-    ///
-    /// Returns `Ok(None)` when the counter key does not exist; callers then
-    /// bootstrap from a tenant prefix scan.
-    pub(super) fn load_tenant_shard_count(
-        &self,
-        tenant: TenantId,
-    ) -> Result<Option<PersistedTenantShardCount>, EtcdCoordinatorError> {
-        let key = self.keyspace.tenant_shard_count_key(tenant).into_bytes();
-        let response = self.etcd_get(key, None)?;
-        let Some(kv) = response.kvs().first() else {
-            return Ok(None);
-        };
-        Ok(Some(decode_tenant_shard_count_kv(kv)?))
-    }
-
-    /// Prepare a CAS-guarded per-tenant counter update for one mutation.
-    ///
-    /// If the counter key exists, uses its current value and revision.
-    /// If absent, bootstraps from a tenant shard scan and guards creation
-    /// with `compare_absent`.
-    pub(super) fn prepare_tenant_shard_count_mutation(
-        &self,
-        tenant: TenantId,
-        additional: usize,
-    ) -> Result<TenantShardCountMutation, EtcdCoordinatorError> {
-        let counter_key = self.keyspace.tenant_shard_count_key(tenant);
-        let delta = usize_to_u64_saturating(additional);
-        if let Some(counter) = self.load_tenant_shard_count(tenant)? {
-            return Ok(TenantShardCountMutation {
-                key: counter_key.clone(),
-                current_count: u64_to_usize_saturating(counter.count),
-                next_count: counter.count.saturating_add(delta),
-                compare: compare_tenant_shard_count_revision(counter_key, counter.mod_revision),
-            });
-        }
-
-        let scanned =
-            self.count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))?;
-        Ok(TenantShardCountMutation {
-            key: counter_key.clone(),
-            current_count: scanned,
-            next_count: usize_to_u64_saturating(scanned).saturating_add(delta),
-            compare: compare_absent(counter_key),
-        })
-    }
-
-    /// Load a single shard record and its owner binding by exact key.
-    ///
-    /// Uses a single prefix-range GET on the shard record key. Because
-    /// shard IDs are fixed-width 16-char hex and the only child key is
-    /// `/owner`, the prefix scan returns exactly the record KV and
-    /// (optionally) the owner KV — no false matches against other shard
-    /// IDs. Cross-validates the owner binding against the shard record's
-    /// lease fields and the decoded record's identity fields against the
-    /// key-path parameters to detect data corruption. Returns `None` if
-    /// the shard record key does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EtcdCoordinatorError::Codec`] with an invariant violation
-    /// if the owner key exists but disagrees with the shard record's
-    /// lease holder or fence epoch, or if the decoded record's identity
-    /// fields disagree with the key-path parameters.
-    pub(super) fn load_shard_record(
-        &self,
-        tenant: TenantId,
-        key: ShardKey,
-    ) -> Result<Option<PersistedShard>, EtcdCoordinatorError> {
-        let shard_record_key = self
-            .keyspace
-            .shard_record_key(tenant, key.run(), key.shard());
-        let owner_key = shard_record_key.owner_key();
-
-        // Single prefix-range scan fetches both the shard record and its
-        // `/owner` child key in one etcd RPC.
-        let response = self.etcd_get(
-            shard_record_key.clone().into_bytes(),
-            Some(GetOptions::new().with_prefix()),
-        )?;
-
-        let mut record_kv: Option<&etcd_client::KeyValue> = None;
-        let mut owner_kv: Option<&etcd_client::KeyValue> = None;
-
-        for kv in response.kvs() {
-            if kv.key() == shard_record_key.as_bytes() {
-                record_kv = Some(kv);
-            } else if kv.key() == owner_key.as_bytes() {
-                owner_kv = Some(kv);
-            }
-        }
-
-        let Some(kv) = record_kv else {
-            return Ok(None);
-        };
-
-        let mut slab = make_decode_slab(kv.value().len());
-        let record = decode_shard_record(kv.value(), &mut slab).map_err(|source| {
-            EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source,
-            }
-        })?;
-
-        if record.tenant != tenant {
-            return Err(EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source: EtcdCodecError::InvariantViolation {
-                    kind: "ShardRecord",
-                    detail: "shard record tenant disagrees with key-path tenant",
-                },
-            });
-        }
-        if record.run != key.run() {
-            return Err(EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source: EtcdCodecError::InvariantViolation {
-                    kind: "ShardRecord",
-                    detail: "shard record run id disagrees with key-path run id",
-                },
-            });
-        }
-        if record.shard != key.shard() {
-            return Err(EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source: EtcdCodecError::InvariantViolation {
-                    kind: "ShardRecord",
-                    detail: "shard record shard id disagrees with key-path shard id",
-                },
-            });
-        }
-
-        let mod_revision = kv.mod_revision();
-
-        let owner = match owner_kv {
-            None => None,
-            Some(okv) => Some(decode_owner_kv(okv)?),
-        };
-
-        if let Some(owner) = &owner {
-            validate_owner_consistency(owner, &record)?;
-        }
-
-        Ok(Some(PersistedShard {
-            record,
-            slab,
-            mod_revision,
-            owner,
-        }))
-    }
-
-    /// Prefix-scan all shard records (and their `/owner` keys) under a run.
-    ///
-    /// Issues a single etcd prefix-range `get` on the `shards/` subtree,
-    /// then partitions the response into record KVs and owner KVs.
-    /// Owner bindings are matched to their parent shard record by
-    /// key suffix convention (`{shard_key}/owner`).
-    ///
-    /// Cross-validates every owner binding against its shard record and
-    /// rejects orphaned owner keys (owner with no matching shard record).
-    pub(super) fn scan_run_shards(
-        &self,
-        tenant: TenantId,
-        run: RunId,
-    ) -> Result<Vec<PersistedShard>, EtcdCoordinatorError> {
-        let prefix = self
-            .keyspace
-            .shard_records_scan_prefix(tenant, run)
-            .into_bytes();
-        let response = self.etcd_get(prefix, Some(GetOptions::new().with_prefix()))?;
-
-        let mut owner_map = HashMap::<ShardOwnerKey, PersistedOwner>::new();
-        let mut record_kvs = Vec::<(ShardRecordKey, Vec<u8>, i64)>::new();
-
-        for kv in response.kvs() {
-            match PersistedShardSubtreeKey::classify(kv.key()) {
-                Some(PersistedShardSubtreeKey::Owner) => {
-                    let owner_key = ShardOwnerKey::from_encoded_key(kv.key()).ok_or_else(|| {
-                        EtcdCoordinatorError::Codec {
-                            operation: EtcdOperation::Get,
-                            source: EtcdCodecError::InvariantViolation {
-                                kind: "OwnerKey",
-                                detail: "owner key under shard scan prefix is malformed",
-                            },
-                        }
-                    })?;
-                    owner_map.insert(owner_key, decode_owner_kv(kv)?);
-                }
-                Some(PersistedShardSubtreeKey::Record) => {
-                    let record_key =
-                        ShardRecordKey::from_encoded_key(kv.key()).ok_or_else(|| {
-                            EtcdCoordinatorError::Codec {
-                                operation: EtcdOperation::Get,
-                                source: EtcdCodecError::InvariantViolation {
-                                    kind: "ShardRecord",
-                                    detail: "shard record key under scan prefix is malformed",
-                                },
-                            }
-                        })?;
-                    record_kvs.push((record_key, kv.value().to_vec(), kv.mod_revision()));
-                }
-                None => {
-                    // Fail closed when an unknown key appears inside the
-                    // persisted shard subtree: this keyspace is schema-bound
-                    // and mixed-version readers must upgrade in lockstep.
-                    return Err(EtcdCoordinatorError::Codec {
-                        operation: EtcdOperation::Get,
-                        source: EtcdCodecError::InvariantViolation {
-                            kind: "ShardKey",
-                            detail: "unexpected key found under shard scan prefix",
-                        },
-                    });
-                }
-            }
-        }
-
-        let mut out = Vec::with_capacity(record_kvs.len());
-        for (record_key, value, mod_revision) in record_kvs {
-            let mut slab = make_decode_slab(value.len());
-            let record = decode_shard_record(&value, &mut slab).map_err(|source| {
-                EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source,
-                }
-            })?;
-
-            // Defense-in-depth: verify decoded payload identity matches
-            // the scanned key path. The prefix constrains etcd results,
-            // but corrupt data can still encode mismatched tenant/run/shard.
-            if record.tenant != tenant || record.run != run {
-                return Err(EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source: EtcdCodecError::InvariantViolation {
-                        kind: "ShardRecord",
-                        detail: "shard record identity disagrees with scan prefix",
-                    },
-                });
-            }
-            let expected_key = self.keyspace.shard_record_key(tenant, run, record.shard);
-            if record_key != expected_key {
-                return Err(EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source: EtcdCodecError::InvariantViolation {
-                        kind: "ShardRecord",
-                        detail: "shard record shard id disagrees with key path",
-                    },
-                });
-            }
-
-            let owner = owner_map.remove(&record_key.owner_key());
-
-            if let Some(owner) = &owner {
-                validate_owner_consistency(owner, &record)?;
-            }
-
-            out.push(PersistedShard {
-                record,
-                slab,
-                mod_revision,
-                owner,
-            });
-        }
-
-        if !owner_map.is_empty() {
-            return Err(EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Get,
-                source: EtcdCodecError::InvariantViolation {
-                    kind: "OwnerKey",
-                    detail: "owner key exists without a corresponding shard record",
-                },
-            });
-        }
-
-        Ok(out)
-    }
-
-    /// Prefix-scan direct run records under a tenant, skipping shard and
-    /// active-index descendants.
-    ///
-    /// Uses [`RunRecordKey::parse_direct_run_id`] to filter the prefix-range
-    /// response down to immediate `runs/{hex}` children, ignoring deeper
-    /// keys (`runs/{hex}/shards/…`, `runs_active/…`). Cross-validates that
-    /// each decoded record's tenant and run ID match the key path. Results
-    /// are sorted by raw run ID.
-    pub(super) fn scan_tenant_runs(
-        &self,
-        tenant: TenantId,
-    ) -> Result<Vec<PersistedRun>, EtcdCoordinatorError> {
-        let prefix = self.keyspace.run_records_scan_prefix(tenant);
-        let response = self.etcd_get(
-            prefix.as_bytes().to_vec(),
-            Some(GetOptions::new().with_prefix()),
-        )?;
-
-        let mut out = Vec::new();
-        for kv in response.kvs() {
-            let Some(run_from_key) = RunRecordKey::parse_direct_run_id(&prefix, kv.key()) else {
-                continue;
-            };
-
-            let record =
-                decode_run_record(kv.value()).map_err(|source| EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source,
-                })?;
-
-            if record.tenant != tenant {
-                return Err(EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source: EtcdCodecError::InvariantViolation {
-                        kind: "RunRecord",
-                        detail: "run record tenant disagrees with keyspace tenant",
-                    },
-                });
-            }
-            if record.run != run_from_key {
-                return Err(EtcdCoordinatorError::Codec {
-                    operation: EtcdOperation::Get,
-                    source: EtcdCodecError::InvariantViolation {
-                        kind: "RunRecord",
-                        detail: "run record run id disagrees with key suffix",
-                    },
-                });
-            }
-
-            out.push(PersistedRun {
-                record,
-                mod_revision: kv.mod_revision(),
-            });
-        }
-
-        out.sort_unstable_by_key(|persisted| persisted.record.run.as_raw());
-        Ok(out)
-    }
-
-    /// Lightweight capacity hint using count-only and keys-only RPCs.
-    ///
-    /// Returns an approximate count of active shards without an owner key,
-    /// suitable for `CapacityHint`. Uses two etcd RPCs with minimal data
-    /// transfer (no shard record values are decoded):
-    ///
-    /// 1. `count_only` on the `shards_active/` prefix → total active shards.
-    /// 2. `keys_only` on the `shards/` prefix, counting `/owner` suffixes →
-    ///    owned shard count.
-    ///
-    /// The result is approximate because the two RPCs are not transactional:
-    /// a concurrent acquire between them may cause a brief undercount or
-    /// overcount. This is acceptable for a capacity hint used in claim
-    /// scheduling.
-    ///
-    /// `earliest_deadline` is always `None` because computing it would
-    /// require decoding shard record values, defeating the purpose.
-    pub(super) fn count_available_lightweight(
-        &self,
-        tenant: TenantId,
-        run: RunId,
-    ) -> Result<CapacityHint, EtcdCoordinatorError> {
-        let active_prefix = self.keyspace.shards_active_prefix(tenant, run).into_bytes();
-        let active_response = self.etcd_get(
-            active_prefix,
-            Some(GetOptions::new().with_prefix().with_count_only()),
-        )?;
-        let total_active = u32::try_from(active_response.count()).unwrap_or_else(|_| {
-            tracing::warn!(
-                count = active_response.count(),
-                "etcd active count exceeds u32 range; clamping to u32::MAX"
-            );
-            u32::MAX
-        });
-
-        let shards_prefix = self.keyspace.shard_records_scan_prefix(tenant, run);
-        let keys_response = self.etcd_get(
-            shards_prefix.as_bytes().to_vec(),
-            Some(GetOptions::new().with_prefix().with_keys_only()),
-        )?;
-        let owned_count = u32::try_from(
-            keys_response
-                .kvs()
-                .iter()
-                .filter(|kv| {
-                    ShardOwnerKey::parse_owned_shard(shards_prefix.as_bytes(), kv.key()).is_some()
-                })
-                .count(),
-        )
-        .unwrap_or(u32::MAX);
-
-        Ok(CapacityHint {
-            available_count: total_active.saturating_sub(owned_count),
-            earliest_deadline: None,
-        })
-    }
-
-    /// Count persisted shard records under `prefix` using a keys-only scan.
-    ///
-    /// The subtree contains run records, owner keys, and active indexes in
-    /// addition to shard records, so the caller filters keys structurally.
-    ///
-    /// This remains an O(N) scan and is used for global-limit preflight and
-    /// lazy bootstrap when a tenant counter key is absent.
-    pub(super) fn count_persisted_shards_under_prefix(
-        &self,
-        prefix: String,
-    ) -> Result<usize, EtcdCoordinatorError> {
-        let response = self.etcd_get(
-            prefix.as_bytes().to_vec(),
-            Some(GetOptions::new().with_prefix().with_keys_only()),
-        )?;
-        Ok(response
-            .kvs()
-            .iter()
-            // Persisted shard records are nested under `.../runs/{run}/shards/{hex}`.
-            // Count only record keys and skip owner keys.
-            .filter(|kv| {
-                PersistedShardSubtreeKey::classify(kv.key())
-                    == Some(PersistedShardSubtreeKey::Record)
-            })
-            .count())
-    }
-
     /// List runs visible to workers by scanning only the active-run index.
-    ///
-    /// Initializing runs remain invisible until `register_shards` publishes
-    /// the corresponding active-run marker.
     pub fn list_active_runs_into(
         &self,
         tenant: TenantId,
         out: &mut Vec<RunId>,
     ) -> Result<(), EtcdCoordinatorError> {
-        let mut prefix = self.keyspace.runs_active_prefix(tenant);
-        prefix.push('/');
-        let response = self.etcd_get(
-            prefix.as_bytes().to_vec(),
-            Some(GetOptions::new().with_prefix().with_keys_only()),
-        )?;
-
-        out.clear();
-        for kv in response.kvs() {
-            if let Some(run) = RunActiveIndexKey::parse_direct_run_id(&prefix, kv.key()) {
-                out.push(run);
-            }
-        }
-        out.sort_unstable_by_key(|run| run.as_raw());
-        Ok(())
+        <Self as SyncEtcdLike>::list_active_runs_into(self, tenant, out)
     }
 
     /// Garbage-collect stale runs that never left `Initializing`.
-    ///
-    /// Scans all runs under `tenant`, retains those that are still
-    /// `Initializing` with `created_at < cutoff`, and attempts to delete
-    /// each one. Each candidate is deleted behind a single CAS transaction
-    /// guarded by the run revision and the absence of the active-run marker.
-    /// A concurrently activated run simply fails the compare and is skipped.
-    ///
-    /// Deletion is total: the run record, any shard records, and any
-    /// active-shard index entries are removed in a single transaction.
-    /// Successfully deleted run IDs are appended to `out`.
-    ///
-    /// On error, `out` may contain a partial list of the runs that were
-    /// successfully deleted before the failure. Callers must not rely on
-    /// `out` contents when the return value is `Err`.
     pub fn gc_stale_initializing_runs_into(
         &mut self,
         tenant: TenantId,
         cutoff: LogicalTime,
         out: &mut Vec<RunId>,
     ) -> Result<(), EtcdCoordinatorError> {
-        let mut candidates = self.scan_tenant_runs(tenant)?;
-        candidates.retain(|persisted| {
-            persisted.record.status == RunStatus::Initializing
-                && persisted.record.created_at < cutoff
-        });
-        candidates.sort_by(|left, right| {
-            left.record
-                .created_at
-                .cmp(&right.record.created_at)
-                .then_with(|| left.record.run.as_raw().cmp(&right.record.run.as_raw()))
-        });
-
-        out.clear();
-        for persisted in candidates {
-            let run = persisted.record.run;
-            let run_key = self.keyspace.run_record_key(tenant, run);
-            let active_key = self.keyspace.run_active_index_key(tenant, run);
-            let shard_prefix = self.keyspace.shard_records_scan_prefix(tenant, run);
-            let mut active_shard_prefix = self.keyspace.shards_active_prefix(tenant, run);
-            active_shard_prefix.push('/');
-            let removed_shard_count =
-                self.count_persisted_shards_under_prefix(shard_prefix.clone())?;
-
-            // Always build the counter update — even when the counter key
-            // does not yet exist.  When absent, bootstrap from a tenant-wide
-            // shard scan and guard creation with `compare_absent` so that a
-            // concurrent `register_shards` (which also uses `compare_absent`
-            // during bootstrap) will conflict rather than committing an
-            // inflated count that includes shards this GC pass is removing.
-            let counter_key = self.keyspace.tenant_shard_count_key(tenant);
-            let (counter_compare, next_count) = if let Some(counter) =
-                self.load_tenant_shard_count(tenant)?
-            {
-                let removed = usize_to_u64_saturating(removed_shard_count);
-                let next = match counter.count.checked_sub(removed) {
-                    Some(n) => n,
-                    None => {
-                        // Counter drifted below the actual shard count —
-                        // rebuild from a fresh tenant-wide scan so the
-                        // persisted value converges back to truth.  The
-                        // CAS guard on `mod_revision` still prevents
-                        // concurrent-mutation races.
-                        tracing::warn!(
-                            tenant = %tenant,
-                            persisted_count = counter.count,
-                            removed = removed,
-                            "tenant shard counter underflow during GC; \
-                             rebuilding from scan"
-                        );
-                        let scanned = self.count_persisted_shards_under_prefix(
-                            self.keyspace.tenant_prefix(tenant),
-                        )?;
-                        usize_to_u64_saturating(scanned).saturating_sub(removed)
-                    }
-                };
-                (
-                    compare_tenant_shard_count_revision(counter_key.clone(), counter.mod_revision),
-                    next,
-                )
-            } else {
-                let scanned =
-                    self.count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))?;
-                let next = usize_to_u64_saturating(scanned)
-                    .saturating_sub(usize_to_u64_saturating(removed_shard_count));
-                (compare_absent(counter_key.clone()), next)
-            };
-
-            let mut txn = TxnBuilder::new();
-            txn.compare(compare_run_revision(
-                run_key.clone(),
-                persisted.mod_revision,
-            ))
-            .compare(compare_absent(active_key.clone()))
-            .delete(run_key.into_bytes())
-            .delete(active_key.into_bytes())
-            .ops([
-                TxnOp::delete(
-                    shard_prefix.into_bytes(),
-                    Some(DeleteOptions::new().with_prefix()),
-                ),
-                TxnOp::delete(
-                    active_shard_prefix.into_bytes(),
-                    Some(DeleteOptions::new().with_prefix()),
-                ),
-            ]);
-            txn.compare(counter_compare).put(
-                counter_key.into_bytes(),
-                encode_tenant_shard_count(next_count),
-            );
-
-            let response = self.etcd_txn(txn.build())?;
-            if response.succeeded() {
-                out.push(run);
-            } else {
-                tracing::debug!(
-                    ?run,
-                    "GC: skipped stale run (concurrent activation or revision change)"
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Shared optimistic-CAS implementation for terminal run transitions
-    /// (`complete_run`, `fail_run`, `cancel_run`).
-    ///
-    /// Each iteration:
-    /// 1. Loads the run record and checks idempotent replay.
-    /// 2. Validates status preconditions (e.g., `complete_run` requires
-    ///    `Active`; `cancel_run` accepts both `Active` and `Initializing`).
-    /// 3. Applies the terminal transition locally.
-    /// 4. Commits the updated run record and deletes the active-run index
-    ///    entry in a single CAS transaction.
-    ///
-    /// The active-run index guard adapts to the prior status: `Active` runs
-    /// require the index entry to exist (`compare_present`), while
-    /// `Initializing` runs require it to be absent (`compare_absent`). This
-    /// prevents cancelling a run that was concurrently activated between the
-    /// read and the write.
-    ///
-    /// On CAS exhaustion, re-reads the run to return the appropriate domain
-    /// error or confirm idempotent replay.
-    pub(super) fn transition_run_terminal(
-        &mut self,
-        now: LogicalTime,
-        tenant: TenantId,
-        run: RunId,
-        op_id: OpId,
-        op_kind: RunOpKind,
-    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
-        let (target_status, payload_hash, require_active) = match op_kind {
-            RunOpKind::CompleteRun => (RunStatus::Done, hash_complete_run_payload(), true),
-            RunOpKind::FailRun => (RunStatus::Failed, hash_fail_run_payload(), true),
-            RunOpKind::CancelRun => (RunStatus::Cancelled, hash_cancel_run_payload(), false),
-            RunOpKind::RegisterShards => {
-                unreachable!("transition_run_terminal does not handle RegisterShards")
-            }
-        };
-
-        self.cas_retry(
-            |this, _attempt| {
-                let persisted = match this.load_run_record(tenant, run) {
-                    Ok(Some(run_record)) => run_record,
-                    Ok(None) => return Err(RunTransitionError::RunNotFound),
-                    Err(err) => {
-                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
-                            "run_terminal.load_run",
-                            err,
-                        )));
-                    }
-                };
-                let prior_status = persisted.record.status;
-                let mut record = persisted.record;
-
-                if record.tenant != tenant {
-                    return Err(RunTransitionError::TenantMismatch { expected: tenant });
-                }
-                if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-                    if entry.kind() != op_kind {
-                        return Err(RunTransitionError::BackendError(InfraError::corruption(
-                            "run_terminal.idempotent_replay",
-                            format!(
-                                "kind mismatch: expected {op_kind:?}, got {:?}",
-                                entry.kind()
-                            ),
-                        )));
-                    }
-                    return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
-                }
-                if record.status.is_terminal() {
-                    return Err(RunTransitionError::RunTerminal {
-                        status: record.status,
-                    });
-                }
-                if require_active && record.status != RunStatus::Active {
-                    return Err(RunTransitionError::WrongStatus {
-                        status: record.status,
-                        target: target_status,
-                    });
-                }
-
-                apply_terminal_run_transition(
-                    &mut record,
-                    now,
-                    target_status,
-                    op_id,
-                    op_kind,
-                    payload_hash,
-                );
-                let run_blob = encode_run_record(&record);
-                let run_key = this.keyspace.run_record_key(tenant, run);
-                let active_key = this.keyspace.run_active_index_key(tenant, run);
-                let mut compares = vec![compare_run_revision(
-                    run_key.clone(),
-                    persisted.mod_revision,
-                )];
-                match prior_status {
-                    RunStatus::Active => {
-                        compares.push(compare_present(active_key.clone()));
-                    }
-                    RunStatus::Initializing => {
-                        compares.push(compare_absent(active_key.clone()));
-                    }
-                    RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled => {
-                        unreachable!("terminal statuses return early")
-                    }
-                }
-
-                let mut txn = TxnBuilder::new();
-                txn.compare_all(compares)
-                    .put(run_key.into_bytes(), run_blob)
-                    .delete(active_key.into_bytes());
-                txn.execute(this, IdempotentOutcome::Executed(()))
-                    .map_err(|err| {
-                        RunTransitionError::BackendError(super::map_etcd_err(
-                            "run_terminal.txn",
-                            err,
-                        ))
-                    })
-            },
-            |this| {
-                // Use load_run_record directly so we can distinguish
-                // "run legitimately deleted by GC" from "data loss".
-                //
-                // gc_stale_initializing_runs_into only deletes Initializing
-                // runs, so a missing run is benign only for cancel_run
-                // (require_active == false). For complete_run / fail_run
-                // (require_active == true) the run must have been Active,
-                // which GC never touches — a missing Active run is corruption.
-                let persisted = match this.load_run_record(tenant, run) {
-                    Ok(Some(r)) => r,
-                    Ok(None) if !require_active => return Err(RunTransitionError::RunNotFound),
-                    Ok(None) => {
-                        return Err(RunTransitionError::BackendError(InfraError::corruption(
-                            "run_terminal.exhaust.load_run",
-                            format!("run {run:?} missing (expected Active)"),
-                        )));
-                    }
-                    Err(err) => {
-                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
-                            "run_terminal.exhaust.load_run",
-                            err,
-                        )));
-                    }
-                };
-                if persisted.record.tenant != tenant {
-                    return Err(RunTransitionError::TenantMismatch { expected: tenant });
-                }
-                if let Some(entry) = persisted.record.check_op_idempotency(op_id, payload_hash)? {
-                    if entry.kind() != op_kind {
-                        return Err(RunTransitionError::BackendError(InfraError::corruption(
-                            "run_terminal.idempotent_replay",
-                            format!(
-                                "kind mismatch: expected {op_kind:?}, got {:?}",
-                                entry.kind()
-                            ),
-                        )));
-                    }
-                    return Ok(IdempotentOutcome::Replayed(()));
-                }
-                if persisted.record.status.is_terminal() {
-                    return Err(RunTransitionError::RunTerminal {
-                        status: persisted.record.status,
-                    });
-                }
-                if require_active && persisted.record.status != RunStatus::Active {
-                    return Err(RunTransitionError::WrongStatus {
-                        status: persisted.record.status,
-                        target: target_status,
-                    });
-                }
-
-                Err(RunTransitionError::BackendError(InfraError::transient(
-                    "run_terminal",
-                    "CAS retry budget exhausted",
-                )))
-            },
-        )
-    }
-
-    /// Attempt to revoke an etcd lease, logging on failure.
-    ///
-    /// Used for cleanup after a CAS failure when the lease is no longer
-    /// needed. If the revocation fails (e.g., network error), the lease
-    /// will eventually expire via etcd's TTL mechanism. Failures are
-    /// logged at `warn` level so operators can detect accumulation of
-    /// orphaned leases during etcd instability.
-    pub(super) fn best_effort_revoke_lease(&self, lease_id: i64) {
-        if lease_id <= 0 {
-            return;
-        }
-        if let Err(err) = self.etcd_lease_revoke(lease_id) {
-            tracing::warn!(
-                lease_id,
-                %err,
-                ttl_secs = self.config.owner_lease_ttl_secs(),
-                "failed to revoke etcd lease; will expire via TTL",
-            );
-        }
-    }
-
-    /// Load a run record that is expected to exist.
-    ///
-    /// Returns `InfraError::corruption` if the key is missing (the record
-    /// existed earlier in the retry loop, so absence signals data loss) and
-    /// maps backend errors via [`map_etcd_err`](super::map_etcd_err).
-    ///
-    /// `context` identifies the calling operation for diagnostics
-    /// (e.g., `"acquire.load_run"`, `"register_shards.exhaust.load_run"`).
-    pub(super) fn load_run_checked(
-        &self,
-        context: &'static str,
-        tenant: TenantId,
-        run: RunId,
-    ) -> Result<PersistedRun, InfraError> {
-        match self.load_run_record(tenant, run) {
-            Ok(Some(run_record)) => Ok(run_record),
-            Ok(None) => Err(InfraError::corruption(
-                context,
-                format!("run {run:?} missing"),
-            )),
-            Err(err) => Err(super::map_etcd_err(context, err)),
-        }
-    }
-
-    /// Load a shard record that is expected to exist.
-    ///
-    /// Returns `InfraError::corruption` if the key is missing and maps
-    /// backend errors via [`map_etcd_err`](super::map_etcd_err).
-    ///
-    /// `context` identifies the calling operation for diagnostics
-    /// (e.g., `"checkpoint.exhaust.load_shard"`).
-    pub(super) fn load_shard_checked(
-        &self,
-        context: &'static str,
-        tenant: TenantId,
-        key: ShardKey,
-    ) -> Result<PersistedShard, InfraError> {
-        match self.load_shard_record(tenant, key) {
-            Ok(Some(shard)) => Ok(shard),
-            Ok(None) => Err(InfraError::corruption(
-                context,
-                format!("shard {key:?} missing"),
-            )),
-            Err(err) => Err(super::map_etcd_err(context, err)),
-        }
+        <Self as SyncEtcdLike>::gc_stale_initializing_runs_into(self, tenant, cutoff, out)
     }
 }
 
 impl TxnBuilder {
     /// Execute the assembled transaction through the sync coordinator and
     /// translate etcd success/failure into a CAS retry outcome.
-    pub(super) fn execute<T>(
+    pub(crate) fn execute<T, C: SyncEtcdLike>(
         self,
-        coordinator: &EtcdCoordinator,
+        coordinator: &C,
         on_success: T,
     ) -> Result<CasOutcome<T>, EtcdCoordinatorError> {
         let response = coordinator.etcd_txn(self.build())?;
@@ -1259,6 +1160,56 @@ impl TxnBuilder {
         } else {
             Ok(CasOutcome::RetryNeeded)
         }
+    }
+}
+
+impl SyncEtcdLike for EtcdCoordinator {
+    fn config(&self) -> &EtcdCoordinatorConfig {
+        &self.config
+    }
+
+    fn keyspace(&self) -> &EtcdKeyspace {
+        &self.keyspace
+    }
+
+    fn etcd_get(
+        &self,
+        key: Vec<u8>,
+        options: Option<GetOptions>,
+    ) -> Result<etcd_client::GetResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_get(self, key, options)
+    }
+
+    fn etcd_txn(&self, txn: Txn) -> Result<etcd_client::TxnResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_txn(self, txn)
+    }
+
+    fn etcd_lease_grant(
+        &self,
+        ttl: i64,
+    ) -> Result<etcd_client::LeaseGrantResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_lease_grant(self, ttl)
+    }
+
+    fn etcd_lease_keep_alive_once(&self, lease_id: i64) -> Result<(), EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_lease_keep_alive_once(self, lease_id)
+    }
+
+    fn etcd_lease_revoke(
+        &self,
+        lease_id: i64,
+    ) -> Result<etcd_client::LeaseRevokeResponse, EtcdCoordinatorError> {
+        EtcdCoordinator::etcd_lease_revoke(self, lease_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_replace_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
+        EtcdCoordinator::inject_split_replace_fault_if_armed(self, tenant, key);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_split_residual_fault_if_armed(&mut self, tenant: TenantId, key: ShardKey) {
+        EtcdCoordinator::inject_split_residual_fault_if_armed(self, tenant, key);
     }
 }
 
