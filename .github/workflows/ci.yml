@@ -234,6 +234,11 @@ jobs:
   # Runs etcd-dependent tests against a real service container.
   # ETCD_ENDPOINTS bypasses testcontainers so all tests share the
   # same service container instead of spinning up their own.
+  #
+  # The coreos/etcd image is distroless (no /bin/sh), so Docker's
+  # CMD-SHELL health checks cannot work. We skip the health check
+  # in `options` and instead poll the HTTP /health endpoint from
+  # the runner in an explicit step.
   test-etcd:
     name: Test (etcd)
     runs-on: ubuntu-24.04
@@ -253,16 +258,25 @@ jobs:
           ETCD_INITIAL_CLUSTER: node1=http://etcd:2380
           ETCD_INITIAL_CLUSTER_TOKEN: gossip-rs-ci-cluster
           ETCD_INITIAL_CLUSTER_STATE: new
-        options: >-
-          --health-cmd "etcdctl --endpoints=http://localhost:2379 endpoint health"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
         ports:
           - 2379:2379
     env:
       ETCD_ENDPOINTS: "http://localhost:2379"
     steps:
+      - name: Wait for etcd
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:2379/health > /dev/null 2>&1; then
+              echo "etcd is ready"
+              exit 0
+            fi
+            echo "Waiting for etcd... ($i/30)"
+            sleep 1
+          done
+          echo "etcd failed to become ready"
+          docker logs "$(docker ps -q --filter ancestor=quay.io/coreos/etcd:v3.5.15)" 2>&1 || true
+          exit 1
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
         with:
