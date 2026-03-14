@@ -55,7 +55,9 @@ impl<T> PageBuf<T> {
     /// # Errors
     ///
     /// Returns [`PageShapeError`] if the page is empty, keys are not strictly
-    /// increasing, or any key falls outside the `[shard_start, shard_end)` bounds.
+    /// increasing, any key falls outside the `[shard_start, shard_end)` bounds,
+    /// or both bounds are non-empty with `shard_start >= shard_end`
+    /// ([`PageShapeError::InvertedBounds`]).
     pub fn try_new_validated(
         items: Vec<T>,
         state: PageState,
@@ -66,7 +68,9 @@ impl<T> PageBuf<T> {
         T: KeyedPageItem,
     {
         validate_filled_page(&items, shard_start, shard_end)?;
-        Ok(Self { items, state })
+        // Delegate to try_new so any future invariants added there are enforced.
+        // validate_filled_page already guarantees non-empty, so try_new succeeds.
+        Self::try_new(items, state)
     }
 
     /// Returns the items in this page.
@@ -243,10 +247,10 @@ pub fn validate_filled_page<T: KeyedPageItem>(
     shard_start: &[u8],
     shard_end: &[u8],
 ) -> Result<(), PageShapeError> {
+    let (first, rest) = items.split_first().ok_or(PageShapeError::EmptyPage)?;
     if !shard_start.is_empty() && !shard_end.is_empty() && shard_start >= shard_end {
         return Err(PageShapeError::InvertedBounds);
     }
-    let (first, rest) = items.split_first().ok_or(PageShapeError::EmptyPage)?;
     let mut previous = first.item_key().as_bytes();
 
     if !shard_start.is_empty() && previous < shard_start {

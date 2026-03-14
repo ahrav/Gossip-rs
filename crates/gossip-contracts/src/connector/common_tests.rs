@@ -247,6 +247,25 @@ fn try_new_validated_rejects_unsorted() {
 }
 
 #[test]
+fn validate_filled_page_returns_empty_page_when_items_empty_and_bounds_inverted() {
+    // Empty input should always yield EmptyPage, even when bounds are also inverted.
+    let items: Vec<ScanItem> = Vec::new();
+    assert_eq!(
+        validate_filled_page(&items, b"z", b"a"),
+        Err(PageShapeError::EmptyPage)
+    );
+}
+
+#[test]
+fn try_new_validated_returns_empty_page_when_items_empty_and_bounds_inverted() {
+    // Same consistency requirement through the PageBuf constructor path.
+    assert_eq!(
+        PageBuf::<ScanItem>::try_new_validated(Vec::new(), PageState::Complete, b"z", b"a"),
+        Err(PageShapeError::EmptyPage)
+    );
+}
+
+#[test]
 fn try_new_validated_rejects_inverted_bounds() {
     let items = scan_items(&[b"m"]);
     assert_eq!(
