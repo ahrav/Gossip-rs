@@ -543,12 +543,12 @@ ORDER BY policy_hash ASC
 /// 1. `tenant_id`
 /// 2. `limit`
 pub const LIST_FINDINGS_NEEDING_TRIAGE_SQL: &str = r#"
-SELECT latest.tenant_id, latest.finding_id, latest.stable_item_id,
+SELECT latest.finding_id, latest.stable_item_id,
        latest.occurrence_id, latest.observation_id, latest.policy_hash,
        latest.seen_at, latest.location_display, latest.location_url
 FROM (
     SELECT DISTINCT ON (f.finding_id)
-        f.tenant_id, f.finding_id, f.stable_item_id,
+        f.finding_id, f.stable_item_id,
         o.occurrence_id, ob.observation_id, ob.policy_hash,
         ob.seen_at, ob.location_display, ob.location_url
     FROM findings AS f
@@ -940,6 +940,36 @@ mod tests {
                 "ORDER BY latest.seen_at DESC, latest.observation_id DESC",
                 "LIMIT $2",
             ],
+        );
+    }
+
+    #[test]
+    fn list_findings_needing_triage_sql_does_not_project_tenant_id() {
+        // tenant_id is reconstructed from the input parameter in the Rust
+        // decoder, so it must not appear in the SELECT projection. The
+        // WHERE / JOIN clauses still reference it for filtering.
+        let outer_select = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("SELECT latest.")
+            .expect("outer SELECT should exist");
+        let from_clause = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("FROM (")
+            .expect("FROM subquery should exist");
+        let outer_projection = &LIST_FINDINGS_NEEDING_TRIAGE_SQL[outer_select..from_clause];
+        assert!(
+            !outer_projection.contains("tenant_id"),
+            "outer SELECT must not project tenant_id: {outer_projection}"
+        );
+
+        let inner_select = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("SELECT DISTINCT ON")
+            .expect("inner SELECT should exist");
+        let inner_from = LIST_FINDINGS_NEEDING_TRIAGE_SQL
+            .find("FROM findings AS f")
+            .expect("inner FROM should exist");
+        let inner_projection = &LIST_FINDINGS_NEEDING_TRIAGE_SQL[inner_select..inner_from];
+        assert!(
+            !inner_projection.contains("tenant_id"),
+            "inner SELECT must not project tenant_id: {inner_projection}"
         );
     }
 
