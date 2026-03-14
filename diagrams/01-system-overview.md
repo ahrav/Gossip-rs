@@ -87,7 +87,11 @@ scan pipelines for both the `scanner-rs` CLI binary and the distributed
 
 `gossip-coordination-etcd` provides an etcd-backed coordination backend.
 `gossip-persistence-inmemory` provides in-memory persistence backends for testing
-and conformance.
+and conformance. `gossip-pg-common` holds shared PostgreSQL primitives (migration
+runner, `u64 ↔ BIGINT` encoding, test-support lifecycle) used by both PostgreSQL
+persistence backends. `gossip-done-ledger-postgres` and
+`gossip-findings-postgres` implement the `DoneLedger` and `FindingsSink` traits
+against PostgreSQL.
 
 ```mermaid
 %% Diagram: crate-mapping
@@ -112,6 +116,9 @@ graph LR
         scanner_scheduler["scanner-scheduler"]
         scanner_git["scanner-git"]
         persistence_inmem["gossip-persistence-inmemory"]
+        pg_common["gossip-pg-common"]
+        done_ledger_pg["gossip-done-ledger-postgres"]
+        findings_pg["gossip-findings-postgres"]
         runtime["gossip-scanner-runtime"]
         worker["gossip-worker"]
         cli["scanner-rs-cli"]
@@ -123,6 +130,9 @@ graph LR
     B3 -->|"contains"| frontier
     B5 -->|"persistence contracts"| contracts
     B5 -->|"persistence impl"| persistence_inmem
+    B5 -->|"PostgreSQL shared"| pg_common
+    B5 -->|"done-ledger backend"| done_ledger_pg
+    B5 -->|"findings backend"| findings_pg
     B2 -->|"contains"| coordination
     B4 -->|"contains"| connectors
 
@@ -143,6 +153,11 @@ graph LR
 
     coordination_etcd -->|"depends on"| coordination
     persistence_inmem -->|"depends on"| contracts
+    pg_common -->|"depends on"| contracts
+    done_ledger_pg -->|"depends on"| contracts
+    done_ledger_pg -->|"depends on"| pg_common
+    findings_pg -->|"depends on"| contracts
+    findings_pg -->|"depends on"| pg_common
     integration_tests -->|"depends on"| scanner_engine
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
@@ -165,6 +180,9 @@ graph LR
     style cli fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style coordination_etcd fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style persistence_inmem fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style pg_common fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style done_ledger_pg fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style findings_pg fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
     style integration_tests fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
@@ -250,9 +268,13 @@ The crate graph compiles in four tiers. Tier 0 (`gossip-stdx`, `gossip-contracts
 and `gossip-frontier`) has no dependencies on higher-level crates and compiles
 first. `gossip-stdx` is a foundational utility crate depended on by contracts,
 frontier, and coordination. Tier 1 includes `gossip-coordination`,
-`gossip-connectors`, `gossip-persistence-inmemory`,
+`gossip-connectors`, `gossip-persistence-inmemory`, `gossip-pg-common`,
+`gossip-done-ledger-postgres`, `gossip-findings-postgres`,
 `scanner-engine`, `scanner-scheduler`, and `scanner-git` --
-these compile in parallel once Tier 0 finishes. Tier 2 includes
+these compile in parallel once Tier 0 finishes. The three PostgreSQL crates
+(`gossip-pg-common`, `gossip-done-ledger-postgres`, `gossip-findings-postgres`)
+depend only on `gossip-contracts` (and `gossip-pg-common` for the two backends),
+placing them alongside other Tier 1 crates. Tier 2 includes
 `gossip-coordination-etcd`, `gossip-scan-driver`, and `gossip-scanner-runtime`,
 which depend on Tier 1 crates. Tier 3
 (`gossip-worker`, `scanner-rs-cli`, `scanner-engine-integration-tests`) are the
@@ -271,6 +293,9 @@ graph TD
         coordination["gossip-coordination"]
         connectors["gossip-connectors"]
         persistence_inmem["gossip-persistence-inmemory"]
+        pg_common["gossip-pg-common"]
+        done_ledger_pg["gossip-done-ledger-postgres"]
+        findings_pg["gossip-findings-postgres"]
         scanner_engine["scanner-engine"]
         scanner_scheduler["scanner-scheduler"]
         scanner_git["scanner-git"]
@@ -296,6 +321,11 @@ graph TD
     contracts --> coordination
     contracts --> connectors
     contracts --> persistence_inmem
+    contracts --> pg_common
+    contracts --> done_ledger_pg
+    contracts --> findings_pg
+    pg_common --> done_ledger_pg
+    pg_common --> findings_pg
     coordination --> coordination_etcd
     scanner_engine --> scan_driver
     scanner_scheduler --> scan_driver
@@ -322,6 +352,9 @@ graph TD
     style cli fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style coordination_etcd fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style persistence_inmem fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style pg_common fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style done_ledger_pg fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style findings_pg fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
     style integration_tests fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
@@ -350,6 +383,9 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | B2: Coordination   | `crates/gossip-contracts/src/coordination/` (data types) + `crates/gossip-coordination/src/` (protocol)                              |
 | B4: Connector      | `crates/gossip-contracts/src/connector/` + `crates/gossip-connectors/`                                                               |
 | B5: Persistence    | `crates/gossip-contracts/src/persistence/`                                                                                           |
+| B5: Persistence (PostgreSQL shared) | `crates/gossip-pg-common/`                                                                                              |
+| B5: Persistence (done-ledger PG)    | `crates/gossip-done-ledger-postgres/`                                                                                   |
+| B5: Persistence (findings PG)       | `crates/gossip-findings-postgres/`                                                                                      |
 | Detection engine   | `crates/scanner-engine/`                                                                                                             |
 | Scan driver traits | `crates/gossip-scan-driver/`                                                                                                         |
 | Scanner runtime    | `crates/gossip-scanner-runtime/`                                                                                                     |
