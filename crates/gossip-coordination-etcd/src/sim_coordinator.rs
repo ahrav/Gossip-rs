@@ -22,7 +22,7 @@ use crate::backend::{PersistedRun, PersistedShard};
 use crate::config::EtcdCoordinatorConfig;
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::keyspace::EtcdKeyspace;
-use crate::sim_etcd_kv::{LeaseInfo, SimEtcdFaultConfig, SimulatedEtcdKV};
+use crate::sim_etcd_kv::{LeaseInfo, SimEtcdFaultConfig, SimEtcdFaultStats, SimulatedEtcdKV};
 
 #[derive(Default)]
 struct SimEtcdTestFaultState {
@@ -132,6 +132,12 @@ impl SimEtcdCoordinator {
     #[must_use]
     pub fn lease_info(&self, lease_id: i64) -> Option<LeaseInfo> {
         self.kv.borrow().lease_info(lease_id)
+    }
+
+    /// Return a copy of the injected-fault counters accumulated by the KV model.
+    #[must_use]
+    pub fn fault_stats(&self) -> SimEtcdFaultStats {
+        self.kv.borrow().fault_stats()
     }
 
     pub fn list_active_runs_into(

@@ -99,10 +99,12 @@ use crate::error::{
 use crate::facade::ClaimError;
 use crate::in_memory::InMemoryCoordinator;
 use crate::record::{ParkReason, ShardRecord, ShardStatus};
+use crate::run::RunConfig;
 use crate::run_errors::{RunTransitionError, UnparkError};
 use crate::session::WorkerSession;
 use crate::sim::backend::SimulationBackend;
 use gossip_contracts::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
+use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use gossip_contracts::coordination::split::{
     plan_split_replace_at_points_initial_cursor, plan_split_residual_at_point,
@@ -808,9 +810,10 @@ fn precompute_split_residual_plan(
 ///
 /// Generic over the backend type `B`, defaulting to [`InMemoryCoordinator`]
 /// so `CoordinationSim::new(...)` compiles without turbofish. The generic impl
-/// block provides all simulation logic; `InMemoryCoordinator`-specific setup
-/// methods (`new`, `register_shard`, `with_workers_and_shards`, `seed_all_runs`)
-/// live in a specialized impl block.
+/// block provides all simulation logic plus the standard
+/// [`with_workers_and_shards`](Self::with_workers_and_shards) topology seeding
+/// path; `InMemoryCoordinator`-specific helpers (`new`, `with_cooldown`,
+/// `register_shard`, `seed_all_runs`) live in a specialized impl block.
 ///
 /// # State management
 ///
@@ -919,27 +922,6 @@ impl CoordinationSim<InMemoryCoordinator> {
         self.coordinator.seed_shard(record);
         self.shard_keys.push(ShardKey::new(run, shard));
         self.run_shard_ids.entry(run).or_default().push(shard);
-    }
-
-    /// Builder: add `n_workers` workers (IDs `1..=n`) and `n_shards` shards
-    /// (run=1, shard IDs `1..=m`), seed run records, and initialize the active
-    /// shard set.
-    ///
-    /// This is the standard one-liner for test setup. For multi-run scenarios,
-    /// use [`register_shard`](Self::register_shard) directly.
-    pub fn with_workers_and_shards(mut self, n_workers: u64, n_shards: u64) -> Self {
-        for i in 1..=n_workers {
-            self.add_worker(WorkerId::from_raw(i));
-        }
-        let run = RunId::from_raw(1);
-        for i in 1..=n_shards {
-            self.register_shard(run, ShardId::from_raw(i));
-        }
-        // Seed run records so `claim_next_available` can discover shards.
-        self.seed_all_runs();
-        // At creation all shards are active (non-terminal).
-        self.active_shard_keys = self.shard_keys.clone();
-        self
     }
 
     /// Create run records for all registered runs in the coordinator.
@@ -1145,6 +1127,106 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         self.workers.insert(id, SimWorker::new(id));
     }
 
+    /// Builder: add `n_workers` workers (IDs `1..=n`) and `n_shards` shards
+    /// (run=1, shard IDs `1..=m`), seed an `Active` run through the public
+    /// coordination API, and initialize the active shard set.
+    ///
+    /// The default topology partitions the one-byte key space into
+    /// non-overlapping ranges. Lower shard counts receive wider ranges,
+    /// preserving room for repeated split operations while keeping the
+    /// manifest structurally valid for backends that reject overlap.
+    pub fn with_workers_and_shards(mut self, n_workers: u64, n_shards: u64) -> Self {
+        for i in 1..=n_workers {
+            self.add_worker(WorkerId::from_raw(i));
+        }
+
+        if n_shards == 0 {
+            return self;
+        }
+        assert!(
+            n_shards <= 255,
+            "one-byte partitioner supports at most 255 shards, got {n_shards}"
+        );
+
+        // Advance the sim clock before each coordinator API call so op_log
+        // entries carry monotonically increasing timestamps.  Without this,
+        // subsequent test operations (which use `self.context.now()`) could
+        // produce timestamps lower than the hardcoded setup values, violating
+        // the non-decreasing op_log invariant (INV-10).
+        self.context.advance(1);
+        let run = RunId::from_raw(1);
+        let config =
+            RunConfig::try_new(CursorSemantics::Completed, DEFAULT_LEASE_DURATION, Some(5))
+                .expect("default simulation run config must be valid");
+        self.coordinator
+            .create_run(self.context.now(), self.tenant, run, config)
+            .unwrap_or_else(|err| {
+                panic!("simulation topology seeding failed to create run {run:?}: {err:?}")
+            });
+
+        // Partition the one-byte keyspace [0x00, 0xFF] into `n_shards`
+        // non-overlapping half-open ranges. Divisor 256 ensures the last
+        // shard's computed end exceeds 0xFF, and a two-byte sentinel
+        // ([0xFF, 0x01]) covers byte 0xFF in the half-open representation.
+        let bounds: Vec<([u8; 1], Vec<u8>)> = (0..n_shards)
+            .map(|index| {
+                let start = ((index * 256) / n_shards) as u8;
+                let end_val = ((index + 1) * 256) / n_shards;
+                if end_val >= 256 {
+                    ([start], vec![0xFF, 0x01])
+                } else {
+                    ([start], vec![end_val as u8])
+                }
+            })
+            .collect();
+        let manifest: Vec<_> = bounds
+            .iter()
+            .enumerate()
+            .map(|(index, (start, end))| {
+                InitialShardInput::new(
+                    ShardId::from_raw((index as u64) + 1),
+                    ShardSpecRef::with_range(start.as_slice(), end.as_slice()),
+                    CursorUpdate::initial(),
+                )
+            })
+            .collect();
+
+        self.context.advance(1);
+        let reg_op_id = self.next_admin_op_id();
+        let outcome = self
+            .coordinator
+            .register_shards(self.context.now(), self.tenant, run, &manifest, reg_op_id)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "simulation topology seeding failed to register {n_shards} shard(s): {err:?}"
+                )
+            });
+        debug_assert!(
+            outcome.is_executed(),
+            "fresh simulation topology seeding must not replay"
+        );
+
+        let new_keys: Vec<_> = (1..=n_shards)
+            .map(|raw| ShardKey::new(run, ShardId::from_raw(raw)))
+            .collect();
+        self.run_shard_ids
+            .insert(run, new_keys.iter().map(|key| key.shard()).collect());
+        self.shard_keys.extend(new_keys.iter().copied());
+        self.active_shard_keys.extend(new_keys);
+        self
+    }
+
+    /// Return a shared reference to the simulation backend.
+    #[must_use]
+    pub fn backend(&self) -> &B {
+        &self.coordinator
+    }
+
+    /// Return a mutable reference to the simulation backend.
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.coordinator
+    }
+
     /// Execute a single step: run the operation, then check **all** invariants.
     ///
     /// Every operation—successful or rejected—is followed by a full invariant
@@ -1182,7 +1264,19 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// terminal state (`converged` flag in the report).
     ///
     /// Consumes `self` to prevent accidental reuse of simulation state.
-    pub fn run(mut self, safety_ops: usize, liveness_ops: usize) -> SimReport {
+    pub fn run(self, safety_ops: usize, liveness_ops: usize) -> SimReport {
+        self.run_and_return_backend(safety_ops, liveness_ops).0
+    }
+
+    /// Run a complete simulation and return both the report and backend.
+    ///
+    /// This is useful for backend-specific assertions that need post-run access
+    /// to observability surfaces such as fault counters or internal metrics.
+    pub fn run_and_return_backend(
+        mut self,
+        safety_ops: usize,
+        liveness_ops: usize,
+    ) -> (SimReport, B) {
         let mut all_violations = Vec::new();
         let mut event_counts = BTreeMap::new();
 
@@ -1229,7 +1323,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 .count()
         };
 
-        SimReport {
+        let report = SimReport {
             ops_executed: self.ops_executed,
             violations: all_violations,
             event_counts,
@@ -1237,7 +1331,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             end_time: self.context.now(),
             converged,
             non_terminal_count,
-        }
+        };
+
+        (report, self.coordinator)
     }
 
     // -----------------------------------------------------------------------
