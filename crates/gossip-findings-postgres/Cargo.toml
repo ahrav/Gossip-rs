@@ -19,10 +19,15 @@ test-utils = []
 gossip-contracts.workspace = true
 gossip-pg-common.workspace = true
 postgres = "0.19"
-blake3 = "1.8"
 
 [dev-dependencies]
+blake3 = "1.8"
 proptest.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
 gossip-pg-common = { workspace = true, features = ["test-support"] }
 gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
+
+[[test]]
+name = "findings_pg_integration"
+path = "tests/findings_pg_integration.rs"
+required-features = ["test-utils"]

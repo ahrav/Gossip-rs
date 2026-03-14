@@ -457,7 +457,6 @@ fn assert_sql_merge_matches_rust_merge(
 /// so commutativity only holds relative to the Rust merge called in the
 /// same order.
 #[test]
-#[ignore = "requires Docker or GOSSIP_POSTGRES_TEST_URL"]
 fn sql_on_conflict_merge_matches_rust_merge_proptest() {
     let mut client = test_client();
     setup_parent_rows(&mut client);
