@@ -80,7 +80,7 @@ Non-negotiables (project-wide):
 |------|---------|
 | `DoneLedgerKey` | Composite lookup key: `(TenantId, PolicyHash, OvidHash)` — fixed-width, implements `CanonicalBytes`. |
 | `DoneLedgerStatus` | Scan outcome enum with monotonic join-semilattice semantics: `FailedRetryable(1) < FailedPermanent(2) < Skipped(3) < ScannedClean(10) < ScannedWithFindings(11)`. Rank gap between 3 and 10 reserves space for future non-terminal states. |
-| `DoneLedgerRecord` | Complete done-ledger row: key, lattice status, `bytes_scanned`, `findings_count`, provenance, optional error code. Validated at construction (`try_new`) and optionally via `validate()` before persisting. Supports `merge` for lattice upsert. |
+| `DoneLedgerRecord` | Complete done-ledger row: key, lattice status, `bytes_scanned`, `findings_count`, provenance, optional error code. Validated at construction (`try_new`) and optionally via `validate()` before persisting. Supports `merge` for lattice upsert. `ScannedClean` forces `findings_count = 0`; `ScannedWithFindings` keeps only `ScannedWithFindings` contributors and clamps to `>= 1`; provenance winner is the lexicographically greatest `(status, finished_at, started_at, fence_epoch, run_id, shard_id, error_code_bytes)` tuple. |
 | `DoneLedgerProvenance` | Write-side metadata: `run_id`, `shard_id`, `fence_epoch`, `started_at`, `finished_at`. Not part of the dedup key. |
 | `DoneLedgerErrorCode` | ASCII-safe bounded string (max 128 bytes) for structured error codes like `HTTP_403`, `TIMEOUT`. Validated alphabet at construction. |
 | `OvidHash` | Content-addressed Object-Version Identity digest (BLAKE3, 32 bytes). Derived from `OvidHashInputs` via `derive_ovid_hash`. |

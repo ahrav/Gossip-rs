@@ -669,7 +669,7 @@ mod tests {
 
         assert_eq!(deduped[0].status(), DoneLedgerStatus::ScannedWithFindings);
         assert_eq!(deduped[0].bytes_scanned(), 500);
-        assert_eq!(deduped[0].findings_count(), 9);
+        assert_eq!(deduped[0].findings_count(), 1);
         assert_eq!(deduped[0].error_code(), None);
     }
 }

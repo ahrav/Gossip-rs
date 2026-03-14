@@ -52,7 +52,8 @@ const ALL_STATUSES: [DoneLedgerStatus; 5] = DoneLedgerStatus::ALL;
 /// - `HigherStatus` — the incoming record has a strictly higher status rank.
 /// - `LaterFinishedAt` — equal status, incoming has a later `finished_at`.
 /// - `LaterStartedAt` — equal status and `finished_at`, incoming has a later `started_at`.
-/// - `ExactTie` — identical status and timestamps; existing row wins (stability).
+/// - `ExactTie` — identical status and timestamps; later tie-break fields
+///   (`fence_epoch`, `run_id`, `shard_id`, `error_code`) choose the winner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MergeScenario {
     General,
@@ -486,10 +487,10 @@ fn arb_later_started_case() -> BoxedStrategy<MergeParityCase> {
         .boxed()
 }
 
-/// Same status, same `started_at`, same `finished_at` — a perfect tie.
-/// The merge rule preserves the existing (first-written) row, so the
-/// parity check must account for write order when comparing SQL and Rust
-/// merge results.
+/// Same status, same `started_at`, same `finished_at` — a tie on the
+/// semantic ordering fields. The remaining tie-break suffix
+/// (`fence_epoch`, `run_id`, `shard_id`, `error_code`) must resolve the
+/// winner identically in Rust and SQL.
 fn arb_exact_tie_case() -> BoxedStrategy<MergeParityCase> {
     (
         arb_key_seeds(),
@@ -669,9 +670,8 @@ fn assert_sql_merge_matches_rust_merge(
 /// `PROPTEST_CASES`).
 ///
 /// Each case is tested in *both* write orders (existing→incoming and
-/// incoming→existing) because exact ties preserve the first-written row,
-/// so commutativity only holds relative to the Rust merge called in the
-/// same order.
+/// incoming→existing) so the parity check covers both insert/update paths
+/// and independently verifies that SQL stays commutative across write order.
 ///
 /// Post-loop assertions verify that the proptest run achieved adequate
 /// coverage: all five status variants appeared, and all four non-General
@@ -713,29 +713,18 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
                 case.scenario,
                 "existing_then_incoming",
             )?;
-            // Exact ties preserve the existing row, so parity has to be
-            // checked against the Rust merge in each write order separately.
-            assert_sql_merge_matches_rust_merge(
+            let sql_incoming_first = assert_sql_merge_matches_rust_merge(
                 &backend,
                 &case.incoming,
                 &case.existing,
                 case.scenario,
                 "incoming_then_existing",
             )?;
-
-            // Independent contract assertion: on exact tie, SQL must
-            // preserve the first-written (existing) record's provenance.
-            // This checks the contract directly rather than via the Rust
-            // merge, catching bugs where both Rust and SQL agree on the
-            // *wrong* answer. Reuses the result from the first parity
-            // check to avoid a redundant database round-trip.
-            if case.scenario == MergeScenario::ExactTie {
-                prop_assert_eq!(
-                    sql_existing_first.provenance(),
-                    case.existing.provenance(),
-                    "ExactTie: SQL should preserve existing record's provenance"
-                );
-            }
+            assert_record_fields_match(
+                &sql_existing_first,
+                &sql_incoming_first,
+                &format!("{:?}/write_order_commutativity", case.scenario),
+            )?;
 
             Ok(())
         })
@@ -772,7 +761,7 @@ fn sql_on_conflict_merge_matches_rust_merge_proptest() {
         );
         assert!(
             saw_exact_tie.get(),
-            "proptest should cover exact-tie stability (existing row wins)"
+            "proptest should cover exact-tie canonical winner selection"
         );
     }
 }

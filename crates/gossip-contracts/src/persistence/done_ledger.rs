@@ -47,6 +47,12 @@ use super::{
     ovid::OvidHash,
 };
 
+#[inline]
+pub(crate) fn pg_bigint_bits_sort_key(raw: u64) -> i64 {
+    // Bit-pattern reinterpret — matches u64_to_pg_bigint_bits in gossip-pg-common
+    i64::from_ne_bytes(raw.to_ne_bytes())
+}
+
 /// Maximum length of a done-ledger error code in bytes.
 ///
 /// This field exists for short structured codes like `HTTP_403`, `TIMEOUT`,
@@ -605,11 +611,16 @@ impl DoneLedgerRecord {
     /// 2. **`bytes_scanned`** — non-regressing maximum of both records.
     /// 3. **`findings_count`** — status-aware:
     ///    - `ScannedClean`: forced to 0.
-    ///    - `ScannedWithFindings`: `max(existing, incoming)`, clamped to `>= 1`.
+    ///    - `ScannedWithFindings`: `max(existing_swf, incoming_swf)`, clamped
+    ///      to `>= 1`. Lower-status rows do not contribute findings once a
+    ///      `ScannedWithFindings` result exists.
     ///    - Otherwise: `max(existing, incoming)`.
     /// 4. **Provenance** (`run_id`, `shard_id`, `fence_epoch`, timestamps) —
-    ///    winner chosen by highest status rank, then latest `finished_at`,
-    ///    then latest `started_at`. Ties preserve `self` (the existing record).
+    ///    winner chosen by the lexicographically greatest
+    ///    `(status rank, finished_at, started_at, fence_epoch, run_id,
+    ///    shard_id, error_code)` tuple. `run_id` and `shard_id` use the same
+    ///    bit-pattern `BIGINT` ordering as the PostgreSQL backend so both
+    ///    implementations resolve exact ties identically.
     /// 5. **`error_code`** — cleared when merged status is scanned; otherwise
     ///    taken from the provenance winner, falling back to the loser.
     ///
@@ -634,18 +645,14 @@ impl DoneLedgerRecord {
         let bytes_scanned = self.bytes_scanned.max(incoming.bytes_scanned);
         let findings_count = match merged_status {
             DoneLedgerStatus::ScannedClean => 0,
-            DoneLedgerStatus::ScannedWithFindings => {
-                self.findings_count.max(incoming.findings_count).max(1)
-            }
+            DoneLedgerStatus::ScannedWithFindings => self
+                .swf_findings_count()
+                .max(incoming.swf_findings_count())
+                .max(1),
             _ => self.findings_count.max(incoming.findings_count),
         };
 
-        let choose_incoming = incoming.status.rank() > self.status.rank()
-            || (incoming.status.rank() == self.status.rank()
-                && incoming.provenance.finished_at() > self.provenance.finished_at())
-            || (incoming.status.rank() == self.status.rank()
-                && incoming.provenance.finished_at() == self.provenance.finished_at()
-                && incoming.provenance.started_at() > self.provenance.started_at());
+        let choose_incoming = incoming.provenance_winner_key() > self.provenance_winner_key();
 
         let chosen = if choose_incoming { incoming } else { self };
         let fallback = if choose_incoming { self } else { incoming };
@@ -667,6 +674,28 @@ impl DoneLedgerRecord {
             chosen.provenance,
             error_code,
         )
+    }
+
+    fn provenance_winner_key(&self) -> (u8, u64, u64, u64, i64, i64, &[u8]) {
+        (
+            self.status.rank(),
+            self.provenance.finished_at().as_raw(),
+            self.provenance.started_at().as_raw(),
+            self.provenance.fence_epoch().as_raw(),
+            pg_bigint_bits_sort_key(self.provenance.run_id().as_raw()),
+            pg_bigint_bits_sort_key(self.provenance.shard_id().as_raw()),
+            self.error_code
+                .as_ref()
+                .map_or(&[][..], |code| code.as_str().as_bytes()),
+        )
+    }
+
+    fn swf_findings_count(&self) -> u32 {
+        if self.status == DoneLedgerStatus::ScannedWithFindings {
+            self.findings_count
+        } else {
+            0
+        }
     }
 }
 
@@ -732,3 +761,7 @@ pub trait DoneLedger: Send + Sync {
 #[cfg(test)]
 #[path = "done_ledger_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lattice_property_tests.rs"]
+mod lattice_property_tests;
