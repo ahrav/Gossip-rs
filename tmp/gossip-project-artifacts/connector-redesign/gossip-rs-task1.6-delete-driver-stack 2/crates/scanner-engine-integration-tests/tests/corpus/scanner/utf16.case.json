@@ -1,0 +1,219 @@
+{
+  "failure": {
+    "kind": "Unimplemented",
+    "message": "corpus",
+    "step": 0
+  },
+  "fault_plan": {
+    "per_file": {}
+  },
+  "git_commit": null,
+  "run_config": {
+    "buffer_pool_cap": 6,
+    "chunk_size": 32,
+    "max_in_flight_objects": 10,
+    "max_steps": 0,
+    "max_transform_depth": 2,
+    "overlap": 512,
+    "scan_utf16_variants": true,
+    "stability_runs": 2,
+    "workers": 2
+  },
+  "scanner_pkg_version": "dev",
+  "scenario": {
+    "expected": [
+      {
+        "path": {
+          "bytes": [
+            117,
+            116,
+            102,
+            49,
+            54,
+            108,
+            101,
+            46,
+            116,
+            120,
+            116
+          ]
+        },
+        "repr": "Utf16Le",
+        "root_span": {
+          "end": 28,
+          "start": 2
+        },
+        "rule_id": 0
+      },
+      {
+        "path": {
+          "bytes": [
+            117,
+            116,
+            102,
+            49,
+            54,
+            98,
+            101,
+            46,
+            116,
+            120,
+            116
+          ]
+        },
+        "repr": "Utf16Be",
+        "root_span": {
+          "end": 26,
+          "start": 0
+        },
+        "rule_id": 1
+      }
+    ],
+    "fs": {
+      "nodes": [
+        {
+          "File": {
+            "contents": [
+              120,
+              120,
+              84,
+              0,
+              79,
+              0,
+              75,
+              0,
+              48,
+              0,
+              95,
+              0,
+              65,
+              0,
+              66,
+              0,
+              67,
+              0,
+              68,
+              0,
+              69,
+              0,
+              70,
+              0,
+              71,
+              0,
+              72,
+              0,
+              121,
+              121
+            ],
+            "path": {
+              "bytes": [
+                117,
+                116,
+                102,
+                49,
+                54,
+                108,
+                101,
+                46,
+                116,
+                120,
+                116
+              ]
+            }
+          }
+        },
+        {
+          "File": {
+            "contents": [
+              0,
+              84,
+              0,
+              79,
+              0,
+              75,
+              0,
+              49,
+              0,
+              95,
+              0,
+              81,
+              0,
+              87,
+              0,
+              69,
+              0,
+              82,
+              0,
+              84,
+              0,
+              89,
+              0,
+              49,
+              0,
+              50
+            ],
+            "path": {
+              "bytes": [
+                117,
+                116,
+                102,
+                49,
+                54,
+                98,
+                101,
+                46,
+                116,
+                120,
+                116
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "rule_suite": {
+      "rules": [
+        {
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              48,
+              95
+            ]
+          ],
+          "name": "TOK0",
+          "radius": 64,
+          "regex": "TOK0_[A-Z0-9]{8}",
+          "rule_id": 0
+        },
+        {
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              49,
+              95
+            ]
+          ],
+          "name": "TOK1",
+          "radius": 64,
+          "regex": "TOK1_[A-Z0-9]{8}",
+          "rule_id": 1
+        }
+      ],
+      "schema_version": 1
+    },
+    "schema_version": 1
+  },
+  "scenario_seed": 3,
+  "schedule_seed": 4242,
+  "schema_version": 1,
+  "target": "local",
+  "trace": {
+    "full": null,
+    "ring": []
+  }
+}

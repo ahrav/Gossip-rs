@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gossip-stdx",
+    "crates/gossip-contracts",
+    "crates/gossip-done-ledger-postgres",
+    "crates/scanner-engine",
+    "crates/scanner-scheduler",
+    "crates/scanner-git",
+    "crates/scanner-engine-integration-tests",
+    "crates/gossip-scanner-runtime",
+    "crates/gossip-connectors",
+    "crates/gossip-coordination",
+    "crates/gossip-coordination-etcd",
+    "crates/gossip-persistence-inmemory",
+    "crates/gossip-frontier",
+    "crates/gossip-worker",
+    "crates/scanner-rs-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+repository = "https://github.com/ahrav/gossip-rs"
+
+[workspace.dependencies]
+# Internal crate dependencies
+gossip-stdx = { path = "crates/gossip-stdx" }
+gossip-contracts = { path = "crates/gossip-contracts" }
+gossip-done-ledger-postgres = { path = "crates/gossip-done-ledger-postgres" }
+scanner-engine = { path = "crates/scanner-engine" }
+scanner-scheduler = { path = "crates/scanner-scheduler" }
+scanner-git = { path = "crates/scanner-git" }
+gossip-scanner-runtime = { path = "crates/gossip-scanner-runtime" }
+gossip-connectors = { path = "crates/gossip-connectors" }
+gossip-coordination = { path = "crates/gossip-coordination" }
+gossip-coordination-etcd = { path = "crates/gossip-coordination-etcd" }
+gossip-persistence-inmemory = { path = "crates/gossip-persistence-inmemory" }
+gossip-frontier = { path = "crates/gossip-frontier" }
+
+# External dev/test dependencies
+rstest = "0.25"
+proptest = "1.6"
+testcontainers = { version = "0.27", features = ["blocking"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1.0"
+
+# ── Profile tuning ────────────────────────────────────────────────────
+# Optimise third-party crates in dev/test builds so property tests,
+# regex matching, and vectorscan scanning run at near-release speed
+# while our own crates stay at opt-level 0 for fast incremental builds.
+#
+# This only affects the initial clean build (deps compile with -O1).
+# Incremental builds are unaffected because deps are cached and only
+# workspace crates recompile on source changes.
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 1
+
+[workspace.metadata.guardrails]
+legacy_driver_stack_check = "python3 scripts/check_no_legacy_driver_stack.py"

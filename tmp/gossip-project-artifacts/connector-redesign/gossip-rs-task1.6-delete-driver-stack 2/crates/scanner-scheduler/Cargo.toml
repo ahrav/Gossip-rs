@@ -1,0 +1,86 @@
+[package]
+name = "scanner-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Scheduler and parallel scan runtime extracted from scanner-rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[dependencies]
+scanner-engine.workspace = true
+gossip-stdx.workspace = true
+bzip2 = "0.5"
+crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
+crc32fast = "1.4"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
+ignore = "0.4"
+libc = "0.2"
+memchr = "2.8"
+num_cpus = "1.16"
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+loom = { version = "0.7", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"
+
+[features]
+default = []
+kani = []
+loom = ["dep:loom", "gossip-stdx/loom"]
+perf-stats = ["scanner-engine/perf-stats"]
+stats = ["perf-stats", "scanner-engine/stats"]
+b64-stats = ["stats", "scanner-engine/b64-stats"]
+bench = []
+
+scheduler-sim = ["sim-harness"]
+sim-harness = [
+    "perf-stats",
+    "scanner-engine/sim-harness",
+    "scanner-engine/test-support",
+]
+stdx-proptest = []
+aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
+
+[[example]]
+name = "gen_scheduler_corpus"
+required-features = ["scheduler-sim"]
+
+[dev-dependencies]
+crc32fast = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+gossip-connectors.workspace = true
+loom = "0.7"
+gossip-contracts = { workspace = true, features = ["test-support"] }
+gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
+proptest = "1.10"
+rstest = "0.25"
+scanner-engine = { workspace = true, features = ["test-support"] }
+tempfile = "3.10"
+
+[[bench]]
+name = "archive_detect"
+harness = false
+
+[[bench]]
+name = "archive_throughput"
+harness = false
+
+[[bench]]
+name = "runtime_hotpath"
+harness = false
+
+

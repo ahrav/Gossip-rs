@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "seed": 229,
+  "case": {
+    "exec_cfg": {
+      "workers": 2,
+      "steal_tries": 2,
+      "seed": 229,
+      "wake_on_hoard_threshold": 32
+    },
+    "resources": [],
+    "programs": [
+      {
+        "name": "root",
+        "code": [
+          {
+            "Spawn": {
+              "program": 1,
+              "placement": "Global"
+            }
+          },
+          "Complete"
+        ]
+      },
+      {
+        "name": "child",
+        "code": [
+          "Complete"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "tid": 0,
+        "program": 0,
+        "pc": 0
+      }
+    ],
+    "initial_runnable": [
+      0
+    ],
+    "external_events": [],
+    "max_steps": 20
+  },
+  "driver_choices": [
+    {
+      "idx": 0
+    },
+    {
+      "idx": 0
+    },
+    {
+      "idx": 0
+    },
+    {
+      "idx": 0
+    }
+  ],
+  "expected_trace_hash": 9966387291953960923,
+  "failure": {
+    "kind": "Timeout",
+    "step": 24,
+    "message": "corpus artifact"
+  }
+}

@@ -1,0 +1,58 @@
+[package]
+name = "gossip-stdx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Shared low-level data structures for gossip-rs (may contain unsafe internals behind safe APIs)"
+
+# NOTE: Run `cargo +nightly miri test -p gossip-stdx` to verify unsafe code.
+# All tests must pass under Miri (detects UB, use-after-free, uninit reads).
+
+[features]
+kani = []
+stdx-proptest = []
+perf-stats = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)'] }
+
+[lib]
+
+[dependencies]
+crossbeam-utils = "0.8"
+loom = { version = "0.7", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+loom = "0.7"
+proptest = "1.10"
+
+[[bench]]
+name = "ring_buffer"
+harness = false
+
+[[bench]]
+name = "inline_vec"
+harness = false
+
+[[bench]]
+name = "byte_slab"
+harness = false
+
+[[bench]]
+name = "bitset_fixedset"
+harness = false
+
+[[bench]]
+name = "fixed_set"
+harness = false
+
+[[bench]]
+name = "fixed_vec"
+harness = false
+
+[[bench]]
+name = "timing_wheel"
+harness = false

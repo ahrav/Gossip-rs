@@ -1,0 +1,72 @@
+[package]
+name = "scanner-engine-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Workspace integration tests for scanner-engine"
+
+[features]
+default = []
+sim-harness = ["scanner-scheduler/sim-harness", "scanner-git/sim-harness"]
+scheduler-sim = ["scanner-scheduler/scheduler-sim"]
+real-rules-harness = []
+aegis-pure-rust = [
+    "scanner-engine/aegis-pure-rust",
+    "scanner-scheduler/aegis-pure-rust",
+    "scanner-git/aegis-pure-rust",
+]
+# Feature gates for migrated scanner-rs external test suites.
+integration-tests = []
+property-tests = ["sim-harness"]
+smoke-tests = []
+diagnostic-tests = []
+kgram-gate = ["scanner-engine/kgram-gate"]
+bench = ["scanner-engine/bench"]
+perf-stats = ["scanner-engine/perf-stats"]
+stdx-proptest = ["scanner-engine/stdx-proptest"]
+
+[dev-dependencies]
+base64 = "0.22"
+blake3 = "1.5"
+crc32fast = "1.4"
+flate2 = "1.1"
+gix-commitgraph = "0.34"
+gossip-stdx.workspace = true
+memchr = "2.7"
+proptest.workspace = true
+regex = "1.12"
+scanner-engine = { workspace = true, features = ["test-support"] }
+scanner-git.workspace = true
+scanner-scheduler.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# ── Test targets ────────────────────────────────────────────────────────
+# Each test binary requires its corresponding feature flag.
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "property"
+path = "tests/property/main.rs"
+required-features = ["property-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/smoke/main.rs"
+required-features = ["smoke-tests"]
+
+[[test]]
+name = "diagnostic"
+path = "tests/diagnostic/main.rs"
+required-features = ["diagnostic-tests"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)'] }

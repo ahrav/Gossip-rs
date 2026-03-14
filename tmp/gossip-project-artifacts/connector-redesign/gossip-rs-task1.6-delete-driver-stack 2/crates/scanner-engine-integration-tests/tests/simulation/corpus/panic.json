@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "seed": 999,
+  "case": {
+    "exec_cfg": {
+      "workers": 1,
+      "steal_tries": 2,
+      "seed": 999,
+      "wake_on_hoard_threshold": 32
+    },
+    "resources": [],
+    "programs": [
+      {
+        "name": "panic_immediately",
+        "code": [
+          "Panic"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "tid": 0,
+        "program": 0,
+        "pc": 0
+      }
+    ],
+    "initial_runnable": [
+      0
+    ],
+    "external_events": [
+      {
+        "at_step": 5,
+        "event": "CloseGateJoin"
+      }
+    ],
+    "max_steps": 50
+  },
+  "driver_choices": [],
+  "expected_trace_hash": 7368683989193764229,
+  "failure": {
+    "kind": "Panic",
+    "step": 1,
+    "message": "task panic test"
+  }
+}
