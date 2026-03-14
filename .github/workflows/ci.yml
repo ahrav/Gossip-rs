@@ -282,6 +282,15 @@ jobs:
           --features test-support
           --profile ci
 
+      - name: Run etcd integration tests (release)
+        if: github.event_name == 'schedule'
+        run: >-
+          cargo nextest run
+          -p gossip-coordination-etcd
+          --features test-support
+          --release
+          --profile nightly
+
   # ── Benchmark (compile check) ────────────────────────────────────
   bench:
     name: Bench (compile)
