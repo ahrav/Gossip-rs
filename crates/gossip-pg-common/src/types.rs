@@ -1,5 +1,7 @@
-//! Rust ↔ PostgreSQL type-mapping helpers for `u64` fields stored as
-//! `BIGINT`.
+//! Rust ↔ PostgreSQL type-mapping helpers for `u64`/`BIGINT` fields and
+//! fixed-width `BYTEA` identity columns.
+//!
+//! # `u64` ↔ `BIGINT`
 //!
 //! PostgreSQL `BIGINT` is a signed 64-bit integer, but domain types
 //! throughout gossip-rs use `u64` for both opaque identifiers and ordered
@@ -20,6 +22,14 @@
 //!
 //! Each function pair (`u64_to_pg_*` / `pg_*_to_u64`) is a bijection over
 //! its accepted domain. Round-trip correctness is verified in unit tests.
+//!
+//! # `BYTEA` ↔ fixed-length byte arrays
+//!
+//! [`decode_fixed_32`] converts a borrowed `&[u8]` slice (obtained via
+//! `Row::try_get::<_, &[u8]>`) into a `[u8; 32]` array, returning
+//! [`PgByteDecodeError::InvalidByteLength`] when the slice length does not
+//! match. This avoids the `Vec<u8>` allocation that `try_get::<_, Vec<u8>>`
+//! would incur.
 
 use std::{error::Error, fmt};
 
@@ -125,11 +135,59 @@ pub fn pg_bigint_nonnegative_to_u64(
     Ok(value as u64)
 }
 
+/// Error produced when a `BYTEA` column cannot be decoded into a
+/// fixed-length byte array.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PgByteDecodeError {
+    /// The stored blob length does not match the expected fixed width.
+    InvalidByteLength {
+        /// Schema column or field name.
+        field: &'static str,
+        /// The fixed width the caller requires (e.g. 32 for identity hashes).
+        expected: usize,
+        /// The actual number of bytes returned by PostgreSQL.
+        actual: usize,
+    },
+}
+
+impl fmt::Display for PgByteDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::InvalidByteLength {
+                field,
+                expected,
+                actual,
+            } => write!(f, "field {field}: expected {expected} bytes, got {actual}"),
+        }
+    }
+}
+
+impl Error for PgByteDecodeError {}
+
+/// Decode a `BYTEA` column value into a fixed 32-byte identity array.
+///
+/// Accepts `&[u8]` to avoid forcing a `Vec<u8>` allocation at the call
+/// site — `postgres::Row::try_get::<_, &[u8]>` borrows directly from the
+/// row buffer.
+///
+/// # Errors
+///
+/// Returns [`PgByteDecodeError::InvalidByteLength`] when `bytes.len() != 32`.
+pub fn decode_fixed_32(bytes: &[u8], field: &'static str) -> Result<[u8; 32], PgByteDecodeError> {
+    bytes
+        .try_into()
+        .map_err(|_| PgByteDecodeError::InvalidByteLength {
+            field,
+            expected: 32,
+            actual: bytes.len(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PgU64ConversionError, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
-        u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
+        PgByteDecodeError, PgU64ConversionError, decode_fixed_32, pg_bigint_nonnegative_to_u64,
+        pg_bigint_to_u64_bits, u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
     };
 
     use gossip_contracts::test_util::miri_proptest_config;
@@ -290,5 +348,54 @@ mod tests {
             let err = u64_to_pg_bigint_checked(value, "test_field");
             prop_assert!(err.is_err(), "values above i64::MAX must be rejected");
         }
+    }
+
+    // ── BYTEA decode ───────────────────────────────────────────────
+
+    #[test]
+    fn decode_fixed_32_accepts_exactly_32_bytes() {
+        let bytes = [0xAB; 32];
+        assert_eq!(
+            decode_fixed_32(&bytes, "test_field").expect("32-byte slice should decode"),
+            [0xAB; 32]
+        );
+    }
+
+    #[test]
+    fn decode_fixed_32_rejects_31_bytes() {
+        let bytes = [0xAB; 31];
+        assert_eq!(
+            decode_fixed_32(&bytes, "test_field"),
+            Err(PgByteDecodeError::InvalidByteLength {
+                field: "test_field",
+                expected: 32,
+                actual: 31,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_fixed_32_rejects_33_bytes() {
+        let bytes = [0xAB; 33];
+        assert_eq!(
+            decode_fixed_32(&bytes, "test_field"),
+            Err(PgByteDecodeError::InvalidByteLength {
+                field: "test_field",
+                expected: 32,
+                actual: 33,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_fixed_32_rejects_empty() {
+        assert_eq!(
+            decode_fixed_32(&[], "test_field"),
+            Err(PgByteDecodeError::InvalidByteLength {
+                field: "test_field",
+                expected: 32,
+                actual: 0,
+            })
+        );
     }
 }

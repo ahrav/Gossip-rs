@@ -14,7 +14,7 @@ pub use gossip_pg_common::migration::{
     MigrationOperation, PgMigrationError as DoneLedgerPgMigrationError,
 };
 
-use crate::types::PgU64ConversionError;
+use crate::types::{PgByteDecodeError, PgU64ConversionError};
 
 /// Conversion failures at the Rust ↔ PostgreSQL storage boundary.
 ///
@@ -27,12 +27,8 @@ use crate::types::PgU64ConversionError;
 pub enum DoneLedgerPgConversionError {
     /// Numeric `u64`/`BIGINT` conversion failed.
     U64Conversion(PgU64ConversionError),
-    /// A fixed-width hash column did not contain 32 bytes.
-    InvalidByteLength {
-        field: &'static str,
-        expected: usize,
-        actual: usize,
-    },
+    /// BYTEA column decode: unexpected byte length.
+    ByteDecode(PgByteDecodeError),
     /// A persisted status rank did not map to a known `DoneLedgerStatus`.
     UnknownStatusRank { rank: i16 },
     /// A persisted `findings_count` value did not fit in `u32`.
@@ -43,14 +39,7 @@ impl fmt::Display for DoneLedgerPgConversionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::U64Conversion(source) => write!(f, "{source}"),
-            Self::InvalidByteLength {
-                field,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "field {field} stored {actual} bytes, expected {expected}"
-            ),
+            Self::ByteDecode(source) => write!(f, "{source}"),
             Self::UnknownStatusRank { rank } => {
                 write!(f, "stored unknown done-ledger status rank {rank}")
             }
@@ -65,9 +54,8 @@ impl Error for DoneLedgerPgConversionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::U64Conversion(source) => Some(source),
-            Self::InvalidByteLength { .. }
-            | Self::UnknownStatusRank { .. }
-            | Self::FindingsCountOutOfRange { .. } => None,
+            Self::ByteDecode(source) => Some(source),
+            Self::UnknownStatusRank { .. } | Self::FindingsCountOutOfRange { .. } => None,
         }
     }
 }
@@ -75,6 +63,12 @@ impl Error for DoneLedgerPgConversionError {
 impl From<PgU64ConversionError> for DoneLedgerPgConversionError {
     fn from(value: PgU64ConversionError) -> Self {
         Self::U64Conversion(value)
+    }
+}
+
+impl From<PgByteDecodeError> for DoneLedgerPgConversionError {
+    fn from(value: PgByteDecodeError) -> Self {
+        Self::ByteDecode(value)
     }
 }
 
@@ -246,6 +240,15 @@ impl From<DoneLedgerPgConversionError> for DoneLedgerPgError {
     }
 }
 
+impl From<PgByteDecodeError> for DoneLedgerPgError {
+    fn from(value: PgByteDecodeError) -> Self {
+        Self::Conversion {
+            record_index: None,
+            source: DoneLedgerPgConversionError::ByteDecode(value),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +306,38 @@ mod tests {
         assert!(
             err.source().is_none(),
             "CorruptedHistoryRecord should have no source error"
+        );
+    }
+
+    #[test]
+    fn conversion_error_byte_decode_delegates_display() {
+        let inner = PgByteDecodeError::InvalidByteLength {
+            field: "tenant_id",
+            expected: 32,
+            actual: 31,
+        };
+        let err = DoneLedgerPgConversionError::ByteDecode(inner);
+        assert_eq!(
+            err.to_string(),
+            inner.to_string(),
+            "ByteDecode Display should delegate to the inner PgByteDecodeError"
+        );
+    }
+
+    #[test]
+    fn conversion_error_byte_decode_exposes_source() {
+        let inner = PgByteDecodeError::InvalidByteLength {
+            field: "ovid_hash",
+            expected: 32,
+            actual: 0,
+        };
+        let err = DoneLedgerPgConversionError::ByteDecode(inner);
+        let source = err
+            .source()
+            .expect("ByteDecode should expose inner error as source");
+        assert!(
+            source.is::<PgByteDecodeError>(),
+            "source should be PgByteDecodeError"
         );
     }
 }
