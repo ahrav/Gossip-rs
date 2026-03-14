@@ -3,7 +3,6 @@
 //! This module defines the first concrete source family built on top of the
 //! shared paging vocabulary ([`PageBuf`], [`super::PageState`]). It models
 //! sources whose worker loop is naturally:
-//! worker loop is naturally:
 //!
 //! 1. fill a bounded ordered page of [`ScanItem`] values,
 //! 2. scan or skip committed items,
