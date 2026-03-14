@@ -451,6 +451,11 @@ fn run_op_sequence(seed: u64, level: FaultLevel, ops: &[ProptestOp]) {
     let mut seen_ovid_indices = BTreeSet::new();
 
     exercise_fault_prefix(&mut sim, &mut seen_ovid_indices);
+    assert_eq!(
+        sim.pending_batch_count(),
+        0,
+        "fault prefix must drain all pending writes"
+    );
 
     for (step_idx, op) in ops.iter().enumerate() {
         let materialized = materialize_op(&mut sim, &mut seen_ovid_indices, op);
