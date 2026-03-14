@@ -79,6 +79,11 @@ fn build_sim(seed: u64, case: &SimCase) -> CoordinationSim<SimEtcdCoordinator> {
     let backend = SimEtcdCoordinator::new(config, seed).expect("sim etcd backend must construct");
     let mut sim = CoordinationSim::with_backend(seed, case.harness_level, backend)
         .with_workers_and_shards(case.workers, case.shards);
+    // etcd-level faults are active from op 0, including during the harness
+    // warmup window (first 5 ops). The harness WARMUP_OPS suppression only
+    // affects harness-level fault scheduling, not backend fault injection.
+    // This is intentional: the coordinator must handle transient failures at
+    // any point, including during initial lease establishment.
     sim.backend_mut().set_fault_config(
         case.etcd_faults
             .clone()
@@ -100,19 +105,6 @@ fn merge_event_counts(
     for (kind, count) in counts {
         *aggregate.entry(*kind).or_insert(0) += count;
     }
-}
-
-fn merge_fault_stats(aggregate: &mut SimEtcdFaultStats, stats: SimEtcdFaultStats) {
-    aggregate.get_failures += stats.get_failures;
-    aggregate.txn_failures += stats.txn_failures;
-    aggregate.lease_grant_failures += stats.lease_grant_failures;
-    aggregate.lease_keep_alive_failures += stats.lease_keep_alive_failures;
-    aggregate.lease_revoke_failures += stats.lease_revoke_failures;
-    aggregate.cas_compare_failures += stats.cas_compare_failures;
-    aggregate.uncertain_commits += stats.uncertain_commits;
-    aggregate.lease_ttl_races += stats.lease_ttl_races;
-    aggregate.retry_exhaustion_bursts += stats.retry_exhaustion_bursts;
-    aggregate.retry_exhaustion_compare_failures += stats.retry_exhaustion_compare_failures;
 }
 
 fn repro_command(test_name: &str, seed: u64) -> String {
@@ -171,7 +163,7 @@ fn run_parallel_seed_sweep(
                     for seed in chunk {
                         let (report, stats) = run_case(seed, &case);
                         merge_event_counts(&mut local_counts, &report.event_counts);
-                        merge_fault_stats(&mut local_faults, stats);
+                        local_faults += stats;
 
                         if !report.violations.is_empty() {
                             failures.push((seed, format!("{:#?}", report.violations)));
@@ -183,19 +175,23 @@ fn run_parallel_seed_sweep(
             })
             .collect();
 
-        for handle in handles {
-            let (failures, local_counts, local_faults) =
-                handle.join().unwrap_or_else(|panic_val| {
-                    let msg = panic_val
-                        .downcast_ref::<String>()
-                        .map(|s| s.as_str())
-                        .or_else(|| panic_val.downcast_ref::<&str>().copied())
-                        .unwrap_or("(non-string panic)");
-                    panic!("{test_name} worker thread panicked: {msg}");
-                });
+        // Two-pass join: collect all outcomes before processing so that a
+        // panic in one thread does not drop unjoined handles and discard
+        // their invariant-violation data or fault counters.
+        let results: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+
+        for result in results {
+            let (failures, local_counts, local_faults) = result.unwrap_or_else(|panic_val| {
+                let msg = panic_val
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_val.downcast_ref::<&str>().copied())
+                    .unwrap_or("(non-string panic)");
+                panic!("{test_name} worker thread panicked: {msg}");
+            });
             all_failures.extend(failures);
             merge_event_counts(&mut aggregate_counts, &local_counts);
-            merge_fault_stats(&mut aggregate_faults, local_faults);
+            aggregate_faults += local_faults;
         }
     });
 
@@ -321,6 +317,10 @@ fn mega_sim_10k_steps_stormy() {
     assert!(
         aggregate_faults.cas_retry_failures() > 0,
         "Stormy seed sweep never observed CAS retry pressure"
+    );
+    assert!(
+        aggregate_faults.lease_ttl_races > 0,
+        "Stormy seed sweep never observed a lease-TTL race injection"
     );
 }
 
@@ -493,8 +493,10 @@ fn uncertain_commit_resilience() {
     }
 
     assert!(
-        total_uncertain_commits > 0,
-        "uncertain-commit resilience sweep never observed an uncertain commit"
+        total_uncertain_commits >= seeds.len(),
+        "uncertain-commit resilience sweep: expected one uncertain commit per seed \
+         ({} seed(s)) but observed only {total_uncertain_commits}",
+        seeds.len(),
     );
 }
 

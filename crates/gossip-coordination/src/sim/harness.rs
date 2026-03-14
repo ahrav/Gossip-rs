@@ -1143,6 +1143,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         if n_shards == 0 {
             return self;
         }
+        assert!(
+            n_shards <= 255,
+            "one-byte partitioner supports at most 255 shards, got {n_shards}"
+        );
 
         // Advance the sim clock before each coordinator API call so op_log
         // entries carry monotonically increasing timestamps.  Without this,
@@ -1160,14 +1164,19 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 panic!("simulation topology seeding failed to create run {run:?}: {err:?}")
             });
 
-        let bounds: Vec<_> = (0..n_shards)
+        // Partition the one-byte keyspace [0x00, 0xFF] into `n_shards`
+        // non-overlapping half-open ranges. Divisor 256 ensures the last
+        // shard's computed end exceeds 0xFF, and a two-byte sentinel
+        // ([0xFF, 0x01]) covers byte 0xFF in the half-open representation.
+        let bounds: Vec<([u8; 1], Vec<u8>)> = (0..n_shards)
             .map(|index| {
-                let start = ((index * 255) / n_shards) as u8;
-                let mut end = (((index + 1) * 255) / n_shards) as u8;
-                if end <= start {
-                    end = start.saturating_add(1);
+                let start = ((index * 256) / n_shards) as u8;
+                let end_val = ((index + 1) * 256) / n_shards;
+                if end_val >= 256 {
+                    ([start], vec![0xFF, 0x01])
+                } else {
+                    ([start], vec![end_val as u8])
                 }
-                ([start], [end])
             })
             .collect();
         let manifest: Vec<_> = bounds
@@ -1183,15 +1192,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .collect();
 
         self.context.advance(1);
+        let reg_op_id = self.next_admin_op_id();
         let outcome = self
             .coordinator
-            .register_shards(
-                self.context.now(),
-                self.tenant,
-                run,
-                &manifest,
-                OpId::from_raw(1),
-            )
+            .register_shards(self.context.now(), self.tenant, run, &manifest, reg_op_id)
             .unwrap_or_else(|err| {
                 panic!(
                     "simulation topology seeding failed to register {n_shards} shard(s): {err:?}"

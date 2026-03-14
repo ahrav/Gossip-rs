@@ -411,6 +411,39 @@ fn seeded_session_sim_with_range(
     (wrap_faulting_session_backend(sim, fault), worker, key)
 }
 
+/// Build a sim with one worker and one shard seeded at the given byte range.
+///
+/// Returns the sim, worker ID, and shard key ready for `execute_op`.
+fn sim_with_custom_spec(
+    seed: u64,
+    range_lo: &[u8],
+    range_hi: &[u8],
+) -> (CoordinationSim, WorkerId, ShardKey) {
+    let mut sim = CoordinationSim::new(seed, FaultLevel::SunnyDay);
+    let worker = WorkerId::from_raw(1);
+    sim.add_worker(worker);
+
+    let run = RunId::from_raw(1);
+    let shard = ShardId::from_raw(1);
+    let spec = ShardSpec::with_range(range_lo, range_hi);
+    let record = crate::record::ShardRecord::new_active(
+        sim.tenant,
+        run,
+        shard,
+        spec.as_ref(),
+        CursorSemantics::Completed,
+        sim.coordinator.slab_mut(),
+    )
+    .expect("slab large enough for test");
+    sim.coordinator.seed_shard(record);
+    let key = ShardKey::new(run, shard);
+    sim.shard_keys.push(key);
+    sim.active_shard_keys.push(key);
+    sim.run_shard_ids.entry(run).or_default().push(shard);
+    sim.context.advance(1);
+    (sim, worker, key)
+}
+
 fn predicted_session_terminal_action(
     seed: u64,
     range_lo: u8,
@@ -725,32 +758,7 @@ fn multi_run_isolation() {
 /// Worker with no prior cursor generates a cursor within spec bounds.
 #[test]
 fn generate_forward_cursor_no_prior() {
-    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
-
-    let worker = WorkerId::from_raw(1);
-    sim.add_worker(worker);
-
-    // Manually seed a shard with spec [b'a', b'z') so cursor range
-    // assertions are independent of the byte-space partitioning in
-    // `with_workers_and_shards`.
-    let run = RunId::from_raw(1);
-    let shard = ShardId::from_raw(1);
-    let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
-    let record = crate::record::ShardRecord::new_active(
-        sim.tenant,
-        run,
-        shard,
-        spec.as_ref(),
-        CursorSemantics::Completed,
-        sim.coordinator.slab_mut(),
-    )
-    .expect("slab large enough for test");
-    sim.coordinator.seed_shard(record);
-    let key = ShardKey::new(run, shard);
-    sim.shard_keys.push(key);
-    sim.active_shard_keys.push(key);
-
-    sim.context.advance(1);
+    let (mut sim, worker, key) = sim_with_custom_spec(42, b"a", b"z");
 
     // Acquire the shard.
     let event = sim.execute_op(&SimOp::Acquire { worker, key });
@@ -806,31 +814,7 @@ fn generate_forward_cursor_forward_progress() {
 /// `generate_forward_cursor` returns the previous cursor (idempotent retry).
 #[test]
 fn generate_forward_cursor_range_exhausted() {
-    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
-
-    let worker = WorkerId::from_raw(1);
-    sim.add_worker(worker);
-
-    // Manually seed a shard with spec [b'a', b'z') so the range-exhaustion
-    // boundary (cursor at b'y', next would be b'z' == range_hi) is testable.
-    let run = RunId::from_raw(1);
-    let shard = ShardId::from_raw(1);
-    let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
-    let record = crate::record::ShardRecord::new_active(
-        sim.tenant,
-        run,
-        shard,
-        spec.as_ref(),
-        CursorSemantics::Completed,
-        sim.coordinator.slab_mut(),
-    )
-    .expect("slab large enough for test");
-    sim.coordinator.seed_shard(record);
-    let key = ShardKey::new(run, shard);
-    sim.shard_keys.push(key);
-    sim.active_shard_keys.push(key);
-
-    sim.context.advance(1);
+    let (mut sim, worker, key) = sim_with_custom_spec(42, b"a", b"z");
 
     let event = sim.execute_op(&SimOp::Acquire { worker, key });
     assert!(matches!(event, SimEvent::AcquireOk { .. }));
@@ -860,31 +844,7 @@ fn generate_forward_cursor_range_exhausted() {
 /// next cursor's first byte must be >= b'b' and < b'c'.
 #[test]
 fn generate_forward_cursor_single_byte_range() {
-    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
-
-    // Add one worker.
-    let worker = WorkerId::from_raw(1);
-    sim.add_worker(worker);
-
-    // Manually seed a shard with narrow spec [b'a', b'c').
-    let run = RunId::from_raw(1);
-    let shard = ShardId::from_raw(1);
-    let spec = ShardSpec::with_range(vec![b'a'], vec![b'c']);
-    let record = crate::record::ShardRecord::new_active(
-        sim.tenant,
-        run,
-        shard,
-        spec.as_ref(),
-        CursorSemantics::Completed,
-        sim.coordinator.slab_mut(),
-    )
-    .expect("slab large enough for test");
-    sim.coordinator.seed_shard(record);
-    let key = ShardKey::new(run, shard);
-    sim.shard_keys.push(key);
-    sim.active_shard_keys.push(key);
-
-    sim.context.advance(1);
+    let (mut sim, worker, key) = sim_with_custom_spec(42, b"a", b"c");
 
     let event = sim.execute_op(&SimOp::Acquire { worker, key });
     assert!(matches!(event, SimEvent::AcquireOk { .. }));
@@ -893,7 +853,7 @@ fn generate_forward_cursor_single_byte_range() {
     sim.workers
         .get_mut(&worker)
         .unwrap()
-        .record_cursor(run, shard, vec![b'a']);
+        .record_cursor(key.run(), key.shard(), vec![b'a']);
 
     let cursor = sim.generate_forward_cursor(worker, key);
     let cursor_key = cursor.as_slice();
@@ -1499,4 +1459,57 @@ fn terminate_run_generator_targets_multiple_runs() {
         seen.contains(&run1) && seen.contains(&run2),
         "terminate_run generator should target both runs, saw: {seen:?}"
     );
+}
+
+/// The second admin op after `with_workers_and_shards` must not collide
+/// with the hard-coded `OpId::from_raw(1)` used by `register_shards`.
+///
+/// `admin_next_op` starts at 0 and is not advanced by
+/// `with_workers_and_shards`, so the sequence is:
+///   0 (first admin) → 1 (second admin).
+/// If `register_shards` also used raw 1, the second admin op on the same
+/// run hits `OpIdConflict` in the run-level op-log.
+#[test]
+fn second_admin_op_does_not_collide_with_topology_seeding() {
+    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+
+    let worker = WorkerId::from_raw(1);
+    let key = sim.shard_keys[0];
+
+    // Acquire and park so we can unpark (first admin op).
+    sim.context.advance(1);
+    let (event, v) = sim.step(SimOp::Acquire { worker, key });
+    assert!(matches!(event, SimEvent::AcquireOk { .. }));
+    assert!(v.is_empty());
+
+    let (event, v) = sim.step(SimOp::Park { worker, key });
+    assert!(matches!(event, SimEvent::ParkOk));
+    assert!(v.is_empty());
+
+    // Unpark → admin_op_id=0, shard op-log (no run-level collision).
+    let (event, v) = sim.step(SimOp::Unpark { key });
+    assert!(
+        matches!(event, SimEvent::UnparkOk),
+        "expected UnparkOk, got {event:?}"
+    );
+    assert!(v.is_empty());
+
+    // Cancel the run → admin_op_id=1. If register_shards wrote op_id=1
+    // to the run op-log, this returns OpIdConflict instead of succeeding.
+    let run = RunId::from_raw(1);
+    let (event, v) = sim.step(SimOp::TerminateRun {
+        run,
+        kind: RunTerminalKind::Cancel,
+    });
+    assert!(
+        matches!(
+            event,
+            SimEvent::RunTerminalOk {
+                kind: RunTerminalKind::Cancel,
+            }
+        ),
+        "expected RunTerminalOk(Cancel), got {event:?} — \
+         likely OpIdConflict with register_shards topology seeding"
+    );
+    assert!(v.is_empty());
 }

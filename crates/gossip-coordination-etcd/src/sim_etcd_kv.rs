@@ -970,6 +970,34 @@ impl SimEtcdFaultStats {
     }
 }
 
+impl std::ops::AddAssign for SimEtcdFaultStats {
+    fn add_assign(&mut self, rhs: Self) {
+        // Destructure so adding a field to the struct is a compile error here.
+        let Self {
+            get_failures,
+            txn_failures,
+            lease_grant_failures,
+            lease_keep_alive_failures,
+            lease_revoke_failures,
+            cas_compare_failures,
+            uncertain_commits,
+            lease_ttl_races,
+            retry_exhaustion_bursts,
+            retry_exhaustion_compare_failures,
+        } = rhs;
+        self.get_failures += get_failures;
+        self.txn_failures += txn_failures;
+        self.lease_grant_failures += lease_grant_failures;
+        self.lease_keep_alive_failures += lease_keep_alive_failures;
+        self.lease_revoke_failures += lease_revoke_failures;
+        self.cas_compare_failures += cas_compare_failures;
+        self.uncertain_commits += uncertain_commits;
+        self.lease_ttl_races += lease_ttl_races;
+        self.retry_exhaustion_bursts += retry_exhaustion_bursts;
+        self.retry_exhaustion_compare_failures += retry_exhaustion_compare_failures;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeaseState {
     ttl: u64,
