@@ -10,13 +10,16 @@
 //!
 //! The connector contract surface is split into focused layers:
 //!
-//! - `types.rs` defines validated value wrappers, paging/value invariants
-//!   (including toxic-byte redaction and size bounds), and [`ToxicDigest`].
+//! - `common.rs` defines the shared paging vocabulary
+//!   ([`PageBuf`], [`PageState`], [`PagingCapabilities`], page validation).
+//! - `types.rs` defines validated value wrappers, item metadata/value
+//!   invariants (including toxic-byte redaction and size bounds), and
+//!   [`ToxicDigest`].
 //! - `api.rs` defines operation-outcome classification and optional capability
 //!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
 //!   `ConnectorCapabilities`).
 //!
-//! Re-exporting both layers here gives runtime crates a single import boundary
+//! Re-exporting these layers here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
 //!
 //! ## Invariants
@@ -36,6 +39,8 @@
 //!
 //! - Byte wrappers: [`ItemKey`], [`ItemRef`], [`TokenBytes`]
 //! - Pooled slab owner for page-scoped toxic-byte wrappers: [`PooledByteSlab`]
+//! - Shared paging vocabulary: [`PageBuf`], [`PageState`], [`PagingCapabilities`],
+//!   [`KeyedPageItem`], [`PageShapeError`]
 //! - Paging bridge: [`Cursor`]
 //! - Version semantics: [`VersionId`]
 //! - Optional metadata: [`ContentHints`], [`Location`]
@@ -57,10 +62,14 @@
 //! scheduling, backoff policy) live in runtime crates.
 
 mod api;
+mod common;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
 pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
+pub use common::{
+    KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, validate_filled_page,
+};
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, ItemKey, ItemRef, Location,
     MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE, MAX_LOCATION_URL_SIZE,
