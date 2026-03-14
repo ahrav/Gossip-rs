@@ -481,10 +481,9 @@ fn collect_columns(records: &[DoneLedgerRecord]) -> Result<UpsertColumns, DoneLe
 /// or `DoneLedgerPgError::Conversion`, indicating data corruption or
 /// schema drift.
 ///
-/// Each BYTEA column allocates a `Vec<u8>` (the `postgres` crate's return
-/// type for `row.try_get`). This is a WARM-path cost accepted for simplicity;
-/// a crate-local newtype with a `FromSql` impl would eliminate 3
-/// allocations per row if profiling shows this is material.
+/// BYTEA columns are decoded as borrowed `&[u8]` slices via
+/// `row.try_get::<_, &[u8]>`, which reads directly from the row buffer
+/// without heap allocation.
 fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
     let tenant_id = TenantId::from_bytes(decode_fixed_32(
         row.try_get::<_, &[u8]>("tenant_id")?,

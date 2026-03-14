@@ -1,5 +1,6 @@
-//! Rust ↔ PostgreSQL type-mapping helpers for `u64` fields stored as
-//! `BIGINT`.
+//! Rust ↔ PostgreSQL type-mapping helpers.
+//!
+//! # `u64` ↔ `BIGINT`
 //!
 //! PostgreSQL `BIGINT` is a signed 64-bit integer, but domain types
 //! throughout gossip-rs use `u64` for both opaque identifiers and ordered
@@ -20,6 +21,14 @@
 //!
 //! Each function pair (`u64_to_pg_*` / `pg_*_to_u64`) is a bijection over
 //! its accepted domain. Round-trip correctness is verified in unit tests.
+//!
+//! # `BYTEA` ↔ fixed-length byte arrays
+//!
+//! [`decode_fixed_32`] converts a borrowed `&[u8]` slice (obtained via
+//! `Row::try_get::<_, &[u8]>`) into a `[u8; 32]` array, returning
+//! [`PgByteDecodeError::InvalidByteLength`] when the slice length does not
+//! match. This avoids the `Vec<u8>` allocation that `try_get::<_, Vec<u8>>`
+//! would incur.
 
 use std::{error::Error, fmt};
 
