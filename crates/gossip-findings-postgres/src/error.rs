@@ -94,7 +94,7 @@ pub enum FindingsPgError {
     Schema(FindingsPgSchemaError),
     /// BYTEA column decode: unexpected byte length.
     ByteDecode(PgByteDecodeError),
-    /// Query limit exceeds PostgreSQL's signed `BIGINT` range.
+    /// Query limit exceeds the non-negative `BIGINT` bound (`i64::MAX`).
     LimitOutOfRange { limit: usize },
     /// Non-negative `BIGINT` decode failed while reading SQL results.
     /// This is the read-path analog: it catches decode failures when
@@ -103,8 +103,6 @@ pub enum FindingsPgError {
     /// [`Schema(FindingsPgSchemaError::PgU64Conversion(..))`](FindingsPgError::Schema)
     /// during batch projection.
     PgU64Conversion(PgU64ConversionError),
-    /// A persisted row count did not fit the non-negative count domain.
-    CountOutOfRange { table: &'static str, value: i64 },
     /// A finding primary key mapped to a different immutable natural key.
     FindingConflict {
         tenant_id: TenantId,
@@ -170,9 +168,6 @@ impl fmt::Display for FindingsPgError {
                 write!(f, "query limit {limit} exceeds PostgreSQL BIGINT range")
             }
             Self::PgU64Conversion(source) => write!(f, "{source}"),
-            Self::CountOutOfRange { table, value } => {
-                write!(f, "stored count for {table} out of range: {value}")
-            }
             Self::FindingConflict {
                 tenant_id,
                 finding_id,
@@ -212,7 +207,6 @@ impl Error for FindingsPgError {
             Self::MutexPoisoned
             | Self::BatchTooLarge { .. }
             | Self::LimitOutOfRange { .. }
-            | Self::CountOutOfRange { .. }
             | Self::FindingConflict { .. }
             | Self::OccurrenceConflict { .. }
             | Self::ObservationConflict { .. }
@@ -534,19 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_error_display_describes_out_of_range_counts() {
-        let err = FindingsPgError::CountOutOfRange {
-            table: "findings",
-            value: -1,
-        };
-
-        assert_eq!(
-            err.to_string(),
-            "stored count for findings out of range: -1"
-        );
-    }
-
-    #[test]
     fn backend_error_display_describes_identity_conflicts() {
         let cases: &[(FindingsPgError, &[&str])] = &[
             (
@@ -648,10 +629,6 @@ mod tests {
             FindingsPgError::MutexPoisoned,
             FindingsPgError::BatchTooLarge { len: 11, max: 10 },
             FindingsPgError::LimitOutOfRange { limit: usize::MAX },
-            FindingsPgError::CountOutOfRange {
-                table: "findings",
-                value: -1,
-            },
             FindingsPgError::FindingConflict {
                 tenant_id: tenant_id(),
                 finding_id: finding_id(),

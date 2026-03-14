@@ -8,6 +8,7 @@ use gossip_contracts::{
         derive_ovid_hash,
     },
 };
+use gossip_findings_postgres::FindingsPgError;
 
 mod common;
 
@@ -485,6 +486,67 @@ fn list_findings_needing_triage_returns_latest_observation_when_finding_has_mult
 }
 
 #[test]
+fn list_findings_needing_triage_breaks_ties_on_observation_id_desc() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x79);
+
+    // Insert the base fixture (1 finding, 1 occurrence, 1 observation).
+    backend
+        .upsert_batch(fixture.batch())
+        .expect("base batch should succeed")
+        .wait()
+        .expect("base batch should commit");
+
+    // Insert a second observation for the same occurrence under a different
+    // policy but with the **same** seen_at — the DISTINCT ON tiebreaker
+    // (`observation_id DESC`) must pick the lexicographically higher ID.
+    let same_seen_at = fixture.observation.seen_at().as_raw();
+    let second_observation =
+        fixture.observation_for_policy(0xBD, 99_201, 99_202, 99_203, same_seen_at);
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            &[],
+            &[],
+            std::slice::from_ref(&second_observation),
+        ))
+        .expect("second-observation submit should succeed")
+        .wait()
+        .expect("second-observation durable write should succeed");
+
+    let rows = backend
+        .list_findings_needing_triage(fixture.tenant_id, 10)
+        .expect("triage query should succeed");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "DISTINCT ON should collapse two observations into one row per finding"
+    );
+
+    // Determine which observation_id is lexicographically greater.
+    let id_a = fixture.observation.observation_id();
+    let id_b = second_observation.observation_id();
+    let expected_winner = if id_a.as_bytes() > id_b.as_bytes() {
+        id_a
+    } else {
+        id_b
+    };
+
+    assert_eq!(
+        rows[0].observation_id(),
+        expected_winner,
+        "when seen_at values are identical, DISTINCT ON must select the \
+         observation with the lexicographically higher observation_id"
+    );
+    assert_eq!(
+        rows[0].seen_at(),
+        same_seen_at,
+        "returned seen_at should match the shared timestamp"
+    );
+}
+
+#[test]
 fn list_findings_needing_triage_picks_latest_across_multiple_occurrences() {
     let harness = LivePgHarness::new();
     let backend = harness.backend();
@@ -660,4 +722,19 @@ fn list_findings_needing_triage_with_zero_limit_returns_empty_vec() {
         .expect("zero-limit triage query should succeed");
 
     assert!(rows.is_empty(), "LIMIT 0 should return no rows");
+}
+
+#[test]
+fn list_findings_needing_triage_rejects_limit_out_of_bigint_range() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+
+    let err = backend
+        .list_findings_needing_triage(tenant(0xFD), usize::MAX)
+        .expect_err("usize::MAX should exceed BIGINT range");
+
+    assert!(
+        matches!(err, FindingsPgError::LimitOutOfRange { limit } if limit == usize::MAX),
+        "expected LimitOutOfRange, got: {err}"
+    );
 }

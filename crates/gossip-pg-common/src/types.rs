@@ -1,4 +1,5 @@
-//! Rust ↔ PostgreSQL type-mapping helpers.
+//! Rust ↔ PostgreSQL type-mapping helpers for `u64`/`BIGINT` fields and
+//! fixed-width `BYTEA` identity columns.
 //!
 //! # `u64` ↔ `BIGINT`
 //!

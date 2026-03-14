@@ -559,9 +559,11 @@ impl FindingsConformanceProbe for FindingsSinkPg {
         let mut client = self.lock_client()?;
         let row = client.query_one(COMBINED_COUNTS_SQL, &[])?;
 
-        let findings = nonneg_count(row.get::<_, i64>(0), FINDINGS_TABLE)?;
-        let occurrences = nonneg_count(row.get::<_, i64>(1), OCCURRENCES_TABLE)?;
-        let observations = nonneg_count(row.get::<_, i64>(2), OBSERVATIONS_TABLE)?;
+        let findings = crate::types::pg_bigint_nonnegative_to_u64(row.try_get(0)?, FINDINGS_TABLE)?;
+        let occurrences =
+            crate::types::pg_bigint_nonnegative_to_u64(row.try_get(1)?, OCCURRENCES_TABLE)?;
+        let observations =
+            crate::types::pg_bigint_nonnegative_to_u64(row.try_get(2)?, OBSERVATIONS_TABLE)?;
 
         Ok(DurableFindingsCounts::new(
             findings,
@@ -700,13 +702,6 @@ fn intercept_fk_violation(err: postgres::Error, table: &'static str) -> Findings
         };
     }
     FindingsPgError::Postgres(err)
-}
-
-/// Guard against negative counts (impossible in PostgreSQL but enforced
-/// defensively for the non-negative count domain).
-fn nonneg_count(value: i64, table: &'static str) -> Result<u64, FindingsPgError> {
-    crate::types::pg_bigint_nonnegative_to_u64(value, table)
-        .map_err(|_| FindingsPgError::CountOutOfRange { table, value })
 }
 
 #[cfg(test)]

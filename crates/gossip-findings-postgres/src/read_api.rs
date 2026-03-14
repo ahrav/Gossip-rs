@@ -1,6 +1,6 @@
 //! Minimal typed results for the findings PostgreSQL read surface.
 //!
-//! These types mirror the current query-plane outputs exposed by
+//! These types mirror the query-plane outputs exposed by
 //! [`crate::FindingsSinkPg`]. They keep harnesses and operational tooling on a
 //! typed Rust surface instead of raw SQL rows.
 
@@ -50,10 +50,10 @@ impl ObservationCountByPolicy {
     }
 }
 
-/// Placeholder row for the latest observation associated with one finding.
+/// Latest observation row for one finding, used by the triage read surface.
 ///
-/// Until mutable triage state exists, "findings needing triage" means the
-/// latest observation per finding for a tenant, ordered by recency.
+/// "Findings needing triage" returns the latest observation per finding for a
+/// tenant, ordered by recency.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingTriageFinding {
     tenant_id: TenantId,
@@ -83,6 +83,10 @@ impl PendingTriageFinding {
         location_display: Option<String>,
         location_url: Option<String>,
     ) -> Self {
+        debug_assert!(
+            location_url.is_none() || location_display.is_some(),
+            "location_url without location_display violates the pairing invariant"
+        );
         Self {
             tenant_id,
             finding_id,

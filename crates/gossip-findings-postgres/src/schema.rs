@@ -150,11 +150,11 @@ pub const OBSERVATIONS_TENANT_RUN_SHARD_INDEX: &str = "observations_tenant_run_s
 /// Field order matches [`FINDINGS_INSERT_COLUMNS`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct FindingRow {
-    pub tenant_id: [u8; 32],
-    pub finding_id: [u8; 32],
-    pub stable_item_id: [u8; 32],
-    pub rule_fingerprint: [u8; 32],
-    pub secret_hash: [u8; 32],
+    pub(crate) tenant_id: [u8; 32],
+    pub(crate) finding_id: [u8; 32],
+    pub(crate) stable_item_id: [u8; 32],
+    pub(crate) rule_fingerprint: [u8; 32],
+    pub(crate) secret_hash: [u8; 32],
 }
 
 impl fmt::Debug for FindingRow {
@@ -188,12 +188,12 @@ impl FindingRow {
 /// Field order matches [`OCCURRENCES_INSERT_COLUMNS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OccurrenceRow {
-    pub tenant_id: [u8; 32],
-    pub occurrence_id: [u8; 32],
-    pub finding_id: [u8; 32],
-    pub object_version_id: [u8; 32],
-    pub byte_offset: i64,
-    pub byte_length: i64,
+    pub(crate) tenant_id: [u8; 32],
+    pub(crate) occurrence_id: [u8; 32],
+    pub(crate) finding_id: [u8; 32],
+    pub(crate) object_version_id: [u8; 32],
+    pub(crate) byte_offset: i64,
+    pub(crate) byte_length: i64,
 }
 
 impl OccurrenceRow {
@@ -236,17 +236,17 @@ impl OccurrenceRow {
 /// Field order matches [`OBSERVATIONS_INSERT_COLUMNS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationRow {
-    pub tenant_id: [u8; 32],
-    pub observation_id: [u8; 32],
-    pub occurrence_id: [u8; 32],
-    pub policy_hash: [u8; 32],
-    pub ovid_hash: [u8; 32],
-    pub run_id: i64,
-    pub shard_id: i64,
-    pub fence_epoch: i64,
-    pub seen_at: i64,
-    pub location_display: Option<String>,
-    pub location_url: Option<String>,
+    pub(crate) tenant_id: [u8; 32],
+    pub(crate) observation_id: [u8; 32],
+    pub(crate) occurrence_id: [u8; 32],
+    pub(crate) policy_hash: [u8; 32],
+    pub(crate) ovid_hash: [u8; 32],
+    pub(crate) run_id: i64,
+    pub(crate) shard_id: i64,
+    pub(crate) fence_epoch: i64,
+    pub(crate) seen_at: i64,
+    pub(crate) location_display: Option<String>,
+    pub(crate) location_url: Option<String>,
 }
 
 impl ObservationRow {
