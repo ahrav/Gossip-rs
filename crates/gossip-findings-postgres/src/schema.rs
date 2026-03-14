@@ -486,6 +486,51 @@ pub const COMBINED_COUNTS_SQL: &str = "\
         (SELECT COUNT(*)::BIGINT FROM occurrences) AS occurrences_count, \
         (SELECT COUNT(*)::BIGINT FROM observations) AS observations_count";
 
+/// Count durable observations for one tenant, grouped by policy hash.
+///
+/// Bind parameters:
+/// 1. `tenant_id`
+pub const COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL: &str = r#"
+SELECT tenant_id, policy_hash, COUNT(*)::BIGINT AS observation_count
+FROM observations
+WHERE tenant_id = $1
+GROUP BY tenant_id, policy_hash
+ORDER BY policy_hash ASC
+"#;
+
+/// Return the latest observation row for each finding for one tenant.
+///
+/// The inner `DISTINCT ON (f.finding_id)` query selects the most recent
+/// observation per finding, then the outer query re-sorts those rows by
+/// overall recency for the tenant. Because the outer `ORDER BY` differs
+/// from the inner `DISTINCT ON` ordering, PostgreSQL materializes the full
+/// per-tenant result set before applying `LIMIT`. At high finding counts
+/// per tenant, consider denormalizing the "latest observation" pointer.
+///
+/// Bind parameters:
+/// 1. `tenant_id`
+/// 2. `limit`
+pub const LIST_FINDINGS_NEEDING_TRIAGE_SQL: &str = r#"
+SELECT latest.tenant_id, latest.finding_id, latest.stable_item_id,
+       latest.occurrence_id, latest.observation_id, latest.policy_hash,
+       latest.seen_at, latest.location_display, latest.location_url
+FROM (
+    SELECT DISTINCT ON (f.finding_id)
+        f.tenant_id, f.finding_id, f.stable_item_id,
+        o.occurrence_id, ob.observation_id, ob.policy_hash,
+        ob.seen_at, ob.location_display, ob.location_url
+    FROM findings AS f
+    INNER JOIN occurrences AS o
+        ON o.tenant_id = f.tenant_id AND o.finding_id = f.finding_id
+    INNER JOIN observations AS ob
+        ON ob.tenant_id = o.tenant_id AND ob.occurrence_id = o.occurrence_id
+    WHERE f.tenant_id = $1
+    ORDER BY f.finding_id, ob.seen_at DESC, ob.observation_id DESC
+) AS latest
+ORDER BY latest.seen_at DESC, latest.observation_id DESC
+LIMIT $2
+"#;
+
 /// Remove all durable findings-layer rows in foreign-key order.
 pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, findings";
 
@@ -830,6 +875,50 @@ mod tests {
         assert!(TRUNCATE_ALL_SQL.contains(OBSERVATIONS_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(OCCURRENCES_TABLE));
         assert!(TRUNCATE_ALL_SQL.contains(FINDINGS_TABLE));
+    }
+
+    #[test]
+    fn count_observations_by_tenant_policy_sql_contains_grouped_count_shape() {
+        assert_sql_contains_all(
+            COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL,
+            &[
+                "COUNT(*)::BIGINT AS observation_count",
+                "FROM observations",
+                "WHERE tenant_id = $1",
+                "GROUP BY tenant_id, policy_hash",
+                "ORDER BY policy_hash ASC",
+            ],
+        );
+    }
+
+    #[test]
+    fn list_findings_needing_triage_sql_contains_distinct_on_and_limit() {
+        assert_sql_contains_all(
+            LIST_FINDINGS_NEEDING_TRIAGE_SQL,
+            &[
+                "SELECT DISTINCT ON (f.finding_id)",
+                "FROM findings AS f",
+                "INNER JOIN occurrences AS o",
+                "INNER JOIN observations AS ob",
+                "WHERE f.tenant_id = $1",
+                "ORDER BY latest.seen_at DESC, latest.observation_id DESC",
+                "LIMIT $2",
+            ],
+        );
+    }
+
+    #[test]
+    fn list_findings_needing_triage_sql_orders_distinct_on_column_first() {
+        let inner_order = "ORDER BY f.finding_id, ob.seen_at DESC, ob.observation_id DESC";
+
+        assert!(
+            LIST_FINDINGS_NEEDING_TRIAGE_SQL.contains("DISTINCT ON (f.finding_id)"),
+            "query must keep DISTINCT ON over finding_id"
+        );
+        assert!(
+            LIST_FINDINGS_NEEDING_TRIAGE_SQL.contains(inner_order),
+            "inner ORDER BY must start with the DISTINCT ON column"
+        );
     }
 
     #[test]

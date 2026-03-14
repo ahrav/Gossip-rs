@@ -1,14 +1,79 @@
 use gossip_contracts::{
+    connector::{Location, VersionId},
     identity::key_secret_hash,
+    identity::{FenceEpoch, LogicalTime, ObjectVersionId, RunId, ShardId},
     persistence::{
-        CommitHandle, DurableFindingsCounts, FindingsSink, FindingsUpsertBatch,
-        conformance::run_findings_conformance,
+        CommitHandle, DurableFindingsCounts, FindingRecord, FindingsSink, FindingsUpsertBatch,
+        ObservationRecord, OccurrenceRecord, OvidHashInputs, conformance::run_findings_conformance,
+        derive_ovid_hash,
     },
 };
 
 mod common;
 
-use common::{LivePgHarness, sample_fixture};
+use common::{FindingsFixture, LivePgHarness, policy, rule, sample_fixture, stable_item, tenant};
+
+struct AdditionalFindingRecords {
+    finding: FindingRecord,
+    occurrence: OccurrenceRecord,
+    observation: ObservationRecord,
+}
+
+fn additional_finding_records(
+    base: &FindingsFixture,
+    disambiguator: u8,
+    policy_fill: u8,
+    seen_at: u64,
+) -> AdditionalFindingRecords {
+    let stable_item_id = stable_item(disambiguator.wrapping_add(1));
+    let rule_fingerprint = rule(disambiguator.wrapping_add(2));
+    let secret_hash = key_secret_hash(&base.tenant_secret_key, &base.norm_hash);
+    let finding = FindingRecord::new(
+        base.tenant_id,
+        stable_item_id,
+        rule_fingerprint,
+        secret_hash,
+    );
+    let object_version_id = ObjectVersionId::from_version_bytes(
+        format!("findings-variant-{disambiguator:02X}").as_bytes(),
+    );
+    let occurrence = OccurrenceRecord::try_new(
+        base.tenant_id,
+        finding.finding_id(),
+        object_version_id,
+        2_000 + u64::from(disambiguator),
+        32,
+    )
+    .expect("fixture byte_length is non-zero");
+    let ovid_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id,
+        version: VersionId::Strong(object_version_id),
+    });
+    let location = Location::try_new(
+        format!("safe/path/findings-{disambiguator:02X}.txt"),
+        Some(format!(
+            "https://example.invalid/findings/{disambiguator:02X}"
+        )),
+    )
+    .expect("fixture location should be valid");
+    let observation = ObservationRecord::new(
+        base.tenant_id,
+        occurrence.occurrence_id(),
+        policy(policy_fill),
+        ovid_hash,
+        RunId::from_raw(50_000 + u64::from(disambiguator)),
+        ShardId::from_raw(60_000 + u64::from(disambiguator)),
+        FenceEpoch::from_raw(70_000 + u64::from(disambiguator)),
+        LogicalTime::from_raw(seen_at),
+    )
+    .with_location(location);
+
+    AdditionalFindingRecords {
+        finding,
+        occurrence,
+        observation,
+    }
+}
 
 /// Run these live integration tests with:
 ///
@@ -225,4 +290,190 @@ fn no_raw_secret_bytes_are_persisted_in_any_inserted_columns() {
         Some(fixture.safe_location_url.as_str()),
         "only the safe location URL should be stored"
     );
+}
+
+#[test]
+fn count_observations_by_tenant_policy_groups_rows_by_policy() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let base = sample_fixture(0x71);
+    let same_policy = additional_finding_records(
+        &base,
+        0x81,
+        base.observation.policy_hash().as_bytes()[0],
+        base.observation.seen_at().as_raw() + 10,
+    );
+    let different_policy = additional_finding_records(
+        &base,
+        0x82,
+        base.observation.policy_hash().as_bytes()[0].wrapping_add(1),
+        base.observation.seen_at().as_raw() + 20,
+    );
+
+    backend
+        .upsert_batch(base.batch())
+        .expect("base batch should succeed")
+        .wait()
+        .expect("base batch should commit");
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            std::slice::from_ref(&same_policy.finding),
+            std::slice::from_ref(&same_policy.occurrence),
+            std::slice::from_ref(&same_policy.observation),
+        ))
+        .expect("same-policy batch should succeed")
+        .wait()
+        .expect("same-policy batch should commit");
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            std::slice::from_ref(&different_policy.finding),
+            std::slice::from_ref(&different_policy.occurrence),
+            std::slice::from_ref(&different_policy.observation),
+        ))
+        .expect("different-policy batch should succeed")
+        .wait()
+        .expect("different-policy batch should commit");
+
+    let counts = backend
+        .count_observations_by_tenant_policy(base.tenant_id)
+        .expect("policy count query should succeed");
+
+    assert_eq!(
+        counts.len(),
+        2,
+        "tenant should have exactly two policy groups"
+    );
+    assert_eq!(
+        counts.iter().map(|row| row.tenant_id()).collect::<Vec<_>>(),
+        vec![base.tenant_id, base.tenant_id],
+        "every grouped row should belong to the requested tenant"
+    );
+    assert_eq!(
+        counts
+            .iter()
+            .map(|row| (row.policy_hash(), row.observation_count()))
+            .collect::<Vec<_>>(),
+        vec![
+            (base.observation.policy_hash(), 2),
+            (different_policy.observation.policy_hash(), 1),
+        ],
+        "counts should be grouped by policy hash and ordered by policy hash"
+    );
+}
+
+#[test]
+fn list_findings_needing_triage_returns_latest_rows_ordered_by_seen_at_and_limited() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let oldest = sample_fixture(0x72);
+    let middle = additional_finding_records(
+        &oldest,
+        0x83,
+        0x95,
+        oldest.observation.seen_at().as_raw() + 100,
+    );
+    let newest = additional_finding_records(
+        &oldest,
+        0x84,
+        0x96,
+        oldest.observation.seen_at().as_raw() + 200,
+    );
+
+    backend
+        .upsert_batch(oldest.batch())
+        .expect("oldest batch should succeed")
+        .wait()
+        .expect("oldest batch should commit");
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            std::slice::from_ref(&middle.finding),
+            std::slice::from_ref(&middle.occurrence),
+            std::slice::from_ref(&middle.observation),
+        ))
+        .expect("middle batch should succeed")
+        .wait()
+        .expect("middle batch should commit");
+    backend
+        .upsert_batch(FindingsUpsertBatch::new(
+            std::slice::from_ref(&newest.finding),
+            std::slice::from_ref(&newest.occurrence),
+            std::slice::from_ref(&newest.observation),
+        ))
+        .expect("newest batch should succeed")
+        .wait()
+        .expect("newest batch should commit");
+
+    let rows = backend
+        .list_findings_needing_triage(oldest.tenant_id, 2)
+        .expect("triage query should succeed");
+
+    assert_eq!(rows.len(), 2, "limit should bound the result set");
+    assert_eq!(rows[0].tenant_id(), oldest.tenant_id);
+    assert_eq!(rows[0].finding_id(), newest.finding.finding_id());
+    assert_eq!(rows[0].stable_item_id(), newest.finding.stable_item_id());
+    assert_eq!(rows[0].occurrence_id(), newest.occurrence.occurrence_id());
+    assert_eq!(
+        rows[0].observation_id(),
+        newest.observation.observation_id()
+    );
+    assert_eq!(rows[0].policy_hash(), newest.observation.policy_hash());
+    assert_eq!(rows[0].seen_at(), newest.observation.seen_at().as_raw());
+    assert_eq!(
+        rows[0].location_display(),
+        Some("safe/path/findings-84.txt")
+    );
+    assert_eq!(
+        rows[0].location_url(),
+        Some("https://example.invalid/findings/84")
+    );
+    assert_eq!(rows[1].finding_id(), middle.finding.finding_id());
+    assert_eq!(rows[1].seen_at(), middle.observation.seen_at().as_raw());
+}
+
+#[test]
+fn read_methods_return_empty_results_for_unknown_tenant() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x73);
+
+    backend
+        .upsert_batch(fixture.batch())
+        .expect("fixture batch should succeed")
+        .wait()
+        .expect("fixture batch should commit");
+
+    let unknown_tenant = tenant(0xFE);
+    assert!(
+        backend
+            .count_observations_by_tenant_policy(unknown_tenant)
+            .expect("empty count query should succeed")
+            .is_empty(),
+        "count query should return no rows for a tenant without data"
+    );
+    assert!(
+        backend
+            .list_findings_needing_triage(unknown_tenant, 10)
+            .expect("empty triage query should succeed")
+            .is_empty(),
+        "triage query should return no rows for a tenant without data"
+    );
+}
+
+#[test]
+fn list_findings_needing_triage_with_zero_limit_returns_empty_vec() {
+    let harness = LivePgHarness::new();
+    let backend = harness.backend();
+    let fixture = sample_fixture(0x74);
+
+    backend
+        .upsert_batch(fixture.batch())
+        .expect("fixture batch should succeed")
+        .wait()
+        .expect("fixture batch should commit");
+
+    let rows = backend
+        .list_findings_needing_triage(fixture.tenant_id, 0)
+        .expect("zero-limit triage query should succeed");
+
+    assert!(rows.is_empty(), "LIMIT 0 should return no rows");
 }

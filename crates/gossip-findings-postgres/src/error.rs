@@ -92,6 +92,21 @@ pub enum FindingsPgError {
     BatchTooLarge { len: usize, max: usize },
     /// Batch validation or row projection failed before SQL mutation.
     Schema(FindingsPgSchemaError),
+    /// BYTEA column decode: unexpected byte length.
+    InvalidByteLength {
+        column: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    /// Query limit exceeds PostgreSQL's signed `BIGINT` range.
+    LimitOutOfRange { limit: usize },
+    /// Non-negative `BIGINT` decode failed while reading SQL results.
+    /// This is the read-path analog: it catches decode failures when
+    /// converting `BIGINT` columns from query rows back to `u64`. The
+    /// write-path equivalent flows through
+    /// [`Schema(FindingsPgSchemaError::PgU64Conversion(..))`](FindingsPgError::Schema)
+    /// during batch projection.
+    PgU64Conversion(PgU64ConversionError),
     /// A persisted row count did not fit the non-negative count domain.
     CountOutOfRange { table: &'static str, value: i64 },
     /// A finding primary key mapped to a different immutable natural key.
@@ -154,6 +169,18 @@ impl fmt::Display for FindingsPgError {
             Self::Schema(source) => {
                 write!(f, "invalid findings batch for postgres backend: {source}")
             }
+            Self::InvalidByteLength {
+                column,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "column {column}: expected {expected} bytes, got {actual}"
+            ),
+            Self::LimitOutOfRange { limit } => {
+                write!(f, "query limit {limit} exceeds PostgreSQL BIGINT range")
+            }
+            Self::PgU64Conversion(source) => write!(f, "{source}"),
             Self::CountOutOfRange { table, value } => {
                 write!(f, "stored count for {table} out of range: {value}")
             }
@@ -191,8 +218,11 @@ impl Error for FindingsPgError {
             Self::Postgres(source) => Some(source),
             Self::Migration(source) => Some(source),
             Self::Schema(source) => Some(source),
+            Self::PgU64Conversion(source) => Some(source),
             Self::MutexPoisoned
             | Self::BatchTooLarge { .. }
+            | Self::InvalidByteLength { .. }
+            | Self::LimitOutOfRange { .. }
             | Self::CountOutOfRange { .. }
             | Self::FindingConflict { .. }
             | Self::OccurrenceConflict { .. }
@@ -217,6 +247,12 @@ impl From<FindingsPgMigrationError> for FindingsPgError {
 impl From<FindingsPgSchemaError> for FindingsPgError {
     fn from(value: FindingsPgSchemaError) -> Self {
         Self::Schema(value)
+    }
+}
+
+impl From<PgU64ConversionError> for FindingsPgError {
+    fn from(value: PgU64ConversionError) -> Self {
+        Self::PgU64Conversion(value)
     }
 }
 
@@ -452,6 +488,58 @@ mod tests {
     }
 
     #[test]
+    fn backend_error_display_describes_invalid_byte_length() {
+        let err = FindingsPgError::InvalidByteLength {
+            column: "tenant_id",
+            expected: 32,
+            actual: 31,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "column tenant_id: expected 32 bytes, got 31"
+        );
+    }
+
+    #[test]
+    fn backend_error_display_describes_limit_out_of_range() {
+        let err = FindingsPgError::LimitOutOfRange { limit: usize::MAX };
+
+        assert_eq!(
+            err.to_string(),
+            format!("query limit {} exceeds PostgreSQL BIGINT range", usize::MAX)
+        );
+    }
+
+    #[test]
+    fn backend_error_display_uses_pg_u64_conversion_source_message() {
+        let inner = PgU64ConversionError::NegativeStoredValue {
+            field: "seen_at",
+            value: -1,
+        };
+        let expected = inner.to_string();
+        let err = FindingsPgError::PgU64Conversion(inner);
+
+        assert_eq!(err.to_string(), expected);
+    }
+
+    #[test]
+    fn backend_error_from_pg_u64_conversion_uses_direct_variant() {
+        let err = FindingsPgError::from(PgU64ConversionError::NegativeStoredValue {
+            field: "seen_at",
+            value: -1,
+        });
+
+        assert!(matches!(
+            err,
+            FindingsPgError::PgU64Conversion(PgU64ConversionError::NegativeStoredValue {
+                field: "seen_at",
+                value: -1
+            })
+        ));
+    }
+
+    #[test]
     fn backend_error_display_describes_out_of_range_counts() {
         let err = FindingsPgError::CountOutOfRange {
             table: "findings",
@@ -548,6 +636,16 @@ mod tests {
                 .to_string(),
             "tenant_id must not be empty"
         );
+        assert_eq!(
+            FindingsPgError::PgU64Conversion(PgU64ConversionError::NegativeStoredValue {
+                field: "seen_at",
+                value: -1,
+            })
+            .source()
+            .expect("conversion variant should expose source")
+            .to_string(),
+            "stored value -1 for field seen_at is negative but the schema requires non-negative BIGINT"
+        );
     }
 
     #[test]
@@ -555,6 +653,12 @@ mod tests {
         let cases = [
             FindingsPgError::MutexPoisoned,
             FindingsPgError::BatchTooLarge { len: 11, max: 10 },
+            FindingsPgError::InvalidByteLength {
+                column: "tenant_id",
+                expected: 32,
+                actual: 31,
+            },
+            FindingsPgError::LimitOutOfRange { limit: usize::MAX },
             FindingsPgError::CountOutOfRange {
                 table: "findings",
                 value: -1,
