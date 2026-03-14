@@ -71,6 +71,7 @@ pub struct SimulatedEtcdKV {
     /// `active_retry_exhaustion`, forms a three-state machine:
     /// Idle → Armed (remaining > 0) → Cooldown (this field set).
     recent_retry_exhaustion: Option<u64>,
+    fault_stats: SimEtcdFaultStats,
     rng: ChaCha8Rng,
 }
 
@@ -100,6 +101,7 @@ impl SimulatedEtcdKV {
             fault_config,
             active_retry_exhaustion: None,
             recent_retry_exhaustion: None,
+            fault_stats: SimEtcdFaultStats::default(),
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
     }
@@ -126,6 +128,12 @@ impl SimulatedEtcdKV {
     #[must_use]
     pub fn lease_count(&self) -> usize {
         self.leases.len()
+    }
+
+    /// Aggregated counts for injected fault paths observed so far.
+    #[must_use]
+    pub fn fault_stats(&self) -> SimEtcdFaultStats {
+        self.fault_stats
     }
 
     /// Whether the store contains the given key (no side effects, no expiry).
@@ -203,6 +211,7 @@ impl SimulatedEtcdKV {
             .fault_config
             .should_fail(SimEtcdOperation::Get, &mut self.rng)
         {
+            self.fault_stats.get_failures += 1;
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::Get,
             });
@@ -270,6 +279,7 @@ impl SimulatedEtcdKV {
             .fault_config
             .should_fail(SimEtcdOperation::Txn, &mut self.rng)
         {
+            self.fault_stats.txn_failures += 1;
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::Txn,
             });
@@ -305,6 +315,7 @@ impl SimulatedEtcdKV {
             }
         }
         if !request.compare.is_empty() && self.fault_config.should_cas_compare_fail(&mut self.rng) {
+            self.fault_stats.cas_compare_failures += 1;
             return Ok(build_txn_response(self.revision, false, Vec::new()));
         }
         if fingerprint.is_some_and(|fp| self.maybe_arm_retry_exhaustion(&request, fp)) {
@@ -323,6 +334,7 @@ impl SimulatedEtcdKV {
         };
         let responses = self.apply_staged_txn(staged, revision);
         if self.fault_config.should_uncertain_commit(&mut self.rng) {
+            self.fault_stats.uncertain_commits += 1;
             // State IS committed; the caller will retry. On the next call for
             // the same fingerprint, compares will fail (revision changed), so
             // we return at the compares_succeeded=false early-exit before
@@ -340,6 +352,7 @@ impl SimulatedEtcdKV {
             .fault_config
             .should_fail(SimEtcdOperation::LeaseGrant, &mut self.rng)
         {
+            self.fault_stats.lease_grant_failures += 1;
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::LeaseGrant,
             });
@@ -382,6 +395,7 @@ impl SimulatedEtcdKV {
             .fault_config
             .should_fail(SimEtcdOperation::LeaseKeepAlive, &mut self.rng)
         {
+            self.fault_stats.lease_keep_alive_failures += 1;
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::LeaseKeepAlive,
             });
@@ -403,6 +417,7 @@ impl SimulatedEtcdKV {
             .fault_config
             .should_fail(SimEtcdOperation::LeaseRevoke, &mut self.rng)
         {
+            self.fault_stats.lease_revoke_failures += 1;
             return Err(SimEtcdError::FaultInjected {
                 operation: SimEtcdOperation::LeaseRevoke,
             });
@@ -444,6 +459,7 @@ impl SimulatedEtcdKV {
         if !self.fault_config.should_lease_ttl_race(&mut self.rng) {
             return;
         }
+        self.fault_stats.lease_ttl_races += 1;
         self.now = self
             .now
             .checked_add(1)
@@ -483,6 +499,7 @@ impl SimulatedEtcdKV {
             self.recent_retry_exhaustion = Some(fingerprint);
             self.active_retry_exhaustion = None;
         }
+        self.fault_stats.retry_exhaustion_compare_failures += 1;
         true
     }
 
@@ -505,6 +522,8 @@ impl SimulatedEtcdKV {
             .fault_config
             .retry_exhaustion_attempts
             .saturating_sub(1);
+        self.fault_stats.retry_exhaustion_bursts += 1;
+        self.fault_stats.retry_exhaustion_compare_failures += 1;
         if remaining_failures == 0 {
             self.recent_retry_exhaustion = Some(fingerprint);
             self.active_retry_exhaustion = None;
@@ -916,6 +935,39 @@ pub struct LeaseInfo {
     pub expires_at: u64,
     /// Number of keys currently attached to this lease.
     pub attached_key_count: usize,
+}
+
+/// Aggregated counts for injected fault paths observed in the simulator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SimEtcdFaultStats {
+    /// Transport-style `get` failures injected before request evaluation.
+    pub get_failures: usize,
+    /// Transport-style `txn` failures injected before request evaluation.
+    pub txn_failures: usize,
+    /// Transport-style lease-grant failures injected before request evaluation.
+    pub lease_grant_failures: usize,
+    /// Transport-style keep-alive failures injected before request evaluation.
+    pub lease_keep_alive_failures: usize,
+    /// Transport-style lease-revoke failures injected before request evaluation.
+    pub lease_revoke_failures: usize,
+    /// Synthetic compare misses injected after compares succeed.
+    pub cas_compare_failures: usize,
+    /// Transactions that committed state but returned `UncertainCommit`.
+    pub uncertain_commits: usize,
+    /// Synthetic lease-expiry races injected immediately before txn evaluation.
+    pub lease_ttl_races: usize,
+    /// Retry-exhaustion bursts armed for a specific transaction fingerprint.
+    pub retry_exhaustion_bursts: usize,
+    /// Compare-fail responses emitted by the retry-exhaustion state machine.
+    pub retry_exhaustion_compare_failures: usize,
+}
+
+impl SimEtcdFaultStats {
+    /// Total compare-fail responses attributable to synthetic CAS retry faults.
+    #[must_use]
+    pub fn cas_retry_failures(&self) -> usize {
+        self.cas_compare_failures + self.retry_exhaustion_compare_failures
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
