@@ -15,7 +15,7 @@ use std::{
 };
 
 use gossip_contracts::{
-    identity::{FindingId, ObservationId, OccurrenceId, TenantId},
+    identity::{FindingId, ObservationId, OccurrenceId, PolicyHash, StableItemId, TenantId},
     persistence::{
         DurableFindingsCounts, FindingsCommitReceipt, FindingsConformanceProbe, FindingsSink,
         FindingsUpsertBatch, RECOMMENDED_MAX_BATCH_SIZE, ReadyCommitHandle,
@@ -28,11 +28,14 @@ use postgres::{Client, Statement, Transaction};
 use crate::{
     error::{FindingsPgError, FindingsPgSchemaError},
     migrations::apply_all_migrations,
+    read_api::{ObservationCountByPolicy, PendingTriageFinding},
     schema::{
-        COMBINED_COUNTS_SQL, FINDINGS_INSERT_SQL, FINDINGS_TABLE, FindingRow,
+        COMBINED_COUNTS_SQL, COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL, FINDINGS_INSERT_SQL,
+        FINDINGS_TABLE, FindingRow, LIST_FINDINGS_NEEDING_TRIAGE_SQL,
         OBSERVATIONS_INSERT_OR_MERGE_SQL, OBSERVATIONS_TABLE, OCCURRENCES_INSERT_SQL,
         OCCURRENCES_TABLE, ObservationRow, OccurrenceRow,
     },
+    types::decode_fixed_32,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -349,6 +352,122 @@ impl FindingsSinkPg {
         Ok(())
     }
 
+    /// Count durable observations for one tenant, grouped by policy hash.
+    ///
+    /// This read path lets validation harnesses and operational tooling inspect
+    /// observation volume by policy without reading raw SQL rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FindingsPgError::Postgres`] on query failure,
+    /// [`FindingsPgError::ByteDecode`] when a stored identity column is
+    /// not 32 bytes, [`FindingsPgError::PgU64Conversion`] when a non-negative
+    /// `BIGINT` result is invalid, or [`FindingsPgError::MutexPoisoned`] if the
+    /// internal mutex was poisoned.
+    pub fn count_observations_by_tenant_policy(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Vec<ObservationCountByPolicy>, FindingsPgError> {
+        let tenant_bytes = tenant_id.as_bytes().as_slice();
+        let mut client = self.lock_client()?;
+        let stmt = client.prepare(COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL)?;
+        let rows = client.query(&stmt, &[&tenant_bytes])?;
+
+        let mut counts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let policy_hash = PolicyHash::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("policy_hash")?,
+                "policy_hash",
+            )?);
+            let observation_count = crate::types::pg_bigint_nonnegative_to_u64(
+                row.try_get::<_, i64>("observation_count")?,
+                "observation_count",
+            )?;
+            counts.push(ObservationCountByPolicy::new(
+                tenant_id,
+                policy_hash,
+                observation_count,
+            ));
+        }
+
+        Ok(counts)
+    }
+
+    /// List the latest observation per finding for one tenant.
+    ///
+    /// This is a placeholder read path until mutable triage state exists. It
+    /// returns the latest observation for each finding and orders the result by
+    /// observation recency.
+    ///
+    /// ## Ordering
+    ///
+    /// Results are ordered by `seen_at DESC`. When two findings share the same
+    /// `seen_at`, the secondary tiebreaker is `observation_id DESC` — a
+    /// lexicographic BYTEA sort over a content-addressed hash. This makes the
+    /// ordering deterministic but semantically arbitrary for tied timestamps.
+    /// Callers paging via `OFFSET` may see row shifts between pages when ties
+    /// exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FindingsPgError::LimitOutOfRange`] when `limit` exceeds the
+    /// PostgreSQL `BIGINT` domain, plus the same SQL, decode, and mutex errors
+    /// as [`count_observations_by_tenant_policy`](Self::count_observations_by_tenant_policy).
+    pub fn list_findings_needing_triage(
+        &self,
+        tenant_id: TenantId,
+        limit: usize,
+    ) -> Result<Vec<PendingTriageFinding>, FindingsPgError> {
+        let limit_i64 =
+            i64::try_from(limit).map_err(|_| FindingsPgError::LimitOutOfRange { limit })?;
+        let tenant_bytes = tenant_id.as_bytes().as_slice();
+        let mut client = self.lock_client()?;
+        let stmt = client.prepare(LIST_FINDINGS_NEEDING_TRIAGE_SQL)?;
+        let rows = client.query(&stmt, &[&tenant_bytes, &limit_i64])?;
+
+        let mut findings = Vec::with_capacity(rows.len());
+        for row in rows {
+            let finding_id = FindingId::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("finding_id")?,
+                "finding_id",
+            )?);
+            let stable_item_id = StableItemId::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("stable_item_id")?,
+                "stable_item_id",
+            )?);
+            let occurrence_id = OccurrenceId::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("occurrence_id")?,
+                "occurrence_id",
+            )?);
+            let observation_id = ObservationId::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("observation_id")?,
+                "observation_id",
+            )?);
+            let policy_hash = PolicyHash::from_bytes(decode_fixed_32(
+                row.try_get::<_, &[u8]>("policy_hash")?,
+                "policy_hash",
+            )?);
+            let seen_at =
+                crate::types::pg_bigint_nonnegative_to_u64(row.try_get("seen_at")?, "seen_at")?;
+            let location_display = row.try_get("location_display")?;
+            let location_url = row.try_get("location_url")?;
+
+            findings.push(PendingTriageFinding::new(
+                tenant_id,
+                finding_id,
+                stable_item_id,
+                occurrence_id,
+                observation_id,
+                policy_hash,
+                seen_at,
+                location_display,
+                location_url,
+            ));
+        }
+
+        Ok(findings)
+    }
+
     /// Acquire the held client, treating poisoning as unrecoverable.
     fn lock_client(&self) -> Result<MutexGuard<'_, Client>, FindingsPgError> {
         self.client
@@ -432,7 +551,7 @@ impl FindingsConformanceProbe for FindingsSinkPg {
     ///
     /// The conformance harness design assumes a clean database containing
     /// exactly one tenant's data — callers must call
-    /// [`truncate_all_for_tests`](Self::truncate_all_for_tests) before each
+    /// `truncate_all_for_tests` before each
     /// conformance run. No `WHERE tenant_id = ?` filter is applied because
     /// the [`FindingsConformanceProbe`] trait signature does not carry a
     /// tenant parameter.
@@ -440,9 +559,11 @@ impl FindingsConformanceProbe for FindingsSinkPg {
         let mut client = self.lock_client()?;
         let row = client.query_one(COMBINED_COUNTS_SQL, &[])?;
 
-        let findings = nonneg_count(row.get::<_, i64>(0), FINDINGS_TABLE)?;
-        let occurrences = nonneg_count(row.get::<_, i64>(1), OCCURRENCES_TABLE)?;
-        let observations = nonneg_count(row.get::<_, i64>(2), OBSERVATIONS_TABLE)?;
+        let findings = crate::types::pg_bigint_nonnegative_to_u64(row.try_get(0)?, FINDINGS_TABLE)?;
+        let occurrences =
+            crate::types::pg_bigint_nonnegative_to_u64(row.try_get(1)?, OCCURRENCES_TABLE)?;
+        let observations =
+            crate::types::pg_bigint_nonnegative_to_u64(row.try_get(2)?, OBSERVATIONS_TABLE)?;
 
         Ok(DurableFindingsCounts::new(
             findings,
@@ -581,13 +702,6 @@ fn intercept_fk_violation(err: postgres::Error, table: &'static str) -> Findings
         };
     }
     FindingsPgError::Postgres(err)
-}
-
-/// Guard against negative counts (impossible in PostgreSQL but enforced
-/// defensively for the non-negative count domain).
-fn nonneg_count(value: i64, table: &'static str) -> Result<u64, FindingsPgError> {
-    crate::types::pg_bigint_nonnegative_to_u64(value, table)
-        .map_err(|_| FindingsPgError::CountOutOfRange { table, value })
 }
 
 #[cfg(test)]
