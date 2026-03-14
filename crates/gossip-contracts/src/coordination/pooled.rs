@@ -568,6 +568,17 @@ pub struct PooledSpawnedIter<'a> {
     chunks: core::slice::ChunksExact<'a, u8>,
 }
 
+impl PooledSpawnedIter<'_> {
+    /// Zero-item iterator that requires no slab reference.
+    #[inline]
+    #[must_use]
+    pub fn empty() -> PooledSpawnedIter<'static> {
+        PooledSpawnedIter {
+            chunks: [].chunks_exact(SHARD_ID_ENCODED_BYTES),
+        }
+    }
+}
+
 impl Iterator for PooledSpawnedIter<'_> {
     type Item = ShardId;
 

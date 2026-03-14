@@ -996,6 +996,9 @@ pub enum ParkError {
         expected_hash: u64,
         actual_hash: u64,
     },
+    /// The coordination backend encountered an infrastructure error.
+    /// See [`InfraError`] for transient vs. corruption classification.
+    BackendError(InfraError),
 }
 
 impl fmt::Debug for ParkError {
@@ -1030,6 +1033,7 @@ impl fmt::Debug for ParkError {
                 .field("expected_hash", &"<redacted>")
                 .field("actual_hash", &"<redacted>")
                 .finish(),
+            Self::BackendError(infra) => f.debug_tuple("BackendError").field(infra).finish(),
         }
     }
 }
@@ -1054,11 +1058,21 @@ impl fmt::Display for ParkError {
             Self::OpIdConflict { op_id, .. } => {
                 write!(f, "op-id conflict: {op_id:?} reused with different payload")
             }
+            Self::BackendError(infra) => {
+                write!(f, "coordination backend error: {infra}")
+            }
         }
     }
 }
 
-impl std::error::Error for ParkError {}
+impl std::error::Error for ParkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError(infra) => Some(infra),
+            _ => None,
+        }
+    }
+}
 
 /// Error from split operations (`split_replace` and `split_residual`).
 ///

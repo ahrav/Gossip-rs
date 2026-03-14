@@ -6,6 +6,8 @@
 
 #[cfg(any(test, feature = "test-support"))]
 use super::PersistedShard;
+#[cfg(any(test, feature = "test-support"))]
+use super::coordinator::SyncEtcdLike;
 use super::{AsyncEtcdCoordinator, EtcdCoordinator};
 #[cfg(any(test, feature = "test-support"))]
 use crate::codec::{encode_run_record, encode_shard_record};

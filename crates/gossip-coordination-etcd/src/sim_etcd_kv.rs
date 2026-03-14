@@ -19,6 +19,12 @@
 //! - **Lease expiry boundary** — a lease with TTL *t* granted at time *T*
 //!   expires when `now >= T + t` (i.e., alive for exactly *t* ticks). Real
 //!   etcd uses a comparable but not identical heartbeat-based mechanism.
+//! - **Batch lease expiry revision** — when multiple leases expire at the
+//!   same logical time, each lease that deletes keys bumps the global
+//!   revision independently. Real etcd coalesces batch expiry into a single
+//!   revision increment. CAS correctness is unaffected (no interleaving
+//!   within `expire_due_leases`), but revision numbers will be inflated
+//!   relative to production.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -164,15 +170,10 @@ impl SimulatedEtcdKV {
             });
         }
 
-        let PbTxnRequest { mut success, .. } =
-            Txn::new().and_then(vec![TxnOp::get(key, options)]).into();
-        let request: PbRangeRequest = match success
-            .pop()
-            .and_then(|op| op.request)
-            .expect("TxnOp::get must produce a range request payload")
-        {
-            PbTxnOpRequest::RequestRange(request) => request,
-            _ => unreachable!("TxnOp::get must build a range request"),
+        let pb_op: PbTxnOpRequest = TxnOp::get(key, options).into();
+        let request: PbRangeRequest = match pb_op {
+            PbTxnOpRequest::RequestRange(r) => r,
+            _ => unreachable!("TxnOp::get produces a range request"),
         };
 
         if request.revision > 0 {
@@ -292,10 +293,7 @@ impl SimulatedEtcdKV {
             .ok_or(SimEtcdError::LeaseIdExhausted)?;
 
         let ttl_u64 = u64::try_from(ttl).expect("TTL validated positive");
-        let expires_at = self
-            .now
-            .checked_add(ttl_u64)
-            .expect("lease expiry overflow");
+        let expires_at = self.now.saturating_add(ttl_u64);
         self.leases.insert(
             lease_id,
             LeaseState {
@@ -325,10 +323,7 @@ impl SimulatedEtcdKV {
             .leases
             .get_mut(&lease_id)
             .ok_or(SimEtcdError::LeaseNotFound { lease_id })?;
-        lease.expires_at = self
-            .now
-            .checked_add(lease.ttl)
-            .expect("lease keep-alive overflow");
+        lease.expires_at = self.now.saturating_add(lease.ttl);
         self.next_expiry = self.next_expiry.min(lease.expires_at);
         Ok(())
     }
@@ -345,8 +340,14 @@ impl SimulatedEtcdKV {
             });
         }
 
+        let attached_keys = self
+            .leases
+            .get(&lease_id)
+            .ok_or(SimEtcdError::LeaseNotFound { lease_id })?
+            .attached_keys
+            .clone();
         let deleted_any = self.remove_lease_and_keys(lease_id)?;
-        self.debug_assert_no_stale_lease_keys(lease_id);
+        self.debug_assert_no_stale_lease_keys(&attached_keys);
         let revision = if deleted_any {
             self.bump_revision()
         } else {
@@ -455,14 +456,13 @@ impl SimulatedEtcdKV {
                 lease_id: request.lease,
             });
         }
-        if !staged.all_put_keys.insert(request.key.clone()) {
-            return Err(SimEtcdError::DuplicateMutation {
-                key: request.key.clone(),
-            });
+        let key = request.key.clone();
+        if !staged.all_put_keys.insert(key.clone()) {
+            return Err(SimEtcdError::DuplicateMutation { key });
         }
-        staged.pending_puts.insert(request.key.clone());
+        staged.pending_puts.insert(key.clone());
         staged.ops.push(StagedOp::Put(StagedPut {
-            key: request.key.clone(),
+            key,
             value: request.value.clone(),
             lease_id: request.lease,
         }));
@@ -626,11 +626,14 @@ impl SimulatedEtcdKV {
         Ok(deleted_any)
     }
 
-    fn debug_assert_no_stale_lease_keys(&self, lease_id: i64) {
-        debug_assert!(
-            !self.kvs.values().any(|e| e.lease_id == lease_id),
-            "stale keys referencing revoked lease {lease_id}"
-        );
+    /// Verify that all keys from a revoked lease have been removed from the store.
+    fn debug_assert_no_stale_lease_keys(&self, removed_keys: &BTreeSet<Vec<u8>>) {
+        for key in removed_keys {
+            debug_assert!(
+                !self.kvs.contains_key(key),
+                "stale key after lease revoke: {key:?}"
+            );
+        }
     }
 
     /// Expire all leases whose TTL has elapsed at the current logical time.
@@ -638,9 +641,13 @@ impl SimulatedEtcdKV {
     /// Called automatically by every mutating operation. Exposed publicly so
     /// the simulation driver can decouple clock advancement ([`Self::set_time`])
     /// from expiry processing.
-    pub fn expire_due_leases(&mut self) {
+    /// Expire all leases whose TTL has elapsed, deleting their attached keys.
+    ///
+    /// Returns the lease IDs that actually expired and deleted at least one
+    /// key. Callers can use this to invalidate cached owner bindings.
+    pub fn expire_due_leases(&mut self) -> Vec<i64> {
         if self.now < self.next_expiry {
-            return;
+            return Vec::new();
         }
 
         let mut expired: Vec<i64> = self
@@ -650,7 +657,13 @@ impl SimulatedEtcdKV {
             .collect();
         expired.sort_unstable();
 
+        let mut deleted_lease_ids = Vec::new();
         for lease_id in expired {
+            let attached_keys = self
+                .leases
+                .get(&lease_id)
+                .map(|ls| ls.attached_keys.clone())
+                .unwrap_or_default();
             let deleted_any = match self.remove_lease_and_keys(lease_id) {
                 Ok(deleted_any) => deleted_any,
                 Err(SimEtcdError::LeaseNotFound { .. }) => false,
@@ -659,9 +672,10 @@ impl SimulatedEtcdKV {
                     continue;
                 }
             };
-            self.debug_assert_no_stale_lease_keys(lease_id);
+            self.debug_assert_no_stale_lease_keys(&attached_keys);
             if deleted_any {
                 self.bump_revision();
+                deleted_lease_ids.push(lease_id);
             }
         }
 
@@ -671,6 +685,8 @@ impl SimulatedEtcdKV {
             .map(|ls| ls.expires_at)
             .min()
             .unwrap_or(u64::MAX);
+
+        deleted_lease_ids
     }
 
     /// Resolve the set of keys matching an etcd key+range_end pair.
@@ -686,11 +702,10 @@ impl SimulatedEtcdKV {
         range_end: &[u8],
     ) -> Result<Vec<(&'a Vec<u8>, &'a KvEntry)>, SimEtcdError> {
         if range_end.is_empty() {
-            return Ok(self
-                .kvs
-                .get_key_value(key)
-                .into_iter()
-                .collect::<Vec<(&Vec<u8>, &KvEntry)>>());
+            return Ok(match self.kvs.get_key_value(key) {
+                Some(pair) => vec![pair],
+                None => Vec::new(),
+            });
         }
 
         if range_end == [0] {
@@ -707,7 +722,10 @@ impl SimulatedEtcdKV {
     }
 
     fn bump_revision(&mut self) -> i64 {
-        self.revision = self.revision.checked_add(1).expect("revision overflow");
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("revision overflow: current revision={}", self.revision));
         self.revision
     }
 }
@@ -1642,5 +1660,153 @@ mod tests {
             3,
             "3-op txn must produce 3 response entries"
         );
+    }
+
+    // ---- Property-based tests ----
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generates a random KV operation sequence.
+        #[derive(Debug, Clone)]
+        enum KvOp {
+            Put { key: Vec<u8>, value: Vec<u8> },
+            Delete { key: Vec<u8> },
+            Get { key: Vec<u8> },
+            Tick(u64),
+        }
+
+        fn arb_key() -> impl Strategy<Value = Vec<u8>> {
+            prop::collection::vec(b'a'..=b'f', 1..=4)
+        }
+
+        fn arb_value() -> impl Strategy<Value = Vec<u8>> {
+            prop::collection::vec(any::<u8>(), 0..=16)
+        }
+
+        fn arb_kv_op() -> impl Strategy<Value = KvOp> {
+            prop_oneof![
+                4 => (arb_key(), arb_value()).prop_map(|(key, value)| KvOp::Put { key, value }),
+                2 => arb_key().prop_map(|key| KvOp::Delete { key }),
+                2 => arb_key().prop_map(|key| KvOp::Get { key }),
+                1 => (1u64..=5).prop_map(KvOp::Tick),
+            ]
+        }
+
+        fn arb_kv_ops(
+            count: impl Into<prop::collection::SizeRange>,
+        ) -> impl Strategy<Value = Vec<KvOp>> {
+            prop::collection::vec(arb_kv_op(), count)
+        }
+
+        proptest! {
+            /// Global revision must never decrease across any operation sequence.
+            #[test]
+            fn revision_monotonically_increases(ops in arb_kv_ops(1..50), seed in any::<u64>()) {
+                let mut kv = SimulatedEtcdKV::new(seed);
+                let mut prev_rev = kv.revision();
+
+                for op in ops {
+                    match op {
+                        KvOp::Put { key, value } => {
+                            let txn = Txn::new()
+                                .when(Vec::new())
+                                .and_then(vec![TxnOp::put(key, value, None)]);
+                            if let Ok(resp) = kv.txn(txn) {
+                                let rev = resp.header().unwrap().revision();
+                                prop_assert!(rev >= prev_rev, "revision went backwards: {} -> {}", prev_rev, rev);
+                                prev_rev = rev;
+                            }
+                        }
+                        KvOp::Delete { key } => {
+                            let txn = Txn::new()
+                                .when(Vec::new())
+                                .and_then(vec![TxnOp::delete(key, None)]);
+                            if let Ok(resp) = kv.txn(txn) {
+                                let rev = resp.header().unwrap().revision();
+                                prop_assert!(rev >= prev_rev, "revision went backwards: {} -> {}", prev_rev, rev);
+                                prev_rev = rev;
+                            }
+                        }
+                        KvOp::Get { key } => {
+                            if let Ok(resp) = kv.get(key, None) {
+                                let rev = resp.header().unwrap().revision();
+                                prop_assert!(rev >= prev_rev, "revision went backwards: {} -> {}", prev_rev, rev);
+                                prev_rev = rev;
+                            }
+                        }
+                        KvOp::Tick(dt) => {
+                            kv.tick(dt);
+                        }
+                    }
+                }
+            }
+
+            /// The key_count accessor must always equal the number of keys
+            /// retrievable via a full-range scan.
+            #[test]
+            fn key_count_matches_full_range_scan(ops in arb_kv_ops(1..30), seed in any::<u64>()) {
+                let mut kv = SimulatedEtcdKV::new(seed);
+
+                for op in ops {
+                    match op {
+                        KvOp::Put { key, value } => {
+                            let _ = kv.txn(
+                                Txn::new()
+                                    .when(Vec::new())
+                                    .and_then(vec![TxnOp::put(key, value, None)]),
+                            );
+                        }
+                        KvOp::Delete { key } => {
+                            let _ = kv.txn(
+                                Txn::new()
+                                    .when(Vec::new())
+                                    .and_then(vec![TxnOp::delete(key, None)]),
+                            );
+                        }
+                        KvOp::Get { .. } => {}
+                        KvOp::Tick(dt) => { kv.tick(dt); }
+                    }
+                }
+
+                // Full-range scan: all keys >= empty key.
+                let scan = kv
+                    .get(Vec::new(), Some(GetOptions::new().with_from_key()))
+                    .expect("full scan should succeed");
+                prop_assert_eq!(
+                    kv.key_count(),
+                    scan.kvs().len(),
+                    "key_count must match full-range scan length"
+                );
+            }
+
+            /// A CAS compare against a stale mod_revision must fail.
+            #[test]
+            fn cas_with_stale_mod_revision_always_fails(seed in any::<u64>()) {
+                let mut kv = SimulatedEtcdKV::new(seed);
+
+                // Create key and record its initial mod_revision.
+                let txn = Txn::new()
+                    .when(vec![Compare::create_revision(b"k", CompareOp::Equal, 0)])
+                    .and_then(vec![TxnOp::put(b"k", b"v1", None)]);
+                kv.txn(txn).expect("initial put should succeed");
+                let initial_mod = get_exact(&mut kv, b"k").mod_revision();
+
+                // Update to bump mod_revision.
+                let txn = Txn::new()
+                    .when(vec![Compare::mod_revision(b"k", CompareOp::Equal, initial_mod)])
+                    .and_then(vec![TxnOp::put(b"k", b"v2", None)]);
+                let resp = kv.txn(txn).expect("update should succeed");
+                prop_assert!(resp.succeeded());
+
+                // Stale compare must fail.
+                let txn = Txn::new()
+                    .when(vec![Compare::mod_revision(b"k", CompareOp::Equal, initial_mod)])
+                    .and_then(vec![TxnOp::put(b"k", b"v3", None)]);
+                let resp = kv.txn(txn).expect("stale compare txn should return response");
+                prop_assert!(!resp.succeeded(), "CAS with stale mod_revision must fail");
+            }
+        }
     }
 }
