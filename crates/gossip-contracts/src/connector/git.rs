@@ -43,6 +43,7 @@
 
 use std::{
     fmt,
+    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
 };
 
@@ -50,7 +51,7 @@ use crate::coordination::ShardSpec;
 
 use super::common::{KeyedPageItem, PageBuf, PagingCapabilities};
 use super::types::ToxicDigest;
-use super::{Budgets, ConnectorInputError, Cursor, EnumerateError, ErrorClass, ItemKey};
+use super::{Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey};
 
 /// Canonical ordered work-unit key for a single repository.
 ///
@@ -61,7 +62,7 @@ use super::{Budgets, ConnectorInputError, Cursor, EnumerateError, ErrorClass, It
 pub struct RepoKey(ItemKey);
 
 impl RepoKey {
-    /// Construct a repo key from an already-validated ordered key.
+    /// Constructs a repo key from an already-validated ordered key.
     #[inline]
     #[must_use]
     pub fn new(item_key: ItemKey) -> Self {
@@ -90,21 +91,21 @@ impl RepoKey {
         Ok(Self(ItemKey::try_from_slice(bytes)?))
     }
 
-    /// Borrow the underlying ordered key.
+    /// Returns a reference to the underlying ordered key.
     #[inline]
     #[must_use]
     pub fn as_item_key(&self) -> &ItemKey {
         &self.0
     }
 
-    /// Consume the repo key and return the underlying ordered key.
+    /// Consumes the repo key and returns the underlying ordered key.
     #[inline]
     #[must_use]
     pub fn into_item_key(self) -> ItemKey {
         self.0
     }
 
-    /// Borrow the raw repo-key bytes.
+    /// Returns the raw repo-key bytes.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -133,25 +134,23 @@ impl fmt::Display for RepoKey {
 
 /// Canonical description of where a repository can be found.
 ///
-/// Only local-path locators are modeled today. The enum is non-exhaustive so
-/// future work can add URL-backed or provider-specific locator variants
-/// without renaming the type.
+/// Only local-path locators are modeled today. URL-backed or
+/// provider-specific locator variants will be added as new enum arms.
 #[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum RepoLocator {
     /// Repository already available on the local filesystem.
     LocalPath(PathBuf),
 }
 
 impl RepoLocator {
-    /// Construct a locator for a local repository path.
+    /// Constructs a locator for a local repository path.
     #[inline]
     #[must_use]
     pub fn local_path(path: impl Into<PathBuf>) -> Self {
         Self::LocalPath(path.into())
     }
 
-    /// Borrow the local filesystem path when this locator is local-path based.
+    /// Returns the local filesystem path when this locator is local-path based.
     #[inline]
     #[must_use]
     pub fn as_local_path(&self) -> Option<&Path> {
@@ -187,17 +186,20 @@ pub enum GitRefSelection {
     DefaultBranchOnly,
     /// Scan all remote branches, optionally limited to one remote.
     AllRemoteBranches {
-        /// Remote name filter (for example `b"origin"`).
+        /// Remote name filter (for example `b"origin"`). `None` means all
+        /// remotes are included.
         remote: Option<Vec<u8>>,
     },
     /// Scan local branches plus tags, optionally including remote branches.
     BranchesAndTags {
         /// Whether remote tracking branches are also included.
         include_remote_branches: bool,
-        /// Remote name filter when remote branches are included.
+        /// Remote name filter, only meaningful when `include_remote_branches`
+        /// is `true`. Ignored otherwise.
         remote: Option<Vec<u8>>,
     },
-    /// Scan a fixed list of fully-qualified refs.
+    /// Scan a fixed list of fully-qualified refs. An empty `refs` vec means
+    /// "scan no refs" — callers should provide at least one entry.
     ExplicitRefs {
         /// Fully-qualified refs such as `b"refs/heads/main"`.
         refs: Vec<Vec<u8>>,
@@ -288,7 +290,12 @@ pub struct GitSelection {
 }
 
 impl GitSelection {
-    /// Construct a repo-native selection tuple.
+    /// Constructs a repo-native selection tuple.
+    ///
+    /// `merge_strategy` only affects [`GitScanMode::DiffHistory`] (commit-walk)
+    /// execution. When `scan_mode` is [`GitScanMode::OdbBlobFast`] the merge
+    /// strategy is ignored by executors because ODB blob scanning bypasses the
+    /// commit graph entirely.
     #[must_use]
     pub fn new(
         refs: GitRefSelection,
@@ -302,21 +309,25 @@ impl GitSelection {
         }
     }
 
-    /// Borrow the selected ref scope.
+    /// Returns a reference to the selected ref scope.
     #[inline]
     #[must_use]
     pub fn refs(&self) -> &GitRefSelection {
         &self.refs
     }
 
-    /// Return the repo-native scan mode.
+    /// Returns the repo-native scan mode.
     #[inline]
     #[must_use]
     pub fn scan_mode(&self) -> GitScanMode {
         self.scan_mode
     }
 
-    /// Return the merge-commit diff strategy.
+    /// Returns the merge-commit diff strategy.
+    ///
+    /// Only meaningful when [`scan_mode()`](Self::scan_mode) is
+    /// [`DiffHistory`](GitScanMode::DiffHistory). Executors ignore this value
+    /// for [`OdbBlobFast`](GitScanMode::OdbBlobFast) runs.
     #[inline]
     #[must_use]
     pub fn merge_strategy(&self) -> GitMergeStrategy {
@@ -346,7 +357,7 @@ pub struct GitRepoTarget {
 }
 
 impl GitRepoTarget {
-    /// Construct a discovery target from its canonical key and locator.
+    /// Constructs a discovery target from its canonical key and locator.
     #[must_use]
     pub fn new(repo_key: RepoKey, locator: RepoLocator) -> Self {
         Self {
@@ -356,28 +367,28 @@ impl GitRepoTarget {
         }
     }
 
-    /// Attach optional diagnostic metadata to the target.
+    /// Attaches optional diagnostic metadata to the target.
     #[must_use]
     pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
         self.display_name = Some(display_name.into());
         self
     }
 
-    /// Borrow the canonical repo key.
+    /// Returns a reference to the canonical repo key.
     #[inline]
     #[must_use]
     pub fn repo_key(&self) -> &RepoKey {
         &self.repo_key
     }
 
-    /// Borrow the repository locator.
+    /// Returns a reference to the repository locator.
     #[inline]
     #[must_use]
     pub fn locator(&self) -> &RepoLocator {
         &self.locator
     }
 
-    /// Borrow the optional diagnostic display name.
+    /// Returns the optional diagnostic display name.
     #[inline]
     #[must_use]
     pub fn display_name(&self) -> Option<&str> {
@@ -421,7 +432,7 @@ pub struct LocalMirror {
 }
 
 impl LocalMirror {
-    /// Construct a local mirror description for `path`.
+    /// Constructs a local mirror description for `path`.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -430,21 +441,21 @@ impl LocalMirror {
         }
     }
 
-    /// Attach optional freshness metadata.
+    /// Attaches optional freshness metadata.
     #[must_use]
     pub fn with_last_synced_at_ms(mut self, last_synced_at_ms: u64) -> Self {
         self.last_synced_at_ms = Some(last_synced_at_ms);
         self
     }
 
-    /// Borrow the local mirror path.
+    /// Returns the local mirror path.
     #[inline]
     #[must_use]
     pub fn path(&self) -> &Path {
         self.path.as_path()
     }
 
-    /// Return the optional last-sync timestamp in milliseconds.
+    /// Returns the optional last-sync timestamp in milliseconds.
     #[inline]
     #[must_use]
     pub fn last_synced_at_ms(&self) -> Option<u64> {
@@ -480,21 +491,102 @@ pub enum GitDebugLevel {
 ///
 /// These are the contract-level knobs that do not depend on runtime Git types.
 /// `Default` is conservative and mirrors the existing runtime defaults where a
-/// sensible static default exists.
+/// sensible static default exists. Numeric limits use [`NonZeroUsize`] /
+/// [`NonZeroU32`] so that `Some(0)` is unrepresentable at compile time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GitExecutionLimits {
-    /// Optional worker override for pack execution.
-    pub pack_exec_workers: Option<usize>,
-    /// Whether binary blobs should be scanned.
-    pub scan_binary: bool,
-    /// Whether commit metadata should be enriched with identity data.
-    pub enrich_identities: bool,
-    /// Diagnostic output level for the execution.
-    pub debug_level: GitDebugLevel,
-    /// Optional tree-delta cache size override in MiB.
-    pub tree_delta_cache_mb: Option<u32>,
-    /// Optional engine chunk-size override in MiB.
-    pub engine_chunk_mb: Option<u32>,
+    pack_exec_workers: Option<NonZeroUsize>,
+    scan_binary: bool,
+    enrich_identities: bool,
+    debug_level: GitDebugLevel,
+    tree_delta_cache_mb: Option<NonZeroU32>,
+    engine_chunk_mb: Option<NonZeroU32>,
+}
+
+impl GitExecutionLimits {
+    /// Sets the worker count override for pack execution.
+    #[must_use]
+    pub fn with_pack_exec_workers(mut self, workers: NonZeroUsize) -> Self {
+        self.pack_exec_workers = Some(workers);
+        self
+    }
+
+    /// Enables or disables scanning of binary blobs.
+    #[must_use]
+    pub fn with_scan_binary(mut self, enabled: bool) -> Self {
+        self.scan_binary = enabled;
+        self
+    }
+
+    /// Enables or disables commit-metadata identity enrichment.
+    #[must_use]
+    pub fn with_enrich_identities(mut self, enabled: bool) -> Self {
+        self.enrich_identities = enabled;
+        self
+    }
+
+    /// Sets the diagnostic output level.
+    #[must_use]
+    pub fn with_debug_level(mut self, level: GitDebugLevel) -> Self {
+        self.debug_level = level;
+        self
+    }
+
+    /// Sets the tree-delta cache size override in MiB.
+    #[must_use]
+    pub fn with_tree_delta_cache_mb(mut self, mb: NonZeroU32) -> Self {
+        self.tree_delta_cache_mb = Some(mb);
+        self
+    }
+
+    /// Sets the engine chunk-size override in MiB.
+    #[must_use]
+    pub fn with_engine_chunk_mb(mut self, mb: NonZeroU32) -> Self {
+        self.engine_chunk_mb = Some(mb);
+        self
+    }
+
+    /// Returns the optional worker count override for pack execution.
+    #[inline]
+    #[must_use]
+    pub fn pack_exec_workers(&self) -> Option<usize> {
+        self.pack_exec_workers.map(|v| v.get())
+    }
+
+    /// Returns `true` when binary blob scanning is enabled.
+    #[inline]
+    #[must_use]
+    pub fn scan_binary(&self) -> bool {
+        self.scan_binary
+    }
+
+    /// Returns `true` when commit-metadata identity enrichment is enabled.
+    #[inline]
+    #[must_use]
+    pub fn enrich_identities(&self) -> bool {
+        self.enrich_identities
+    }
+
+    /// Returns the diagnostic output level.
+    #[inline]
+    #[must_use]
+    pub fn debug_level(&self) -> GitDebugLevel {
+        self.debug_level
+    }
+
+    /// Returns the optional tree-delta cache size override in MiB.
+    #[inline]
+    #[must_use]
+    pub fn tree_delta_cache_mb(&self) -> Option<u32> {
+        self.tree_delta_cache_mb.map(|v| v.get())
+    }
+
+    /// Returns the optional engine chunk-size override in MiB.
+    #[inline]
+    #[must_use]
+    pub fn engine_chunk_mb(&self) -> Option<u32> {
+        self.engine_chunk_mb.map(|v| v.get())
+    }
 }
 
 /// High-level counts and timing from one completed Git execution.
@@ -518,115 +610,34 @@ pub struct GitRunOutcome {
     pub persist_ns: u64,
 }
 
-fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
-    for ch in message.chars() {
-        if ch.is_control() && !matches!(ch, '\t' | '\n' | '\r') {
-            f.write_str("\u{FFFD}")?;
-        } else {
-            fmt::Write::write_char(f, ch)?;
-        }
-    }
-    Ok(())
-}
-
-/// Repo-native execution or mirroring failure.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GitRunError {
-    class: ErrorClass,
-    message: String,
-    retry_after_ms: Option<u64>,
+crate::define_connector_error! {
+    /// Repo-native execution or mirroring failure.
+    GitRunError
 }
 
 impl GitRunError {
-    /// Return the retryability classification for this failure.
-    #[inline]
-    #[must_use]
-    pub fn class(&self) -> ErrorClass {
-        self.class
-    }
-
-    /// Borrow the connector-originated diagnostic message.
-    #[inline]
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// Return the optional retry hint in milliseconds.
-    #[inline]
-    #[must_use]
-    pub fn retry_after_ms(&self) -> Option<u64> {
-        self.retry_after_ms
-    }
-
-    /// Return `true` when the error is retryable.
-    #[inline]
-    #[must_use]
-    pub fn is_retryable(&self) -> bool {
-        self.class.is_retryable()
-    }
-
-    /// Consume the error and return the owned diagnostic message.
-    #[inline]
-    #[must_use]
-    pub fn into_message(self) -> String {
-        self.message
-    }
-
-    /// Construct a retryable Git run error without a retry hint.
-    #[must_use]
-    pub fn retryable(message: impl Into<String>) -> Self {
-        Self {
-            class: ErrorClass::Retryable,
-            message: message.into(),
-            retry_after_ms: None,
-        }
-    }
-
-    /// Construct a retryable Git run error with an advisory retry hint.
-    #[must_use]
-    pub fn rate_limited(message: impl Into<String>, retry_after_ms: u64) -> Self {
-        Self {
-            class: ErrorClass::Retryable,
-            message: message.into(),
-            retry_after_ms: Some(retry_after_ms),
-        }
-    }
-
-    /// Construct a permanent Git run error.
-    #[must_use]
-    pub fn permanent(message: impl Into<String>) -> Self {
-        Self {
-            class: ErrorClass::Permanent,
-            message: message.into(),
-            retry_after_ms: None,
-        }
-    }
-
-    /// Construct the standard retryable error for concurrent repository maintenance.
+    /// Constructs the standard retryable error for concurrent repository
+    /// maintenance.
     #[must_use]
     pub fn concurrent_maintenance() -> Self {
         Self::retryable("concurrent git maintenance invalidated repository state")
     }
 }
 
-impl fmt::Display for GitRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: ", self.class)?;
-        fmt_sanitized_message(f, &self.message)?;
-        if let Some(retry_after_ms) = self.retry_after_ms {
-            write!(f, " (retry_after_ms={retry_after_ms})")?;
-        }
-        Ok(())
-    }
+/// Capability flags specific to Git repository discovery.
+///
+/// Wraps the generic paging capabilities with room for Git-specific flags
+/// as the runtime dispatch layer takes shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GitDiscoveryCapabilities {
+    /// Generic paging features supported by this source.
+    pub paging: PagingCapabilities,
 }
-
-impl std::error::Error for GitRunError {}
 
 /// Trait for discovering repository work units in deterministic frontier order.
 pub trait GitRepoDiscoverySource: Send {
-    /// Return paging features supported by this discovery source.
-    fn capabilities(&self) -> PagingCapabilities;
+    /// Returns the discovery capabilities for this source.
+    fn capabilities(&self) -> GitDiscoveryCapabilities;
 
     /// Fill one discovery page of repository work units within `shard`.
     ///
@@ -674,6 +685,7 @@ pub trait GitRepoExecutor: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::ErrorClass;
 
     fn repo_key(bytes: &[u8]) -> RepoKey {
         RepoKey::try_from_slice(bytes).expect("repo key")
@@ -690,8 +702,8 @@ mod tests {
     struct StubDiscovery;
 
     impl GitRepoDiscoverySource for StubDiscovery {
-        fn capabilities(&self) -> PagingCapabilities {
-            PagingCapabilities::default()
+        fn capabilities(&self) -> GitDiscoveryCapabilities {
+            GitDiscoveryCapabilities::default()
         }
 
         fn discover_page(
@@ -811,12 +823,12 @@ mod tests {
     #[test]
     fn git_execution_limits_default_is_conservative() {
         let limits = GitExecutionLimits::default();
-        assert_eq!(limits.pack_exec_workers, None);
-        assert!(!limits.scan_binary);
-        assert!(!limits.enrich_identities);
-        assert_eq!(limits.debug_level, GitDebugLevel::Off);
-        assert_eq!(limits.tree_delta_cache_mb, None);
-        assert_eq!(limits.engine_chunk_mb, None);
+        assert_eq!(limits.pack_exec_workers(), None);
+        assert!(!limits.scan_binary());
+        assert!(!limits.enrich_identities());
+        assert_eq!(limits.debug_level(), GitDebugLevel::Off);
+        assert_eq!(limits.tree_delta_cache_mb(), None);
+        assert_eq!(limits.engine_chunk_mb(), None);
     }
 
     #[test]
@@ -883,5 +895,118 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    // -- RepoKey validation + ordering --
+
+    #[test]
+    fn repo_key_rejects_empty_input() {
+        let err = RepoKey::try_from_slice(b"").unwrap_err();
+        assert!(
+            matches!(err, ConnectorInputError::Empty { .. }),
+            "expected Empty, got: {err:?}"
+        );
+
+        let err_vec = RepoKey::try_from_vec(vec![]).unwrap_err();
+        assert!(matches!(err_vec, ConnectorInputError::Empty { .. }));
+    }
+
+    #[test]
+    fn repo_key_rejects_oversized_input() {
+        let oversized = vec![b'x'; crate::connector::MAX_ITEM_KEY_SIZE + 1];
+        let err = RepoKey::try_from_slice(&oversized).unwrap_err();
+        assert!(
+            matches!(err, ConnectorInputError::TooLarge { .. }),
+            "expected TooLarge, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn repo_key_ord_matches_byte_order() {
+        let a = repo_key(b"aaa");
+        let b = repo_key(b"bbb");
+        assert!(a < b);
+        assert!(b > a);
+        assert_eq!(a, a.clone());
+    }
+
+    #[test]
+    fn repo_key_eq_implies_same_hash() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a1 = repo_key(b"github.com\0acme\0repo");
+        let a2 = repo_key(b"github.com\0acme\0repo");
+        assert_eq!(a1, a2);
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a1.hash(&mut h1);
+        a2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    // -- Debug redaction completeness --
+
+    #[test]
+    fn git_repo_target_debug_redacts_display_name() {
+        let target = repo_target(b"github.com\0acme\0repo");
+        let debug = format!("{target:?}");
+        assert!(debug.contains("GitRepoTarget"));
+        assert!(
+            !debug.contains("acme/repo"),
+            "display_name leaked into Debug: {debug}"
+        );
+    }
+
+    #[test]
+    fn git_ref_selection_debug_redacts_remote() {
+        let all_remote = GitRefSelection::AllRemoteBranches {
+            remote: Some(b"origin".to_vec()),
+        };
+        let debug = format!("{all_remote:?}");
+        assert!(
+            !debug.contains("origin"),
+            "remote bytes leaked into AllRemoteBranches Debug: {debug}"
+        );
+
+        let branches_tags = GitRefSelection::BranchesAndTags {
+            include_remote_branches: true,
+            remote: Some(b"upstream".to_vec()),
+        };
+        let debug = format!("{branches_tags:?}");
+        assert!(
+            !debug.contains("upstream"),
+            "remote bytes leaked into BranchesAndTags Debug: {debug}"
+        );
+    }
+
+    // -- Sanitizer edge cases --
+
+    #[test]
+    fn sanitized_display_preserves_allowed_whitespace() {
+        let err = GitRunError::retryable("col1\tcol2\nrow2\rrow3");
+        let display = err.to_string();
+        assert!(
+            display.contains("col1\tcol2\nrow2\rrow3"),
+            "allowed whitespace was stripped: {display}"
+        );
+    }
+
+    #[test]
+    fn sanitized_display_replaces_c1_controls() {
+        // U+0085 (NEXT LINE) and U+009B (CSI) are C1 control characters.
+        let msg = "before\u{0085}middle\u{009B}after";
+        let err = GitRunError::retryable(msg);
+        let display = err.to_string();
+        assert!(
+            !display.contains('\u{0085}'),
+            "C1 U+0085 survived: {display}"
+        );
+        assert!(
+            !display.contains('\u{009B}'),
+            "C1 U+009B survived: {display}"
+        );
+        assert_eq!(display, "retryable: before\u{FFFD}middle\u{FFFD}after");
     }
 }

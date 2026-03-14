@@ -26,7 +26,8 @@
 //!   ([`git::RepoKey`], [`git::RepoLocator`], [`git::GitRepoTarget`],
 //!   [`git::GitSelection`], [`git::LocalMirror`],
 //!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
-//!   [`git::GitRunError`], [`git::GitRepoDiscoverySource`],
+//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
+//!   [`git::GitRepoDiscoverySource`],
 //!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]).
 //!
 //! `api.rs`, `common.rs`, and `types.rs` remain internal organization units;
@@ -66,7 +67,8 @@
 //! - Git family types and contracts: [`git::RepoKey`], [`git::RepoLocator`],
 //!   [`git::GitRepoTarget`], [`git::GitSelection`], [`git::LocalMirror`],
 //!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
-//!   [`git::GitRunError`], [`git::GitRepoDiscoverySource`],
+//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
+//!   [`git::GitRepoDiscoverySource`],
 //!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]
 //!
 //! These types are intentionally composable: a connector validates once at the
@@ -88,6 +90,9 @@ mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
 pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
+// Re-export for use by `define_connector_error!` macro via `$crate::connector::` path.
+#[doc(hidden)]
+pub use api::fmt_sanitized_message;
 pub use common::{
     KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, validate_filled_page,
 };
