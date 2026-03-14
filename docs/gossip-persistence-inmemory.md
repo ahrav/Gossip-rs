@@ -243,8 +243,12 @@ manual-release operations while the invariant checker validates every step.
   for the `Radioactive` fault level, catching regressions without CI cost.
 - `done_ledger_sim_radioactive` is an ignored 50-seed stress sweep for the
   highest fault tier.
-- `prop_done_ledger_state_machine` generates shrinkable `DoneLedgerSimOp`
-  sequences so a failing scenario minimizes to the smallest reproducer.
+- `prop_done_ledger_state_machine` generates shrinkable `ProptestOp`
+  sequences that are materialized into `DoneLedgerSimOp` at execution time.
+  Every case starts with a deterministic fault prefix (delay → commit failure
+  → successful retry) before the random tail. Seed-based replay is the
+  primary debugging mechanism; shrunk sequences produce different `RunId`
+  values due to the materialization layer.
 
 ## 9. Conformance
 

@@ -1,8 +1,8 @@
-//! Shared paging vocabulary for connector source families.
+//! Shared paging vocabulary for connector enumeration pages.
 //!
-//! This module does not define a fake universal connector trait. It defines
-//! the common page types and validation rules that family-specific contracts
-//! reuse when they page ordered work units across shard boundaries.
+//! This module defines the reusable page container and validation helpers that
+//! connector families use to emit ordered enumeration results without
+//! re-specifying page shape rules at each family boundary.
 //!
 //! ## Surface overview
 //!
@@ -10,9 +10,9 @@
 //! |------|------|
 //! | [`PageBuf`] | Non-empty typed page container |
 //! | [`PageState`] | Terminal vs resumable page completion state |
-//! | [`PagingCapabilities`] | Shared paging capability flags |
-//! | [`KeyedPageItem`] | Ordered-key contract for paged items |
-//! | [`PageShapeError`] | Deterministic page validation failure taxonomy |
+//! | [`PageShapeError`] | Page validation failure taxonomy |
+//! | [`PagingCapabilities`] | Optional paging behavior flags for a connector family |
+//! | [`KeyedPageItem`] | Trait for items that participate in ordered page emission |
 //! | [`validate_filled_page`] | Validates ordering, uniqueness, and shard bounds |
 //!
 //! ## Bound semantics
@@ -49,13 +49,17 @@ impl<T> PageBuf<T> {
         Ok(Self { items, state })
     }
 
-    /// Construct a non-empty page after validating ordering and shard bounds.
+    /// Construct a non-empty page after validating ordering, uniqueness, and shard bounds.
+    ///
+    /// Combines [`PageBuf::try_new`] non-empty check with [`validate_filled_page`]
+    /// shape validation in a single step.
     ///
     /// # Errors
     ///
     /// Returns [`PageShapeError`] if the page is empty, keys are not strictly
     /// increasing, any key falls outside the `[shard_start, shard_end)` bounds,
-    /// or both bounds are non-empty with `shard_start >= shard_end`.
+    /// or both bounds are non-empty with `shard_start >= shard_end`
+    /// ([`PageShapeError::InvertedBounds`]).
     pub fn try_new_validated(
         items: Vec<T>,
         state: PageState,
@@ -66,6 +70,8 @@ impl<T> PageBuf<T> {
         T: KeyedPageItem,
     {
         validate_filled_page(&items, shard_start, shard_end)?;
+        // Delegate to try_new so any future invariants added there are enforced.
+        // validate_filled_page already guarantees non-empty, so try_new succeeds.
         Self::try_new(items, state)
     }
 
@@ -103,7 +109,7 @@ impl<T> PageBuf<T> {
         self.items.iter()
     }
 
-    /// Consume the page and return its owned items and completion state.
+    /// Consume the page and return its owned items and state.
     #[must_use]
     pub fn into_parts(self) -> (Vec<T>, PageState) {
         (self.items, self.state)
@@ -122,7 +128,10 @@ impl<'a, T> IntoIterator for &'a PageBuf<T> {
 /// Whether a page completes the current enumeration scope or requires resume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageState {
-    /// More items remain; the supplied cursor resumes the next request.
+    /// The caller must resume with the supplied cursor. A resume cursor does
+    /// not guarantee another in-scope item will be returned on the next call;
+    /// connectors may emit a cursor at a boundary-crossing page and signal
+    /// completion on the subsequent (possibly empty) call.
     HasMore { cursor: Cursor },
     /// This page is terminal for the current enumeration scope.
     Complete,
@@ -147,7 +156,7 @@ impl PageState {
     }
 }
 
-/// Shared paging behavior flags exposed by connector families.
+/// Optional paging behavior flags exposed by a connector family.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PagingCapabilities {
     /// Whether the family produces strictly ordered page keys.
@@ -163,7 +172,7 @@ pub trait KeyedPageItem {
     /// Returns the ordered key used for page progression.
     fn item_key(&self) -> &ItemKey;
 
-    /// Returns the optional item byte-size estimate used for budgeting.
+    /// Returns the optional item byte-size estimate used for budget tracking.
     fn size_hint(&self) -> Option<u64>;
 }
 
@@ -230,8 +239,13 @@ impl std::error::Error for PageShapeError {}
 /// Validate a non-empty ordered page against shard bounds.
 ///
 /// `shard_start` and `shard_end` use the same convention as
-/// `ShardSpec::key_range_start()` / `ShardSpec::key_range_end()`: empty slices
-/// mean the bound is unbounded.
+/// `ShardSpec::key_range_start()` / `key_range_end()`: empty slices mean the
+/// bound is unbounded. Validation rules:
+///
+/// - page is non-empty;
+/// - when both bounds are present, `start < end` (rejects inverted bounds);
+/// - keys are strictly increasing (duplicates are rejected);
+/// - keys stay within the half-open interval `[start, end)`.
 ///
 /// # Errors
 ///
@@ -245,8 +259,8 @@ pub fn validate_filled_page<T: KeyedPageItem>(
     if !shard_start.is_empty() && !shard_end.is_empty() && shard_start >= shard_end {
         return Err(PageShapeError::InvertedBounds);
     }
-
     let mut previous = first.item_key().as_bytes();
+
     if !shard_start.is_empty() && previous < shard_start {
         return Err(PageShapeError::KeyOutsideShardBounds {
             index: 0,
@@ -260,20 +274,15 @@ pub fn validate_filled_page<T: KeyedPageItem>(
         });
     }
 
-    for (index, item) in rest.iter().enumerate() {
-        let index = index + 1;
+    // Strictly increasing keys guarantee all subsequent items exceed the first,
+    // which was already verified against shard_start.
+    for (offset, item) in rest.iter().enumerate() {
+        let index = offset + 1;
         let key = item.item_key().as_bytes();
-        if key < previous {
-            return Err(PageShapeError::UnsortedKeys { index });
-        }
-        if key == previous {
-            return Err(PageShapeError::DuplicateKeys { index });
-        }
-        if !shard_start.is_empty() && key < shard_start {
-            return Err(PageShapeError::KeyOutsideShardBounds {
-                index,
-                below_start: true,
-            });
+        match key.cmp(previous) {
+            std::cmp::Ordering::Less => return Err(PageShapeError::UnsortedKeys { index }),
+            std::cmp::Ordering::Equal => return Err(PageShapeError::DuplicateKeys { index }),
+            std::cmp::Ordering::Greater => {}
         }
         if !shard_end.is_empty() && key >= shard_end {
             return Err(PageShapeError::KeyOutsideShardBounds {
@@ -288,60 +297,5 @@ pub fn validate_filled_page<T: KeyedPageItem>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Debug)]
-    struct TestItem(ItemKey);
-
-    impl KeyedPageItem for TestItem {
-        fn item_key(&self) -> &ItemKey {
-            &self.0
-        }
-
-        fn size_hint(&self) -> Option<u64> {
-            None
-        }
-    }
-
-    fn key(bytes: &[u8]) -> ItemKey {
-        ItemKey::try_from_slice(bytes).expect("valid key")
-    }
-
-    #[test]
-    fn page_buf_rejects_empty_pages() {
-        let err = PageBuf::<TestItem>::try_new(Vec::new(), PageState::Complete)
-            .expect_err("empty page must be rejected");
-        assert_eq!(err, PageShapeError::EmptyPage);
-    }
-
-    #[test]
-    fn validate_filled_page_accepts_sorted_in_bounds_items() {
-        let items = [
-            TestItem(key(b"a")),
-            TestItem(key(b"b")),
-            TestItem(key(b"c")),
-        ];
-        assert_eq!(validate_filled_page(&items, b"a", b"d"), Ok(()));
-    }
-
-    #[test]
-    fn validate_filled_page_rejects_duplicate_keys() {
-        let items = [TestItem(key(b"a")), TestItem(key(b"a"))];
-        let err = validate_filled_page(&items, b"", b"").expect_err("duplicate keys");
-        assert_eq!(err, PageShapeError::DuplicateKeys { index: 1 });
-    }
-
-    #[test]
-    fn validate_filled_page_rejects_out_of_range_keys() {
-        let items = [TestItem(key(b"a")), TestItem(key(b"z"))];
-        let err = validate_filled_page(&items, b"b", b"y").expect_err("out of range");
-        assert_eq!(
-            err,
-            PageShapeError::KeyOutsideShardBounds {
-                index: 0,
-                below_start: true,
-            }
-        );
-    }
-}
+#[path = "common_tests.rs"]
+mod tests;

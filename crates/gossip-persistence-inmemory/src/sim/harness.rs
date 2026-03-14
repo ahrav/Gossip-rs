@@ -45,6 +45,12 @@ use crate::{CompletionOrder, InMemoryDoneLedger, InMemoryDoneLedgerHandle, Pendi
 /// Overlapping keys force merge contention.
 const OVID_POOL_SIZE: usize = 50;
 
+/// Test-only mirror of the shared key-pool width so property tests in the
+/// `tests` module generate upserts and reads against the same key space as
+/// the harness.
+#[cfg(test)]
+pub(super) const PROPTEST_OVID_POOL_SIZE: usize = OVID_POOL_SIZE;
+
 /// First N safety ops suppress fault injection to allow initial state
 /// population.
 const WARMUP_OPS: usize = 5;
@@ -378,6 +384,27 @@ impl DoneLedgerSim {
     #[cfg(test)]
     pub(super) fn pending_batch_count(&self) -> usize {
         self.pending_batches.len()
+    }
+
+    /// Sorted snapshot of currently-pending write IDs. Used by the
+    /// proptest materialization layer to remap `ReleaseSpecific` ops
+    /// to actual pending IDs, ensuring the found-and-released path
+    /// is exercised.
+    #[cfg(test)]
+    pub(super) fn pending_batch_ids_sorted(&self) -> Vec<PendingWriteId> {
+        let mut ids: Vec<PendingWriteId> = self.pending_batches.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Inject PPM-based background faults when the fault level is
+    /// non-SunnyDay. Intended for the proptest op loop so the `FaultLevel`
+    /// parameter produces distinct execution traces at each severity.
+    #[cfg(test)]
+    pub(super) fn inject_background_faults_if_configured(&mut self) {
+        if !self.fault_config.is_fault_free() {
+            self.maybe_inject_faults();
+        }
     }
 
     /// Verify I6 convergence once the caller has drained pending writes.
@@ -735,7 +762,7 @@ impl DoneLedgerSim {
         if order == CompletionOrder::NewestFirst {
             sorted_batches.reverse();
         }
-        debug_assert_eq!(
+        assert_eq!(
             count,
             sorted_batches.len(),
             "store/harness pending count mismatch"
@@ -749,7 +776,9 @@ impl DoneLedgerSim {
             match event.kind() {
                 DoneLedgerSimEventKind::Released => committed += 1,
                 DoneLedgerSimEventKind::ReleasedCommitFailed => failed += 1,
-                _ => {}
+                other => unreachable!(
+                    "finish_released_batch returned unexpected event kind {other:?} for op_id {op_id}"
+                ),
             }
             all_violations.extend(violations);
         }
@@ -1003,6 +1032,22 @@ impl DoneLedgerSim {
             error_code,
         )
         .unwrap()
+    }
+
+    /// Build a record against the harness key pool using test-supplied fields.
+    #[cfg(test)]
+    pub(super) fn build_test_record(
+        &mut self,
+        spec: &super::tests::RecordSpec,
+    ) -> DoneLedgerRecord {
+        self.build_record(
+            spec.ovid_index,
+            spec.status,
+            spec.bytes_scanned,
+            spec.findings_count,
+            spec.started_at,
+            spec.started_at + spec.duration,
+        )
     }
 
     // ── Record generation ────────────────────────────────────────────

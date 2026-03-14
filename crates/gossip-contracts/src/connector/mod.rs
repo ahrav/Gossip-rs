@@ -10,8 +10,11 @@
 //!
 //! The connector contract surface is split into focused layers:
 //!
-//! - `types.rs` defines validated value wrappers, paging/value invariants
-//!   (including toxic-byte redaction and size bounds), and [`ToxicDigest`].
+//! - `common.rs` defines the shared paging vocabulary
+//!   ([`PageBuf`], [`PageState`], [`PagingCapabilities`], page validation).
+//! - `types.rs` defines validated value wrappers, item metadata/value
+//!   invariants (including toxic-byte redaction and size bounds), and
+//!   [`ToxicDigest`].
 //! - `api.rs` defines operation-outcome classification and optional capability
 //!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
 //!   `ConnectorCapabilities`).

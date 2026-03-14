@@ -61,6 +61,13 @@ impl PendingWriteId {
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
+
+    /// Extract the raw integer value.
+    #[inline]
+    #[must_use]
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Debug for PendingWriteId {
