@@ -248,26 +248,32 @@ fn materialize_record(sim: &mut DoneLedgerSim, spec: &RecordSpec) -> DoneLedgerR
 }
 
 fn map_batch_get_indices(raw_indices: &[usize], seen_ovid_indices: &BTreeSet<usize>) -> Vec<usize> {
-    if seen_ovid_indices.is_empty() {
-        return raw_indices
+    debug_assert!(!raw_indices.is_empty());
+
+    let result: Vec<usize> = if seen_ovid_indices.is_empty() {
+        raw_indices
             .iter()
             .map(|idx| idx % PROPTEST_OVID_POOL_SIZE)
-            .collect();
-    }
+            .collect()
+    } else {
+        let seen: Vec<usize> = seen_ovid_indices.iter().copied().collect();
+        raw_indices
+            .iter()
+            .map(|idx| {
+                // ~20% of reads target arbitrary pool keys to detect delayed-write
+                // leaks for keys the oracle has no record of.
+                if idx % 5 == 0 {
+                    idx % PROPTEST_OVID_POOL_SIZE
+                } else {
+                    seen[idx % seen.len()]
+                }
+            })
+            .collect()
+    };
 
-    let seen: Vec<usize> = seen_ovid_indices.iter().copied().collect();
-    raw_indices
-        .iter()
-        .map(|idx| {
-            // ~20% of reads target arbitrary pool keys to detect delayed-write
-            // leaks for keys the oracle has no record of.
-            if idx % 5 == 0 {
-                idx % PROPTEST_OVID_POOL_SIZE
-            } else {
-                seen[idx % seen.len()]
-            }
-        })
-        .collect()
+    debug_assert_eq!(result.len(), raw_indices.len());
+    debug_assert!(result.iter().all(|&i| i < PROPTEST_OVID_POOL_SIZE));
+    result
 }
 
 fn materialize_op(
@@ -448,6 +454,8 @@ fn exercise_fault_prefix(sim: &mut DoneLedgerSim, seen_ovid_indices: &mut BTreeS
 
 fn run_op_sequence(seed: u64, level: FaultLevel, ops: &[ProptestOp]) {
     let mut sim = DoneLedgerSim::new(seed, level);
+    // BTreeSet gives deterministic sorted iteration, which map_batch_get_indices
+    // relies on for reproducible index remapping across proptest shrink attempts.
     let mut seen_ovid_indices = BTreeSet::new();
 
     exercise_fault_prefix(&mut sim, &mut seen_ovid_indices);
@@ -592,6 +600,10 @@ proptest! {
         cfg
     })]
 
+    // Shrinking note: the materialization layer (ProptestOp -> DoneLedgerSimOp)
+    // means shrunk sequences produce different RunId values than the original
+    // failure. Seed-based replay (seed=N in assertion messages) is the primary
+    // debugging mechanism, not proptest's minimal counterexamples.
     #[test]
     fn prop_done_ledger_state_machine(
         seed in any::<u64>(),
