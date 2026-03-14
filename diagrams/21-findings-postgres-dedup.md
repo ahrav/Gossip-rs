@@ -330,10 +330,127 @@ The convergence guarantee holds because:
 
 ---
 
+## 5. Read API Surface: Query-Plane Types and SQL
+
+The findings PostgreSQL backend exposes a read surface alongside the write path.
+While the write path (sections 1--4) handles batch upserts through
+`FindingsSink`, the read surface provides typed queries for operational use
+cases: conformance probing, triage listing, and grouped counts.
+
+```mermaid
+%% Diagram: findings-read-api-surface
+flowchart TB
+    subgraph traits ["Trait surface"]
+        sink["FindingsSink<br/>upsert_batch()"]
+        probe["FindingsConformanceProbe<br/>durable_counts()"]
+    end
+
+    subgraph backend ["FindingsSinkPg"]
+        impl_sink["impl FindingsSink"]
+        impl_probe["impl FindingsConformanceProbe"]
+        read_methods["Read methods on FindingsSinkPg:<br/>• count_observations_by_tenant_policy()<br/>• list_findings_needing_triage()"]
+    end
+
+    subgraph sql_queries ["SQL queries"]
+        combined["COMBINED_COUNTS_SQL<br/>Single round-trip: all 3 table counts"]
+        count_obs["COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL<br/>Grouped count per tenant+policy"]
+        list_triage["LIST_FINDINGS_NEEDING_TRIAGE_SQL<br/>Latest observation per finding<br/>for one tenant, ordered by recency"]
+    end
+
+    subgraph result_types ["Result types (read_api.rs)"]
+        durable["DurableFindingsCounts<br/>{ findings, occurrences, observations }"]
+        obs_count["ObservationCountByPolicy<br/>{ tenant_id, policy_hash, observation_count }"]
+        triage["PendingTriageFinding<br/>{ tenant_id, finding_id, stable_item_id,<br/>occurrence_id, observation_id, policy_hash,<br/>seen_at, location_display, location_url }"]
+    end
+
+    sink -->|"write path"| impl_sink
+    probe -->|"conformance"| impl_probe
+    impl_probe --> combined
+    read_methods --> count_obs
+    read_methods --> list_triage
+
+    combined --> durable
+    count_obs --> obs_count
+    list_triage --> triage
+
+    style sink fill:#EDE9FE,stroke:#5B21B6,color:#5B21B6
+    style probe fill:#EDE9FE,stroke:#5B21B6,color:#5B21B6
+    style impl_sink fill:#8B5CF6,stroke:#5B21B6,color:#FFF
+    style impl_probe fill:#8B5CF6,stroke:#5B21B6,color:#FFF
+    style read_methods fill:#8B5CF6,stroke:#5B21B6,color:#FFF
+    style combined fill:#C4B5FD,stroke:#5B21B6,color:#5B21B6
+    style count_obs fill:#C4B5FD,stroke:#5B21B6,color:#5B21B6
+    style list_triage fill:#C4B5FD,stroke:#5B21B6,color:#5B21B6
+    style durable fill:#DCFCE7,stroke:#166534,color:#166534
+    style obs_count fill:#DCFCE7,stroke:#166534,color:#166534
+    style triage fill:#DCFCE7,stroke:#166534,color:#166534
+```
+
+### Query summary
+
+| Query | SQL constant | Bind params | Result type | Purpose |
+|:---|:---|:---|:---|:---|
+| Combined counts | `COMBINED_COUNTS_SQL` | None | `DurableFindingsCounts` | Single round-trip: `SELECT (SELECT COUNT(*) FROM findings), (SELECT COUNT(*) FROM occurrences), (SELECT COUNT(*) FROM observations)`. Used by `FindingsConformanceProbe::durable_counts()` for test assertions. |
+| Observations by policy | `COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL` | `$1: tenant_id` | `Vec<ObservationCountByPolicy>` | Grouped observation count per tenant+policy. Omits `tenant_id` from `SELECT` and `GROUP BY` because the `WHERE` clause constrains every row to a single tenant. |
+| Findings needing triage | `LIST_FINDINGS_NEEDING_TRIAGE_SQL` | `$1: tenant_id`, `$2: limit` | `Vec<PendingTriageFinding>` | Latest observation per finding for one tenant, ordered by recency. Uses `DISTINCT ON (finding_id)` in a subquery, then re-sorts by overall recency. |
+
+### Triage query structure
+
+The triage query is the most complex read query. It uses a subquery with
+`DISTINCT ON` to select the most recent observation per finding, then
+re-sorts those rows by overall recency for the tenant:
+
+```
+SELECT latest.*
+FROM (
+    SELECT DISTINCT ON (f.finding_id)
+        f.finding_id, f.stable_item_id,
+        o.occurrence_id, ob.observation_id, ob.policy_hash,
+        ob.seen_at, ob.location_display, ob.location_url
+    FROM findings AS f
+    INNER JOIN occurrences AS o ON ...
+    INNER JOIN observations AS ob ON ...
+    WHERE f.tenant_id = $1
+    ORDER BY f.finding_id, ob.seen_at DESC, ob.observation_id DESC
+) AS latest
+ORDER BY latest.seen_at DESC, latest.observation_id DESC
+LIMIT $2
+```
+
+Key design decisions:
+
+| Decision | Rationale |
+|:---|:---|
+| `tenant_id` omitted from projection | Reconstructed from the input parameter in the Rust decoder, avoiding per-row BYTEA decode overhead |
+| Secondary tiebreaker `observation_id DESC` | Deterministic but semantically arbitrary (BYTEA sort over content-addressed hash) -- callers cannot predict ordering when `seen_at` ties |
+| Full materialization before `LIMIT` | The outer `ORDER BY` differs from the inner `DISTINCT ON` ordering, so PostgreSQL materializes the full per-tenant result. At high finding counts, a `LATERAL` rewrite should be evaluated. |
+
+### Backend structure: `FindingsSinkPg`
+
+The backend struct mirrors `DoneLedgerPg` in design:
+
+| Aspect | Detail |
+|:---|:---|
+| Internal state | `Arc<Mutex<Client>>` -- same pattern as `DoneLedgerPg` |
+| Constructors | `from_client`, `connect` (test-utils), `connect_and_migrate` (test-utils) |
+| Write path | Per-record SQL (`FINDINGS_INSERT_SQL`, `OCCURRENCES_INSERT_SQL`, `OBSERVATIONS_INSERT_OR_MERGE_SQL`) inside an explicit transaction |
+| Commit model | `ReadyCommitHandle` after `tx.commit()` -- durable-before-return |
+| Conformance | Implements `FindingsConformanceProbe` via `COMBINED_COUNTS_SQL` |
+
+Unlike the done-ledger's `unnest()`-based bulk upsert, the findings backend
+issues per-record SQL statements within a transaction because each of the three
+layers has different conflict semantics (immutable vs. mergeable) and foreign-key
+relationships.
+
+---
+
 ## Cross-References
 
 - [Persistence Contracts](19-persistence-contracts.md) -- the contract surface
   (traits, record types, identity chains) that this backend implements against
+- [Done-Ledger PostgreSQL Backend](22-done-ledger-postgres.md) -- the sibling
+  PostgreSQL backend for the done-ledger, using `unnest()`-based bulk upsert
+  with lattice-monotonic merge
 - [PageCommit Typestate Machine](08-pagecommit-typestate.md) -- the compile-time
   ordering guarantee that findings are durable before done-ledger and checkpoint
 - [ID Derivation DAG](03-id-derivation-dag.md) -- the BLAKE3 content-addressing
@@ -345,7 +462,10 @@ The convergence guarantee holds because:
 
 | File | Purpose |
 |:---|:---|
-| `crates/gossip-findings-postgres/src/backend.rs` | `project_and_dedupe`, per-layer dedup functions, `merge_observation_rows`, `drain_in_order` |
-| `crates/gossip-findings-postgres/src/schema.rs` | Row projections (`FindingRow`, `OccurrenceRow`, `ObservationRow`), SQL constants (`FINDINGS_INSERT_SQL`, `OCCURRENCES_INSERT_SQL`, `OBSERVATIONS_INSERT_OR_MERGE_SQL`), table/column/index names |
+| `crates/gossip-findings-postgres/src/backend.rs` | `FindingsSinkPg` struct, `FindingsSink` impl, `project_and_dedupe`, per-layer dedup functions, `merge_observation_rows`, `drain_in_order` |
+| `crates/gossip-findings-postgres/src/schema.rs` | Row projections (`FindingRow`, `OccurrenceRow`, `ObservationRow`), SQL constants (`FINDINGS_INSERT_SQL`, `OCCURRENCES_INSERT_SQL`, `OBSERVATIONS_INSERT_OR_MERGE_SQL`, `COMBINED_COUNTS_SQL`, `COUNT_OBSERVATIONS_BY_TENANT_POLICY_SQL`, `LIST_FINDINGS_NEEDING_TRIAGE_SQL`), table/column/index names |
+| `crates/gossip-findings-postgres/src/read_api.rs` | `ObservationCountByPolicy`, `PendingTriageFinding` result types |
+| `crates/gossip-findings-postgres/src/error.rs` | `FindingsPgError` (12 variants), `FindingsPgSchemaError` (3 variants) |
 | `crates/gossip-contracts/src/persistence/findings.rs` | `FindingRecord`, `OccurrenceRecord`, `ObservationRecord`, `FindingsUpsertBatch`, `validate_observation_identity()`, `validate_tenant_consistency()` |
+| `crates/gossip-contracts/src/persistence/conformance.rs` | `FindingsConformanceProbe`, `DurableFindingsCounts`, `run_findings_conformance` |
 | `crates/gossip-persistence-inmemory/src/findings.rs` | Reference in-memory backend implementing the same validate-then-mutate pattern and merge rules |

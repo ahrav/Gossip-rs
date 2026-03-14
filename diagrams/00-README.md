@@ -55,7 +55,8 @@ graph TD
     SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
     PCC[19-persistence-contracts.md<br/>Traits, data model, lattice,<br/>OVID, receipts<br/>5 diagrams]
     ECP[20-etcd-coordinator-persistence.md<br/>Keyspace, codec, backend,<br/>delegation, wire format<br/>5 diagrams]
-    FPD[21-findings-postgres-dedup.md<br/>Batch dedup, observation merge,<br/>dual convergence<br/>4 diagrams]
+    FPD[21-findings-postgres-dedup.md<br/>Batch dedup, observation merge,<br/>dual convergence, read API<br/>5 diagrams]
+    DLP[22-done-ledger-postgres.md<br/>Backend architecture, upsert<br/>pipeline, provenance merge,<br/>schema, errors<br/>7 diagrams]
 
     R --> SO
     SO --> BD
@@ -80,6 +81,8 @@ graph TD
     BD --> PCC
     PCC --> ECP
     PCC --> FPD
+    PCC --> DLP
+    FPD --> DLP
     PC --> PCC
 
     style R fill:#F3F4F6,stroke:#374151
@@ -103,6 +106,7 @@ graph TD
     style PCC fill:#EDE9FE,stroke:#5B21B6
     style ECP fill:#DCFCE7,stroke:#166534
     style FPD fill:#EDE9FE,stroke:#5B21B6
+    style DLP fill:#EDE9FE,stroke:#5B21B6
 ```
 
 ### Suggested Reading Paths
@@ -123,23 +127,24 @@ graph TD
 **Deep dive into persistence and connectors** (after coordination or identity):
 6. `08-pagecommit-typestate.md` — Compile-time safety for atomic commits
 7. `19-persistence-contracts.md` — Traits, data model, lattice, OVID, receipts
-8. `21-findings-postgres-dedup.md` — Batch dedup, observation merge, dual convergence
-9. `09-circuit-breaker.md` — Failure isolation for external APIs
-10. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
-11. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
-12. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
-13. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
+8. `21-findings-postgres-dedup.md` — Batch dedup, observation merge, dual convergence, read API
+9. `22-done-ledger-postgres.md` — Done-ledger PostgreSQL backend: upsert pipeline, provenance merge, schema
+10. `09-circuit-breaker.md` — Failure isolation for external APIs
+11. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
+12. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
+13. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
+14. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
 
 **Deep dive into etcd coordination persistence** (after persistence):
-14. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
+15. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
 
 **Cross-cutting concerns** (after any deep dive):
-15. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
-16. `11-tenant-isolation.md` — Cryptographic multi-tenancy
-17. `12-split-operations.md` — Dynamic work distribution via shard splitting
+16. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
+17. `11-tenant-isolation.md` — Cryptographic multi-tenancy
+18. `12-split-operations.md` — Dynamic work distribution via shard splitting
 
 **Deep dive into shard algebra** (after split operations):
-18. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
+19. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
 
 ## File Index
 
@@ -165,8 +170,9 @@ graph TD
 | 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |
 | 19  | `19-persistence-contracts.md`        | 5        | B5               | Trait hierarchy, findings data model, done-ledger lattice, OVID, receipts |
 | 20  | `20-etcd-coordinator-persistence.md` | 5        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
-| 21  | `21-findings-postgres-dedup.md`      | 4        | B5               | Batch dedup pipeline, per-layer conflict rules, observation merge, dual convergence |
-|     | **Total**                            | **97**   |                  |                                                                           |
+| 21  | `21-findings-postgres-dedup.md`      | 5        | B5               | Batch dedup pipeline, per-layer conflict rules, observation merge, dual convergence, read API surface |
+| 22  | `22-done-ledger-postgres.md`         | 7        | B5               | Backend architecture, batch upsert pipeline, provenance winner-selection, SQL schema/indexes, BIGINT encoding, error hierarchy |
+|     | **Total**                            | **106**  |                  |                                                                           |
 
 ## Implementation Status Legend
 
@@ -218,7 +224,8 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `18-streaming-split-estimation.md`   | `crates/gossip-connectors/src/split_estimator.rs`, `common.rs`; `crates/gossip-contracts/src/connector/api.rs` (choose_split_point)                                                                                             |
 | `19-persistence-contracts.md`        | `crates/gossip-contracts/src/persistence/commit.rs`, `findings.rs`, `done_ledger.rs`, `ovid.rs`, `page_commit.rs`, `error.rs`, `conformance.rs`; `crates/gossip-persistence-inmemory/src/`; `crates/gossip-pg-common/src/`; `crates/gossip-done-ledger-postgres/src/`; `crates/gossip-findings-postgres/src/` |
 | `20-etcd-coordinator-persistence.md` | `crates/gossip-coordination-etcd/src/backend.rs`, `keyspace.rs`, `codec.rs`, `config.rs`, `error.rs`; `crates/gossip-coordination/src/traits.rs`, `in_memory.rs`                                                                |
-| `21-findings-postgres-dedup.md`      | `crates/gossip-findings-postgres/src/backend.rs`, `schema.rs`; `crates/gossip-contracts/src/persistence/findings.rs`; `crates/gossip-persistence-inmemory/src/findings.rs`                                                       |
+| `21-findings-postgres-dedup.md`      | `crates/gossip-findings-postgres/src/backend.rs`, `schema.rs`, `read_api.rs`, `error.rs`; `crates/gossip-contracts/src/persistence/findings.rs`, `conformance.rs`; `crates/gossip-persistence-inmemory/src/findings.rs`            |
+| `22-done-ledger-postgres.md`         | `crates/gossip-done-ledger-postgres/src/backend.rs`, `schema.rs`, `error.rs`, `migrations.rs`; `crates/gossip-done-ledger-postgres/migrations/0001_done_ledger_entries.sql`; `crates/gossip-pg-common/src/migration.rs`, `types.rs`; `crates/gossip-contracts/src/persistence/done_ledger.rs` |
 
 ## Source Code References
 

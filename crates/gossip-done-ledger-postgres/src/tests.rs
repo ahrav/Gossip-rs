@@ -369,7 +369,9 @@ fn batch_upsert_merges_duplicate_keys_before_persist() {
         .expect("commit should succeed");
     assert_eq!(receipt.record_count(), 1);
     assert_eq!(receipt.scanned_count(), 1);
-    assert_eq!(receipt.findings_count(), 8);
+    // ScannedWithFindings merge only counts findings from ScannedWithFindings
+    // contributors; the FailedRetryable record's findings_count=8 is ignored.
+    assert_eq!(receipt.findings_count(), 1);
 
     let fetched = backend
         .batch_get(tenant(3), policy(4), &[ovid(21)])
@@ -380,7 +382,7 @@ fn batch_upsert_merges_duplicate_keys_before_persist() {
 
     assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
     assert_eq!(merged.bytes_scanned(), 900);
-    assert_eq!(merged.findings_count(), 8);
+    assert_eq!(merged.findings_count(), 1);
     assert_eq!(merged.error_code(), None);
     assert_eq!(merged.provenance(), scanned.provenance());
 }
@@ -499,7 +501,7 @@ fn cross_batch_upsert_exercises_sql_on_conflict_merge() {
     assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
     // bytes_scanned takes the GREATEST across both batches.
     assert_eq!(merged.bytes_scanned(), 400);
-    // findings_count takes GREATEST: max(3, 5) = 5.
+    // ScannedWithFindings keeps only ScannedWithFindings contributors.
     assert_eq!(merged.findings_count(), 5);
     // Scanned status clears error_code.
     assert_eq!(merged.error_code(), None);
@@ -581,12 +583,12 @@ fn cross_batch_upsert_equal_status_picks_later_finished_at() {
     assert_eq!(merged.error_code().map(|c| c.as_str()), Some("ERR_B"),);
 }
 
-/// The SQL merge uses `GREATEST(EXCLUDED.findings_count, done_ledger_entries.findings_count, 1)`
-/// for `ScannedWithFindings` status. This test verifies that a valid
+/// The SQL merge uses only `ScannedWithFindings` contributors plus a floor
+/// clamp for `ScannedWithFindings` status. This test verifies that a valid
 /// cross-batch promotion from `FailedRetryable` to `ScannedWithFindings`
-/// picks up the incoming record's provenance and findings via the GREATEST
-/// merge. The floor clamp (trailing `1`) is not independently observable
-/// here because `GREATEST(1, 0, 1)` equals `GREATEST(1, 0)`;
+/// picks up the incoming record's provenance and findings from the scanned
+/// winner. The floor clamp (trailing `1`) is not independently observable
+/// here because `GREATEST(1, 0, 1)` already equals `1`;
 /// [`sql_greatest_floor_clamp_is_observable_at_sql_level`] exercises it
 /// directly via raw SQL with a zero-count incoming row.
 #[test]
@@ -620,7 +622,8 @@ fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
 
     // Second batch: ScannedWithFindings with findings_count=1.
     // Merge promotes status to ScannedWithFindings (rank 11 > rank 1).
-    // SQL GREATEST(1, 0, 1) = 1, exercising the floor clamp.
+    // The ScannedWithFindings branch ignores the non-scanned row's count and
+    // keeps the winner's findings_count=1 while still exercising the floor clamp.
     let scanned = done_record(
         7,
         8,
@@ -649,8 +652,8 @@ fn cross_batch_upsert_scanned_with_findings_clamps_findings_floor() {
         .expect("row should exist after cross-batch upsert");
 
     assert_eq!(merged.status(), DoneLedgerStatus::ScannedWithFindings);
-    // GREATEST(1, 0, 1) = 1 — the floor clamp is exercised because the
-    // existing record contributed findings_count=0.
+    // The floor clamp is exercised because the existing non-scanned row
+    // contributes 0 to the ScannedWithFindings branch.
     assert_eq!(merged.findings_count(), 1);
     assert_eq!(merged.provenance(), scanned.provenance());
 }
@@ -683,7 +686,7 @@ fn sql_on_conflict_rejects_invalid_scanned_with_findings_excluded_row() {
 
     // The incoming row is invalid (`status=11` with `findings_count=0`), so
     // PostgreSQL rejects it before the ON CONFLICT update can clamp the value
-    // with GREATEST(EXCLUDED.findings_count, existing.findings_count, 1).
+    // in the ScannedWithFindings branch.
     let err = client
         .execute(
             &format!(
@@ -695,7 +698,11 @@ fn sql_on_conflict_rejects_invalid_scanned_with_findings_excluded_row() {
                  findings_count = CASE \
                      WHEN GREATEST(EXCLUDED.status, {t}.status) = 10 THEN 0 \
                      WHEN GREATEST(EXCLUDED.status, {t}.status) = 11 THEN \
-                         GREATEST(EXCLUDED.findings_count, {t}.findings_count, 1) \
+                         GREATEST( \
+                             CASE WHEN EXCLUDED.status = 11 THEN EXCLUDED.findings_count ELSE 0 END, \
+                             CASE WHEN {t}.status = 11 THEN {t}.findings_count ELSE 0 END, \
+                             1 \
+                         ) \
                      ELSE GREATEST(EXCLUDED.findings_count, {t}.findings_count) \
                  END",
                 t = crate::schema::DONE_LEDGER_ENTRIES_TABLE
