@@ -247,10 +247,10 @@ jobs:
           ETCD_NAME: node1
           ETCD_DATA_DIR: /etcd-data
           ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
-          ETCD_ADVERTISE_CLIENT_URLS: http://localhost:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
           ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
-          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://localhost:2380
-          ETCD_INITIAL_CLUSTER: node1=http://localhost:2380
+          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd:2380
+          ETCD_INITIAL_CLUSTER: node1=http://etcd:2380
           ETCD_INITIAL_CLUSTER_TOKEN: gossip-rs-ci-cluster
           ETCD_INITIAL_CLUSTER_STATE: new
         options: >-
