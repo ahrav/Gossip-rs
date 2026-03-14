@@ -345,6 +345,7 @@ fn convergence_stormy_cas_contention() {
         liveness_ops: 20_000,
     };
 
+    // Sequential: per-seed convergence assertion with individual repro commands.
     let mut total_cas_retries = 0usize;
     for seed in &seeds {
         let (report, stats) = run_case(*seed, &case);
@@ -394,6 +395,7 @@ fn cas_contention_stress() {
         liveness_ops: 2_000,
     };
 
+    // Sequential: per-seed violation check with individual repro reporting.
     let mut total_cas_retries = 0usize;
     for seed in &seeds {
         let (report, stats) = run_case(*seed, &case);
@@ -426,6 +428,7 @@ fn uncertain_commit_resilience() {
         return;
     }
 
+    // Sequential: manual sim construction and per-seed acquire/checkpoint ops.
     let mut total_uncertain_commits = 0usize;
     for seed in &seeds {
         let mut sim = build_sim(

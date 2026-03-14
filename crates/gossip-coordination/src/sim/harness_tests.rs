@@ -784,12 +784,7 @@ fn generate_forward_cursor_no_prior() {
 /// (strict forward progress).
 #[test]
 fn generate_forward_cursor_forward_progress() {
-    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
-
-    let worker = WorkerId::from_raw(1);
-    let key = sim.shard_keys[0];
-
-    sim.context.advance(1);
+    let (mut sim, worker, key) = sim_with_custom_spec(42, b"a", b"z");
 
     let event = sim.execute_op(&SimOp::Acquire { worker, key });
     assert!(matches!(event, SimEvent::AcquireOk { .. }));
