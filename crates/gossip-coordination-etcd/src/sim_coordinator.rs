@@ -1040,7 +1040,7 @@ mod tests {
         );
     }
 
-    // ---- Lease expiry tests (C2) ----
+    // ---- Lease expiry tests ----
 
     #[test]
     fn lease_expiry_allows_reacquire_by_different_worker() {

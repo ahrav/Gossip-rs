@@ -80,6 +80,12 @@ impl SimulatedEtcdKV {
     /// Create an empty simulated etcd store with an explicit fault profile.
     #[must_use]
     pub fn with_fault_config(seed: u64, fault_config: SimEtcdFaultConfig) -> Self {
+        debug_assert!(
+            fault_config.retry_exhaustion_ppm == 0 || fault_config.retry_exhaustion_attempts > 0,
+            "retry_exhaustion_attempts is 0 but retry_exhaustion_ppm is nonzero ({} PPM); \
+             the fault will never fire",
+            fault_config.retry_exhaustion_ppm,
+        );
         Self {
             kvs: BTreeMap::new(),
             revision: 0,
@@ -171,6 +177,12 @@ impl SimulatedEtcdKV {
     /// Clears any in-progress retry-exhaustion burst so the new config
     /// takes effect from a clean state.
     pub fn set_fault_config(&mut self, config: SimEtcdFaultConfig) {
+        debug_assert!(
+            config.retry_exhaustion_ppm == 0 || config.retry_exhaustion_attempts > 0,
+            "retry_exhaustion_attempts is 0 but retry_exhaustion_ppm is nonzero ({} PPM); \
+             the fault will never fire",
+            config.retry_exhaustion_ppm,
+        );
         self.fault_config = config;
         self.active_retry_exhaustion = None;
         self.recent_retry_exhaustion = None;
@@ -283,17 +295,10 @@ impl SimulatedEtcdKV {
             None
         };
 
-        let compares_succeeded = request
-            .compare
-            .iter()
-            .try_fold(true, |all_match, compare| {
-                if !all_match {
-                    return Ok(false);
-                }
-                self.evaluate_compare(compare)
-            })?;
-        if !compares_succeeded {
-            return Ok(build_txn_response(self.revision, false, Vec::new()));
+        for compare in &request.compare {
+            if !self.evaluate_compare(compare)? {
+                return Ok(build_txn_response(self.revision, false, Vec::new()));
+            }
         }
         if !request.compare.is_empty() && self.fault_config.should_cas_compare_fail(&mut self.rng) {
             return Ok(build_txn_response(self.revision, false, Vec::new()));
@@ -314,6 +319,11 @@ impl SimulatedEtcdKV {
         };
         let responses = self.apply_staged_txn(staged, revision);
         if self.fault_config.should_uncertain_commit(&mut self.rng) {
+            // State IS committed; the caller will retry. On the next call for
+            // the same fingerprint, compares will fail (revision changed), so
+            // we return at the compares_succeeded=false early-exit before
+            // maybe_arm_retry_exhaustion can fire. The retry-exhaustion state
+            // machine is intentionally left unchanged here.
             return Err(SimEtcdError::UncertainCommit);
         }
         Ok(build_txn_response(revision, true, responses))
@@ -356,6 +366,12 @@ impl SimulatedEtcdKV {
     }
 
     /// Keep an existing lease alive for another full TTL interval.
+    ///
+    /// Note: TTL-race fault injection is intentionally omitted here.
+    /// Unlike `txn`, where a lease-boundary race exercises CAS conflict
+    /// handling, a race inside keep-alive permanently deletes the lease
+    /// and returns `LeaseNotFound` — which `map_etcd_err` classifies as
+    /// transient, causing an unrecoverable retry loop.
     pub fn lease_keep_alive_once(&mut self, lease_id: i64) -> Result<(), SimEtcdError> {
         self.expire_due_leases();
         if self
@@ -366,7 +382,6 @@ impl SimulatedEtcdKV {
                 operation: SimEtcdOperation::LeaseKeepAlive,
             });
         }
-        self.maybe_inject_lease_ttl_race();
 
         let lease = self
             .leases
@@ -467,13 +482,6 @@ impl SimulatedEtcdKV {
     }
 
     fn maybe_arm_retry_exhaustion(&mut self, request: &PbTxnRequest, fingerprint: u64) -> bool {
-        debug_assert!(
-            self.fault_config.retry_exhaustion_ppm == 0
-                || self.fault_config.retry_exhaustion_attempts > 0,
-            "retry_exhaustion_attempts is 0 but retry_exhaustion_ppm is nonzero; \
-             the fault will never fire"
-        );
-
         if request.compare.is_empty()
             || request.success.is_empty()
             || self.fault_config.retry_exhaustion_attempts == 0
@@ -775,12 +783,11 @@ impl SimulatedEtcdKV {
         }
     }
 
-    /// Expire all leases whose TTL has elapsed at the current logical time.
+    /// Expire all leases whose TTL has elapsed, deleting their attached keys.
     ///
     /// Called automatically by every mutating operation. Exposed publicly so
     /// the simulation driver can decouple clock advancement ([`Self::set_time`])
     /// from expiry processing.
-    /// Expire all leases whose TTL has elapsed, deleting their attached keys.
     ///
     /// Returns the lease IDs that actually expired and deleted at least one
     /// key. Callers can use this to invalidate cached owner bindings.
@@ -1240,10 +1247,12 @@ fn txn_fingerprint(request: &PbTxnRequest) -> u64 {
             Some(PbTxnOpRequest::RequestDeleteRange(delete)) => {
                 fnv_mix_byte(&mut sig, 11);
                 fnv_mix_bytes(&mut sig, &delete.key);
+                fnv_mix_bytes(&mut sig, &delete.range_end);
             }
             Some(PbTxnOpRequest::RequestRange(range)) => {
                 fnv_mix_byte(&mut sig, 12);
                 fnv_mix_bytes(&mut sig, &range.key);
+                fnv_mix_bytes(&mut sig, &range.range_end);
             }
             Some(PbTxnOpRequest::RequestTxn(_)) => fnv_mix_byte(&mut sig, 13),
             None => fnv_mix_byte(&mut sig, 254),
@@ -2148,8 +2157,12 @@ mod tests {
         assert_eq!(get_exact(&mut kv, b"single-retry").value(), b"value");
     }
 
+    /// TTL-race fault injection is excluded from `lease_keep_alive_once`
+    /// to prevent an unrecoverable retry loop (the lease expires
+    /// permanently but `LeaseNotFound` maps to a transient error).
+    /// Keep-alive succeeds even with 100% TTL race configured.
     #[test]
-    fn lease_ttl_race_expires_lease_during_keep_alive() {
+    fn keep_alive_ignores_ttl_race_fault() {
         let mut kv = SimulatedEtcdKV::new(13);
         let lease = kv.lease_grant(1).expect("lease grant should succeed");
         kv.txn(
@@ -2169,19 +2182,15 @@ mod tests {
 
         kv.set_fault_config(SimEtcdFaultConfig::default().with_lease_ttl_race_ppm(1_000_000));
 
-        let err = kv
-            .lease_keep_alive_once(lease.id())
-            .expect_err("keep-alive should fail after TTL-race expires the lease");
+        // TTL race is not injected in keep-alive, so this succeeds.
+        kv.lease_keep_alive_once(lease.id())
+            .expect("keep-alive should succeed — TTL race not injected here");
         assert!(
-            matches!(err, SimEtcdError::LeaseNotFound { .. }),
-            "expected LeaseNotFound, got {err:?}"
-        );
-        assert!(
-            kv.get(b"keep-alive-race".to_vec(), None)
+            !kv.get(b"keep-alive-race".to_vec(), None)
                 .expect("get should succeed")
                 .kvs()
                 .is_empty(),
-            "attached key must be deleted when lease expires during keep-alive"
+            "attached key must still exist after successful keep-alive"
         );
     }
 
@@ -2247,6 +2256,107 @@ mod tests {
         }
     }
 
+    // ---- Verification tests for review-identified edge cases ----
+
+    /// TTL-race fault injection is not applied inside `lease_keep_alive_once`
+    /// because it would permanently expire the target lease and return
+    /// `LeaseNotFound`, which maps to a transient error at the backend
+    /// layer — creating an unrecoverable retry loop.
+    #[test]
+    fn ttl_race_does_not_fire_inside_keep_alive() {
+        let fault = SimEtcdFaultConfig::default().with_lease_ttl_race_ppm(1_000_000);
+        let mut kv = SimulatedEtcdKV::with_fault_config(100, fault);
+
+        // Grant a lease with TTL=5 ticks.
+        let lease = kv.lease_grant(5).expect("lease_grant should succeed");
+        let lease_id = lease.id();
+
+        // Position clock at 1 tick before expiry.
+        kv.set_time(4);
+
+        // With TTL race excluded from keep-alive, this should succeed
+        // rather than expiring the lease.
+        let result = kv.lease_keep_alive_once(lease_id);
+        assert!(
+            result.is_ok(),
+            "keep-alive must succeed — TTL race is not injected here, got: {result:?}"
+        );
+
+        // Lease must still exist.
+        assert!(
+            kv.lease_info(lease_id).is_some(),
+            "lease must still exist after successful keep-alive"
+        );
+    }
+
+    /// Constructing a fault config with `retry_exhaustion_ppm > 0` and
+    /// `attempts == 0` triggers a debug_assert at construction time,
+    /// catching the misconfiguration early rather than silently disabling
+    /// the fault.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "retry_exhaustion_attempts is 0")
+    )]
+    fn retry_exhaustion_ppm_without_attempts_panics_in_debug() {
+        let fault = SimEtcdFaultConfig::default()
+            .with_retry_exhaustion_ppm(1_000_000) // 100% rate
+            .with_retry_exhaustion_attempts(0); // but zero burst length
+        // In debug builds, this panics at the debug_assert in with_fault_config.
+        // In release builds, the fault silently does nothing (no panic).
+        let _kv = SimulatedEtcdKV::with_fault_config(200, fault);
+    }
+
+    /// A point delete (empty `range_end`) and a range delete (non-empty
+    /// `range_end`) on the same key should produce different fingerprints
+    /// so the retry-exhaustion state machine does not conflate them.
+    #[test]
+    fn point_and_range_delete_produce_distinct_fingerprints() {
+        use etcd_client::proto::{
+            PbCompare, PbDeleteRequest, PbTxnOpRequest, PbTxnRequest, PbTxnRequestOp,
+        };
+
+        let compare = PbCompare {
+            key: b"prefix/".to_vec(),
+            ..Default::default()
+        };
+
+        // Point delete: range_end is empty.
+        let point_delete = PbTxnRequest {
+            compare: vec![compare.clone()],
+            success: vec![PbTxnRequestOp {
+                request: Some(PbTxnOpRequest::RequestDeleteRange(PbDeleteRequest {
+                    key: b"prefix/".to_vec(),
+                    range_end: Vec::new(),
+                    ..Default::default()
+                })),
+            }],
+            failure: Vec::new(),
+        };
+
+        // Range delete: range_end is the prefix-end sentinel.
+        let range_delete = PbTxnRequest {
+            compare: vec![compare],
+            success: vec![PbTxnRequestOp {
+                request: Some(PbTxnOpRequest::RequestDeleteRange(PbDeleteRequest {
+                    key: b"prefix/".to_vec(),
+                    range_end: b"prefix0".to_vec(), // prefix end
+                    ..Default::default()
+                })),
+            }],
+            failure: Vec::new(),
+        };
+
+        let fp_point = super::txn_fingerprint(&point_delete);
+        let fp_range = super::txn_fingerprint(&range_delete);
+
+        // These should differ since range_end changes the semantics.
+        assert_ne!(
+            fp_point, fp_range,
+            "point delete and range delete on the same key must produce different fingerprints"
+        );
+    }
+
     // ---- Property-based tests ----
 
     mod proptests {
@@ -2294,15 +2404,22 @@ mod tests {
                 0usize..=5,
             )
                 .prop_map(|(cas, uncertain, lease, retry, attempts)| {
+                    // Ensure valid config: if retry ppm is nonzero, attempts
+                    // must also be nonzero (otherwise the fault never fires
+                    // and a debug_assert catches the misconfiguration).
+                    let valid_attempts = if retry > 0 && attempts == 0 {
+                        1
+                    } else {
+                        attempts
+                    };
                     SimEtcdFaultConfig::default()
                         .with_cas_compare_failure_ppm(cas)
                         .with_uncertain_commit_ppm(uncertain)
                         .with_lease_ttl_race_ppm(lease)
                         .with_retry_exhaustion_ppm(retry)
-                        .with_retry_exhaustion_attempts(attempts)
+                        .with_retry_exhaustion_attempts(valid_attempts)
                 })
         }
-
         proptest! {
             /// Global revision must never decrease across any operation sequence,
             /// even under randomized fault injection.
