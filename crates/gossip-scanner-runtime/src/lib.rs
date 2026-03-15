@@ -67,6 +67,7 @@ use scanner_scheduler::store::{
 };
 
 pub mod cli;
+pub mod commit_model;
 pub mod commit_sink;
 pub mod coordination_sink;
 pub mod distributed;
@@ -576,8 +577,8 @@ pub struct ScanReport {
 pub struct ScanCheckpoint {
     /// Cursor pointing just past the last fully committed item.
     pub cursor: Cursor,
-    /// Running count of items committed up to this cursor position.
-    pub committed_items: u64,
+    /// Running count of units committed up to this cursor position.
+    pub committed_units: u64,
 }
 
 /// Runtime wiring errors for scan execution.

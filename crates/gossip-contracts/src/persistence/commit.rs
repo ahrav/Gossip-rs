@@ -18,8 +18,8 @@
 //!   (findings, occurrences, observations) is durable.
 //! - [`DoneLedgerCommitReceipt`] — proves done-ledger deduplication rows
 //!   are durable.
-//! - [`CheckpointCommitReceipt`] — proves the cursor checkpoint is durable;
-//!   carries the full page scope so the typestate machine can validate
+//! - [`CheckpointCommitReceipt`] — proves the checkpoint boundary is durable;
+//!   carries the full commit scope so the typestate machine can validate
 //!   receipt-to-scope correspondence.
 //! - [`ItemCommitReceipt`] — composite: findings + done-ledger.
 //! - [`PageCommitReceipt`] — composite: item-commit + checkpoint (the
@@ -40,7 +40,7 @@ use std::{error::Error, fmt, sync::Arc};
 
 use crate::identity::LogicalTime;
 
-use super::page_commit::PageCommitScope;
+use super::page_commit::CommitScope;
 
 /// Marker trait for durable persistence acknowledgements.
 ///
@@ -233,31 +233,31 @@ impl DoneLedgerCommitReceipt {
 
 impl CommitReceipt for DoneLedgerCommitReceipt {}
 
-/// Durable acknowledgement for a cursor checkpoint.
+/// Durable acknowledgement for a checkpoint boundary.
 ///
-/// Embeds the full [`PageCommitScope`] so the [`PageCommit`](super::PageCommit)
+/// Embeds the full [`CommitScope`] so the [`PageCommit`](super::PageCommit)
 /// typestate machine can validate receipt-to-scope correspondence with a single
 /// equality check, guarding against receipt mix-ups across concurrent pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointCommitReceipt {
-    scope: PageCommitScope,
+    scope: CommitScope,
     checkpointed_at: LogicalTime,
 }
 
 impl CheckpointCommitReceipt {
     /// Construct a checkpoint receipt.
     #[must_use]
-    pub fn new(scope: PageCommitScope, checkpointed_at: LogicalTime) -> Self {
+    pub fn new(scope: CommitScope, checkpointed_at: LogicalTime) -> Self {
         Self {
             scope,
             checkpointed_at,
         }
     }
 
-    /// Page scope covered by this checkpoint receipt.
+    /// Commit scope covered by this checkpoint receipt.
     #[inline]
     #[must_use]
-    pub fn scope(&self) -> &PageCommitScope {
+    pub fn scope(&self) -> &CommitScope {
         &self.scope
     }
 
@@ -271,11 +271,11 @@ impl CheckpointCommitReceipt {
 
 impl CommitReceipt for CheckpointCommitReceipt {}
 
-/// Composite receipt proving a page's findings and done-ledger rows are
+/// Composite receipt proving a commit scope's findings and done-ledger rows are
 /// durably committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemCommitReceipt {
-    scope: Arc<PageCommitScope>,
+    scope: Arc<CommitScope>,
     findings: FindingsCommitReceipt,
     done_ledger: DoneLedgerCommitReceipt,
 }
@@ -288,7 +288,7 @@ impl ItemCommitReceipt {
     #[inline]
     #[must_use]
     pub(super) fn new(
-        scope: Arc<PageCommitScope>,
+        scope: Arc<CommitScope>,
         findings: FindingsCommitReceipt,
         done_ledger: DoneLedgerCommitReceipt,
     ) -> Self {
@@ -299,10 +299,10 @@ impl ItemCommitReceipt {
         }
     }
 
-    /// Page scope shared by the durable findings and done-ledger receipts.
+    /// Commit scope shared by the durable findings and done-ledger receipts.
     #[inline]
     #[must_use]
-    pub fn scope(&self) -> &PageCommitScope {
+    pub fn scope(&self) -> &CommitScope {
         &self.scope
     }
 
@@ -326,8 +326,9 @@ impl CommitReceipt for ItemCommitReceipt {}
 /// Terminal receipt proving a complete page is durable: findings, done-ledger,
 /// and checkpoint have all been acknowledged.
 ///
-/// Holding a `PageCommitReceipt` is sufficient proof that the cursor can be
-/// safely advanced — no further persistence work is required for this page.
+/// Holding a `PageCommitReceipt` is proof that the frontier boundary has been
+/// durably checkpointed — no further persistence work is required for this
+/// scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageCommitReceipt {
     item_commit: ItemCommitReceipt,

@@ -3,11 +3,11 @@
 //! # Problem
 //!
 //! A page's data must become durable in a strict order so that crash
-//! recovery never observes a checkpointed cursor without the corresponding
-//! findings and done-ledger rows already on disk. Violating this ordering
-//! can cause data loss (findings committed after a cursor advance that is
-//! already visible to restart logic) or duplicate work (done-ledger rows
-//! missing, causing re-scans).
+//! recovery never observes a checkpointed frontier boundary without the
+//! corresponding findings and done-ledger rows already on disk. Violating
+//! this ordering can cause data loss (findings committed after a frontier
+//! advance that is already visible to restart logic) or duplicate work
+//! (done-ledger rows missing, causing re-scans).
 //!
 //! # Solution
 //!
@@ -16,11 +16,12 @@
 //!
 //! 1. **Findings** — persist detected-secret rows via the findings sink.
 //! 2. **Done-ledger** — persist deduplication records via the done-ledger.
-//! 3. **Checkpoint** — advance the shard cursor to mark the page complete.
+//! 3. **Checkpoint** — advance the family-specific frontier boundary to mark
+//!    the page complete.
 //!
 //! Each transition method is only available on the correct state, so callers
 //! cannot skip or reorder stages. Transitions that accept a backend receipt
-//! also validate that the receipt matches the page's [`PageCommitScope`],
+//! also validate that the receipt matches the page's [`CommitScope`],
 //! catching receipt mix-ups between concurrent pages at the earliest point.
 //!
 //! # Transition methods
@@ -38,7 +39,7 @@
 //!   simpler generics. Given that incorrect ordering is a data-loss bug,
 //!   compile-time enforcement is worth the generics cost.
 //! - **Scope validation on checkpoint:** the checkpoint receipt embeds a
-//!   full [`PageCommitScope`], so the typestate machine validates receipt-
+//!   full [`CommitScope`], so the typestate machine validates receipt-
 //!   to-scope correspondence with a single equality check. Findings and
 //!   done-ledger receipts carry lighter payloads because they are produced
 //!   by the same in-process pipeline that constructed the scope, while
@@ -74,12 +75,108 @@ use super::commit::{
     ItemCommitReceipt, PageCommitReceipt,
 };
 
-/// Immutable scope for a single page commit.
+/// Semantic domain for a durable checkpoint boundary.
 ///
-/// A page commit is always scoped to one tenant, run, shard, fence epoch,
-/// item count, and cursor advancement boundary. The runtime constructs this
-/// once, then drives the page through findings, done-ledger, and checkpoint
-/// durability.
+/// Ordered-content execution advances by item cursor, while repo-native Git
+/// execution advances by repo-frontier position. Both are encoded as a
+/// monotonic [`Cursor`] at the persistence boundary, but the tag keeps the
+/// family semantics explicit so runtime code cannot accidentally mix them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckpointBoundaryKind {
+    /// Ordered-content item frontier (`last committed item key`, optional token).
+    OrderedContent,
+    /// Repo-frontier progress (`last committed repo key`, optional token).
+    RepoFrontier,
+}
+
+/// Family-neutral durable checkpoint boundary.
+///
+/// The payload stays as a [`Cursor`] because both currently planned first-wave
+/// families reduce to a monotonic frontier position plus optional opaque token.
+/// The enum tag carries the semantic domain that the runtime must preserve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckpointBoundary {
+    /// Ordered-content checkpoint boundary.
+    OrderedContent(Cursor),
+    /// Repo-frontier checkpoint boundary.
+    RepoFrontier(Cursor),
+}
+
+impl CheckpointBoundary {
+    /// Construct an ordered-content checkpoint boundary.
+    #[inline]
+    #[must_use]
+    pub fn ordered_content(cursor: Cursor) -> Self {
+        Self::OrderedContent(cursor)
+    }
+
+    /// Construct a repo-frontier checkpoint boundary.
+    #[inline]
+    #[must_use]
+    pub fn repo_frontier(cursor: Cursor) -> Self {
+        Self::RepoFrontier(cursor)
+    }
+
+    /// Semantic domain carried by this checkpoint boundary.
+    #[inline]
+    #[must_use]
+    pub const fn kind(&self) -> CheckpointBoundaryKind {
+        match self {
+            Self::OrderedContent(_) => CheckpointBoundaryKind::OrderedContent,
+            Self::RepoFrontier(_) => CheckpointBoundaryKind::RepoFrontier,
+        }
+    }
+
+    /// Returns `true` when this is an ordered-content boundary.
+    #[inline]
+    #[must_use]
+    pub const fn is_ordered_content(&self) -> bool {
+        matches!(self, Self::OrderedContent(_))
+    }
+
+    /// Returns `true` when this is a repo-frontier boundary.
+    #[inline]
+    #[must_use]
+    pub const fn is_repo_frontier(&self) -> bool {
+        matches!(self, Self::RepoFrontier(_))
+    }
+
+    /// Underlying monotonic frontier position.
+    #[inline]
+    #[must_use]
+    pub fn cursor(&self) -> &Cursor {
+        match self {
+            Self::OrderedContent(cursor) | Self::RepoFrontier(cursor) => cursor,
+        }
+    }
+
+    /// Ordered-content cursor view, if this boundary belongs to that family.
+    #[inline]
+    #[must_use]
+    pub fn as_ordered_content(&self) -> Option<&Cursor> {
+        match self {
+            Self::OrderedContent(cursor) => Some(cursor),
+            Self::RepoFrontier(_) => None,
+        }
+    }
+
+    /// Repo-frontier cursor view, if this boundary belongs to that family.
+    #[inline]
+    #[must_use]
+    pub fn as_repo_frontier(&self) -> Option<&Cursor> {
+        match self {
+            Self::OrderedContent(_) => None,
+            Self::RepoFrontier(cursor) => Some(cursor),
+        }
+    }
+}
+
+/// Immutable scope for one durable commit boundary.
+///
+/// A commit scope is always bound to one tenant, run, shard, fence epoch,
+/// committed-prefix length, and checkpoint boundary. The runtime freezes this
+/// scope once, then drives the work through findings, done-ledger, and
+/// checkpoint durability.
 ///
 /// # Invariant
 ///
@@ -87,89 +184,104 @@ use super::commit::{
 /// receipt-validation check compares against these values. If the scope were
 /// mutated mid-protocol, the typestate guarantees would be meaningless.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PageCommitScope {
+pub struct CommitScope {
     tenant_id: TenantId,
     run_id: RunId,
     shard_id: ShardId,
     fence_epoch: FenceEpoch,
-    committed_items: u64,
-    checkpoint_cursor: Cursor,
+    committed_units: u64,
+    checkpoint_boundary: CheckpointBoundary,
 }
 
-impl PageCommitScope {
-    /// Construct the page scope.
+impl CommitScope {
+    /// Construct the commit scope.
     #[must_use]
     pub fn new(
         tenant_id: TenantId,
         run_id: RunId,
         shard_id: ShardId,
         fence_epoch: FenceEpoch,
-        committed_items: u64,
-        checkpoint_cursor: Cursor,
+        committed_units: u64,
+        checkpoint_boundary: CheckpointBoundary,
     ) -> Self {
         Self {
             tenant_id,
             run_id,
             shard_id,
             fence_epoch,
-            committed_items,
-            checkpoint_cursor,
+            committed_units,
+            checkpoint_boundary,
         }
     }
 
-    /// Tenant isolation boundary for the page.
+    /// Tenant isolation boundary for this scope.
     #[inline]
     #[must_use]
     pub const fn tenant_id(&self) -> TenantId {
         self.tenant_id
     }
 
-    /// Run that produced the page.
+    /// Run that produced this scope.
     #[inline]
     #[must_use]
     pub const fn run_id(&self) -> RunId {
         self.run_id
     }
 
-    /// Shard that emitted the page.
+    /// Shard that emitted this scope.
     #[inline]
     #[must_use]
     pub const fn shard_id(&self) -> ShardId {
         self.shard_id
     }
 
-    /// Fence epoch under which the page was processed.
+    /// Fence epoch under which the scope was processed.
     #[inline]
     #[must_use]
     pub const fn fence_epoch(&self) -> FenceEpoch {
         self.fence_epoch
     }
 
-    /// Number of items represented by the page.
+    /// Number of committed units represented by this scope.
     #[inline]
     #[must_use]
-    pub const fn committed_items(&self) -> u64 {
-        self.committed_items
+    pub const fn committed_units(&self) -> u64 {
+        self.committed_units
     }
 
-    /// Cursor boundary the checkpoint must durably acknowledge.
+    /// Family-neutral checkpoint boundary the receipt must durably acknowledge.
+    #[inline]
+    #[must_use]
+    pub fn checkpoint_boundary(&self) -> &CheckpointBoundary {
+        &self.checkpoint_boundary
+    }
+
+    /// Semantic domain for the checkpoint boundary.
+    #[inline]
+    #[must_use]
+    pub fn checkpoint_boundary_kind(&self) -> CheckpointBoundaryKind {
+        self.checkpoint_boundary.kind()
+    }
+
+    /// Underlying frontier position shared by ordered-content and repo-frontier
+    /// checkpoints.
     #[inline]
     #[must_use]
     pub fn checkpoint_cursor(&self) -> &Cursor {
-        &self.checkpoint_cursor
+        self.checkpoint_boundary.cursor()
     }
 }
 
 /// Validation failures when advancing a page commit through its durable stages.
 ///
 /// Each variant indicates that a receipt returned by the persistence backend
-/// does not match the [`PageCommitScope`] of the page being committed. This
+/// does not match the [`CommitScope`] of the page being committed. This
 /// is a programming error or a backend mis-routing bug, never a transient
 /// failure — callers should treat it as fatal for the affected page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageCommitValidationError {
-    /// The done-ledger receipt covers a different number of items than the page.
-    LedgerItemCountMismatch { expected: u64, actual: u64 },
+    /// The done-ledger receipt covers a different number of units than the page.
+    LedgerUnitCountMismatch { expected: u64, actual: u64 },
     /// The checkpoint receipt's scope does not match the page scope.
     CheckpointScopeMismatch,
 }
@@ -177,9 +289,9 @@ pub enum PageCommitValidationError {
 impl fmt::Display for PageCommitValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LedgerItemCountMismatch { expected, actual } => write!(
+            Self::LedgerUnitCountMismatch { expected, actual } => write!(
                 f,
-                "done-ledger receipt item count mismatch: expected {expected}, got {actual}"
+                "done-ledger receipt unit count mismatch: expected {expected}, got {actual}"
             ),
             Self::CheckpointScopeMismatch => {
                 write!(f, "checkpoint receipt scope does not match page scope")
@@ -253,8 +365,8 @@ pub struct ItemDurable {
 
 /// Typestate: terminal state. All three stages are durable.
 ///
-/// The [`PageCommitReceipt`] inside is sufficient proof that the cursor can
-/// be safely advanced.
+/// The [`PageCommitReceipt`] inside is proof that the frontier boundary has
+/// been durably checkpointed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointDurable {
     page_commit: PageCommitReceipt,
@@ -291,16 +403,16 @@ pub struct CheckpointDurable {
 /// use gossip_contracts::{
 ///     connector::Cursor,
 ///     identity::{FenceEpoch, RunId, ShardId, TenantId},
-///     persistence::{DoneLedgerCommitReceipt, PageCommit, PageCommitScope},
+///     persistence::{CheckpointBoundary, CommitScope, DoneLedgerCommitReceipt, PageCommit},
 /// };
 ///
-/// let page = PageCommit::new(PageCommitScope::new(
+/// let page = PageCommit::new(CommitScope::new(
 ///     TenantId::from_bytes([1; 32]),
 ///     RunId::from_raw(2),
 ///     ShardId::from_raw(3),
 ///     FenceEpoch::from_raw(4),
 ///     1,
-///     Cursor::initial(),
+///     CheckpointBoundary::ordered_content(Cursor::initial()),
 /// ));
 ///
 /// let _ = page.record_done_ledger(DoneLedgerCommitReceipt::new(1, 1, 0));
@@ -313,16 +425,19 @@ pub struct CheckpointDurable {
 /// use gossip_contracts::{
 ///     connector::Cursor,
 ///     identity::{FenceEpoch, LogicalTime, RunId, ShardId, TenantId},
-///     persistence::{CheckpointCommitReceipt, FindingsCommitReceipt, PageCommit, PageCommitScope},
+///     persistence::{
+///         CheckpointBoundary, CheckpointCommitReceipt, CommitScope, FindingsCommitReceipt,
+///         PageCommit,
+///     },
 /// };
 ///
-/// let scope = PageCommitScope::new(
+/// let scope = CommitScope::new(
 ///     TenantId::from_bytes([1; 32]),
 ///     RunId::from_raw(2),
 ///     ShardId::from_raw(3),
 ///     FenceEpoch::from_raw(4),
 ///     1,
-///     Cursor::initial(),
+///     CheckpointBoundary::ordered_content(Cursor::initial()),
 /// );
 /// let page = PageCommit::new(scope.clone()).record_findings(FindingsCommitReceipt::new(1, 1, 1));
 /// let checkpoint = CheckpointCommitReceipt::new(scope.clone(), LogicalTime::from_raw(5));
@@ -332,7 +447,7 @@ pub struct CheckpointDurable {
 #[must_use = "page commits must be driven to a durable receipt or explicitly dropped"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageCommit<S> {
-    scope: Arc<PageCommitScope>,
+    scope: Arc<CommitScope>,
     state: S,
 }
 
@@ -340,7 +455,7 @@ impl<S> PageCommit<S> {
     /// Page scope shared across all typestates.
     #[inline]
     #[must_use]
-    pub fn scope(&self) -> &PageCommitScope {
+    pub fn scope(&self) -> &CommitScope {
         &self.scope
     }
 }
@@ -348,7 +463,7 @@ impl<S> PageCommit<S> {
 impl PageCommit<AwaitingFindings> {
     /// Start a new page commit for `scope`.
     #[inline]
-    pub fn new(scope: PageCommitScope) -> Self {
+    pub fn new(scope: CommitScope) -> Self {
         Self {
             scope: Arc::new(scope),
             state: AwaitingFindings,
@@ -395,17 +510,17 @@ impl PageCommit<FindingsDurable> {
     ///
     /// # Errors
     ///
-    /// Returns [`PageCommitValidationError::LedgerItemCountMismatch`] if the
-    /// receipt's `record_count` does not equal `scope.committed_items()`.
+    /// Returns [`PageCommitValidationError::LedgerUnitCountMismatch`] if the
+    /// receipt's `record_count` does not equal `scope.committed_units()`.
     /// This guards against partial or mixed-page done-ledger flushes.
     pub fn record_done_ledger(
         self,
         receipt: DoneLedgerCommitReceipt,
     ) -> Result<PageCommit<ItemDurable>, PageCommitValidationError> {
-        let expected = self.scope.committed_items();
+        let expected = self.scope.committed_units();
         let actual = receipt.record_count();
         if expected != actual {
-            return Err(PageCommitValidationError::LedgerItemCountMismatch { expected, actual });
+            return Err(PageCommitValidationError::LedgerUnitCountMismatch { expected, actual });
         }
 
         let item_commit = ItemCommitReceipt::new(self.scope.clone(), self.state.findings, receipt);
@@ -451,7 +566,7 @@ impl PageCommit<ItemDurable> {
 
     /// Advance the page after obtaining a durable checkpoint receipt.
     ///
-    /// Validates that the receipt's embedded [`PageCommitScope`] matches this
+    /// Validates that the receipt's embedded [`CommitScope`] matches this
     /// page's scope exactly. This guards against receipt mix-ups between
     /// concurrent pages at the earliest possible point.
     ///
@@ -524,14 +639,14 @@ mod tests {
         Cursor::with_last_key(ItemKey::try_from_slice(&[seed]).unwrap())
     }
 
-    fn sample_scope() -> PageCommitScope {
-        PageCommitScope::new(
+    fn sample_scope() -> CommitScope {
+        CommitScope::new(
             tenant(1),
             RunId::from_raw(2),
             ShardId::from_raw(3),
             FenceEpoch::from_raw(4),
             2,
-            sample_cursor(5),
+            CheckpointBoundary::ordered_content(sample_cursor(5)),
         )
     }
 
@@ -543,7 +658,7 @@ mod tests {
         DoneLedgerCommitReceipt::new(record_count, record_count, 4)
     }
 
-    fn sample_checkpoint_receipt(scope: &PageCommitScope) -> CheckpointCommitReceipt {
+    fn sample_checkpoint_receipt(scope: &CommitScope) -> CheckpointCommitReceipt {
         CheckpointCommitReceipt::new(scope.clone(), LogicalTime::from_raw(99))
     }
 
@@ -551,22 +666,32 @@ mod tests {
         let scope = sample_scope();
         PageCommit::new(scope.clone())
             .record_findings(sample_findings_receipt())
-            .record_done_ledger(sample_done_ledger_receipt(scope.committed_items()))
+            .record_done_ledger(sample_done_ledger_receipt(scope.committed_units()))
             .unwrap()
     }
 
     /// Construct a checkpoint receipt with a scope that differs from the given
     /// scope (different tenant), so scope equality will fail.
-    fn checkpoint_with_wrong_scope(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        let wrong_scope = PageCommitScope::new(
+    fn checkpoint_with_wrong_scope(scope: &CommitScope) -> CheckpointCommitReceipt {
+        let wrong_scope = CommitScope::new(
             tenant(99),
             scope.run_id(),
             scope.shard_id(),
             scope.fence_epoch(),
-            scope.committed_items(),
-            scope.checkpoint_cursor().clone(),
+            scope.committed_units(),
+            scope.checkpoint_boundary().clone(),
         );
         CheckpointCommitReceipt::new(wrong_scope, LogicalTime::from_raw(99))
+    }
+
+    #[test]
+    fn checkpoint_boundary_tags_distinguish_equal_cursors() {
+        let cursor = sample_cursor(0x42);
+
+        assert_ne!(
+            CheckpointBoundary::ordered_content(cursor.clone()),
+            CheckpointBoundary::repo_frontier(cursor)
+        );
     }
 
     #[test]
@@ -581,7 +706,7 @@ mod tests {
             .unwrap()
             .wait_done_ledger(
                 ReadyCommitHandle::<DoneLedgerCommitReceipt, TestWaitError>::ok(
-                    sample_done_ledger_receipt(scope.committed_items()),
+                    sample_done_ledger_receipt(scope.committed_units()),
                 ),
             )
             .unwrap()
@@ -597,7 +722,7 @@ mod tests {
         assert_eq!(receipt.item_commit().findings(), sample_findings_receipt());
         assert_eq!(
             receipt.item_commit().done_ledger(),
-            sample_done_ledger_receipt(scope.committed_items())
+            sample_done_ledger_receipt(scope.committed_units())
         );
         assert_eq!(receipt.checkpoint(), &sample_checkpoint_receipt(&scope));
     }
@@ -620,11 +745,11 @@ mod tests {
         let page = PageCommit::new(scope.clone()).record_findings(sample_findings_receipt());
 
         assert_eq!(
-            page.record_done_ledger(sample_done_ledger_receipt(scope.committed_items() + 1))
+            page.record_done_ledger(sample_done_ledger_receipt(scope.committed_units() + 1))
                 .unwrap_err(),
-            PageCommitValidationError::LedgerItemCountMismatch {
-                expected: scope.committed_items(),
-                actual: scope.committed_items() + 1,
+            PageCommitValidationError::LedgerUnitCountMismatch {
+                expected: scope.committed_units(),
+                actual: scope.committed_units() + 1,
             }
         );
     }
@@ -650,14 +775,14 @@ mod tests {
         assert_eq!(
             page.wait_done_ledger(
                 ReadyCommitHandle::<DoneLedgerCommitReceipt, TestWaitError>::ok(
-                    sample_done_ledger_receipt(scope.committed_items() + 1),
+                    sample_done_ledger_receipt(scope.committed_units() + 1),
                 )
             )
             .unwrap_err(),
             CommitAdvanceError::<TestWaitError>::Validation(
-                PageCommitValidationError::LedgerItemCountMismatch {
-                    expected: scope.committed_items(),
-                    actual: scope.committed_items() + 1,
+                PageCommitValidationError::LedgerUnitCountMismatch {
+                    expected: scope.committed_units(),
+                    actual: scope.committed_units() + 1,
                 },
             )
         );
@@ -708,17 +833,17 @@ mod tests {
 
     #[test]
     fn done_ledger_validates_count_not_scope_by_design() {
-        // Two pages with different scopes but the same committed_items.
-        let scope_a = sample_scope(); // committed_items = 2
-        let scope_b = PageCommitScope::new(
+        // Two pages with different scopes but the same committed_units count.
+        let scope_a = sample_scope(); // committed_units = 2
+        let scope_b = CommitScope::new(
             tenant(9),                // different tenant
             RunId::from_raw(99),      // different run
             ShardId::from_raw(88),    // different shard
             FenceEpoch::from_raw(77), // different epoch
-            2,                        // same committed_items
-            sample_cursor(6),         // different cursor
+            2,                        // same committed_units
+            CheckpointBoundary::repo_frontier(sample_cursor(6)),
         );
-        assert_eq!(scope_a.committed_items(), scope_b.committed_items());
+        assert_eq!(scope_a.committed_units(), scope_b.committed_units());
         assert_ne!(scope_a.tenant_id(), scope_b.tenant_id());
 
         // Page A accepts a done-ledger receipt matching page B's count.
@@ -727,7 +852,7 @@ mod tests {
         // are produced by the same in-process pipeline.
         let page_a = PageCommit::new(scope_a)
             .record_findings(sample_findings_receipt())
-            .record_done_ledger(sample_done_ledger_receipt(scope_b.committed_items()))
+            .record_done_ledger(sample_done_ledger_receipt(scope_b.committed_units()))
             .expect("done-ledger stage validates count, not scope — by design");
 
         // The checkpoint stage is where full scope validation occurs.
@@ -737,5 +862,50 @@ mod tests {
             page_a.record_checkpoint(wrong_checkpoint).unwrap_err(),
             PageCommitValidationError::CheckpointScopeMismatch
         );
+    }
+
+    #[test]
+    fn page_commit_happy_path_with_repo_frontier_boundary() {
+        let scope = CommitScope::new(
+            tenant(1),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            2,
+            CheckpointBoundary::repo_frontier(sample_cursor(5)),
+        );
+        let page = PageCommit::new(scope.clone())
+            .record_findings(sample_findings_receipt())
+            .record_done_ledger(sample_done_ledger_receipt(scope.committed_units()))
+            .unwrap()
+            .record_checkpoint(sample_checkpoint_receipt(&scope))
+            .unwrap();
+        let receipt = page.into_page_commit_receipt();
+        assert_eq!(receipt.item_commit().scope(), &scope);
+        assert!(scope.checkpoint_boundary().is_repo_frontier());
+    }
+
+    #[test]
+    fn checkpoint_boundary_ordered_content_accessors() {
+        let cursor = sample_cursor(0xAA);
+        let boundary = CheckpointBoundary::ordered_content(cursor.clone());
+        assert_eq!(boundary.kind(), CheckpointBoundaryKind::OrderedContent);
+        assert!(boundary.is_ordered_content());
+        assert!(!boundary.is_repo_frontier());
+        assert_eq!(boundary.cursor(), &cursor);
+        assert_eq!(boundary.as_ordered_content(), Some(&cursor));
+        assert_eq!(boundary.as_repo_frontier(), None);
+    }
+
+    #[test]
+    fn checkpoint_boundary_repo_frontier_accessors() {
+        let cursor = sample_cursor(0xBB);
+        let boundary = CheckpointBoundary::repo_frontier(cursor.clone());
+        assert_eq!(boundary.kind(), CheckpointBoundaryKind::RepoFrontier);
+        assert!(!boundary.is_ordered_content());
+        assert!(boundary.is_repo_frontier());
+        assert_eq!(boundary.cursor(), &cursor);
+        assert_eq!(boundary.as_ordered_content(), None);
+        assert_eq!(boundary.as_repo_frontier(), Some(&cursor));
     }
 }

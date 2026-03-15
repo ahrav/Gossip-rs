@@ -8,7 +8,7 @@
 - typed scan configuration for filesystem and git entrypoints
 - CLI parsing and summary rendering
 - path and budget validation before runtime execution
-- owned report, checkpoint, cancellation, and commit-sink types
+- owned report, checkpoint, cancellation, commit-model, and commit-sink types
 - local filesystem and git execution through family-oriented runtime modules
 - distributed runtime placeholder nouns for future worker-loop wiring
 
@@ -24,6 +24,7 @@ entrypoints share the same local runtime execution paths.
 |------|---------|
 | `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime` |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
+| `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput` |
 | `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink |
 | `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing |
 | `src/distributed.rs` | Distributed runtime family placeholders and shared config/report types |
@@ -185,7 +186,7 @@ tests, and caller logging.
 ```rust
 pub struct ScanCheckpoint {
     pub cursor: Cursor,
-    pub committed_items: u64,
+    pub committed_units: u64,
 }
 ```
 
@@ -204,7 +205,23 @@ pub struct AssignmentOutcome {
 ```
 
 Return shape for the sink-aware runtime entrypoints. Callers receive the
-main report plus optional checkpoint and debug payloads.
+main report plus optional checkpoint and debug payloads. The `checkpoint_hint`
+field remains a non-authoritative hint; the durable commit pipeline is modeled
+separately in `src/commit_model.rs`.
+
+### Runtime commit model
+
+`src/commit_model.rs` freezes the family-neutral durability vocabulary that the
+future runtime commit stages build on:
+
+- `CompletedUnit` couples a monotonically increasing in-shard sequence number
+  with a tagged `CheckpointBoundary`.
+- `CommitRequest<'a>` borrows findings and done-ledger payloads so the runtime
+  keeps buffer ownership outside the commit stage.
+- `UnitCommitReceipt` proves findings and done-ledger durability for one
+  completed unit without implying checkpoint advancement.
+- `CheckpointAggregatorInput` wraps only durable unit receipts so the future
+  checkpoint stage never consumes raw scan completion signals.
 
 ### ScanRuntimeError
 
@@ -327,4 +344,5 @@ that worker-loop API is fully wired.
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |
+| Frozen runtime commit vocabulary | `crates/gossip-scanner-runtime/src/commit_model.rs` |
 | JSONL parity helpers | `crates/gossip-scanner-runtime/src/parity.rs` |

@@ -13,7 +13,7 @@ dispatch overhead) and total (there is no way to circumvent the protocol without
 PageCommit lives in the **B5 Persistence** boundary. It is the final step in
 the worker's hot path: after scanning a page of items, the worker must
 durably persist three things in order — findings, done-ledger entries, and the
-cursor checkpoint. If any one of these three writes succeeds without the
+checkpoint boundary. If any one of these three writes succeeds without the
 preceding ones already being durable, the system enters an inconsistent state
 that produces **false negatives** — the worst possible failure mode for a
 secret scanner, because secrets silently slip through undetected.
@@ -106,10 +106,10 @@ The four states correspond to four phases of a page commit:
 | **ItemDurable**        | `PageCommit<ItemDurable>`        | `record_checkpoint()`, `wait_checkpoint()`, `item_commit_receipt()`      | Findings + done-ledger durable; checkpoint is the next step   |
 | **CheckpointDurable**  | `PageCommit<CheckpointDurable>`  | `page_commit_receipt()`, `into_page_commit_receipt()`                    | Terminal — all three stages durable, receipt extractable       |
 
-### `PageCommitScope`
+### `CommitScope`
 
-Every `PageCommit` is scoped to an immutable `PageCommitScope` that identifies
-the page being committed:
+Every `PageCommit` is scoped to an immutable `CommitScope` that identifies
+the durable commit boundary:
 
 | Field               | Type         | Purpose                                                 |
 | :------------------ | :----------- | :------------------------------------------------------ |
@@ -117,8 +117,8 @@ the page being committed:
 | `run_id`            | `RunId`      | Run that produced the page                              |
 | `shard_id`          | `ShardId`    | Shard that emitted the page                             |
 | `fence_epoch`       | `FenceEpoch` | Fence epoch under which the page was processed          |
-| `committed_items`   | `u64`        | Number of items in the page                             |
-| `checkpoint_cursor` | `Cursor`     | Cursor boundary the checkpoint must durably acknowledge  |
+| `committed_units`   | `u64`        | Number of durable units represented by the page         |
+| `checkpoint_boundary` | `CheckpointBoundary` | Tagged frontier boundary the checkpoint must durably acknowledge |
 
 Receipt validation at the done-ledger and checkpoint stages compares against
 these scope values, catching receipt mix-ups between concurrent pages at the
@@ -140,26 +140,33 @@ DoneLedgerCommitReceipt ┘                       ├── PageCommitReceipt
 | `FindingsCommitReceipt`    | finding/occurrence/observation counts           | `FindingsSink::upsert_batch`    |
 | `DoneLedgerCommitReceipt`  | record_count, scanned_count, findings_count     | `DoneLedger::batch_upsert`      |
 | `ItemCommitReceipt`        | scope + findings receipt + done-ledger receipt  | `record_done_ledger` validation |
-| `CheckpointCommitReceipt`  | full `PageCommitScope` + checkpointed_at time   | Coordinator checkpoint          |
+| `CheckpointCommitReceipt`  | full `CommitScope` + checkpointed_at time       | Coordinator checkpoint          |
 | `PageCommitReceipt`        | item-commit receipt + checkpoint receipt        | `record_checkpoint` validation  |
 
-Holding a `PageCommitReceipt` is sufficient proof that the cursor can be safely
-advanced — no further persistence work is required for this page.
+Holding a `PageCommitReceipt` is proof that the frontier boundary has been
+durably checkpointed — no further persistence work is required for this page.
 
 ### Validation at each stage
 
 | Stage         | Validation                                                                    | Error on mismatch                                              |
 | :------------ | :---------------------------------------------------------------------------- | :------------------------------------------------------------- |
 | Findings      | None — receipts carry only aggregate counts, produced by same in-process pipe | (no validation error possible)                                 |
-| Done-ledger   | `receipt.record_count() == scope.committed_items()`                           | `PageCommitValidationError::LedgerItemCountMismatch`           |
+| Done-ledger   | `receipt.record_count() == scope.committed_units()`                           | `PageCommitValidationError::LedgerUnitCountMismatch`           |
 | Checkpoint    | `receipt.scope() == page.scope()`                                             | `PageCommitValidationError::CheckpointScopeMismatch`           |
+
+**Done-ledger invariant:** the validation assumes each committed unit produces
+exactly one done-ledger row (`DoneLedgerCommitReceipt.record_count()` equals
+`CommitScope.committed_units()`). Both currently planned families — ordered-content
+and repo-frontier — maintain this 1:1 correspondence. If a future family emits
+a different ratio, the validation and error variant
+(`LedgerUnitCountMismatch`) must be updated accordingly.
 
 ---
 
 ## 2. Partial Write Failure Scenarios
 
 Why does the strict ordering matter? Consider what happens if the three
-durability stages (findings, done-ledger, cursor checkpoint) are performed
+durability stages (findings, done-ledger, checkpoint boundary) are performed
 independently and one fails. There are three failure scenarios, and **two of
 the three produce false negatives** — secrets that the scanner processed but
 never reported. The only acceptable failure mode is the one where findings are
@@ -168,7 +175,7 @@ re-scan rather than missed secrets.
 
 The PageCommit typestate eliminates all three partial-failure scenarios by
 enforcing that each stage's durability is proven (via receipt) before the next
-stage can proceed. If any stage fails, the cursor is not advanced, so the
+stage can proceed. If any stage fails, the frontier boundary is not advanced, so the
 page will be re-scanned on the next attempt.
 
 ```mermaid
@@ -385,7 +392,7 @@ sequenceDiagram
         DL-->>W: Ok(ledger_handle)
         W->>PC: wait_done_ledger(ledger_handle)
         Note over PC: handle.wait() → DoneLedgerCommitReceipt
-        Note over PC: Validates: receipt.record_count == scope.committed_items
+        Note over PC: Validates: receipt.record_count == scope.committed_units
         Note over PC: Assembles ItemCommitReceipt (findings + done-ledger)
         Note over PC: State: PageCommit< ItemDurable >
     end
@@ -403,15 +410,15 @@ sequenceDiagram
 
     W->>PC: into_page_commit_receipt()
     PC-->>W: PageCommitReceipt
-    Note over W: Cursor safely advanced — full page is durable
+    Note over W: Frontier boundary safely advanced — full page is durable
 ```
 
 The sequence breaks down into four phases:
 
 1. **Construction** (step 1): The worker creates a `PageCommit<AwaitingFindings>`
-   with a `PageCommitScope` that identifies the tenant, run, shard, fence epoch,
-   item count, and cursor boundary. The scope is `Arc`-shared and frozen for the
-   duration of the protocol.
+   with a `CommitScope` that identifies the tenant, run, shard, fence epoch,
+   committed-unit count, and tagged checkpoint boundary. The scope is
+   `Arc`-shared and frozen for the duration of the protocol.
 
 2. **Findings durability** (steps 2-5): The worker submits findings to the
    `FindingsSink`, receives a `CommitHandle`, and passes it to `wait_findings()`.
@@ -423,22 +430,22 @@ The sequence breaks down into four phases:
 
 3. **Done-ledger durability** (steps 6-9): The worker submits done-ledger
    records, receives a handle, and passes it to `wait_done_ledger()`. The method
-   validates that the receipt's `record_count` matches `scope.committed_items()`,
+   validates that the receipt's `record_count` matches `scope.committed_units()`,
    rejecting partial or mixed-page flushes. On success, it assembles an
    `ItemCommitReceipt` (findings + done-ledger) and transitions to
    `PageCommit<ItemDurable>`.
 
-4. **Checkpoint durability** (steps 10-13): The worker checkpoints the cursor
+4. **Checkpoint durability** (steps 10-13): The worker checkpoints the frontier boundary
    with the coordinator, receives a handle, and passes it to
    `wait_checkpoint()`. The method validates that the receipt's embedded
-   `PageCommitScope` matches the page's scope exactly, catching receipt mix-ups
+   `CommitScope` matches the page's scope exactly, catching receipt mix-ups
    between concurrent pages. On success, it assembles the final
    `PageCommitReceipt` and transitions to `PageCommit<CheckpointDurable>`.
 
 5. **Receipt extraction** (steps 14-15): The worker calls
    `into_page_commit_receipt()` to consume the `PageCommit<CheckpointDurable>`
    and obtain the terminal `PageCommitReceipt`. Holding this receipt is
-   sufficient proof that the cursor can be safely advanced.
+   sufficient proof that the frontier boundary can be safely advanced.
 
 ### Error handling
 
@@ -461,7 +468,7 @@ a receipt is in hand.
 ## Cross-References
 
 - [Shard and Run State Machines](05-shard-and-run-state-machines.md) -- the
-  shard lifecycle that the cursor advancement feeds into
+  shard lifecycle that checkpoint-boundary advancement feeds into
 - [Fencing Protocol](06-fencing-protocol.md) -- the checkpoint call in
   stage 3 passes through the 5-check fencing preamble
 - [End-to-End Scan Flow](04-end-to-end-scan-flow.md) -- DurableCommitSink
@@ -474,7 +481,7 @@ a receipt is in hand.
 | File                                                   | Purpose                                                                                   |
 | :----------------------------------------------------- | :---------------------------------------------------------------------------------------- |
 | `07-boundary-5-persistence/04-commit-protocol-typestate.md` | Deep dive design document for the commit protocol typestate                          |
-| `crates/gossip-contracts/src/persistence/page_commit.rs` | `PageCommit<S>` typestate, `PageCommitScope`, `PageCommitValidationError`, `CommitAdvanceError` |
+| `crates/gossip-contracts/src/persistence/page_commit.rs` | `PageCommit<S>` typestate, `CheckpointBoundary`, `CommitScope`, `PageCommitValidationError`, `CommitAdvanceError` |
 | `crates/gossip-contracts/src/persistence/commit.rs`    | `CommitHandle` trait, `ReadyCommitHandle`, all receipt types (`FindingsCommitReceipt`, `DoneLedgerCommitReceipt`, `CheckpointCommitReceipt`, `ItemCommitReceipt`, `PageCommitReceipt`) |
 | `crates/gossip-contracts/src/persistence/mod.rs`       | Public re-exports and cross-trait ordering contract documentation                         |
 | `crates/gossip-contracts/src/persistence/findings.rs`  | `FindingsSink` trait producing `FindingsCommitReceipt`                                    |

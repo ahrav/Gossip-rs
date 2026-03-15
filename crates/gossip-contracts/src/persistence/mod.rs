@@ -14,8 +14,9 @@
 //!   the backend-neutral `DoneLedger` trait.
 //! - `findings.rs` defines stable finding, occurrence, and observation record
 //!   shapes plus the backend-neutral `FindingsSink` trait.
-//! - `page_commit.rs` defines the `PageCommit<S>` typestate machine that
-//!   enforces findings → done-ledger → checkpoint ordering.
+//! - `page_commit.rs` defines the family-neutral checkpoint boundary types and
+//!   the `PageCommit<S>` typestate machine that enforces findings →
+//!   done-ledger → checkpoint ordering.
 //! - `error.rs` defines shared input-validation errors used by persistence-only
 //!   value wrappers.
 //! - `conformance.rs` defines the backend-agnostic persistence conformance
@@ -49,8 +50,9 @@
 //!
 //! When a scan produces findings, callers must durably persist them via
 //! `FindingsSink::upsert_batch` **before** durably recording completion in
-//! `DoneLedger::batch_upsert`, and only checkpoint the cursor after both layers
-//! are durable. The `PageCommit<S>` typestate machine enforces that ordering.
+//! `DoneLedger::batch_upsert`, and only checkpoint the family-specific
+//! frontier boundary after both layers are durable. The `PageCommit<S>`
+//! typestate machine enforces that ordering.
 //!
 //! ## Observation-identity scope
 //!
@@ -112,6 +114,7 @@ pub use findings::{
 };
 pub use ovid::{OvidHash, OvidHashInputs, derive_ovid_hash};
 pub use page_commit::{
-    AwaitingFindings, CheckpointDurable, CommitAdvanceError, FindingsDurable, ItemDurable,
-    PageCommit, PageCommitScope, PageCommitValidationError,
+    AwaitingFindings, CheckpointBoundary, CheckpointBoundaryKind, CheckpointDurable,
+    CommitAdvanceError, CommitScope, FindingsDurable, ItemDurable, PageCommit,
+    PageCommitValidationError,
 };
