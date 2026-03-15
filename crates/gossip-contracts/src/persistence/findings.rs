@@ -550,7 +550,7 @@ impl ObservationRecord {
 /// This type borrows slices rather than owning them so the caller retains
 /// control over allocation and can reuse buffers across flushes. An empty
 /// batch (all three slices empty) is a valid no-op input.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FindingsUpsertBatch<'a> {
     findings: &'a [FindingRecord],
     occurrences: &'a [OccurrenceRecord],

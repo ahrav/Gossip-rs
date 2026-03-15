@@ -69,8 +69,10 @@ Non-negotiables (project-wide):
 
 | Type | Purpose |
 |------|---------|
-| `PageCommit<S>` | Compile-time enforcement of the commit protocol ordering: findings flush → done-ledger upsert → cursor checkpoint. State parameter `S` transitions through `AwaitingFindings` → `FindingsDurable` → `ItemDurable` → `CheckpointDurable`. Each state exposes only the transition methods valid for that stage; out-of-order calls are compile errors. |
-| `PageCommitScope` | Immutable scope for a single page commit: tenant, run, shard, fence epoch, item count, and cursor boundary. Frozen at construction; every receipt-validation check compares against these values. |
+| `PageCommit<S>` | Compile-time enforcement of the commit protocol ordering: findings flush → done-ledger upsert → checkpoint boundary. State parameter `S` transitions through `AwaitingFindings` → `FindingsDurable` → `ItemDurable` → `CheckpointDurable`. Each state exposes only the transition methods valid for that stage; out-of-order calls are compile errors. |
+| `CheckpointBoundaryKind` | Copy tag distinguishing ordered-content progress from repo-frontier progress. |
+| `CheckpointBoundary` | Family-neutral checkpoint boundary: `OrderedContent(Cursor)` or `RepoFrontier(Cursor)`. Tags keep same-byte cursors from different source families distinct. |
+| `CommitScope` | Immutable scope for a single page commit: tenant, run, shard, fence epoch, committed-unit count, and tagged checkpoint boundary. Frozen at construction; every receipt-validation check compares against these values. |
 
 ### Data types
 
@@ -101,9 +103,9 @@ Non-negotiables (project-wide):
 |------|---------|
 | `FindingsCommitReceipt` | Proves three-layer findings data is durable. Carries `finding_count`, `occurrence_count`, `observation_count`. |
 | `DoneLedgerCommitReceipt` | Proves done-ledger rows are durable. Carries `record_count`, `scanned_count`, `findings_count`. |
-| `CheckpointCommitReceipt` | Proves cursor checkpoint is durable. Embeds a `PageCommitScope` and `checkpointed_at` timestamp; the typestate machine validates receipt-to-scope correspondence with a single equality check. |
+| `CheckpointCommitReceipt` | Proves the checkpoint boundary is durable. Embeds a `CommitScope` and `checkpointed_at` timestamp; the typestate machine validates receipt-to-scope correspondence with a single equality check. |
 | `ItemCommitReceipt` | Composite: findings + done-ledger. Assembled by `PageCommit` after validating ordering. |
-| `PageCommitReceipt` | Terminal composite: item-commit + checkpoint. Sufficient proof that the cursor can be safely advanced. |
+| `PageCommitReceipt` | Terminal composite: item-commit + checkpoint. Sufficient proof that the checkpoint boundary can be safely advanced. |
 
 **Typestate and error types** (`page_commit.rs`):
 
@@ -113,7 +115,7 @@ Non-negotiables (project-wide):
 | `FindingsDurable` | Typestate: findings are durable; done-ledger is next. Carries `FindingsCommitReceipt`. |
 | `ItemDurable` | Typestate: findings + done-ledger durable; checkpoint is next. Carries `ItemCommitReceipt`. |
 | `CheckpointDurable` | Typestate: terminal state, all three stages durable. Carries `PageCommitReceipt`. |
-| `PageCommitValidationError` | Receipt-vs-scope mismatch errors: `LedgerItemCountMismatch` (done-ledger) and `CheckpointScopeMismatch` (checkpoint). |
+| `PageCommitValidationError` | Receipt-vs-scope mismatch errors: `LedgerUnitCountMismatch` (done-ledger) and `CheckpointScopeMismatch` (checkpoint). |
 | `CommitAdvanceError<E>` | Combined wait-or-validation error for `wait_*` transitions. |
 
 **Shared error type** (`error.rs`):
@@ -151,7 +153,7 @@ The worker-side commit protocol is mandatory and enforces correctness without cr
 
 1. **`AwaitingFindings` → `FindingsDurable`**: Findings durable — `record_findings` / `wait_findings`
 2. **`FindingsDurable` → `ItemDurable`**: Done-ledger durable — `record_done_ledger` / `wait_done_ledger` (validates item count)
-3. **`ItemDurable` → `CheckpointDurable`**: Cursor checkpoint durable — `record_checkpoint` / `wait_checkpoint` (validates receipt scope equals page scope)
+3. **`ItemDurable` → `CheckpointDurable`**: Checkpoint boundary durable — `record_checkpoint` / `wait_checkpoint` (validates receipt scope equals page scope)
 
 Consequences:
 

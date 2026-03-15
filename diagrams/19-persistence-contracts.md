@@ -75,8 +75,8 @@ graph TB
 
         FCR["FindingsCommitReceipt<br/>finding/occurrence/<br/>observation counts"]
         DLCR["DoneLedgerCommitReceipt<br/>record_count,<br/>scanned_count,<br/>findings_count"]
-        CCR["CheckpointCommitReceipt<br/>PageCommitScope +<br/>checkpointed_at"]
-        ICR["ItemCommitReceipt<br/>PageCommitScope +<br/>Findings + DoneLedger"]
+        CCR["CheckpointCommitReceipt<br/>CommitScope +<br/>checkpointed_at"]
+        ICR["ItemCommitReceipt<br/>CommitScope +<br/>Findings + DoneLedger"]
         PCR["PageCommitReceipt<br/>= Item + Checkpoint"]
 
         FCR --> ICR
@@ -486,8 +486,8 @@ graph TB
 2. **Submission is not durability.** `Ok(handle)` means the backend accepted
    the write; `handle.wait()` establishes durability and returns a typed receipt.
 3. **Cross-trait ordering.** Findings must be durable before done-ledger, and
-   done-ledger must be durable before the cursor checkpoint. Enforced at compile
-   time by the `PageCommit<S>` typestate.
+   done-ledger must be durable before the checkpoint boundary. Enforced at
+   compile time by the `PageCommit<S>` typestate.
 4. **Monotonic status lattice.** Once an object-version reaches a scanned state,
    no concurrent or replayed failure/skip write can downgrade it.
 5. **Content-addressed identity.** All IDs are derived from natural keys via
@@ -520,7 +520,7 @@ graph TB
 | `crates/gossip-contracts/src/persistence/findings.rs` | `FindingRecord`, `OccurrenceRecord`, `ObservationRecord`, `FindingsSink`, `FindingsUpsertBatch` |
 | `crates/gossip-contracts/src/persistence/done_ledger.rs` | `DoneLedgerKey`, `DoneLedgerStatus`, `DoneLedgerRecord`, `DoneLedger` trait |
 | `crates/gossip-contracts/src/persistence/ovid.rs` | `OvidHash`, `OvidHashInputs`, `derive_ovid_hash()` |
-| `crates/gossip-contracts/src/persistence/page_commit.rs` | `PageCommit<S>` typestate, `PageCommitScope`, validation errors |
+| `crates/gossip-contracts/src/persistence/page_commit.rs` | `PageCommit<S>` typestate, `CheckpointBoundary`, `CommitScope`, validation errors |
 | `crates/gossip-contracts/src/persistence/error.rs` | `PersistenceInputError` shared validation errors |
 | `crates/gossip-contracts/src/persistence/conformance.rs` | `run_conformance()`, `FindingsConformanceProbe`, conformance report |
 | `crates/gossip-persistence-inmemory/src/` | Reference implementation: `InMemoryDoneLedger`, `InMemoryFindingsSink` |
