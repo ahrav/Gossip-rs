@@ -12,8 +12,9 @@
 //!   split-replace planning core, manifest validation, and split capacity
 //!   constants. Protocol traits and the in-memory backend live in
 //!   `gossip-coordination`.
-//! - **Connector boundary** — enumeration/read traits and connector
-//!   registration.
+//! - **Connector boundary** — shared paging vocabulary, validated connector
+//!   value types, and family-specific contracts for ordered-content and Git
+//!   sources.
 //! - **Persistence boundary** — done-ledger identities, findings record
 //!   shapes, durable acknowledgement handles and receipts, commit-ordering
 //!   typestate, and backend-neutral traits.
