@@ -1,6 +1,6 @@
 ---
 name: doc-rigor-verify
-description: Write-then-verify documentation pipeline — a doc-rigor agent writes/improves docs, then a separate fresh doc-verify agent checks accuracy against code reality with zero confirmation bias
+description: Write-then-verify documentation pipeline — a doc-rigor agent writes/improves docs, then a separate fresh doc-verify agent checks accuracy of API claims, command examples, units, and platform assumptions against code reality with zero confirmation bias
 user-invocable: true
 ---
 
@@ -167,6 +167,14 @@ Every doc you write should cover the applicable items:
 - Edge cases and failure modes
 - Complexity or performance constraints when relevant
 - Concrete examples when behavior is subtle
+- Runnable command examples only when crate names, package flags, and feature
+  flags have been verified against the current workspace
+- Units, time domains, and ordering assumptions when values are easy to misread
+  (for example seconds vs ticks, per-step vs cumulative advance)
+- Platform scope when behavior is Unix-only, Windows-only, or relies on path
+  or byte-semantics assumptions
+- The exact API, trait, or observation path when docs describe which component
+  performs a lookup or emits an observation
 
 ### Rust-Specific Guidance
 
@@ -182,6 +190,8 @@ Every doc you write should cover the applicable items:
 - Do NOT add version suffixes, deprecated annotations, or compatibility shims
 - Focus on WHY, not WHAT — don't restate what the code already says
 - Be factually precise — every claim in a doc comment must be true
+- Never overstate API surface usage; if only some observations flow through a
+  trait or helper, name the exact path instead of saying "all" or "always"
 
 ### Output
 
@@ -247,6 +257,9 @@ Categorize each claim:
 | **Complexity** | "O(n log n)", "amortized O(1)", "linear in the number of X" |
 | **Performance** | "zero-copy", "no allocation", "lock-free", "wait-free" |
 | **Safety** | "safe because X", "unsafe requires Y", "SAFETY: Z" |
+| **Operational Example** | cargo commands, feature flags, CLI invocations, package names |
+| **Unit/Time Domain** | seconds vs ticks, absolute vs cumulative time, ordering assumptions |
+| **Platform Scope** | Unix-only, Windows-only, filesystem/path assumptions |
 | **External** | "uses algorithm from [paper]", "follows RFC N", "compatible with library X" |
 | **Negative** | "does NOT do X", "never Y", "no Z" |
 
@@ -257,6 +270,15 @@ For each claim, record:
 - Testable assertion: rewrite as a concrete true/false statement
 
 ## Step B: Verify Code-Level Claims
+
+Always perform these high-risk drift checks when they appear in docs:
+
+- Verify command examples against current crate names, package flags, and
+  feature gates in `Cargo.toml`
+- Verify units and time-domain wording against the implementation and tests
+- Verify platform-specific claims against `cfg` gates, path handling, and
+  safety comments
+- Verify trait/API attribution claims against the exact call path in code
 
 For each claim category, verify against the actual code:
 

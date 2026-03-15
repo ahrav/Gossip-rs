@@ -29,6 +29,8 @@ This checklist is derived from production-validated DST systems:
   or any module touching shard lifecycle, leases, fencing, or gossip protocols
 - After adding new trait methods to `CoordinationBackend` or related traits
 - After adding new state machine transitions or protocol messages
+- After adding or rewriting simulation, behavioral, or oracle-style tests for
+  coordination flows
 - Before marking coordination PRs ready for review
 
 ## When NOT to Use
@@ -118,12 +120,23 @@ DST-COMPATIBILITY CHECKLIST
       boundaries. Use From<CoordError> with unreachable!() for
       impossible variants (D2.16).
 
+[ ] INVARIANT-ISOLATING TESTS
+    New behavioral, simulation, or oracle tests must identify one primary
+    invariant.
+    → Remove setup that does not participate in that invariant
+    → Add a negative-path or boundary case when terminal or rejection behavior
+      changes
+    → Ensure the test would fail for the intended reason, not for unrelated
+      preconditions
+    → Normalize unordered aggregate state before oracle comparisons
+
 [ ] DETERMINISTIC ITERATION ORDER
     No HashMap/HashSet iteration where order affects correctness.
     → Use BTreeMap/BTreeSet when iteration order matters
     → Or collect into Vec and explicitly .sort() before iterating
       (HashMap + sort is a valid pattern — see reference code split ops)
     → Key question: does any downstream logic depend on iteration order?
+    → Apply the same rule to test oracles and comparable snapshots
 
 [ ] CORRECTNESS PROPERTIES DOCUMENTED
     New coordination operations document their invariants.
@@ -206,6 +219,8 @@ For each new error variant added to `CoordError` or similar enums:
 1. Search for test functions that trigger this variant
 2. If none exist, flag as WARN with suggested test skeleton
 3. Priority: lease expiry, fence rejection, split validation, concurrent access errors
+4. If terminal states, stale replays, or rejection paths changed, check for at
+   least one negative-path test that proves irreversibility or rejection
 
 ### Step 6: Summary Report
 
@@ -293,5 +308,8 @@ fn transition(state: ShardStatus, event: ShardEvent, now: LogicalTime)
 
 - `/dist-sys-auditor` — Evidence-backed distributed systems design review
 - `/test-strategy` — Assess and recommend testing strategy
+- `/invariant-test-review` — Deep-dive review of whether a specific test
+  actually proves its claimed invariant when INVARIANT-ISOLATING TESTS
+  findings need more analysis
 - `/sim-scaffold` — Generate DST-ready module scaffolding
 - `/sim-run` — Execute simulation tests
