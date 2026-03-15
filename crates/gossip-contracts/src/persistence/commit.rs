@@ -326,9 +326,9 @@ impl CommitReceipt for ItemCommitReceipt {}
 /// Terminal receipt proving a complete page is durable: findings, done-ledger,
 /// and checkpoint have all been acknowledged.
 ///
-/// Holding a `PageCommitReceipt` is sufficient proof that the frontier
-/// boundary can be safely advanced — no further persistence work is required
-/// for this scope.
+/// Holding a `PageCommitReceipt` is proof that the frontier boundary has been
+/// durably checkpointed — no further persistence work is required for this
+/// scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageCommitReceipt {
     item_commit: ItemCommitReceipt,

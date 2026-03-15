@@ -143,8 +143,8 @@ DoneLedgerCommitReceipt ┘                       ├── PageCommitReceipt
 | `CheckpointCommitReceipt`  | full `CommitScope` + checkpointed_at time       | Coordinator checkpoint          |
 | `PageCommitReceipt`        | item-commit receipt + checkpoint receipt        | `record_checkpoint` validation  |
 
-Holding a `PageCommitReceipt` is sufficient proof that the frontier boundary
-can be safely advanced — no further persistence work is required for this page.
+Holding a `PageCommitReceipt` is proof that the frontier boundary has been
+durably checkpointed — no further persistence work is required for this page.
 
 ### Validation at each stage
 
@@ -153,6 +153,13 @@ can be safely advanced — no further persistence work is required for this page
 | Findings      | None — receipts carry only aggregate counts, produced by same in-process pipe | (no validation error possible)                                 |
 | Done-ledger   | `receipt.record_count() == scope.committed_units()`                           | `PageCommitValidationError::LedgerUnitCountMismatch`           |
 | Checkpoint    | `receipt.scope() == page.scope()`                                             | `PageCommitValidationError::CheckpointScopeMismatch`           |
+
+**Done-ledger invariant:** the validation assumes each committed unit produces
+exactly one done-ledger row (`DoneLedgerCommitReceipt.record_count()` equals
+`CommitScope.committed_units()`). Both currently planned families — ordered-content
+and repo-frontier — maintain this 1:1 correspondence. If a future family emits
+a different ratio, the validation and error variant
+(`LedgerUnitCountMismatch`) must be updated accordingly.
 
 ---
 

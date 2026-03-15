@@ -215,6 +215,13 @@ pub struct UnitCommitReceipt {
 impl UnitCommitReceipt {
     /// Construct a durable runtime receipt.
     ///
+    /// Validates only the `checkpoint_boundary` field — full `CommitScope`
+    /// correspondence (tenant, run, shard, fence epoch, committed units) is
+    /// the caller's responsibility. `CompletedUnit` does not carry scope
+    /// identity, so a stronger check is structurally impossible at this layer.
+    /// The downstream `PageCommit::record_checkpoint` enforces full-scope
+    /// equality against the coordination-side receipt.
+    ///
     /// # Errors
     ///
     /// Returns [`BoundaryMismatchError`] if the completed unit's checkpoint
@@ -475,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_commit_receipt_rejects_same_family_cursor_mismatch() {
+    fn unit_commit_receipt_rejects_same_kind_cursor_mismatch() {
         let unit = CompletedUnit::ordered_content(1, sample_cursor(1));
         let receipt = sample_item_receipt(CheckpointBoundary::ordered_content(sample_cursor(2)));
         assert!(
