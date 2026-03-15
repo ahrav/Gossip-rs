@@ -772,8 +772,10 @@ impl DifferentialOracle {
             .with_workers_and_shards(N_WORKERS, N_SHARDS);
 
         let oracle = Self { sim, etcd, seed };
-        let sim_state = comparable_state(oracle.sim.backend());
-        let etcd_state = comparable_state(oracle.etcd.backend());
+        let sim_state = comparable_state(oracle.sim.backend())
+            .expect("sim comparable_state failed during initial check");
+        let etcd_state = comparable_state(oracle.etcd.backend())
+            .expect("etcd comparable_state failed during initial check");
         if sim_state != etcd_state {
             panic!(
                 "initial state drift detected\nseed={seed}\nsim_state={sim_state:#?}\netcd_state={etcd_state:#?}"
@@ -834,8 +836,36 @@ impl DifferentialOracle {
                 );
             }
 
-            let sim_state = comparable_state(self.sim.backend());
-            let etcd_state = comparable_state(self.etcd.backend());
+            let sim_state = comparable_state(self.sim.backend()).unwrap_or_else(|err| {
+                panic_drift(
+                    seed,
+                    step,
+                    op,
+                    ops,
+                    "sim comparable_state failed",
+                    DriftComparison {
+                        sim_event: format!("{sim_event:#?}"),
+                        etcd_event: format!("{etcd_event:#?}"),
+                        sim_detail: err,
+                        etcd_detail: String::new(),
+                    },
+                );
+            });
+            let etcd_state = comparable_state(self.etcd.backend()).unwrap_or_else(|err| {
+                panic_drift(
+                    seed,
+                    step,
+                    op,
+                    ops,
+                    "etcd comparable_state failed",
+                    DriftComparison {
+                        sim_event: format!("{sim_event:#?}"),
+                        etcd_event: format!("{etcd_event:#?}"),
+                        sim_detail: String::new(),
+                        etcd_detail: err,
+                    },
+                );
+            });
             if sim_state != etcd_state {
                 panic_drift(
                     seed,
@@ -891,13 +921,13 @@ fn panic_drift(
 /// variable-length fields (spec bounds, cursor, spawned children) into owned
 /// collections and stripping backend-specific lease internals. Also validates
 /// structural invariants on each shard record (via `validate_record_invariants`)
-/// as a side-effect — a failing invariant is a hard panic, not a comparison
-/// mismatch.
+/// — returning an error rather than panicking so the caller can include oracle
+/// context (seed, step, operation sequence) in the failure message.
 ///
-/// Ends with an assertion that `shard_count()` agrees with the iteration
-/// length, catching `SimIntrospection` implementations where the counter
-/// and iterator diverge.
-fn comparable_state<B: SimIntrospection>(backend: &B) -> ComparableBackendState {
+/// Ends with a check that `shard_count()` agrees with the iteration length,
+/// catching `SimIntrospection` implementations where the counter and iterator
+/// diverge.
+fn comparable_state<B: SimIntrospection>(backend: &B) -> Result<ComparableBackendState, String> {
     let mut runs = BTreeMap::new();
     let mut shards = BTreeMap::new();
 
@@ -932,7 +962,7 @@ fn comparable_state<B: SimIntrospection>(backend: &B) -> ComparableBackendState 
     for ((tenant, key), record) in backend.shards() {
         backend
             .validate_record_invariants(record)
-            .unwrap_or_else(|err| panic!("invalid record in comparable_state for {key:?}: {err}"));
+            .map_err(|err| format!("invalid record for {key:?}: {err}"))?;
         let (start, end) = backend.spec_bounds(record);
         let lease = record.lease().map(|lease| ComparableLease {
             owner: lease.owner(),
@@ -972,13 +1002,15 @@ fn comparable_state<B: SimIntrospection>(backend: &B) -> ComparableBackendState 
         );
     }
 
-    assert_eq!(
-        backend.shard_count(),
-        shards.len(),
-        "SimIntrospection::shard_count disagrees with shard iteration",
-    );
+    let count = backend.shard_count();
+    if count != shards.len() {
+        return Err(format!(
+            "SimIntrospection::shard_count ({count}) disagrees with shard iteration ({})",
+            shards.len(),
+        ));
+    }
 
-    ComparableBackendState { runs, shards }
+    Ok(ComparableBackendState { runs, shards })
 }
 
 /// Build an `EtcdCoordinatorConfig` for the simulated (in-memory) backend.
