@@ -7,13 +7,32 @@
 //! The harness stays intentionally strict about the surface it uses:
 //! shard-level mutations and run-level mutations go through the protocol
 //! traits ([`CoordinationBackend`](crate::traits::CoordinationBackend) and
-//! [`RunManagement`](crate::run::RunManagement)), while shard-level
-//! observations go through
-//! [`SimIntrospection`](crate::sim::SimIntrospection) and run-level
-//! observations go through
-//! [`RunManagement::get_run`](crate::run::RunManagement::get_run).
-//! That keeps the suite backend-agnostic and avoids reaching into
-//! allocator-specific internals such as `ByteSlab`.
+//! [`RunManagement`](crate::run::RunManagement)), while observations go
+//! through the [`SimulationBackend`] super-trait (which includes
+//! [`SimIntrospection`](crate::sim::SimIntrospection) for shard-level
+//! lookups and [`RunManagement::get_run`](crate::run::RunManagement::get_run)
+//! for run-level queries). That keeps the suite backend-agnostic and avoids
+//! reaching into allocator-specific internals such as `ByteSlab`.
+//!
+//! # Test groups
+//!
+//! Tests are organized into three groups by what they exercise:
+//!
+//! - **Group A — Cross-cutting invariant interactions.** Each test composes
+//!   two or more of the protocol's safety invariants and verifies they hold
+//!   simultaneously. These are the tests most likely to catch regressions
+//!   where a fix for one invariant violates another.
+//! - **Group B — Boundary conditions and variant coverage.** Edge cases
+//!   (exact-deadline expiry, dispatched cursor semantics, ring-buffer
+//!   eviction, same-worker reacquire) that have zero or minimal coverage
+//!   elsewhere.
+//! - **Group C — Run-level conformance.** Run lifecycle state-machine
+//!   tests: terminal irreversibility, registration guards, `completed_at`
+//!   consistency, and terminal-run rejection of shard-level operations.
+//!
+//! Every assertion carries a descriptive message explaining the invariant
+//! under test (Tiger-style). This keeps failures self-diagnosing without
+//! requiring a debugger session or test-name guessing.
 
 use crate::error::{CheckpointError, IdempotentOutcome};
 use crate::lease::Lease;
@@ -76,13 +95,32 @@ fn assert_all_run_transitions_rejected<B: SimulationBackend>(
 
 /// Run the coordination conformance suite against a simulation backend.
 ///
-/// The factory must return a fresh seeded backend for each case. Most cases
-/// use [`CursorSemantics::Completed`]; the dispatched-routing case requests
-/// [`CursorSemantics::Dispatched`] explicitly.
-pub fn run_coordination_conformance<B, F>(factory: F)
+/// # Factory seeding contract
+///
+/// The factory receives a [`CursorSemantics`] value and must return a fresh
+/// backend pre-seeded with:
+///
+/// - **Tenant:** [`test_tenant()`] (`[0x01; 32]`)
+/// - **One run:** [`test_run()`] (ID 1), [`RunStatus::Active`], using the
+///   given `CursorSemantics`
+/// - **One shard:** [`test_shard()`] (ID 10), key range `[a, z)`, initial
+///   cursor
+/// - **Lease duration:** [`LEASE_DURATION`] (100 ticks)
+///
+/// Most cases use [`CursorSemantics::Completed`]; the dispatched-routing
+/// case requests [`CursorSemantics::Dispatched`] explicitly.
+///
+/// # `SimulationBackend` bound
+///
+/// The bound is intentionally [`SimulationBackend`] rather than a narrower
+/// trait intersection. All expected consumers are simulation backends that
+/// already satisfy the full super-trait (`CoordinationFacade +
+/// SimIntrospection`), so a tighter bound would add complexity without
+/// excluding any real caller.
+pub fn run_coordination_conformance<B, F>(mut factory: F)
 where
     B: SimulationBackend,
-    F: Fn(CursorSemantics) -> B,
+    F: FnMut(CursorSemantics) -> B,
 {
     // =====================================================================
     // Group A: Cross-Cutting Invariant Interactions
