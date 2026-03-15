@@ -310,21 +310,21 @@ impl fmt::Display for PageCommitValidationError {
                 f,
                 "checkpoint receipt scope does not match page scope \
                  (expected tenant={:?}, shard={:?}, run={:?}, epoch={:?}, \
-                 units={}, boundary_kind={:?}; \
+                 units={}, boundary={}; \
                  actual tenant={:?}, shard={:?}, run={:?}, epoch={:?}, \
-                 units={}, boundary_kind={:?})",
+                 units={}, boundary={})",
                 expected.tenant_id(),
                 expected.shard_id(),
                 expected.run_id(),
                 expected.fence_epoch(),
                 expected.committed_units(),
-                expected.checkpoint_boundary_kind(),
+                expected.checkpoint_boundary(),
                 actual.tenant_id(),
                 actual.shard_id(),
                 actual.run_id(),
                 actual.fence_epoch(),
                 actual.committed_units(),
-                actual.checkpoint_boundary_kind(),
+                actual.checkpoint_boundary(),
             ),
         }
     }
@@ -980,5 +980,61 @@ mod tests {
         assert_eq!(boundary.cursor(), &cursor);
         assert_eq!(boundary.as_ordered_content(), None);
         assert_eq!(boundary.as_repo_frontier(), Some(&cursor));
+    }
+
+    /// Cursor-only mismatches must be visible in the formatted error message.
+    ///
+    /// When two commit scopes differ only in their checkpoint cursor (same
+    /// boundary kind, same scalars), the Display output must show distinct
+    /// values for expected vs actual so operators can diagnose the root cause.
+    #[test]
+    fn scope_mismatch_display_distinguishes_cursor_only_difference() {
+        let expected_scope = CommitScope::new(
+            tenant(1),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            10,
+            CheckpointBoundary::ordered_content(sample_cursor(0xAA)),
+        );
+        let actual_scope = CommitScope::new(
+            tenant(1),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            10,
+            CheckpointBoundary::ordered_content(sample_cursor(0xBB)),
+        );
+
+        // Scopes must differ (cursor is different).
+        assert_ne!(expected_scope, actual_scope);
+
+        let err = PageCommitValidationError::CheckpointScopeMismatch {
+            expected: Box::new(expected_scope),
+            actual: Box::new(actual_scope),
+        };
+
+        let msg = err.to_string();
+
+        // Split at the semicolon to isolate expected vs actual field values.
+        let halves: Vec<&str> = msg.splitn(2, ';').collect();
+        assert_eq!(halves.len(), 2, "Display must have expected;actual halves");
+
+        // Extract the boundary= value from each half — this is the only field
+        // that differs between the two scopes.
+        let expected_boundary = halves[0]
+            .rsplit_once("boundary=")
+            .map(|(_, v)| v)
+            .expect("expected half must contain boundary=");
+        let actual_boundary = halves[1]
+            .rsplit_once("boundary=")
+            .map(|(_, v)| v)
+            .expect("actual half must contain boundary=");
+
+        assert_ne!(
+            expected_boundary, actual_boundary,
+            "cursor-only mismatch must produce distinct boundary values in \
+             the formatted output:\n  {msg}"
+        );
     }
 }
