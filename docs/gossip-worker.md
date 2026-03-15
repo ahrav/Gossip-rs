@@ -23,10 +23,10 @@ the runtime, and surfaces runtime errors unchanged through `WorkerError`.
 Today that means:
 
 - invalid CLI arguments fail with exit code `2`
-- valid scan requests reach the runtime and currently fail with a
-  family-specific placeholder error
-- successful logging paths remain available for when the family runtime
-  loops are implemented
+- valid filesystem and git scan requests execute through the runtime's
+  local scan loops
+- successful runs log `(items_scanned, bytes_scanned, findings_emitted)`
+  through `tracing`
 
 This keeps the worker binary aligned with the current runtime surface
 instead of preserving a removed driver-based execution path.
@@ -38,8 +38,8 @@ instead of preserving a removed driver-based execution path.
 ```text
 gossip-worker
   --> gossip-scanner-runtime
-       --> ordered-content family placeholder
-       --> git-repo family placeholder
+       --> ordered-content local runtime
+       --> git-repo local runtime
        --> distributed runtime placeholder types
        --> event and commit sink support types
 ```
@@ -123,12 +123,12 @@ The worker test module currently checks:
 - default parsing
 - explicit `git` path parsing with mode override
 - rejection of unknown sources
-- placeholder runtime error for a valid filesystem path
-- placeholder runtime error for a valid git repository root
+- successful filesystem scans for a valid local path
+- successful git scans for a valid repository root
 
-The runtime-placeholder assertions are intentional. They confirm that the
-worker is wired to the current runtime behavior rather than to the removed
-driver-backed scan path.
+These assertions confirm that the worker stays wired to the runtime's live
+filesystem and git execution paths rather than to a removed driver-backed
+scan path.
 
 ---
 

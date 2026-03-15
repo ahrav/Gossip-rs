@@ -9,44 +9,9 @@ use std::{
 #[cfg(unix)]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
-#[cfg(test)]
-use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
-use gossip_contracts::{
-    connector::{
-        ConnectorInputError, Cursor, EnumerateError, ItemKey, MAX_ITEM_KEY_SIZE, ReadError,
-        ToxicDigest,
-    },
-    identity::ConnectorTag,
+use gossip_contracts::connector::{
+    ConnectorInputError, Cursor, EnumerateError, ItemKey, MAX_ITEM_KEY_SIZE, ReadError, ToxicDigest,
 };
-
-// ---------------------------------------------------------------------------
-// Canonical connector-tag constants
-// ---------------------------------------------------------------------------
-//
-// These live in `common` (always compiled, no `cfg` gates) so every
-// platform sees a single definition.  Individual connector modules
-// import them from here; `lib.rs` re-exports them as public API.
-
-/// Connector tag for filesystem-sourced items.
-///
-/// Domain-separates [`gossip_contracts::identity::StableItemId`] derivation so
-/// that identity hashes are disjoint from items produced by other connector
-/// types.
-pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
-
-/// Connector tag for git-sourced items.
-///
-/// Domain-separates [`gossip_contracts::identity::StableItemId`] derivation so
-/// that identity hashes are disjoint from items produced by other connector
-/// types.
-pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
-
-/// Connector tag for the deterministic in-memory connector kind.
-///
-/// Domain-separates [`gossip_contracts::identity::StableItemId`] derivation so
-/// that identity hashes are disjoint from items produced by other connector
-/// types.
-pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmem");
 
 /// Parse an 8-byte big-endian `u64` from a byte slice.
 ///
@@ -59,20 +24,6 @@ pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inm
 pub(crate) fn parse_u64_be(bytes: &[u8]) -> Option<u64> {
     let array: [u8; 8] = bytes.try_into().ok()?;
     Some(u64::from_be_bytes(array))
-}
-
-/// Derive a stable per-key identity via the canonical [`ItemIdentityKey`] path.
-///
-/// The hash input includes the [`ConnectorTag`], connector-instance scope, and
-/// key bytes under domain-separated BLAKE3, so identical key bytes from
-/// different connectors or connector instances produce distinct IDs.
-#[cfg(test)]
-pub(crate) fn derive_stable_item_id(
-    tag: ConnectorTag,
-    connector_instance: ConnectorInstanceIdHash,
-    key: &ItemKey,
-) -> StableItemId {
-    ItemIdentityKey::new(tag, connector_instance, key.as_bytes()).stable_id()
 }
 
 /// Validate a shard key-range bound where `[]` (empty) means unbounded.

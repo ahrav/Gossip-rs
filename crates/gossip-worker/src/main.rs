@@ -1,8 +1,22 @@
-//! Unified gossip-worker entrypoint.
+//! Unified gossip-worker binary entrypoint.
 //!
-//! The worker routes scan requests through `gossip-scanner-runtime`.
-//! The runtime currently validates inputs and returns family-oriented
-//! placeholder errors until the source-specific execution loops are wired in.
+//! The worker is a thin CLI shell around `gossip-scanner-runtime`. It parses
+//! a minimal argument grammar, delegates to [`scan_fs`] or [`scan_git`], and
+//! logs the resulting report via `tracing`.
+//!
+//! # Argument grammar
+//!
+//! ```text
+//! gossip-worker [--mode=direct|connector] [fs|git] [path]
+//! ```
+//!
+//! All arguments are optional. Defaults: `--mode=connector fs .`
+//!
+//! # Exit codes
+//!
+//! - `0` — scan completed successfully.
+//! - `1` — scan failed at runtime.
+//! - `2` — invalid CLI arguments.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -12,6 +26,7 @@ use gossip_scanner_runtime::{
 };
 use tracing_subscriber::EnvFilter;
 
+/// Scan source family selected by the first positional argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerSource {
     Fs,
@@ -39,6 +54,9 @@ impl Default for WorkerConfig {
     }
 }
 
+/// Worker-level error distinguishing argument errors from runtime failures.
+///
+/// `Usage` errors cause exit code 2; `Runtime` errors cause exit code 1.
 #[derive(Debug)]
 enum WorkerError {
     Usage(String),
@@ -69,6 +87,9 @@ impl From<ScanRuntimeError> for WorkerError {
     }
 }
 
+/// Initialize the global tracing subscriber.
+///
+/// Reads the `RUST_LOG` env var for filter directives, defaulting to `info`.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -268,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn run_worker_returns_placeholder_for_filesystem_path() {
+    fn run_worker_scans_filesystem_path() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), "password=xK9mP2qL7wN4vR8t")
             .expect("write fixture");
@@ -279,17 +300,15 @@ mod tests {
             execution_mode: ExecutionMode::Connector,
         };
 
-        let err = run_worker(&cfg).expect_err("filesystem worker should return placeholder");
-        match err {
-            WorkerError::Runtime(ScanRuntimeError::Driver(error)) => {
-                assert!(error.to_string().contains("ordered-content runtime path"));
-            }
-            other => panic!("expected runtime placeholder error, got {other:?}"),
-        }
+        let (items_scanned, bytes_scanned, findings_emitted) =
+            run_worker(&cfg).expect("filesystem worker should succeed");
+        assert!(items_scanned > 0);
+        assert!(bytes_scanned > 0);
+        assert!(findings_emitted <= items_scanned);
     }
 
     #[test]
-    fn run_worker_returns_placeholder_for_git_repo_path() {
+    fn run_worker_scans_git_repo_path() {
         let dir = tempdir().expect("tempdir");
         create_git_repo(dir.path());
         fs::write(dir.path().join("secret.txt"), "token=aB3dE5fG7hJ9kL1m").expect("write fixture");
@@ -302,12 +321,10 @@ mod tests {
             execution_mode: ExecutionMode::Connector,
         };
 
-        let err = run_worker(&cfg).expect_err("git worker should return placeholder");
-        match err {
-            WorkerError::Runtime(ScanRuntimeError::Driver(error)) => {
-                assert!(error.to_string().contains("git-repo runtime path"));
-            }
-            other => panic!("expected runtime placeholder error, got {other:?}"),
-        }
+        let (items_scanned, bytes_scanned, findings_emitted) =
+            run_worker(&cfg).expect("git worker should succeed");
+        assert!(items_scanned > 0);
+        assert!(bytes_scanned > 0);
+        assert!(findings_emitted <= items_scanned);
     }
 }

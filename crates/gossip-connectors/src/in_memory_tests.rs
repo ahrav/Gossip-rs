@@ -186,8 +186,7 @@ fn caps_reflect_token_setting() {
 
 #[test]
 fn different_tags_produce_different_stable_ids() {
-    use crate::common::derive_stable_item_id;
-    use gossip_contracts::identity::ConnectorTag;
+    use gossip_contracts::identity::{ConnectorTag, ItemIdentityKey};
 
     let tag_a = ConnectorTag::from_ascii(b"tagA");
     let tag_b = ConnectorTag::from_ascii(b"tagB");
@@ -195,15 +194,15 @@ fn different_tags_produce_different_stable_ids() {
         gossip_contracts::identity::ConnectorInstanceIdHash::from_instance_id_bytes(b"dataset-a");
     let key = make_key(b"same-key");
 
-    let id_a = derive_stable_item_id(tag_a, instance, &key);
-    let id_b = derive_stable_item_id(tag_b, instance, &key);
+    let id_a = ItemIdentityKey::new(tag_a, instance, key.as_bytes()).stable_id();
+    let id_b = ItemIdentityKey::new(tag_b, instance, key.as_bytes()).stable_id();
     assert_ne!(id_a, id_b);
 }
 
 #[test]
 fn different_instances_produce_different_stable_ids() {
-    use crate::common::IN_MEMORY_CONNECTOR_TAG;
-    use crate::common::derive_stable_item_id;
+    use crate::IN_MEMORY_CONNECTOR_TAG;
+    use gossip_contracts::identity::ItemIdentityKey;
 
     let key = make_key(b"same-key");
     let instance_a =
@@ -211,8 +210,10 @@ fn different_instances_produce_different_stable_ids() {
     let instance_b =
         gossip_contracts::identity::ConnectorInstanceIdHash::from_instance_id_bytes(b"dataset-b");
 
-    let id_a = derive_stable_item_id(IN_MEMORY_CONNECTOR_TAG, instance_a, &key);
-    let id_b = derive_stable_item_id(IN_MEMORY_CONNECTOR_TAG, instance_b, &key);
+    let id_a =
+        ItemIdentityKey::new(IN_MEMORY_CONNECTOR_TAG, instance_a, key.as_bytes()).stable_id();
+    let id_b =
+        ItemIdentityKey::new(IN_MEMORY_CONNECTOR_TAG, instance_b, key.as_bytes()).stable_id();
     assert_ne!(id_a, id_b);
 }
 

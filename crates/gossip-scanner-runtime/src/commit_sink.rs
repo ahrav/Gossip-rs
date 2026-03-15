@@ -84,6 +84,11 @@ impl CommitSink for CliNoOpCommitSink {
 }
 
 /// Durable commit sink used by distributed-mode coordination sinks.
+///
+/// The `in_flight_meta` Mutex is effectively uncontended: the commit forwarder
+/// is a single-threaded drain loop, so only one thread calls `begin_item`,
+/// `upsert_findings`, and `finish_item`. The Mutex satisfies the `Send + Sync`
+/// bound required by `CommitSink` without introducing real contention.
 pub struct DurableCommitSink {
     shard_id: Arc<str>,
     recorder: Arc<dyn CoordinationEventRecorder>,
@@ -173,15 +178,16 @@ impl DurableCommitSink {
 
 impl CommitSink for DurableCommitSink {
     fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()> {
+        let key_bytes = item_key.as_bytes().to_vec();
         self.in_flight_meta
             .lock()
             .map_err(|_| anyhow!("durable commit sink metadata lock poisoned"))?
-            .insert(item_key.as_bytes().to_vec(), meta.clone());
+            .insert(key_bytes.clone(), meta.clone());
 
         self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Begin {
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: key_bytes,
                 size_hint: meta.size_hint,
             },
         )
@@ -198,15 +204,16 @@ impl CommitSink for DurableCommitSink {
     }
 
     fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
+        let key_bytes = item_key.as_bytes().to_vec();
         self.in_flight_meta
             .lock()
             .map_err(|_| anyhow!("durable commit sink metadata lock poisoned"))?
-            .remove(item_key.as_bytes());
+            .remove(&key_bytes);
 
         self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Finish {
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: key_bytes,
             },
         )
     }
@@ -214,6 +221,16 @@ impl CommitSink for DurableCommitSink {
 
 /// Expand a numeric rule identifier into the fixed fingerprint shape used by
 /// identity derivation.
+///
+/// The 4-byte `rule_id` is written into the first 4 bytes of a 32-byte
+/// `RuleFingerprint`, with the remaining 28 bytes zeroed. This mapping is
+/// injective as long as `rule_id` values are unique within a single engine
+/// instance — guaranteed by `Engine::new`, which assigns rule IDs by
+/// sequential position in the input `Vec<RuleSpec>`.
+///
+/// If rule IDs are ever shared or reused across engine instances within the
+/// same tenant/item scope, the resulting fingerprint collisions would produce
+/// incorrect finding identity chains.
 fn rule_fingerprint_from_rule_id(rule_id: u32) -> RuleFingerprint {
     let mut bytes = [0u8; 32];
     bytes[..4].copy_from_slice(&rule_id.to_le_bytes());
@@ -225,7 +242,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::coordination_sink::{StoredCoreEvent, StoredGitEvent};
+    use crate::OwnedCoreEvent;
+    use crate::coordination_sink::StoredGitEvent;
 
     #[derive(Default)]
     struct Recorder {
@@ -234,7 +252,7 @@ mod tests {
     }
 
     impl CoordinationEventRecorder for Recorder {
-        fn record_core_event(&self, _shard_id: &str, _event: StoredCoreEvent) -> Result<()> {
+        fn record_core_event(&self, _shard_id: &str, _event: OwnedCoreEvent) -> Result<()> {
             Ok(())
         }
 
