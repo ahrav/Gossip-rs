@@ -108,6 +108,10 @@ doc = "docs/source-families.md"
 dir = "crates/gossip-connectors/src/"
 
 [[scopes]]
+doc = "docs/source-families.md"
+dir = "crates/gossip-scanner-runtime/src/"
+
+[[scopes]]
 doc = "docs/scanner-core-parity.md"
 dir = "crates/gossip-scanner-runtime/src/"
 

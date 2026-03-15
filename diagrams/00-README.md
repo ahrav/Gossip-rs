@@ -49,7 +49,7 @@ graph TD
     TI[11-tenant-isolation.md<br/>3 isolation layers<br/>5 diagrams]
     SP[12-split-operations.md<br/>split_replace + split_residual<br/>5 diagrams]
     SA[13-shard-algebra-types.md<br/>B3 deep dive: types, keys,<br/>hints, builder<br/>7 diagrams]
-    CA[14-connector-architecture.md<br/>B4 deep dive: traits, types,<br/>driver bridge, errors<br/>4 diagrams]
+    CA[14-connector-architecture.md<br/>B4 deep dive: traits, types,<br/>runtime-family bridge, errors<br/>4 diagrams]
     CR[16-cursor-resume-strategy.md<br/>Two-layer cursor,<br/>token fallback<br/>5 diagrams]
     FW[17-filesystem-walk-state-machine.md<br/>DFS walk, WalkToken,<br/>pruning, safety<br/>5 diagrams]
     SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
@@ -130,7 +130,7 @@ graph TD
 8. `21-findings-postgres-dedup.md` — Batch dedup, observation merge, dual convergence, read API
 9. `22-done-ledger-postgres.md` — Done-ledger PostgreSQL backend: upsert pipeline, provenance merge, schema
 10. `09-circuit-breaker.md` — Failure isolation for external APIs
-11. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
+11. `14-connector-architecture.md` — Trait hierarchy, types, runtime-family bridge, error classification
 12. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
 13. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
 14. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
@@ -164,7 +164,7 @@ graph TD
 | 11  | `11-tenant-isolation.md`             | 5        | B1, B2           | 3 isolation layers, correlation attack, TenantSecretKey                   |
 | 12  | `12-split-operations.md`             | 5        | B2, B3           | split_replace, split_residual, coverage validation                        |
 | 13  | `13-shard-algebra-types.md`          | 7        | B3               | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration    |
-| 14  | `14-connector-architecture.md`       | 4        | B4               | Trait hierarchy, core types, scan-driver bridge, error classification     |
+| 14  | `14-connector-architecture.md`       | 4        | B4               | Trait hierarchy, core types, runtime-family bridge, error classification  |
 | 16  | `16-cursor-resume-strategy.md`       | 5        | B4               | Two-layer cursor, token encoding, resilience model, resume decision       |
 | 17  | `17-filesystem-walk-state-machine.md`| 5        | B4               | DFS walk, WalkFrame stack, subtree pruning, WalkToken, safety mechanisms  |
 | 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |

@@ -29,7 +29,9 @@ cycles.
 
 ```text
 fill_page(shard, cursor, budgets)
-  -> PageBuf<ScanItem> { items, state: HasMore{cursor} | Complete }
+  -> Result<Option<PageBuf<ScanItem>>, EnumerateError>
+     Ok(None)          => terminal completion (shard fully enumerated)
+     Ok(Some(PageBuf)) => { items, state: HasMore{cursor} | Complete }
      for each item:
        open(item_ref, budgets) -> dyn Read
        (optionally) read_range(item_ref, offset, dst, budgets) -> usize
@@ -60,7 +62,8 @@ operates on entire repositories rather than individual items.
 
 ```text
 1. GitRepoDiscoverySource::discover_page(shard, cursor, budgets)
-   -> PageBuf<GitRepoTarget>
+   -> Result<Option<PageBuf<GitRepoTarget>>, EnumerateError>
+      Ok(None) => terminal completion (shard fully enumerated)
 2. GitMirrorManager::sync_mirror(locator)
    -> LocalMirror
 3. GitRepoExecutor::run_repo(mirror, selection, limits)

@@ -309,10 +309,10 @@ for system-wide recovery patterns.
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/types.rs` | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `ScanItem`, `Budgets`, `ConnectorInputError`, `ContentHints`, `Location`, `VersionId`, `PooledByteSlab`, `ToxicDigest` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/ordered.rs` | `OrderedContentSource`, `OrderedContentCapabilities` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/git.rs` | `GitRepoDiscoverySource`, `GitMirrorManager`, `GitRepoExecutor`, `GitRepoTarget`, `LocalMirror`, `GitRunOutcome`, `GitRunError` |
-| `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `is_permanent_io_error`, `classify_io_enumerate_error`, `classify_io_read_error`, `path_digest`, `resolve_bounds` |
+| `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG`, `path_buf_from_bytes` |
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/git.rs` | `GitConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector`, `MemItem` |
-| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `filesystem_placeholder` |
-| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `local_repo_placeholder` |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `filesystem_placeholder` (pub(crate)) |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `local_repo_placeholder` (pub(crate)) |
 | `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/distributed.rs` | `DistributedFamily`, `DistributedRunConfig`, `DistributedRunReport`, `run_distributed` |
