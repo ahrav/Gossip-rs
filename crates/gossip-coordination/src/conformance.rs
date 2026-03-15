@@ -31,6 +31,49 @@ use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use gossip_contracts::identity::{OpId, RunId, ShardId, ShardKey};
 
+/// Assert that `complete_run`, `fail_run`, and `cancel_run` all reject
+/// with `RunTerminal` on a run that has already reached `expected_status`.
+///
+/// Uses timestamps 13–15 and OpIds 101–103 to avoid collisions with the
+/// setup operations in each calling block.
+fn assert_all_run_transitions_rejected<B: SimulationBackend>(
+    coord: &mut B,
+    expected_status: RunStatus,
+) {
+    let err = coord
+        .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RunTransitionError::RunTerminal { status } if status == expected_status
+        ),
+        "complete_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
+    );
+
+    let err = coord
+        .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RunTransitionError::RunTerminal { status } if status == expected_status
+        ),
+        "fail_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
+    );
+
+    let err = coord
+        .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RunTransitionError::RunTerminal { status } if status == expected_status
+        ),
+        "cancel_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
+    );
+}
+
 /// Run the coordination conformance suite against a simulation backend.
 ///
 /// The factory must return a fresh seeded backend for each case. Most cases
@@ -646,38 +689,7 @@ where
         let rec = coord.get_run(test_tenant(), test_run()).unwrap();
         assert_eq!(rec.status(), expected_status);
 
-        let err = coord
-            .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "complete_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
-
-        let err = coord
-            .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "fail_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
-
-        let err = coord
-            .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "cancel_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
+        assert_all_run_transitions_rejected(&mut coord, expected_status);
     }
 
     {
@@ -706,38 +718,7 @@ where
         let rec = coord.get_run(test_tenant(), test_run()).unwrap();
         assert_eq!(rec.status(), expected_status);
 
-        let err = coord
-            .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "complete_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
-
-        let err = coord
-            .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "fail_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
-
-        let err = coord
-            .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "cancel_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
+        assert_all_run_transitions_rejected(&mut coord, expected_status);
     }
 
     {
@@ -758,38 +739,7 @@ where
         let rec = coord.get_run(test_tenant(), test_run()).unwrap();
         assert_eq!(rec.status(), expected_status);
 
-        let err = coord
-            .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "complete_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
-
-        let err = coord
-            .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "fail_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
-
-        let err = coord
-            .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RunTransitionError::RunTerminal { status } if status == expected_status
-            ),
-            "cancel_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
-        );
+        assert_all_run_transitions_rejected(&mut coord, expected_status);
     }
 
     {
