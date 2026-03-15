@@ -22,7 +22,7 @@ loops are wired in behind placeholder entrypoints.
 | File | Purpose |
 |------|---------|
 | `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime` |
-| `src/cli.rs` | `scanner-rs scan {fs|git}` parsing, sink selection, runtime dispatch, stderr summary rendering |
+| `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
 | `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink |
 | `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing |
 | `src/distributed.rs` | Distributed runtime family placeholders and shared config/report types |
@@ -65,8 +65,10 @@ Current behavior after validation:
 - git scans route to `git_repo::local_repo_placeholder`
 - distributed runs route to `distributed::run_distributed`
 
-Each placeholder returns `ScanRuntimeError::Driver(anyhow::Error)`. The
-runtime never uses `todo!()` for unimplemented family paths.
+Filesystem and git placeholders return `ScanRuntimeError::Driver(anyhow::Error)`.
+The distributed placeholder returns `DistributedRuntimeError`, which wraps
+`ScanRuntimeError`. The runtime never uses `todo!()` for unimplemented family
+paths.
 
 ### Family split
 

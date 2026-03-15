@@ -173,8 +173,20 @@ fn scan_git_rejects_subdirectory_of_repo() {
 
 #[test]
 fn scan_git_direct_returns_placeholder_error_after_validation() {
-    let repo = create_test_repo(&[("secret.txt", b"password=xK9mP2qL7wN4vR8t")]);
+    let repo = create_test_repo(&[("secret.txt", b"password=test-password-fixture")]);
     let error = scan_git_direct(&GitScanConfig::new(repo.path())).expect_err("placeholder");
     assert!(matches!(error, ScanRuntimeError::Driver(_)));
     assert!(error.to_string().contains("git-repo"));
+}
+
+#[test]
+fn fs_config_clamps_zero_workers_to_one() {
+    let config = FsScanConfig::new("/tmp").with_workers(0);
+    assert_eq!(config.workers, 1, "zero workers must be clamped to 1");
+}
+
+#[test]
+fn git_config_clamps_zero_workers_to_one() {
+    let config = GitScanConfig::new("/tmp").with_workers(0);
+    assert_eq!(config.workers, 1, "zero workers must be clamped to 1");
 }

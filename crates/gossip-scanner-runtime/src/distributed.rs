@@ -35,7 +35,7 @@ impl Default for DistributedRunConfig {
 }
 
 /// Summary report from one distributed runtime invocation.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DistributedRunReport {
     /// Total number of leases dequeued from the coordinator.
     pub leases_seen: u64,
