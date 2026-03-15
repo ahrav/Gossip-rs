@@ -1,11 +1,11 @@
 ---
 name: pr-comment-response
-description: Respond to PR review comments by verifying bug reports with failing tests before fixing code — never blindly trust a reviewer
+description: Respond to PR review comments by building the smallest proof that confirms or refutes the claim before changing code or docs — never blindly trust a reviewer
 ---
 
 # PR Comment Response
 
-Respond to pull request review comments using a test-driven, verify-first approach. Never blindly accept reviewer suggestions — prove they're right with a failing test before changing code.
+Respond to pull request review comments using a verify-first approach. Never blindly accept reviewer suggestions — build the smallest proof that can confirm or refute the claim before changing code or docs.
 
 ## When to Use
 
@@ -16,14 +16,14 @@ Respond to pull request review comments using a test-driven, verify-first approa
 
 ## Core Principle
 
-**Reviewers can be wrong.** Treat every bug claim as a hypothesis, not a fact. The workflow is:
+**Reviewers can be wrong.** Treat every correctness claim as a hypothesis, not a fact. The workflow is:
 
 1. Read the comment
 2. Understand the claim
-3. Write a test that would fail if the claim is true
-4. Run the test — does it actually fail?
-5. Only fix code if the test fails
-6. If the test passes, the reviewer was wrong — respond with evidence
+3. Choose the smallest proof that could decide it
+4. Run that proof
+5. Change code or docs only if the proof justifies it
+6. Respond with evidence
 
 ## Workflow
 
@@ -40,6 +40,7 @@ Collect every comment. Categorize each one:
 | Category | Action |
 |----------|--------|
 | **Bug report** | Full verify-first workflow (Steps 2-6) |
+| **Invariant / assertion-strength claim** | Targeted boundary proof plus code-path audit |
 | **Style/naming suggestion** | Evaluate on merit, apply if reasonable |
 | **Question / clarification** | Reply with explanation |
 | **Refactor suggestion** | Evaluate, apply if it improves clarity without risk |
@@ -47,16 +48,20 @@ Collect every comment. Categorize each one:
 
 **Focus the verify-first workflow on bug reports and correctness claims.** These are the comments where blind trust is most dangerous.
 
-### Step 2: Analyze Each Bug Claim
+**Invariant / assertion-strength claims also require Steps 2–6** — treat the
+claimed weakness as the hypothesis, identify the boundary input that would
+expose it, and proceed through the same workflow.
 
-For each comment claiming a bug or incorrect behavior:
+### Step 2: Analyze Each Correctness Claim
+
+For each comment claiming a bug, incorrect behavior, or assertion-strength gap:
 
 1. **Read the code** the comment refers to — understand it fully before proceeding
 2. **Identify the claim** — what specific behavior does the reviewer say is wrong?
 3. **Identify the trigger** — what input, state, or condition would expose the bug?
 4. **Assess plausibility** — does the claim make logical sense given the code?
 
-Document your analysis before writing any test:
+Document your analysis before building any proof:
 
 ```markdown
 ### Comment: [reviewer quote or summary]
@@ -64,11 +69,20 @@ Document your analysis before writing any test:
 - **Claim**: [what the reviewer says is wrong]
 - **Trigger condition**: [input/state that would expose the bug]
 - **Plausibility**: [high/medium/low — your initial assessment and why]
+- **Best proof form**: [failing test / boundary test + code-path audit / doc-only verification]
 ```
 
-### Step 3: Write a Failing Test
+### Step 3: Construct the Smallest Discriminating Proof
 
-Write a test that **directly targets the claimed bug**. The test should:
+Pick the lightest proof that can separate "reviewer is right" from "reviewer is wrong":
+
+| Claim shape | Preferred proof |
+|-------------|-----------------|
+| Behavioral bug | A failing test that directly targets the claimed trigger |
+| Boundary or invariant-strength concern | The smallest boundary test that distinguishes the competing claims, plus a code-path audit if control flow matters |
+| Docs / wording mismatch | Verify against implementation and update docs only if the reviewer is right |
+
+If the right proof is a test, it should:
 
 - Use the exact trigger condition the reviewer described (or a minimal reproduction)
 - Assert the **correct** behavior (what the code *should* do)
@@ -85,45 +99,60 @@ fn handles_empty_input_without_panic() {
 
 **Do NOT touch the production code yet.**
 
-### Step 4: Run the Test
+### Step 4: Run the Proof
+
+Run the proof you chose.
+
+If the proof includes a test:
 
 ```bash
 cargo test <test_name> -- --nocapture
 ```
 
-**Two outcomes:**
+**Three outcomes matter:**
 
-#### Test FAILS — Reviewer was right
+#### Bug confirmed
 
-The bug is confirmed. Proceed to Step 5.
+The proof shows the implementation is wrong. Proceed to Step 5.
 
 Record:
 ```markdown
-- **Verdict**: CONFIRMED — test fails with: [error message]
+- **Verdict**: CONFIRMED — [failing test, trace, or boundary proof]
 ```
 
-#### Test PASSES — Reviewer was wrong
+#### Code is correct, but docs or wording are misleading
+
+Do not change the implementation. Fix only the docs or comments that created the confusion.
+
+Record:
+```markdown
+- **Verdict**: DOCS ONLY — implementation is correct, wording was misleading
+- **Evidence**: [test, trace, or code-path proof]
+```
+
+#### Claim not reproduced
 
 The code already handles this case correctly. **Do not change the code.**
 
-**Delete the verification test.** It served its purpose — proving the reviewer's claim was wrong. Keeping it adds noise without value since it tests behavior that already works and wasn't at risk.
+If you wrote a diagnostic test and it passes, **delete it** unless it adds durable coverage for a realistic future risk.
 
 Record:
 ```markdown
-- **Verdict**: NOT REPRODUCED — test passes, code already handles this correctly
-- **Verification test**: removed (served its diagnostic purpose)
+- **Verdict**: NOT REPRODUCED — code already handles this correctly
+- **Verification artifact**: removed or not kept if it was diagnostic only
 - **Response**: [draft reply to reviewer explaining why the code is correct]
 ```
 
 Skip to Step 6 for this comment.
 
-### Step 5: Fix the Code (Only After Confirmed Failure)
+### Step 5: Apply the Minimal Change Supported by the Proof
 
-Now — and only now — fix the production code:
+Now — and only now — make the smallest change the evidence supports:
 
-1. Make the **minimal change** needed to pass the test
-2. Run the specific test to confirm it passes
-3. Run the full test suite to check for regressions
+1. If the implementation is wrong, make the **minimal code change** needed to satisfy the proof.
+2. If only the wording is wrong, make the **minimal doc or comment change** needed to match reality.
+3. Re-run the specific proof to confirm the change is correct.
+4. Run broader checks if code changed.
 
 ```bash
 # Confirm the fix
@@ -133,7 +162,7 @@ cargo test <test_name> -- --nocapture
 cargo test
 ```
 
-If the full suite passes, the fix is good. If new failures appear, investigate — the fix may have been too broad or revealed a deeper issue.
+If broader checks fail, investigate — the fix may have been too broad or revealed a deeper issue.
 
 ### Step 6: Respond to the Reviewer
 
@@ -145,10 +174,16 @@ Good catch! Confirmed — added a test (`test_name`) that reproduces this.
 Fixed in [commit SHA]. The issue was [brief explanation].
 ```
 
+**For docs-only corrections:**
+```markdown
+I checked this against the current implementation. The code path is correct, but the wording was misleading.
+Clarified in [commit SHA] so the docs now match the actual behavior.
+```
+
 **For unconfirmed claims:**
 ```markdown
-I investigated this and wrote a test targeting the scenario you described.
-The test passes against the current code — [brief explanation of why the code is correct].
+I investigated this with a targeted proof for the scenario you described.
+The current code already handles it correctly — [brief explanation of why the code is correct].
 Let me know if I'm missing something.
 ```
 
@@ -171,12 +206,13 @@ After processing all comments, produce a summary:
 ```markdown
 ## PR Comment Response Summary — PR #<number>
 
-### Bug Claims Investigated
+### Claims Investigated
 
-| # | Comment | File | Verdict | Test | Fix |
-|---|---------|------|---------|------|-----|
-| 1 | [summary] | path:line | CONFIRMED | test_name (kept) | commit SHA |
-| 2 | [summary] | path:line | NOT REPRODUCED | verified & removed | N/A |
+| # | Comment | File | Verdict | Proof | Fix |
+|---|---------|------|---------|-------|-----|
+| 1 | [summary] | path:line | CONFIRMED | failing test `test_name` | commit SHA |
+| 2 | [summary] | path:line | DOCS ONLY | code-path audit + targeted proof | commit SHA |
+| 3 | [summary] | path:line | NOT REPRODUCED | verified & removed | N/A |
 
 ### Other Changes
 
@@ -194,10 +230,11 @@ After processing all comments, produce a summary:
 ## Anti-Patterns to Avoid
 
 - **Blind application**: Never change code just because a reviewer said to
-- **Skipping the test**: Always write the test before fixing, even if the bug seems obvious
-- **Fixing without failing**: If your test passes, the "bug" isn't a bug — don't fix it
-- **Over-scoping fixes**: Fix only what the test proves is broken, nothing more
-- **Keeping diagnostic tests**: If a verification test passes (reviewer was wrong), delete it — it was a diagnostic tool, not a valuable test. Tests that merely confirm already-working behavior add noise.
+- **Skipping the proof**: Always produce evidence before changing code or docs
+- **Using a heavyweight test when a smaller proof would decide it**: Prefer the lightest artifact that discriminates between the competing claims
+- **Fixing without confirmation**: If your proof does not show the implementation is wrong, don't "fix" it
+- **Over-scoping fixes**: Fix only what the proof shows is wrong, nothing more
+- **Keeping diagnostic tests**: If a verification artifact only proved the reviewer wrong, remove it unless it adds durable value
 - **Naming tests after the review**: Never name a test "regression_for_pr_comment" or similar. Name it after the behavior it verifies.
 - **Arguing without evidence**: If you disagree with a reviewer, show a passing test, don't just assert correctness
 
