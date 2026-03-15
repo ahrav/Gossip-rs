@@ -4063,9 +4063,9 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vectorscan-rs-sys"
-version = "0.0.5"
+version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "473f4b86c4c9e42140712b9790079bca554f6341c8ce19f0f1a3ad3b9509dbd5"
+checksum = "195d07e20b78923c2e8542f95a9bfd31d0cacf19f9134181c292b84055c5c7c1"
 dependencies = [
  "cmake",
  "flate2",
