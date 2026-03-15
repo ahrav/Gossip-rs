@@ -1293,7 +1293,6 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "gossip-contracts",
- "gossip-scan-driver",
  "gossip-stdx",
  "libc",
  "proptest",
@@ -1401,16 +1400,6 @@ dependencies = [
  "postgres",
  "proptest",
  "testcontainers",
-]
-
-[[package]]
-name = "gossip-scan-driver"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gossip-contracts",
- "scanner-engine",
- "scanner-scheduler",
 ]
 
 [[package]]

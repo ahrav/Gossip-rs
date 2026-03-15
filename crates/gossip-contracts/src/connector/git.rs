@@ -39,7 +39,7 @@
 //!   boundary (for example, watermark stores or seen-blob state in runtime
 //!   crates).
 //! - No type in this module depends on `scanner-git`, `gix-*`, or
-//!   `gossip-scan-driver`.
+//!   the removed legacy driver crate.
 
 use std::{
     fmt,

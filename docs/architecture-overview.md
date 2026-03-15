@@ -174,11 +174,9 @@ gossip-contracts  (data model leaf -- identity, shard spec, connector types)
     ├──► gossip-frontier       (shard algebra -- key encoding, range arithmetic, builder)
     ├──► gossip-coordination   (protocol -- state machine, lease/fence, in-memory backend)
     ├──► gossip-connectors     (source impls -- filesystem, git, in-memory connectors)
-    └──► gossip-scan-driver    (driver boundary -- Assignment → ScanSourceFactory → ScanDriver)
+    └──► gossip-scanner-runtime  (family-oriented runtime -- scan_fs / scan_git dispatchers)
               │
-              └──► gossip-scanner-runtime  (unified runtime -- scan_fs / scan_git dispatchers)
-                        │
-                        └──► gossip-worker  (binary -- CLI entry, tracing, exit codes)
+              └──► gossip-worker  (binary -- CLI entry, tracing, exit codes)
 ```
 
 | Component                          | Location                                                                  | Purpose                                                                                                    |
@@ -192,9 +190,7 @@ gossip-contracts  (data model leaf -- identity, shard spec, connector types)
 | **CoordinationBackend**            | `crates/gossip-coordination/src/traits.rs`                                | Trait defining `acquire_and_restore_into`, `renew`, `checkpoint`, `complete`, `park_shard`, `split_replace`, `split_residual` |
 | **InMemoryCoordinator**            | `crates/gossip-coordination/src/in_memory.rs`                             | Reference backend implementation (executable spec for testing and simulation)                               |
 | **gossip-connectors**              | `crates/gossip-connectors/src/`                                           | Concrete connector implementations: `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
-| **ScanSourceFactory impls**        | `crates/gossip-connectors/src/scan_driver.rs`                             | `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`, `execute_git_assignment`                       |
-| **gossip-scan-driver**             | `crates/gossip-scan-driver/src/lib.rs`                                    | `ScanDriver` + `ScanSourceFactory` traits, `Assignment`, `CommitSink`, execution configs                   |
-| **gossip-scanner-runtime**         | `crates/gossip-scanner-runtime/src/lib.rs`                                | Unified runtime: `scan_fs()`, `scan_git()` entry points; `ExecutionMode` (Direct/Connector) routing        |
+| **gossip-scanner-runtime**         | `crates/gossip-scanner-runtime/src/lib.rs`                                | Family-oriented runtime: `scan_fs()`, `scan_git()` entry points; `ExecutionMode` (Direct/Connector) routing |
 | **Distributed Coordinator**        | `crates/gossip-scanner-runtime/src/distributed.rs`                        | `DistributedCoordinator` trait, `ShardLease`, distributed run loop                                         |
 | **gossip-worker**                  | `crates/gossip-worker/src/main.rs`                                        | Binary: CLI arg parsing, tracing init, dispatches to `scan_fs`/`scan_git` via runtime                      |
 

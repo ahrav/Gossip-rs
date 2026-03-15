@@ -60,43 +60,34 @@ The crate provides four core capabilities:
 | `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |
 | `split_estimator.rs` | `StreamingSplitEstimator` -- bounded-memory byte-weighted split-point estimation                          |
 | `git.rs`         | `GitConnector` -- Git repository connector with ref enumeration and blob reading                              |
-| `scan_driver.rs` | `ScanSourceFactory` impls: `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`; standalone `execute_git_assignment` |
 
 ---
 
 ## 2. Architectural Layering
 
 ```text
-         ┌──────────────────────────────────────────────────┐
-         │  gossip-scanner-runtime                          │  scan_fs(), scan_git()
-         │  (top-level scan dispatchers)                    │  entry points
-         └──────────────┬───────────────────────────────────┘
-                        │ uses ScanSourceFactory + ScanDriver::run()
+gossip-scanner-runtime / scanner-rs-cli / gossip-worker
+    source-family orchestration and entry points
+                        │
                         ▼
-         ┌──────────────────────────────────────────────────┐
-         │  gossip-scan-driver (traits + types)             │  ScanDriver, ScanSourceFactory,
-         │                                                  │  Assignment, ScanExecutionConfig
-         └──────────────┬───────────────────────────────────┘
-                        │ implemented by
+gossip-connectors
+    concrete family implementations
+    - FilesystemConnector
+    - InMemoryDeterministicConnector
+    - GitConnector
+                        │
                         ▼
-         ┌──────────────────────────────────────────────────┐
-         │  gossip-connectors (Boundary 4 implementations)  │  FilesystemConnector,
-         │  + scan_driver.rs (ScanSourceFactory impls)      │  InMemoryDeterministicConnector,
-         │                                                  │  Fs/Git/InMemoryScanSourceFactory
-         └──────────────┬───────────────────────────────────┘
-                        │ depends on
+gossip-contracts::connector
+    family contracts + paging/value types
+    - OrderedContentSource
+    - GitRepoDiscoverySource
+    - GitMirrorManager
+    - GitRepoExecutor
+    - PageBuf / Cursor / ScanItem / ItemKey
+                        │
                         ▼
-         ┌──────────────────────────────────────────────────┐
-         │  gossip-contracts::connector (Boundary 4 contracts) │  traits, types
-         │                                                  │
-         └──────────────┬───────────────────────────────────┘
-                        │ depends on
-                        ▼
-         ┌──────────────────────────────────────────────────┐
-         │  gossip-contracts::identity (B1) +               │  ConnectorTag,
-         │  gossip-contracts::coordination (B2 data model)  │  StableItemId,
-         │                                                  │  ShardSpec, CursorUpdate
-         └──────────────────────────────────────────────────┘
+gossip-contracts::identity + gossip-contracts::coordination
+    ConnectorTag / StableItemId / ShardSpec
 ```
 
 ### Ownership boundaries
@@ -108,9 +99,7 @@ The crate provides four core capabilities:
 | Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
 | Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `resolve_bounds`                                     |
 | Streaming split estimation     | `gossip-connectors::split_estimator` | `StreamingSplitEstimator` (bounded-memory byte-weighted median)             |
-| Scan driver traits             | `gossip-scan-driver`             | `ScanDriver::run()`, `ScanSourceFactory`, `Assignment`                             |
-| Scan source factory impls      | `gossip-connectors::scan_driver` | `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`, `execute_git_assignment` |
-| Scan runtime entry points      | `gossip-scanner-runtime`         | `scan_fs()`, `scan_git()`, execution-mode dispatch                                 |
+| Family runtime entry points    | `gossip-scanner-runtime`         | `scan_fs()`, `scan_git()`, execution-mode dispatch over source families             |
 
 ### Dependency direction
 
@@ -122,13 +111,10 @@ value types. It must NOT depend on `gossip-coordination`,
   gossip-connectors ──► gossip-contracts
 ```
 
-`gossip-scan-driver` defines the `ScanDriver` and `ScanSourceFactory` traits
-that bridge assignments to source-specific execution backends.
-`gossip-connectors::scan_driver` provides concrete factory implementations
-(`FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`) and the
-standalone `execute_git_assignment` entry point for git scans. `gossip-scanner-runtime` provides the top-level
-entry points (`scan_fs()`, `scan_git()`) that compose driver execution with
-engine and event infrastructure.
+The legacy universal driver layer has been removed from the workspace.
+Higher-level runtime crates now integrate directly with the source-family
+contracts in `gossip-contracts::connector` and the concrete family
+implementations in `gossip-connectors`.
 
 ---
 
@@ -465,95 +451,34 @@ or weight concentrates in the leading entry.
 
 ---
 
-## 6a. Scan Source Factories (`scan_driver.rs`)
+## 6a. Source-Family Integration
 
-`scan_driver.rs` provides concrete `ScanSourceFactory`
-implementations that bridge coordination-layer assignments to
-source-specific scan execution backends. Each factory validates the
-assignment's `ConnectorKind`, extracts the source payload, and returns a
-boxed `ScanDriver` that runs the actual scan.
+Boundary 4 no longer routes through a universal driver abstraction.
+Integration now happens through the family contracts themselves:
 
-### Factory types
+- ordered content sources implement `OrderedContentSource`
+- Git repository discovery implements `GitRepoDiscoverySource`
+- local mirror preparation implements `GitMirrorManager`
+- repo-native execution implements `GitRepoExecutor`
 
-| Factory                        | `ConnectorKind` | Driver                | Backend                       |
-| ------------------------------ | --------------- | --------------------- | ----------------------------- |
-| `FilesystemScanSourceFactory`  | `Filesystem`    | `FsScanDriver`        | `parallel_scan_dir`           |
-| `InMemoryScanSourceFactory`    | `InMemory`      | `InMemoryScanDriver`  | Sequential item iteration     |
-
-> Git scans use `execute_git_assignment()` instead of the factory/trait
-> path — see below.
-
-The crate root re-exports `FilesystemScanSourceFactory`,
-`InMemoryScanSourceFactory`, `execute_git_assignment`,
-`GitExecutionConfig`, and `GitDebugLevel`.
-
-### `FilesystemScanSourceFactory`
-
-Zero-sized, `Copy`-able factory. Creates `FsScanDriver` which wraps
-`parallel_scan_dir` from `scanner-scheduler`. Event and commit forwarding
-use scoped threads with crossbeam channels to bridge the scheduler's
-`EventOutput` / `StoreProducer` interfaces to the coordination layer's
-`EventOutput` and `CommitSink` sinks (`FsScanDriver::run` takes
-`&dyn EventOutput`, not `&dyn GitEventOutput` — the git-specific event
-trait is only used on the dedicated git execution path). Does not support
-cooperative cancellation (only pre-check). Checkpoint hints are not
-currently supported (will be added with resumable FS scans).
-
-### `execute_git_assignment`
-
-Sole entry point for git scans; does not go through `ScanDriver::run` or
-`ScanSourceFactory`. Requires `&dyn GitEventOutput` so the driver can
-emit git-specific events (`CommitMeta`, `IdentityDictionary`) alongside
-`CoreEvent`s. Accepts `GitExecutionConfig` to control scan mode
-(`OdbBlobFast` vs `DiffHistory`), merge-diff mode (`AllParents` vs
-`FirstParent`), and the stable repository identifier. Returns
-`(ScanReport, Option<CursorUpdate>, Option<String>)`; the cursor is
-always `None` because git uses watermark-based persistence, not
-cursor-based.
-
-### `InMemoryScanSourceFactory`
-
-Cloneable factory backed by `Arc<[MemItem]>`. Items are sorted at
-construction time for deterministic scan order. Creates
-`InMemoryScanDriver` which iterates items sequentially, driving the
-commit-sink lifecycle (`begin_item` / `finish_item`) and emitting
-checkpoint hints at configured intervals. Does not invoke the scanner
-engine. Supports both checkpoint hints and cooperative cancellation.
-
-### Channel-based event and commit forwarding
-
-The scan drivers use crossbeam channels to forward events and findings
-across thread boundaries:
-
-- `ChannelEventOutput` -- implements `EventOutput` and forwards
-  `CoreEvent`s as `OwnedCoreEvent` for cross-thread delivery.
-- `ChannelGitEventOutput` -- implements both `EventOutput` and
-  `GitEventOutput`, forwarding both core and git events through a
-  shared channel (used only in the git execution path).
-- `ChannelStoreProducer` -- normalizes scheduler paths (absolute OS
-  paths from `FsFindingBatch`) to connector-relative `/`-separated key
-  encoding via `normalize_scheduler_path`, then forwards batches through
-  the commit channel.
-- `forward_commits` drains the commit channel, mapping
-  `OwnedFsFindingBatch` to `CommitSink` lifecycle calls
-  (`begin_item` → `upsert_findings` → `finish_item`). On error, the
-  first failure is captured but draining continues to prevent deadlock.
+The practical migration guide for new source work lives in
+`docs/source-families.md`.
 
 ---
 
-## 7. Scan Execution Path
+## 7. Runtime Integration
 
-Scan execution flows through three crates that compose connectors with
-the scanner engine and coordination layer:
+Runtime entry points live in `gossip-scanner-runtime`. They expose both
+`Direct` and `Connector` execution modes, but both modes currently cross
+the same family-oriented runtime boundary rather than a separate universal
+driver layer.
 
-- **`gossip-scan-driver`** (`crates/gossip-scan-driver/src/lib.rs`) --
-  defines `ScanDriver::run()` and `ScanSourceFactory` traits.
-- **`gossip-connectors::scan_driver`** (`crates/gossip-connectors/src/scan_driver.rs`) --
-  provides `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`,
-  and `execute_git_assignment` (see Section 6a).
-- **`gossip-scanner-runtime`** (`crates/gossip-scanner-runtime/src/lib.rs`) --
-  provides `scan_fs()` and `scan_git()` top-level entry points that
-  compose driver execution with engine and event infrastructure.
+- Ordered-content paths compose connector enumeration/read behavior with
+  scheduler and engine infrastructure.
+- Git paths compose repository discovery, mirror preparation, and
+  repo-native execution with `scanner-git`.
+- The connector boundary remains responsible for source semantics,
+  identity derivation, cursor handling, and split-point selection.
 
 ---
 

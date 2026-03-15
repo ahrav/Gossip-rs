@@ -1,6 +1,5 @@
 //! Shared connector utilities: shard-bound validation, binary search,
-//! split-candidate validation, identity derivation, and canonical
-//! connector-tag constants.
+//! split-candidate validation, and canonical connector-tag constants.
 
 use std::{
     io,
@@ -10,12 +9,14 @@ use std::{
 #[cfg(unix)]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
+#[cfg(test)]
+use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
 use gossip_contracts::{
     connector::{
         ConnectorInputError, Cursor, EnumerateError, ItemKey, MAX_ITEM_KEY_SIZE, ReadError,
         ToxicDigest,
     },
-    identity::{ConnectorInstanceIdHash, ConnectorTag, ItemIdentityKey, StableItemId},
+    identity::ConnectorTag,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,20 +29,23 @@ use gossip_contracts::{
 
 /// Connector tag for filesystem-sourced items.
 ///
-/// Domain-separates [`StableItemId`] derivation so that identity hashes are
-/// disjoint from items produced by other connector types.
+/// Domain-separates [`gossip_contracts::identity::StableItemId`] derivation so
+/// that identity hashes are disjoint from items produced by other connector
+/// types.
 pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
 
 /// Connector tag for git-sourced items.
 ///
-/// Domain-separates [`StableItemId`] derivation so that identity hashes are
-/// disjoint from items produced by other connector types.
+/// Domain-separates [`gossip_contracts::identity::StableItemId`] derivation so
+/// that identity hashes are disjoint from items produced by other connector
+/// types.
 pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
 
 /// Connector tag for the deterministic in-memory connector kind.
 ///
-/// Domain-separates [`StableItemId`] derivation so that identity hashes are
-/// disjoint from items produced by other connector types.
+/// Domain-separates [`gossip_contracts::identity::StableItemId`] derivation so
+/// that identity hashes are disjoint from items produced by other connector
+/// types.
 pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmem");
 
 /// Parse an 8-byte big-endian `u64` from a byte slice.
@@ -62,6 +66,7 @@ pub(crate) fn parse_u64_be(bytes: &[u8]) -> Option<u64> {
 /// The hash input includes the [`ConnectorTag`], connector-instance scope, and
 /// key bytes under domain-separated BLAKE3, so identical key bytes from
 /// different connectors or connector instances produce distinct IDs.
+#[cfg(test)]
 pub(crate) fn derive_stable_item_id(
     tag: ConnectorTag,
     connector_instance: ConnectorInstanceIdHash,
