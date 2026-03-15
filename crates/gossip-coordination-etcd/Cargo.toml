@@ -17,6 +17,7 @@ test-support = [
     "etcd-client/build-server",
     "dep:rand",
     "dep:rand_chacha",
+    "dep:testcontainers",
 ]
 
 [dependencies]
@@ -28,6 +29,7 @@ tokio = { version = "1", features = ["rt", "time", "sync", "net"] }
 tracing.workspace = true
 rand = { version = "0.9", optional = true }
 rand_chacha = { version = "0.9", optional = true }
+testcontainers = { workspace = true, optional = true }
 
 [dev-dependencies]
 gossip-coordination = { workspace = true, features = ["test-support"] }

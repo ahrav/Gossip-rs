@@ -228,7 +228,7 @@ pub enum SimOp {
 ///
 /// The `kind()` method maps each variant to a payload-free
 /// [`SimEventKind`] discriminant for histogram counting in [`SimReport`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimEvent {
     /// Lease acquired; `fence` is the new fence epoch for the shard.
     AcquireOk { fence: FenceEpoch },
