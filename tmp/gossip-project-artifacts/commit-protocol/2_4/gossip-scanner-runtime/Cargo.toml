@@ -1,0 +1,31 @@
+[package]
+name = "gossip-scanner-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Runtime orchestration APIs for scanner-rs direct and connector execution modes"
+
+[features]
+default = []
+aegis-pure-rust = [
+    "scanner-engine/aegis-pure-rust",
+    "scanner-scheduler/aegis-pure-rust",
+    "scanner-git/aegis-pure-rust",
+]
+
+[dependencies]
+anyhow.workspace = true
+gossip-contracts.workspace = true
+scanner-engine.workspace = true
+scanner-scheduler.workspace = true
+scanner-git.workspace = true
+regex = "1.12"
+serde_json = "1"
+tracing.workspace = true
+
+[dev-dependencies]
+gossip-persistence-inmemory.workspace = true
+rstest.workspace = true
+tempfile = "3"
