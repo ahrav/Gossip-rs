@@ -16,6 +16,11 @@ use gossip_coordination::{
 };
 use gossip_coordination_etcd::{EtcdCoordinatorConfig, SimEtcdCoordinator};
 
+/// Etcd owner-lease TTL. Named `_SECS` to match the real etcd gRPC API
+/// parameter, but `SimEtcdCoordinator` consumes this as logical ticks.
+/// Must be >= LEASE_DURATION so the etcd owner key survives for the
+/// full protocol lease period; each acquire issues a fresh lease_grant,
+/// so a single-lease-duration bound is sufficient.
 const OWNER_LEASE_TTL_SECS: i64 = 200;
 const OPTIMISTIC_TXN_RETRIES: usize = 8;
 const MAX_CHILDREN_PER_OP: usize = 8;
@@ -23,6 +28,9 @@ const SEED: u64 = 42;
 
 const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
 const _: () = assert!(LEASE_DURATION == 100);
+// The etcd owner key must outlive one protocol lease so checkpoint/complete
+// CAS guards find it. Each acquire creates a fresh etcd lease, so there is
+// no need for the TTL to span multiple consecutive protocol leases.
 const _: () = assert!(OWNER_LEASE_TTL_SECS >= LEASE_DURATION as i64);
 
 #[test]
