@@ -55,8 +55,8 @@ struct EtcdEndpoint {
     _container: Option<Container<GenericImage>>,
 }
 
-/// SAFETY: `Container<GenericImage>` is `Send + Sync`, and `String`
-/// is trivially `Send + Sync`. OnceLock requires `Sync`.
+/// Both `Container<GenericImage>` and `String` are `Send + Sync`,
+/// satisfying the `OnceLock` bound.
 static SHARED_ETCD: OnceLock<EtcdEndpoint> = OnceLock::new();
 
 /// Build the etcd container image definition.

@@ -27,8 +27,10 @@
 //!   from either side is a test failure.
 //!
 //! Implementation-specific details (etcd revision numbers, raw lease IDs,
-//! internal slab addresses) are **stripped** before comparison via the
-//! `Comparable*` wrapper types.
+//! internal slab addresses) are **stripped** before comparison. Events are
+//! compared directly as [`SimEvent`] values (which derive `PartialEq`);
+//! state snapshots are compared via the `Comparable*` wrapper types that
+//! normalize away backend-specific fields.
 //!
 //! # Architecture
 //!
@@ -90,8 +92,9 @@ const N_SHARDS: u64 = 8;
 /// Long TTL avoids time-of-day expiry interfering with the oracle's
 /// coordination-level comparisons. The oracle runs at `FaultLevel::SunnyDay`
 /// (no synthetic time-jumps), so leases expire only if the test clock
-/// advances far enough — 300 s of logical time is well beyond the
-/// `AdvanceTime` range in `arb_sim_op`.
+/// advances far enough. No single `AdvanceTime` step in `arb_sim_op`
+/// exceeds 150 ticks, so 300 s provides at least a 2× safety margin per
+/// step against accidental expiry.
 const OWNER_LEASE_TTL_SECS: i64 = 300;
 
 const OPTIMISTIC_TXN_RETRIES: usize = 8;
@@ -188,9 +191,10 @@ struct ObservedEtcdRunIter<'a> {
 // mechanism by which the oracle detects behavioral drift without being
 // sensitive to implementation-level noise.
 
-/// Lease stripped of its etcd-internal lease ID. Only the worker identity
+/// Lease fields for cross-backend comparison. Only the worker identity
 /// and logical deadline are semantically meaningful at the coordination
-/// boundary.
+/// boundary; backend-specific identifiers (etcd lease ID, slab slot) are
+/// excluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComparableLease {
     owner: WorkerId,
@@ -223,6 +227,9 @@ struct ComparableRunOpLogEntry {
 /// lease (as [`ComparableLease`]), fence epoch, split lineage, and op log.
 /// Variable-length byte fields (`spec_start`, `spec_end`, `cursor_last_key`)
 /// are materialized into owned `Vec<u8>` so comparison is slab-independent.
+///
+/// `cursor_token` is intentionally omitted: the sim harness never exercises
+/// token-based cursors, so the field is always `None` on both sides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComparableShardState {
     status: ShardStatus,
@@ -258,6 +265,14 @@ struct ComparableBackendState {
     shards: BTreeMap<ShardCacheKey, ComparableShardState>,
 }
 
+// Tripwire: if ShardRecord or RunRecord layout changes, audit `comparable_state`
+// to ensure the new fields are captured (or intentionally excluded).
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<ShardRecord>() == 728);
+    assert!(std::mem::size_of::<RunRecord>() == 512);
+};
+
 // ---------------------------------------------------------------------------
 // Differential oracle — the core test driver
 // ---------------------------------------------------------------------------
@@ -268,6 +283,7 @@ struct ComparableBackendState {
 struct DifferentialOracle {
     sim: CoordinationSim<SimEtcdCoordinator>,
     etcd: CoordinationSim<ObservedEtcdCoordinator>,
+    seed: u64,
 }
 
 /// Debug payload carried into [`panic_drift`] for rich failure messages.
@@ -561,6 +577,8 @@ impl CoordinationBackend for ObservedEtcdCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
         let result = self.inner.split_replace(now, tenant, lease, plan, op_id);
+        // Register new shard IDs *before* refresh so the refresh loop
+        // knows to fetch their snapshots from etcd.
         if let Ok(outcome) = result.as_ref() {
             self.note_shards(
                 tenant,
@@ -580,6 +598,7 @@ impl CoordinationBackend for ObservedEtcdCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
         let result = self.inner.split_residual(now, tenant, lease, plan, op_id);
+        // Same ordering invariant as split_replace: note before refresh.
         if let Ok(outcome) = result.as_ref() {
             self.note_shards(tenant, lease.run(), [outcome.as_ref().residual]);
         }
@@ -611,8 +630,8 @@ impl RunManagement for ObservedEtcdCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError> {
         let result = self.inner.register_shards(now, tenant, run, shards, op_id);
-        if result.is_ok() {
-            self.note_shards(tenant, run, shards.iter().map(InitialShardInput::shard));
+        if let Ok(outcome) = result.as_ref() {
+            self.note_shards(tenant, run, outcome.as_ref().iter().copied());
         }
         self.refresh_if_ok(tenant, run, result, "register_shards")
     }
@@ -734,7 +753,7 @@ impl DifferentialOracle {
         let etcd = CoordinationSim::with_backend(seed, FaultLevel::SunnyDay, etcd_backend)
             .with_workers_and_shards(N_WORKERS, N_SHARDS);
 
-        let oracle = Self { sim, etcd };
+        let oracle = Self { sim, etcd, seed };
         let sim_state = comparable_state(oracle.sim.backend());
         let etcd_state = comparable_state(oracle.etcd.backend());
         if sim_state != etcd_state {
@@ -751,14 +770,15 @@ impl DifferentialOracle {
     /// 1. **No invariant violations** — either harness reporting a violation
     ///    is a failure, regardless of whether the other agrees.
     /// 2. **Event equivalence** — both harnesses must emit the same
-    ///    [`ComparableEvent`] for the same input.
+    ///    [`SimEvent`] for the same input.
     /// 3. **State equivalence** — full [`ComparableBackendState`] snapshots
     ///    must match after every step.
     ///
     /// On any divergence, the panic includes the seed, step index, failing
     /// operation, and the full operation sequence so the failure is
     /// deterministically reproducible.
-    fn run_sequence(&mut self, seed: u64, ops: &[SimOp]) {
+    fn run_sequence(&mut self, ops: &[SimOp]) {
+        let seed = self.seed;
         for (step, op) in ops.iter().enumerate() {
             let (sim_event, sim_violations) = self.sim.step(op.clone());
             let (etcd_event, etcd_violations) = self.etcd.step(op.clone());
@@ -973,6 +993,6 @@ proptest! {
         ops in proptest::collection::vec(arb_sim_op(N_WORKERS, N_SHARDS), 15..50),
     ) {
         let mut oracle = DifferentialOracle::new(seed);
-        oracle.run_sequence(seed, &ops);
+        oracle.run_sequence(&ops);
     }
 }

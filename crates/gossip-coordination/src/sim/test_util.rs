@@ -55,7 +55,7 @@ pub fn arb_fault_level() -> impl Strategy<Value = FaultLevel> {
 ///
 /// # Weight distribution
 ///
-/// Total weight across the 18 included variants is **40**. Weights bias
+/// Total weight across the 18 strategy arms (17 variants; `AdvanceTime` appears twice with different ranges) is **40**. Weights bias
 /// toward ops that drive forward progress (Acquire=6, AdvanceTime=5,
 /// Checkpoint=5, Complete=4) while exotic variants (Split*, Replay/Conflict
 /// Checkpoint, ZombieCheckpoint) appear at weight 1 to exercise rejection
