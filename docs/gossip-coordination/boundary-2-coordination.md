@@ -88,6 +88,7 @@ The module provides seven core capabilities:
 | `events.rs`          | `EventCollector`, `EventKind`, `StateTransitionEvent`                                            |
 | `facade.rs`          | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                                              |
 | `session.rs`         | `WorkerSession` ergonomic wrapper with move/borrow lifecycle                                     |
+| `conformance.rs`     | Feature-gated backend-agnostic coordination conformance harness for `SimulationBackend` impls    |
 | `lib.rs`             | Module root and public re-exports                                                                |
 
 #### `gossip-contracts` crate (`crates/gossip-contracts/src/coordination/`)

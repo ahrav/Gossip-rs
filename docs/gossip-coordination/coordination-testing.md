@@ -128,13 +128,17 @@ All tests use shared fixtures from `test_fixtures.rs` (see Section 5).
 
 ## 3. Tier 2 — Conformance Tests
 
-**File:** `crates/gossip-coordination/src/conformance_tests.rs`
-**Declared in:** `lib.rs` (`#[cfg(test)]`)
+**Harness:** `crates/gossip-coordination/src/conformance.rs`
+**In-memory binding:** `crates/gossip-coordination/src/conformance_tests.rs`
+**Declared in:** `lib.rs` (`#[cfg(any(test, feature = "test-support"))] pub mod conformance;`, `#[cfg(test)] mod conformance_tests;`)
 
 Invariant-interaction tests. Each test composes two or more of the
 protocol's safety invariants and verifies they hold simultaneously. The
 focus is on invariant *combinations* — these are the tests most likely to
 catch regressions where a fix for one invariant violates another.
+`conformance.rs` owns the reusable backend-agnostic harness, while
+`conformance_tests.rs` keeps the in-memory backend entrypoint and the
+production-only compile-time API guards.
 
 ### Group A: Cross-Cutting Invariant Interactions
 
@@ -142,7 +146,7 @@ catch regressions where a fix for one invariant violates another.
 | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `fence_monotonicity_across_full_lifecycle`         | Fence monotonicity + lease expiry enables re-acquisition + checkpoint/complete do not mutate fence        |
 | `cursor_monotonicity_combined_with_split_residual` | Cursor bounds + split-residual spec narrowing + cursor preservation across splits                         |
-| `idempotency_before_lease_validation`              | OpId idempotency + terminal irreversibility + their priority ordering                                     |
+| `idempotency_before_terminal_state_rejection`      | OpId idempotency + terminal irreversibility + their priority ordering                                     |
 | `owner_divergence_with_matching_fence`             | Lease validation (fence + owner identity) + tenant isolation                                              |
 | `terminal_clears_lease`                            | Terminal transitions clear leases + correct terminal status per operation (complete, park, split_replace) |
 
@@ -221,7 +225,7 @@ Shared factory functions consumed by all three coordination test modules.
 | `test_worker(id)`                                   | `WorkerId::from_raw(id)`                                                                                                 |
 | `now(t)`                                            | `LogicalTime::from_raw(t)`                                                                                               |
 | `test_key()`                                        | `ShardKey::new(test_run(), test_shard())`                                                                                |
-| `test_cursor(key)`                                  | `Cursor::with_last_key(key.to_vec())`                                                                                    |
+| `test_cursor(key)`                                  | `CursorUpdate::new(key)`                                                                                                 |
 | `seeded_coordinator()`                              | `InMemoryCoordinator` with one run containing one shard `[a, z)`, `CursorSemantics::Completed`, already in Active status |
 | `seeded_coordinator_with_semantics(s)`              | Same as above but with the specified `CursorSemantics`                                                                   |
 | `test_split_replace_plan()`                         | Canonical `[a,m) + [m,z)` `SplitReplacePlan`                                                                             |
@@ -557,7 +561,8 @@ Full invariant definitions and the checker implementation are in
 | `crates/gossip-coordination/src/session_tests.rs`                    | Tier 1: `WorkerSession` RAII handle and delegation tests               |
 | `crates/gossip-coordination/src/in_memory_filter_tests.rs`           | Tier 1: `ShardFilter` predicates for `list_shards_into`                |
 | `crates/gossip-coordination/src/in_memory_run_tests.rs`              | Tier 1: `RunManagement` trait implementation tests                     |
-| `crates/gossip-coordination/src/conformance_tests.rs`                | Tier 2: invariant-interaction tests (Groups A, B, C)                   |
+| `crates/gossip-coordination/src/conformance.rs`                      | Tier 2: backend-agnostic invariant-interaction harness (Groups A, B, C) |
+| `crates/gossip-coordination/src/conformance_tests.rs`                | Tier 2: InMemoryCoordinator binding + compile-time API guards          |
 | `crates/gossip-coordination/src/scenario_tests.rs`                   | Tier 3: multi-step end-to-end workflows (S1–S9)                        |
 | `crates/gossip-coordination/src/test_fixtures.rs`                    | Shared factory functions and seeded coordinator setup                  |
 | `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`         | Tier 4a: fixed-seed behavioral regression + deterministic replay       |

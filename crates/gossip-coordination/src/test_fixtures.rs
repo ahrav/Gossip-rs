@@ -252,12 +252,15 @@ pub fn test_split_residual_plan() -> SplitResidualPlan<'static> {
 // ============================================================================
 //
 // Each helper performs one coordinator operation and panics on failure.
+// The helpers are generic over [`CoordinationBackend`] so shared conformance
+// and scenario tests can reuse the same setup steps across backend
+// implementations.
 // Use these only for *setup* steps where the return value is not the
 // subject of the test's assertions. For assertions on outcomes, call
 // the coordinator method directly.
 
 /// Acquire the default test shard with the given worker at the given time.
-pub fn acquire_shard(coord: &mut InMemoryCoordinator, t: u64, worker_id: u64) -> Lease {
+pub fn acquire_shard<B: CoordinationBackend>(coord: &mut B, t: u64, worker_id: u64) -> Lease {
     let mut scratch = crate::error::AcquireScratch::new();
     let result = coord
         .acquire_and_restore_into(
@@ -275,8 +278,8 @@ pub fn acquire_shard(coord: &mut InMemoryCoordinator, t: u64, worker_id: u64) ->
 ///
 /// Panics on failure. Use this only for fire-and-forget checkpoints where
 /// the return value is not needed (e.g. setting up state for a later assertion).
-pub fn checkpoint_ok(
-    coord: &mut InMemoryCoordinator,
+pub fn checkpoint_ok<B: CoordinationBackend>(
+    coord: &mut B,
     t: u64,
     lease: &Lease,
     cursor_key: &[u8],
@@ -292,8 +295,8 @@ pub fn checkpoint_ok(
 ///
 /// Panics on failure. Use this only for fire-and-forget completes where
 /// the return value is not needed.
-pub fn complete_ok(
-    coord: &mut InMemoryCoordinator,
+pub fn complete_ok<B: CoordinationBackend>(
+    coord: &mut B,
     t: u64,
     lease: &Lease,
     cursor_key: &[u8],
@@ -309,8 +312,8 @@ pub fn complete_ok(
 ///
 /// Panics on failure. Use this only for fire-and-forget parks where
 /// the return value is not needed.
-pub fn park_ok(
-    coord: &mut InMemoryCoordinator,
+pub fn park_ok<B: CoordinationBackend>(
+    coord: &mut B,
     t: u64,
     lease: &Lease,
     reason: ParkReason,
@@ -373,7 +376,7 @@ pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
 /// Uses t=4 and OpId=2. Panics on failure. Intended to be called after
 /// [`coordinator_with_run_and_lease`] to set up a post-split state for
 /// index-consistency and filter tests.
-pub fn do_split_replace(coord: &mut InMemoryCoordinator, lease: &Lease) {
+pub fn do_split_replace<B: CoordinationBackend>(coord: &mut B, lease: &Lease) {
     let plan = test_split_replace_plan();
     let _ = coord
         .split_replace(now(4), test_tenant(), lease, plan, OpId::from_raw(2))
