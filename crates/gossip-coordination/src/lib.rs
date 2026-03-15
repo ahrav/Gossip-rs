@@ -161,7 +161,7 @@ pub use in_memory::{
 };
 
 // Re-export record internal types used by tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use record::SpawnedList;
 
 // ---------------------------------------------------------------------------

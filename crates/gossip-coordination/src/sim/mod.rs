@@ -74,9 +74,11 @@ mod mega_sim_tests;
 mod proptest_state_machine_tests;
 #[cfg(test)]
 mod sim_behavioral_tests;
-#[cfg(test)]
-mod test_util;
-pub use harness::{CoordinationSim, RejectionKind, SimEvent, SimEventKind, SimOp, SimReport};
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_util;
+pub use harness::{
+    CoordinationSim, RejectionKind, RunTerminalKind, SimEvent, SimEventKind, SimOp, SimReport,
+};
 pub use invariants::{InvariantChecker, InvariantViolation, SplitCoverageDetail};
 pub use overload::{D1Observation, OverloadKind, OverloadReport, OverloadScenario};
 pub use worker::SimWorker;

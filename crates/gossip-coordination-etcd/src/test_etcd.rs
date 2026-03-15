@@ -68,15 +68,16 @@ fn etcd_image() -> ContainerRequest<GenericImage> {
     GenericImage::new("quay.io/coreos/etcd", "v3.5.15")
         .with_wait_for(WaitFor::message_on_stderr("ready to serve client requests"))
         .with_exposed_port(2379.tcp())
+        .with_hostname("node1")
         .with_cmd([
             "etcd",
             "--name=node1",
             "--data-dir=/etcd-data",
             "--listen-client-urls=http://0.0.0.0:2379",
-            "--advertise-client-urls=http://localhost:2379",
+            "--advertise-client-urls=http://node1:2379",
             "--listen-peer-urls=http://0.0.0.0:2380",
-            "--initial-advertise-peer-urls=http://localhost:2380",
-            "--initial-cluster=node1=http://localhost:2380",
+            "--initial-advertise-peer-urls=http://node1:2380",
+            "--initial-cluster=node1=http://node1:2380",
             "--initial-cluster-token=gossip-rs-test-cluster",
             "--initial-cluster-state=new",
         ])
@@ -142,7 +143,7 @@ fn unique_namespace() -> String {
 ///
 /// Each call returns a coordinator with its own keyspace, so tests run
 /// in full isolation without needing `test_clear_namespace`.
-pub(crate) fn test_coordinator() -> EtcdCoordinator {
+pub fn test_coordinator() -> EtcdCoordinator {
     let ep = shared_endpoint();
     let namespace = unique_namespace();
     let config = EtcdCoordinatorConfig::from_endpoints_csv(&ep.endpoint, &namespace)
@@ -151,7 +152,7 @@ pub(crate) fn test_coordinator() -> EtcdCoordinator {
 }
 
 /// Create an [`EtcdCoordinator`] with explicit shard count limits.
-pub(crate) fn test_coordinator_with_limits(
+pub fn test_coordinator_with_limits(
     max_shards_per_tenant: usize,
     max_total_shards: usize,
 ) -> EtcdCoordinator {
@@ -166,7 +167,7 @@ pub(crate) fn test_coordinator_with_limits(
 
 /// Create an [`EtcdCoordinator`] with a custom owner-lease TTL
 /// for testing lease expiry behavior.
-pub(crate) fn test_coordinator_with_ttl(ttl_secs: i64) -> EtcdCoordinator {
+pub fn test_coordinator_with_ttl(ttl_secs: i64) -> EtcdCoordinator {
     let ep = shared_endpoint();
     let namespace = unique_namespace();
     let config = EtcdCoordinatorConfig::from_endpoints_csv_with_tuning(
@@ -183,7 +184,7 @@ pub(crate) fn test_coordinator_with_ttl(ttl_secs: i64) -> EtcdCoordinator {
 /// Create an [`EtcdCoordinator`] with explicit persistence-tuning
 /// values for testing backend-specific behavior (e.g., reduced
 /// `max_children_per_op` to test fanout rejection).
-pub(crate) fn test_coordinator_with_tuning(
+pub fn test_coordinator_with_tuning(
     owner_lease_ttl_secs: i64,
     optimistic_txn_retries: usize,
     max_children_per_op: usize,
@@ -206,11 +207,11 @@ pub(crate) fn test_coordinator_with_tuning(
 // ---------------------------------------------------------------------------
 
 /// Generate a unique namespace prefix that can be shared across multiple
-/// coordinators in a single test. Unlike [`unique_namespace`] (which is
-/// called implicitly by [`test_coordinator`] and friends), this returns
-/// the raw namespace string so multiple coordinators can target the same
-/// etcd keyspace.
-pub(crate) fn contention_namespace() -> String {
+/// coordinators in a single test. Unlike the internal `unique_namespace`
+/// (which is called implicitly by [`test_coordinator`] and friends), this
+/// returns the raw namespace string so multiple coordinators can target the
+/// same etcd keyspace.
+pub fn contention_namespace() -> String {
     unique_namespace()
 }
 
@@ -220,7 +221,7 @@ pub(crate) fn contention_namespace() -> String {
 /// this allows multiple coordinators to share one keyspace for CAS
 /// contention testing. Each coordinator still owns its own Tokio runtime
 /// and connection, so they can be used from separate threads.
-pub(crate) fn test_coordinator_in_namespace(namespace: &str) -> EtcdCoordinator {
+pub fn test_coordinator_in_namespace(namespace: &str) -> EtcdCoordinator {
     let ep = shared_endpoint();
     let config = EtcdCoordinatorConfig::from_endpoints_csv(&ep.endpoint, namespace)
         .expect("test endpoint config should be valid");
@@ -229,7 +230,7 @@ pub(crate) fn test_coordinator_in_namespace(namespace: &str) -> EtcdCoordinator 
 
 /// Create an [`EtcdCoordinator`] in a shared namespace with explicit
 /// shard count limits for limit enforcement contention tests.
-pub(crate) fn test_coordinator_in_namespace_with_limits(
+pub fn test_coordinator_in_namespace_with_limits(
     namespace: &str,
     max_shards_per_tenant: usize,
     max_total_shards: usize,

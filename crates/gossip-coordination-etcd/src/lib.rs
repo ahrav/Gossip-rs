@@ -97,8 +97,8 @@ pub use keyspace::{
 #[cfg(any(test, feature = "test-support"))]
 pub use sim_coordinator::SimEtcdCoordinator;
 
-#[cfg(test)]
-mod test_etcd;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_etcd;
 
 #[cfg(test)]
 mod tests;

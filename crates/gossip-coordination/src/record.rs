@@ -34,14 +34,14 @@
 use std::fmt;
 
 use blake3::Hasher;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use gossip_stdx::InlineVec;
 use gossip_stdx::{ByteSlab, RingBuffer};
 
 use crate::lease::{LeaseHolder, OpLogEntry};
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::pooled::{PooledCursor, PooledShardSpec, PooledSpawned};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use gossip_contracts::coordination::shard_spec::ShardSpec;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use gossip_contracts::identity::{
@@ -54,7 +54,7 @@ use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
 ///
 /// Runtime shard records store lineage in slab-backed [`PooledSpawned`], but
 /// test constructors accept this inline container for ergonomics.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub type SpawnedList = InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>;
 
 // ============================================================================
@@ -472,7 +472,7 @@ impl ShardRecord {
     ///
     /// Only available in test builds — allows constructing intentionally
     /// invalid records for testing invariant checks.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub fn from_raw_parts(
         tenant: TenantId,
