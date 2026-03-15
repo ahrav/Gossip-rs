@@ -258,7 +258,7 @@ where
             }
             validate_loaded_shard_lease(now, tenant, lease, &persisted, E::stale_fence)?;
 
-            Err(E::backend_error(InfraError::transient(
+            Err(E::backend_error(InfraError::corruption(
                 op_names.base,
                 "CAS retry budget exhausted after ruling out replay, stale fence, \
                  and terminal status — lease-exclusive operation should not face \
@@ -1576,7 +1576,7 @@ impl AsyncEtcdCoordinator {
             return Ok(IdempotentOutcome::Replayed(()));
         }
         validate_loaded_shard_lease(now, tenant, lease, &persisted, E::stale_fence)?;
-        Err(E::backend_error(InfraError::transient(
+        Err(E::backend_error(InfraError::corruption(
             op_names.base,
             "CAS retry budget exhausted after ruling out replay, stale fence, \
              and terminal status — lease-exclusive operation should not face \
