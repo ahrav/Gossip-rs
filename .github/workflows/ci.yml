@@ -779,6 +779,9 @@ jobs:
               owner, repo,
               labels: 'nightly-failure',
               state: 'open',
+              per_page: 1,
+              sort: 'created',
+              direction: 'desc',
             });
             if (existing.data.length > 0) {
               await github.rest.issues.createComment({
