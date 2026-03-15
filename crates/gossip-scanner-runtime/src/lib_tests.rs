@@ -747,7 +747,7 @@ fn owned_core_event_finding_round_trips() {
     assert_eq!(event["rule"], "test-rule");
     assert_eq!(event["start"], 10);
     assert_eq!(event["end"], 42);
-    assert_eq!(event["confidence"], 85);
+    assert_eq!(event["confidence_score"], 85);
     assert_eq!(event["commit_id"], 3);
     assert_eq!(event["change_kind"], "modify");
 }
