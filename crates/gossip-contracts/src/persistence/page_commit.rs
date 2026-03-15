@@ -120,7 +120,7 @@ impl CheckpointBoundary {
     /// Semantic domain carried by this checkpoint boundary.
     #[inline]
     #[must_use]
-    pub fn kind(&self) -> CheckpointBoundaryKind {
+    pub const fn kind(&self) -> CheckpointBoundaryKind {
         match self {
             Self::OrderedContent(_) => CheckpointBoundaryKind::OrderedContent,
             Self::RepoFrontier(_) => CheckpointBoundaryKind::RepoFrontier,
@@ -365,8 +365,8 @@ pub struct ItemDurable {
 
 /// Typestate: terminal state. All three stages are durable.
 ///
-/// The [`PageCommitReceipt`] inside is sufficient proof that the frontier
-/// boundary can be safely advanced.
+/// The [`PageCommitReceipt`] inside is proof that the frontier boundary has
+/// been durably checkpointed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointDurable {
     page_commit: PageCommitReceipt,

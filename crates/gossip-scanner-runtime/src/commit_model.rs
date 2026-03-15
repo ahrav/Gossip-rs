@@ -146,6 +146,7 @@ impl<'a> CommitRequest<'a> {
 
     /// Completed unit this request will make durable.
     #[inline]
+    #[must_use]
     pub fn completed_unit(&self) -> &CompletedUnit {
         &self.completed_unit
     }
@@ -212,6 +213,13 @@ pub struct UnitCommitReceipt {
 impl UnitCommitReceipt {
     /// Construct a durable runtime receipt.
     ///
+    /// Validates only the `checkpoint_boundary` field — full `CommitScope`
+    /// correspondence (tenant, run, shard, fence epoch, committed units) is
+    /// the caller's responsibility. `CompletedUnit` does not carry scope
+    /// identity, so a stronger check is structurally impossible at this layer.
+    /// The downstream `PageCommit::record_checkpoint` enforces full-scope
+    /// equality against the coordination-side receipt.
+    ///
     /// # Errors
     ///
     /// Returns [`BoundaryMismatchError`] if the completed unit's checkpoint
@@ -219,12 +227,12 @@ impl UnitCommitReceipt {
     pub fn new(
         completed_unit: CompletedUnit,
         durable: ItemCommitReceipt,
-    ) -> Result<Self, Box<BoundaryMismatchError>> {
+    ) -> Result<Self, BoundaryMismatchError> {
         if completed_unit.checkpoint_boundary() != durable.scope().checkpoint_boundary() {
-            return Err(Box::new(BoundaryMismatchError {
+            return Err(BoundaryMismatchError {
                 unit_boundary: completed_unit.checkpoint_boundary().clone(),
                 receipt_boundary: durable.scope().checkpoint_boundary().clone(),
-            }));
+            });
         }
 
         Ok(Self {
@@ -235,6 +243,7 @@ impl UnitCommitReceipt {
 
     /// Completed unit proved durable by this receipt.
     #[inline]
+    #[must_use]
     pub fn completed_unit(&self) -> &CompletedUnit {
         &self.completed_unit
     }
@@ -273,6 +282,7 @@ impl CheckpointAggregatorInput {
 
     /// Durable receipt carried into the checkpoint stage.
     #[inline]
+    #[must_use]
     pub fn receipt(&self) -> &UnitCommitReceipt {
         &self.receipt
     }
@@ -469,5 +479,15 @@ mod tests {
         let unit = CompletedUnit::ordered_content(1, sample_cursor(1));
         let receipt = sample_item_receipt(CheckpointBoundary::repo_frontier(sample_cursor(1)));
         assert!(UnitCommitReceipt::new(unit, receipt).is_err());
+    }
+
+    #[test]
+    fn unit_commit_receipt_rejects_same_kind_cursor_mismatch() {
+        let unit = CompletedUnit::ordered_content(1, sample_cursor(1));
+        let receipt = sample_item_receipt(CheckpointBoundary::ordered_content(sample_cursor(2)));
+        assert!(
+            UnitCommitReceipt::new(unit, receipt).is_err(),
+            "same boundary kind but different cursor values must be rejected"
+        );
     }
 }
