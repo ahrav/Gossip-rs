@@ -30,8 +30,6 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use gossip_connectors::GitDebugLevel;
-use gossip_scan_driver::CancellationToken;
 use scanner_engine::TransformId;
 use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::source_kind::SourceKind;
@@ -39,9 +37,9 @@ use scanner_scheduler::source_kind::SourceKind;
 use crate::commit_sink::CliNoOpCommitSink;
 use crate::event_sink::{JsonEventSink, JsonlEventSink, SarifEventSink, TextEventSink};
 use crate::{
-    AnchorMode, EventFormat, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets,
-    ScanRuntimeError, TransformFilter, available_workers, scan_fs_with_runtime,
-    scan_git_with_runtime,
+    AnchorMode, CancellationToken, EventFormat, ExecutionMode, FsScanConfig, GitDebugLevel,
+    GitScanConfig, ScanBudgets, ScanReport, ScanRuntimeError, TransformFilter, available_workers,
+    scan_fs_with_runtime, scan_git_with_runtime,
 };
 
 /// Parsed source subcommand from the CLI.
@@ -731,7 +729,7 @@ where
 /// elapsed_ms=3071
 /// throughput_mib_s=493.61
 /// ```
-pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError> {
+pub fn run(config: CliConfig) -> Result<ScanReport, CliError> {
     let sink = build_event_sink(config.event_format, config.verbose, config.null_sink);
     let commit = CliNoOpCommitSink;
     let cancel = CancellationToken::new();
@@ -832,7 +830,7 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
 /// `binary_skipped`, `init_ms`, `scan_ms`, `persist_ms`, etc.) are
 /// appended after the standard fields.
 fn print_scan_summary(
-    report: &gossip_scan_driver::ScanReport,
+    report: &ScanReport,
     elapsed: std::time::Duration,
     workers: usize,
     source_kind: SourceKind,
@@ -844,7 +842,7 @@ fn print_scan_summary(
 }
 
 fn render_scan_summary(
-    report: &gossip_scan_driver::ScanReport,
+    report: &ScanReport,
     elapsed: std::time::Duration,
     workers: usize,
     source_kind: SourceKind,

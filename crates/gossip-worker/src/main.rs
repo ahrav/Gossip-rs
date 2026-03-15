@@ -1,7 +1,8 @@
 //! Unified gossip-worker entrypoint.
 //!
-//! The worker now routes scans through `gossip-scanner-runtime`, which in turn
-//! maps assignments onto `ScanSourceFactory -> ScanDriver::run`.
+//! The worker routes scan requests through `gossip-scanner-runtime`.
+//! The runtime currently validates inputs and returns family-oriented
+//! placeholder errors until the source-specific execution loops are wired in.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ enum WorkerSource {
 /// Worker launch configuration.
 ///
 /// The worker intentionally defaults to connector mode so both worker and CLI
-/// entrypoints exercise the same scan-driver seam.
+/// entrypoints exercise the same runtime-family boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkerConfig {
     source: WorkerSource,
@@ -139,7 +140,7 @@ where
     }
 }
 
-/// Execute one scan using the unified runtime seam.
+/// Execute one scan using the scanner runtime boundary.
 ///
 /// Returns `(items_scanned, bytes_scanned, findings_emitted)` for logging and
 /// smoke-test assertions.
@@ -267,9 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn run_worker_scans_filesystem_path() {
+    fn run_worker_returns_placeholder_for_filesystem_path() {
         let dir = tempdir().expect("tempdir");
-        // Secret must be ≥16 high-entropy chars to trigger builtin rules.
         fs::write(dir.path().join("secret.txt"), "password=xK9mP2qL7wN4vR8t")
             .expect("write fixture");
 
@@ -279,13 +279,17 @@ mod tests {
             execution_mode: ExecutionMode::Connector,
         };
 
-        let report = run_worker(&cfg).expect("filesystem worker run");
-        assert!(report.0 >= 1);
-        assert!(report.2 >= 1);
+        let err = run_worker(&cfg).expect_err("filesystem worker should return placeholder");
+        match err {
+            WorkerError::Runtime(ScanRuntimeError::Driver(error)) => {
+                assert!(error.to_string().contains("ordered-content runtime path"));
+            }
+            other => panic!("expected runtime placeholder error, got {other:?}"),
+        }
     }
 
     #[test]
-    fn run_worker_scans_git_repo_path() {
+    fn run_worker_returns_placeholder_for_git_repo_path() {
         let dir = tempdir().expect("tempdir");
         create_git_repo(dir.path());
         fs::write(dir.path().join("secret.txt"), "token=aB3dE5fG7hJ9kL1m").expect("write fixture");
@@ -298,11 +302,12 @@ mod tests {
             execution_mode: ExecutionMode::Connector,
         };
 
-        let report = run_worker(&cfg).expect("git worker run");
-        assert!(report.0 >= 1);
-        assert!(
-            report.2 >= 1,
-            "git scan should emit findings for test fixture"
-        );
+        let err = run_worker(&cfg).expect_err("git worker should return placeholder");
+        match err {
+            WorkerError::Runtime(ScanRuntimeError::Driver(error)) => {
+                assert!(error.to_string().contains("git-repo runtime path"));
+            }
+            other => panic!("expected runtime placeholder error, got {other:?}"),
+        }
     }
 }

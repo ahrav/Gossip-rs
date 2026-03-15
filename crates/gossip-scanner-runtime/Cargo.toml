@@ -11,8 +11,6 @@ description = "Runtime orchestration APIs for scanner-rs direct and connector ex
 default = []
 aegis-pure-rust = [
     "scanner-engine/aegis-pure-rust",
-    "gossip-connectors/aegis-pure-rust",
-    "gossip-scan-driver/aegis-pure-rust",
     "scanner-scheduler/aegis-pure-rust",
     "scanner-git/aegis-pure-rust",
 ]
@@ -20,8 +18,6 @@ aegis-pure-rust = [
 [dependencies]
 anyhow.workspace = true
 gossip-contracts.workspace = true
-gossip-scan-driver.workspace = true
-gossip-connectors.workspace = true
 scanner-engine.workspace = true
 scanner-scheduler.workspace = true
 scanner-git.workspace = true

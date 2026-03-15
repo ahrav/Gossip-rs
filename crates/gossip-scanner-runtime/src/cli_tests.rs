@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use gossip_connectors::GitDebugLevel;
 use scanner_engine::TransformId;
 use scanner_git::{GitScanMode, MergeDiffMode};
 use scanner_scheduler::source_kind::SourceKind;
@@ -250,13 +249,13 @@ fn git_help_text_omits_hidden_x_flags() {
 
 #[test]
 fn default_summary_omits_workers_but_keeps_errors_for_git() {
-    let report = gossip_scan_driver::ScanReport {
+    let report = ScanReport {
         items_scanned: 5,
         bytes_scanned: 10,
         chunks_scanned: 2,
         findings_emitted: 1,
         errors: 3,
-        ..gossip_scan_driver::ScanReport::default()
+        ..ScanReport::default()
     };
     let summary = render_scan_summary(
         &report,
@@ -271,7 +270,7 @@ fn default_summary_omits_workers_but_keeps_errors_for_git() {
 
 #[test]
 fn debug_summary_includes_extended_fs_metrics() {
-    let report = gossip_scan_driver::ScanReport {
+    let report = ScanReport {
         items_scanned: 9,
         bytes_scanned: 1024,
         chunks_scanned: 3,
@@ -316,7 +315,7 @@ fn fs_debug_timing_components_sum_to_elapsed() {
     // When scan_ns and persist_ns are both non-zero, the debug output
     // shows init_ms, scan_ms, and persist_ms. These three components
     // must be non-overlapping and sum to elapsed_ms exactly.
-    let report = gossip_scan_driver::ScanReport {
+    let report = ScanReport {
         items_scanned: 1,
         bytes_scanned: 100,
         chunks_scanned: 1,
@@ -324,7 +323,7 @@ fn fs_debug_timing_components_sum_to_elapsed() {
         errors: 0,
         scan_ns: 11_000_000,   // 11ms
         persist_ns: 2_000_000, // 2ms
-        ..gossip_scan_driver::ScanReport::default()
+        ..ScanReport::default()
     };
     let elapsed = std::time::Duration::from_millis(20);
     let summary = render_scan_summary(&report, elapsed, 4, SourceKind::Fs, true);
