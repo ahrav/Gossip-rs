@@ -65,10 +65,10 @@ The module provides seven core capabilities:
 - **Tiger-style invariant enforcement** -- crash-to-prevent-corruption
   philosophy where violated invariants panic before persistence, ensuring
   crash-recovery returns to the last valid state.
-- **Assignment handoff boundary** -- coordination emits shard assignments
-  that runtime layers translate through `gossip-scan-driver`
-  (`ScanSourceFactory` + `ScanDriver`) so CLI and distributed execution share
-  one scanner-scheduler/engine path.
+- **Source-family handoff boundary** -- coordination emits shard claims,
+  key-range state, and cursors that runtime layers route through
+  `gossip-contracts::connector` and `gossip-scanner-runtime` so CLI and
+  distributed execution share one family-oriented orchestration surface.
 
 ### Source files
 

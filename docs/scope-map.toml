@@ -98,6 +98,19 @@ dir = "crates/gossip-scanner-runtime/src/"
 doc = "docs/scanner-core-parity.md"
 dir = "crates/scanner-engine/src/"
 
+# Source-family model (ordered content + git repo-native contracts).
+[[scopes]]
+doc = "docs/source-families.md"
+dir = "crates/gossip-contracts/src/connector/"
+
+[[scopes]]
+doc = "docs/source-families.md"
+dir = "crates/gossip-connectors/src/"
+
+[[scopes]]
+doc = "docs/source-families.md"
+dir = "crates/gossip-scanner-runtime/src/"
+
 [[scopes]]
 doc = "docs/scanner-core-parity.md"
 dir = "crates/gossip-scanner-runtime/src/"

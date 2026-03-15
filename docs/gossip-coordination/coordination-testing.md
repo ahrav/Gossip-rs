@@ -12,11 +12,11 @@ tests validate backend execution semantics using those shared planner surfaces.
 For protocol details see [boundary-2-coordination.md](boundary-2-coordination.md).
 For simulation architecture see [simulation-harness.md](simulation-harness.md).
 
-A unified execution seam in `crates/gossip-scan-driver/`
-(`Assignment -> ScanSourceFactory -> ScanDriver`) bridges coordination and
-scan execution. Coordination tests continue to validate protocol invariants
-independently of scan execution internals, while runtime integration tests
-exercise that assignment-to-driver boundary.
+A family-oriented execution seam in `crates/gossip-scanner-runtime/` and
+`gossip_contracts::connector` bridges coordination and scan execution.
+Coordination tests continue to validate protocol invariants independently of
+scan execution internals, while runtime integration tests exercise the same
+family entrypoints used by the CLI and worker binaries.
 
 The etcd scaffold in `crates/gossip-coordination-etcd/` adds backend-specific
 tests alongside the shared protocol suite: configuration/keyspace/codec tests

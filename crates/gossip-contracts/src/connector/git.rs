@@ -38,8 +38,8 @@
 //! - Inner Git progress remains repo-native and lives behind the executor
 //!   boundary (for example, watermark stores or seen-blob state in runtime
 //!   crates).
-//! - No type in this module depends on `scanner-git`, `gix-*`, or
-//!   `gossip-scan-driver`.
+//! - No type in this module depends on runtime Git implementation crates
+//!   such as `scanner-git` or `gix-*`.
 
 use std::{
     fmt,

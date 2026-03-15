@@ -1,315 +1,261 @@
 # End-to-End Scan Flow
 
-This document traces the production scan execution path from entry point
-through to completion. Two entry points — CLI and distributed worker — converge
-on a shared `execute_assignment_with_config` function that delegates to
-source-specific `ScanDriver` implementations. Each driver owns its entire
-scan lifecycle internally: enumeration, detection, and result collection are
-not orchestrated by an external loop.
+This document traces the runtime surface that fronts filesystem, Git, and
+distributed scan entrypoints. The CLI and worker binaries converge on
+`gossip-scanner-runtime`; the runtime validates requests, selects a source
+family module, and routes findings through the local event and commit-sink
+surfaces.
 
 ---
 
-## 1. Dual Entry Points — CLI and Distributed
+## 1. Dual Entry Points -- CLI, Worker, and Distributed Runtime
 
-Both execution paths build an `Assignment` and feed it to the same shared
-core. The distributed path adds shard-level coordination: lease acquisition,
-done-ledger gating, and shard completion bookkeeping.
+The CLI and worker binaries call the same filesystem and Git entrypoints.
+Distributed execution uses `run_distributed`, which validates the run config
+and carries the same family naming into the worker loop surface.
 
 ```mermaid
 %% Diagram: dual-entry-point-sequence
 sequenceDiagram
     autonumber
 
-    participant CLI as CLI Binary
-    participant DW as Distributed Worker
-    participant DC as DistributedCoordinator
-    participant RT as Runtime Core
-    participant SF as ScanSourceFactory
-    participant DR as ScanDriver
+    participant CLI as scanner-rs-cli
+    participant WRK as gossip-worker
+    participant RT as gossip-scanner-runtime
+    participant OC as ordered_content
+    participant GR as git_repo
+    participant DRT as distributed
 
-    note over CLI: CLI Path (scanner-rs-cli)
-    CLI->>RT: scan_fs_with_runtime / scan_git_with_runtime
-
-    alt Filesystem assignment
-        RT->>RT: build_assignment(source, shard_spec, cursor)
-        RT->>RT: execute_assignment_with_config(assignment, ...)
-        RT->>SF: driver_for_assignment(&assignment)
-        SF-->>RT: Box&lt;dyn ScanDriver&gt;
-        RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-        RT->>DR: driver.run(engine, cfg, out: &amp;dyn EventOutput, commit, cancel)
-        activate DR
-        DR-->>RT: ScanReport
-        deactivate DR
-    else Git assignment
-        RT->>RT: build_assignment(source, shard_spec, cursor)
-        RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-        RT->>DR: execute_git_assignment(assignment, engine, cfg, git_cfg, out: &amp;dyn GitEventOutput, cancel)
-        activate DR
-        DR-->>RT: (ScanReport, checkpoint_hint, debug_output)
-        deactivate DR
+    note over CLI: CLI path
+    CLI->>RT: scan_fs(config) / scan_git(config)
+    RT->>RT: validate path + budgets
+    alt Filesystem request
+        RT->>OC: filesystem_placeholder(config, canonical_path)
+        OC-->>RT: ScanRuntimeError::Driver(...)
+    else Git request
+        RT->>GR: local_repo_placeholder(config, canonical_repo)
+        GR-->>RT: ScanRuntimeError::Driver(...)
     end
-    RT-->>CLI: ScanReport
+    RT-->>CLI: Result<ScanReport, ScanRuntimeError>
 
-    note over DW,DC: Distributed Path (run_worker loop)
-    loop For each shard
-        DW->>DC: acquire_shard()
-        DC-->>DW: Option&lt;ShardLease&gt;
-        DW->>DC: is_shard_done(&shard_id)
-        DC-->>DW: bool
-        alt Already done
-            DW->>DC: release_shard(&lease)
-        else Git assignment
-            DW->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-            DW->>DR: execute_git_assignment(assignment, engine, cfg, git_cfg, &amp;sink, cancel)
-            activate DR
-            DR-->>DW: (ScanReport, checkpoint_hint, debug_output)
-            deactivate DR
-            DW->>DC: complete_shard(&lease, checkpoint_hint, report)
-            DW->>DC: mark_shard_done(&shard_id)
-        else Non-git assignment
-            DW->>RT: execute_assignment_with_config(lease.assignment, ...)
-            RT->>SF: driver_for_assignment(&assignment)
-            SF-->>RT: Box&lt;dyn ScanDriver&gt;
-            RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-            RT->>DR: driver.run(engine, cfg, out, commit, cancel)
-            activate DR
-            DR-->>RT: ScanReport
-            deactivate DR
-            RT-->>DW: AssignmentOutcome { report, checkpoint_hint, debug_output }
-            DW->>DC: complete_shard(&lease, checkpoint_hint, report)
-            DW->>DC: mark_shard_done(&shard_id)
-        end
+    note over WRK: Worker path
+    WRK->>RT: scan_fs(config) / scan_git(config)
+    RT->>RT: validate path + budgets
+    alt Filesystem request
+        RT->>OC: filesystem_placeholder(config, canonical_path)
+        OC-->>RT: ScanRuntimeError::Driver(...)
+    else Git request
+        RT->>GR: local_repo_placeholder(config, canonical_repo)
+        GR-->>RT: ScanRuntimeError::Driver(...)
     end
+    RT-->>WRK: Result<ScanReport, ScanRuntimeError>
+
+    note over DRT: Distributed runtime entrypoint
+    DRT->>DRT: run_distributed(config)
+    DRT->>DRT: validate budgets
+    DRT-->>DRT: DistributedRuntimeError::Runtime(...)
 ```
 
-**Convergence at `execute_assignment_with_config`.** The CLI path synthesises a
-single-shard `Assignment` with `Cursor::initial()` and a placeholder job ID.
-The distributed path receives a real `ShardLease` from the coordinator, whose
-`assignment` field carries the shard's key range and any prior cursor. Both
-paths pass the assignment to the same function, which selects a factory by
-`ConnectorKind`, builds a driver, and calls `driver.run()`.
+**One public boundary.** `ExecutionMode` remains caller-visible, but both
+`Direct` and `Connector` modes converge on the same family modules inside the
+runtime crate.
 
-**Done-ledger gating.** The distributed worker checks `is_shard_done` before
-scanning. If a prior worker already completed this shard, the lease is
-released and the loop advances. This prevents redundant work after crash
-recovery.
-
-**Ordered completion.** `complete_shard` runs before `mark_shard_done`. If the
-process crashes between these two calls, the shard may be retried, but the
-system never observes a done-ledger entry without the corresponding report.
+**Typed placeholders.** The runtime reports unimplemented family loops through
+`ScanRuntimeError::Driver(...)` or `DistributedRuntimeError::Runtime(...)`
+rather than panicking or relying on `todo!()`.
 
 ---
 
-## 2. Driver Architecture — Each Driver Owns Its Lifecycle
+## 2. Family Runtime Surface
 
-The `ScanDriver` trait has a single `run()` method. Each implementation owns
-enumeration, detection, and result collection internally. There is no external
-page-processing loop.
+`gossip-scanner-runtime` expresses scan execution in terms of source families.
+The ordered-content family uses `OrderedContentRuntime`; the Git family uses
+`GitRepoRuntime`; the distributed surface keeps its own `DistributedFamily`
+selector. The filesystem and Git backend crates remain the engine targets that
+these family modules are shaped around.
 
 ```mermaid
-%% Diagram: driver-internal-architecture
-graph TB
-    subgraph shared ["Shared Runtime Core (gossip-scanner-runtime)"]
-        EX["execute_assignment_with_config"]
-        DFA["driver_for_assignment<br/>match ConnectorKind"]
-        ENG["runtime_engine<br/>→ Arc&lt;Engine&gt;"]
+%% Diagram: family-runtime-surface
+graph TD
+    subgraph EntryPoints["Runtime entrypoints"]
+        FS["scan_fs(...)"]
+        GIT["scan_git(...)"]
+        DIST["run_distributed(...)"]
     end
 
-    subgraph drivers ["ScanDriver Implementations (gossip-connectors)"]
-        direction TB
-        FS["<b>FsScanDriver::run</b><br/>━━━━━━━━━━━━━━━━━━━<br/>1. Spawn event + commit forwarder threads<br/>2. parallel_scan_dir(root, engine, cfg)<br/>3. Join forwarders<br/>4. Build ScanReport"]
-        GIT["<b>GitScanDriver::run</b><br/>━━━━━━━━━━━━━━━━━━━<br/>1. Spawn event forwarder thread<br/>2. run_git_scan(repo, engine, resolver,<br/>   seen, watermarks, cfg, sink)<br/>3. Join forwarder<br/>4. Build ScanReport"]
-        MEM["<b>InMemoryScanDriver::run</b><br/>━━━━━━━━━━━━━━━━━━━<br/>1. For each item in sorted dataset:<br/>   commit.begin_item → commit.finish_item<br/>2. Build ScanReport"]
+    subgraph Runtime["gossip-scanner-runtime"]
+        OC["OrderedContentRuntime<br/>filesystem_placeholder(...)"]
+        GR["GitRepoRuntime<br/>local_repo_placeholder(...)"]
+        DF["DistributedFamily<br/>OrderedContent | GitRepo"]
     end
 
-    subgraph engines ["Detection Backends"]
-        PSD["parallel_scan_dir<br/>(scanner-scheduler)<br/>━━━━━━━━━━━━━━━<br/>IterWalker DFS<br/>+ work-stealing pool<br/>+ Engine::scan per chunk"]
-        RGS["run_git_scan<br/>(scanner-git)<br/>━━━━━━━━━━━━━━━<br/>repo open → MIDX<br/>→ commit-graph plan<br/>→ ODB blob / diff pipeline<br/>→ Engine::scan per blob"]
+    subgraph Contracts["gossip-contracts::connector"]
+        OCS["OrderedContentSource"]
+        GDS["GitRepoDiscoverySource"]
+        GMM["GitMirrorManager"]
+        GRE["GitRepoExecutor"]
     end
 
-    EX --> DFA
-    EX --> ENG
-    DFA -->|Filesystem| FS
-    DFA -->|Git| GIT
-    DFA -->|InMemory| MEM
+    subgraph Engines["Execution engines"]
+        SCHED["scanner-scheduler<br/>parallel_scan_dir / scan_local"]
+        SGIT["scanner-git<br/>run_git_scan"]
+    end
 
-    FS --> PSD
-    GIT --> RGS
+    FS --> OC
+    GIT --> GR
+    DIST --> DF
 
-    style shared fill:none,stroke:#374151,stroke-width:1px
-    style drivers fill:none,stroke:#991B1B,stroke-width:1px
-    style engines fill:none,stroke:#991B1B,stroke-width:1px
+    OC --> OCS
+    GR --> GDS
+    GR --> GMM
+    GR --> GRE
 
-    style EX fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style DFA fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style ENG fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style FS fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style GIT fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style MEM fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style PSD fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
-    style RGS fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+    OCS --> SCHED
+    GRE --> SGIT
+
+    style FS fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style GIT fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style DIST fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style OC fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style GR fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style DF fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style OCS fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style GDS fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style GMM fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style GRE fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style SCHED fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+    style SGIT fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
 ```
 
-**Why drivers own the loop.** Different sources have fundamentally different
-traversal strategies. Filesystem scanning uses a work-stealing parallel
-directory walker. Git scanning traverses the commit graph and pack index.
-Forcing these into a common page-oriented loop would add latency and
-eliminate source-specific parallelism opportunities. Each driver calls the
-shared `Engine::scan` for detection but controls its own I/O scheduling.
+**Generic hooks.** `OrderedContentRuntime::execute_source`,
+`GitRepoRuntime::execute_discovery`, and `GitRepoRuntime::execute_repo` are the
+family-shaped generic hooks exported by the runtime crate.
 
-**Thread scoping.** Both `FsScanDriver` and `GitScanDriver` use
-`std::thread::scope` to spawn forwarder threads that bridge channel-based
-internal sinks to the caller-provided `EventOutput` and `CommitSink` trait
-objects. This avoids `Send + 'static` bounds on the caller's sinks while
-keeping detection work off the calling thread.
+**Concrete implementations stay on the family contracts.**
+`FilesystemConnector`, `GitConnector`, and `InMemoryDeterministicConnector`
+live in `gossip-connectors` and implement the connector family contracts
+defined in `gossip-contracts`.
 
 ---
 
 ## 3. Findings and Identity Flow
 
-Findings travel through two parallel channels: the `EventOutput` stream
-(human-readable output) and the `CommitSink` (identity derivation for
-persistence). In CLI mode the commit sink is a no-op. In distributed mode
-the `DurableCommitSink` derives the full identity chain per finding.
+Once a family loop starts producing scan results, findings move through two
+parallel channels: `EventOutput` for human-facing output and `CommitSink` for
+identity derivation and persistence-oriented bookkeeping.
 
 ```mermaid
 %% Diagram: findings-identity-flow
 sequenceDiagram
     autonumber
 
-    participant DR as ScanDriver
+    participant LOOP as Family loop
     participant EO as EventOutput
     participant CS as CommitSink
     participant ID as Identity (B1)
     participant REC as CoordinationEventRecorder
 
-    note over DR,EO: Channel 1 — Event Stream (all modes)
-    DR->>EO: emit_core(Finding { rule, span, ... })
-    DR->>EO: emit_core(Progress { items, bytes, ... })
-    DR->>EO: emit_core(Summary { totals })
+    note over LOOP,EO: Channel 1 -- Event stream
+    LOOP->>EO: emit_core(Finding { rule, span, ... })
+    LOOP->>EO: emit_core(Progress { items, bytes, ... })
+    LOOP->>EO: emit_core(Summary { totals })
 
-    note over DR,REC: Channel 2 — Commit Lifecycle (distributed mode)
-    DR->>CS: begin_item(item_key, ItemMeta { stable_item_id, version })
+    note over LOOP,REC: Channel 2 -- Commit lifecycle
+    LOOP->>CS: begin_item(item_key, ItemMeta { stable_item_id, version })
     CS->>REC: record_commit_progress(Begin { item_key, size_hint })
 
     loop For each finding in item
-        DR->>CS: upsert_findings(item_key, FindingsBatch)
-
-        note over CS,ID: DurableCommitSink derives identity chain
-        CS->>ID: NormHash::from_digest(finding.norm_hash)
-        CS->>ID: key_secret_hash(tenant_secret_key, &norm_hash) → SecretHash
-        CS->>ID: derive_finding_id(FindingIdInputs) → FindingId
-        CS->>ID: derive_occurrence_id(OccurrenceIdInputs) → OccurrenceId
-
+        LOOP->>CS: upsert_findings(item_key, FindingsBatch)
+        CS->>ID: NormHash::from_digest(...)
+        CS->>ID: key_secret_hash(...)
+        CS->>ID: derive_finding_id(...)
+        CS->>ID: derive_occurrence_id(...)
         CS->>REC: record_identity_chain(IdentityChainRecord)
     end
 
-    DR->>CS: finish_item(item_key)
+    LOOP->>CS: finish_item(item_key)
     CS->>REC: record_commit_progress(Finish { item_key })
 ```
 
-**Split responsibility.** The `EventOutput` stream carries rich finding
-context (matched text, transform path, rule metadata) for human consumption
-and SARIF/JSONL output. The `CommitSink` carries only the minimal fields
-needed for identity derivation — `norm_hash`, `rule_id`, byte offsets — and
-derives the chain. This split keeps the detection engine decoupled from
-identity concerns.
+**Event output stays source-neutral.** The family loop decides how work is
+enumerated and executed, while `EventOutput` receives a stable stream of
+runtime events.
 
-**Identity derivation chain.** For each finding the `DurableCommitSink`
-derives four identity types:
-
-1. `NormHash` — BLAKE3 digest of normalised secret bytes (from engine).
-2. `SecretHash` — tenant-scoped keyed hash: `key_secret_hash(tenant_secret_key, &norm_hash)`.
-3. `FindingId` — deterministic from `(tenant, stable_item_id, rule_fingerprint, secret_hash)`.
-4. `OccurrenceId` — deterministic from `(finding_id, object_version, byte_offset, byte_length)`.
-
-The `StableItemId` and `VersionId` are connector-provided via `ItemMeta` and
-trusted by the sink — the runtime does not re-derive them.
-
-> **Scope note.** The `DurableCommitSink` chain terminates at `OccurrenceId`.
-> `ObservationId` (which adds `PolicyHash` scoping) is derived downstream in
-> the B5 Persistence layer, not here — the commit sink has no access to the
-> active policy. See [ID Derivation DAG §7](./03-id-derivation-dag.md) for the
-> full `ObservationId` derivation.
+**Identity derivation stays local to the runtime.** `DurableCommitSink`
+computes the finding and occurrence identity chain without leaking identity
+logic into the family contracts.
 
 ---
 
 ## 4. Simplified Overview Flowchart
 
-The following flowchart shows the overall shape of both execution paths
-as a decision graph.
+The following flowchart shows the shape of the current runtime surface.
 
 ```mermaid
-%% Diagram: simplified-scan-overview-flowchart
+%% Diagram: simplified-runtime-flowchart
 graph TD
-    A["CLI: parse args"]
-    B["Distributed: acquire_shard"]
-    C{"Shard<br/>done?"}
-    D["build Assignment"]
-    E["driver_for_assignment<br/>(select factory by ConnectorKind)"]
-    F["runtime_engine<br/>(build/cache Engine)"]
-    G["driver.run<br/>(owns scan lifecycle)"]
-    H["ScanReport"]
-    I["complete_shard +<br/>mark_shard_done"]
-    J{"More<br/>shards?"}
-    K["Done"]
+    A["CLI / worker config"]
+    B["scan_fs / scan_git"]
+    C["Validate path + budgets"]
+    D{"Source family"}
+    E["ordered_content::filesystem_placeholder"]
+    F["git_repo::local_repo_placeholder"]
+    G["Result&lt;ScanReport, ScanRuntimeError&gt;"]
+    H["run_distributed"]
+    I["Validate distributed budgets"]
+    J["Result&lt;DistributedRunReport,<br/>DistributedRuntimeError&gt;"]
 
-    A --> D
+    A --> B
     B --> C
-    C -- "Yes" --> J
-    C -- "No" --> D
-    D --> E
-    E --> F
+    C --> D
+    D -- "ordered-content" --> E
+    D -- "git-repo" --> F
+    E --> G
     F --> G
-    G --> H
-    H -->|CLI| K
-    H -->|Distributed| I
+
+    A --> H
+    H --> I
     I --> J
-    J -- "Yes" --> B
-    J -- "No" --> K
 
     style A fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style B fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style C fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style D fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style B fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style C fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style D fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style E fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style F fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style G fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
-    style H fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style F fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style G fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style H fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style I fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style J fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style K fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
-**Interpreting the colors.** Green nodes belong to the distributed
-coordination layer (`DistributedCoordinator`). Red nodes are scan-driver /
-connector operations. Gray nodes are runtime plumbing. The CLI path skips the
-green nodes entirely — it builds a single assignment and runs it directly.
+**Current execution surface.** Filesystem, Git, and distributed entrypoints all
+share the same pattern: validate inputs first, then hand off to a family module
+that owns the runtime-specific execution semantics.
 
 ---
 
 ## Cross-References
 
-| Diagram                          | Related Document                                                                                   |
-| -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Dual entry points                | [Shard and Run State Machines](./05-shard-and-run-state-machines.md) — shard lifecycle              |
-| Driver architecture              | [Connector Architecture](./14-connector-architecture.md) — connector type hierarchy                |
-| Findings identity flow           | [ID Derivation DAG](./03-id-derivation-dag.md) — finding identity derivation chain                 |
-| Simplified overview              | [Lease Lifecycle](./07-lease-lifecycle.md) — distributed lease acquisition and renewal              |
+| Diagram | Related Document |
+| ------- | ---------------- |
+| Dual entry points | [Shard and Run State Machines](./05-shard-and-run-state-machines.md) -- shard lifecycle and completion outcomes |
+| Family runtime surface | [Connector Architecture](./14-connector-architecture.md) -- family contracts and connector capabilities |
+| Findings and identity flow | [ID Derivation DAG](./03-id-derivation-dag.md) -- finding identity derivation chain |
+| Simplified overview | [Lease Lifecycle](./07-lease-lifecycle.md) -- distributed lease acquisition and renewal |
 
 ## Source Code References
 
-| Component                                                          | Path                                                |
-| ------------------------------------------------------------------ | --------------------------------------------------- |
-| CLI entry point and dispatch                                       | `crates/scanner-rs-cli/src/main.rs`                 |
-| Runtime core (`execute_assignment_with_config`, `driver_for_assignment`) | `crates/gossip-scanner-runtime/src/lib.rs`  |
-| Distributed worker loop (`run_worker`)                             | `crates/gossip-scanner-runtime/src/distributed.rs` |
-| `DistributedCoordinator` trait                                     | `crates/gossip-scanner-runtime/src/distributed.rs` |
-| `ScanDriver` trait and `Assignment`                                | `crates/gossip-scan-driver/src/lib.rs`      |
-| `CommitSink` trait and `NoOpCommitSink`                            | `crates/gossip-scan-driver/src/lib.rs`      |
-| `DurableCommitSink` (identity derivation)                          | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
-| `FsScanDriver` / `GitScanDriver` / `InMemoryScanDriver`           | `crates/gossip-connectors/src/scan_driver.rs`       |
-| `parallel_scan_dir` (filesystem detection backend)                 | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `run_git_scan` (git detection backend)                             | `crates/scanner-git/src/runner.rs`             |
-| `CoordinationEventRecorder` trait                                  | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
-| `EventOutput` trait                                                | `crates/scanner-scheduler/src/events.rs`      |
+| Component | Path |
+| --------- | ---- |
+| CLI binary entrypoint | `crates/scanner-rs-cli/src/main.rs` |
+| Worker binary entrypoint | `crates/gossip-worker/src/main.rs` |
+| Runtime entrypoints and validation | `crates/gossip-scanner-runtime/src/lib.rs` |
+| Ordered-content runtime module | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
+| Git runtime module | `crates/gossip-scanner-runtime/src/git_repo.rs` |
+| Distributed runtime module | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Commit sink and identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Coordination event recorder types | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
+| Filesystem execution engine | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`, `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
+| Git execution engine | `crates/scanner-git/src/runner.rs` |
+| Event sink trait | `crates/scanner-scheduler/src/events.rs` |

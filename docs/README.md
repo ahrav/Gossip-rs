@@ -11,7 +11,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | Scanner engine work | [detection-engine.md](scanner-engine/detection-engine.md) → [detection-rules.md](scanner-engine/detection-rules.md)                                         |
 | Coordination work   | [boundary-2-coordination.md](gossip-coordination/boundary-2-coordination.md) → [coordination-testing.md](gossip-coordination/coordination-testing.md)       |
 | Scheduler work      | [scheduler-engine-abstraction.md](scanner-scheduler/scheduler-engine-abstraction.md) → [scheduler-task-graph.md](scanner-scheduler/scheduler-task-graph.md) |
-| Runtime / CLI work  | [gossip-scanner-runtime.md](gossip-scanner-runtime.md) → [gossip-scan-driver.md](gossip-scan-driver.md)                                                     |
+| Runtime / CLI work  | [gossip-scanner-runtime.md](gossip-scanner-runtime.md) → [source-families.md](source-families.md)                                                           |
 | Worker binary       | [gossip-worker.md](gossip-worker.md)                                                                                                                         |
 | CLI binary          | [scanner-rs-cli.md](scanner-rs-cli.md)                                                                                                                       |
 | Connector work      | [boundary-4-connectors.md](gossip-connectors/boundary-4-connectors.md)                                                                                       |
@@ -174,7 +174,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | Document                                                       | Crate                          | Focus                                                         |
 | -------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------- |
 | [gossip-scanner-runtime.md](gossip-scanner-runtime.md)         | `crates/gossip-scanner-runtime/` | Runtime orchestration: CLI, distributed mode, output sinks    |
-| [gossip-scan-driver.md](gossip-scan-driver.md)                 | `crates/gossip-scan-driver/`     | Scan driver abstraction: Assignment, ScanSourceFactory, ScanDriver |
+| [source-families.md](source-families.md)                       | workspace boundary guide         | Source-family model: ordered content, Git discovery, mirroring, execution |
 | [gossip-worker.md](gossip-worker.md)                           | `crates/gossip-worker/`          | Distributed worker binary: CLI, scan dispatch, tracing        |
 | [scanner-rs-cli.md](scanner-rs-cli.md)                         | `crates/scanner-rs-cli/`         | Standalone CLI binary: argument parsing, output formats       |
 | [shard-algebra.md](gossip-frontier/shard-algebra.md)           | `crates/gossip-frontier/`        | Shard algebra: key encoding, range arithmetic, hint framing   |
@@ -237,7 +237,7 @@ Chart assets: [`assets/charts/`](assets/charts/) (scan-time, cold-warm-ratio, me
 | Write simulation tests              | [simulation-harness.md](gossip-coordination/simulation-harness.md) → [counterexample-testing-unification.md](counterexample-testing-unification.md)           |
 | Run integration/property tests      | [scanner-engine-integration-tests.md](scanner-engine-integration-tests.md)                                                                                    |
 | Understand Kani proofs              | [kani-verification.md](kani-verification.md)                                                                                                                  |
-| Understand the scan driver seam     | [gossip-scan-driver.md](gossip-scan-driver.md)                                                                                                                |
+| Understand the source-family model  | [source-families.md](source-families.md)                                                                                                                      |
 | Work on scanner runtime / CLI       | [gossip-scanner-runtime.md](gossip-scanner-runtime.md)                                                                                                        |
 | Understand the worker binary        | [gossip-worker.md](gossip-worker.md)                                                                                                                          |
 | Understand the CLI binary           | [scanner-rs-cli.md](scanner-rs-cli.md)                                                                                                                        |
