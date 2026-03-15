@@ -43,7 +43,7 @@
 //! ```
 
 use crate::keyspace::PersistedShardSubtreeKey;
-use crate::test_etcd::{
+use crate::test_support::{
     contention_namespace, test_coordinator, test_coordinator_in_namespace,
     test_coordinator_in_namespace_with_limits, test_coordinator_with_limits,
     test_coordinator_with_ttl, test_coordinator_with_tuning,
@@ -1905,7 +1905,7 @@ fn unpark_seeded_parked_shard_round_trip_against_local_etcd() {
 // ---------------------------------------------------------------------------
 //
 // Deterministic identity constructors shared by all integration tests.
-// Backend construction is handled by `test_etcd::test_coordinator*`.
+// Backend construction is handled by `test_support::test_coordinator*`.
 
 /// Stable tenant identity used across all tests.
 fn test_tenant() -> TenantId {

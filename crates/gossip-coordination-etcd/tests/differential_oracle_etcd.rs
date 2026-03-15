@@ -74,7 +74,7 @@ use gossip_coordination::{
     SplitReplaceError, SplitReplacePlan, SplitReplaceResult, SplitResidualError, SplitResidualPlan,
     SplitResidualResult, TenantId, UnparkError, WorkerId,
 };
-use gossip_coordination_etcd::test_etcd::test_coordinator_with_ttl;
+use gossip_coordination_etcd::test_support::test_coordinator_with_ttl;
 use gossip_coordination_etcd::{
     EtcdCoordinator, EtcdCoordinatorConfig, EtcdTestShardSnapshot, SimEtcdCoordinator,
 };
@@ -955,7 +955,7 @@ fn sim_config(namespace: &str) -> EtcdCoordinatorConfig {
 // Proptest harness
 // ---------------------------------------------------------------------------
 //
-// Generates 50 random operation sequences (5–50 ops each) and feeds each
+// Generates 50 random operation sequences (15–50 ops each) and feeds each
 // through the differential oracle. `#[ignore]` keeps CI fast by default;
 // run with `--ignored` when a live etcd is available.
 
@@ -970,7 +970,7 @@ proptest! {
     #[ignore]
     fn no_model_drift_against_real_etcd(
         seed in any::<u64>(),
-        ops in proptest::collection::vec(arb_sim_op(N_WORKERS, N_SHARDS), 5..50),
+        ops in proptest::collection::vec(arb_sim_op(N_WORKERS, N_SHARDS), 15..50),
     ) {
         let mut oracle = DifferentialOracle::new(seed);
         oracle.run_sequence(seed, &ops);
