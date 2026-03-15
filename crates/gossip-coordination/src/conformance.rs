@@ -558,13 +558,24 @@ where
         let mut coord = factory(CursorSemantics::Completed);
         let lease = acquire_shard(&mut coord, 10, 1);
 
+        // All inputs derive from OP_LOG_CAP so the test stays correct if
+        // the ring buffer capacity changes. Multi-byte keys avoid the
+        // single-byte `b'a' + i` overflow that would break at cap > 25.
+        let cap = ShardRecord::OP_LOG_CAP as u64;
+        let base_t = 10;
+        let key_for = |n: u64| -> [u8; 9] {
+            let mut key = [b'a'; 9];
+            key[1..].copy_from_slice(&n.to_be_bytes());
+            key
+        };
+
         // Fill the ring buffer to capacity (OP_LOG_CAP entries).
-        for i in 1..=ShardRecord::OP_LOG_CAP as u64 {
-            let key = vec![b'a' + i as u8];
-            let update = CursorUpdate::new(key.as_slice());
+        for i in 1..=cap {
+            let key = key_for(i);
+            let update = CursorUpdate::new(&key);
             let outcome = coord
                 .checkpoint(
-                    now(10 + i),
+                    now(base_t + i),
                     test_tenant(),
                     &lease,
                     &update,
@@ -578,15 +589,16 @@ where
         }
 
         // One more checkpoint evicts op 1 from the ring buffer.
-        let cap = ShardRecord::OP_LOG_CAP as u64;
-        checkpoint_ok(&mut coord, 27, &lease, b"s", cap + 1);
+        let evict_key = key_for(cap + 1);
+        checkpoint_ok(&mut coord, base_t + cap + 1, &lease, &evict_key, cap + 1);
 
-        // Surviving op: still in the ring buffer → Replayed.
+        // Surviving op: still in the ring buffer -> Replayed.
+        let surviving_key = key_for(cap);
         let replay_surviving = coord.checkpoint(
-            now(28),
+            now(base_t + cap + 2),
             test_tenant(),
             &lease,
-            &CursorUpdate::new(&[b'a' + cap as u8]),
+            &CursorUpdate::new(&surviving_key),
             OpId::from_raw(cap),
         );
         assert!(
@@ -598,11 +610,12 @@ where
         // has an idempotency record for op 1, so the backend treats it as
         // a fresh operation. A forward cursor satisfies monotonicity and
         // the checkpoint succeeds as Executed.
+        let fresh_key = key_for(cap + 2);
         let evicted_replay = coord.checkpoint(
-            now(29),
+            now(base_t + cap + 3),
             test_tenant(),
             &lease,
-            &CursorUpdate::new(b"t"),
+            &CursorUpdate::new(&fresh_key),
             OpId::from_raw(1),
         );
         assert!(
@@ -612,13 +625,14 @@ where
         );
 
         // Complete the shard, then verify terminal rejection.
-        complete_ok(&mut coord, 30, &lease, b"y", cap + 2);
+        let complete_key = key_for(cap + 3);
+        complete_ok(&mut coord, base_t + cap + 4, &lease, &complete_key, cap + 2);
 
         let replay_on_terminal = coord.complete(
-            now(31),
+            now(base_t + cap + 5),
             test_tenant(),
             &lease,
-            &test_cursor(b"y"),
+            &test_cursor(&complete_key),
             OpId::from_raw(cap + 2),
         );
         assert!(
