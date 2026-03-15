@@ -294,8 +294,8 @@ impl EtcdCoordinator {
 
     /// Overwrite a shard record in etcd, bypassing all CAS guards.
     ///
-    /// This allows integration tests to seed states that are not otherwise
-    /// reachable yet, such as `Parked` while `park_shard` remains fail-closed.
+    /// This allows integration tests to seed exact persisted states without
+    /// replaying the full mutation sequence that would normally produce them.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_seed_shard_record(
         &self,
@@ -384,6 +384,53 @@ impl EtcdCoordinator {
 }
 
 impl AsyncEtcdCoordinator {
+    /// Load the persisted owner binding and its etcd lease ID.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test_load_owner_binding(
+        &self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<Option<(WorkerId, FenceEpoch, i64)>, EtcdCoordinatorError> {
+        let owner_key = self
+            .keyspace
+            .shard_owner_key(tenant, key.run(), key.shard())
+            .into_bytes();
+        let response = self.etcd_get(owner_key, None).await?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let binding = super::decode_owner_binding(EtcdOperation::Get, kv.value())?;
+        Ok(Some((binding.worker, binding.fence, kv.lease())))
+    }
+
+    /// Load a shard record snapshot for assertion-heavy async tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test_load_shard_snapshot(
+        &self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<Option<EtcdTestShardSnapshot>, EtcdCoordinatorError> {
+        Ok(self
+            .load_shard_record(tenant, key)
+            .await?
+            .map(|inner| EtcdTestShardSnapshot { inner }))
+    }
+
+    /// Return `true` when the active-shard index marker exists for `key`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test_active_shard_index_exists(
+        &self,
+        tenant: TenantId,
+        key: ShardKey,
+    ) -> Result<bool, EtcdCoordinatorError> {
+        let index_key = self
+            .keyspace
+            .shard_active_index_key(tenant, key.run(), key.shard())
+            .into_bytes();
+        let response = self.etcd_get(index_key, None).await?;
+        Ok(!response.kvs().is_empty())
+    }
+
     /// Arm a one-shot fault injection hook for the next matching split
     /// operation.
     ///

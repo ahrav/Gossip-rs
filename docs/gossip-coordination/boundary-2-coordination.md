@@ -37,8 +37,10 @@ used by the in-memory backend. The persisted backend enforces those limits
 before `register_shards`, `split_replace`, and `split_residual` by counting
 existing shard-record keys under the relevant etcd prefixes, then rejecting
 growth that would exceed the configured caps.
-The remaining mutating operations (`complete`, `park_shard`) fail closed
-until their persisted transaction semantics are defined. All `RunManagement`
+The remaining mutating shard-lifecycle operations (`complete`, `park_shard`)
+are fully persisted with terminal-state transitions, lease cleanup, and
+idempotent replay, matching the same CAS-guarded pattern used by the other
+shard operations. All `RunManagement`
 (and `AsyncRunManagement`) trait operations (run terminal transitions,
 `unpark_shard`) are fully persisted. The etcd backend also exposes
 backend-specific helpers for active-run listing and GC of stale initializing
@@ -107,10 +109,11 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
+| `behavioral_conformance.rs` | Real-etcd behavioral conformance scenarios that mirror the shared coordination harness using protocol operations plus persisted read-back oracles |
 | `backend.rs`      | Module root for the `backend/` directory; shared free functions (key comparison, CAS delay, shard capacity counting) |
 | `backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper with owned Tokio runtime) and `AsyncEtcdCoordinator` (async core): shared low-level etcd RPC wrappers, CAS retry logic, data-access helpers (load/scan run and shard records), and inherent methods (`list_active_runs_into`, `gc_stale_initializing_runs_into`) |
 | `backend/run_management.rs` | `RunManagement` and `AsyncRunManagement` impl: create/register/terminate runs, unpark shards, claim candidates |
-| `backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` impl: acquire/renew/checkpoint/split operations |
+| `backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` impl: shard acquisition, lease renewal, checkpointing, terminal transitions (`complete`, `park_shard`), and split operations |
 | `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
 | `sim_etcd_kv.rs` | Feature-gated in-memory model of the etcd KV subset used by coordination: point reads, prefix scans, CAS transactions, revision metadata, and lease-backed expiry for deterministic simulation |
 | `config.rs`       | Endpoint + namespace validation plus owner-lease TTL, optimistic retry tuning, shard count limits, and bounded split fanout |
