@@ -555,6 +555,15 @@ where
 
     {
         eprintln!("  conformance: oplog_eviction_then_replay");
+
+        // All derived timestamps must land before the lease deadline
+        // (base_t + LEASE_DURATION). If OP_LOG_CAP grows past this
+        // bound, the test needs a mid-test lease renewal.
+        const _: () = assert!(
+            ShardRecord::OP_LOG_CAP + 6 < LEASE_DURATION as usize,
+            "oplog eviction test timestamps exceed single lease window"
+        );
+
         let mut coord = factory(CursorSemantics::Completed);
         let lease = acquire_shard(&mut coord, 10, 1);
 
