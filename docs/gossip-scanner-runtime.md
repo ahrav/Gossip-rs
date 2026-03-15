@@ -57,13 +57,13 @@ stable.
 The runtime performs setup work in a fixed order:
 
 1. Validate the requested path.
-2. Validate runtime budgets.
+2. Validate runtime budgets (distributed path only; local paths skip budget validation).
 3. Normalize source-specific inputs.
 4. Call the source family boundary.
 
 Current behavior after validation:
 
-- filesystem scans route to `ordered_content::scan_filesystem`
+- filesystem scans route to `ordered_content::scan_local_filesystem`
 - git scans route to `git_repo::scan_local_repo`
 - distributed runs route to `distributed::run_distributed`
 
@@ -98,7 +98,6 @@ old cross-crate driver seam.
 
 - `FsScanConfig::path` must exist
 - the runtime canonicalizes the path before dispatch
-- `ScanBudgets.max_items` and `ScanBudgets.max_bytes` must both be non-zero
 
 ### Git scans
 
@@ -106,7 +105,6 @@ old cross-crate driver seam.
 - the path must be a git repository root
 - subdirectories of a git repository are rejected so the runtime has a
   stable repository anchor
-- `ScanBudgets.max_items` and `ScanBudgets.max_bytes` must both be non-zero
 
 ### Distributed runs
 

@@ -716,3 +716,194 @@ fn scan_git_with_runtime_returns_empty_report_when_pre_cancelled() {
         "no events should be emitted when pre-cancelled"
     );
 }
+
+// ---------------------------------------------------------------------------
+// OwnedCoreEvent round-trip fidelity (F11)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn owned_core_event_finding_round_trips() {
+    let original = CoreEvent::Finding(FindingEvent {
+        source: SourceKind::Fs,
+        object_path: b"/tmp/secret.txt",
+        start: 10,
+        end: 42,
+        rule_id: 7,
+        rule_name: "test-rule",
+        commit_id: Some(3),
+        change_kind: Some("modify"),
+        confidence_score: 85,
+    });
+
+    let owned = OwnedCoreEvent::from_core(original);
+    let out = scanner_scheduler::events::VecEventOutput::new();
+    owned.emit_into(&out);
+
+    let events = parse_jsonl(out.take());
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["type"], "finding");
+    assert_eq!(event["source"], "fs");
+    assert_eq!(event["rule"], "test-rule");
+    assert_eq!(event["start"], 10);
+    assert_eq!(event["end"], 42);
+    assert_eq!(event["confidence"], 85);
+    assert_eq!(event["commit_id"], 3);
+    assert_eq!(event["change_kind"], "modify");
+}
+
+#[test]
+fn owned_core_event_summary_round_trips() {
+    let original = CoreEvent::Summary(SummaryEvent {
+        source: SourceKind::Git,
+        status: "completed",
+        elapsed_ms: 1234,
+        bytes_scanned: 5678,
+        findings_emitted: 3,
+        errors: 0,
+        throughput_mib_s: 42.5,
+    });
+
+    let owned = OwnedCoreEvent::from_core(original);
+    let out = scanner_scheduler::events::VecEventOutput::new();
+    owned.emit_into(&out);
+
+    let events = parse_jsonl(out.take());
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["type"], "summary");
+    assert_eq!(event["status"], "completed");
+    assert_eq!(event["elapsed_ms"], 1234);
+    assert_eq!(event["bytes_scanned"], 5678);
+    assert_eq!(event["findings_emitted"], 3);
+}
+
+#[test]
+fn owned_core_event_diagnostic_round_trips() {
+    let original = CoreEvent::Diagnostic(DiagnosticEvent {
+        level: "warn",
+        message: "something went wrong",
+    });
+
+    let owned = OwnedCoreEvent::from_core(original);
+    let out = scanner_scheduler::events::VecEventOutput::new();
+    owned.emit_into(&out);
+
+    let events = parse_jsonl(out.take());
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["type"], "diagnostic");
+    assert_eq!(event["level"], "warn");
+    assert_eq!(event["message"], "something went wrong");
+}
+
+// ---------------------------------------------------------------------------
+// OwnedGitEvent round-trip fidelity (F11)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn owned_git_event_commit_meta_round_trips() {
+    let oid = OidBytes::sha1([0xab; 20]);
+    let identity = CommitIdentityIds {
+        author_name: 1,
+        author_email: 2,
+        committer_name: 3,
+        committer_email: 4,
+    };
+
+    let original = GitEvent::CommitMeta(CommitMetaEvent {
+        commit_id: 42,
+        commit_oid: oid,
+        timestamp: 1_700_000_000,
+        identity: Some(identity),
+    });
+
+    let owned = OwnedGitEvent::from_git(original);
+    let out = scanner_git::VecEventSink::new();
+    owned.emit_into(&out);
+
+    let events = parse_jsonl(out.take());
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["type"], "commit_meta");
+    assert_eq!(event["commit_id"], 42);
+    assert_eq!(event["timestamp"], 1_700_000_000u64);
+}
+
+#[test]
+fn scan_git_with_perf_debug_includes_pack_exec_keys() {
+    let repo = create_test_repo(&[("secret.txt", b"prefix TOK_ABCDEFGH suffix")]);
+    let rules = write_runtime_rules();
+    let out = scanner_git::VecEventSink::new();
+    let cancel = CancellationToken::new();
+
+    let outcome = scan_git_with_runtime(
+        &GitScanConfig::new(repo.path())
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_debug_level(GitDebugLevel::Perf),
+        &out,
+        &cancel,
+    )
+    .expect("git scan should succeed");
+
+    let debug_output = outcome.debug_output.expect("perf debug output");
+    assert!(
+        debug_output.contains("git_debug.level=perf"),
+        "debug output should contain perf level marker"
+    );
+    // Perf level includes stage timing, which is always present.
+    assert!(
+        debug_output.contains("stage.pack_exec.nanos"),
+        "perf debug should include stage timing"
+    );
+}
+
+#[test]
+fn scan_git_with_perf_debug_handles_empty_pack_exec_reports() {
+    // A repo with an empty commit has no pack_exec_reports, exercising the
+    // empty-vector path in format_git_debug_output's Perf branch.
+    let repo = create_test_repo(&[]);
+    // Create an empty commit so the repo has at least one ref.
+    run_git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "empty"],
+    );
+    let rules = write_runtime_rules();
+    let out = scanner_git::VecEventSink::new();
+    let cancel = CancellationToken::new();
+
+    let outcome = scan_git_with_runtime(
+        &GitScanConfig::new(repo.path())
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_debug_level(GitDebugLevel::Perf),
+        &out,
+        &cancel,
+    )
+    .expect("git scan should succeed");
+
+    let debug_output = outcome.debug_output.expect("perf debug output");
+    assert!(debug_output.contains("git_debug.level=perf"));
+    // No pack_exec entries expected since there are no blob objects.
+    assert!(
+        !debug_output.contains("pack_exec.0.cache_lookup_nanos"),
+        "empty repo should have no pack_exec entries"
+    );
+}
+
+#[test]
+fn owned_git_event_identity_dictionary_round_trips() {
+    let original = GitEvent::IdentityDictionary(IdentityDictionaryEvent {
+        id: 99,
+        value: b"alice@example.com",
+    });
+
+    let owned = OwnedGitEvent::from_git(original);
+    let out = scanner_git::VecEventSink::new();
+    owned.emit_into(&out);
+
+    let events = parse_jsonl(out.take());
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["type"], "identity_dictionary");
+    assert_eq!(event["id"], 99);
+}

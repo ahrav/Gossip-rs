@@ -141,3 +141,17 @@ pub use fixed_set::FixedSet128;
 pub use ring_buffer::{IntoIter, Iter, RingBuffer};
 pub use spsc::{OwnedSpscConsumer, OwnedSpscProducer, spsc_channel};
 pub use timing_wheel::{Bitset2, PushError, PushOutcome, TimingWheel};
+
+/// Encode a byte slice as a lowercase hexadecimal string.
+///
+/// Uses a constant lookup table for branchless nibble conversion.
+#[must_use]
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}

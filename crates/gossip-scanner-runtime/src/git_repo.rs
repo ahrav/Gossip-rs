@@ -33,7 +33,7 @@ use scanner_git::{
 };
 
 use crate::{
-    AssignmentOutcome, CancellationToken, ChannelGitEventOutput, EVENT_CHANNEL_CAP, GitDebugLevel,
+    AssignmentOutcome, CancellationToken, ChannelEventOutput, EVENT_CHANNEL_CAP, GitDebugLevel,
     GitScanConfig, ScanReport, ScanRuntimeError, build_runtime_engine, forward_git_events,
     join_scoped,
 };
@@ -119,9 +119,9 @@ pub(crate) fn scan_local_repo(
         let event_forwarder = scope.spawn(move || forward_git_events(out, event_rx));
 
         let git_sink: Arc<dyn scanner_git::EventSink> =
-            Arc::new(ChannelGitEventOutput::new(event_tx.clone()));
+            Arc::new(ChannelEventOutput::new(event_tx.clone()));
         let git_cfg = build_git_scan_config(config)?;
-        let resolver = NativeRefResolver::new(StartSetConfig::DefaultBranchOnly);
+        let resolver = NativeRefResolver::new(git_cfg.start_set.clone());
         let watermarks = EmptyWatermarkStore;
         let seen = NeverSeenStore;
 
@@ -178,12 +178,11 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
                 gossip_contracts::connector::ConnectorInputError::ZeroBudget { field: label },
             ));
         }
-        value_mb
-            .checked_mul(MIB)
-            .ok_or_else(|| ScanRuntimeError::RulesConfig {
-                path: None,
-                message: format!("{label} exceeds supported size"),
-            })
+        value_mb.checked_mul(MIB).ok_or_else(|| {
+            ScanRuntimeError::Driver(anyhow!(
+                "{label} value {value_mb} MiB overflows u32 byte count"
+            ))
+        })
     }
 
     /// Same as `mebibytes_to_u32_bytes` but widens to `usize` for APIs that
@@ -193,10 +192,9 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
         label: &'static str,
     ) -> Result<usize, ScanRuntimeError> {
         usize::try_from(mebibytes_to_u32_bytes(value_mb, label)?).map_err(|_| {
-            ScanRuntimeError::RulesConfig {
-                path: None,
-                message: format!("{label} exceeds platform usize"),
-            }
+            ScanRuntimeError::Driver(anyhow!(
+                "{label} value {value_mb} MiB exceeds platform usize"
+            ))
         })
     }
 
@@ -370,5 +368,55 @@ impl RefWatermarkStore for EmptyWatermarkStore {
         ref_names: &[&[u8]],
     ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
         Ok(vec![None; ref_names.len()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GitScanConfig;
+
+    /// Zero-valued `tree_delta_cache_mb` produces a `ZeroBudget` error.
+    #[test]
+    fn build_git_scan_config_rejects_zero_tree_delta_cache() {
+        let cfg = GitScanConfig::new("/tmp").with_tree_delta_cache_mb(Some(0));
+        let err = build_git_scan_config(&cfg).expect_err("zero tree_delta_cache_mb");
+        assert!(
+            matches!(err, ScanRuntimeError::ConnectorInput(_)),
+            "expected ConnectorInput(ZeroBudget), got: {err:?}"
+        );
+    }
+
+    /// `tree_delta_cache_mb` that overflows u32 byte count produces a Driver error.
+    #[test]
+    fn build_git_scan_config_rejects_overflow_tree_delta_cache() {
+        let cfg = GitScanConfig::new("/tmp").with_tree_delta_cache_mb(Some(4096));
+        let err = build_git_scan_config(&cfg).expect_err("overflow tree_delta_cache_mb");
+        assert!(
+            matches!(err, ScanRuntimeError::Driver(_)),
+            "expected Driver (overflow), got: {err:?}"
+        );
+    }
+
+    /// Zero-valued `engine_chunk_mb` produces a `ZeroBudget` error.
+    #[test]
+    fn build_git_scan_config_rejects_zero_engine_chunk() {
+        let cfg = GitScanConfig::new("/tmp").with_engine_chunk_mb(Some(0));
+        let err = build_git_scan_config(&cfg).expect_err("zero engine_chunk_mb");
+        assert!(
+            matches!(err, ScanRuntimeError::ConnectorInput(_)),
+            "expected ConnectorInput(ZeroBudget), got: {err:?}"
+        );
+    }
+
+    /// `engine_chunk_mb` that overflows u32 byte count produces a Driver error.
+    #[test]
+    fn build_git_scan_config_rejects_overflow_engine_chunk() {
+        let cfg = GitScanConfig::new("/tmp").with_engine_chunk_mb(Some(4096));
+        let err = build_git_scan_config(&cfg).expect_err("overflow engine_chunk_mb");
+        assert!(
+            matches!(err, ScanRuntimeError::Driver(_)),
+            "expected Driver (overflow), got: {err:?}"
+        );
     }
 }

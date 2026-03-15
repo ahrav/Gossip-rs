@@ -18,6 +18,7 @@ aegis-pure-rust = [
 [dependencies]
 anyhow.workspace = true
 gossip-contracts.workspace = true
+gossip-stdx.workspace = true
 scanner-engine.workspace = true
 scanner-scheduler.workspace = true
 scanner-git.workspace = true

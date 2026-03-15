@@ -1,5 +1,5 @@
 //! Shared connector utilities: shard-bound validation, binary search,
-//! split-candidate validation, and canonical connector-tag constants.
+//! and split-candidate validation.
 
 use std::{
     io,

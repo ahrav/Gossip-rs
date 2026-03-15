@@ -6,6 +6,7 @@
 //! `DurableCommitSink`, while event recording remains best-effort telemetry.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use scanner_git::{GitEvent, GitEventOutput};
@@ -80,24 +81,48 @@ pub trait CoordinationEventRecorder: Send + Sync {
     fn record_identity_chain(&self, shard_id: &str, record: IdentityChainRecord) -> Result<()>;
 }
 
+/// Map a sentinel identity ID to `None`, real IDs to `Some`.
+fn sentinel_to_option(id: u32) -> Option<u32> {
+    (id != scanner_git::SENTINEL_ID).then_some(id)
+}
+
 /// Distributed event sink that forwards events to a coordinator recorder.
+///
+/// Recorder errors are non-fatal. The first failure for each event kind
+/// (core / git) is logged; subsequent failures are suppressed to avoid
+/// flooding logs during sustained recorder outages.
 pub struct CoordinationEventSink {
     shard_id: Arc<str>,
     recorder: Arc<dyn CoordinationEventRecorder>,
+    core_error_logged: AtomicBool,
+    git_error_logged: AtomicBool,
 }
 
 impl CoordinationEventSink {
     /// Creates a sink that forwards events to `recorder` tagged with `shard_id`.
     #[must_use]
     pub fn new(recorder: Arc<dyn CoordinationEventRecorder>, shard_id: Arc<str>) -> Self {
-        Self { shard_id, recorder }
+        Self {
+            shard_id,
+            recorder,
+            core_error_logged: AtomicBool::new(false),
+            git_error_logged: AtomicBool::new(false),
+        }
     }
 }
 
 impl EventOutput for CoordinationEventSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
         let owned = OwnedCoreEvent::from_core(event);
-        let _ = self.recorder.record_core_event(&self.shard_id, owned);
+        if let Err(error) = self.recorder.record_core_event(&self.shard_id, owned)
+            && !self.core_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist core event; subsequent failures suppressed",
+            );
+        }
     }
 
     fn flush(&self) {}
@@ -108,20 +133,20 @@ impl GitEventOutput for CoordinationEventSink {
         let owned = match event {
             GitEvent::CommitMeta(meta) => StoredGitEvent::CommitMeta {
                 commit_id: meta.commit_id,
-                oid_hex: oid_to_hex(&meta.commit_oid),
+                oid_hex: gossip_stdx::hex_encode(meta.commit_oid.as_slice()),
                 timestamp: meta.timestamp,
-                author_name_id: meta.identity.and_then(|ids| {
-                    (ids.author_name != scanner_git::SENTINEL_ID).then_some(ids.author_name)
-                }),
-                author_email_id: meta.identity.and_then(|ids| {
-                    (ids.author_email != scanner_git::SENTINEL_ID).then_some(ids.author_email)
-                }),
-                committer_name_id: meta.identity.and_then(|ids| {
-                    (ids.committer_name != scanner_git::SENTINEL_ID).then_some(ids.committer_name)
-                }),
-                committer_email_id: meta.identity.and_then(|ids| {
-                    (ids.committer_email != scanner_git::SENTINEL_ID).then_some(ids.committer_email)
-                }),
+                author_name_id: meta
+                    .identity
+                    .and_then(|ids| sentinel_to_option(ids.author_name)),
+                author_email_id: meta
+                    .identity
+                    .and_then(|ids| sentinel_to_option(ids.author_email)),
+                committer_name_id: meta
+                    .identity
+                    .and_then(|ids| sentinel_to_option(ids.committer_name)),
+                committer_email_id: meta
+                    .identity
+                    .and_then(|ids| sentinel_to_option(ids.committer_email)),
             },
             GitEvent::IdentityDictionary(entry) => StoredGitEvent::IdentityDictionary {
                 id: entry.id,
@@ -129,16 +154,14 @@ impl GitEventOutput for CoordinationEventSink {
             },
         };
 
-        let _ = self.recorder.record_git_event(&self.shard_id, owned);
+        if let Err(error) = self.recorder.record_git_event(&self.shard_id, owned)
+            && !self.git_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist git event; subsequent failures suppressed",
+            );
+        }
     }
-}
-
-fn oid_to_hex(oid: &scanner_git::OidBytes) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(oid.as_slice().len() * 2);
-    for byte in oid.as_slice() {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }

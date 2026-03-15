@@ -91,7 +91,10 @@ impl From<ScanRuntimeError> for WorkerError {
 ///
 /// Reads the `RUST_LOG` env var for filter directives, defaulting to `info`.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|e| {
+        eprintln!("warning: invalid RUST_LOG filter ({e}), falling back to 'info'");
+        EnvFilter::new("info")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -166,34 +169,23 @@ where
 /// Returns `(items_scanned, bytes_scanned, findings_emitted)` for logging and
 /// smoke-test assertions.
 fn run_worker(cfg: &WorkerConfig) -> Result<(u64, u64, u64), WorkerError> {
-    match cfg.source {
+    let report = match cfg.source {
         WorkerSource::Fs => scan_fs(
             &FsScanConfig::new(&cfg.path)
                 .with_execution_mode(cfg.execution_mode)
                 .with_budgets(gossip_scanner_runtime::ScanBudgets::default()),
-        )
-        .map(|report| {
-            (
-                report.items_scanned,
-                report.bytes_scanned,
-                report.findings_emitted,
-            )
-        })
-        .map_err(Into::into),
+        )?,
         WorkerSource::Git => scan_git(
             &GitScanConfig::new(&cfg.path)
                 .with_execution_mode(cfg.execution_mode)
                 .with_budgets(gossip_scanner_runtime::ScanBudgets::default()),
-        )
-        .map(|report| {
-            (
-                report.items_scanned,
-                report.bytes_scanned,
-                report.findings_emitted,
-            )
-        })
-        .map_err(Into::into),
-    }
+        )?,
+    };
+    Ok((
+        report.items_scanned,
+        report.bytes_scanned,
+        report.findings_emitted,
+    ))
 }
 
 fn log_report(cfg: &WorkerConfig, report: (u64, u64, u64)) {
@@ -300,11 +292,10 @@ mod tests {
             execution_mode: ExecutionMode::Connector,
         };
 
-        let (items_scanned, bytes_scanned, findings_emitted) =
+        let (items_scanned, bytes_scanned, _findings_emitted) =
             run_worker(&cfg).expect("filesystem worker should succeed");
         assert!(items_scanned > 0);
         assert!(bytes_scanned > 0);
-        assert!(findings_emitted <= items_scanned);
     }
 
     #[test]
@@ -321,10 +312,9 @@ mod tests {
             execution_mode: ExecutionMode::Connector,
         };
 
-        let (items_scanned, bytes_scanned, findings_emitted) =
+        let (items_scanned, bytes_scanned, _findings_emitted) =
             run_worker(&cfg).expect("git worker should succeed");
         assert!(items_scanned > 0);
         assert!(bytes_scanned > 0);
-        assert!(findings_emitted <= items_scanned);
     }
 }

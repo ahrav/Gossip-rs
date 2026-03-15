@@ -774,7 +774,10 @@ pub(crate) fn scan_git_with_runtime(
 pub(crate) fn available_workers() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get())
-        .unwrap_or(1)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to query available parallelism, defaulting to 1");
+            1
+        })
 }
 
 /// Bounded channel capacity for scan event forwarding.
@@ -957,35 +960,9 @@ impl EventOutput for ChannelEventOutput {
     fn flush(&self) {}
 }
 
-/// Combined [`EventOutput`] + [`GitEventOutput`] adapter that forwards both
-/// core and git-specific events through the same bounded channel.
-#[derive(Clone, Debug)]
-pub(crate) struct ChannelGitEventOutput {
-    inner: ChannelEventOutput,
-}
-
-impl ChannelGitEventOutput {
-    pub(crate) fn new(tx: SyncSender<OwnedDriverEvent>) -> Self {
-        Self {
-            inner: ChannelEventOutput::new(tx),
-        }
-    }
-}
-
-impl EventOutput for ChannelGitEventOutput {
-    fn emit_core(&self, event: CoreEvent<'_>) {
-        self.inner.emit_core(event);
-    }
-
-    fn flush(&self) {
-        self.inner.flush();
-    }
-}
-
-impl GitEventOutput for ChannelGitEventOutput {
+impl GitEventOutput for ChannelEventOutput {
     fn emit_git(&self, event: GitEvent<'_>) {
         let _ = self
-            .inner
             .tx
             .send(OwnedDriverEvent::Git(OwnedGitEvent::from_git(event)));
     }
@@ -1085,9 +1062,15 @@ impl StoreProducer for ChannelStoreProducer {
 pub(crate) enum CommitMessage {
     /// A batch of findings for one scanned item.
     Batch(OwnedCommitBatch),
-    /// Run-level loss record (not yet forwarded to the commit sink).
+    /// Run-level loss record. Not forwarded to the commit sink because
+    /// `ScanReport` already captures `dropped_findings` and
+    /// `persist_emit_failures` from the executor metrics. Present in the
+    /// channel because `ChannelStoreProducer` implements `StoreProducer`,
+    /// which requires `record_fs_run_loss`.
     RunLoss(FsRunLoss),
-    /// End-of-run signal indicating whether coverage limits were hit.
+    /// End-of-run signal. Not forwarded to the commit sink because
+    /// run completion is handled by the caller after the scan function
+    /// returns. Present for the same `StoreProducer` trait obligation.
     EndRun(bool),
 }
 
@@ -1102,6 +1085,12 @@ pub(crate) struct OwnedCommitBatch {
 /// Drain commit messages from the channel and forward finding batches to
 /// the commit sink.
 ///
+/// `RunLoss` and `EndRun` messages are acknowledged but not forwarded:
+/// run-level loss counters are already captured in [`ScanReport`] via the
+/// executor metrics, and run completion is signaled by the scan function's
+/// return. These variants exist in the channel only because
+/// [`ChannelStoreProducer`] must satisfy the [`StoreProducer`] trait.
+///
 /// Captures only the *first* error and continues draining the channel so
 /// the sender side does not block. Returns the first error (if any) after
 /// the channel is fully drained.
@@ -1110,19 +1099,38 @@ pub(crate) fn forward_commits(
     rx: Receiver<CommitMessage>,
 ) -> anyhow::Result<()> {
     let mut first_error: Option<anyhow::Error> = None;
+    let mut error_count: u64 = 0;
 
     while let Ok(message) = rx.recv() {
         let result = match message {
             CommitMessage::Batch(batch) => forward_commit_batch(commit, batch),
-            CommitMessage::RunLoss(_loss) => Ok(()),
-            CommitMessage::EndRun(_had_coverage_limits) => Ok(()),
+            CommitMessage::RunLoss(loss) => {
+                tracing::debug!(
+                    dropped_findings = loss.dropped_findings,
+                    persistence_emit_failures = loss.persistence_emit_failures,
+                    "received run-loss record",
+                );
+                Ok(())
+            }
+            CommitMessage::EndRun(had_coverage_limits) => {
+                tracing::debug!(had_coverage_limits, "received end-run signal");
+                Ok(())
+            }
         };
 
-        if first_error.is_none()
-            && let Err(error) = result
-        {
-            first_error = Some(error);
+        if let Err(error) = result {
+            error_count += 1;
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
+    }
+
+    if error_count > 1 {
+        tracing::warn!(
+            total_errors = error_count,
+            "commit forwarding encountered multiple errors; only the first is propagated",
+        );
     }
 
     if let Some(error) = first_error {
@@ -1175,12 +1183,23 @@ fn forward_commit_batch(
 /// relative path. In that case the function returns the file name component
 /// of the root as the item key.
 ///
-/// # Safety
+/// # Platform
+///
+/// This function relies on `OsStr::from_encoded_bytes_unchecked`, which is
+/// sound on Unix (arbitrary bytes are valid OS strings) but requires WTF-8
+/// on Windows. The scanner runtime is Unix-only; a compile-time assertion
+/// below rejects Windows targets.
+///
+/// # Internal unsafe
 ///
 /// Uses `OsStr::from_encoded_bytes_unchecked` because `raw_bytes` originates
 /// from the scheduler, which always provides valid OS-string-encoded paths.
 fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    #[cfg(windows)]
+    compile_error!("normalize_scheduler_path relies on Unix byte-string semantics for OsStr");
+
     // SAFETY: raw_bytes are OS-string-encoded paths from the scheduler.
+    // On Unix, any &[u8] is a valid OsStr encoding.
     let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(raw_bytes) };
     let path = Path::new(os_str);
     let rel = path.strip_prefix(root).map_err(|_| {
@@ -1225,7 +1244,7 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> anyhow::Result<Vec
 /// Mirrors the borrowed `CoreEvent<'_>` variants but owns all heap data
 /// (paths, rule names, messages). Created by `from_core` and replayed by
 /// `emit_into`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum OwnedCoreEvent {
     Finding {
         source: SourceKind,
@@ -1361,6 +1380,102 @@ impl OwnedCoreEvent {
     }
 }
 
+impl PartialEq for OwnedCoreEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Finding {
+                    source: s1,
+                    object_path: p1,
+                    start: st1,
+                    end: e1,
+                    rule_id: r1,
+                    rule_name: rn1,
+                    commit_id: c1,
+                    change_kind: ck1,
+                    confidence_score: cs1,
+                },
+                Self::Finding {
+                    source: s2,
+                    object_path: p2,
+                    start: st2,
+                    end: e2,
+                    rule_id: r2,
+                    rule_name: rn2,
+                    commit_id: c2,
+                    change_kind: ck2,
+                    confidence_score: cs2,
+                },
+            ) => {
+                s1 == s2
+                    && p1 == p2
+                    && st1 == st2
+                    && e1 == e2
+                    && r1 == r2
+                    && rn1 == rn2
+                    && c1 == c2
+                    && ck1 == ck2
+                    && cs1 == cs2
+            }
+            (
+                Self::Progress {
+                    source: s1,
+                    stage: st1,
+                    objects_scanned: os1,
+                    bytes_scanned: bs1,
+                    findings_emitted: fe1,
+                },
+                Self::Progress {
+                    source: s2,
+                    stage: st2,
+                    objects_scanned: os2,
+                    bytes_scanned: bs2,
+                    findings_emitted: fe2,
+                },
+            ) => s1 == s2 && st1 == st2 && os1 == os2 && bs1 == bs2 && fe1 == fe2,
+            (
+                Self::Summary {
+                    source: s1,
+                    status: st1,
+                    elapsed_ms: em1,
+                    bytes_scanned: bs1,
+                    findings_emitted: fe1,
+                    errors: er1,
+                    throughput_mib_s: t1,
+                },
+                Self::Summary {
+                    source: s2,
+                    status: st2,
+                    elapsed_ms: em2,
+                    bytes_scanned: bs2,
+                    findings_emitted: fe2,
+                    errors: er2,
+                    throughput_mib_s: t2,
+                },
+            ) => {
+                s1 == s2
+                    && st1 == st2
+                    && em1 == em2
+                    && bs1 == bs2
+                    && fe1 == fe2
+                    && er1 == er2
+                    && t1.to_bits() == t2.to_bits()
+            }
+            (
+                Self::Diagnostic {
+                    level: l1,
+                    message: m1,
+                },
+                Self::Diagnostic {
+                    level: l2,
+                    message: m2,
+                },
+            ) => l1 == l2 && m1 == m2,
+            _ => false,
+        }
+    }
+}
+
 /// Owned representation of [`GitEvent`] for cross-thread forwarding.
 ///
 /// Mirrors the borrowed `GitEvent<'_>` variants. Identity dictionary values
@@ -1424,9 +1539,9 @@ pub(crate) fn join_scoped<T>(
     handle: std::thread::ScopedJoinHandle<'_, T>,
     thread_name: &str,
 ) -> anyhow::Result<T> {
-    handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("{thread_name} panicked"))
+    handle.join().map_err(|payload| {
+        anyhow::anyhow!("{thread_name} panicked: {}", panic_payload_message(payload))
+    })
 }
 
 /// Validate a filesystem scan target path.
