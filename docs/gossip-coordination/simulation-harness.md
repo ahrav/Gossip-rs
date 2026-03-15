@@ -4,11 +4,12 @@ Deterministic simulation infrastructure for the coordination subsystem,
 inspired by FoundationDB's simulation framework, TigerBeetle's VOPR, and
 sled's simulation harness.
 
-Execution integration note: the runtime now has a dedicated scan-driver seam
-(`crates/gossip-scan-driver`) for translating shard assignments into
-source-specific execution backends. The simulation harness remains focused on
-coordination correctness and intentionally does not depend on scanner-engine
-or scheduler internals.
+Execution integration note: the runtime translates shard assignments into
+source-specific execution through family contracts (`OrderedContentSource`
+for item sources, `GitRepoDiscoverySource` / `GitMirrorManager` /
+`GitRepoExecutor` for repository sources). The simulation harness remains
+focused on coordination correctness and intentionally does not depend on
+scanner-engine or scheduler internals.
 
 Persistence note: `crates/gossip-coordination-etcd/` provides two entrypoints —
 `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core) —

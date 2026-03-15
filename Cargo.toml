@@ -66,5 +66,3 @@ opt-level = 1
 [profile.test.package."*"]
 opt-level = 1
 
-[workspace.metadata.guardrails]
-legacy_driver_stack_check = "python3 scripts/check_no_legacy_source_design.py"

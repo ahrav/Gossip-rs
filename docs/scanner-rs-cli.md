@@ -43,8 +43,7 @@ scanner-rs-cli (Tier 3 binary, produces `scanner-rs`)
        --> scanner-engine          (detection pipeline)
        --> scanner-scheduler       (execution scheduling, FS scanning)
        --> scanner-git             (git repository scanning)
-       --> gossip-scan-driver      (ScanDriver, Assignment traits)
-       --> gossip-connectors       (FS/Git/InMemory scan source factories)
+       --> gossip-connectors       (FS/Git/InMemory source implementations)
        --> gossip-contracts        (connector/coordination/identity types)
 ```
 

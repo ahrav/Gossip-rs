@@ -66,9 +66,10 @@ The module provides seven core capabilities:
   philosophy where violated invariants panic before persistence, ensuring
   crash-recovery returns to the last valid state.
 - **Assignment handoff boundary** -- coordination emits shard assignments
-  that runtime layers translate through `gossip-scan-driver`
-  (`ScanSourceFactory` + `ScanDriver`) so CLI and distributed execution share
-  one scanner-scheduler/engine path.
+  that runtime layers translate through source-family contracts
+  (`OrderedContentSource` for item sources, `GitRepoDiscoverySource` +
+  `GitMirrorManager` + `GitRepoExecutor` for repository sources) so CLI
+  and distributed execution share one integration path per family.
 
 ### Source files
 
