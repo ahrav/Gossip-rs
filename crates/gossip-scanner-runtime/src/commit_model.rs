@@ -146,7 +146,6 @@ impl<'a> CommitRequest<'a> {
 
     /// Completed unit this request will make durable.
     #[inline]
-    #[must_use]
     pub fn completed_unit(&self) -> &CompletedUnit {
         &self.completed_unit
     }
@@ -227,12 +226,12 @@ impl UnitCommitReceipt {
     pub fn new(
         completed_unit: CompletedUnit,
         durable: ItemCommitReceipt,
-    ) -> Result<Self, BoundaryMismatchError> {
+    ) -> Result<Self, Box<BoundaryMismatchError>> {
         if completed_unit.checkpoint_boundary() != durable.scope().checkpoint_boundary() {
-            return Err(BoundaryMismatchError {
+            return Err(Box::new(BoundaryMismatchError {
                 unit_boundary: completed_unit.checkpoint_boundary().clone(),
                 receipt_boundary: durable.scope().checkpoint_boundary().clone(),
-            });
+            }));
         }
 
         Ok(Self {
@@ -243,7 +242,6 @@ impl UnitCommitReceipt {
 
     /// Completed unit proved durable by this receipt.
     #[inline]
-    #[must_use]
     pub fn completed_unit(&self) -> &CompletedUnit {
         &self.completed_unit
     }
@@ -282,7 +280,6 @@ impl CheckpointAggregatorInput {
 
     /// Durable receipt carried into the checkpoint stage.
     #[inline]
-    #[must_use]
     pub fn receipt(&self) -> &UnitCommitReceipt {
         &self.receipt
     }
