@@ -46,6 +46,8 @@ pub mod validation;
 // ---------------------------------------------------------------------------
 
 #[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
+#[cfg(any(test, feature = "test-support"))]
 pub mod sim;
 
 // ---------------------------------------------------------------------------
