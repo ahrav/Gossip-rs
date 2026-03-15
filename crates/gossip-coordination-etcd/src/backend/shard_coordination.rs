@@ -56,8 +56,8 @@ use gossip_coordination::{
     OpLogEntry, OpResult, ParkError, ParkReason, RenewError, RenewResult, ShardCountSnapshot,
     ShardKey, ShardRecord, ShardStatus, SplitChildIds, SplitReplaceError, SplitReplacePlan,
     SplitReplaceResult, SplitResidualError, SplitResidualPlan, SplitResidualResult, TenantId,
-    WorkerId, check_op_idempotency, derive_split_shard_id, hash_checkpoint_payload,
-    hash_complete_payload, hash_park_payload, hash_split_replace_payload,
+    TerminalTransitionError, WorkerId, check_op_idempotency, derive_split_shard_id,
+    hash_checkpoint_payload, hash_complete_payload, hash_park_payload, hash_split_replace_payload,
     hash_split_residual_payload, shard_limit_violation, split_replace_apply_parent,
     split_replace_validate_preconditions, split_residual_apply_parent, split_residual_build_record,
     split_residual_check_replay, split_residual_validate_preconditions,
@@ -82,7 +82,9 @@ use crate::sim_coordinator::SimEtcdCoordinator;
 /// caller alongside the freshly minted lease and capacity hint.
 ///
 /// Shared by both sync and async `acquire_and_restore_into` to keep the
-/// snapshot projection logic in a single place.
+/// snapshot projection logic in a single place. The separation from the
+/// CAS closure avoids the lifetime conflict between the closure's capture
+/// of `out` and the returned view that borrows from it.
 fn build_acquire_result<'a>(
     out: &'a mut AcquireScratch,
     persisted: &PersistedShard,
@@ -112,6 +114,168 @@ fn build_acquire_result<'a>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Terminal transition helpers — shared between `complete` and `park_shard`
+// ---------------------------------------------------------------------------
+
+/// Operation-name strings used in error context for terminal shard transitions.
+///
+/// All fields are `&'static str` to avoid runtime concatenation on the
+/// error path. Separate constants for `complete` and `park_shard` are
+/// pre-built below.
+struct TerminalOpNames {
+    /// Context for the initial shard load (e.g. `"complete.load_shard"`).
+    load_shard: &'static str,
+    /// Context for the shard-record encode step.
+    encode_shard: &'static str,
+    /// Context for the CAS transaction execution.
+    txn: &'static str,
+    /// Context for the post-exhaustion shard re-load.
+    exhaust_load_shard: &'static str,
+    /// Base operation name in the final exhaustion error.
+    base: &'static str,
+}
+
+const COMPLETE_OP_NAMES: TerminalOpNames = TerminalOpNames {
+    load_shard: "complete.load_shard",
+    encode_shard: "complete.encode_shard",
+    txn: "complete.txn",
+    exhaust_load_shard: "complete.exhaust.load_shard",
+    base: "complete",
+};
+
+const PARK_OP_NAMES: TerminalOpNames = TerminalOpNames {
+    load_shard: "park_shard.load_shard",
+    encode_shard: "park_shard.encode_shard",
+    txn: "park_shard.txn",
+    exhaust_load_shard: "park_shard.exhaust.load_shard",
+    base: "park_shard",
+};
+
+/// Execute a terminal shard transition (complete or park) with CAS retry.
+///
+/// Encapsulates the load-validate-mutate-CAS-retry loop shared by `complete`
+/// and `park_shard`. The caller supplies:
+///
+/// - `payload_hash` — pre-computed from the operation-specific arguments.
+/// - `op_names` — error-context strings for this operation.
+/// - `apply` — closure that applies operation-specific record mutations
+///   (cursor update + status=Done for complete; status=Parked + park_reason
+///   for park). Called once per CAS attempt with a freshly loaded record.
+///
+/// Everything else — shard loading, idempotency checks, lease validation,
+/// encoding, CAS guard construction, retry, post-exhaust diagnostics, cache
+/// refresh, and owner lease revocation — is handled here.
+#[allow(clippy::too_many_arguments)]
+fn execute_sync_terminal_transition<T, E>(
+    coord: &mut T,
+    now: LogicalTime,
+    tenant: TenantId,
+    lease: &Lease,
+    op_id: OpId,
+    payload_hash: u64,
+    op_names: &TerminalOpNames,
+    apply: impl Fn(&mut PersistedShard) -> Result<(), E>,
+) -> Result<IdempotentOutcome<()>, E>
+where
+    T: SyncEtcdLike,
+    E: TerminalTransitionError,
+{
+    let key = lease.shard_key();
+    let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
+
+    let result = coord.cas_retry(
+        |this, _attempt| {
+            shard_buf.clear();
+            owner_buf.clear();
+
+            let persisted = match this.load_shard_record(tenant, key) {
+                Ok(Some(shard)) => shard,
+                Ok(None) => return Err(E::shard_not_found(key)),
+                Err(err) => {
+                    return Err(E::backend_error(super::map_etcd_err(
+                        op_names.load_shard,
+                        err,
+                    )));
+                }
+            };
+
+            if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
+                return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
+            }
+            validate_loaded_shard_lease(now, tenant, lease, &persisted, E::stale_fence)?;
+
+            let mut persisted = persisted;
+            apply(&mut persisted)?;
+            persisted.record.assert_invariants(&persisted.slab);
+
+            encode_shard_record_into(&persisted.record, &persisted.slab, &mut shard_buf).map_err(
+                |err| E::backend_error(InfraError::corruption(op_names.encode_shard, err)),
+            )?;
+            let owner = persisted
+                .owner
+                .as_ref()
+                .expect("validated owner must have binding");
+            let owner_etcd_lease = owner.lease_id;
+            encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
+
+            let shard_record_key = this
+                .keyspace()
+                .shard_record_key(tenant, key.run(), key.shard());
+            let owner_key = this
+                .keyspace()
+                .shard_owner_key(tenant, key.run(), key.shard());
+            let compares = build_shard_owner_cas(
+                shard_record_key.clone(),
+                owner_key.clone(),
+                &persisted,
+                owner_buf.clone(),
+            );
+
+            let mut txn = TxnBuilder::from_compares(compares);
+            txn.put(shard_record_key.into_bytes(), shard_buf.clone())
+                .delete(owner_key.into_bytes())
+                .delete(
+                    this.keyspace()
+                        .shard_active_index_key(tenant, key.run(), key.shard())
+                        .into_bytes(),
+                );
+            let outcome = txn
+                .execute(this, IdempotentOutcome::Executed(()))
+                .map_err(|err| E::backend_error(super::map_etcd_err(op_names.txn, err)))?;
+            if matches!(outcome, CasOutcome::Committed(_)) {
+                this.best_effort_revoke_lease(owner_etcd_lease);
+            }
+            Ok(outcome)
+        },
+        |this| {
+            let persisted = this
+                .load_shard_checked(op_names.exhaust_load_shard, tenant, key)
+                .map_err(E::backend_error)?;
+            if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
+                return Ok(IdempotentOutcome::Replayed(()));
+            }
+            validate_loaded_shard_lease(now, tenant, lease, &persisted, E::stale_fence)?;
+
+            Err(E::backend_error(InfraError::transient(
+                op_names.base,
+                "CAS retry budget exhausted after ruling out replay, stale fence, \
+                 and terminal status — lease-exclusive operation should not face \
+                 legitimate contention",
+            )))
+        },
+    )?;
+    coord.best_effort_refresh_cached_run_state(tenant, key.run());
+    Ok(result)
+}
+
+/// Stamps out [`CoordinationBackend`] for a concrete `SyncEtcdLike` type.
+///
+/// The macro exists because `CoordinationBackend` trait methods take `&mut self`
+/// and the CAS retry closures borrow `self`, creating lifetime conflicts that
+/// cannot be expressed through a blanket impl. Each concrete type gets its
+/// own monomorphized impl, preserving inlining across the CAS hot path.
 macro_rules! impl_sync_coordination_backend {
     ($coord:ty) => {
         impl CoordinationBackend for $coord {
@@ -617,42 +781,21 @@ macro_rules! impl_sync_coordination_backend {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteError> {
         self.sync_logical_time(now);
-        let key = lease.shard_key();
-        let payload_hash = hash_complete_payload(final_cursor);
-        let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
-        let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
-
-        let result = self.cas_retry(
-            |this, _attempt| {
-                let persisted = match this.load_shard_record(tenant, key) {
-                    Ok(Some(shard)) => shard,
-                    Ok(None) => return Err(CompleteError::ShardNotFound { shard: key }),
-                    Err(err) => {
-                        return Err(CompleteError::BackendError(super::map_etcd_err(
-                            "complete.load_shard",
-                            err,
-                        )));
-                    }
-                };
-
-                if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
-                    return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
-                }
-                validate_loaded_shard_lease(
-                    now,
-                    tenant,
-                    lease,
-                    &persisted,
-                    |presented, current| CompleteError::StaleFence { presented, current },
-                )?;
+        execute_sync_terminal_transition(
+            self,
+            now,
+            tenant,
+            lease,
+            op_id,
+            hash_complete_payload(final_cursor),
+            &COMPLETE_OP_NAMES,
+            |persisted| {
                 validate_cursor_update_pooled(
                     final_cursor,
                     persisted.record.cursor.last_key(&persisted.slab),
                     persisted.record.spec.key_range_start(&persisted.slab),
                     persisted.record.spec.key_range_end(&persisted.slab),
                 )?;
-
-                let mut persisted = persisted;
                 persisted
                     .record
                     .cursor
@@ -664,79 +807,12 @@ macro_rules! impl_sync_coordination_backend {
                     op_id,
                     OpKind::Complete,
                     OpResult::Completed,
-                    payload_hash,
+                    hash_complete_payload(final_cursor),
                     now,
                 ));
-                persisted.record.assert_invariants(&persisted.slab);
-                encode_shard_record_into(&persisted.record, &persisted.slab, &mut shard_buf)
-                    .map_err(|err| {
-                        CompleteError::BackendError(InfraError::corruption(
-                            "complete.encode_shard",
-                            err,
-                        ))
-                    })?;
-                let owner = persisted
-                    .owner
-                    .as_ref()
-                    .expect("validated owner must have binding");
-                let owner_etcd_lease = owner.lease_id;
-                encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
-
-                let shard_record_key =
-                    this.keyspace
-                        .shard_record_key(tenant, key.run(), key.shard());
-                let owner_key = this
-                    .keyspace
-                    .shard_owner_key(tenant, key.run(), key.shard());
-                let compares = build_shard_owner_cas(
-                    shard_record_key.clone(),
-                    owner_key.clone(),
-                    &persisted,
-                    owner_buf.clone(),
-                );
-
-                let mut txn = TxnBuilder::from_compares(compares);
-                txn.put(shard_record_key.into_bytes(), shard_buf.clone())
-                    .delete(owner_key.into_bytes())
-                    .delete(
-                        this.keyspace
-                            .shard_active_index_key(tenant, key.run(), key.shard())
-                            .into_bytes(),
-                    );
-                let outcome = txn.execute(this, IdempotentOutcome::Executed(()))
-                    .map_err(|err| {
-                        CompleteError::BackendError(super::map_etcd_err("complete.txn", err))
-                    })?;
-                if matches!(outcome, CasOutcome::Committed(_)) {
-                    this.best_effort_revoke_lease(owner_etcd_lease);
-                }
-                Ok(outcome)
+                Ok(())
             },
-            |this| {
-                let persisted = this
-                    .load_shard_checked("complete.exhaust.load_shard", tenant, key)
-                    .map_err(CompleteError::BackendError)?;
-                if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
-                    return Ok(IdempotentOutcome::Replayed(()));
-                }
-                validate_loaded_shard_lease(
-                    now,
-                    tenant,
-                    lease,
-                    &persisted,
-                    |presented, current| CompleteError::StaleFence { presented, current },
-                )?;
-
-                Err(CompleteError::BackendError(InfraError::corruption(
-                    "complete",
-                    "CAS retry budget exhausted after ruling out replay, stale fence, \
-                     and terminal status — lease-exclusive operation should not face \
-                     legitimate contention",
-                )))
-            },
-        )?;
-        self.best_effort_refresh_cached_run_state(tenant, key.run());
-        Ok(result)
+        )
     }
 
     /// Park a shard (temporarily suspend processing) for the given reason.
@@ -758,36 +834,15 @@ macro_rules! impl_sync_coordination_backend {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, ParkError> {
         self.sync_logical_time(now);
-        let key = lease.shard_key();
-        let payload_hash = hash_park_payload(reason);
-        let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
-        let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
-
-        let result = self.cas_retry(
-            |this, _attempt| {
-                let persisted = match this.load_shard_record(tenant, key) {
-                    Ok(Some(shard)) => shard,
-                    Ok(None) => return Err(ParkError::ShardNotFound { shard: key }),
-                    Err(err) => {
-                        return Err(ParkError::BackendError(super::map_etcd_err(
-                            "park_shard.load_shard",
-                            err,
-                        )));
-                    }
-                };
-
-                if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
-                    return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
-                }
-                validate_loaded_shard_lease(
-                    now,
-                    tenant,
-                    lease,
-                    &persisted,
-                    |presented, current| ParkError::StaleFence { presented, current },
-                )?;
-
-                let mut persisted = persisted;
+        execute_sync_terminal_transition(
+            self,
+            now,
+            tenant,
+            lease,
+            op_id,
+            hash_park_payload(reason),
+            &PARK_OP_NAMES,
+            |persisted| {
                 persisted.record.assert_transition_legal(ShardStatus::Parked);
                 persisted.record.status = ShardStatus::Parked;
                 persisted.record.park_reason = Some(reason);
@@ -796,79 +851,12 @@ macro_rules! impl_sync_coordination_backend {
                     op_id,
                     OpKind::Park,
                     OpResult::Completed,
-                    payload_hash,
+                    hash_park_payload(reason),
                     now,
                 ));
-                persisted.record.assert_invariants(&persisted.slab);
-                encode_shard_record_into(&persisted.record, &persisted.slab, &mut shard_buf)
-                    .map_err(|err| {
-                        ParkError::BackendError(InfraError::corruption(
-                            "park_shard.encode_shard",
-                            err,
-                        ))
-                    })?;
-                let owner = persisted
-                    .owner
-                    .as_ref()
-                    .expect("validated owner must have binding");
-                let owner_etcd_lease = owner.lease_id;
-                encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
-
-                let shard_record_key =
-                    this.keyspace
-                        .shard_record_key(tenant, key.run(), key.shard());
-                let owner_key = this
-                    .keyspace
-                    .shard_owner_key(tenant, key.run(), key.shard());
-                let compares = build_shard_owner_cas(
-                    shard_record_key.clone(),
-                    owner_key.clone(),
-                    &persisted,
-                    owner_buf.clone(),
-                );
-
-                let mut txn = TxnBuilder::from_compares(compares);
-                txn.put(shard_record_key.into_bytes(), shard_buf.clone())
-                    .delete(owner_key.into_bytes())
-                    .delete(
-                        this.keyspace
-                            .shard_active_index_key(tenant, key.run(), key.shard())
-                            .into_bytes(),
-                    );
-                let outcome = txn.execute(this, IdempotentOutcome::Executed(()))
-                    .map_err(|err| {
-                        ParkError::BackendError(super::map_etcd_err("park_shard.txn", err))
-                    })?;
-                if matches!(outcome, CasOutcome::Committed(_)) {
-                    this.best_effort_revoke_lease(owner_etcd_lease);
-                }
-                Ok(outcome)
+                Ok(())
             },
-            |this| {
-                let persisted = this
-                    .load_shard_checked("park_shard.exhaust.load_shard", tenant, key)
-                    .map_err(ParkError::BackendError)?;
-                if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
-                    return Ok(IdempotentOutcome::Replayed(()));
-                }
-                validate_loaded_shard_lease(
-                    now,
-                    tenant,
-                    lease,
-                    &persisted,
-                    |presented, current| ParkError::StaleFence { presented, current },
-                )?;
-
-                Err(ParkError::BackendError(InfraError::corruption(
-                    "park_shard",
-                    "CAS retry budget exhausted after ruling out replay, stale fence, \
-                     and terminal status — lease-exclusive operation should not face \
-                     legitimate contention",
-                )))
-            },
-        )?;
-        self.best_effort_refresh_cached_run_state(tenant, key.run());
-        Ok(result)
+        )
     }
 
     /// Replace an owned shard with N child shards in a single atomic
@@ -1492,6 +1480,111 @@ impl_sync_coordination_backend!(EtcdCoordinator);
 #[cfg(any(test, feature = "test-support"))]
 impl_sync_coordination_backend!(SimEtcdCoordinator);
 
+impl AsyncEtcdCoordinator {
+    /// Execute a terminal shard transition (complete or park) with async
+    /// CAS retry.
+    ///
+    /// Async counterpart of [`execute_sync_terminal_transition`]. See that
+    /// function's doc comment for the shared protocol semantics.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_terminal_transition<E>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        op_id: OpId,
+        payload_hash: u64,
+        op_names: &TerminalOpNames,
+        apply: impl Fn(&mut PersistedShard) -> Result<(), E>,
+    ) -> Result<IdempotentOutcome<()>, E>
+    where
+        E: TerminalTransitionError,
+    {
+        let key = lease.shard_key();
+        let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
+        let max_retries = self.config.optimistic_txn_retries();
+        for attempt_num in 0..max_retries {
+            shard_buf.clear();
+            owner_buf.clear();
+            let persisted = match self.load_shard_record(tenant, key).await {
+                Ok(Some(s)) => s,
+                Ok(None) => return Err(E::shard_not_found(key)),
+                Err(e) => {
+                    return Err(E::backend_error(super::map_etcd_err(
+                        op_names.load_shard,
+                        e,
+                    )));
+                }
+            };
+            if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
+                self.best_effort_refresh_cached_run_state(tenant, key.run())
+                    .await;
+                return Ok(IdempotentOutcome::Replayed(()));
+            }
+            validate_loaded_shard_lease(now, tenant, lease, &persisted, E::stale_fence)?;
+
+            let mut persisted = persisted;
+            apply(&mut persisted)?;
+            persisted.record.assert_invariants(&persisted.slab);
+
+            encode_shard_record_into(&persisted.record, &persisted.slab, &mut shard_buf)
+                .map_err(|e| E::backend_error(InfraError::corruption(op_names.encode_shard, e)))?;
+            let owner = persisted
+                .owner
+                .as_ref()
+                .expect("validated owner must have binding");
+            let owner_etcd_lease = owner.lease_id;
+            encode_owner_value_into(owner.binding.worker, owner.binding.fence, &mut owner_buf);
+            let srk = self
+                .keyspace
+                .shard_record_key(tenant, key.run(), key.shard());
+            let ok = self
+                .keyspace
+                .shard_owner_key(tenant, key.run(), key.shard());
+            let compares =
+                build_shard_owner_cas(srk.clone(), ok.clone(), &persisted, owner_buf.clone());
+            let mut txn = TxnBuilder::from_compares(compares);
+            txn.put(srk.into_bytes(), shard_buf.clone())
+                .delete(ok.into_bytes())
+                .delete(
+                    self.keyspace
+                        .shard_active_index_key(tenant, key.run(), key.shard())
+                        .into_bytes(),
+                );
+            let outcome = txn
+                .execute_async(self, IdempotentOutcome::Executed(()))
+                .await
+                .map_err(|err| E::backend_error(super::map_etcd_err(op_names.txn, err)))?;
+            if let CasOutcome::Committed(result) = outcome {
+                self.best_effort_revoke_lease(owner_etcd_lease).await;
+                self.best_effort_refresh_cached_run_state(tenant, key.run())
+                    .await;
+                return Ok(result);
+            }
+            if attempt_num + 1 < max_retries {
+                tokio::time::sleep(cas_retry_delay(attempt_num)).await;
+            }
+        }
+        let persisted = self
+            .load_shard_checked(op_names.exhaust_load_shard, tenant, key)
+            .await
+            .map_err(E::backend_error)?;
+        if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
+            self.best_effort_refresh_cached_run_state(tenant, key.run())
+                .await;
+            return Ok(IdempotentOutcome::Replayed(()));
+        }
+        validate_loaded_shard_lease(now, tenant, lease, &persisted, E::stale_fence)?;
+        Err(E::backend_error(InfraError::transient(
+            op_names.base,
+            "CAS retry budget exhausted after ruling out replay, stale fence, \
+             and terminal status — lease-exclusive operation should not face \
+             legitimate contention",
+        )))
+    }
+}
+
 impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
     async fn acquire_and_restore_into<'a>(
         &mut self,
@@ -1876,24 +1969,79 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
 
     async fn complete(
         &mut self,
-        _now: LogicalTime,
-        _tenant: TenantId,
-        _lease: &Lease,
-        _final_cursor: &CursorUpdate<'_>,
-        _op_id: OpId,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        final_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteError> {
-        self.fail_unimplemented("complete")
+        self.execute_terminal_transition(
+            now,
+            tenant,
+            lease,
+            op_id,
+            hash_complete_payload(final_cursor),
+            &COMPLETE_OP_NAMES,
+            |persisted| {
+                validate_cursor_update_pooled(
+                    final_cursor,
+                    persisted.record.cursor.last_key(&persisted.slab),
+                    persisted.record.spec.key_range_start(&persisted.slab),
+                    persisted.record.spec.key_range_end(&persisted.slab),
+                )?;
+                persisted
+                    .record
+                    .cursor
+                    .update_from_ref(final_cursor, &mut persisted.slab)?;
+                persisted.record.assert_transition_legal(ShardStatus::Done);
+                persisted.record.status = ShardStatus::Done;
+                persisted.record.lease = None;
+                persisted.record.op_log_push(OpLogEntry::new(
+                    op_id,
+                    OpKind::Complete,
+                    OpResult::Completed,
+                    hash_complete_payload(final_cursor),
+                    now,
+                ));
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn park_shard(
         &mut self,
-        _now: LogicalTime,
-        _tenant: TenantId,
-        _lease: &Lease,
-        _reason: ParkReason,
-        _op_id: OpId,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        reason: ParkReason,
+        op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, ParkError> {
-        self.fail_unimplemented("park_shard")
+        self.execute_terminal_transition(
+            now,
+            tenant,
+            lease,
+            op_id,
+            hash_park_payload(reason),
+            &PARK_OP_NAMES,
+            |persisted| {
+                persisted
+                    .record
+                    .assert_transition_legal(ShardStatus::Parked);
+                persisted.record.status = ShardStatus::Parked;
+                persisted.record.park_reason = Some(reason);
+                persisted.record.lease = None;
+                persisted.record.op_log_push(OpLogEntry::new(
+                    op_id,
+                    OpKind::Park,
+                    OpResult::Completed,
+                    hash_park_payload(reason),
+                    now,
+                ));
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn split_replace(

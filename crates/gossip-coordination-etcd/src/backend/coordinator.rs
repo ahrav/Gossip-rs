@@ -74,6 +74,33 @@ use super::{
 #[cfg(any(test, feature = "test-support"))]
 use super::test_support::EtcdTestFaultState;
 
+/// Abstraction over the sync etcd transport, enabling the same coordination
+/// logic to run against both real etcd ([`EtcdCoordinator`]) and the
+/// in-process simulation backend ([`SimEtcdCoordinator`]).
+///
+/// This trait defines the low-level RPC surface (`etcd_get`, `etcd_txn`,
+/// lease operations), the CAS retry loop, and all data-loading helpers
+/// that coordination operations compose. The actual trait impls for
+/// [`CoordinationBackend`](gossip_coordination::CoordinationBackend) and
+/// [`RunManagement`](gossip_coordination::RunManagement) are defined in
+/// sibling modules and are generic over `SyncEtcdLike` via a macro.
+///
+/// # Polymorphism via macro
+///
+/// Rather than object-safe dynamic dispatch, the coordination trait impls
+/// are stamped out via `impl_sync_coordination_backend!` and
+/// `impl_sync_run_management!` for each concrete type. This preserves
+/// monomorphization and inlining across the CAS retry hot path while
+/// avoiding the ergonomic overhead of generic bounds on every call site.
+///
+/// # Default method overrides
+///
+/// - `cas_retry_backoff` — real backends sleep with jittered exponential
+///   backoff; simulation overrides to a no-op (deterministic, no real
+///   contention).
+/// - `sync_logical_time` — simulation uses this to advance its synthetic
+///   clock; real backends ignore it.
+/// - `on_gc_run` — simulation uses this to drop cached run state.
 #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub(crate) trait SyncEtcdLike: Sized {
     fn config(&self) -> &EtcdCoordinatorConfig;
@@ -117,6 +144,18 @@ pub(crate) trait SyncEtcdLike: Sized {
     /// Simulation overrides to drop cached run state.
     fn on_gc_run(&mut self, _tenant: TenantId, _run: RunId) {}
 
+    /// Drive an optimistic CAS mutation with bounded retries.
+    ///
+    /// `attempt` runs the read-validate-CAS cycle and returns
+    /// [`CasOutcome::Committed`] on success or [`CasOutcome::RetryNeeded`]
+    /// when the etcd transaction's preconditions fail. Non-retryable domain
+    /// errors (stale fence, terminal shard, etc.) are returned as `Err`
+    /// immediately, short-circuiting the loop.
+    ///
+    /// After `optimistic_txn_retries` attempts, `on_exhaustion` re-reads
+    /// persisted state and returns the appropriate domain error. This final
+    /// read distinguishes idempotent replays, stale fences, and genuine
+    /// transient contention.
     fn cas_retry<T, E>(
         &mut self,
         mut attempt: impl FnMut(&mut Self, usize) -> Result<CasOutcome<T>, E>,
@@ -136,6 +175,17 @@ pub(crate) trait SyncEtcdLike: Sized {
         on_exhaustion(self)
     }
 
+    /// Load a shard record, then validate a presented lease against it.
+    ///
+    /// Combines the shard load with full lease validation (expiry, tenant,
+    /// status, and owner binding match) in a single call, reducing
+    /// boilerplate at call sites. The three closures map the three
+    /// possible error categories into the caller's error type:
+    ///
+    /// - `map_not_found` — shard key absent in etcd.
+    /// - `map_load_error` — etcd RPC or decode failure.
+    /// - `map_stale_fence` — owner binding disagrees with the presented
+    ///   lease's worker + fence epoch.
     fn load_shard_and_validate_lease<E>(
         &self,
         now: LogicalTime,
@@ -181,6 +231,15 @@ pub(crate) trait SyncEtcdLike: Sized {
         lease_id: i64,
     ) -> Result<etcd_client::LeaseRevokeResponse, EtcdCoordinatorError>;
 
+    /// Load a run record by exact key and validate identity consistency.
+    ///
+    /// Decodes the stored record and verifies that its `tenant` and `run`
+    /// fields match the key path used to retrieve it. This defense-in-depth
+    /// check catches silent data corruption (e.g., a misplaced blob or
+    /// corrupted write) at the access layer rather than surfacing it as
+    /// a subtle logic error during validation.
+    ///
+    /// Returns `Ok(None)` if the key does not exist in etcd.
     fn load_run_record(
         &self,
         tenant: TenantId,
@@ -223,6 +282,10 @@ pub(crate) trait SyncEtcdLike: Sized {
         }))
     }
 
+    /// Load the per-tenant materialized shard counter.
+    ///
+    /// Returns `Ok(None)` when the counter key does not exist — callers
+    /// bootstrap from a full tenant prefix scan in that case.
     fn load_tenant_shard_count(
         &self,
         tenant: TenantId,
@@ -235,6 +298,16 @@ pub(crate) trait SyncEtcdLike: Sized {
         Ok(Some(decode_tenant_shard_count_kv(kv)?))
     }
 
+    /// Prepare a CAS-guarded per-tenant shard counter update.
+    ///
+    /// If the counter key exists, returns its current value with a
+    /// revision-based CAS compare. If the key is absent (first shard
+    /// creation for this tenant), bootstraps the count from a full
+    /// tenant prefix scan and guards creation with `compare_absent`.
+    ///
+    /// The returned [`TenantShardCountMutation`] contains both the
+    /// compare clause (for inclusion in the caller's CAS transaction)
+    /// and the `current_count` (for shard-limit preflight checks).
     fn prepare_tenant_shard_count_mutation(
         &self,
         tenant: TenantId,
@@ -261,6 +334,19 @@ pub(crate) trait SyncEtcdLike: Sized {
         })
     }
 
+    /// Load a shard record and its co-located owner binding in one RPC.
+    ///
+    /// Uses a prefix-scoped `get` on the shard record key, which returns
+    /// both the record itself and its `/owner` child key (if present) in
+    /// a single etcd range read. This avoids a second round-trip to
+    /// determine ownership status.
+    ///
+    /// After decoding, validates:
+    /// - Record identity (tenant, run, shard) matches the key path.
+    /// - If an owner key exists, its binding is consistent with the
+    ///   record's lease holder and fence epoch.
+    ///
+    /// Returns `Ok(None)` if the shard record key does not exist.
     fn load_shard_record(
         &self,
         tenant: TenantId,
@@ -346,6 +432,21 @@ pub(crate) trait SyncEtcdLike: Sized {
         }))
     }
 
+    /// Prefix-scan all shard records and owner bindings under a run.
+    ///
+    /// Performs a single etcd prefix range read that returns both shard
+    /// record keys and owner keys interleaved. The results are classified
+    /// and separated into two collections in a first pass, then joined
+    /// by the owner key derived from each record key. This two-pass
+    /// approach avoids N+1 round-trips for owner lookups.
+    ///
+    /// # Invariant checks
+    ///
+    /// - Each record's identity (tenant, run, shard) must match the
+    ///   scan prefix and key path.
+    /// - Every owner key must have a corresponding shard record (orphan
+    ///   owners indicate corruption or incomplete cleanup).
+    /// - No unexpected key types may appear under the shard subtree.
     fn scan_run_shards(
         &self,
         tenant: TenantId,
@@ -457,6 +558,13 @@ pub(crate) trait SyncEtcdLike: Sized {
         Ok(out)
     }
 
+    /// Prefix-scan all run records under a tenant.
+    ///
+    /// Returns all runs (including terminal ones) sorted by raw run ID.
+    /// Validates that each record's tenant matches and that the record's
+    /// run ID matches the key suffix. Keys that do not parse as direct
+    /// run IDs are silently skipped (they may be sub-keys like active
+    /// index entries).
     fn scan_tenant_runs(
         &self,
         tenant: TenantId,
@@ -504,6 +612,24 @@ pub(crate) trait SyncEtcdLike: Sized {
         Ok(out)
     }
 
+    /// Estimate the number of claimable shards for a run using cheap RPCs.
+    ///
+    /// Computes `available = total_active - owned` using two lightweight
+    /// etcd requests:
+    ///
+    /// 1. A `count_only` prefix scan on the active-shard index (no values
+    ///    transferred) to get `total_active`.
+    /// 2. A `keys_only` prefix scan on the shard record subtree, filtering
+    ///    for `/owner` keys to get `owned`.
+    ///
+    /// This is an approximation: the two reads are not atomic, so
+    /// concurrent acquires or releases may cause brief overcounting or
+    /// undercounting. The trade-off is acceptable because `CapacityHint`
+    /// is advisory and only used for scheduling heuristics, not for
+    /// correctness-critical decisions.
+    ///
+    /// `earliest_deadline` is always `None` because computing it would
+    /// require loading full shard record blobs.
     fn count_available_lightweight(
         &self,
         tenant: TenantId,
@@ -547,6 +673,12 @@ pub(crate) trait SyncEtcdLike: Sized {
         })
     }
 
+    /// Count shard records under a keyspace prefix, excluding owner keys.
+    ///
+    /// Uses a `keys_only` prefix scan and classifies each key via
+    /// [`PersistedShardSubtreeKey`] to count only record keys, not
+    /// owner keys that share the same prefix. Used for shard-limit
+    /// preflight checks.
     fn count_persisted_shards_under_prefix(
         &self,
         prefix: String,
@@ -565,6 +697,11 @@ pub(crate) trait SyncEtcdLike: Sized {
             .count())
     }
 
+    /// List active run IDs by scanning the active-run index.
+    ///
+    /// Only runs that have completed `register_shards` (and thus have
+    /// an active-run index entry) appear here. Results are sorted by
+    /// raw run ID for deterministic ordering.
     fn list_active_runs_into(
         &self,
         tenant: TenantId,
@@ -586,6 +723,25 @@ pub(crate) trait SyncEtcdLike: Sized {
         Ok(())
     }
 
+    /// Garbage-collect runs stuck in `Initializing` past a creation-time
+    /// cutoff.
+    ///
+    /// Runs that fail to complete `register_shards` (e.g., the creating
+    /// worker crashes) leave behind orphaned `Initializing` records. This
+    /// method scans all tenant runs, filters to stale initializing ones,
+    /// and attempts to delete each via a CAS transaction guarded by:
+    ///
+    /// - Run record `mod_revision` (unchanged since the scan).
+    /// - Active-run index absent (the run was never activated).
+    ///
+    /// Each successful deletion also removes the run's shard records,
+    /// active-shard index entries, and adjusts the per-tenant shard
+    /// counter. Candidates are processed oldest-first to prioritize the
+    /// most stale runs.
+    ///
+    /// Concurrent activation (a late `register_shards` succeeding between
+    /// the scan and the GC transaction) causes the CAS to fail, which is
+    /// silently skipped.
     fn gc_stale_initializing_runs_into(
         &mut self,
         tenant: TenantId,
@@ -686,6 +842,22 @@ pub(crate) trait SyncEtcdLike: Sized {
         Ok(())
     }
 
+    /// Shared CAS implementation for terminal run transitions
+    /// (Done, Failed, Cancelled).
+    ///
+    /// The CAS transaction adapts its active-run index guard based on
+    /// the run's prior status:
+    ///
+    /// - `Active` runs have an index entry → guard with `compare_present`.
+    /// - `Initializing` runs have no index entry → guard with
+    ///   `compare_absent`. Only `cancel_run` reaches this path; the
+    ///   other two transitions (`complete_run`, `fail_run`) require
+    ///   `Active` status.
+    ///
+    /// In both cases, the index entry is deleted on commit.
+    ///
+    /// Idempotent via run op-log. Kind-mismatch on replay (same `op_id`
+    /// but different `RunOpKind`) is treated as corruption.
     fn transition_run_terminal(
         &mut self,
         now: LogicalTime,
@@ -836,6 +1008,15 @@ pub(crate) trait SyncEtcdLike: Sized {
         )
     }
 
+    /// Revoke an etcd lease, logging but not propagating failures.
+    ///
+    /// Called after CAS transactions that either grant a new lease
+    /// (revoking the prior one) or release ownership (revoking the
+    /// current one). If the revocation fails, the lease will expire
+    /// via etcd's TTL mechanism, so correctness is preserved — the
+    /// revocation only accelerates cleanup.
+    ///
+    /// No-ops for non-positive lease IDs (etcd sentinel for "no lease").
     fn best_effort_revoke_lease(&self, lease_id: i64) {
         if lease_id <= 0 {
             return;
@@ -850,6 +1031,11 @@ pub(crate) trait SyncEtcdLike: Sized {
         }
     }
 
+    /// Load a run record that is expected to exist.
+    ///
+    /// Returns `InfraError::corruption` if the key is missing — callers
+    /// use this in contexts where a missing run indicates data loss or
+    /// an invariant violation, not a normal "not found" condition.
     fn load_run_checked(
         &self,
         context: &'static str,
@@ -866,6 +1052,10 @@ pub(crate) trait SyncEtcdLike: Sized {
         }
     }
 
+    /// Load a shard record that is expected to exist.
+    ///
+    /// Returns `InfraError::corruption` if the key is missing.
+    /// See [`load_run_checked`](Self::load_run_checked) for rationale.
     fn load_shard_checked(
         &self,
         context: &'static str,
@@ -1220,7 +1410,7 @@ impl fmt::Debug for EtcdCoordinator {
             .field("namespace_prefix", &self.keyspace.prefix())
             .field(
                 "coordination_storage_mode",
-                &"persisted acquire/renew/checkpoint/split/unpark + run lifecycle in etcd",
+                &"persisted shard lifecycle + run lifecycle in etcd",
             )
             .finish()
     }
@@ -1442,6 +1632,35 @@ impl AsyncEtcdCoordinator {
                 %err,
                 ttl_secs = self.config.owner_lease_ttl_secs(),
                 "failed to revoke etcd lease; will expire via TTL",
+            );
+        }
+    }
+
+    async fn refresh_cached_run_state(
+        &mut self,
+        _tenant: TenantId,
+        _run: RunId,
+    ) -> Result<(), EtcdCoordinatorError> {
+        Ok(())
+    }
+
+    /// Best-effort async cache refresh after a run-scoped mutation.
+    ///
+    /// The async coordinator currently does not maintain a decoded run cache,
+    /// so this is a no-op that preserves the same call sites as the sync
+    /// surface. If async caching is added later, the refresh logic can land
+    /// here without changing mutation semantics.
+    pub(super) async fn best_effort_refresh_cached_run_state(
+        &mut self,
+        tenant: TenantId,
+        run: RunId,
+    ) {
+        if let Err(err) = self.refresh_cached_run_state(tenant, run).await {
+            tracing::warn!(
+                %err,
+                %tenant,
+                ?run,
+                "post-commit cache refresh failed; cache is stale until next mutation",
             );
         }
     }
@@ -1887,14 +2106,6 @@ impl AsyncEtcdCoordinator {
         }
     }
 
-    /// Panics with a message identifying the unimplemented operation (async variant).
-    pub(super) fn fail_unimplemented<T>(&self, operation: &'static str) -> T {
-        panic!(
-            "AsyncEtcdCoordinator::{operation} is not yet persisted to etcd; \
-             this operation must be implemented before it is callable"
-        );
-    }
-
     /// Async CAS retry loop with exponential backoff and jitter.
     ///
     /// Semantically identical to [`EtcdCoordinator::cas_retry`] but
@@ -2114,7 +2325,7 @@ impl fmt::Debug for AsyncEtcdCoordinator {
             .field("namespace_prefix", &self.keyspace.prefix())
             .field(
                 "coordination_storage_mode",
-                &"persisted acquire/renew/checkpoint/split/unpark + run lifecycle in etcd",
+                &"persisted shard lifecycle + run lifecycle in etcd",
             )
             .finish()
     }

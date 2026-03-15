@@ -24,15 +24,21 @@ stay local and deterministic, while ignored local-etcd integration coverage
 auto-provisions `quay.io/coreos/etcd:v3.5.15` via testcontainers (or reuses
 `ETCD_ENDPOINTS`) and verifies `EtcdCoordinator::connect()` /
 `AsyncEtcdCoordinator::connect()` + `status()`, persisted run
-creation/registration, acquire/checkpoint/renew, unpark, split round trips,
-shard-limit rejection paths, derived-ID collision handling, and deterministic
-split-atomicity aborts via test-only owner-drop fault injection. The binary
-codec (`codec.rs`) has dedicated round-trip fuzz targets and proptest coverage
-for `ShardRecord` serialization in `codec_tests.rs`. Deterministic simulator
-tests cover the in-process etcd path via `SimulatedEtcdKV` and
-`SimEtcdCoordinator`, including compare-miss contention, uncertain commits,
-lease-expiry races, and retry-exhaustion bursts. The ignored local-etcd tests
-remain the coverage layer for live gRPC transport and real-member integration.
+creation/registration, acquire/checkpoint/renew, terminal shard transitions
+(`complete`, `park_shard`), unpark, split round trips, shard-limit rejection
+paths, derived-ID collision handling, and deterministic split-atomicity aborts
+via test-only owner-drop fault injection. The binary codec (`codec.rs`) has
+dedicated round-trip fuzz targets and proptest coverage for `ShardRecord`
+serialization in `codec_tests.rs`. Deterministic simulator tests cover the
+in-process etcd path via `SimulatedEtcdKV` and `SimEtcdCoordinator`, including
+compare-miss contention, uncertain commits, lease-expiry races, and
+retry-exhaustion bursts. The ignored local-etcd tests remain the coverage layer
+for live gRPC transport and real-member integration. A dedicated
+`behavioral_conformance.rs` module mirrors the shared coordination conformance
+scenarios against the real `EtcdCoordinator`, using only public
+`CoordinationBackend` / `RunManagement` operations plus persisted read-back
+helpers (`test_load_shard_snapshot`, `test_load_run_snapshot`) instead of
+simulation-only introspection.
 
 ## Allocation Policy Scope (Tiered)
 

@@ -1336,6 +1336,57 @@ impl From<CoordError> for ParkError {
     }
 }
 
+// ============================================================================
+// TerminalTransitionError — shared error shape for complete/park
+// ============================================================================
+
+/// Error constructors shared by terminal shard transitions (`complete`, `park_shard`).
+///
+/// Both [`CompleteError`] and [`ParkError`] carry the same base variants for
+/// shard-not-found, backend infrastructure failure, and stale-fence detection.
+/// This trait captures that shared shape so backend implementations can factor
+/// out the CAS-retry loop that both operations share, parameterized only by the
+/// caller's error type and the operation-specific record mutation.
+///
+/// # Why a trait instead of a common error enum
+///
+/// `CompleteError` has cursor-related variants that `ParkError` does not, so a
+/// single enum would either carry dead variants or require runtime assertions.
+/// The trait preserves each error type's exact variant set while enabling generic
+/// helpers over the shared subset.
+pub trait TerminalTransitionError: From<CoordError> {
+    /// Shard key was not found in the backend store.
+    fn shard_not_found(shard: ShardKey) -> Self;
+    /// Backend infrastructure failure (etcd RPC, codec, etc.).
+    fn backend_error(e: InfraError) -> Self;
+    /// Presented lease fence epoch does not match the persisted value.
+    fn stale_fence(presented: FenceEpoch, current: FenceEpoch) -> Self;
+}
+
+impl TerminalTransitionError for CompleteError {
+    fn shard_not_found(shard: ShardKey) -> Self {
+        Self::ShardNotFound { shard }
+    }
+    fn backend_error(e: InfraError) -> Self {
+        Self::BackendError(e)
+    }
+    fn stale_fence(presented: FenceEpoch, current: FenceEpoch) -> Self {
+        Self::StaleFence { presented, current }
+    }
+}
+
+impl TerminalTransitionError for ParkError {
+    fn shard_not_found(shard: ShardKey) -> Self {
+        Self::ShardNotFound { shard }
+    }
+    fn backend_error(e: InfraError) -> Self {
+        Self::BackendError(e)
+    }
+    fn stale_fence(presented: FenceEpoch, current: FenceEpoch) -> Self {
+        Self::StaleFence { presented, current }
+    }
+}
+
 impl From<CoordError> for SplitError {
     fn from(e: CoordError) -> Self {
         match e {

@@ -98,6 +98,7 @@ pub use error::{
     AcquireError, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError, CompleteError,
     CoordError, CursorOutOfBoundsDetail, FixedBuf, IdempotentOutcome, InfraError, ParkError,
     RenewError, RenewResult, ShardSnapshotView, SplitError, SplitReplaceError, SplitResidualError,
+    TerminalTransitionError,
 };
 pub use events::{EventCollector, EventKind, RedactedKey, StateTransitionEvent};
 pub use facade::{ClaimError, CoordinationFacade, ShardClaiming, default_claim_next_available};
