@@ -1,41 +1,92 @@
-//! Commit sink adapters for runtime entry points.
+//! Commit sink types and adapters for runtime entry points.
 //!
-//! The distributed sink derives identities at commit time from engine finding
-//! records so the scan loop remains focused on detection and scheduling.
+//! Durable sinks derive finding identity chains while scan loops remain focused
+//! on enumeration and detection.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use gossip_contracts::{
-    connector::ItemKey,
+    connector::{ItemKey, VersionId},
     identity::{
-        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, TenantId,
-        TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
+        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint,
+        StableItemId, TenantId, TenantSecretKey, derive_finding_id, derive_occurrence_id,
+        key_secret_hash,
     },
 };
-use gossip_scan_driver::{CommitSink, FindingRecord, FindingsBatch, ItemMeta};
 
 use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, IdentityChainRecord,
 };
 
-/// Re-export of the no-op commit sink for CLI use where findings are not persisted.
-pub use gossip_scan_driver::NoOpCommitSink as CliNoOpCommitSink;
+/// Per-item metadata passed to [`CommitSink::begin_item`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemMeta {
+    /// Connector-assigned stable identity for the scanned item.
+    pub stable_item_id: StableItemId,
+    /// Connector-assigned version for the scanned snapshot.
+    pub version: Option<VersionId>,
+    /// Approximate byte length of the item payload, if known before scanning.
+    pub size_hint: Option<u64>,
+}
 
-/// Durable commit sink used by distributed mode.
-///
-/// This sink derives the full finding identity chain from engine-level finding
-/// batches and persists records through the coordinator recorder.
-///
-/// Derivation flow:
-/// `norm_hash -> secret_hash -> finding_id -> occurrence_id`.
-///
-/// The sink stores per-item metadata from `begin_item` so `upsert_findings`
-/// can use connector-provided version IDs when present.
+/// Compact finding record forwarded through the [`CommitSink`] bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FindingRecord {
+    /// Numeric identifier of the detection rule that matched.
+    pub rule_id: u32,
+    /// Byte offset of the match start within the item payload.
+    pub start: u64,
+    /// Byte offset one past the match end.
+    pub end: u64,
+    /// Digest of the normalized secret bytes.
+    pub norm_hash: [u8; 32],
+    /// Additive confidence score from gate signals.
+    pub confidence_score: i8,
+}
+
+/// All findings for a single item.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FindingsBatch {
+    /// Findings emitted for one item.
+    pub findings: Vec<FindingRecord>,
+}
+
+/// Per-item lifecycle sink for persisting scan results.
+pub trait CommitSink: Send + Sync {
+    /// Register a new item and its metadata.
+    fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()>;
+
+    /// Record one batch of findings for an in-progress item.
+    fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()>;
+
+    /// Mark the item as fully scanned.
+    fn finish_item(&self, item_key: &ItemKey) -> Result<()>;
+}
+
+/// No-op sink used by CLI and direct-mode scans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CliNoOpCommitSink;
+
+impl CommitSink for CliNoOpCommitSink {
+    fn begin_item(&self, _item_key: &ItemKey, _meta: &ItemMeta) -> Result<()> {
+        Ok(())
+    }
+
+    fn upsert_findings(&self, _item_key: &ItemKey, _batch: &FindingsBatch) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish_item(&self, _item_key: &ItemKey) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Durable commit sink used by distributed-mode coordination sinks.
 pub struct DurableCommitSink {
     shard_id: Arc<str>,
-    recorder: std::sync::Arc<dyn CoordinationEventRecorder>,
+    recorder: Arc<dyn CoordinationEventRecorder>,
     tenant_id: TenantId,
     tenant_secret_key: TenantSecretKey,
     in_flight_meta: Mutex<BTreeMap<Vec<u8>, ItemMeta>>,
@@ -43,14 +94,9 @@ pub struct DurableCommitSink {
 
 impl DurableCommitSink {
     /// Creates a durable commit sink bound to `shard_id`.
-    ///
-    /// All identity derivation uses the provided `tenant_id` and
-    /// `tenant_secret_key`, while stable item identity is trusted from
-    /// connector-provided [`ItemMeta`]. Derived records are persisted through
-    /// `recorder`.
     #[must_use]
     pub fn new(
-        recorder: std::sync::Arc<dyn CoordinationEventRecorder>,
+        recorder: Arc<dyn CoordinationEventRecorder>,
         shard_id: Arc<str>,
         tenant_id: TenantId,
         tenant_secret_key: TenantSecretKey,
@@ -91,20 +137,16 @@ impl DurableCommitSink {
             secret: secret_hash,
         });
 
-        // Connector-provided versions are authoritative because they align
-        // occurrence identity with the source's own version model. The
-        // item-key fallback is a temporary compatibility path for scan flows
-        // that have not plumbed version metadata through `ItemMeta` yet: it
-        // keeps occurrence IDs deterministic, but collapses all revisions of
-        // the same item key onto the same pseudo-version.
+        // When the source exposes version metadata it defines occurrence
+        // identity directly. Otherwise the item-key bytes provide a stable
+        // deterministic surrogate version for the same logical key.
         let object_version = meta
             .version
             .map(|version| version.object_version_id())
             .unwrap_or_else(|| {
                 tracing::debug!(
                     item_key = ?item_key.as_bytes(),
-                    "missing connector version metadata; temporarily deriving ObjectVersionId \
-                     from item_key bytes until filesystem version propagation is plumbed"
+                    "deriving ObjectVersionId from item-key bytes"
                 );
                 ObjectVersionId::from_version_bytes(item_key.as_bytes())
             });
@@ -170,13 +212,8 @@ impl CommitSink for DurableCommitSink {
     }
 }
 
-/// Expand a numeric runtime rule ID into the 32-byte fingerprint shape used by
-/// the identity layer.
-///
-/// This is a compatibility shim for sources that currently expose only
-/// scheduler rule IDs. The little-endian `u32` lives in the first four bytes
-/// and the remaining bytes are zero. Once the runtime carries real rule
-/// fingerprints end-to-end, this helper should disappear.
+/// Expand a numeric rule identifier into the fixed fingerprint shape used by
+/// identity derivation.
 fn rule_fingerprint_from_rule_id(rule_id: u32) -> RuleFingerprint {
     let mut bytes = [0u8; 32];
     bytes[..4].copy_from_slice(&rule_id.to_le_bytes());
@@ -186,8 +223,6 @@ fn rule_fingerprint_from_rule_id(rule_id: u32) -> RuleFingerprint {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
-
-    use gossip_scan_driver::{FindingsBatch, ItemMeta};
 
     use super::*;
     use crate::coordination_sink::{StoredCoreEvent, StoredGitEvent};
@@ -240,7 +275,7 @@ mod tests {
         sink.begin_item(
             &item_key,
             &ItemMeta {
-                stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x33; 32]),
+                stable_item_id: StableItemId::from_bytes([0x33; 32]),
                 version: None,
                 size_hint: None,
             },
@@ -272,9 +307,6 @@ mod tests {
         assert_eq!(progress.len(), 2);
     }
 
-    /// Calling `upsert_findings` without a prior `begin_item` is a protocol
-    /// violation and must be rejected so the runtime never fabricates stable
-    /// identity or version metadata.
     #[test]
     fn upsert_without_begin_item_is_rejected() {
         let recorder = Arc::new(Recorder::default());
@@ -286,8 +318,6 @@ mod tests {
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/other.txt").expect("item key");
-
-        // Deliberately skip begin_item — this is a protocol violation.
         let result = sink.upsert_findings(
             &item_key,
             &FindingsBatch {

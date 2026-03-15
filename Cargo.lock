@@ -1418,9 +1418,7 @@ name = "gossip-scanner-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "gossip-connectors",
  "gossip-contracts",
- "gossip-scan-driver",
  "regex",
  "rstest",
  "scanner-engine",

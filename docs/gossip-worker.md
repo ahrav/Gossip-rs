@@ -1,220 +1,141 @@
 # gossip-worker
 
-## 1. Module Purpose
+## Module Purpose
 
-The `gossip-worker` crate is the **distributed worker binary** for the
-gossip-rs secret scanning system. It is one of two top-level binaries in
-the workspace (the other being `scanner-rs-cli`), sitting at **Tier 3** of
-the build DAG.
+`gossip-worker` is the lightweight worker binary that drives one scan
+request through `gossip-scanner-runtime`. It owns only:
 
-The binary is intentionally minimal (including tests). It accepts
-a scan source type, a target path, and an execution mode, then delegates all
-scanning logic to `gossip-scanner-runtime`. It owns only CLI argument
-parsing, process lifecycle (exit codes), and tracing initialization.
+- a minimal positional CLI grammar
+- tracing initialization
+- exit-code policy
+- mapping runtime results into structured logs
 
-### Distinction from scanner-rs-cli
-
-| Aspect | `gossip-worker` | `scanner-rs-cli` |
-|--------|-----------------|-------------------|
-| Role | Distributed worker entrypoint | Standalone user-facing CLI |
-| Default mode | `Connector` | `Direct` |
-| CLI grammar | Minimal positional args | Full flag/subcommand parser |
-| Output | Structured tracing logs | JSONL/Text/JSON/SARIF to stdout |
-| Finding output | Log summary only | Per-finding event stream |
-| Designed for | Orchestration-invoked scans | Interactive developer use |
-
-The worker defaults to `Connector` execution mode so that both entrypoints
-exercise the same scan-driver seam. In the future, it will evolve to consume
-shard leases from a coordinator (the `DistributedCoordinator` trait and
-`run_worker` loop already exist in `gossip-scanner-runtime::distributed`).
+The binary does not implement its own scan loop. It delegates filesystem
+and git requests directly to the runtime crate.
 
 ---
 
-## 2. Source File Map
+## Current Behavior
 
-| File | Purpose |
-|------|---------|
-| `src/main.rs` | Entire crate: CLI parsing, scan dispatch, tracing, error handling, tests |
-| `Cargo.toml` | Manifest: depends on `gossip-scanner-runtime`, `tracing`, `tracing-subscriber` |
+The worker accepts valid filesystem and git scan requests, forwards them to
+the runtime, and surfaces runtime errors unchanged through `WorkerError`.
 
-There is no `lib.rs` -- this is a pure binary crate with no public API.
+Today that means:
+
+- invalid CLI arguments fail with exit code `2`
+- valid scan requests reach the runtime and currently fail with a
+  family-specific placeholder error
+- successful logging paths remain available for when the family runtime
+  loops are implemented
+
+This keeps the worker binary aligned with the current runtime surface
+instead of preserving a removed driver-based execution path.
 
 ---
 
-## 3. Architecture
+## Architecture
 
 ```text
-gossip-worker (Tier 3 binary)
-  --> gossip-scanner-runtime (Tier 2: unified scan orchestration)
-       --> gossip-scan-driver (traits: Assignment, ScanDriver, ScanSourceFactory)
-       --> gossip-connectors (concrete FS/Git scan drivers)
-       --> scanner-engine (detection rules, transforms, engine)
-       --> scanner-scheduler (execution scheduling)
-       --> scanner-git (git-specific scanning)
-       --> gossip-contracts (identity types, coordination types, connector types)
+gossip-worker
+  --> gossip-scanner-runtime
+       --> ordered-content family placeholder
+       --> git-repo family placeholder
+       --> distributed runtime placeholder types
+       --> event and commit sink support types
 ```
 
 ### Execution flow
 
 ```text
-CLI invocation:  gossip-worker [--mode=direct|connector] [fs|git] [path]
+gossip-worker [--mode=direct|connector] [fs|git] [path]
 
 main()
-  |
-  +--> init_tracing()          -- tracing-subscriber with RUST_LOG env filter
-  |
-  +--> parse_args(args)        -- parse CLI into WorkerConfig
-  |     |
-  |     +--> parse_mode_flag() -- if --mode= prefix present
-  |     +--> parse_source()    -- if source positional present
-  |
-  +--> run_worker(&cfg)
-  |     |
-  |     +--> (Fs) scan_fs(&FsScanConfig { path, mode, budgets })
-  |     |
-  |     +--> (Git) scan_git(&GitScanConfig { repo, mode, budgets })
-  |
-  +--> log_report()            -- structured tracing::info! with scan metrics
+  -> init_tracing()
+  -> parse_args(...)
+  -> run_worker(&cfg)
+     -> scan_fs(...) or scan_git(...)
+  -> log_report(...) on success
 ```
 
-### Exit codes
-
-| Code | Meaning |
-|:----:|---------|
-| 0 | Scan completed successfully |
-| 1 | Scan execution failed |
-| 2 | Invalid CLI arguments |
+The default configuration is still `connector fs .`, which keeps the worker
+and CLI entrypoints aligned on the same runtime-family surface.
 
 ---
 
-## 4. CLI Grammar
-
-```text
-gossip-worker [--mode=direct|connector] [fs|git] [path]
-```
-
-**Defaults:** `--mode=connector fs .`
-
-| Form | Example | Behavior |
-|------|---------|----------|
-| No arguments | `gossip-worker` | Connector mode, FS scan, current directory |
-| Path only | `gossip-worker /data` | Connector mode, FS scan at `/data` |
-| Source + path | `gossip-worker git /repo` | Connector mode, Git scan at `/repo` |
-| Full | `gossip-worker --mode=direct fs /data` | Direct mode, FS scan at `/data` |
-
-More than 2 positional arguments produces an error (exit code 2).
-
----
-
-## 5. Key Types
-
-All types are **crate-private** (no `pub` visibility outside the binary).
+## Key Types
 
 ### WorkerSource
 
 ```rust
-enum WorkerSource { Fs, Git }
+enum WorkerSource {
+    Fs,
+    Git,
+}
 ```
 
-Selects between filesystem and git repository scanning.
+Selects which runtime entrypoint the worker will call.
 
 ### WorkerConfig
 
 ```rust
 struct WorkerConfig {
-    source: WorkerSource,          // Fs or Git
-    path: PathBuf,                 // Target path to scan
-    execution_mode: ExecutionMode, // Direct or Connector (default: Connector)
+    source: WorkerSource,
+    path: PathBuf,
+    execution_mode: ExecutionMode,
 }
 ```
+
+Small, crate-private config assembled from worker CLI arguments.
 
 ### WorkerError
 
 ```rust
 enum WorkerError {
-    Usage(String),                 // CLI argument parsing errors
-    Runtime(ScanRuntimeError),     // Scan execution errors
+    Usage(String),
+    Runtime(ScanRuntimeError),
 }
 ```
 
-Implements `Display`, `Error`, and `From<ScanRuntimeError>`.
+Encodes the two failure classes the worker cares about: local argument
+errors and delegated runtime failures.
 
 ---
 
-## 6. Functions
+## Functions
 
-| Function | Signature | Purpose |
-|----------|-----------|---------|
-| `init_tracing()` | `fn init_tracing()` | Initialize tracing-subscriber with compact format and `RUST_LOG` env filter (default: `info`) |
-| `usage()` | `fn usage() -> &'static str` | Return help string |
-| `parse_mode_flag(flag)` | `fn parse_mode_flag(&str) -> Result<ExecutionMode, WorkerError>` | Parse `--mode=direct\|connector` flag |
-| `parse_source(value)` | `fn parse_source(&str) -> Result<WorkerSource, WorkerError>` | Map `"fs"` / `"git"` to `WorkerSource` |
-| `parse_args(args)` | `fn parse_args<I: IntoIterator>(I) -> Result<WorkerConfig, WorkerError>` | Parse CLI arguments into config |
-| `run_worker(cfg)` | `fn run_worker(&WorkerConfig) -> Result<(u64, u64, u64), WorkerError>` | Execute one scan, return `(items, bytes, findings)` |
-| `log_report(cfg, report)` | `fn log_report(&WorkerConfig, (u64, u64, u64))` | Emit structured `tracing::info!` log |
-| `main()` | `fn main()` | Binary entrypoint: init, parse, scan, report |
-
----
-
-## 7. Dependencies
-
-### Direct
-
-| Dependency | Purpose |
-|------------|---------|
-| `gossip-scanner-runtime` (workspace) | `ExecutionMode`, `FsScanConfig`, `GitScanConfig`, `ScanRuntimeError`, `ScanBudgets`, `scan_fs`, `scan_git` |
-| `tracing` (workspace) | Structured logging macros |
-| `tracing-subscriber` (workspace) | Tracing initialization with env-filter |
-
-### Dev
-
-| Dependency | Purpose |
-|------------|---------|
-| `tempfile = "3"` | Temporary directories for integration tests |
-
-### Feature Flags
-
-| Feature | Effect |
-|---------|--------|
-| `aegis-pure-rust` | Cascades to `gossip-scanner-runtime/aegis-pure-rust` for pure-Rust engine (no vectorscan FFI) |
+| Function | Purpose |
+|----------|---------|
+| `init_tracing()` | Initialize compact tracing output with `RUST_LOG` support |
+| `usage()` | Return the stable worker help text |
+| `parse_mode_flag()` | Parse `--mode=direct` or `--mode=connector` |
+| `parse_source()` | Parse `fs` or `git` into `WorkerSource` |
+| `parse_args()` | Build `WorkerConfig` from positional worker arguments |
+| `run_worker()` | Call `scan_fs` or `scan_git` and map the result into `(items, bytes, findings)` |
+| `log_report()` | Emit success metrics through `tracing::info!` |
+| `main()` | Wire together tracing, parsing, execution, logging, and exit codes |
 
 ---
 
-## 8. Tests
+## Tests
 
-Five tests in an inline `#[cfg(test)]` module:
+The worker test module currently checks:
 
-| Test | Verifies |
-|------|----------|
-| `parse_args_defaults_to_connector_fs_current_dir` | Default config: `Fs`, `.`, `Connector` |
-| `parse_args_supports_explicit_git_path_and_mode` | `--mode=direct git /tmp/repo` parsed correctly |
-| `parse_args_rejects_unknown_source` | `unknown /tmp/path` returns `WorkerError` |
-| `run_worker_scans_filesystem_path` | FS scan of temp dir with secret produces findings |
-| `run_worker_scans_git_repo_path` | Git scan of temp repo with committed secret produces findings |
+- default parsing
+- explicit `git` path parsing with mode override
+- rejection of unknown sources
+- placeholder runtime error for a valid filesystem path
+- placeholder runtime error for a valid git repository root
 
-All tests use `tempfile::tempdir()` for isolated filesystem state.
-
----
-
-## 9. Design Notes
-
-- **Minimal binary, maximal delegation.** All scan logic lives in
-  `gossip-scanner-runtime`. The worker owns only CLI parsing, process
-  lifecycle, and tracing.
-- **Connector mode by default.** Ensures parity with distributed
-  deployment expectations.
-- **Single-shot design (current).** Runs exactly one scan per invocation.
-  The distributed worker loop in `gossip-scanner-runtime::distributed`
-  is not yet wired in.
-- **Default scan budgets.** Uses `ScanBudgets::default()` (256 max items,
-  1 MB max bytes), appropriate for integration testing.
+The runtime-placeholder assertions are intentional. They confirm that the
+worker is wired to the current runtime behavior rather than to the removed
+driver-backed scan path.
 
 ---
 
-## 10. Source of Truth
+## Source of Truth
 
 | Concern | Path |
 |---------|------|
-| Binary entrypoint, CLI parsing, tests | `crates/gossip-worker/src/main.rs` |
-| Scan orchestration | `crates/gossip-scanner-runtime/src/lib.rs` |
-| Distributed worker loop (planned) | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Worker entrypoint, parsing, and tests | `crates/gossip-worker/src/main.rs` |
+| Runtime scan entrypoints | `crates/gossip-scanner-runtime/src/lib.rs` |
+| Distributed runtime placeholders | `crates/gossip-scanner-runtime/src/distributed.rs` |

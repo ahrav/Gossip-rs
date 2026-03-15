@@ -1,733 +1,316 @@
 # gossip-scanner-runtime
 
-## 1. Module Purpose
+## Module Purpose
 
-The `gossip-scanner-runtime` crate provides the unified runtime
-orchestration layer for scanner execution. It bridges CLI argument
-parsing and distributed coordination into a single scan-driver seam,
-routing both filesystem and git scans through the same
-`Assignment -> ScanSourceFactory -> ScanDriver::run` pipeline. The crate
-also owns finding identity derivation, output format sinks, and JSONL
-parity testing infrastructure.
+`gossip-scanner-runtime` is the shared runtime crate behind the
+`scanner-rs` CLI surface and the `gossip-worker` binary. It owns:
+
+- typed scan configuration for filesystem and git entrypoints
+- CLI parsing and summary rendering
+- path and budget validation before runtime execution
+- owned report, checkpoint, cancellation, and commit-sink types
+- placeholder family boundaries for ordered-content, git-repo, and distributed execution
+
+The crate no longer depends on a separate scan-driver abstraction. Its
+public surface stays stable for callers while the family-specific runtime
+loops are wired in behind placeholder entrypoints.
 
 ---
 
-## 2. Source File Map
+## Source File Map
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Core wiring: config types (`FsScanConfig`, `GitScanConfig`, `ScanBudgets`), execution-mode dispatch (`scan_fs`, `scan_git`), engine construction, assignment building, path validation |
-| `src/cli.rs` | CLI argument parser (`parse_args`), `CliConfig` struct, `run()` entrypoint that builds event sinks and dispatches scans |
-| `src/commit_sink.rs` | `DurableCommitSink` for distributed mode: derives full finding identity chain (`norm_hash -> secret_hash -> finding_id -> occurrence_id`) and persists records through the coordinator recorder |
-| `src/coordination_sink.rs` | `CoordinationEventSink` implementing `EventOutput` + `GitEventOutput`, owned event representations (`StoredCoreEvent`, `StoredGitEvent`), `CoordinationEventRecorder` trait, `IdentityChainRecord` |
-| `src/distributed.rs` | Distributed worker loop (`run_worker`), `DistributedCoordinator` trait, `ShardLease`, done-ledger gating, `InMemoryCoordinator` test harness |
-| `src/event_sink.rs` | Output format sinks: `JsonlEventSink`, `TextEventSink`, `JsonEventSink`, `SarifEventSink`; hand-rolled JSON encoding with broken-pipe tolerance |
-| `src/parity.rs` | JSONL parity testing: `canonicalize_jsonl_events` parses scanner output into `CanonicalFinding` tuples with commit-meta joining, path normalization, and sorted deterministic comparison |
-| `src/lib_tests.rs` | Unit and integration tests for core wiring: execution mode parsing, FS/git scan dispatch, budget validation, direct/connector parity |
-| `src/cli_tests.rs` | Unit tests for CLI argument parsing: flag combinations, default values, error cases |
-| `Cargo.toml` | Dependencies: `anyhow`, `gossip-contracts`, `gossip-scan-driver`, `gossip-connectors`, `scanner-engine`, `scanner-scheduler`, `scanner-git`, `regex`, `serde_json` |
+| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime` |
+| `src/cli.rs` | `scanner-rs scan {fs|git}` parsing, sink selection, runtime dispatch, stderr summary rendering |
+| `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink |
+| `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing |
+| `src/distributed.rs` | Distributed runtime family placeholders and shared config/report types |
+| `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
+| `src/git_repo.rs` | Git-repository family placeholder boundary |
+| `src/ordered_content.rs` | Ordered-content family placeholder boundary |
+| `src/parity.rs` | JSONL canonicalization and parity helpers |
+| `src/lib_tests.rs` | Validation and placeholder behavior tests for the runtime core |
+| `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
+| `Cargo.toml` | Runtime crate dependencies and feature flags |
 
 ---
 
-## 3. Architecture
+## Architecture
 
-### Unified execution seam
+### Runtime entrypoints
 
-Both CLI and distributed execution paths build an `Assignment` and route
-it to a driver, but filesystem and git assignments follow structurally
-separate paths. `driver_for_assignment` rejects `ConnectorKind::Git` —
-git assignments bypass the `ScanDriver` trait entirely:
+The crate exposes two public scan entrypoints:
 
-```text
-CLI args ──► CliConfig ──► FsScanConfig / GitScanConfig
-                                │
-Distributed ──► ShardLease ─────┤
-                                ▼
-                   build_assignment()
-                        │
-           ┌────────────┴────────────┐
-           │ Filesystem / InMemory   │ Git
-           ▼                         ▼
-  driver_for_assignment()     execute_git_assignment()
-           │                   (dedicated git entry point,
-           ▼                    &dyn GitEventOutput, no CommitSink)
-  ScanSourceFactory                  │
-  ::driver_for_assignment()          ▼
-           │               (ScanReport, checkpoint, debug)
-           ▼
-  ScanDriver::run(engine, config,
-    out: &dyn EventOutput, commit, cancel)
-           │
-           ▼
-  AssignmentOutcome { report, checkpoint_hint, debug_output }
-```
+- `scan_fs(&FsScanConfig) -> Result<ScanReport, ScanRuntimeError>`
+- `scan_git(&GitScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 
-### Key wiring functions
+Each entrypoint dispatches on `ExecutionMode`, but both `Direct` and
+`Connector` currently converge on the same family-facing runtime surface.
+The execution-mode flag is retained so callers can preserve their existing
+CLI and worker flows while the underlying family loops are implemented.
 
-| Function | Role |
-|----------|------|
-| `scan_fs` / `scan_git` | Top-level dispatchers that delegate to direct/connector variants |
-| `scan_fs_with_runtime` / `scan_git_with_runtime` | Internal entrypoints that accept event output, commit sink, and cancellation token |
-| `execute_assignment_with_config` | Non-git driver seam: builds engine, runs driver via `ScanDriver::run`, returns `AssignmentOutcome` |
-| `execute_git_assignment` | Git-specific entry point: builds `GitScanDriver` directly, takes `&dyn GitEventOutput`, no `CommitSink` |
-| `driver_for_assignment` | Maps `ConnectorKind` to `ScanSourceFactory` — rejects `ConnectorKind::Git` with `UnsupportedConnectorKind` |
-| `runtime_engine` | Builds or caches the scanner `Engine` with rules, transforms, and tuning |
-| `build_assignment` | Constructs an `Assignment` from connector kind, instance ID, and source |
+### Validation-first execution
 
-### Engine construction
+The runtime performs setup work in a fixed order:
 
-`runtime_engine` caches the default engine configuration in a `OnceLock`
-for reuse across scans. Non-default configurations (custom rules file,
-decode depth override, transform filter) build a fresh engine each time.
+1. Validate the requested path.
+2. Validate runtime budgets.
+3. Normalize source-specific inputs.
+4. Call the source family boundary.
 
-The engine is assembled from:
+Current behavior after validation:
 
-- **Rules** -- loaded from an external YAML file via `load_runtime_rules`,
-  or a built-in default rule (`runtime-secret`) matching
-  `SECRET`/`password`/`token` anchors with a 64-byte radius.
-- **Transforms** -- `UrlPercent` and `Base64` decoders, each with
-  `AnchorsInDecoded` gating, 64 KiB limits, and 8 max spans per buffer.
-- **Tuning** -- default `Tuning` with `merge_gap=64`,
-  `max_transform_depth=3`, `max_findings_per_chunk=8192`.
-- **Anchor policy** -- `ManualOnly` (default) or `DerivedOnly`, selected
-  by `AnchorMode`.
+- filesystem scans route to `ordered_content::filesystem_placeholder`
+- git scans route to `git_repo::local_repo_placeholder`
+- distributed runs route to `distributed::run_distributed`
+
+Each placeholder returns `ScanRuntimeError::Driver(anyhow::Error)`. The
+runtime never uses `todo!()` for unimplemented family paths.
+
+### Family split
+
+The runtime is organized around source families rather than driver traits:
+
+- `ordered_content` covers sources that behave like forward-only item streams
+- `git_repo` covers repository discovery and repository execution paths
+- `distributed` exposes the future worker-loop nouns for family-based execution
+
+This keeps the public orchestration types available without requiring the
+old cross-crate driver seam.
 
 ---
 
-## 4. Key Types
+## Validation Rules
+
+### Filesystem scans
+
+- `FsScanConfig::path` must exist
+- the runtime canonicalizes the path before dispatch
+- `ScanBudgets.max_items` and `ScanBudgets.max_bytes` must both be non-zero
+
+### Git scans
+
+- `GitScanConfig::repo` must exist
+- the path must be a git repository root
+- subdirectories of a git repository are rejected so the runtime has a
+  stable repository anchor
+- `ScanBudgets.max_items` and `ScanBudgets.max_bytes` must both be non-zero
+
+### Distributed runs
+
+- `DistributedRunConfig.budgets` must validate before the family placeholder runs
+
+---
+
+## Key Types
 
 ### ExecutionMode
 
 ```rust
 pub enum ExecutionMode {
-    Direct,    // default
+    Direct,
     Connector,
 }
 ```
 
-Retained for CLI compatibility and telemetry. Both variants currently
-execute the same unified scan path.
+Caller-visible mode selector retained for compatibility with existing CLI
+and worker surfaces.
 
-### ParseExecutionModeError
-
-> **Source:** `src/lib.rs`
+### CancellationToken
 
 ```rust
-pub struct ParseExecutionModeError {
-    raw: String, // private
-}
+pub struct CancellationToken { ... }
 ```
 
-Error returned by `ExecutionMode`'s `FromStr` implementation when the
-input is neither `"direct"` nor `"connector"`. `Display` formats as
-`"invalid execution mode '<raw>' (expected 'direct' or 'connector')"`.
-Used in CLI `--execution-mode` parsing, where it is mapped to
-`CliError::Usage`.
-
-### AnchorMode
-
-```rust
-pub enum AnchorMode {
-    Manual,   // default -- ManualOnly anchor policy
-    Derived,  // DerivedOnly anchor policy
-}
-```
-
-Controls whether the engine uses manually specified anchors or derives
-them from rule patterns.
-
-### EventFormat
-
-```rust
-pub enum EventFormat {
-    Jsonl,  // default
-    Text,
-    Json,
-    Sarif,
-}
-```
-
-Selects the output sink for CLI scans. See section 6 for format details.
-
-### TransformFilter
-
-```rust
-pub enum TransformFilter {
-    All,                    // default -- all configured transforms
-    None,                   // disable all transforms
-    Only(Vec<TransformId>), // enable only the listed transforms
-}
-```
-
-Controls which transform decoders (URL-percent, Base64) are active
-during scanning.
+Cooperative cancellation token backed by `Arc<AtomicBool>`. Runtime callers
+can request cancellation through `cancel()` and poll it through
+`is_cancelled()`.
 
 ### ScanBudgets
 
-| Field | Type | Default | Purpose |
-|-------|------|---------|---------|
-| `max_items` | `usize` | 256 | Maximum items processed between checkpoints |
-| `max_bytes` | `u64` | 1,000,000 | Runtime-level byte budget knob (must be non-zero) |
+```rust
+pub struct ScanBudgets {
+    pub max_items: usize,
+    pub max_bytes: u64,
+}
+```
 
-Converted to `ScanExecutionConfig` via `to_execution_config()`, which
-also sets worker count from `available_parallelism()`.
+Runtime-level budget controls. Validation rejects zero values for either
+field.
 
-### FsScanConfig
+### FsScanConfig and GitScanConfig
 
-Builder-pattern configuration for filesystem scans.
+Builder-style request structs used by both binaries. They preserve the
+full caller-facing scan surface:
 
-| Field | Type | Default | Purpose |
-|-------|------|---------|---------|
-| `path` | `PathBuf` | required | Filesystem root or file path to scan |
-| `workers` | `usize` | CPU count | Number of worker threads |
-| `decode_depth` | `Option<usize>` | `None` | Transform decode depth override |
-| `skip_archives` | `bool` | `false` | Disable archive expansion |
-| `scan_binary` | `bool` | `false` | Scan binary files |
-| `persist_findings` | `bool` | `false` | Persist findings via commit sink bridge |
-| `anchor_mode` | `AnchorMode` | `Manual` | Anchor extraction policy |
-| `rules_file` | `Option<PathBuf>` | `None` | External rules file path |
-| `transform_filter` | `TransformFilter` | `All` | Transform decoder filter |
-| `execution_mode` | `ExecutionMode` | `Direct` | Retained for compatibility |
-| `budgets` | `ScanBudgets` | default | Scan execution budget controls |
+- worker counts
+- decode depth
+- binary-scan toggles
+- rules file override
+- transform filter
+- anchor mode
+- git debug and enrichment options
+- execution mode
+- runtime budgets
 
-### GitScanConfig
+### ScanReport
 
-Builder-pattern configuration for git scans.
+```rust
+pub struct ScanReport {
+    pub items_scanned: u64,
+    pub bytes_scanned: u64,
+    pub chunks_scanned: u64,
+    pub findings_emitted: u64,
+    pub errors: u64,
+    ...
+}
+```
 
-| Field | Type | Default | Purpose |
-|-------|------|---------|---------|
-| `repo` | `PathBuf` | required | Repository root path |
-| `workers` | `usize` | CPU count | Number of pack-exec worker threads |
-| `decode_depth` | `Option<usize>` | `None` | Transform decode depth override |
-| `scan_binary` | `bool` | `false` | Scan binary blobs |
-| `debug_level` | `GitDebugLevel` | `Off` | Git debug output level (`Off`, `Stats`, `Perf`) |
-| `enrich_identities` | `bool` | `false` | Enrich commit metadata with identity dictionary IDs |
-| `anchor_mode` | `AnchorMode` | `Manual` | Anchor extraction policy |
-| `rules_file` | `Option<PathBuf>` | `None` | External rules file path |
-| `transform_filter` | `TransformFilter` | `All` | Transform decoder filter |
-| `repo_id` | `u64` | 1 | Stable repository identifier for persistence keys |
-| `scan_mode` | `GitScanMode` | `OdbBlobFast` | Diff-history vs ODB-blob fast path |
-| `merge_mode` | `MergeDiffMode` | `AllParents` | Merge-diff strategy for merge commits |
-| `tree_delta_cache_mb` | `Option<u32>` | `None` | Tree delta cache size override in MiB |
-| `engine_chunk_mb` | `Option<u32>` | `None` | Engine chunk size override in MiB |
-| `execution_mode` | `ExecutionMode` | `Direct` | Retained for compatibility |
-| `budgets` | `ScanBudgets` | default | Scan execution budget controls |
+Owned runtime summary returned by CLI-facing and worker-facing scan
+entrypoints. It carries the counters used by summary rendering, parity
+tests, and caller logging.
+
+### ScanCheckpoint
+
+```rust
+pub struct ScanCheckpoint {
+    pub cursor: Cursor,
+    pub committed_items: u64,
+}
+```
+
+Incremental progress hint for future resumable runtime loops. The type is
+local to this crate and avoids name collisions with other cursor-related
+types.
 
 ### AssignmentOutcome
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `report` | `ScanReport` | Scan-driver report (items scanned, findings, etc.) |
-| `checkpoint_hint` | `Option<CursorUpdate>` | Driver-provided checkpoint to hand back to coordinators |
-| `debug_output` | `Option<String>` | Driver-generated debug diagnostics (for CLI stderr) |
+```rust
+pub struct AssignmentOutcome {
+    pub report: ScanReport,
+    pub checkpoint_hint: Option<ScanCheckpoint>,
+    pub debug_output: Option<String>,
+}
+```
+
+Return shape for the sink-aware runtime entrypoints. Callers receive the
+main report plus optional checkpoint and debug payloads.
 
 ### ScanRuntimeError
 
-Flat error enum covering all runtime wiring failures:
+The runtime error surface has six current categories:
 
-| Variant | Cause |
-|---------|-------|
-| `InvalidPath { source, path, message }` | Path validation failure (does not exist, not a directory, not repo root) |
-| `UnsupportedConnectorKind(ConnectorKind)` | `InMemory` connector requested at runtime |
-| `GitCommandFailed { repo, status_code, stderr }` | `git rev-parse --show-toplevel` failure |
-| `Io { op, path: Option<PathBuf>, error }` | Filesystem canonicalization or git command spawn failure (`path` is `None` for non-path I/O such as process spawn) |
-| `RulesConfig { path: Option<PathBuf>, message }` | Rules file read or parse error (`path` is `None` when no file was specified) |
-| `ConnectorInput(ConnectorInputError)` | Zero-budget or invalid connector input |
-| `Driver(anyhow::Error)` | Scan driver execution failure |
+- `InvalidPath`
+- `GitCommandFailed`
+- `Io`
+- `RulesConfig`
+- `ConnectorInput`
+- `Driver`
+
+`Driver(anyhow::Error)` is the catch-all for family placeholder failures and
+other runtime wiring problems.
 
 ---
 
-## 5. Execution Modes
+## Commit Sink Surface
 
-### CLI mode (`src/cli.rs`)
+`src/commit_sink.rs` defines the local persistence-facing types used by the
+runtime:
 
-#### CliSource
+- `ItemMeta`
+- `FindingRecord`
+- `FindingsBatch`
+- `CommitSink`
+- `CliNoOpCommitSink`
+- `DurableCommitSink`
 
-> **Source:** `src/cli.rs`
+`DurableCommitSink` is the bridge between scan-loop item lifecycle events
+and persisted identity derivation. It computes:
+
+- normalized secret hash input
+- tenant-scoped secret hash
+- finding ID
+- occurrence ID
+
+When a source does not provide an explicit version, the sink derives a
+stable surrogate object version from the item-key bytes.
+
+---
+
+## CLI Surface
+
+`src/cli.rs` owns the full `scanner-rs scan {fs|git}` grammar. Its
+responsibilities are:
+
+- parse raw `OsString` arguments into `CliConfig`
+- choose the requested event sink
+- auto-size git workers when the caller does not supply `--workers`
+- invoke `scan_fs_with_runtime` or `scan_git_with_runtime`
+- print a compact `key=value` summary to stderr
+
+The CLI summary reads from the local `ScanReport` type, not a report type
+imported from another crate.
+
+---
+
+## Distributed Placeholder Surface
+
+`src/distributed.rs` keeps the future distributed runtime nouns available
+without exposing the removed worker-loop implementation.
 
 ```rust
-pub enum CliSource {
-    Fs { path: PathBuf },
-    Git { repo: PathBuf },
+pub enum DistributedFamily {
+    OrderedContent,
+    GitRepo,
 }
 ```
 
-Populated by `parse_args_from()` based on whether the user passed
-`scan fs --path <path>` or `scan git --repo <path>`. Consumed by
-`cli::run()` via pattern matching to dispatch to `scan_fs_with_runtime`
-or `scan_git_with_runtime`.
-
-#### CliError
-
-> **Source:** `src/cli.rs`
-
 ```rust
-pub enum CliError {
-    HelpRequested(String),
-    Usage(String),
-    Runtime(ScanRuntimeError),
-}
-```
-
-Error type for both `parse_args()` and `cli::run()`. `HelpRequested`
-and `Usage` are produced during argument parsing; `Runtime` wraps
-`ScanRuntimeError` from scan execution (via `From` conversion).
-Callers can distinguish help-requested from real errors to set
-appropriate exit codes.
-
-The CLI entrypoint parses `scanner-rs scan {fs|git}` commands with flag
-and positional arguments. The parser is hand-rolled (no clap dependency)
-to keep the binary small and startup fast.
-
-**Usage patterns:**
-
-```text
-scanner-rs scan fs  --path <dir|file> [FS OPTIONS] [COMMON OPTIONS]
-scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
-```
-
-**Common flags:**
-
-| Flag | Values | Default |
-|------|--------|---------|
-| `--execution-mode` | `direct`, `connector` | `direct` |
-| `--max-items` | integer | 256 |
-| `--max-bytes` | integer | 1000000 |
-| `--workers` | integer >= 1 | CPU count |
-| `--decode-depth` | integer | engine default |
-| `--anchors` | `manual`, `derived` | `manual` |
-| `--rules` | file path | built-in rules |
-| `--transforms` | `all`, `none`, or comma-separated list | `all` |
-| `--event-format` | `jsonl`, `text`, `json`, `sarif` | `jsonl` |
-| `--null-sink` | flag | off |
-| `--verbose` | flag | off |
-
-**FS-specific flags:** `--skip-archives`, `--scan-archives`,
-`--scan-binary`, `--skip-binary`, `--persist-findings`
-
-**Git-specific flags:** `--debug[=perf|stats]`, `--enrich-identities`
-
-**Git hidden flags (parsed but excluded from help text):**
-`--x-repo-id`, `--x-mode`, `--x-merge`,
-`--x-tree-delta-cache-mb`, `--x-engine-chunk-mb`
-
-The `cli::run` function:
-
-1. Builds an event sink from `EventFormat` + `null_sink` + `verbose`.
-2. Constructs `FsScanConfig` or `GitScanConfig` from `CliConfig`.
-3. Calls `scan_fs_with_runtime` or `scan_git_with_runtime` with a
-   `CliNoOpCommitSink` (no finding persistence in CLI mode).
-4. Flushes the event sink and returns the `ScanReport`.
-
-### Distributed mode (`src/distributed.rs`)
-
-#### DistributedRuntimeConfig
-
-> **Source:** `src/distributed.rs`
-
-```rust
-pub struct DistributedRuntimeConfig {
+pub struct DistributedRunConfig {
+    pub family: DistributedFamily,
     pub budgets: ScanBudgets,
 }
 ```
 
-Runtime configuration for distributed scans. Passed as the second
-argument to `run_worker()`. The `budgets` field is converted to
-`ScanExecutionConfig` via `to_execution_config()` inside the worker
-loop, with `emit_findings_to_commit_sink` forced to `true` for
-distributed persistence. Implements `Default` (all default budgets:
-`max_items=256`, `max_bytes=1_000_000`).
-
-#### DistributedRuntimeError
-
-> **Source:** `src/distributed.rs`
-
 ```rust
-pub enum DistributedRuntimeError {
-    Coordinator(AnyError),
-    Runtime(ScanRuntimeError),
-}
+pub fn run_distributed(
+    config: &DistributedRunConfig,
+) -> Result<DistributedRunReport, DistributedRuntimeError>
 ```
 
-Error type returned by `run_worker()`. `Coordinator` wraps errors from
-coordinator operations (acquire, release, complete, mark-done).
-`Runtime` wraps `ScanRuntimeError` from scan execution. Implements
-`Display`, `Error` (with `source()`), and `From<ScanRuntimeError>`.
-
-The distributed worker loop processes shards from a coordinator:
-
-1. **Acquire** -- `coordinator.acquire_shard()` returns the next
-   `ShardLease` or `None` when no work remains.
-2. **Done-ledger gate** -- `coordinator.is_shard_done()` checks whether
-   the shard was already completed. If done, the lease is released and
-   skipped.
-3. **Scan** -- Builds a `CoordinationEventSink` and `DurableCommitSink`
-   from the lease's tenant credentials, then calls
-   `execute_assignment_with_config` with `emit_findings_to_commit_sink`
-   enabled.
-4. **Complete** -- `coordinator.complete_shard()` with checkpoint hint
-   and report, then `coordinator.mark_shard_done()`.
-5. **Loop** until `acquire_shard()` returns `None`.
-
-### Direct vs Connector
-
-`ExecutionMode::Direct` and `ExecutionMode::Connector` are retained as
-separate enum variants for CLI flag compatibility and telemetry tagging.
-Both variants currently execute the identical scan path: connector-mode
-functions (`scan_fs_connector`, `scan_git_connector`) delegate directly
-to their direct-mode counterparts.
+`run_distributed` validates budgets and then returns a family-specific
+placeholder runtime error.
 
 ---
 
-## 6. Output Sinks (`src/event_sink.rs`)
+## Tests
 
-All sinks implement both `EventOutput` (core scheduler events) and
-`GitEventOutput` (git-specific events). Broken-pipe errors are silently
-tolerated for CLI piping compatibility.
+The runtime tests focus on the behavior that exists today:
 
-### JSONL (`JsonlEventSink`)
+- execution-mode parsing
+- cancellation-token state transitions
+- budget validation
+- filesystem path validation
+- git repository root validation
+- placeholder error routing for filesystem, git, and distributed entrypoints
+- CLI parsing and summary formatting
+- durable commit-sink identity derivation
 
-One JSON object per line, newline-delimited. Finding records intentionally
-omit a `type` field for scanner-rs parity. Progress, summary, and
-diagnostic records include `"type":"progress"`, `"type":"summary"`, and
-`"type":"diagnostic"` respectively.
-
-Git events use `"type":"commit_meta"` and `"type":"identity_dictionary"`.
-
-### Text (`TextEventSink`)
-
-Human-readable output. Non-verbose mode emits compact single-line
-findings:
-
-```text
-path/to/file:10-40  rule-name  (fs)
-```
-
-Verbose mode emits multi-line blocks with labeled fields. Progress events
-are only emitted in verbose mode. Diagnostics are written to stderr.
-
-### JSON (`JsonEventSink`)
-
-Streaming JSON array. Opens with `[`, emits comma-separated elements,
-and closes with `]` on flush. Double-flush is safe (guarded by an
-`AtomicBool` closed flag).
-
-### SARIF (`SarifEventSink`)
-
-SARIF 2.1.0 format. Emits a complete SARIF document with tool metadata
-(`scanner-rs` + crate version), a single run, and results array. Only
-finding events are included; progress and diagnostic events are ignored.
-Git events are also ignored. Double-flush is safe.
-
-Each result includes `ruleId`, `message`, `locations` (with
-`byteOffset` and `byteLength`), and `rank` (confidence score normalized
-to 0-100 scale).
+These tests intentionally verify placeholder behavior for valid sources so
+the crate can evolve without depending on the removed driver stack.
 
 ---
 
-## 7. Identity Chain (`src/commit_sink.rs`)
-
-`DurableCommitSink` implements the `CommitSink` trait for distributed
-mode, deriving the full finding identity chain at commit time so the
-scan loop remains focused on detection.
-
-### Derivation flow
-
-```text
-FindingRecord.norm_hash
-       │
-       ▼
-NormHash::from_digest(norm_hash)
-       │
-       ▼
-key_secret_hash(tenant_secret_key, &norm_hash)  ──►  secret_hash
-       │
-       ▼
-derive_finding_id(FindingIdInputs {
-    tenant, item: stable_item, rule: rule_fingerprint, secret: secret_hash
-})  ──►  finding_id
-       │
-       ▼
-derive_occurrence_id(OccurrenceIdInputs {
-    finding: finding_id, version: object_version, byte_offset, byte_length
-})  ──►  occurrence_id
-```
-
-### CommitSink protocol
-
-| Method | Behavior |
-|--------|----------|
-| `begin_item(item_key, meta)` | Stores per-item metadata in `in_flight_meta` map; records `CommitProgressRecord::Begin` |
-| `upsert_findings(item_key, batch)` | For each finding in batch: derives `IdentityChainRecord` and records it via `recorder.record_identity_chain` |
-| `finish_item(item_key)` | Removes item from `in_flight_meta`; records `CommitProgressRecord::Finish` |
-
-### Version ID resolution
-
-When connector-provided `ItemMeta.version` is present, the sink uses
-`version.object_version_id()` for occurrence derivation. Otherwise, it
-falls back to `ObjectVersionId::from_version_bytes(item_key)`.
-
-### Rule fingerprint
-
-`rule_fingerprint_from_rule_id` converts the `u32` rule ID into a
-`RuleFingerprint` by zero-padding the LE bytes into a 32-byte array.
-
----
-
-## 8. Distributed Mode (`src/distributed.rs`)
-
-### DistributedCoordinator trait
-
-```rust
-pub trait DistributedCoordinator: Send + Sync {
-    fn acquire_shard(&self) -> Result<Option<ShardLease>>;
-    fn release_shard(&self, lease: &ShardLease) -> Result<()>;
-    fn complete_shard(
-        &self, lease: &ShardLease,
-        checkpoint: Option<CursorUpdate>, report: ScanReport,
-    ) -> Result<()>;
-    fn is_shard_done(&self, shard_id: &str) -> Result<bool>;
-    fn mark_shard_done(&self, shard_id: &str) -> Result<()>;
-    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder>;
-}
-```
-
-| Method | Purpose |
-|--------|---------|
-| `acquire_shard` | Get next lease to process, or `None` when queue is empty |
-| `release_shard` | Release lease without marking complete (done-ledger skip path) |
-| `complete_shard` | Mark lease complete with optional checkpoint and report |
-| `is_shard_done` | Query done-ledger before scanning |
-| `mark_shard_done` | Persist done-ledger entry after successful scan |
-| `event_recorder` | Shared recorder for event and commit sinks |
-
-### ShardLease
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `shard_id` | `String` | Unique shard identifier for done-ledger and event recording |
-| `assignment` | `Assignment` | Scan-driver assignment (job ID, connector kind, source, cursor, shard spec) |
-| `tenant_id` | `TenantId` | Tenant identity for finding ID derivation |
-| `tenant_secret_key` | `TenantSecretKey` | Tenant secret for secret hash derivation |
-
-### Worker loop lifecycle
-
-```text
-loop {
-    lease = coordinator.acquire_shard()?
-    if lease is None → break
-
-    if coordinator.is_shard_done(lease.shard_id)? {
-        coordinator.release_shard(&lease)?
-        report.shards_skipped_done += 1
-        continue
-    }
-
-    sink = CoordinationEventSink::new(recorder, shard_id)
-    commit = DurableCommitSink::new(recorder, shard_id, tenant_id, tenant_secret_key, connector_tag)
-
-    outcome = execute_assignment_with_config(
-        &lease.assignment, runtime, &engine_config, &sink, Some(&sink), &commit, &cancel
-    )?
-
-    coordinator.complete_shard(&lease, outcome.checkpoint_hint, outcome.report)?
-    coordinator.mark_shard_done(lease.shard_id)?
-    report.shards_scanned += 1
-}
-```
-
-### DistributedRunReport
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `leases_seen` | `u64` | Total leases acquired from coordinator |
-| `shards_scanned` | `u64` | Shards that completed scanning |
-| `shards_skipped_done` | `u64` | Shards skipped by done-ledger gate |
-
-### InMemoryCoordinator
-
-Test harness implementing `DistributedCoordinator` +
-`CoordinationEventRecorder` backed by `Arc<Mutex<State>>`. Provides
-inspection methods: `done_set()`, `released_shards()`,
-`completed_shards()`, `core_events()`, `identity_records()`.
-
-### CoordinationEventRecorder trait
-
-```rust
-pub trait CoordinationEventRecorder: Send + Sync {
-    fn record_core_event(&self, shard_id: &str, event: StoredCoreEvent) -> Result<()>;
-    fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()>;
-    fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()>;
-    fn record_identity_chain(&self, shard_id: &str, record: IdentityChainRecord) -> Result<()>;
-}
-```
-
-Recorder failures are intentionally non-fatal for event emission:
-commit durability is enforced by `DurableCommitSink`, while event
-recording remains best-effort telemetry.
-
----
-
-## 9. Coordination Event Types (`src/coordination_sink.rs`)
-
-### CoordinationEventSink
-
-> **Source:** `src/coordination_sink.rs`
-
-```rust
-pub struct CoordinationEventSink {
-    shard_id: String,                           // private
-    recorder: Arc<dyn CoordinationEventRecorder>, // private
-}
-```
-
-Distributed event sink that bridges scan-driver output to the
-coordinator recorder. Implements both `EventOutput` (core events) and
-`GitEventOutput` (git-specific events). Constructed inside the worker
-loop via `CoordinationEventSink::new(recorder, shard_id)` and passed
-as the `out` sink — to `execute_assignment_with_config` for non-git
-assignments, or to `execute_git_assignment` for git assignments.
-
-Each event variant is converted from its borrowed form (`CoreEvent`,
-`GitEvent`) into the corresponding owned form (`StoredCoreEvent`,
-`StoredGitEvent`) before forwarding to the recorder. Recorder failures
-are intentionally non-fatal (silently discarded) -- event emission is
-best-effort telemetry.
-
-### StoredCoreEvent
-
-Owned representation of scheduler core events, persisted by distributed
-sinks.
-
-| Variant | Key Fields |
-|---------|------------|
-| `Finding` | `source`, `object_path`, `start`, `end`, `rule_id`, `rule_name`, `commit_id`, `change_kind`, `confidence_score` |
-| `Progress` | `source`, `stage`, `objects_scanned`, `bytes_scanned`, `findings_emitted` |
-| `Summary` | `source`, `status`, `elapsed_ms`, `bytes_scanned`, `findings_emitted`, `errors`, `throughput_mib_s` |
-| `Diagnostic` | `level`, `message` |
-
-### StoredGitEvent
-
-| Variant | Key Fields |
-|---------|------------|
-| `CommitMeta` | `commit_id`, `oid_hex`, `timestamp`, `author_name_id`, `author_email_id`, `committer_name_id`, `committer_email_id` |
-| `IdentityDictionary` | `id`, `value` |
-
-### CommitProgressRecord
-
-| Variant | Fields |
-|---------|--------|
-| `Begin` | `item_key`, `size_hint` |
-| `Finish` | `item_key` |
-
-### IdentityChainRecord
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `item_key` | `Vec<u8>` | Source item key bytes |
-| `rule_id` | `u32` | Matched rule identifier |
-| `start` | `u64` | Finding start byte offset |
-| `end` | `u64` | Finding end byte offset |
-| `confidence_score` | `i8` | Detection confidence score |
-| `norm_hash` | `[u8; 32]` | BLAKE3 hash of normalized secret bytes |
-| `secret_hash` | `[u8; 32]` | Keyed hash of norm_hash with tenant secret |
-| `finding_id` | `[u8; 32]` | Deterministic finding identity |
-| `occurrence_id` | `[u8; 32]` | Deterministic occurrence identity |
-
----
-
-## 10. JSONL Parity Testing (`src/parity.rs`)
-
-The parity module enables deterministic comparison between gossip-rs
-and scanner-rs output. It canonicalizes JSONL event streams into sorted
-finding tuples, abstracting over format differences between the two
-scanner implementations.
-
-### CanonicalizeError
-
-> **Source:** `src/parity.rs`
-
-```rust
-pub enum CanonicalizeError {
-    Json { line: usize, source: serde_json::Error },
-    MissingField { line: usize, field: &'static str },
-    InvalidFieldType { line: usize, field: &'static str, expected: &'static str },
-    MissingCommitMeta { commit_id: u32 },
-    MissingSummaryThroughput,
-}
-```
-
-Error type returned by `canonicalize_jsonl_events()` and
-`canonicalize_jsonl_events_with_roots()`. Covers JSON parse failures,
-missing or mistyped fields in individual records, commit metadata
-join failures (git finding references a `commit_id` without a matching
-`commit_meta` event), and missing summary throughput. Implements
-`Display` and `Error`.
-
-### Canonicalization rules
-
-- Both scanner-rs shapes (`"type":"finding"` + `rule` field) and
-  gossip-rs shapes (no `type` field, `rule_name` field) are accepted.
-- Git findings with `commit_id` are joined to `commit_meta` events to
-  resolve commit OID and timestamp.
-- A summary event with `throughput_mib_s` is required.
-- Path prefixes can be stripped via `canonicalize_jsonl_events_with_roots`
-  for stable cross-machine comparison.
-- Output findings are sorted for deterministic assertion.
-
-### CanonicalFinding
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `path` | `String` | Source-displayed path (optionally root-normalized) |
-| `rule` | `String` | Rule identity |
-| `start` | `u64` | Inclusive start offset |
-| `end` | `u64` | Exclusive end offset |
-| `source` | `String` | Source kind (`fs`, `git`) |
-| `change_kind` | `Option<String>` | Git change kind (omitted for FS) |
-| `commit_oid` | `Option<String>` | Git commit OID resolved from commit_meta |
-| `commit_timestamp` | `Option<u64>` | Git commit timestamp from commit_meta |
-
-### CanonicalRun
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `findings` | `Vec<CanonicalFinding>` | Sorted canonical finding identities |
-| `throughput_mib_s` | `f64` | Throughput from summary event |
-
----
-
-## 11. Source of Truth
-
-| Concern | Authoritative Path |
-|---------|--------------------|
-| Execution-mode dispatch and config types | `crates/gossip-scanner-runtime/src/lib.rs` |
-| CLI argument parsing and `run()` | `crates/gossip-scanner-runtime/src/cli.rs` |
-| Durable finding identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
-| Coordinator event types and recorder trait | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
-| Distributed worker loop and coordinator trait | `crates/gossip-scanner-runtime/src/distributed.rs` |
-| Output format sinks (JSONL, Text, JSON, SARIF) | `crates/gossip-scanner-runtime/src/event_sink.rs` |
-| JSONL parity canonicalization | `crates/gossip-scanner-runtime/src/parity.rs` |
-| Crate dependencies and feature flags | `crates/gossip-scanner-runtime/Cargo.toml` |
-| Scan driver traits (`ScanDriver`, `ScanSourceFactory`) | `crates/gossip-scan-driver/src/lib.rs` |
-| Scan source factory implementations | `crates/gossip-connectors/src/scan_driver.rs` |
-| Scanner engine construction | `crates/scanner-engine/` |
-| Identity derivation primitives | `crates/gossip-contracts/src/identity/` |
-
----
-
-## 12. Known Limitations
-
-- **GitScanDriver does not use the commit sink.** The git scan driver
-  takes a `_commit` parameter but does not call it. Findings discovered
-  during git scans in distributed mode are emitted as events but never
-  persisted through the identity chain. The shard is still marked done.
-  The fix belongs in `gossip-connectors/src/scan_driver.rs`. There is
-  an ignored integration test documenting this:
-  `distributed::tests::git_shard_produces_identity_records_through_commit_sink`.
-
-- **Upsert without begin_item is silently tolerated.** Calling
-  `DurableCommitSink::upsert_findings` without a prior `begin_item` falls
-  back to `ItemMeta::default()`, using an item-key-based version ID
-  instead of the connector-provided one. The protocol violation is not
-  surfaced as an error.
+## Source of Truth
+
+| Concern | Path |
+|---------|------|
+| Core runtime types and validation | `crates/gossip-scanner-runtime/src/lib.rs` |
+| CLI parsing and summary rendering | `crates/gossip-scanner-runtime/src/cli.rs` |
+| Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Distributed family placeholders | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Ordered-content placeholder boundary | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
+| Git-repo placeholder boundary | `crates/gossip-scanner-runtime/src/git_repo.rs` |
+| Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |
+| JSONL parity helpers | `crates/gossip-scanner-runtime/src/parity.rs` |
