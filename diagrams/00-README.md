@@ -37,7 +37,7 @@ graph TD
     SO[01-system-overview.md<br/>5-boundary architecture<br/>4 diagrams]
     BD[02-boundary-dependency-graph.md<br/>Type-annotated DAG<br/>3 diagrams]
     ID[03-id-derivation-dag.md<br/>19-type identity hierarchy<br/>7 diagrams]
-    E2E[04-end-to-end-scan-flow.md<br/>ScanDriver architecture<br/>4 diagrams]
+    E2E[04-end-to-end-scan-flow.md<br/>Source-family runtime surface<br/>4 diagrams]
 
     SM[05-shard-and-run-state-machines.md<br/>Shard + Run state machines<br/>4 diagrams]
     FP[06-fencing-protocol.md<br/>5-check validation<br/>4 diagrams]
@@ -154,7 +154,7 @@ graph TD
 | 01  | `01-system-overview.md`              | 4        | All              | 5-boundary model, crate mapping, scan flow, build DAG                     |
 | 02  | `02-boundary-dependency-graph.md`    | 3        | B1, All          | Type-annotated DAG, tiered compilation, anti-patterns                     |
 | 03  | `03-id-derivation-dag.md`            | 7        | B1               | 19-type hierarchy, item/secret/finding/occurrence/observation chains     |
-| 04  | `04-end-to-end-scan-flow.md`         | 4        | All              | ScanDriver architecture, dual entry points, findings identity flow        |
+| 04  | `04-end-to-end-scan-flow.md`         | 4        | All              | Source-family runtime surface, dual entry points, findings identity flow  |
 | 05  | `05-shard-and-run-state-machines.md` | 4        | B2               | Shard SM, run SM, splits lifecycle, illegal transitions                   |
 | 06  | `06-fencing-protocol.md`             | 4        | B2               | 5-check validation, zombie resolution, decision tree                      |
 | 07  | `07-lease-lifecycle.md`              | 7        | B2               | Acquisition, renewal timeline, cursor monotonicity, capacity piggybacking |
@@ -218,7 +218,7 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `11-tenant-isolation.md`             | `08-cross-cutting/04-tenant-isolation.md`                                                                                                                                                   |
 | `12-split-operations.md`             | `04-boundary-2-coordination/06-split-operations.md`                                                                                                                                         |
 | `13-shard-algebra-types.md`          | `crates/gossip-frontier/src/key_encoding.rs`, `hint.rs`, `builder.rs`; `crates/gossip-contracts/src/coordination/shard_spec.rs`, `split.rs`; `crates/gossip-contracts/src/connector/api.rs` |
-| `14-connector-architecture.md`       | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`, `in_memory.rs`, `scan_driver.rs`; `crates/gossip-scan-driver/src/lib.rs` |
+| `14-connector-architecture.md`       | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`, `ordered.rs`, `git.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`, `in_memory.rs`; `crates/gossip-scanner-runtime/src/ordered_content.rs`, `git_repo.rs`, `distributed.rs` |
 | `16-cursor-resume-strategy.md`       | `crates/gossip-contracts/src/connector/types.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`                                                                                        |
 | `17-filesystem-walk-state-machine.md`| `crates/gossip-connectors/src/filesystem.rs` (WalkState, WalkFrame, WalkToken, should_skip_subtree)                                                                                                                             |
 | `18-streaming-split-estimation.md`   | `crates/gossip-connectors/src/split_estimator.rs`, `common.rs`; `crates/gossip-contracts/src/connector/api.rs` (choose_split_point)                                                                                             |

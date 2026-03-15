@@ -63,12 +63,12 @@ If omitted, defaults to `--full` (all sections).
 | `theory` | `03-distributed-systems-theory/` | (conceptual, light code refs) |
 | `coordination` | `04-boundary-2-coordination/` | `gossip-contracts/src/coordination/`, `gossip-coordination/src/`, `gossip-coordination-etcd/src/` |
 | `shard-algebra` | `05-boundary-3-shard-algebra/` | `gossip-frontier/src/` |
-| `connector` | `06-boundary-4-connector/` | `gossip-contracts/src/connector/`, `gossip-connectors/src/`, `gossip-scan-driver/src/` |
+| `connector` | `06-boundary-4-connector/` | `gossip-contracts/src/connector/`, `gossip-connectors/src/`, `gossip-scanner-runtime/src/` |
 | `persistence` | `07-boundary-5-persistence/` | `gossip-contracts/src/persistence/`, `gossip-persistence-inmemory/src/` |
 | `cross-cutting` | `08-cross-cutting/` | (cross-cutting) |
 | `appendices` | `09-appendices/` | (cross-cutting) |
 | `scanner-engine` | `10-scanner-engine/` | `scanner-engine/src/` |
-| `scan-driver` | `11-scan-driver-and-pipeline/` | `gossip-scan-driver/src/` |
+| `scan-driver` | `11-scan-driver-and-pipeline/` | `gossip-scanner-runtime/src/`, `scanner-scheduler/src/`, `scanner-git/src/` |
 | `scanner-git` | `12-scanner-git/` | `scanner-git/src/` |
 | `scheduler` | `13-scanner-scheduler/` | `scanner-scheduler/src/` |
 | `runtime` | `14-scanner-runtime-and-worker/` | `gossip-scanner-runtime/src/`, `gossip-worker/src/` |
@@ -382,7 +382,7 @@ paths are relative to `/Users/ahrav/Projects/Gossip-rs/crates/`.
 06-boundary-4-connector:
   crates: gossip-contracts/src/connector/
           gossip-connectors/src/
-          gossip-scan-driver/src/
+          gossip-scanner-runtime/src/
 
 07-boundary-5-persistence:
   crates: gossip-contracts/src/persistence/
@@ -398,7 +398,9 @@ paths are relative to `/Users/ahrav/Projects/Gossip-rs/crates/`.
   crates: scanner-engine/src/
 
 11-scan-driver-and-pipeline:
-  crates: gossip-scan-driver/src/
+  crates: gossip-scanner-runtime/src/
+          scanner-scheduler/src/
+          scanner-git/src/
 
 12-scanner-git:
   crates: scanner-git/src/

@@ -374,7 +374,7 @@ graph TD
 | Connector boundary overview | [09-circuit-breaker.md](09-circuit-breaker.md) | B4 fault isolation context |
 | Shard key ranges and splits | [12-split-operations.md](12-split-operations.md) | Shard bounds that constrain cursor ranges |
 | Shard algebra types | [13-shard-algebra-types.md](13-shard-algebra-types.md) | `ShardSpec` key range encoding that cursors operate within |
-| End-to-end scan flow | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) | ScanDriver architecture and distributed worker loop |
+| End-to-end scan flow | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) | Source-family runtime surface and distributed runtime placeholders |
 | Lease lifecycle | [07-lease-lifecycle.md](07-lease-lifecycle.md) | Cursor monotonicity enforcement by the coordination layer |
 
 ---

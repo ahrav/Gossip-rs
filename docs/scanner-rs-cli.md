@@ -40,12 +40,14 @@ There is no `lib.rs`, no additional modules, and no subdirectories.
 ```text
 scanner-rs-cli (Tier 3 binary, produces `scanner-rs`)
   --> gossip-scanner-runtime (Tier 2: all CLI logic lives here)
+       --> gossip-contracts       (source-family contracts, coordination + identity types)
        --> scanner-engine          (detection pipeline)
        --> scanner-scheduler       (execution scheduling, FS scanning)
        --> scanner-git             (git repository scanning)
-       --> gossip-connectors       (FS/Git/InMemory source implementations)
-       --> gossip-contracts        (connector/coordination/identity types)
+
 ```
+
+The canonical source-boundary guide lives in `docs/source-families.md`.
 
 ### Execution flow
 
@@ -205,10 +207,10 @@ binary is a thin wrapper. All testing lives in `gossip-scanner-runtime`:
 ## 8. Relationship to gossip-worker
 
 Both `scanner-rs-cli` and `gossip-worker` are top-level binaries that
-route through the same unified execution pipeline:
+route through the same family-oriented runtime boundary:
 
 ```text
-config -> Assignment -> ScanSourceFactory -> ScanDriver::run
+config -> scan_fs / scan_git -> validation -> ordered_content / git_repo runtime boundary
 ```
 
 | Aspect | scanner-rs-cli | gossip-worker |

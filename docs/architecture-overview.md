@@ -191,7 +191,7 @@ gossip-contracts  (data model leaf -- identity, shard spec, connector types)
 | **InMemoryCoordinator**            | `crates/gossip-coordination/src/in_memory.rs`                             | Reference backend implementation (executable spec for testing and simulation)                               |
 | **gossip-connectors**              | `crates/gossip-connectors/src/`                                           | Concrete connector implementations: `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
 | **gossip-scanner-runtime**         | `crates/gossip-scanner-runtime/src/lib.rs`                                | Family-oriented runtime: `scan_fs()`, `scan_git()` entry points; `ExecutionMode` (Direct/Connector) routing |
-| **Distributed Coordinator**        | `crates/gossip-scanner-runtime/src/distributed.rs`                        | `DistributedCoordinator` trait, `ShardLease`, distributed run loop                                         |
+| **Distributed Runtime Surface**    | `crates/gossip-scanner-runtime/src/distributed.rs`                        | `DistributedFamily`, `DistributedRunConfig`, `DistributedRunReport`, `run_distributed`                    |
 | **gossip-worker**                  | `crates/gossip-worker/src/main.rs`                                        | Binary: CLI arg parsing, tracing init, dispatches to `scan_fs`/`scan_git` via runtime                      |
 
 

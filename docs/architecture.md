@@ -10,7 +10,16 @@ reusable scratch buffers so large scans do not trigger per-chunk allocations.
 
 ```
 scanner-rs scan fs
-  -> scan_fs (gossip-scanner-runtime) / parallel_scan_dir (crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
+  -> scan_fs (gossip-scanner-runtime)
+  -> path + budget validation
+  -> ordered_content::filesystem_placeholder (crates/gossip-scanner-runtime/src/ordered_content.rs)
+```
+
+The runtime crate owns the public filesystem entrypoint and validation surface.
+The filesystem scan engine itself lives in `scanner-scheduler`:
+
+```
+filesystem engine backend
   -> parallel_scan_dir (crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
   -> IterWalker (single-threaded discovery)
   -> scan_local (crates/scanner-scheduler/src/scheduler/local_fs_owner.rs)
@@ -29,8 +38,9 @@ scanner-rs scan fs
   (JSONL/Text/JSON/SARIF), and a final summary event is emitted by the
   orchestrator.
 
-For direct synchronous library use, `crates/scanner-scheduler/src/runtime.rs` still provides
-`ScannerRuntime` + `read_file_chunks` with overlap-aware chunking.
+For direct synchronous library use,
+`crates/scanner-scheduler/src/runtime.rs` still provides `ScannerRuntime` +
+`read_file_chunks` with overlap-aware chunking.
 
 ## Engine Flow (per buffer)
 

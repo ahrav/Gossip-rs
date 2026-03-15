@@ -1,14 +1,21 @@
-# 14 — Connector Architecture
+# 14 -- Connector Architecture
 
-This document diagrams the B4 Connector boundary: trait contracts, core value types, scan-driver integration, and error classification. Connectors bridge external data sources into the unified shard-based enumeration and read model defined in `gossip-contracts`.
+This document diagrams the B4 Connector boundary: trait contracts, core value
+types, family-runtime integration, and error classification. Connectors bridge
+external data sources into the shard-based enumeration and read model defined
+in `gossip-contracts`.
 
-**Color coding**: All B4 Connector components use fill `#EF4444` / `#FEE2E2`, stroke `#991B1B` (red — external I/O, highest risk). Cross-boundary components use their respective boundary colors per [00-README.md](./00-README.md).
+**Color coding**: All B4 Connector components use fill `#EF4444` / `#FEE2E2`,
+stroke `#991B1B` (red -- external I/O, highest risk). Cross-boundary
+components use their respective boundary colors per [00-README.md](./00-README.md).
 
 ---
 
 ## 1. Connector Method Surface
 
-Each concrete connector exposes read and split-point operations as inherent methods (not trait dispatch). All three connectors share the same method signatures and advertise capabilities via `ConnectorCapabilities`, a four-flag struct that orchestration reads at registration time. All three connectors support `seek_by_key`, `range_read`, and `split_hints`; `token_resume` is configurable per instance.
+Each concrete connector exposes read and split-point operations as inherent
+methods. `ConnectorCapabilities` advertises which optional operations are
+available per connector instance.
 
 ```mermaid
 %% Diagram: connector-method-surface
@@ -17,15 +24,15 @@ graph TD
         CC["<b>ConnectorCapabilities</b><br/>seek_by_key: bool<br/>token_resume: bool<br/>range_read: bool<br/>split_hints: bool"]
     end
 
-    subgraph Methods["Inherent Method Surface"]
-        EM["<b>Split &amp; Capability Methods</b><br/>caps() → ConnectorCapabilities<br/>choose_split_point(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
-        RM["<b>Read Methods</b><br/>open(&mut, &ItemRef, Budgets)<br/>  → Result&lt;Box&lt;dyn Read + Send&gt;, ReadError&gt;<br/>read_range(&mut, &ItemRef, u64, &mut [u8], Budgets)<br/>  → Result&lt;usize, ReadError&gt;"]
+    subgraph Methods["Inherent method surface"]
+        EM["<b>Split &amp; capability methods</b><br/>caps() → ConnectorCapabilities<br/>choose_split_point(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
+        RM["<b>Read methods</b><br/>open(&mut, &ItemRef, Budgets)<br/>  → Result&lt;Box&lt;dyn Read + Send&gt;, ReadError&gt;<br/>read_range(&mut, &ItemRef, u64, &mut [u8], Budgets)<br/>  → Result&lt;usize, ReadError&gt;"]
     end
 
     EM -->|"caps() returns"| CC
 
-    subgraph Connectors["Concrete Implementations"]
-        FS["<b>FilesystemConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
+    subgraph Connectors["Concrete implementations"]
+        FS["<b>FilesystemConnector</b><br/>seek_by_key: ✓<br/>token_resume: ✗<br/>range_read: ✓<br/>split_hints: ✗"]
         GIT["<b>GitConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
         MEM["<b>InMemoryDeterministicConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
     end
@@ -47,47 +54,55 @@ graph TD
 
 **Key design decisions:**
 
-- Reading (payload I/O) and split-point selection are separate method groups from capability advertisement. Orchestration applies independent retry and circuit-breaker policies per operation.
-- `choose_split_point` is provided by connectors that advertise `split_hints: true`. Only connectors with natural partition boundaries (tree objects, directory structure) implement it.
-- Connectors without native random-access support must explicitly return `Err(ReadError::unsupported("range_read"))` from `read_range`. All three current connectors implement full range-read support.
-- `token_resume` is instance-configurable via `with_tokens(bool)` on each connector rather than hardcoded, because some test scenarios disable tokens to exercise key-only resume.
+- Reading payload bytes and selecting split points are separate method groups.
+  Orchestration can apply different retry and circuit-breaker policies to each
+  path.
+- `choose_split_point` is only meaningful for connectors that advertise
+  `split_hints: true`.
+- `FilesystemConnector` keeps a simpler capability profile: key-based seek and
+  range reads are available, while token resume and split hints are not.
+- `GitConnector` and `InMemoryDeterministicConnector` can expose token resume
+  conditionally through `with_tokens(bool)`.
 
-See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for failure isolation per connector, [13-shard-algebra-types.md](./13-shard-algebra-types.md) for shard key encoding.
+See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for failure
+isolation per connector, [13-shard-algebra-types.md](./13-shard-algebra-types.md)
+for shard key encoding.
 
 ---
 
 ## 2. Core Type Relationships
 
-Connector boundary types enforce invariants at construction time so downstream code can operate on strongly-typed values without repeating validation. The toxic-byte wrappers (`ItemKey`, `ItemRef`, `TokenBytes`) never expose raw bytes in `Debug`/`Display` output — both produce an identical redacted format (`TypeName(len=N, hash=XXXXXXXX..)`) using a truncated BLAKE3 prefix.
+Connector boundary types enforce invariants at construction time so downstream
+code can operate on strongly typed values without repeating validation.
 
 ```mermaid
 %% Diagram: connector-core-types
 graph TD
-    subgraph ToxicWrappers["Toxic-Byte Wrappers"]
+    subgraph ToxicWrappers["Toxic-byte wrappers"]
         IK["<b>ItemKey</b><br/>max: 4 KiB<br/>ordered (Ord)<br/>enumeration position"]
         IR["<b>ItemRef</b><br/>max: 16 KiB<br/>unordered<br/>opaque read handle"]
         TB["<b>TokenBytes</b><br/>max: 16 KiB<br/>unordered<br/>pagination resume token"]
     end
 
-    subgraph Paging["Paging State"]
+    subgraph Paging["Paging state"]
         CUR["<b>Cursor</b><br/>last_key: Option&lt;ItemKey&gt;<br/>token: Option&lt;TokenBytes&gt;<br/><i>invariant: token implies last_key</i>"]
     end
 
     IK -->|"last_key field"| CUR
     TB -->|"token field"| CUR
 
-    subgraph Enumeration["Connector Output"]
+    subgraph Enumeration["Connector output"]
         SI["<b>ScanItem</b><br/>item_key: ItemKey<br/>item_ref: ItemRef<br/>stable_item_id: StableItemId<br/>version: VersionId<br/>size_hint: Option&lt;u64&gt;<br/>content_hints: Option&lt;ContentHints&gt;<br/>location: Option&lt;Location&gt;"]
     end
 
     IK -->|"item_key field"| SI
     IR -->|"item_ref field"| SI
 
-    subgraph Budgets["Scan Budgets"]
+    subgraph Budgets["Scan budgets"]
         BU["<b>Budgets</b><br/>max_items: NonZeroUsize<br/>max_bytes: NonZeroU64<br/>deadline: Option&lt;Instant&gt;"]
     end
 
-    subgraph Errors["Error Types"]
+    subgraph Errors["Error types"]
         EC2["<b>ErrorClass</b><br/>Retryable | Permanent"]
         EE["<b>EnumerateError</b><br/>class: ErrorClass<br/>message: String<br/>retry_after_ms: Option&lt;u64&gt;"]
         RE["<b>ReadError</b><br/>class: ErrorClass<br/>message: String<br/>retry_after_ms: Option&lt;u64&gt;"]
@@ -111,82 +126,114 @@ graph TD
 
 **Design notes:**
 
-- `ItemKey` has `Ord` (lexicographic byte comparison) because it participates in cursor progression and shard range membership. `ItemRef` and `TokenBytes` are unordered — they are looked up, not ranged.
-- `MAX_ITEM_KEY_SIZE` (4 KiB) and `MAX_TOKEN_SIZE` (16 KiB) track coordination cursor field limits so connector paging state fits in cursor updates without truncation. `MAX_ITEM_REF_SIZE` (16 KiB) is independent — refs never enter cursor state.
-- `Cursor` constructors make the `(None, Some(token))` state unrepresentable. `try_from_update` rejects `TokenWithoutLastKey`.
-- `EnumerateError` and `ReadError` are structurally identical but distinct nominal types. This prevents accidental cross-assignment and lets orchestration apply different retry policies per operation path.
-- All toxic-byte wrappers support both owned (`Box<[u8]>`) and pooled (`ByteSlot` + `Arc<PooledByteSlab>`) storage. Pooled values avoid per-item heap allocation on HOT enumeration paths.
+- `ItemKey` has `Ord` because it participates in cursor progression and shard
+  range membership. `ItemRef` and `TokenBytes` are looked up, not ranged.
+- `Cursor` constructors make the `(None, Some(token))` state unrepresentable.
+- `EnumerateError` and `ReadError` share the same shape but remain nominally
+  distinct so orchestration cannot mix the two operation paths by accident.
+- Pooled toxic-byte wrappers retain a shared slab so page-scoped data can
+  escape a page boundary without copying raw bytes into ad hoc buffers.
 
-See also: [03-id-derivation-dag.md](./03-id-derivation-dag.md) for `StableItemId` and `VersionId` derivation, [08-pagecommit-typestate.md](./08-pagecommit-typestate.md) for how `ScanItem` flows into the persistence commit protocol.
+See also: [03-id-derivation-dag.md](./03-id-derivation-dag.md) for
+`StableItemId` and `VersionId` derivation, [08-pagecommit-typestate.md](./08-pagecommit-typestate.md)
+for how `ScanItem` flows into persistence commits.
 
 ---
 
-## 3. Connector-to-Driver Bridge
+## 3. Connector-to-Runtime Family Bridge
 
-The scan-driver layer (`gossip-scan-driver`) defines a second trait surface that bridges connectors into the scan execution pipeline. `ConnectorKind` discriminates the source backend; `ScanSourceFactory` maps `Assignment`s to boxed `ScanDriver` instances. This separation keeps `gossip-contracts` a lightweight leaf crate while scan-driver concerns (engines, event sinks, cancellation) live in their own crate.
+Runtime orchestration imports shared connector nouns from
+`gossip-contracts::connector` and selects a family module inside
+`gossip-scanner-runtime`. Ordered-content work flows through
+`OrderedContentRuntime`; Git repository work flows through `GitRepoRuntime`;
+distributed execution keeps its own `DistributedFamily` selector.
 
 ```mermaid
-%% Diagram: connector-driver-bridge
+%% Diagram: connector-runtime-family-bridge
 graph LR
     subgraph Coordination["B2: Coordination"]
-        AS["<b>Assignment</b><br/>job_id, connector_kind,<br/>connector_instance_id,<br/>shard_spec, cursor, source"]
+        CLAIM["<b>Shard claim</b><br/>ShardSpec + Cursor + run context"]
     end
 
-    subgraph ScanDriver["gossip-scan-driver"]
-        CK["<b>ConnectorKind</b><br/>Filesystem | Git | InMemory"]
-        SSF["<b>ScanSourceFactory</b><br/>driver_for_assignment(&Assignment)<br/>  → Result&lt;Box&lt;dyn ScanDriver&gt;&gt;<br/>capabilities()<br/>  → SourceCapabilities"]
-        SD["<b>ScanDriver</b><br/>run(&mut, Engine, &ScanExecutionConfig,<br/>  &dyn EventOutput, Option&lt;&dyn GitEventOutput&gt;,<br/>  &dyn CommitSink, &CancellationToken)<br/>  → Result&lt;ScanReport&gt;"]
+    subgraph Runtime["gossip-scanner-runtime"]
+        OCR["<b>OrderedContentRuntime</b><br/>execute_source(...)<br/>filesystem_placeholder(...)"]
+        GRR["<b>GitRepoRuntime</b><br/>execute_discovery(...)<br/>execute_repo(...)<br/>local_repo_placeholder(...)"]
+        DRT["<b>distributed::run_distributed</b><br/>DistributedFamily"]
     end
 
-    subgraph Factories["gossip-connectors (factories)"]
-        FSF["<b>FilesystemScanSourceFactory</b><br/>→ FsScanDriver<br/>checkpoint: ✗  cancel: ✗"]
-        EGA["<b>execute_git_assignment</b><br/>standalone fn (no factory/trait)<br/>checkpoint: ✗  cancel: ✗"]
-        MSF["<b>InMemoryScanSourceFactory</b><br/>→ InMemoryScanDriver<br/>checkpoint: ✓  cancel: ✓"]
+    subgraph Contracts["gossip-contracts::connector"]
+        OCS["<b>OrderedContentSource</b>"]
+        GDS["<b>GitRepoDiscoverySource</b>"]
+        GMM["<b>GitMirrorManager</b>"]
+        GRE["<b>GitRepoExecutor</b>"]
     end
 
-    AS -->|"connector_kind selects"| CK
-    CK -->|"routes to"| SSF
-    SSF -->|"produces"| SD
+    subgraph Sources["gossip-connectors"]
+        FSC["<b>FilesystemConnector</b>"]
+        GTC["<b>GitConnector</b>"]
+        IMC["<b>InMemoryDeterministicConnector</b>"]
+    end
 
-    FSF -->|impl| SSF
-    MSF -->|impl| SSF
-    CK -->|"Git kind"| EGA
+    CLAIM --> OCR
+    CLAIM --> GRR
+    CLAIM --> DRT
 
-    style AS fill:#DCFCE7,stroke:#166534
-    style CK fill:#EF4444,stroke:#991B1B,color:#fff
-    style SSF fill:#FEE2E2,stroke:#991B1B
-    style SD fill:#FEE2E2,stroke:#991B1B
-    style FSF fill:#FEE2E2,stroke:#991B1B
-    style EGA fill:#FEE2E2,stroke:#991B1B
-    style MSF fill:#FEE2E2,stroke:#991B1B
+    OCR --> OCS
+    GRR --> GDS
+    GRR --> GMM
+    GRR --> GRE
+
+    FSC --> OCS
+    IMC --> OCS
+    GTC --> GDS
+    GTC --> GMM
+    GTC --> GRE
+
+    style CLAIM fill:#DCFCE7,stroke:#166534
+    style OCR fill:#FEE2E2,stroke:#991B1B
+    style GRR fill:#FEE2E2,stroke:#991B1B
+    style DRT fill:#DCFCE7,stroke:#166534
+    style OCS fill:#FEE2E2,stroke:#991B1B
+    style GDS fill:#FEE2E2,stroke:#991B1B
+    style GMM fill:#FEE2E2,stroke:#991B1B
+    style GRE fill:#FEE2E2,stroke:#991B1B
+    style FSC fill:#FEE2E2,stroke:#991B1B
+    style GTC fill:#FEE2E2,stroke:#991B1B
+    style IMC fill:#FEE2E2,stroke:#991B1B
 ```
 
-**Execution flow:**
+**Runtime surface:**
 
-1. The coordination layer builds an `Assignment` from a shard claim, including `ConnectorKind`, `ShardSpec`, `Cursor`, and source-specific payload (`AssignmentSource::Filesystem { root }`, `AssignmentSource::Git { repo_root }`, or `AssignmentSource::InMemory { dataset_id }`).
-2. For filesystem and in-memory assignments, the runtime selects a `ScanSourceFactory` by `ConnectorKind` and calls `driver_for_assignment` to produce a boxed `ScanDriver`. Git assignments bypass the factory/trait path and use `execute_git_assignment` directly (requires `&dyn GitEventOutput`).
-3. The driver's `run()` method receives a compiled `Engine`, execution config, event/commit sinks, and a `CancellationToken`, then returns a `ScanReport` with aggregate counters.
+| Runtime entry | Purpose |
+| ------------- | ------- |
+| `OrderedContentRuntime::execute_source` | Generic ordered-content execution hook |
+| `ordered_content::filesystem_placeholder` | Filesystem-facing ordered-content entrypoint |
+| `GitRepoRuntime::execute_discovery` | Generic repository-discovery hook |
+| `GitRepoRuntime::execute_repo` | Generic mirror + executor hook |
+| `git_repo::local_repo_placeholder` | Local repository entrypoint |
+| `distributed::run_distributed` | Family-tagged distributed runtime surface |
 
-**Capability differences by factory:**
+**Boundary split.** `gossip-connectors` owns concrete source implementations;
+`gossip-contracts` owns the family traits and value contracts; `gossip-scanner-runtime`
+owns the orchestration modules that sit between callers and those family traits.
 
-| Factory / Entry Point | Checkpoint hints | Cooperative cancel |
-|-----------------------|------------------|--------------------|
-| `FilesystemScanSourceFactory` | No | No (`parallel_scan_dir` has no mid-scan cancel) |
-| `execute_git_assignment` | No (watermark-based persistence) | No |
-| `InMemoryScanSourceFactory` | Yes | Yes (polls `is_cancelled()` per item) |
-
-See also: [04-end-to-end-scan-flow.md](./04-end-to-end-scan-flow.md) for the ScanDriver architecture and distributed worker loop, [05-shard-and-run-state-machines.md](./05-shard-and-run-state-machines.md) for shard assignment lifecycle.
+See also: [04-end-to-end-scan-flow.md](./04-end-to-end-scan-flow.md) for the
+runtime entrypoints and commit-sink flow, [05-shard-and-run-state-machines.md](./05-shard-and-run-state-machines.md)
+for shard lifecycle.
 
 ---
 
 ## 4. Error Classification Flow
 
-I/O errors from the host OS are classified at the connector boundary into a binary `ErrorClass` posture. The shared helpers in `gossip-connectors::common` centralize this decision so all three connectors use identical permanence logic. Classified errors carry a log-safe `ToxicDigest` of the affected path rather than raw filesystem paths.
+I/O errors from the host OS are classified at the connector boundary into a
+binary `ErrorClass` posture. Shared helpers in `gossip-connectors::common`
+centralize this decision so all three connectors use identical permanence
+logic.
 
 ```mermaid
 %% Diagram: error-classification-flow
 graph TD
-    subgraph IO["Raw I/O Layer"]
+    subgraph IO["Raw I/O layer"]
         IOE["<b>std::io::Error</b><br/>from filesystem / git / network"]
     end
 
@@ -201,14 +248,14 @@ graph TD
     CIE2 -->|"delegates to"| IPIE
     CIR -->|"delegates to"| IPIE
 
-    subgraph Redaction["Log-Safe Redaction"]
+    subgraph Redaction["Log-safe redaction"]
         TD2["<b>ToxicDigest</b><br/>BLAKE3 hash of path bytes<br/>no raw paths in error messages"]
     end
 
     CIE2 -->|"path_digest()"| TD2
     CIR -->|"path_digest()"| TD2
 
-    subgraph Outcomes["Classified Outcomes"]
+    subgraph Outcomes["Classified outcomes"]
         RET["<b>ErrorClass::Retryable</b><br/>transient / capacity failures<br/>→ retry with backoff"]
         PERM["<b>ErrorClass::Permanent</b><br/>structural failures<br/>→ park shard or skip item"]
     end
@@ -216,7 +263,7 @@ graph TD
     IPIE -->|"false: transient"| RET
     IPIE -->|"true: structural"| PERM
 
-    subgraph Actions["Orchestration Response"]
+    subgraph Actions["Orchestration response"]
         RETRY["Retry decision<br/>(backoff, circuit breaker)"]
         PARK["Park shard / skip item<br/>(coordination state transition)"]
     end
@@ -238,7 +285,7 @@ graph TD
 **Classification rules:**
 
 | `io::ErrorKind` | Classification | Rationale |
-|------------------|----------------|-----------|
+| --------------- | -------------- | --------- |
 | `NotFound` | Permanent | Resource does not exist |
 | `PermissionDenied` | Permanent | Access control failure |
 | `InvalidInput` | Permanent | Malformed argument |
@@ -246,30 +293,26 @@ graph TD
 | `NotADirectory` | Permanent | Type mismatch |
 | `IsADirectory` | Permanent | Type mismatch |
 | `ELOOP` (Unix) | Permanent | Symlink cycle |
-| Everything else | Retryable | Network timeout, interrupted, would-block, etc. |
+| Everything else | Retryable | Interrupted, would-block, timeout, or capacity failure |
 
-**Design notes:**
-
-- `retry_after_ms` is advisory backoff metadata from the connector (e.g., HTTP `Retry-After` header). The runtime may enforce stricter global policies.
-- `classify_io_enumerate_error` always includes a `ToxicDigest` of the path. `classify_io_read_error` accepts `Option<&Path>` because some read operations do not have an associated filesystem path.
-- `enumerate_error_to_read` bridges an `EnumerateError` to a `ReadError` preserving retryability, used when a read operation requires enumeration-phase setup (e.g., `ensure_root_fd` in `FilesystemConnector::open`).
-- Error `message` fields undergo control-character sanitization in `Display` (C0/C1 replaced with U+FFFD, preserving HT/LF/CR) to prevent log injection.
-
-See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for how classified errors feed circuit breaker state transitions, [10-failure-modes-and-recovery.md](./10-failure-modes-and-recovery.md) for system-wide failure recovery patterns.
+See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for how classified
+errors feed circuit-breaker state transitions, [10-failure-modes-and-recovery.md](./10-failure-modes-and-recovery.md)
+for system-wide recovery patterns.
 
 ---
 
 ## Source Code References
 
-| Crate | File | Key Types / Functions |
-|-------|------|----------------------|
+| Crate | File | Key types / functions |
+| ----- | ---- | --------------------- |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/api.rs` | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/types.rs` | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `ScanItem`, `Budgets`, `ConnectorInputError`, `ContentHints`, `Location`, `VersionId`, `PooledByteSlab`, `ToxicDigest` |
-| `gossip-contracts` | `crates/gossip-contracts/src/connector/mod.rs` | Module structure and re-exports |
-| `gossip-connectors` | `crates/gossip-connectors/src/lib.rs` | `connector_tag_for_kind`, re-exports of connectors and factories |
-| `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `is_permanent_io_error`, `classify_io_enumerate_error`, `classify_io_read_error`, `path_digest`, `borrowed_shard_bound`, `resolve_bounds`, `key_resume_start`, `estimate_split_from_sorted` |
+| `gossip-contracts` | `crates/gossip-contracts/src/connector/ordered.rs` | `OrderedContentSource`, `OrderedContentCapabilities` |
+| `gossip-contracts` | `crates/gossip-contracts/src/connector/git.rs` | `GitRepoDiscoverySource`, `GitMirrorManager`, `GitRepoExecutor`, `GitRepoTarget`, `LocalMirror`, `GitRunOutcome`, `GitRunError` |
+| `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `is_permanent_io_error`, `classify_io_enumerate_error`, `classify_io_read_error`, `path_digest`, `resolve_bounds` |
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/git.rs` | `GitConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector`, `MemItem` |
-| `gossip-connectors` | `crates/gossip-connectors/src/scan_driver.rs` | `FilesystemScanSourceFactory`, `InMemoryScanSourceFactory`, `execute_git_assignment` |
-| `gossip-scan-driver` | `crates/gossip-scan-driver/src/lib.rs` | `ConnectorKind`, `Assignment`, `AssignmentSource`, `ScanSourceFactory`, `ScanDriver`, `ScanReport`, `SourceCapabilities`, `CancellationToken`, `CommitSink` |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `filesystem_placeholder` |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `local_repo_placeholder` |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/distributed.rs` | `DistributedFamily`, `DistributedRunConfig`, `DistributedRunReport`, `run_distributed` |

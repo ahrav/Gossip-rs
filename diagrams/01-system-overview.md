@@ -78,12 +78,11 @@ types and vice versa. Every other crate depends on `gossip-contracts`.
 
 `gossip-coordination` owns B2, `gossip-connectors` owns B4, and persistence
 contracts live within `gossip-contracts/src/persistence/`. Detection is owned by
-`scanner-engine`, with `scanner-scheduler` providing the executor and
-`scanner-git` handling git-specific scanning. `gossip-scan-driver` defines the
-`ScanDriver` and `ScanSourceFactory` traits that bridge detection with
-orchestration. `gossip-scanner-runtime` wires everything together into runnable
-scan pipelines for both the `scanner-rs` CLI binary and the distributed
-`gossip-worker` binary.
+`scanner-engine`, with `scanner-scheduler` providing the filesystem execution
+engine and `scanner-git` handling git-specific scanning. `gossip-scanner-runtime`
+imports the source-family vocabulary from `gossip-contracts` and exposes the
+runtime entrypoints that select ordered-content or git-repo family modules for
+both the `scanner-rs` CLI binary and the `gossip-worker` binary.
 
 `gossip-coordination-etcd` provides an etcd-backed coordination backend.
 `gossip-persistence-inmemory` provides in-memory persistence backends for testing
@@ -111,7 +110,6 @@ graph LR
         coordination["gossip-coordination"]
         coordination_etcd["gossip-coordination-etcd"]
         connectors["gossip-connectors"]
-        scan_driver["gossip-scan-driver"]
         scanner_engine["scanner-engine"]
         scanner_scheduler["scanner-scheduler"]
         scanner_git["scanner-git"]
@@ -141,13 +139,11 @@ graph LR
     coordination -->|"depends on"| contracts
     coordination -->|"depends on"| stdx
     connectors -->|"depends on"| contracts
-    connectors -->|"depends on"| scan_driver
-    scan_driver -->|"depends on"| scanner_engine
-    scan_driver -->|"depends on"| scanner_scheduler
     scanner_git -->|"depends on"| scanner_engine
-    runtime -->|"depends on"| scan_driver
-    runtime -->|"depends on"| connectors
     runtime -->|"depends on"| contracts
+    runtime -->|"depends on"| scanner_engine
+    runtime -->|"depends on"| scanner_scheduler
+    runtime -->|"depends on"| scanner_git
     worker -->|"depends on"| runtime
     cli -->|"depends on"| runtime
 
@@ -171,7 +167,6 @@ graph LR
     style frontier fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
     style coordination fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style connectors fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style scan_driver fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style scanner_engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style scanner_scheduler fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style scanner_git fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
@@ -275,8 +270,8 @@ these compile in parallel once Tier 0 finishes. The three PostgreSQL crates
 (`gossip-pg-common`, `gossip-done-ledger-postgres`, `gossip-findings-postgres`)
 depend only on `gossip-contracts` (and `gossip-pg-common` for the two backends),
 placing them alongside other Tier 1 crates. Tier 2 includes
-`gossip-coordination-etcd`, `gossip-scan-driver`, and `gossip-scanner-runtime`,
-which depend on Tier 1 crates. Tier 3
+`gossip-coordination-etcd` and `gossip-scanner-runtime`, which depend on Tier 1
+crates. Tier 3
 (`gossip-worker`, `scanner-rs-cli`, `scanner-engine-integration-tests`) are the
 final binaries and test crates.
 
@@ -303,7 +298,6 @@ graph TD
 
     subgraph "Tier 2"
         coordination_etcd["gossip-coordination-etcd"]
-        scan_driver["gossip-scan-driver"]
         runtime["gossip-scanner-runtime"]
     end
 
@@ -327,13 +321,11 @@ graph TD
     pg_common --> done_ledger_pg
     pg_common --> findings_pg
     coordination --> coordination_etcd
-    scanner_engine --> scan_driver
-    scanner_scheduler --> scan_driver
-    scan_driver --> connectors
     scanner_engine --> scanner_git
-    scan_driver --> runtime
-    connectors --> runtime
     contracts --> runtime
+    scanner_engine --> runtime
+    scanner_scheduler --> runtime
+    scanner_git --> runtime
     runtime --> worker
     runtime --> cli
     scanner_engine --> integration_tests
@@ -343,7 +335,6 @@ graph TD
     style frontier fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
     style coordination fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style connectors fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style scan_driver fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style scanner_engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style scanner_scheduler fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style scanner_git fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
@@ -387,7 +378,7 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | B5: Persistence (done-ledger PG)    | `crates/gossip-done-ledger-postgres/`                                                                                   |
 | B5: Persistence (findings PG)       | `crates/gossip-findings-postgres/`                                                                                      |
 | Detection engine   | `crates/scanner-engine/`                                                                                                             |
-| Scan driver traits | `crates/gossip-scan-driver/`                                                                                                         |
+| Runtime family modules | `crates/gossip-scanner-runtime/src/{ordered_content.rs, git_repo.rs, distributed.rs}`                                          |
 | Scanner runtime    | `crates/gossip-scanner-runtime/`                                                                                                     |
 | Worker binary      | `crates/gossip-worker/`                                                                                                              |
 | CLI binary         | `crates/scanner-rs-cli/`                                                                                                             |
