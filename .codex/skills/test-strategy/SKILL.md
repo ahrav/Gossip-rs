@@ -268,6 +268,13 @@ these checks before choosing the test type:
 - If a reviewer is challenging the strength of an assertion, start with the
   smallest boundary example that distinguishes the competing claims
 
+The `Test Shape Hygiene` checklist below operationalizes these same questions
+during broader strategy reviews.
+
+If an existing test fails these checks, use `/invariant-test-review` to produce
+a structured diagnosis of what the test actually proves and what needs to
+change.
+
 ## Assessment Checklist
 
 When analyzing code for test strategy, consider:
@@ -435,3 +442,11 @@ When analyzing code for test strategy, consider:
 | Identity types / derivation | Fuzz tests | Property tests for roundtrip |
 | Data structures (stdx) | Fuzz + Property tests | Kani for unsafe |
 | Connector / persistence | Conformance tests | Unit tests for edge cases |
+
+## Related Skills
+
+- `/invariant-test-review` — Deep-dive review when an existing test fails the
+  hygiene checks or a reviewer says the test does not prove its invariant
+- `/sim-review` — Review DST compatibility and simulation-specific test risks
+- `/run-fuzz` — Execute fuzz targets when adversarial input coverage is the
+  better fit

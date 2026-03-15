@@ -308,5 +308,8 @@ fn transition(state: ShardStatus, event: ShardEvent, now: LogicalTime)
 
 - `/dist-sys-auditor` — Evidence-backed distributed systems design review
 - `/test-strategy` — Assess and recommend testing strategy
+- `/invariant-test-review` — Deep-dive review of whether a specific test
+  actually proves its claimed invariant when INVARIANT-ISOLATING TESTS
+  findings need more analysis
 - `/sim-scaffold` — Generate DST-ready module scaffolding
 - `/sim-run` — Execute simulation tests
