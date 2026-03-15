@@ -186,6 +186,8 @@ For each document, systematically extract and verify claims in these categories:
 - Do named functions/methods exist with the documented signatures?
 - Are described behaviors correct? (read the actual implementation)
 - Do documented error conditions match the code?
+- If the doc attributes behavior to a trait, helper, or observation path,
+  is that the exact API surface used in code?
 
 ### 4. Behavioral Claims
 - Are stated invariants enforced in code?
@@ -194,19 +196,29 @@ For each document, systematically extract and verify claims in these categories:
 - Do described state machines match actual state transitions?
 - Are lifecycle descriptions accurate?
 
-### 5. Architecture & Dependency Claims
+### 5. Operational Examples & Assumptions
+- Do cargo commands, package names, and feature flags still match the current
+  workspace configuration?
+- Are units and time domains explicit and correct (seconds vs ticks, per-step
+  vs cumulative advance, ordered vs unordered outputs)?
+- Are platform-specific claims accurate (Unix-only, Windows-only, path or byte
+  semantics)?
+- Does the doc avoid overstating one trait or helper when only some call paths
+  flow through it?
+
+### 6. Architecture & Dependency Claims
 - Do "depends on" / "imports from" claims match Cargo.toml and use statements?
 - Are crate-to-boundary mappings accurate?
 - Are module organization claims correct?
 - Do described data flow paths match the actual call graph?
 
-### 6. Cross-References
+### 7. Cross-References
 - Do links to other docs point to files that exist?
 - Are cross-referenced claims consistent between documents?
 - Do "source code references" tables list files that exist with accurate descriptions?
 - Do referenced diagram files exist?
 
-### 7. Coverage Gaps
+### 8. Coverage Gaps
 - Are there significant types, traits, or modules in the source directories
   that the design doc does not mention at all?
 - Are there new public APIs not covered by the doc?
@@ -220,6 +232,9 @@ Use these tools to check claims against code:
 - `colgrep -e "<exact_name>" --include="*.rs" <source_dir>` — exact name search
 - Read specific files when you need to verify function bodies, struct fields,
   or invariant enforcement
+- Read `Cargo.toml` and feature declarations when a doc includes cargo commands,
+  package names, or feature flags
+- Check `cfg` gates and path handling when docs make platform-specific claims
 - Use Glob to find files when a doc references a file that may have moved
 - Use Grep for exact identifier lookups
 

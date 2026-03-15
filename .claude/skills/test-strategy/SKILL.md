@@ -252,6 +252,22 @@ cargo test -p gossip-coordination --features test-support  # All coordination te
 cargo test -p gossip-coordination sim                       # Just sim-related tests
 ```
 
+## Invariant Test Hygiene
+
+When recommending or reviewing tests that claim to prove an invariant, apply
+these checks before choosing the test type:
+
+- State the exact invariant in one sentence before writing the test
+- Keep one primary invariant per test or oracle assertion
+- Remove vestigial setup, discarded handles, or extra transitions that do not
+  participate in the asserted property
+- Add a negative-path or boundary case when terminal behavior, rejection logic,
+  or assertion strength is the real concern
+- Normalize unordered state before comparisons; compare setwise when order is
+  irrelevant
+- If a reviewer is challenging the strength of an assertion, start with the
+  smallest boundary example that distinguishes the competing claims
+
 ## Assessment Checklist
 
 When analyzing code for test strategy, consider:
@@ -285,15 +301,23 @@ When analyzing code for test strategy, consider:
    - [ ] Identity types / derivation chains → Fuzz tests (see `gossip-contracts/fuzz/`)
    - [ ] Data structures (ByteSlab, InlineVec, RingBuffer) → Fuzz + Property tests
 
-4. **Simulation Harness Checklist** (always evaluate for coordination changes)
+4. **Test Shape Hygiene**
+   - [ ] Does each test name one primary invariant instead of vaguely "covering" a scenario?
+   - [ ] Would the test fail for the intended reason, or could unrelated setup explain the result?
+   - [ ] Is there a negative-path or boundary twin when the behavior involves terminal states, rejection, or idempotency?
+   - [ ] Do oracle or snapshot comparisons normalize unordered collections before asserting equality?
+   - [ ] Can any setup be deleted without changing the asserted property?
+
+5. **Simulation Harness Checklist** (always evaluate for coordination changes)
    - [ ] Does this change affect shard state transitions (Active, Done, Split, Parked)? → CoordinationSim
    - [ ] Does this change affect lease acquisition, renewal, or expiry? → CoordinationSim with Stormy/Radioactive
    - [ ] Does this change affect fence epochs or monotonicity guarantees? → Invariant checker S2
    - [ ] Does this change affect run lifecycle or session management? → sim_behavioral_tests
    - [ ] Does this change affect split handling or coverage? → Invariant checker S7
+   - [ ] Does any sim oracle compare unordered aggregate state? → Sort or compare setwise before diffing
    - [ ] Can a seed-based replay reproduce the scenario deterministically? → Add test to `sim/mega_sim_tests.rs`
 
-5. **Existing Patterns in This Codebase**
+6. **Existing Patterns in This Codebase**
    - Unit tests: `#[cfg(test)] mod tests` inline, or sibling `*_tests.rs` files
    - Parameterized tests: rstest `#[rstest]` with `#[case]` (workspace dep `rstest = "0.25"`)
    - Property tests: proptest as dev-dep; `Arbitrary` impls gated behind `test-support` feature in gossip-contracts
