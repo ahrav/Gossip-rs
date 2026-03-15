@@ -16,10 +16,9 @@
 //!    containment, scan isolation, fixed-width hex encoding).
 //!
 //! 3. **etcd integration** — round-trip tests that connect to a local
-//!    etcd cluster. These are marked `#[ignore]` and require either
-//!    Docker running (testcontainers auto-provisions
-//!    `quay.io/coreos/etcd:v3.5.15`) or the `ETCD_ENDPOINTS`
-//!    environment variable pointing to a reachable cluster. They cover
+//!    etcd cluster. When Docker is available, testcontainers
+//!    auto-provisions `quay.io/coreos/etcd:v3.5.15`. Alternatively,
+//!    set `ETCD_ENDPOINTS` to point at an existing cluster. They cover
 //!    the full acquire/checkpoint/renew/split lifecycle, deterministic
 //!    split atomicity fault injection, idempotent replay, lease expiry,
 //!    and sequential acquire contention.
@@ -36,11 +35,11 @@
 //!
 //! ```bash
 //! # With Docker installed, tests auto-provision etcd via testcontainers:
-//! cargo test -p gossip-coordination-etcd -- --ignored
+//! cargo test -p gossip-coordination-etcd
 //!
 //! # Or point to an existing cluster:
 //! ETCD_ENDPOINTS="http://10.0.0.1:2379,http://10.0.0.2:2379" \
-//!   cargo test -p gossip-coordination-etcd -- --ignored
+//!   cargo test -p gossip-coordination-etcd
 //! ```
 
 use crate::keyspace::PersistedShardSubtreeKey;
@@ -846,13 +845,12 @@ fn run_records_scan_prefix_is_scan_safe() {
 }
 
 // ---------------------------------------------------------------------------
-// etcd integration tests (require running etcd, #[ignore])
+// etcd integration tests (require Docker or ETCD_ENDPOINTS)
 // ---------------------------------------------------------------------------
 
 /// A batch of 42 shards exceeds the per-transaction op limit (41) and must
 /// be rejected before writing to etcd.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
     let mut backend = test_coordinator();
 
@@ -902,7 +900,6 @@ fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
 /// count above the configured cap must return `ShardLimitExceeded(Global)`.
 /// The existing shard from a different tenant counts toward the global total.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn register_shards_rejects_global_shard_limit_against_local_etcd() {
     let mut backend = test_coordinator_with_limits(100, 2);
 
@@ -969,7 +966,6 @@ fn register_shards_rejects_global_shard_limit_against_local_etcd() {
 /// If the tenant counter key is missing, `register_shards` bootstraps it
 /// from the tenant prefix scan and creates the key in the same CAS txn.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn register_shards_bootstraps_counter_when_key_is_absent() {
     let mut backend = test_coordinator_with_limits(10, 100);
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -1032,7 +1028,6 @@ fn register_shards_bootstraps_counter_when_key_is_absent() {
 /// Smoke test: connect to etcd and verify that the status RPC returns a
 /// non-empty cluster version.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn connects_to_local_etcd_and_fetches_status() {
     let backend = test_coordinator();
     let status = backend.status().expect("status call should succeed");
@@ -1048,7 +1043,6 @@ fn connects_to_local_etcd_and_fetches_status() {
 /// owner binding, cursor state, and lease deadline are all persisted
 /// correctly across the full lifecycle.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
     let mut backend = test_coordinator();
 
@@ -1131,7 +1125,6 @@ fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
 /// children are `Active` and claimable, and confirm idempotent replay
 /// returns the same child IDs.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_round_trip_against_local_etcd() {
     let mut backend = test_coordinator();
 
@@ -1233,7 +1226,6 @@ fn split_replace_round_trip_against_local_etcd() {
 /// shards from a different run under the same tenant count toward the
 /// per-tenant total.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_per_tenant_shard_limit_against_local_etcd() {
     let mut backend = test_coordinator_with_limits(3, 100);
 
@@ -1326,7 +1318,6 @@ fn split_replace_rejects_per_tenant_shard_limit_against_local_etcd() {
 /// `Active` with updated spec, verify the residual is claimable with an
 /// empty cursor, and confirm idempotent replay returns the same residual ID.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_round_trip_against_local_etcd() {
     let mut backend = test_coordinator();
 
@@ -1437,7 +1428,6 @@ fn split_residual_round_trip_against_local_etcd() {
 /// must fail with `ShardLimitExceeded(Global)`. A sibling shard from a
 /// different tenant fills the global quota.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_rejects_global_shard_limit_against_local_etcd() {
     let mut backend = test_coordinator_with_limits(100, 2);
 
@@ -1532,7 +1522,6 @@ fn split_residual_rejects_global_shard_limit_against_local_etcd() {
 ///
 /// Also verifies idempotent replay of `cancel_run` and `complete_run`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn active_run_index_hides_initializing_runs_and_unpublishes_terminal_runs() {
     let mut backend = test_coordinator();
 
@@ -1654,7 +1643,6 @@ fn active_run_index_hides_initializing_runs_and_unpublishes_terminal_runs() {
 /// active-run index entry, records the completion timestamp, and replays
 /// idempotently with the same op_id.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn fail_run_removes_active_index_and_replays_idempotently() {
     let mut backend = test_coordinator();
 
@@ -1698,7 +1686,6 @@ fn fail_run_removes_active_index_and_replays_idempotently() {
 /// GC deletes only `Initializing` runs created before the cutoff time,
 /// leaving fresh initializing runs, active runs, and terminal runs intact.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn gc_stale_initializing_runs_deletes_only_old_orphans() {
     let mut backend = test_coordinator();
 
@@ -1794,7 +1781,6 @@ fn gc_stale_initializing_runs_deletes_only_old_orphans() {
 /// GC decrements the tenant shard counter by the number of deleted shard
 /// records when collecting a stale initializing run.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn gc_stale_initializing_runs_decrements_tenant_counter() {
     let mut backend = test_coordinator();
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -1851,7 +1837,6 @@ fn gc_stale_initializing_runs_decrements_tenant_counter() {
 /// owner binding is absent, cursor is preserved, park_reason is cleared,
 /// and the operation replays idempotently.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn unpark_seeded_parked_shard_round_trip_against_local_etcd() {
     let mut backend = test_coordinator();
 
@@ -1965,7 +1950,6 @@ fn now(t: u64) -> LogicalTime {
 /// a stale checkpoint from worker A must be rejected and leave the
 /// persisted cursor unchanged.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn stale_fence_checkpoint_rejected_after_reacquire() {
     let mut backend = test_coordinator();
 
@@ -2059,7 +2043,6 @@ fn stale_fence_checkpoint_rejected_after_reacquire() {
 /// Retrying `checkpoint` with the same `(op_id, payload)` must replay
 /// without appending a duplicate op-log entry.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn checkpoint_replay_remains_idempotent() {
     let mut backend = test_coordinator();
 
@@ -2121,7 +2104,6 @@ fn checkpoint_replay_remains_idempotent() {
 /// After the etcd lease expires (owner key auto-deleted), checkpoint must
 /// fail because the owner binding no longer matches the presented lease.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn lease_expiry_rejects_stale_checkpoint() {
     // Use a short owner-lease TTL so the etcd lease expires quickly.
     // etcd enforces a minimum TTL of ~5s in most configurations.
@@ -2177,7 +2159,6 @@ fn lease_expiry_rejects_stale_checkpoint() {
 /// When two workers race to acquire the same unowned shard, exactly one
 /// succeeds and the other receives `AlreadyLeased`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn concurrent_acquire_second_worker_gets_already_leased() {
     let mut backend = test_coordinator();
 
@@ -2247,7 +2228,6 @@ fn concurrent_acquire_second_worker_gets_already_leased() {
 /// must be rejected with `BackendChildLimitExceeded` before any etcd writes.
 /// This is a pre-validation gate that runs before shared split validation.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_fanout_above_backend_cap() {
     let mut backend = test_coordinator_with_tuning(60, 8, 2);
 
@@ -2314,7 +2294,6 @@ fn split_replace_rejects_fanout_above_backend_cap() {
 /// status. A second split with a different op_id must be rejected with
 /// `ShardTerminal` — only idempotent replay (same op_id) is allowed.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_terminal_shard() {
     let mut backend = test_coordinator();
 
@@ -2390,7 +2369,6 @@ fn split_replace_rejects_terminal_shard() {
 /// (bumping the fence epoch), worker A's original lease is stale. A split
 /// attempt using worker A's lease must fail with `StaleFence`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_stale_fence() {
     let mut backend = test_coordinator();
 
@@ -2464,7 +2442,6 @@ fn split_replace_rejects_stale_fence() {
 /// before the atomic `split_replace` transaction commits, the backend
 /// must publish no child records or active-index entries.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_abort_does_not_publish_partial_children() {
     let mut backend = test_coordinator();
 
@@ -2560,7 +2537,6 @@ fn split_replace_abort_does_not_publish_partial_children() {
 /// This test simulates the collision by pre-registering a shard with the
 /// exact ID that `derive_split_shard_id` will compute.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_returns_collision_when_child_key_exists() {
     let mut backend = test_coordinator();
 
@@ -2652,7 +2628,6 @@ fn split_replace_returns_collision_when_child_key_exists() {
 /// but for the `split_residual` path. Pre-registers a shard with the
 /// derived residual ID and verifies `DerivedIdCollision` is returned.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_returns_collision_when_residual_key_exists() {
     let mut backend = test_coordinator();
 
@@ -2753,7 +2728,6 @@ fn split_residual_returns_collision_when_residual_key_exists() {
 /// the derived residual ID. This verifies the two-tier replay
 /// mechanism (op-log first, spawned lineage second).
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_replay_via_spawned_after_oplog_eviction() {
     let mut backend = test_coordinator();
 
@@ -2852,7 +2826,6 @@ fn split_residual_replay_via_spawned_after_oplog_eviction() {
 /// before the transaction commits, the parent state must remain unchanged
 /// and the residual shard must not be published.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_residual_abort_does_not_publish_partial_residual() {
     let mut backend = test_coordinator();
 
@@ -2946,7 +2919,6 @@ fn split_residual_abort_does_not_publish_partial_residual() {
 /// Verifies that the rejection is clean: the parent shard remains `Active`
 /// with the original owner binding unchanged (no partial mutation).
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn split_replace_rejects_over_cap_max_children_per_op() {
     // max_children_per_op = 1: any multi-child split must be rejected.
     let mut backend = test_coordinator_with_tuning(60, 8, 1);
@@ -3150,7 +3122,6 @@ fn shard_limit_three_way_split_just_over_tenant_limit() {
 /// `complete_run` requires `Active` status — must reject `Initializing` runs
 /// with `WrongStatus`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn complete_run_rejects_initializing_run() {
     let mut backend = test_coordinator();
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -3177,7 +3148,6 @@ fn complete_run_rejects_initializing_run() {
 /// `fail_run` requires `Active` status — must reject `Initializing` runs
 /// with `WrongStatus`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn fail_run_rejects_initializing_run() {
     let mut backend = test_coordinator();
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -3208,7 +3178,6 @@ fn fail_run_rejects_initializing_run() {
 /// `unpark_shard` requires `Parked` status — must reject `Active` shards
 /// with `NotParked`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn unpark_shard_rejects_active_shard() {
     let mut backend = test_coordinator();
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -3249,7 +3218,6 @@ fn unpark_shard_rejects_active_shard() {
 /// After a successful `complete_run`, calling `fail_run` with a different
 /// op_id must return `RunTerminal` (not `WrongStatus`).
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn complete_then_fail_with_different_op_id_returns_run_terminal() {
     let mut backend = test_coordinator();
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -3293,7 +3261,6 @@ fn complete_then_fail_with_different_op_id_returns_run_terminal() {
 /// Unparking a shard whose run has been completed must return
 /// `RunTerminal`, regardless of the shard's own status.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn unpark_shard_rejects_terminal_run() {
     let mut backend = test_coordinator();
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -3347,7 +3314,6 @@ fn unpark_shard_rejects_terminal_run() {
 /// in a separate thread with its own EtcdCoordinator targeting the same
 /// namespace.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn concurrent_acquire_exactly_one_wins() {
     const N_WORKERS: usize = 5;
     let namespace = contention_namespace();
@@ -3421,7 +3387,6 @@ fn concurrent_acquire_exactly_one_wins() {
 /// thread B registers 3 shards. Total would be 6 > 5, so at least one
 /// must be rejected with `ShardLimitExceeded`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn concurrent_register_shards_respects_per_tenant_limit() {
     let namespace = contention_namespace();
 
@@ -3536,7 +3501,6 @@ fn concurrent_register_shards_respects_per_tenant_limit() {
 /// must prevent both splits from committing if their combined child
 /// counts would exceed the limit.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn concurrent_split_replace_respects_per_tenant_limit() {
     let namespace = contention_namespace();
 
@@ -3544,11 +3508,11 @@ fn concurrent_split_replace_respects_per_tenant_limit() {
     let shard_a = ShardId::from_raw(0xCC11);
     let shard_b = ShardId::from_raw(0xCC12);
     // Per-tenant limit = 4. We start with 2 parent shards. Each split
-    // creates 2 children (parent goes terminal but stays in storage, so
+    // creates 2 children (parent goes terminal but stays in storage, and
     // the counter increases by 2). First split brings the counter from
-    // 2 to 4. Second split would bring it from 4 to 6, exceeding
-    // limit=4. The CAS guard on the tenant counter serializes them, so
-    // at most one split should succeed.
+    // 2 to 4 (at the limit). Second split would bring it from 4 to 6,
+    // exceeding limit=4. The CAS guard on the tenant counter serializes
+    // them, so exactly one split succeeds.
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
 
     // Phase 1: Setup — seed two shards, acquire them.
@@ -3636,26 +3600,21 @@ fn concurrent_split_replace_respects_per_tenant_limit() {
         .test_load_tenant_shard_count(test_tenant())
         .expect("counter load should succeed");
 
-    if a_ok && b_ok {
-        // Both succeeded — counter should reflect all shards (parents + children).
-        assert_eq!(
-            counter,
-            Some(4),
-            "counter must equal 2 parents + 2 children = 4 total persisted shards"
-        );
-    } else {
-        // At least one failed — counter should reflect partial state.
-        let successes = usize::from(a_ok) + usize::from(b_ok);
-        assert!(
-            successes >= 1,
-            "at least one split should succeed: a={result_a:?}, b={result_b:?}"
-        );
-        assert_eq!(
-            counter,
-            Some(3),
-            "one split succeeded: 2 initial + 1 child = 3 persisted shards"
-        );
-    }
+    // Each split_replace creates 2 children and adds 2 to the counter
+    // (the parent goes terminal but remains persisted). Starting from
+    // counter=2, the first split brings it to 4 (at the limit). The
+    // second split would need 4+2=6 > limit=4, so the CAS guard
+    // ensures exactly one succeeds.
+    let successes = usize::from(a_ok) + usize::from(b_ok);
+    assert_eq!(
+        successes, 1,
+        "exactly one split should succeed under the per-tenant limit: a={result_a:?}, b={result_b:?}"
+    );
+    assert_eq!(
+        counter,
+        Some(4),
+        "one split succeeded: 2 initial parents + 2 children = 4 persisted shards"
+    );
 }
 
 /// When the per-tenant counter key is absent, two concurrent
@@ -3664,7 +3623,6 @@ fn concurrent_split_replace_respects_per_tenant_limit() {
 /// the other retries after the CAS failure and reads the established
 /// counter.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn concurrent_register_shards_bootstraps_counter_under_contention() {
     let namespace = contention_namespace();
 
@@ -3761,7 +3719,6 @@ fn concurrent_register_shards_bootstraps_counter_under_contention() {
 /// is the only discriminator. A backend that ignores the tenant prefix
 /// would return both tenants' shards in a single query.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn list_shards_returns_only_shards_from_requested_tenant() {
     let mut backend = test_coordinator();
 
@@ -3841,7 +3798,6 @@ fn list_shards_returns_only_shards_from_requested_tenant() {
 /// the same `RunId` and `ShardId` so the tenant prefix is the only
 /// discriminator.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn acquire_in_one_tenant_does_not_affect_other_tenant() {
     let mut backend = test_coordinator();
 
@@ -3915,7 +3871,6 @@ fn acquire_in_one_tenant_does_not_affect_other_tenant() {
 /// tenant B registers one; a backend that ignores the prefix would return
 /// three candidates for tenant A.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn collect_claim_candidates_scoped_to_tenant() {
     let mut backend = test_coordinator();
 
@@ -3993,7 +3948,6 @@ fn collect_claim_candidates_scoped_to_tenant() {
 /// Each run must be activated via `register_shards` to appear in the
 /// active-run index; `create_run` alone leaves them in `Initializing`.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn list_active_runs_scoped_to_tenant() {
     let mut backend = test_coordinator();
 
@@ -4058,7 +4012,6 @@ fn list_active_runs_scoped_to_tenant() {
 /// `get_run` with a tenant that does not own the run must return `RunNotFound`.
 /// Tenant B cannot see tenant A's run metadata.
 #[test]
-#[ignore = "requires Docker or ETCD_ENDPOINTS"]
 fn get_run_returns_not_found_for_wrong_tenant() {
     let mut backend = test_coordinator();
 

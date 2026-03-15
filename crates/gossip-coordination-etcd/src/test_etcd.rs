@@ -25,11 +25,11 @@
 //!
 //! ```bash
 //! # With Docker running (auto-provisions etcd):
-//! cargo test -p gossip-coordination-etcd -- --ignored
+//! cargo test -p gossip-coordination-etcd
 //!
 //! # With a pre-existing etcd (no Docker needed):
 //! ETCD_ENDPOINTS="http://127.0.0.1:2379" \
-//!   cargo test -p gossip-coordination-etcd -- --ignored
+//!   cargo test -p gossip-coordination-etcd
 //! ```
 
 use std::sync::OnceLock;

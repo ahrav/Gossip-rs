@@ -114,6 +114,8 @@ jobs:
   # PR/push: lightweight feature set — excludes stdx-proptest, sim-harness,
   # tiger-harness, kgram-gate, bench, b64-stats, perf-counters.
   # Those are exercised nightly by test-full-harness with --all-features.
+  # Infrastructure-dependent crates (postgres, etcd) run in dedicated jobs
+  # with service containers.
   test:
     name: Test (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
@@ -155,6 +157,7 @@ jobs:
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
+          --exclude gossip-coordination-etcd
           --no-run
           --profile ci
 
@@ -165,6 +168,7 @@ jobs:
           --features test-support,perf-stats
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
+          --exclude gossip-coordination-etcd
           --profile ci
 
       # nextest does not run doctests; run them separately.
@@ -225,6 +229,81 @@ jobs:
           -p gossip-findings-postgres
           --features test-utils
           --profile ci
+
+  # ── Test (etcd integration) ──────────────────────────────────────
+  # Runs etcd-dependent tests against a real service container.
+  # ETCD_ENDPOINTS bypasses testcontainers so all tests share the
+  # same service container instead of spinning up their own.
+  #
+  # The coreos/etcd image is distroless (no /bin/sh), so Docker's
+  # CMD-SHELL health checks cannot work. We skip the health check
+  # in `options` and instead poll the HTTP /health endpoint from
+  # the runner in an explicit step.
+  test-etcd:
+    name: Test (etcd)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    needs: [changes]
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_NAME: node1
+          ETCD_DATA_DIR: /etcd-data
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+          ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd:2380
+          ETCD_INITIAL_CLUSTER: node1=http://etcd:2380
+          ETCD_INITIAL_CLUSTER_TOKEN: gossip-rs-ci-cluster
+          ETCD_INITIAL_CLUSTER_STATE: new
+        ports:
+          - 2379:2379
+    env:
+      ETCD_ENDPOINTS: "http://localhost:2379"
+    steps:
+      - name: Wait for etcd
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:2379/health > /dev/null 2>&1; then
+              echo "etcd is ready"
+              exit 0
+            fi
+            echo "Waiting for etcd... ($i/30)"
+            sleep 1
+          done
+          echo "etcd failed to become ready"
+          docker logs "$(docker ps -q --filter ancestor=quay.io/coreos/etcd:v3.5.15)" 2>&1 || true
+          exit 1
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: stable-linux
+          save-cache: "false"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        with:
+          tool: cargo-nextest
+
+      - name: Run etcd integration tests
+        run: >-
+          cargo nextest run
+          -p gossip-coordination-etcd
+          --features test-support
+          --profile ci
+
+      - name: Run etcd integration tests (release)
+        if: github.event_name == 'schedule'
+        run: >-
+          cargo nextest run
+          -p gossip-coordination-etcd
+          --features test-support
+          --release
+          --profile nightly
 
   # ── Benchmark (compile check) ────────────────────────────────────
   bench:
@@ -315,8 +394,30 @@ jobs:
         working-directory: tools/eval-harness
       - run: cargo clippy --all-targets --all-features -- -D warnings
         working-directory: tools/eval-harness
-      - run: cargo test
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        with:
+          tool: cargo-nextest
+
+      - run: cargo nextest run
         working-directory: tools/eval-harness
+
+  # ── Dependency Review (PR only) ────────────────────────────────────
+  # Catches newly introduced vulnerable or license-incompatible deps at
+  # PR time, before they land. Complements cargo-deny (license/ban rules)
+  # and rustsec/audit-check (post-merge advisory scan).
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+          deny-licenses: AGPL-3.0, AGPL-3.0-only, AGPL-3.0-or-later, GPL-3.0, GPL-3.0-only, GPL-3.0-or-later
 
   # ── Security Audit ─────────────────────────────────────────────────
   audit:
@@ -332,10 +433,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ── Fuzz Pack Smoke (PR only) ───────────────────────────────────────
-  # Quick sanity check on the 4 pack-format fuzz targets when fuzz or
-  # source files change in a PR. Each target runs for 20 seconds max.
-  # Targets are hardcoded (unlike fuzz-nightly's dynamic discovery);
-  # update the list below when fuzz_pack_*.rs files are added/removed.
+  # Quick sanity check on pack-format fuzz targets when fuzz or source
+  # files change in a PR. Each target runs for 20 seconds max.
+  # Targets are auto-discovered from fuzz_targets/fuzz_pack_*.rs.
   fuzz-pack-smoke:
     name: Fuzz Pack Smoke (PR)
     runs-on: ubuntu-24.04
@@ -368,10 +468,22 @@ jobs:
       - name: Run pack fuzz targets
         working-directory: crates/scanner-git/fuzz
         run: |
-          cargo +nightly fuzz run fuzz_pack_parse_delta   --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_inflate_stream --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_delta_into     --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_exec           --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
+          set -euo pipefail
+          ran=0
+          for f in fuzz_targets/fuzz_pack_*.rs; do
+            [ -f "$f" ] || continue
+            target="$(basename "${f%.rs}")"
+            echo "Running: ${target}"
+            cargo +nightly fuzz run "${target}" \
+              --target x86_64-unknown-linux-gnu \
+              -- -max_total_time="${FUZZ_SECONDS}"
+            ran=$((ran + 1))
+          done
+          if [ "${ran}" -eq 0 ]; then
+            echo "::error::No fuzz targets discovered — expected fuzz_targets/fuzz_pack_*.rs"
+            exit 1
+          fi
+          echo "Ran ${ran} fuzz target(s)"
 
   # ══════════════════════════════════════════════════════════════════
   # Scheduled-only jobs (nightly at 02:00 UTC)
@@ -380,11 +492,20 @@ jobs:
   # ── Test (full harness, nightly) ─────────────────────────────────
   # --all-features enables stdx-proptest, sim-harness, tiger-harness,
   # kgram-gate, b64-stats, perf-counters — everything the PR job skips.
+  # Debug and release run as parallel matrix legs for faster wall-clock time.
   test-full-harness:
-    name: Test (Scheduled, Full Harness)
+    name: Test (Scheduled, ${{ matrix.profile }})
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: debug
+            release-flag: ""
+          - profile: release
+            release-flag: "--release"
     env:
       PROPTEST_CASES: "64"
     steps:
@@ -400,14 +521,15 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run tests (debug)
-        run: cargo nextest run --all-features --profile nightly
-      - name: Run doctests (debug)
-        run: cargo test --all-features --doc
-      - name: Run tests (release)
-        run: cargo nextest run --all-features --release --profile nightly
-      - name: Run doctests (release)
-        run: cargo test --all-features --release --doc
+      - name: Run tests (${{ matrix.profile }})
+        run: >-
+          cargo nextest run --all-features ${{ matrix.release-flag }}
+          --profile nightly
+          --exclude gossip-coordination-etcd
+
+      - name: Run doctests (${{ matrix.profile }})
+        run: >-
+          cargo test --all-features ${{ matrix.release-flag }} --doc
 
   # ── Miri (nightly only) ────────────────────────────────────────────
   miri:
@@ -614,6 +736,7 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
+          total_ran=0
           for fuzz_dir in crates/*/fuzz; do
             [ -d "${fuzz_dir}/fuzz_targets" ] || continue
             crate_name="$(basename "$(dirname "${fuzz_dir}")")"
@@ -633,21 +756,61 @@ jobs:
                 echo "::error::Fuzz target ${target} in ${crate_name} failed"
                 failed=1
               fi
+              total_ran=$((total_ran + 1))
             done
             cd "${GITHUB_WORKSPACE}"
             echo "::endgroup::"
           done
+          if [ "${total_ran}" -eq 0 ]; then
+            echo "::error::No fuzz targets discovered across any crate"
+            exit 1
+          fi
+          echo "Ran ${total_ran} fuzz target(s) total"
           [ "${failed}" -eq 0 ] || exit 1
 
   # ── Nightly Summary ───────────────────────────────────────────────
   nightly-summary:
     name: Nightly Summary
     if: always() && github.event_name == 'schedule'
-    needs: [test-full-harness, miri, kani, loom, asan, fuzz-nightly]
+    needs: [test-full-harness, test-etcd, test-postgres, miri, kani, loom, asan, fuzz-nightly, audit]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      issues: write
     steps:
-      - name: Check for failures
+      - name: Create issue on failure
+        if: contains(needs.*.result, 'failure')
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().split('T')[0];
+
+            const existing = await github.rest.issues.listForRepo({
+              owner, repo,
+              labels: 'nightly-failure',
+              state: 'open',
+              per_page: 1,
+              sort: 'created',
+              direction: 'desc',
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner, repo,
+                issue_number: existing.data[0].number,
+                body: `Another nightly failure on ${today}.\n\n[View run](${runUrl})`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner, repo,
+                title: `Nightly CI failure: ${today}`,
+                body: `One or more nightly jobs failed.\n\n[View workflow run](${runUrl})`,
+                labels: ['nightly-failure'],
+              });
+            }
+
+      - name: Fail on nightly errors
         if: contains(needs.*.result, 'failure')
         run: |
           echo "::error::One or more nightly jobs failed. Check the workflow run for details."
