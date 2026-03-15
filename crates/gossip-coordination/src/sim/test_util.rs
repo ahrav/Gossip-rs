@@ -66,10 +66,10 @@ pub fn arb_fault_level() -> impl Strategy<Value = FaultLevel> {
 /// harness-internal state). The cost is small (1/40 of ops) and ensures
 /// the variant appears in all property test suites.
 ///
-/// A fixed-150-tick `AdvanceTime` variant (weight 1) exceeds
-/// `DEFAULT_LEASE_DURATION` (100), enabling lease-expiry coverage in
-/// property tests. The main `AdvanceTime` (weight 5) stays at 1..=50 to
-/// avoid expiring all leases every step.
+/// A fixed `LEASE_DUR + 50` tick `AdvanceTime` variant (weight 1) exceeds
+/// `LEASE_DUR`, enabling lease-expiry coverage in property tests. The
+/// main `AdvanceTime` (weight 5) stays at 1..=50 to avoid expiring all
+/// leases every step.
 pub fn arb_sim_op(n_workers: u64, n_shards: u64) -> impl Strategy<Value = SimOp> {
     let worker = (1..=n_workers).prop_map(WorkerId::from_raw);
     let key = (1..=n_shards).prop_map(|s| ShardKey::new(RunId::from_raw(1), ShardId::from_raw(s)));
@@ -78,7 +78,7 @@ pub fn arb_sim_op(n_workers: u64, n_shards: u64) -> impl Strategy<Value = SimOp>
     let k = key.clone();
     prop_oneof![
         6 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Acquire { worker, key }),
-        // Tick range 1..=50 stays below DEFAULT_LEASE_DURATION (100) to prevent
+        // Tick range 1..=50 stays below LEASE_DUR (100) to prevent
         // a single advance from expiring all leases at once.
         5 => (1u64..=50).prop_map(|ticks| SimOp::AdvanceTime { ticks }),
         5 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Checkpoint { worker, key }),
@@ -88,8 +88,8 @@ pub fn arb_sim_op(n_workers: u64, n_shards: u64) -> impl Strategy<Value = SimOp>
         2 => w.clone().prop_map(|worker| SimOp::ClaimNext { worker }),
         2 => w.clone().prop_map(|worker| SimOp::PauseWorker { worker }),
         2 => w.clone().prop_map(|worker| SimOp::ResumeWorker { worker }),
-        // Exceeds DEFAULT_LEASE_DURATION (100) to trigger lease expiry.
-        1 => Just(SimOp::AdvanceTime { ticks: 150 }),
+        // Exceeds LEASE_DUR to trigger lease expiry.
+        1 => Just(SimOp::AdvanceTime { ticks: LEASE_DUR + 50 }),
         1 => Just(SimOp::ZombieCheckpoint),
         1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Park { worker, key }),
         1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::SplitReplace { worker, key }),
@@ -120,7 +120,8 @@ pub const TENANT: TenantId = TenantId::from_bytes([0x01; 32]);
 /// Matches `DEFAULT_LEASE_DURATION` in `harness.rs` (both are 100 ticks).
 /// The primary `AdvanceTime` arm in `arb_sim_op` caps ticks at 50 — half
 /// this value — so that most time advances cannot expire a freshly acquired
-/// lease. A secondary arm at 150 ticks exists specifically to trigger expiry.
+/// lease. A secondary arm at `LEASE_DUR + 50` ticks exists specifically to
+/// trigger expiry.
 pub const LEASE_DUR: u64 = 100;
 
 /// Convenience constructor for [`ShardKey`] from raw integer IDs.

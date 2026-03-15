@@ -56,10 +56,10 @@
 //!
 //! ```sh
 //! # testcontainers (Docker required):
-//! cargo test --features test-support -- --ignored no_model_drift
+//! cargo test -p gossip-coordination-etcd --features test-support -- --ignored no_model_drift
 //!
 //! # External etcd:
-//! ETCD_ENDPOINTS=http://localhost:2379 cargo test --features test-support -- --ignored no_model_drift
+//! ETCD_ENDPOINTS=http://localhost:2379 cargo test -p gossip-coordination-etcd --features test-support -- --ignored no_model_drift
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,7 +76,7 @@ use gossip_coordination::{
     SplitReplaceError, SplitReplacePlan, SplitReplaceResult, SplitResidualError, SplitResidualPlan,
     SplitResidualResult, TenantId, UnparkError, WorkerId,
 };
-use gossip_coordination_etcd::test_support::test_coordinator_with_ttl;
+use gossip_coordination_etcd::test_support::test_coordinator_with_tuning;
 use gossip_coordination_etcd::{
     EtcdCoordinator, EtcdCoordinatorConfig, EtcdTestShardSnapshot, SimEtcdCoordinator,
 };
@@ -89,12 +89,20 @@ use proptest::prelude::*;
 const N_WORKERS: u64 = 4;
 const N_SHARDS: u64 = 8;
 
-/// Long TTL avoids time-of-day expiry interfering with the oracle's
-/// coordination-level comparisons. The oracle runs at `FaultLevel::SunnyDay`
-/// (no synthetic time-jumps), so leases expire only if the test clock
-/// advances far enough. No single `AdvanceTime` step in `arb_sim_op`
-/// exceeds 150 ticks, so 300 s provides at least a 2× safety margin per
-/// step against accidental expiry.
+/// Dual-purpose TTL applied to etcd owner leases in both backends.
+///
+/// **Wall-clock dimension (real etcd):** 300 real seconds prevents the
+/// real etcd backend's lease from expiring during a fast-running test.
+///
+/// **Logical-time dimension (SimEtcdCoordinator):** The simulated KV store
+/// expires leases when `logical_now >= grant_time + TTL`. No single
+/// `AdvanceTime` step in `arb_sim_op` exceeds 150 ticks, so 300 provides
+/// a 2x per-step safety margin. Cumulative advances across a full 50-op
+/// sequence can theoretically exceed 300, but coordination-level behavior
+/// remains identical: the per-shard logical deadline (`now + lease_duration`,
+/// where `lease_duration = 100`) expires well before the etcd-level TTL,
+/// so both backends observe the same lease-expired state at the
+/// coordination boundary.
 const OWNER_LEASE_TTL_SECS: i64 = 300;
 
 const OPTIMISTIC_TXN_RETRIES: usize = 8;
@@ -579,6 +587,13 @@ impl CoordinationBackend for ObservedEtcdCoordinator {
         let result = self.inner.split_replace(now, tenant, lease, plan, op_id);
         // Register new shard IDs *before* refresh so the refresh loop
         // knows to fetch their snapshots from etcd.
+        //
+        // On idempotent re-application (`AlreadyApplied`), `outcome.as_ref()`
+        // returns the cached result, so the same child IDs are re-inserted
+        // into `known_shards`. If a child was previously pruned (returned
+        // `None` from `refresh_run_state`), it gets re-added here and the
+        // subsequent refresh prunes it again — an extra etcd round-trip but
+        // not a correctness issue.
         if let Ok(outcome) = result.as_ref() {
             self.note_shards(
                 tenant,
@@ -745,8 +760,11 @@ impl DifferentialOracle {
         let sim_backend =
             SimEtcdCoordinator::new(sim_config(&format!("/gossip/diff/{seed}")), seed)
                 .expect("simulated etcd backend must construct");
-        let etcd_backend =
-            ObservedEtcdCoordinator::new(test_coordinator_with_ttl(OWNER_LEASE_TTL_SECS));
+        let etcd_backend = ObservedEtcdCoordinator::new(test_coordinator_with_tuning(
+            OWNER_LEASE_TTL_SECS,
+            OPTIMISTIC_TXN_RETRIES,
+            MAX_CHILDREN_PER_OP,
+        ));
 
         let sim = CoordinationSim::with_backend(seed, FaultLevel::SunnyDay, sim_backend)
             .with_workers_and_shards(N_WORKERS, N_SHARDS);
@@ -891,7 +909,11 @@ fn comparable_state<B: SimIntrospection>(backend: &B) -> ComparableBackendState 
                 status: record.status,
                 created_at: record.created_at,
                 completed_at: record.completed_at,
-                root_shards: record.root_shards.clone(),
+                root_shards: {
+                    let mut v = record.root_shards.clone();
+                    v.sort_unstable();
+                    v
+                },
                 op_log: record
                     .op_log
                     .iter()
@@ -940,7 +962,11 @@ fn comparable_state<B: SimIntrospection>(backend: &B) -> ComparableBackendState 
                 lease,
                 fence_epoch: record.fence_epoch,
                 parent: record.parent,
-                spawned: backend.spawned_children(record).collect(),
+                spawned: {
+                    let mut v: Vec<ShardId> = backend.spawned_children(record).collect();
+                    v.sort_unstable();
+                    v
+                },
                 op_log,
             },
         );
