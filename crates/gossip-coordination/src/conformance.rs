@@ -5,10 +5,15 @@
 //! implementation can execute the same protocol checks.
 //!
 //! The harness stays intentionally strict about the surface it uses:
-//! mutations go through the protocol traits, while observations go through
-//! [`SimIntrospection`](crate::sim::SimIntrospection). That keeps the suite
-//! backend-agnostic and avoids reaching into allocator-specific internals
-//! such as `ByteSlab`.
+//! shard-level mutations and run-level mutations go through the protocol
+//! traits ([`CoordinationBackend`](crate::traits::CoordinationBackend) and
+//! [`RunManagement`](crate::run::RunManagement)), while shard-level
+//! observations go through
+//! [`SimIntrospection`](crate::sim::SimIntrospection) and run-level
+//! observations go through
+//! [`RunManagement::get_run`](crate::run::RunManagement::get_run).
+//! That keeps the suite backend-agnostic and avoids reaching into
+//! allocator-specific internals such as `ByteSlab`.
 
 use crate::error::{CheckpointError, IdempotentOutcome};
 use crate::lease::Lease;
@@ -472,6 +477,7 @@ where
         let mut coord = factory(CursorSemantics::Completed);
         let lease = acquire_shard(&mut coord, 10, 1);
 
+        // Fill the ring buffer to capacity (OP_LOG_CAP entries).
         for i in 1..=ShardRecord::OP_LOG_CAP as u64 {
             let key = vec![b'a' + i as u8];
             let update = CursorUpdate::new(key.as_slice());
@@ -490,31 +496,53 @@ where
             );
         }
 
-        checkpoint_ok(&mut coord, 27, &lease, b"s", 17);
-        complete_ok(&mut coord, 28, &lease, b"y", 18);
+        // One more checkpoint evicts op 1 from the ring buffer.
+        let cap = ShardRecord::OP_LOG_CAP as u64;
+        checkpoint_ok(&mut coord, 27, &lease, b"s", cap + 1);
 
-        let replay_surviving = coord.complete(
-            now(29),
+        // Surviving op: still in the ring buffer → Replayed.
+        let replay_surviving = coord.checkpoint(
+            now(28),
             test_tenant(),
             &lease,
-            &test_cursor(b"y"),
-            OpId::from_raw(18),
+            &CursorUpdate::new(&[b'a' + cap as u8]),
+            OpId::from_raw(cap),
         );
         assert!(
             matches!(replay_surviving, Ok(IdempotentOutcome::Replayed(()))),
-            "surviving op must return Replayed, got: {replay_surviving:?}"
+            "surviving op in ring buffer must return Replayed, got: {replay_surviving:?}"
         );
 
-        let replay_evicted = coord.checkpoint(
-            now(30),
+        // Evicted op on the still-ACTIVE shard: the ring buffer no longer
+        // has an idempotency record for op 1, so the backend treats it as
+        // a fresh operation. A forward cursor satisfies monotonicity and
+        // the checkpoint succeeds as Executed.
+        let evicted_replay = coord.checkpoint(
+            now(29),
             test_tenant(),
             &lease,
-            &CursorUpdate::new(b"b"),
+            &CursorUpdate::new(b"t"),
             OpId::from_raw(1),
         );
         assert!(
-            matches!(replay_evicted, Err(CheckpointError::ShardTerminal { .. })),
-            "evicted op on terminal shard must return ShardTerminal, got: {replay_evicted:?}"
+            matches!(evicted_replay, Ok(IdempotentOutcome::Executed(()))),
+            "evicted op replayed with forward cursor on active shard must be Executed, \
+             got: {evicted_replay:?}"
+        );
+
+        // Complete the shard, then verify terminal rejection.
+        complete_ok(&mut coord, 30, &lease, b"y", cap + 2);
+
+        let replay_on_terminal = coord.complete(
+            now(31),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"y"),
+            OpId::from_raw(cap + 2),
+        );
+        assert!(
+            matches!(replay_on_terminal, Ok(IdempotentOutcome::Replayed(()))),
+            "surviving op on terminal shard must return Replayed, got: {replay_on_terminal:?}"
         );
     }
 
@@ -657,8 +685,15 @@ where
         let expected_status = RunStatus::Cancelled;
         let mut coord = factory(CursorSemantics::Completed);
 
-        let lease = acquire_shard(&mut coord, 10, 1);
-        let _ = lease;
+        // Acquire a shard so the run has an active lease when cancelled.
+        // cancel_run must succeed regardless of outstanding leases.
+        let _lease = acquire_shard(&mut coord, 10, 1);
+        let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+        assert_eq!(
+            rec.status,
+            ShardStatus::Active,
+            "shard must be leased before cancel"
+        );
 
         let outcome = coord
             .cancel_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
@@ -666,6 +701,58 @@ where
         assert!(
             outcome.is_executed(),
             "first-time cancel_run must be Executed"
+        );
+
+        let rec = coord.get_run(test_tenant(), test_run()).unwrap();
+        assert_eq!(rec.status(), expected_status);
+
+        let err = coord
+            .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RunTransitionError::RunTerminal { status } if status == expected_status
+            ),
+            "complete_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
+        );
+
+        let err = coord
+            .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RunTransitionError::RunTerminal { status } if status == expected_status
+            ),
+            "fail_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
+        );
+
+        let err = coord
+            .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RunTransitionError::RunTerminal { status } if status == expected_status
+            ),
+            "cancel_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
+        );
+    }
+
+    {
+        eprintln!("  conformance: run_terminal_irreversibility [Failed]");
+        let expected_status = RunStatus::Failed;
+        let mut coord = factory(CursorSemantics::Completed);
+
+        // fail_run requires Active status — the seeded backend already
+        // creates the run in Active state with registered shards.
+        let outcome = coord
+            .fail_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
+            .unwrap();
+        assert!(
+            outcome.is_executed(),
+            "first-time fail_run must be Executed"
         );
 
         let rec = coord.get_run(test_tenant(), test_run()).unwrap();
