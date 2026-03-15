@@ -471,6 +471,7 @@ jobs:
         working-directory: crates/scanner-git/fuzz
         run: |
           set -euo pipefail
+          ran=0
           for f in fuzz_targets/fuzz_*.rs; do
             [ -f "$f" ] || continue
             target="$(basename "${f%.rs}")"
@@ -478,7 +479,13 @@ jobs:
             cargo +nightly fuzz run "${target}" \
               --target x86_64-unknown-linux-gnu \
               -- -max_total_time="${FUZZ_SECONDS}"
+            ran=$((ran + 1))
           done
+          if [ "${ran}" -eq 0 ]; then
+            echo "::error::No fuzz targets discovered — expected fuzz_targets/fuzz_*.rs"
+            exit 1
+          fi
+          echo "Ran ${ran} fuzz target(s)"
 
   # ══════════════════════════════════════════════════════════════════
   # Scheduled-only jobs (nightly at 02:00 UTC)
@@ -731,6 +738,7 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
+          total_ran=0
           for fuzz_dir in crates/*/fuzz; do
             [ -d "${fuzz_dir}/fuzz_targets" ] || continue
             crate_name="$(basename "$(dirname "${fuzz_dir}")")"
@@ -750,10 +758,16 @@ jobs:
                 echo "::error::Fuzz target ${target} in ${crate_name} failed"
                 failed=1
               fi
+              total_ran=$((total_ran + 1))
             done
             cd "${GITHUB_WORKSPACE}"
             echo "::endgroup::"
           done
+          if [ "${total_ran}" -eq 0 ]; then
+            echo "::error::No fuzz targets discovered across any crate"
+            exit 1
+          fi
+          echo "Ran ${total_ran} fuzz target(s) total"
           [ "${failed}" -eq 0 ] || exit 1
 
   # ── Nightly Summary ───────────────────────────────────────────────
