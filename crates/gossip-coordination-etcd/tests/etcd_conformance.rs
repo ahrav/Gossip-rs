@@ -8,12 +8,8 @@
 //! protocol lease duration.
 
 use gossip_coordination::conformance::run_coordination_conformance;
-use gossip_coordination::test_fixtures::{
-    LEASE_DURATION, now, test_run, test_shard, test_spec, test_tenant,
-};
-use gossip_coordination::{
-    CursorSemantics, CursorUpdate, InitialShardInput, OpId, RunConfig, RunManagement, ShardRecord,
-};
+use gossip_coordination::test_fixtures::{LEASE_DURATION, seed_conformance_fixture};
+use gossip_coordination::{CursorSemantics, MAX_SPAWNED_PER_SHARD, ShardRecord};
 use gossip_coordination_etcd::{EtcdCoordinatorConfig, SimEtcdCoordinator};
 
 /// Etcd owner-lease TTL. Named `_SECS` to match the real etcd gRPC API
@@ -27,6 +23,7 @@ const MAX_CHILDREN_PER_OP: usize = 8;
 const SEED: u64 = 42;
 
 const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
+const _: () = assert!(MAX_SPAWNED_PER_SHARD == 1024);
 const _: () = assert!(LEASE_DURATION == 100);
 // The etcd owner key must outlive one protocol lease so checkpoint/complete
 // CAS guards find it. Each acquire creates a fresh etcd lease, so there is
@@ -51,27 +48,6 @@ fn seed_sim_etcd_with_semantics(semantics: CursorSemantics) -> SimEtcdCoordinato
 
     let mut coord =
         SimEtcdCoordinator::new(config, SEED).expect("simulated etcd coordinator must construct");
-    let run_config = RunConfig::try_new(semantics, LEASE_DURATION, Some(5))
-        .expect("conformance run config must be valid");
-    coord
-        .create_run(now(1), test_tenant(), test_run(), run_config)
-        .expect("conformance seeding must create the run");
-
-    let spec = test_spec();
-    let shards = [InitialShardInput::new(
-        test_shard(),
-        spec.as_ref(),
-        CursorUpdate::initial(),
-    )];
-    let _ = coord
-        .register_shards(
-            now(2),
-            test_tenant(),
-            test_run(),
-            &shards,
-            OpId::from_raw(u64::MAX),
-        )
-        .expect("conformance seeding must register the root shard");
-
+    seed_conformance_fixture(&mut coord, semantics);
     coord
 }
