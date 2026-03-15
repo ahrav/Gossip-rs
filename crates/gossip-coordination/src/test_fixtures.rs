@@ -123,12 +123,21 @@ pub fn seeded_coordinator() -> InMemoryCoordinator {
 /// Like [`seeded_coordinator`] but allows choosing cursor semantics.
 pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    seed_conformance_fixture(&mut coord, semantics);
+    coord
+}
+
+/// Seed the canonical single-run, single-shard conformance fixture onto any backend.
+///
+/// The caller constructs the backend; this function performs the shared
+/// create-run + register-shards sequence that the conformance harness expects.
+pub fn seed_conformance_fixture<B: RunManagement>(coord: &mut B, semantics: CursorSemantics) {
     let config = RunConfig::try_new(semantics, LEASE_DURATION, Some(5)).unwrap();
     coord
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
     let spec = test_spec();
-    let shards = vec![InitialShardInput::new(
+    let shards = [InitialShardInput::new(
         test_shard(),
         spec.as_ref(),
         CursorUpdate::initial(),
@@ -142,7 +151,6 @@ pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemory
             OpId::from_raw(u64::MAX),
         )
         .unwrap();
-    coord
 }
 
 /// Standard [`RunConfig`] with default lease duration (100 ticks).
