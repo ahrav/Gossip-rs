@@ -9,11 +9,12 @@
 - CLI parsing and summary rendering
 - path and budget validation before runtime execution
 - owned report, checkpoint, cancellation, and commit-sink types
-- placeholder family boundaries for ordered-content, git-repo, and distributed execution
+- local filesystem and git execution through family-oriented runtime modules
+- distributed runtime placeholder nouns for future worker-loop wiring
 
 The crate no longer depends on a separate scan-driver abstraction. Its
-public surface stays stable for callers while the family-specific runtime
-loops are wired in behind placeholder entrypoints.
+public surface stays stable for callers while direct and connector-mode
+entrypoints share the same local runtime execution paths.
 
 ---
 
@@ -27,10 +28,10 @@ loops are wired in behind placeholder entrypoints.
 | `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing |
 | `src/distributed.rs` | Distributed runtime family placeholders and shared config/report types |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
-| `src/git_repo.rs` | Git-repository family placeholder boundary |
-| `src/ordered_content.rs` | Ordered-content family placeholder boundary |
+| `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
+| `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
-| `src/lib_tests.rs` | Validation and placeholder behavior tests for the runtime core |
+| `src/lib_tests.rs` | Validation and local scan execution tests for the runtime core |
 | `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
 | `Cargo.toml` | Runtime crate dependencies and feature flags |
 
@@ -46,29 +47,37 @@ The crate exposes two public scan entrypoints:
 - `scan_git(&GitScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 
 Each entrypoint dispatches on `ExecutionMode`, but both `Direct` and
-`Connector` currently converge on the same family-facing runtime surface.
-The execution-mode flag is retained so callers can preserve their existing
-CLI and worker flows while the underlying family loops are implemented.
+`Connector` currently converge on the same local family-facing runtime
+surface. The execution-mode flag is retained so callers can preserve
+their existing CLI and worker flows while the public runtime API stays
+stable.
 
 ### Validation-first execution
 
 The runtime performs setup work in a fixed order:
 
 1. Validate the requested path.
-2. Validate runtime budgets.
+2. Validate runtime budgets (distributed path only; local paths skip budget validation).
 3. Normalize source-specific inputs.
 4. Call the source family boundary.
 
 Current behavior after validation:
 
-- filesystem scans route to `ordered_content::filesystem_placeholder`
-- git scans route to `git_repo::local_repo_placeholder`
+- filesystem scans route to `ordered_content::scan_local_filesystem`
+- git scans route to `git_repo::scan_local_repo`
 - distributed runs route to `distributed::run_distributed`
 
-Filesystem and git placeholders return `ScanRuntimeError::Driver(anyhow::Error)`.
-The distributed placeholder returns `DistributedRuntimeError`, which wraps
-`ScanRuntimeError`. The runtime never uses `todo!()` for unimplemented family
-paths.
+Filesystem scans build a runtime engine, forward scheduler events through
+owned channel bridges, optionally forward persisted findings through the
+local commit sink surface, and convert scheduler counters into the local
+`ScanReport`.
+
+Git scans build the same runtime engine family, bridge git/core events
+through owned channel forwarding, invoke `run_git_scan`, and convert the
+git report into the local `ScanReport` plus optional debug output.
+
+The distributed entrypoint still returns `DistributedRuntimeError`, which
+wraps `ScanRuntimeError`.
 
 ### Family split
 
@@ -89,7 +98,6 @@ old cross-crate driver seam.
 
 - `FsScanConfig::path` must exist
 - the runtime canonicalizes the path before dispatch
-- `ScanBudgets.max_items` and `ScanBudgets.max_bytes` must both be non-zero
 
 ### Git scans
 
@@ -97,7 +105,6 @@ old cross-crate driver seam.
 - the path must be a git repository root
 - subdirectories of a git repository are rejected so the runtime has a
   stable repository anchor
-- `ScanBudgets.max_items` and `ScanBudgets.max_bytes` must both be non-zero
 
 ### Distributed runs
 
@@ -210,8 +217,9 @@ The runtime error surface has six current categories:
 - `ConnectorInput`
 - `Driver`
 
-`Driver(anyhow::Error)` is the catch-all for family placeholder failures and
-other runtime wiring problems.
+`Driver(anyhow::Error)` is the catch-all for runtime execution failures such
+as scan-loop errors, event-forwarder join failures, and the still-unwired
+distributed family path.
 
 ---
 
@@ -282,7 +290,7 @@ pub fn run_distributed(
 ```
 
 `run_distributed` validates budgets and then returns a family-specific
-placeholder runtime error.
+runtime placeholder error.
 
 ---
 
@@ -295,12 +303,16 @@ The runtime tests focus on the behavior that exists today:
 - budget validation
 - filesystem path validation
 - git repository root validation
-- placeholder error routing for filesystem, git, and distributed entrypoints
+- successful filesystem and git scans with custom rules
+- event forwarding for filesystem and git runtime entrypoints
+- commit forwarding for filesystem scans with persistence enabled
+- distributed placeholder error routing
 - CLI parsing and summary formatting
 - durable commit-sink identity derivation
 
-These tests intentionally verify placeholder behavior for valid sources so
-the crate can evolve without depending on the removed driver stack.
+These tests exercise the live local runtime paths for valid filesystem and
+git sources while keeping the distributed placeholder surface covered until
+that worker-loop API is fully wired.
 
 ---
 
@@ -312,7 +324,7 @@ the crate can evolve without depending on the removed driver stack.
 | CLI parsing and summary rendering | `crates/gossip-scanner-runtime/src/cli.rs` |
 | Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
 | Distributed family placeholders | `crates/gossip-scanner-runtime/src/distributed.rs` |
-| Ordered-content placeholder boundary | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
-| Git-repo placeholder boundary | `crates/gossip-scanner-runtime/src/git_repo.rs` |
+| Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
+| Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |
 | JSONL parity helpers | `crates/gossip-scanner-runtime/src/parity.rs` |

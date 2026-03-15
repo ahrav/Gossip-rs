@@ -89,6 +89,8 @@
 //! implementations and orchestration decisions (retry, scheduling, backoff
 //! policy) live in runtime crates.
 
+use crate::identity::ConnectorTag;
+
 mod api;
 pub mod common;
 pub mod git;
@@ -108,3 +110,25 @@ pub use types::{
     MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE, MAX_LOCATION_URL_SIZE,
     MAX_TOKEN_SIZE, PooledByteSlab, ScanItem, TokenBytes, ToxicDigest, VersionId,
 };
+
+// ---------------------------------------------------------------------------
+// Canonical connector-tag constants
+// ---------------------------------------------------------------------------
+
+/// Connector tag for filesystem-sourced items.
+///
+/// Domain-separates [`crate::identity::StableItemId`] derivation so that
+/// identity hashes are disjoint from items produced by other connector types.
+pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
+
+/// Connector tag for git-sourced items.
+///
+/// Domain-separates [`crate::identity::StableItemId`] derivation so that
+/// identity hashes are disjoint from items produced by other connector types.
+pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
+
+/// Connector tag for the deterministic in-memory connector kind.
+///
+/// Domain-separates [`crate::identity::StableItemId`] derivation so that
+/// identity hashes are disjoint from items produced by other connector types.
+pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmem");

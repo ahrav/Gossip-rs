@@ -20,12 +20,13 @@ pub mod git;
 pub mod in_memory;
 mod split_estimator;
 
-pub use common::{
-    FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG, path_buf_from_bytes,
-};
+pub use common::path_buf_from_bytes;
 #[cfg(unix)]
 pub use filesystem::FilesystemConnector;
 pub use git::GitConnector;
+pub use gossip_contracts::connector::{
+    FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG,
+};
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 
 #[doc(hidden)]
