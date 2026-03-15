@@ -48,9 +48,13 @@ Collect every comment. Categorize each one:
 
 **Focus the verify-first workflow on bug reports and correctness claims.** These are the comments where blind trust is most dangerous.
 
-### Step 2: Analyze Each Bug Claim
+**Invariant / assertion-strength claims also require Steps 2–6** — treat the
+claimed weakness as the hypothesis, identify the boundary input that would
+expose it, and proceed through the same workflow.
 
-For each comment claiming a bug or incorrect behavior:
+### Step 2: Analyze Each Correctness Claim
+
+For each comment claiming a bug, incorrect behavior, or assertion-strength gap:
 
 1. **Read the code** the comment refers to — understand it fully before proceeding
 2. **Identify the claim** — what specific behavior does the reviewer say is wrong?

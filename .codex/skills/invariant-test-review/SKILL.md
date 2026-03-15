@@ -29,11 +29,35 @@ abstract, but "the test passes without isolating the intended invariant."
   rather than proof strength
 - Pure documentation review without test changes
 
+## Invocation
+
+```
+/invariant-test-review [<test-file-or-function>]
+```
+
+- With no argument: review recently changed Rust test files in the working tree.
+  Prefer dedicated test files first (`*_tests.rs`, `tests/*.rs`); if none
+  changed, inspect changed Rust files that contain inline tests or
+  simulation/oracle helpers.
+- With a file path: review all relevant tests in that file.
+- With a test function name: review that specific test plus any nearby helper,
+  fixture, oracle, or comparable-state code it depends on.
+
 ## Core Principle
 
 A test only proves what its setup, observation surface, and assertions uniquely
 force. If the test can pass because of unrelated setup, missing negative cases,
 or a lossy comparator, it is weaker than it looks.
+
+## Severity Levels
+
+Classify each finding with one of these severities:
+
+| Severity | Meaning |
+|----------|---------|
+| **BLOCK** | The test does not isolate the claimed invariant, can pass for the wrong reason, or relies on an invalid oracle/comparator. |
+| **WARN** | The test points at the right behavior but is weaker than it looks because of missing twins, proxy observations, or confounding setup. |
+| **INFO** | Improves clarity, discoverability, or explanation without materially changing proof strength. |
 
 ## Workflow
 
@@ -116,15 +140,21 @@ If the answer is "not sure" or "only indirectly," the test needs revision.
 
 ## Red Flags
 
-- The test name claims one invariant, but the assertion only checks generic
-  success
-- Setup acquires leases, cursors, or resources that are never used by the
-  assertion
-- A "regression test" duplicates a larger scenario instead of isolating the bug
-- Terminal or rejection semantics are tested only on the happy path
-- Comparable-state assertions use order-sensitive equality for unordered data
-- The test could fail because of an unrelated precondition before it reaches the
-  behavior under review
+Typical classifications:
+
+- **BLOCK**: The test name claims one invariant, but the assertion only checks
+  generic success.
+- **BLOCK**: Comparable-state assertions use order-sensitive equality for
+  unordered data.
+- **BLOCK**: The test could fail because of an unrelated precondition before it
+  reaches the behavior under review.
+- **WARN**: Setup acquires leases, cursors, or resources that are never used by
+  the assertion.
+- **WARN**: A "regression test" duplicates a larger scenario instead of
+  isolating the bug.
+- **WARN**: Terminal or rejection semantics are tested only on the happy path.
+- **INFO**: Assertion messages or rewrite guidance could name the invariant
+  more directly.
 
 ## Review Output
 
@@ -139,14 +169,15 @@ Return a short report in this format:
 
 ### Findings
 
-1. [Issue]: [why the current test is weaker than it looks]
-2. [Issue]: [missing twin, confounder, or comparator problem]
+- [BLOCK|WARN|INFO] [Issue 1]: [why the current test is weaker than it looks]
+- [BLOCK|WARN|INFO] [Issue 2]: [missing twin, confounder, or comparator problem]
+- [BLOCK|WARN|INFO] [Issue N]: [additional issues — add as many as needed]
 
 ### Recommended Rewrite
 
-- Remove: [vestigial setup]
-- Add: [negative-path or boundary twin]
-- Normalize: [unordered state before comparison]
+- Remove (if applicable): [vestigial setup]
+- Add (if applicable): [negative-path or boundary twin]
+- Normalize (if applicable): [unordered state before comparison]
 - Assert: [the direct property instead of a proxy]
 ```
 
