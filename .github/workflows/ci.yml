@@ -394,8 +394,32 @@ jobs:
         working-directory: tools/eval-harness
       - run: cargo clippy --all-targets --all-features -- -D warnings
         working-directory: tools/eval-harness
-      - run: cargo test
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        with:
+          tool: cargo-nextest
+
+      - run: cargo nextest run
         working-directory: tools/eval-harness
+
+  # ── Dependency Review (PR only) ────────────────────────────────────
+  # Catches newly introduced vulnerable or license-incompatible deps at
+  # PR time, before they land. Complements cargo-deny (license/ban rules)
+  # and rustsec/audit-check (post-merge advisory scan).
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+          deny-licenses: AGPL-3.0, GPL-3.0
 
   # ── Security Audit ─────────────────────────────────────────────────
   audit:
@@ -411,10 +435,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ── Fuzz Pack Smoke (PR only) ───────────────────────────────────────
-  # Quick sanity check on the 4 pack-format fuzz targets when fuzz or
-  # source files change in a PR. Each target runs for 20 seconds max.
-  # Targets are hardcoded (unlike fuzz-nightly's dynamic discovery);
-  # update the list below when fuzz_pack_*.rs files are added/removed.
+  # Quick sanity check on pack-format fuzz targets when fuzz or source
+  # files change in a PR. Each target runs for 20 seconds max.
+  # Targets are auto-discovered from fuzz_targets/fuzz_*.rs.
   fuzz-pack-smoke:
     name: Fuzz Pack Smoke (PR)
     runs-on: ubuntu-24.04
@@ -447,10 +470,15 @@ jobs:
       - name: Run pack fuzz targets
         working-directory: crates/scanner-git/fuzz
         run: |
-          cargo +nightly fuzz run fuzz_pack_parse_delta   --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_inflate_stream --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_delta_into     --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_exec           --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
+          set -euo pipefail
+          for f in fuzz_targets/fuzz_*.rs; do
+            [ -f "$f" ] || continue
+            target="$(basename "${f%.rs}")"
+            echo "Running: ${target}"
+            cargo +nightly fuzz run "${target}" \
+              --target x86_64-unknown-linux-gnu \
+              -- -max_total_time="${FUZZ_SECONDS}"
+          done
 
   # ══════════════════════════════════════════════════════════════════
   # Scheduled-only jobs (nightly at 02:00 UTC)
@@ -459,11 +487,20 @@ jobs:
   # ── Test (full harness, nightly) ─────────────────────────────────
   # --all-features enables stdx-proptest, sim-harness, tiger-harness,
   # kgram-gate, b64-stats, perf-counters — everything the PR job skips.
+  # Debug and release run as parallel matrix legs for faster wall-clock time.
   test-full-harness:
-    name: Test (Scheduled, Full Harness)
+    name: Test (Scheduled, ${{ matrix.profile }})
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: debug
+            release-flag: ""
+          - profile: release
+            release-flag: "--release"
     env:
       PROPTEST_CASES: "64"
     steps:
@@ -479,18 +516,15 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run tests (debug)
+      - name: Run tests (${{ matrix.profile }})
         run: >-
-          cargo nextest run --all-features --profile nightly
+          cargo nextest run --all-features ${{ matrix.release-flag }}
+          --profile nightly
           --exclude gossip-coordination-etcd
-      - name: Run doctests (debug)
-        run: cargo test --all-features --doc
-      - name: Run tests (release)
+
+      - name: Run doctests (${{ matrix.profile }})
         run: >-
-          cargo nextest run --all-features --release --profile nightly
-          --exclude gossip-coordination-etcd
-      - name: Run doctests (release)
-        run: cargo test --all-features --release --doc
+          cargo test --all-features ${{ matrix.release-flag }} --doc
 
   # ── Miri (nightly only) ────────────────────────────────────────────
   miri:
@@ -726,11 +760,42 @@ jobs:
   nightly-summary:
     name: Nightly Summary
     if: always() && github.event_name == 'schedule'
-    needs: [test-full-harness, test-etcd, test-postgres, miri, kani, loom, asan, fuzz-nightly]
+    needs: [test-full-harness, test-etcd, test-postgres, miri, kani, loom, asan, fuzz-nightly, audit]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      issues: write
     steps:
-      - name: Check for failures
+      - name: Create issue on failure
+        if: contains(needs.*.result, 'failure')
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().split('T')[0];
+
+            const existing = await github.rest.issues.listForRepo({
+              owner, repo,
+              labels: 'nightly-failure',
+              state: 'open',
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner, repo,
+                issue_number: existing.data[0].number,
+                body: `Another nightly failure on ${today}.\n\n[View run](${runUrl})`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner, repo,
+                title: `Nightly CI failure: ${today}`,
+                body: `One or more nightly jobs failed.\n\n[View workflow run](${runUrl})`,
+                labels: ['nightly-failure'],
+              });
+            }
+
+      - name: Fail on nightly errors
         if: contains(needs.*.result, 'failure')
         run: |
           echo "::error::One or more nightly jobs failed. Check the workflow run for details."
