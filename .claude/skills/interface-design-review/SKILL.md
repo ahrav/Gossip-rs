@@ -18,6 +18,8 @@ runtime only as a last resort.
 - When adding a new module or crate boundary
 - Before stabilizing an interface that other code will depend on
 - When reviewing builder patterns, configuration types, or plugin interfaces
+- When reviewing CLI or configuration flows that are parsed once and then
+  threaded through multiple layers
 - After discovering a bug caused by caller misuse of an existing API
 - When an API requires documentation to explain "don't do X" — that's a signal
   the interface should prevent X structurally
@@ -75,6 +77,9 @@ Prefer enforcement higher in this list. Each level down is weaker:
   fallible path the only path?
 - [ ] **No `pub` on fields with invariants** — If `start <= end` must hold,
   neither field should be `pub`.
+- [ ] **Single source of truth for validated config** — If one parser or builder
+  produces validated config that multiple layers consume, do downstream layers
+  derive from that type instead of re-parsing or re-encoding defaults?
 
 ### C. Guide the Caller Toward Correct Usage
 
@@ -106,6 +111,9 @@ Prefer enforcement higher in this list. Each level down is weaker:
   `range(start, end)` match what a caller would guess?
 - [ ] **Consistent naming conventions** — Do similar operations across the
   codebase use the same verb (`get_` vs `fetch_` vs `load_`)?
+- [ ] **No ambiguous positional parsing** — Can a single positional token,
+  overloaded string, or shorthand path be misclassified? Prefer explicit enums,
+  subcommands, or regression tests that lock down edge shapes.
 - [ ] **`#[must_use]` on results** — Can the caller silently ignore a return
   value that indicates failure or carries important data?
   ```rust
@@ -149,6 +157,8 @@ Prefer enforcement higher in this list. Each level down is weaker:
 | Returning `i32` error codes | Caller can ignore, misinterpret, or mix with valid values | Return `Result<T, E>` with typed error |
 | `fn send(data: &[u8], compress: bool, encrypt: bool, sign: bool)` | 3 bools = 8 combinations, many invalid | Options struct or builder with valid combinations |
 | Silent default on invalid input | Caller doesn't know their input was wrong | Return `Err` or use a type that can't be invalid |
+| Parsing config twice into similar structs | Layers silently drift when defaults change in only one place | Parse once, validate once, derive downstream views from the validated config |
+| Treating a single positional token as multiple possible modes | Callers cannot predict how edge cases are classified | Use explicit syntax or add parser tests for each ambiguous shape |
 
 ## Project-Specific Patterns
 
