@@ -148,6 +148,12 @@ impl<'a> CommitRequest<'a> {
         findings: FindingsUpsertBatch<'a>,
         done_ledger: &'a [DoneLedgerRecord],
     ) -> Self {
+        // Defense-in-depth for dev builds: sample the first element of each
+        // slice to catch tenant mismatches early.  The authoritative runtime
+        // check is `FindingsUpsertBatch::validate_tenant_consistency()`, which
+        // is called downstream before persistence and inspects every record.
+        // First-element sampling is sufficient here because upstream guarantees
+        // single-tenant batches.
         debug_assert!(
             findings
                 .observations()
@@ -317,6 +323,20 @@ impl fmt::Display for KindMismatchError {
 }
 
 impl std::error::Error for KindMismatchError {}
+
+impl KindMismatchError {
+    /// Boundary kind declared by the owning shard stream.
+    #[must_use]
+    pub fn expected(&self) -> CheckpointBoundaryKind {
+        self.expected
+    }
+
+    /// Boundary kind carried by the receipt.
+    #[must_use]
+    pub fn actual(&self) -> CheckpointBoundaryKind {
+        self.actual
+    }
+}
 
 /// Receipt-only input to the checkpoint aggregator.
 ///
@@ -630,8 +650,8 @@ mod tests {
 
         let err = CheckpointAggregatorInput::new(CheckpointBoundaryKind::RepoFrontier, receipt)
             .unwrap_err();
-        assert_eq!(err.expected, CheckpointBoundaryKind::RepoFrontier);
-        assert_eq!(err.actual, CheckpointBoundaryKind::OrderedContent);
+        assert_eq!(err.expected(), CheckpointBoundaryKind::RepoFrontier);
+        assert_eq!(err.actual(), CheckpointBoundaryKind::OrderedContent);
     }
 
     #[test]
@@ -645,6 +665,81 @@ mod tests {
 
         assert!(
             CheckpointAggregatorInput::new(CheckpointBoundaryKind::OrderedContent, receipt).is_ok()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Debug-assertion coverage for tenant consistency sampling
+    // ------------------------------------------------------------------
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "write_context tenant must match observations tenant")]
+    fn commit_request_debug_asserts_mismatched_observation_tenant() {
+        use gossip_contracts::{
+            identity::{LogicalTime, OccurrenceId, OvidHash, PolicyHash as PH},
+            persistence::ObservationRecord,
+        };
+
+        let write_ctx = sample_write_context(0xAA);
+
+        // Observation whose tenant differs from the write context.
+        let other_tenant = TenantId::from_bytes([0xBB; 32]);
+        let obs = ObservationRecord::new(
+            other_tenant,
+            OccurrenceId::from_bytes([0x01; 32]),
+            PH::from_bytes([0x02; 32]),
+            OvidHash::from_bytes([0x03; 32]),
+            RunId::from_raw(1),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(1),
+        );
+        let observations = [obs];
+        let findings = FindingsUpsertBatch::new(&[], &[], &observations);
+
+        let _request = CommitRequest::new(
+            write_ctx,
+            CompletedUnit::ordered_content(0, sample_cursor(1)),
+            findings,
+            &[],
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "write_context tenant must match done-ledger tenant")]
+    fn commit_request_debug_asserts_mismatched_done_ledger_tenant() {
+        use gossip_contracts::persistence::{
+            DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, OvidHash,
+        };
+
+        let write_ctx = sample_write_context(0xAA);
+
+        // Done-ledger record whose tenant differs from the write context.
+        let other_tenant = TenantId::from_bytes([0xCC; 32]);
+        let key = DoneLedgerKey::new(
+            other_tenant,
+            PolicyHash::from_bytes([0x01; 32]),
+            OvidHash::from_bytes([0x02; 32]),
+        );
+        let prov = DoneLedgerProvenance::new(
+            RunId::from_raw(1),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            gossip_contracts::identity::LogicalTime::from_raw(1),
+            gossip_contracts::identity::LogicalTime::from_raw(2),
+        );
+        let record =
+            DoneLedgerRecord::try_new(key, DoneLedgerStatus::ScannedClean, 1024, 0, prov, None)
+                .expect("test record should satisfy construction invariants");
+        let done_ledger = [record];
+
+        let _request = CommitRequest::new(
+            write_ctx,
+            CompletedUnit::ordered_content(0, sample_cursor(1)),
+            FindingsUpsertBatch::new(&[], &[], &[]),
+            &done_ledger,
         );
     }
 }

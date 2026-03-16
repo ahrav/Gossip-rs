@@ -3,6 +3,7 @@
 //! This module exposes the high-level distributed runtime nouns without the
 //! removed driver-based lease execution surface.
 
+use std::fmt;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -53,38 +54,100 @@ pub trait ShardLeaseAssignment {
 /// numeric shard identity used for fenced writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardLease<A> {
-    /// String shard label used for routing recorder events.
-    pub shard_id: Arc<str>,
-    /// Scan assignment payload associated with this lease.
-    pub assignment: A,
-    /// Shared routing and fencing metadata for all writes emitted under the lease.
-    pub write_context: WriteContext,
-    /// Tenant secret key used for secret-hash derivation.
-    pub tenant_secret_key: TenantSecretKey,
+    shard_id: Arc<str>,
+    assignment: A,
+    write_context: WriteContext,
+    tenant_secret_key: TenantSecretKey,
+}
+
+/// Policy-hash mismatch between a shard assignment and its write context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyMismatchError {
+    assignment: PolicyHash,
+    context: PolicyHash,
+}
+
+impl fmt::Display for PolicyMismatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "assignment policy_hash ({:?}) does not match write_context policy_hash ({:?})",
+            self.assignment, self.context
+        )
+    }
+}
+
+impl std::error::Error for PolicyMismatchError {}
+
+impl PolicyMismatchError {
+    /// Policy hash carried by the assignment payload.
+    #[must_use]
+    pub fn assignment(&self) -> PolicyHash {
+        self.assignment
+    }
+
+    /// Policy hash carried by the write context.
+    #[must_use]
+    pub fn context(&self) -> PolicyHash {
+        self.context
+    }
 }
 
 impl<A: ShardLeaseAssignment> ShardLease<A> {
-    /// Construct a lease payload and verify that assignment and write context
+    /// Construct a lease payload, verifying that assignment and write context
     /// agree on policy scope.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyMismatchError`] if the assignment's policy hash differs
+    /// from the write context's policy hash.
     pub fn new(
         shard_id: Arc<str>,
         assignment: A,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
-    ) -> Self {
-        assert_eq!(
-            assignment.policy_hash(),
-            write_context.policy_hash(),
-            "lease assignment policy_hash must match write_context.policy_hash"
-        );
+    ) -> Result<Self, PolicyMismatchError> {
+        if assignment.policy_hash() != write_context.policy_hash() {
+            return Err(PolicyMismatchError {
+                assignment: assignment.policy_hash(),
+                context: write_context.policy_hash(),
+            });
+        }
 
-        Self {
+        Ok(Self {
             shard_id,
             assignment,
             write_context,
             tenant_secret_key,
-        }
+        })
+    }
+
+    /// String shard label used for routing recorder events.
+    #[inline]
+    #[must_use]
+    pub fn shard_id(&self) -> &str {
+        &self.shard_id
+    }
+
+    /// Scan assignment payload associated with this lease.
+    #[inline]
+    #[must_use]
+    pub fn assignment(&self) -> &A {
+        &self.assignment
+    }
+
+    /// Shared routing and fencing metadata for all writes emitted under the lease.
+    #[inline]
+    #[must_use]
+    pub fn write_context(&self) -> WriteContext {
+        self.write_context
+    }
+
+    /// Tenant secret key used for secret-hash derivation.
+    #[inline]
+    #[must_use]
+    pub fn tenant_secret_key(&self) -> TenantSecretKey {
+        self.tenant_secret_key
     }
 }
 
@@ -202,15 +265,15 @@ mod tests {
             assignment.clone(),
             write_context,
             TenantSecretKey::from_bytes([0x33; 32]),
-        );
+        )
+        .unwrap();
 
-        assert_eq!(&*lease.shard_id, "shard-a");
-        assert_eq!(lease.assignment, assignment);
-        assert_eq!(lease.write_context, write_context);
+        assert_eq!(lease.shard_id(), "shard-a");
+        assert_eq!(lease.assignment(), &assignment);
+        assert_eq!(lease.write_context(), write_context);
     }
 
     #[test]
-    #[should_panic(expected = "lease assignment policy_hash must match write_context.policy_hash")]
     fn shard_lease_rejects_mismatched_policy_hash() {
         let write_context = WriteContext::new(
             TenantId::from_bytes([0x11; 32]),
@@ -219,14 +282,19 @@ mod tests {
             ShardId::from_raw(4),
             FenceEpoch::from_raw(5),
         );
+        let assignment_hash = PolicyHash::from_bytes([0xFF; 32]);
         let assignment = StubAssignment {
-            policy_hash: PolicyHash::from_bytes([0xFF; 32]),
+            policy_hash: assignment_hash,
         };
-        let _ = ShardLease::new(
+        let err = ShardLease::new(
             Arc::from("shard-x"),
             assignment,
             write_context,
             TenantSecretKey::from_bytes([0x33; 32]),
-        );
+        )
+        .unwrap_err();
+
+        assert_eq!(err.assignment(), assignment_hash);
+        assert_eq!(err.context(), write_context.policy_hash());
     }
 }

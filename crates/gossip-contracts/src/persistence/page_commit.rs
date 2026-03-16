@@ -71,11 +71,11 @@ use crate::{
 };
 
 use super::{
-    WriteContext,
     commit::{
         CheckpointCommitReceipt, CommitHandle, DoneLedgerCommitReceipt, FindingsCommitReceipt,
         ItemCommitReceipt, PageCommitReceipt,
     },
+    WriteContext,
 };
 
 /// Semantic domain for a durable checkpoint boundary.
@@ -348,17 +348,19 @@ impl fmt::Display for PageCommitValidationError {
             Self::CheckpointScopeMismatch { expected, actual } => write!(
                 f,
                 "checkpoint receipt scope does not match page scope \
-                 (expected tenant={:?}, shard={:?}, run={:?}, epoch={:?}, \
+                 (expected tenant={:?}, policy={:?}, shard={:?}, run={:?}, epoch={:?}, \
                  units={}, boundary={}; \
-                 actual tenant={:?}, shard={:?}, run={:?}, epoch={:?}, \
+                 actual tenant={:?}, policy={:?}, shard={:?}, run={:?}, epoch={:?}, \
                  units={}, boundary={})",
                 expected.tenant_id(),
+                expected.policy_hash(),
                 expected.shard_id(),
                 expected.run_id(),
                 expected.fence_epoch(),
                 expected.committed_units(),
                 expected.checkpoint_boundary(),
                 actual.tenant_id(),
+                actual.policy_hash(),
                 actual.shard_id(),
                 actual.run_id(),
                 actual.fence_epoch(),
@@ -721,7 +723,7 @@ mod tests {
     use crate::{
         connector::ItemKey,
         identity::{LogicalTime, PolicyHash},
-        test_util::{TestWaitError, tenant},
+        test_util::{tenant, TestWaitError},
     };
 
     use super::super::commit::ReadyCommitHandle;
@@ -1038,6 +1040,61 @@ mod tests {
         assert_eq!(boundary.cursor(), &cursor);
         assert_eq!(boundary.as_ordered_content(), None);
         assert_eq!(boundary.as_repo_frontier(), Some(&cursor));
+    }
+
+    /// When two commit scopes differ only in policy_hash, the Display output
+    /// must show distinct values so operators can diagnose the root cause.
+    #[test]
+    fn scope_mismatch_display_distinguishes_policy_hash_only_difference() {
+        let expected_scope = CommitScope::new(
+            tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            NonZeroU64::new(10).unwrap(),
+            CheckpointBoundary::ordered_content(sample_cursor(5)),
+        );
+        let actual_scope = CommitScope::new(
+            tenant(1),
+            PolicyHash::from_bytes([0xBB; 32]), // only field that differs
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            NonZeroU64::new(10).unwrap(),
+            CheckpointBoundary::ordered_content(sample_cursor(5)),
+        );
+
+        // Scopes must differ (policy_hash is different).
+        assert_ne!(expected_scope, actual_scope);
+
+        let err = PageCommitValidationError::CheckpointScopeMismatch {
+            expected: Box::new(expected_scope),
+            actual: Box::new(actual_scope),
+        };
+
+        let msg = err.to_string();
+
+        // The formatted message must contain both distinct policy hashes so
+        // operators can see which field actually differs.
+        let halves: Vec<&str> = msg.splitn(2, ';').collect();
+        assert_eq!(halves.len(), 2, "Display must have expected;actual halves");
+
+        // Extract policy= values from each half.
+        let expected_policy = halves[0]
+            .split("policy=")
+            .nth(1)
+            .expect("expected half must contain policy=");
+        let actual_policy = halves[1]
+            .split("policy=")
+            .nth(1)
+            .expect("actual half must contain policy=");
+
+        assert_ne!(
+            expected_policy, actual_policy,
+            "policy-hash-only mismatch must produce distinct values in \
+             the formatted output:\n  {msg}"
+        );
     }
 
     #[test]

@@ -429,8 +429,20 @@ fn merge_different_keys_returns_key_mismatch_error() {
     let b =
         DoneLedgerRecord::try_new(key_b, ScannedClean, 200, 0, make_provenance(), None).unwrap();
 
-    assert_eq!(a.merge(&b).unwrap_err(), PersistenceInputError::KeyMismatch);
-    assert_eq!(b.merge(&a).unwrap_err(), PersistenceInputError::KeyMismatch);
+    assert_eq!(
+        a.merge(&b).unwrap_err(),
+        PersistenceInputError::KeyMismatch {
+            existing: Box::new(key_a),
+            incoming: Box::new(key_b),
+        }
+    );
+    assert_eq!(
+        b.merge(&a).unwrap_err(),
+        PersistenceInputError::KeyMismatch {
+            existing: Box::new(key_b),
+            incoming: Box::new(key_a),
+        }
+    );
 }
 
 #[test]

@@ -8,18 +8,18 @@
 //!    write to the specific lease epoch that produced it.
 //!
 //! This module freezes the five routing and fencing fields as one explicit
-//! value object so the runtime does not
-//! keep passing fencing metadata as loose scalar arguments. Backends that can
-//! later enforce stale-writer rejection can validate the fence fields directly
-//! from this context.
+//! value object so the runtime passes fencing metadata as a single copyable
+//! token instead of loose scalar arguments. Backends that enforce
+//! stale-writer rejection validate the fence fields directly from this
+//! context.
 
 use crate::identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId};
 
 /// Shared write-side routing and fencing metadata.
 ///
 /// `WriteContext` is intentionally small and copyable. It is the common shape
-/// threaded through runtime commit APIs so later backends can enforce stale
-/// writer rejection without changing every call site again.
+/// threaded through runtime commit APIs so backends can enforce stale-writer
+/// rejection from a single value rather than scattered scalar parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WriteContext {
     tenant_id: TenantId,

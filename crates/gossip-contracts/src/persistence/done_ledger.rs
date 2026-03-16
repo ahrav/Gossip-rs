@@ -682,7 +682,10 @@ impl DoneLedgerRecord {
         incoming.validate()?;
 
         if self.key != incoming.key {
-            return Err(PersistenceInputError::KeyMismatch);
+            return Err(PersistenceInputError::KeyMismatch {
+                existing: Box::new(self.key),
+                incoming: Box::new(incoming.key),
+            });
         }
 
         let merged_status = self.status.merge(incoming.status);

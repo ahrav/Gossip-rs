@@ -2,6 +2,8 @@ use std::{error::Error, fmt};
 
 use crate::identity::ObservationId;
 
+use super::done_ledger::DoneLedgerKey;
+
 /// Validation errors for persistence-boundary value types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistenceInputError {
@@ -48,7 +50,10 @@ pub enum PersistenceInputError {
     /// Provenance timestamps are out of order (`started_at > finished_at`).
     ProvenanceOrdering { started_at: u64, finished_at: u64 },
     /// Two records with different keys were passed to a merge operation.
-    KeyMismatch,
+    KeyMismatch {
+        existing: Box<DoneLedgerKey>,
+        incoming: Box<DoneLedgerKey>,
+    },
 }
 
 impl fmt::Display for PersistenceInputError {
@@ -100,7 +105,10 @@ impl fmt::Display for PersistenceInputError {
                 f,
                 "provenance started_at ({started_at}) must not exceed finished_at ({finished_at})"
             ),
-            Self::KeyMismatch => write!(f, "merge requires records with the same key"),
+            Self::KeyMismatch { existing, incoming } => write!(
+                f,
+                "merge requires records with the same key (existing: {existing:?}, incoming: {incoming:?})"
+            ),
         }
     }
 }

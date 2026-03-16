@@ -308,10 +308,10 @@ pub struct DistributedRunConfig {
 
 ```rust
 pub struct ShardLease<A> {
-    pub shard_id: Arc<str>,
-    pub assignment: A,
-    pub write_context: WriteContext,
-    pub tenant_secret_key: TenantSecretKey,
+    shard_id: Arc<str>,
+    assignment: A,
+    write_context: WriteContext,
+    tenant_secret_key: TenantSecretKey,
 }
 ```
 
@@ -321,11 +321,14 @@ pub fn run_distributed(
 ) -> Result<DistributedRunReport, DistributedRuntimeError>
 ```
 
-`ShardLease<A>` is the future hand-off object from coordination into the worker
-loop. It keeps the string shard label used for recorder routing separate from
-the numeric shard identity carried inside `WriteContext`. `run_distributed`
-still validates budgets and then returns a family-specific runtime placeholder
-error.
+`ShardLease<A>` is the hand-off object from coordination into the worker loop.
+It keeps the string shard label used for recorder routing separate from the
+numeric shard identity carried inside `WriteContext`. Construction via
+`ShardLease::new` enforces that `assignment.policy_hash()` equals
+`write_context.policy_hash()`, returning `Err(PolicyMismatchError)` on
+mismatch. Fields are private; callers access them through getter methods.
+`run_distributed` validates budgets and then returns a family-specific runtime
+placeholder error.
 
 ---
 

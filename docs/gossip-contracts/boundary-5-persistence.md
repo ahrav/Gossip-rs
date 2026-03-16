@@ -72,7 +72,7 @@ Non-negotiables (project-wide):
 | `PageCommit<S>` | Compile-time enforcement of the commit protocol ordering: findings flush → done-ledger upsert → checkpoint boundary. State parameter `S` transitions through `AwaitingFindings` → `FindingsDurable` → `ItemDurable` → `CheckpointDurable`. Each state exposes only the transition methods valid for that stage; out-of-order calls are compile errors. |
 | `CheckpointBoundaryKind` | Copy tag distinguishing ordered-content progress from repo-frontier progress. |
 | `CheckpointBoundary` | Family-neutral checkpoint boundary: `OrderedContent(Cursor)` or `RepoFrontier(Cursor)`. Tags keep same-byte cursors from different source families distinct. |
-| `CommitScope` | Immutable scope for a single page commit: tenant, run, shard, fence epoch, committed-unit count, and tagged checkpoint boundary. Frozen at construction; every receipt-validation check compares against these values. |
+| `CommitScope` | Immutable scope for a single page commit: tenant, policy hash, run, shard, fence epoch, committed-unit count, and tagged checkpoint boundary. Frozen at construction; every receipt-validation check (including checkpoint matching) compares against these values. |
 | `WriteContext` | Shared runtime write scope: `tenant_id`, `policy_hash`, `run_id`, `shard_id`, `fence_epoch`. Runtime commit paths pass this copyable value once and let `ObservationRecord` / `DoneLedgerRecord` reconstruct the same routing and fencing metadata from durable fields. |
 
 ### Data types
