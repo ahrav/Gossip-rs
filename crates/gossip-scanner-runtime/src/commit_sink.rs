@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use gossip_contracts::{
     connector::{ItemKey, VersionId},
     identity::{
-        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint,
-        StableItemId, TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
+        derive_finding_id, derive_occurrence_id, key_secret_hash, FindingIdInputs, NormHash,
+        ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, StableItemId, TenantSecretKey,
     },
     persistence::WriteContext,
 };
@@ -207,10 +207,15 @@ impl DurableCommitSink {
 impl CommitSink for DurableCommitSink {
     fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()> {
         let key_bytes = item_key.as_bytes().to_vec();
-        self.in_flight_meta
-            .lock()
-            .map_err(|_| anyhow!("durable commit sink metadata lock poisoned during begin_item"))?
-            .insert(key_bytes.clone(), meta.clone());
+        {
+            let mut guard = self.in_flight_meta.lock().map_err(|_| {
+                anyhow!("durable commit sink metadata lock poisoned during begin_item")
+            })?;
+            if guard.contains_key(&key_bytes) {
+                return Err(anyhow!("begin_item called for item already in flight"));
+            }
+            guard.insert(key_bytes.clone(), meta.clone());
+        }
 
         self.recorder.record_commit_progress(
             &self.recorder_shard_label,
@@ -246,19 +251,29 @@ impl CommitSink for DurableCommitSink {
             .lock()
             .map_err(|_| anyhow!("durable commit sink metadata lock poisoned during finish_item"))?
             .remove(item_key.as_bytes());
-        if removed.is_none() {
-            return Err(anyhow!(
-                "finish_item called for item that was never started or already finished"
-            ));
-        }
+        let meta = removed.ok_or_else(|| {
+            anyhow!("finish_item called for item that was never started or already finished")
+        })?;
 
-        self.recorder.record_commit_progress(
+        if let Err(err) = self.recorder.record_commit_progress(
             &self.recorder_shard_label,
             CommitProgressRecord::Finish {
                 write_context: self.write_context,
                 item_key: item_key.as_bytes().to_vec(),
             },
-        )
+        ) {
+            // Re-insert metadata so the caller can retry finish_item.
+            self.in_flight_meta
+                .lock()
+                .map_err(|_| {
+                    anyhow!(
+                        "durable commit sink metadata lock poisoned during finish_item rollback"
+                    )
+                })?
+                .insert(item_key.as_bytes().to_vec(), meta);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -276,8 +291,8 @@ mod tests {
     use gossip_contracts::identity::derive_rule_fingerprint;
 
     use super::*;
-    use crate::OwnedCoreEvent;
     use crate::coordination_sink::StoredGitEvent;
+    use crate::OwnedCoreEvent;
 
     /// Test-only rule fingerprint lookup that derives from a synthetic name.
     fn test_rule_fingerprint(rule_id: u32) -> gossip_contracts::identity::RuleFingerprint {
@@ -682,6 +697,132 @@ mod tests {
         assert!(
             err.to_string().contains("never"),
             "expected lifecycle error, got: {err}"
+        );
+    }
+
+    /// Recorder that fails on `Finish`-variant `record_commit_progress` calls.
+    /// Used to verify atomicity of `finish_item`.
+    #[derive(Default)]
+    struct FinishFailingRecorder {
+        identity: Mutex<Vec<IdentityChainRecord>>,
+        progress: Mutex<Vec<CommitProgressRecord>>,
+    }
+
+    impl CoordinationEventRecorder for FinishFailingRecorder {
+        fn record_core_event(&self, _shard_id: &str, _event: OwnedCoreEvent) -> Result<()> {
+            Ok(())
+        }
+        fn record_git_event(&self, _shard_id: &str, _event: StoredGitEvent) -> Result<()> {
+            Ok(())
+        }
+        fn record_commit_progress(
+            &self,
+            _shard_id: &str,
+            event: CommitProgressRecord,
+        ) -> Result<()> {
+            if matches!(event, CommitProgressRecord::Finish { .. }) {
+                return Err(anyhow!("simulated recorder failure on Finish"));
+            }
+            self.progress.lock().expect("progress lock").push(event);
+            Ok(())
+        }
+        fn record_identity_chain(
+            &self,
+            _shard_id: &str,
+            record: IdentityChainRecord,
+        ) -> Result<()> {
+            self.identity.lock().expect("identity lock").push(record);
+            Ok(())
+        }
+    }
+
+    /// If `record_commit_progress` fails during `finish_item`, the item must
+    /// remain in `in_flight_meta` so a subsequent retry can succeed.
+    #[test]
+    fn finish_item_restores_metadata_on_recorder_failure() {
+        let recorder = Arc::new(FinishFailingRecorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-fail"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"retry-item").expect("item key");
+        sink.begin_item(
+            &item_key,
+            &ItemMeta {
+                stable_item_id: StableItemId::from_bytes([0x33; 32]),
+                version: None,
+                size_hint: Some(512),
+            },
+        )
+        .expect("begin item");
+
+        // finish_item should fail because the recorder rejects Finish events.
+        let err = sink.finish_item(&item_key).unwrap_err();
+        assert!(
+            err.to_string().contains("simulated"),
+            "expected recorder failure, got: {err}"
+        );
+
+        // The item must still be in in_flight_meta. Verify by calling
+        // metadata_for_item which returns Err if the item was removed.
+        let meta = sink.metadata_for_item(&item_key);
+        assert!(
+            meta.is_ok(),
+            "item metadata must be restored after recorder failure so finish_item can be retried"
+        );
+    }
+
+    /// Calling `begin_item` for an already in-flight item must be rejected to
+    /// enforce symmetric lifecycle guards with `finish_item`.
+    #[test]
+    fn begin_item_rejects_duplicate_in_flight_item() {
+        let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-dup"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"dup-item").expect("item key");
+        let meta = ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x33; 32]),
+            version: None,
+            size_hint: None,
+        };
+        sink.begin_item(&item_key, &meta).expect("first begin_item");
+
+        let err = sink.begin_item(&item_key, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("already in flight"),
+            "expected lifecycle error for duplicate begin, got: {err}"
+        );
+
+        // Only one Begin event should have been recorded.
+        let progress = recorder.progress.lock().expect("progress lock");
+        assert_eq!(
+            progress.len(),
+            1,
+            "duplicate begin_item must not emit a second Begin event"
         );
     }
 
