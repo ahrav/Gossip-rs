@@ -71,8 +71,12 @@ impl ScanTiming {
 
     /// Construct item-local scan timing metadata.
     ///
-    /// Panics when `started_at > finished_at`. Prefer [`Self::try_new`] when
-    /// the caller can handle the error.
+    /// # Panics
+    ///
+    /// Panics if `started_at > finished_at`. Callers must validate timing
+    /// monotonicity before construction when timestamps originate from
+    /// external sources (connectors, deserialized data). Prefer
+    /// [`Self::try_new`] when the caller can handle the error.
     #[inline]
     #[must_use]
     pub fn new(started_at: LogicalTime, finished_at: LogicalTime) -> Self {
