@@ -11,8 +11,8 @@ surfaces.
 ## 1. Dual Entry Points -- CLI, Worker, and Distributed Runtime
 
 The CLI and worker binaries call the same filesystem and Git entrypoints.
-Distributed execution uses `run_distributed`, which validates the run config
-and carries the same family naming into the worker loop surface.
+The distributed module currently exposes worker-loop foundation types instead
+of a callable placeholder entrypoint.
 
 ```mermaid
 %% Diagram: dual-entry-point-sequence
@@ -50,19 +50,18 @@ sequenceDiagram
     end
     RT-->>WRK: Result<ScanReport, ScanRuntimeError>
 
-    note over DRT: Distributed runtime entrypoint
-    DRT->>DRT: run_distributed(config)
-    DRT->>DRT: validate budgets
-    DRT-->>DRT: DistributedRuntimeError::Runtime(...)
+    note over DRT: distributed.rs foundation types
+    note over DRT: ShardLease&lt;A&gt;, DistributedCoordinator&lt;A&gt;, DistributedRuntimeConfig
 ```
 
 **One public boundary.** `ExecutionMode` remains caller-visible, but both
 `Direct` and `Connector` modes converge on the same family modules inside the
 runtime crate.
 
-**Typed placeholders.** The runtime reports unimplemented family loops through
-`ScanRuntimeError::Driver(...)` or `DistributedRuntimeError::Runtime(...)`
-rather than panicking or relying on `todo!()`.
+**Typed placeholders.** The filesystem and Git family modules report
+unimplemented execution through `ScanRuntimeError::Driver(...)` rather than
+panicking or relying on `todo!()`. The distributed type layer already carries a
+dedicated `DistributedRuntimeError` enum for the upcoming worker loop.
 
 ---
 
@@ -70,9 +69,10 @@ rather than panicking or relying on `todo!()`.
 
 `gossip-scanner-runtime` expresses scan execution in terms of source families.
 The ordered-content family uses `OrderedContentRuntime`; the Git family uses
-`GitRepoRuntime`; the distributed surface keeps its own `DistributedFamily`
-selector. The filesystem and Git backend crates remain the engine targets that
-these family modules are shaped around.
+`GitRepoRuntime`; the distributed module now provides shared worker-loop types
+such as `ShardLease<A>` and `DistributedCoordinator<A>`. The filesystem and Git
+backend crates remain the engine targets that these family modules are shaped
+around.
 
 ```mermaid
 %% Diagram: family-runtime-surface
@@ -80,13 +80,16 @@ graph TD
     subgraph EntryPoints["Runtime entrypoints"]
         FS["scan_fs(...)"]
         GIT["scan_git(...)"]
-        DIST["run_distributed(...)"]
     end
 
     subgraph Runtime["gossip-scanner-runtime"]
         OC["OrderedContentRuntime<br/>filesystem_placeholder(...)"]
         GR["GitRepoRuntime<br/>local_repo_placeholder(...)"]
-        DF["DistributedFamily<br/>OrderedContent | GitRepo"]
+    end
+
+    subgraph Distributed["distributed.rs foundation"]
+        DIST["ShardLease&lt;A&gt;"]
+        DF["DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
     end
 
     subgraph Contracts["gossip-contracts::connector"]
@@ -204,9 +207,9 @@ graph TD
     E["ordered_content::filesystem_placeholder"]
     F["git_repo::local_repo_placeholder"]
     G["Result&lt;ScanReport, ScanRuntimeError&gt;"]
-    H["run_distributed"]
-    I["Validate distributed budgets"]
-    J["Result&lt;DistributedRunReport,<br/>DistributedRuntimeError&gt;"]
+    H["distributed.rs foundation types"]
+    I["ShardLease&lt;A&gt;<br/>DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
+    J["DistributedRunReport /<br/>DistributedRuntimeError"]
 
     A --> B
     B --> C
@@ -215,8 +218,8 @@ graph TD
     D -- "git-repo" --> F
     E --> G
     F --> G
+    D -. "types only" .-> H
 
-    A --> H
     H --> I
     I --> J
 
@@ -232,9 +235,10 @@ graph TD
     style J fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
 ```
 
-**Current execution surface.** Filesystem, Git, and distributed entrypoints all
-share the same pattern: validate inputs first, then hand off to a family module
-that owns the runtime-specific execution semantics.
+**Current execution surface.** Filesystem and Git entrypoints validate inputs
+first, then hand off to a family module that owns execution semantics. The
+distributed module currently contributes the types that the worker loop will
+assemble around coordination and durability backends.
 
 ---
 

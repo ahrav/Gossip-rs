@@ -146,7 +146,7 @@ Runtime orchestration imports shared connector nouns from
 `gossip-contracts::connector` and selects a family module inside
 `gossip-scanner-runtime`. Ordered-content work flows through
 `OrderedContentRuntime`; Git repository work flows through `GitRepoRuntime`;
-distributed execution keeps its own `DistributedFamily` selector.
+the distributed module contributes the shared worker-loop foundation types.
 
 ```mermaid
 %% Diagram: connector-runtime-family-bridge
@@ -156,9 +156,9 @@ graph LR
     end
 
     subgraph Runtime["gossip-scanner-runtime"]
-        OCR["<b>OrderedContentRuntime</b><br/>execute_source(...)<br/>filesystem_placeholder(...)"]
-        GRR["<b>GitRepoRuntime</b><br/>execute_discovery(...)<br/>execute_repo(...)<br/>local_repo_placeholder(...)"]
-        DRT["<b>distributed::run_distributed</b><br/>DistributedFamily"]
+        OCR["<b>OrderedContentRuntime</b><br/>execute_source(...)<br/>scan_local_filesystem(...)"]
+        GRR["<b>GitRepoRuntime</b><br/>execute_discovery(...)<br/>execute_repo(...)<br/>scan_local_repo(...)"]
+        DRT["<b>distributed.rs foundation</b><br/>ShardLease&lt;A&gt;<br/>DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
     end
 
     subgraph Contracts["gossip-contracts::connector"]
@@ -207,11 +207,11 @@ graph LR
 | Runtime entry | Purpose |
 | ------------- | ------- |
 | `OrderedContentRuntime::execute_source` | Generic ordered-content execution hook |
-| `ordered_content::filesystem_placeholder` | Filesystem-facing ordered-content entrypoint |
+| `ordered_content::scan_local_filesystem` | Filesystem-facing ordered-content entrypoint |
 | `GitRepoRuntime::execute_discovery` | Generic repository-discovery hook |
 | `GitRepoRuntime::execute_repo` | Generic mirror + executor hook |
-| `git_repo::local_repo_placeholder` | Local repository entrypoint |
-| `distributed::run_distributed` | Family-tagged distributed runtime surface |
+| `git_repo::scan_local_repo` | Local repository entrypoint |
+| `distributed.rs` foundation types | Lease, coordinator, persistence, config, and error layer for the distributed worker loop |
 
 **Boundary split.** `gossip-connectors` owns concrete source implementations;
 `gossip-contracts` owns the family traits and value contracts; `gossip-scanner-runtime`
@@ -313,6 +313,6 @@ for system-wide recovery patterns.
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/git.rs` | `GitConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector`, `MemItem` |
-| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `filesystem_placeholder` (pub(crate)) |
-| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `local_repo_placeholder` (pub(crate)) |
-| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/distributed.rs` | `DistributedFamily`, `DistributedRunConfig`, `DistributedRunReport`, `run_distributed` |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `scan_local_filesystem` (pub(crate)) |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `scan_local_repo` (pub(crate)) |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/distributed.rs` | `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, `DistributedRuntimeConfig`, `DistributedRunReport`, `DistributedRuntimeError` |
