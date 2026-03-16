@@ -1,8 +1,17 @@
 //! Testcontainers-based etcd lifecycle management for integration tests.
 //!
-//! Provides [`test_coordinator`], [`test_coordinator_with_limits`],
-//! [`test_coordinator_with_ttl`], and [`test_async_coordinator_config`] to
-//! create test coordinators or async-ready configs backed by either:
+//! Provides helpers to create test coordinators or async-ready configs.
+//!
+//! **Isolated namespace** (unique per call):
+//! [`test_coordinator`], [`test_coordinator_with_limits`],
+//! [`test_coordinator_with_tuning`], [`test_async_coordinator_config`].
+//!
+//! **Shared namespace** (caller-controlled):
+//! [`contention_namespace`], [`test_coordinator_in_namespace`],
+//! [`test_coordinator_in_namespace_with_limits`],
+//! [`test_coordinator_in_namespace_with_tuning`].
+//!
+//! All helpers are backed by either:
 //!
 //! - An auto-provisioned Docker container (default), or
 //! - A pre-existing etcd at the address in `ETCD_ENDPOINTS`.
@@ -178,22 +187,6 @@ pub fn test_coordinator_with_limits(
     EtcdCoordinator::connect(config).expect("test etcd should be reachable")
 }
 
-/// Create an [`EtcdCoordinator`] with a custom owner-lease TTL
-/// for testing lease expiry behavior.
-pub fn test_coordinator_with_ttl(ttl_secs: i64) -> EtcdCoordinator {
-    let ep = shared_endpoint();
-    let namespace = unique_namespace();
-    let config = EtcdCoordinatorConfig::from_endpoints_csv_with_tuning(
-        &ep.endpoint,
-        &namespace,
-        ttl_secs,
-        8,
-        8,
-    )
-    .expect("test endpoint config should be valid");
-    EtcdCoordinator::connect(config).expect("test etcd should be reachable")
-}
-
 /// Create an [`EtcdCoordinator`] with explicit persistence-tuning
 /// values for testing backend-specific behavior (e.g., reduced
 /// `max_children_per_op` to test fanout rejection).
@@ -202,11 +195,30 @@ pub fn test_coordinator_with_tuning(
     optimistic_txn_retries: usize,
     max_children_per_op: usize,
 ) -> EtcdCoordinator {
-    let ep = shared_endpoint();
     let namespace = unique_namespace();
+    test_coordinator_in_namespace_with_tuning(
+        &namespace,
+        owner_lease_ttl_secs,
+        optimistic_txn_retries,
+        max_children_per_op,
+    )
+}
+
+/// Create an [`EtcdCoordinator`] targeting a specific shared namespace with
+/// explicit persistence tuning.
+///
+/// Multi-coordinator tests use this helper when they need both a shared etcd
+/// keyspace and non-default lease or retry settings.
+pub fn test_coordinator_in_namespace_with_tuning(
+    namespace: &str,
+    owner_lease_ttl_secs: i64,
+    optimistic_txn_retries: usize,
+    max_children_per_op: usize,
+) -> EtcdCoordinator {
+    let ep = shared_endpoint();
     let config = EtcdCoordinatorConfig::from_endpoints_csv_with_tuning(
         &ep.endpoint,
-        &namespace,
+        namespace,
         owner_lease_ttl_secs,
         optimistic_txn_retries,
         max_children_per_op,
