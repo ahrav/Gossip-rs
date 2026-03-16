@@ -21,7 +21,6 @@
 //!   enabled action when a worker reports `ShouldPark`.
 
 #![cfg(any(test, feature = "scheduler-sim"))]
-#![allow(dead_code)]
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -29,9 +28,8 @@ use std::time::Duration;
 
 use super::executor::ExecutorConfig;
 use super::executor_core::{
-    ACCEPTING_BIT, COUNT_UNIT, ExecTraceEvent, IdleAction, IdleHooks, NoopTrace, PopSource,
-    TraceHooks, WAKE_ON_HOARD_THRESHOLD, WorkerCtxLike, WorkerStepResult, in_flight, is_accepting,
-    worker_step,
+    ACCEPTING_BIT, COUNT_UNIT, ExecTraceEvent, IdleAction, IdleHooks, PopSource, TraceHooks,
+    WAKE_ON_HOARD_THRESHOLD, WorkerCtxLike, WorkerStepResult, in_flight, is_accepting, worker_step,
 };
 use super::rng::XorShift64;
 
@@ -49,15 +47,6 @@ pub struct SimExecCfg {
 }
 
 impl SimExecCfg {
-    pub(crate) fn new(workers: usize, seed: u64) -> Self {
-        Self {
-            workers,
-            steal_tries: 4,
-            seed,
-            wake_on_hoard_threshold: WAKE_ON_HOARD_THRESHOLD,
-        }
-    }
-
     pub(crate) fn to_executor_config(self) -> ExecutorConfig {
         // Spin/park values are placeholders: simulation does not sleep,
         // but the shared `worker_step` requires a config.
@@ -90,7 +79,9 @@ pub(crate) struct SimWorker<T, S> {
     pub(crate) local_spawns_since_wake: u32,
     /// Per-worker RNG for victim selection.
     pub(crate) rng: XorShift64,
-    /// Per-worker scratch used by the task runner.
+    /// Per-worker scratch used by the task runner. Accessed through
+    /// `WorkerCtxLike::scratch_mut()` which the dead_code lint cannot trace.
+    #[allow(dead_code)]
     pub(crate) scratch: S,
 }
 
@@ -156,11 +147,6 @@ impl<T: Send + 'static, S> SimExecutor<T, S> {
             wake_on_hoard_threshold: cfg.wake_on_hoard_threshold,
             current_worker: 0,
         }
-    }
-
-    pub(crate) fn spawn_local(&mut self, task: T) {
-        let wid = self.current_worker;
-        self.spawn_local_for(wid, task);
     }
 
     /// Spawn a task into a specific worker's local queue.
@@ -240,19 +226,6 @@ impl<T: Send + 'static, S> SimExecutor<T, S> {
         }
 
         res
-    }
-
-    pub(crate) fn step_worker_no_trace<Runner>(
-        &mut self,
-        wid: usize,
-        runner: &mut Runner,
-    ) -> WorkerStepResult<<NoopTrace as TraceHooks<T>>::TaskTag>
-    where
-        Runner: FnMut(T, &mut SimExecutor<T, S>),
-    {
-        let mut idle = SimIdle;
-        let mut trace = NoopTrace;
-        self.step_worker(wid, runner, &mut idle, &mut trace)
     }
 }
 
@@ -434,14 +407,10 @@ pub struct LogicalTaskInit {
 }
 
 /// Blocking reason for a logical task.
-///
-/// `Resource` is reserved for future blocking semantics; current bytecode
-/// uses `TryAcquire` instead of blocking on resources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BlockReason {
     SleepUntil(u64),
     Io(IoToken),
-    Resource(ResourceId),
 }
 
 #[derive(Clone, Debug)]
@@ -459,13 +428,6 @@ pub(crate) trait TaskTraceHooks {
 
     /// Called when a spawn successfully enqueues a new run-token.
     fn on_task_spawn(&mut self, _parent: TaskId, _child: TaskId, _placement: SpawnPlacement) {}
-}
-
-/// No-op task tracing (production default).
-pub(crate) struct NoopTaskTrace;
-
-impl TaskTraceHooks for NoopTaskTrace {
-    fn on_task_instr(&mut self, _tid: TaskId, _pc: u16, _instr: &Instruction) {}
 }
 
 /// Bytecode VM for scheduler simulations.

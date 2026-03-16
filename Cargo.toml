@@ -44,6 +44,9 @@ gossip-coordination-etcd = { path = "crates/gossip-coordination-etcd" }
 gossip-persistence-inmemory = { path = "crates/gossip-persistence-inmemory" }
 gossip-frontier = { path = "crates/gossip-frontier" }
 
+# External dependencies
+postgres = "0.19"
+
 # External dev/test dependencies
 rstest = "0.25"
 proptest = "1.6"

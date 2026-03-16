@@ -1386,6 +1386,9 @@ name = "gossip-persistence-inmemory"
 version = "0.1.0"
 dependencies = [
  "gossip-contracts",
+ "gossip-done-ledger-postgres",
+ "gossip-pg-common",
+ "postgres",
  "proptest",
  "rand",
  "rand_chacha",

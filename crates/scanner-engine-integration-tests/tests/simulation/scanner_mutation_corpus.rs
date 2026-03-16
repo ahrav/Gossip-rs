@@ -16,12 +16,6 @@ struct MutationCorpusEntry {
     seed: u64,
     run_config: RunConfig,
     plans: Vec<MutationPlan>,
-    /// Original violation messages captured when the failure was written.
-    /// Defaults to empty for backward-compatible deserialization of older
-    /// corpus files that predate this field.
-    #[serde(default)]
-    #[allow(dead_code)]
-    violation_messages: Vec<String>,
 }
 
 fn corpus_dir() -> PathBuf {

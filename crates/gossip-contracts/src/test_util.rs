@@ -311,3 +311,60 @@ impl std::fmt::Display for TestWaitError {
 }
 
 impl std::error::Error for TestWaitError {}
+
+// ---------------------------------------------------------------------------
+// Seed and case-count helpers for differential oracle tests
+// ---------------------------------------------------------------------------
+
+/// Parse a `u64` seed from the environment variable `var`.
+///
+/// Returns `None` when the variable is absent. Panics with a descriptive
+/// message when the variable is present but not a valid `u64`.
+pub fn parse_env_seed(var: &str) -> Option<u64> {
+    match std::env::var(var) {
+        Ok(raw) => Some(
+            raw.parse::<u64>()
+                .unwrap_or_else(|err| panic!("{var}={raw:?} is not a valid u64: {err}")),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            panic!("{var}={raw:?} is not valid Unicode")
+        }
+    }
+}
+
+/// Parse a case count from the environment variable `var`, falling back to
+/// `default` when the variable is absent.
+///
+/// Panics with a descriptive message when the variable is present but not
+/// a valid `usize`.
+pub fn parse_env_case_count(var: &str, default: usize) -> usize {
+    match std::env::var(var) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .unwrap_or_else(|err| panic!("{var}={raw:?} is not a valid usize: {err}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            panic!("{var}={raw:?} is not valid Unicode")
+        }
+    }
+}
+
+/// Return a single seed from `seed_var`, or sequential `0..N` seeds where
+/// `N` comes from `count_var` (defaulting to `default`).
+///
+/// This is the standard pattern for differential-oracle test entry points:
+/// set the seed env var to reproduce a single failure, or leave it unset to
+/// run `N` sequential seeds.
+pub fn selected_seeds_from_env(seed_var: &str, count_var: &str, default: usize) -> Vec<u64> {
+    if let Some(seed) = parse_env_seed(seed_var) {
+        vec![seed]
+    } else {
+        let count = parse_env_case_count(count_var, default);
+        assert!(
+            count > 0,
+            "{count_var} resolved to 0 — oracle would run no cases"
+        );
+        (0..count as u64).collect()
+    }
+}

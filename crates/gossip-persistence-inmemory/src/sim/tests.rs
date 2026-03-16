@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use gossip_contracts::{
     persistence::{DoneLedgerRecord, DoneLedgerStatus},
@@ -28,10 +25,6 @@ struct SweepOutcome {
     seed_count: usize,
     failures: Vec<(u64, String)>,
     aggregate_counts: BTreeMap<DoneLedgerSimEventKind, usize>,
-    /// Wall-clock duration. Retained for diagnostic output; not asserted
-    /// in tests to avoid CI flakiness.
-    #[allow(dead_code)]
-    elapsed: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -92,13 +85,11 @@ fn run_seed_sweep<F>(seed_count: usize, runner: F) -> SweepOutcome
 where
     F: Fn(u64) -> DoneLedgerSimReport + Sync,
 {
-    let start = Instant::now();
     if seed_count == 0 {
         return SweepOutcome {
             seed_count,
             failures: Vec::new(),
             aggregate_counts: BTreeMap::new(),
-            elapsed: start.elapsed(),
         };
     }
 
@@ -169,7 +160,6 @@ where
         seed_count,
         failures,
         aggregate_counts,
-        elapsed: start.elapsed(),
     }
 }
 

@@ -58,9 +58,7 @@ use std::collections::HashSet;
 #[cfg(feature = "stdx-proptest")]
 use std::ops::Range;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Cached engine singletons — Vectorscan DB compilation is extremely expensive
@@ -3191,33 +3189,6 @@ fn nested_encoding_is_skipped_in_gated_mode() {
 
     let hits = scan_chunk_findings(&eng, &hay);
     assert!(!hits.iter().any(|h| h.rule == "github-pat"));
-}
-
-struct TempFile {
-    path: PathBuf,
-}
-
-impl TempFile {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn write_temp_file(bytes: &[u8]) -> std::io::Result<TempFile> {
-    let mut path = std::env::temp_dir();
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    path.push(format!("scanner_rs_test_{}_{}", std::process::id(), stamp));
-    std::fs::write(&path, bytes)?;
-    Ok(TempFile { path })
 }
 
 #[cfg(feature = "stdx-proptest")]
