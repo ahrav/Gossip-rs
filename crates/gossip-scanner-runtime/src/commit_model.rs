@@ -149,12 +149,13 @@ impl<'a> CommitRequest<'a> {
             findings
                 .observations()
                 .first()
-                .map_or(true, |obs| obs.tenant_id() == write_context.tenant_id()),
+                .is_none_or(|obs| obs.tenant_id() == write_context.tenant_id()),
             "write_context tenant must match observations tenant"
         );
         debug_assert!(
-            done_ledger.first().map_or(true, |rec| rec.key().tenant_id()
-                == write_context.tenant_id()),
+            done_ledger
+                .first()
+                .is_none_or(|rec| rec.key().tenant_id() == write_context.tenant_id()),
             "write_context tenant must match done-ledger tenant"
         );
         Self {
@@ -175,7 +176,6 @@ impl<'a> CommitRequest<'a> {
 
     /// Completed unit this request will make durable.
     #[inline]
-    #[must_use]
     pub fn completed_unit(&self) -> &CompletedUnit {
         &self.completed_unit
     }
@@ -196,7 +196,6 @@ impl<'a> CommitRequest<'a> {
 
     /// Consume the request into its raw parts.
     #[inline]
-    #[must_use]
     pub fn into_parts(
         self,
     ) -> (
@@ -279,7 +278,6 @@ impl UnitCommitReceipt {
 
     /// Completed unit proved durable by this receipt.
     #[inline]
-    #[must_use]
     pub fn completed_unit(&self) -> &CompletedUnit {
         &self.completed_unit
     }
@@ -293,7 +291,6 @@ impl UnitCommitReceipt {
 
     /// Consume the receipt into its raw parts.
     #[inline]
-    #[must_use]
     pub fn into_parts(self) -> (CompletedUnit, ItemCommitReceipt) {
         (self.completed_unit, self.durable)
     }
@@ -361,14 +358,12 @@ impl CheckpointAggregatorInput {
 
     /// Durable receipt carried into the checkpoint stage.
     #[inline]
-    #[must_use]
     pub fn receipt(&self) -> &UnitCommitReceipt {
         &self.receipt
     }
 
     /// Consume the wrapper and return the underlying receipt.
     #[inline]
-    #[must_use]
     pub fn into_receipt(self) -> UnitCommitReceipt {
         self.receipt
     }
