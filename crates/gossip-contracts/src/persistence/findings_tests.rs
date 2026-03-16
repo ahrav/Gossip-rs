@@ -160,6 +160,30 @@ fn observation_record_preserves_optional_location() {
 }
 
 #[test]
+fn observation_record_from_write_context_preserves_scope() {
+    let write_context = WriteContext::new(
+        tenant(1),
+        policy(4),
+        RunId::from_raw(6),
+        ShardId::from_raw(7),
+        FenceEpoch::from_raw(8),
+    );
+
+    let observation = ObservationRecord::from_write_context(
+        write_context,
+        occurrence(3),
+        ovid(5),
+        LogicalTime::from_raw(9),
+    );
+
+    assert_eq!(observation.write_context(), write_context);
+    assert_eq!(observation.policy_hash(), write_context.policy_hash());
+    assert_eq!(observation.run_id(), write_context.run_id());
+    assert_eq!(observation.shard_id(), write_context.shard_id());
+    assert_eq!(observation.fence_epoch(), write_context.fence_epoch());
+}
+
+#[test]
 fn observation_record_validation_helpers_match_stored_identity() {
     let record = make_observation_record(0x03);
 

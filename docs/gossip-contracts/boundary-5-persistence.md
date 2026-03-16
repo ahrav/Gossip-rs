@@ -73,6 +73,7 @@ Non-negotiables (project-wide):
 | `CheckpointBoundaryKind` | Copy tag distinguishing ordered-content progress from repo-frontier progress. |
 | `CheckpointBoundary` | Family-neutral checkpoint boundary: `OrderedContent(Cursor)` or `RepoFrontier(Cursor)`. Tags keep same-byte cursors from different source families distinct. |
 | `CommitScope` | Immutable scope for a single page commit: tenant, run, shard, fence epoch, committed-unit count, and tagged checkpoint boundary. Frozen at construction; every receipt-validation check compares against these values. |
+| `WriteContext` | Shared runtime write scope: `tenant_id`, `policy_hash`, `run_id`, `shard_id`, `fence_epoch`. Runtime commit paths pass this copyable value once and let `ObservationRecord` / `DoneLedgerRecord` reconstruct the same routing and fencing metadata from durable fields. |
 
 ### Data types
 
@@ -83,7 +84,7 @@ Non-negotiables (project-wide):
 | `DoneLedgerKey` | Composite lookup key: `(TenantId, PolicyHash, OvidHash)` — fixed-width, implements `CanonicalBytes`. |
 | `DoneLedgerStatus` | Scan outcome enum with monotonic join-semilattice semantics: `FailedRetryable(1) < FailedPermanent(2) < Skipped(3) < ScannedClean(10) < ScannedWithFindings(11)`. Rank gap between 3 and 10 reserves space for future non-terminal states. |
 | `DoneLedgerRecord` | Complete done-ledger row: key, lattice status, `bytes_scanned`, `findings_count`, provenance, optional error code. `try_new()` enforces the status/`findings_count` shape; write paths and `merge()` call `validate()` to enforce the full invariant set (e.g., non-scanned statuses require `error_code`). `ScannedClean` forces `findings_count = 0`; `ScannedWithFindings` keeps only `ScannedWithFindings` contributors and clamps to `>= 1`; provenance winner is the lexicographically greatest `(status, finished_at, started_at, fence_epoch, run_id, shard_id, error_code_bytes)` tuple. |
-| `DoneLedgerProvenance` | Write-side metadata: `run_id`, `shard_id`, `fence_epoch`, `started_at`, `finished_at`. Not part of the dedup key. |
+| `DoneLedgerProvenance` | Write-side metadata: `run_id`, `shard_id`, `fence_epoch`, `started_at`, `finished_at`. Not part of the dedup key. `from_write_context()` extracts the non-key fields from a `WriteContext`; `DoneLedgerRecord::write_context()` reconstructs the full scope by combining key + provenance. |
 | `DoneLedgerErrorCode` | ASCII-safe bounded string (max 128 bytes) for structured error codes like `HTTP_403`, `TIMEOUT`. Validated alphabet at construction. |
 | `OvidHash` | Content-addressed Object-Version Identity digest (BLAKE3, 32 bytes). Derived from `OvidHashInputs` via `derive_ovid_hash`. |
 | `OvidHashInputs` | Structured inputs: `stable_item_id` + `version` (strong or weak `VersionId`). |
@@ -94,7 +95,7 @@ Non-negotiables (project-wide):
 |------|---------|
 | `FindingRecord` | Layer 1 — stable identity: `(tenant, stable_item_id, rule_fingerprint, secret_hash)`. Content-addressed `FindingId`. Version-independent and policy-independent. Never stores raw secrets. |
 | `OccurrenceRecord` | Layer 2 — version-specific: pins a finding to an `ObjectVersionId` with `(byte_offset, byte_length)` span. `byte_length` guaranteed non-zero via `NonZeroU64`. Content-addressed `OccurrenceId`. |
-| `ObservationRecord` | Layer 3 — policy- and run-scoped: records that an occurrence was seen under a specific `(policy_hash, run_id, shard_id, fence_epoch)` with associated `ovid_hash`. Optional display-safe `Location` metadata. Content-addressed `ObservationId`. |
+| `ObservationRecord` | Layer 3 — policy- and run-scoped: records that an occurrence was seen under a specific `(policy_hash, run_id, shard_id, fence_epoch)` with associated `ovid_hash`. Optional display-safe `Location` metadata. Content-addressed `ObservationId`. Runtime code can build one directly from `WriteContext`, and `write_context()` round-trips the stored routing/fencing fields back into the shared scope value. |
 | `FindingsUpsertBatch<'a>` | Borrowed zero-copy batch view over all three layers. Provides `validate_referential_integrity()` for intra-batch consistency checks. |
 
 **Commit receipts** (`commit.rs`):

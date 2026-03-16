@@ -45,7 +45,7 @@ use crate::{
 };
 
 use super::{
-    PersistenceInputError,
+    PersistenceInputError, WriteContext,
     commit::{CommitHandle, FindingsCommitReceipt},
     ovid::OvidHash,
 };
@@ -353,6 +353,29 @@ impl ObservationRecord {
         }
     }
 
+    /// Construct an observation from a shared write context.
+    ///
+    /// Runtime code should prefer this constructor when the tenant, policy,
+    /// run, shard, and fence epoch all come from the same leased write scope.
+    #[must_use]
+    pub fn from_write_context(
+        write_context: WriteContext,
+        occurrence_id: OccurrenceId,
+        ovid_hash: OvidHash,
+        seen_at: LogicalTime,
+    ) -> Self {
+        Self::new(
+            write_context.tenant_id(),
+            occurrence_id,
+            write_context.policy_hash(),
+            ovid_hash,
+            write_context.run_id(),
+            write_context.shard_id(),
+            write_context.fence_epoch(),
+            seen_at,
+        )
+    }
+
     /// Reconstruct an observation record from persisted storage and verify
     /// that the stored `observation_id` still matches the canonical
     /// derivation.
@@ -478,6 +501,20 @@ impl ObservationRecord {
             policy: self.policy_hash,
             occurrence: self.occurrence_id,
         })
+    }
+
+    /// Reconstruct the shared write context from this observation's stored
+    /// routing and fencing fields.
+    #[inline]
+    #[must_use]
+    pub const fn write_context(&self) -> WriteContext {
+        WriteContext::new(
+            self.tenant_id,
+            self.policy_hash,
+            self.run_id,
+            self.shard_id,
+            self.fence_epoch,
+        )
     }
 
     /// Parent occurrence this observation references.

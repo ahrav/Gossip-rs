@@ -3,7 +3,13 @@
 //! This module exposes the high-level distributed runtime nouns without the
 //! removed driver-based lease execution surface.
 
+use std::sync::Arc;
+
 use anyhow::anyhow;
+use gossip_contracts::{
+    identity::{PolicyHash, TenantSecretKey},
+    persistence::WriteContext,
+};
 
 use crate::{ScanBudgets, ScanRuntimeError};
 
@@ -30,6 +36,54 @@ impl Default for DistributedRunConfig {
         Self {
             family: DistributedFamily::OrderedContent,
             budgets: ScanBudgets::default(),
+        }
+    }
+}
+
+/// Assignment payload that can report its policy scope for lease validation.
+pub trait ShardLeaseAssignment {
+    /// Detection-policy hash carried by the assignment payload.
+    fn policy_hash(&self) -> PolicyHash;
+}
+
+/// Lease payload consumed by the future distributed runtime.
+///
+/// One lease corresponds to one shard from the coordination layer. The string
+/// shard label routes runtime telemetry, while [`WriteContext`] carries the
+/// numeric shard identity used for fenced writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardLease<A> {
+    /// String shard label used for routing recorder events.
+    pub shard_id: Arc<str>,
+    /// Scan assignment payload associated with this lease.
+    pub assignment: A,
+    /// Shared routing and fencing metadata for all writes emitted under the lease.
+    pub write_context: WriteContext,
+    /// Tenant secret key used for secret-hash derivation.
+    pub tenant_secret_key: TenantSecretKey,
+}
+
+impl<A: ShardLeaseAssignment> ShardLease<A> {
+    /// Construct a lease payload and verify that assignment and write context
+    /// agree on policy scope.
+    #[must_use]
+    pub fn new(
+        shard_id: Arc<str>,
+        assignment: A,
+        write_context: WriteContext,
+        tenant_secret_key: TenantSecretKey,
+    ) -> Self {
+        assert_eq!(
+            assignment.policy_hash(),
+            write_context.policy_hash(),
+            "lease assignment policy_hash must match write_context.policy_hash"
+        );
+
+        Self {
+            shard_id,
+            assignment,
+            write_context,
+            tenant_secret_key,
         }
     }
 }
@@ -92,6 +146,18 @@ pub fn run_distributed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gossip_contracts::identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct StubAssignment {
+        policy_hash: PolicyHash,
+    }
+
+    impl ShardLeaseAssignment for StubAssignment {
+        fn policy_hash(&self) -> PolicyHash {
+            self.policy_hash
+        }
+    }
 
     #[test]
     fn distributed_runtime_validates_budgets_before_placeholder_error() {
@@ -117,5 +183,50 @@ mod tests {
             error,
             DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(_))
         ));
+    }
+
+    #[test]
+    fn shard_lease_preserves_assignment_and_write_context() {
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x22; 32]),
+            RunId::from_raw(3),
+            ShardId::from_raw(4),
+            FenceEpoch::from_raw(5),
+        );
+        let assignment = StubAssignment {
+            policy_hash: write_context.policy_hash(),
+        };
+        let lease = ShardLease::new(
+            Arc::from("shard-a"),
+            assignment.clone(),
+            write_context,
+            TenantSecretKey::from_bytes([0x33; 32]),
+        );
+
+        assert_eq!(&*lease.shard_id, "shard-a");
+        assert_eq!(lease.assignment, assignment);
+        assert_eq!(lease.write_context, write_context);
+    }
+
+    #[test]
+    #[should_panic(expected = "lease assignment policy_hash must match write_context.policy_hash")]
+    fn shard_lease_rejects_mismatched_policy_hash() {
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x22; 32]),
+            RunId::from_raw(3),
+            ShardId::from_raw(4),
+            FenceEpoch::from_raw(5),
+        );
+        let assignment = StubAssignment {
+            policy_hash: PolicyHash::from_bytes([0xFF; 32]),
+        };
+        let _ = ShardLease::new(
+            Arc::from("shard-x"),
+            assignment,
+            write_context,
+            TenantSecretKey::from_bytes([0x33; 32]),
+        );
     }
 }

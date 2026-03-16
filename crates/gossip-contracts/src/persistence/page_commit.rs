@@ -63,16 +63,19 @@
 //! deterministic scope mismatches — retrying will produce the same result.
 //! These indicate a programming error, not a transient failure.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, num::NonZeroU64, sync::Arc};
 
 use crate::{
     connector::Cursor,
-    identity::{FenceEpoch, RunId, ShardId, TenantId},
+    identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId},
 };
 
-use super::commit::{
-    CheckpointCommitReceipt, CommitHandle, DoneLedgerCommitReceipt, FindingsCommitReceipt,
-    ItemCommitReceipt, PageCommitReceipt,
+use super::{
+    WriteContext,
+    commit::{
+        CheckpointCommitReceipt, CommitHandle, DoneLedgerCommitReceipt, FindingsCommitReceipt,
+        ItemCommitReceipt, PageCommitReceipt,
+    },
 };
 
 /// Semantic domain for a durable checkpoint boundary.
@@ -173,10 +176,14 @@ impl CheckpointBoundary {
 
 /// Immutable scope for one durable commit boundary.
 ///
-/// A commit scope is always bound to one tenant, run, shard, fence epoch,
-/// committed-prefix length, and checkpoint boundary. The runtime freezes this
-/// scope once, then drives the work through findings, done-ledger, and
+/// A commit scope is always bound to one tenant, policy, run, shard, fence
+/// epoch, committed-prefix length, and checkpoint boundary. The runtime freezes
+/// this scope once, then drives the work through findings, done-ledger, and
 /// checkpoint durability.
+///
+/// `policy_hash` is carried for scope-identity completeness — checkpoint receipt
+/// validation compares the full scope — even though checkpoint routing itself is
+/// policy-independent.
 ///
 /// # Invariant
 ///
@@ -186,10 +193,11 @@ impl CheckpointBoundary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitScope {
     tenant_id: TenantId,
+    policy_hash: PolicyHash,
     run_id: RunId,
     shard_id: ShardId,
     fence_epoch: FenceEpoch,
-    committed_units: u64,
+    committed_units: NonZeroU64,
     checkpoint_boundary: CheckpointBoundary,
 }
 
@@ -198,14 +206,16 @@ impl CommitScope {
     #[must_use]
     pub fn new(
         tenant_id: TenantId,
+        policy_hash: PolicyHash,
         run_id: RunId,
         shard_id: ShardId,
         fence_epoch: FenceEpoch,
-        committed_units: u64,
+        committed_units: NonZeroU64,
         checkpoint_boundary: CheckpointBoundary,
     ) -> Self {
         Self {
             tenant_id,
+            policy_hash,
             run_id,
             shard_id,
             fence_epoch,
@@ -214,11 +224,40 @@ impl CommitScope {
         }
     }
 
+    /// Construct a commit scope from a shared write context.
+    ///
+    /// Extracts tenant, policy, run, shard, and fence epoch from the
+    /// [`WriteContext`]; the caller supplies the remaining commit-specific
+    /// fields.
+    #[must_use]
+    pub fn from_write_context(
+        wc: WriteContext,
+        committed_units: NonZeroU64,
+        checkpoint_boundary: CheckpointBoundary,
+    ) -> Self {
+        Self::new(
+            wc.tenant_id(),
+            wc.policy_hash(),
+            wc.run_id(),
+            wc.shard_id(),
+            wc.fence_epoch(),
+            committed_units,
+            checkpoint_boundary,
+        )
+    }
+
     /// Tenant isolation boundary for this scope.
     #[inline]
     #[must_use]
     pub const fn tenant_id(&self) -> TenantId {
         self.tenant_id
+    }
+
+    /// Detection-policy version under which the scope was produced.
+    #[inline]
+    #[must_use]
+    pub const fn policy_hash(&self) -> PolicyHash {
+        self.policy_hash
     }
 
     /// Run that produced this scope.
@@ -245,7 +284,7 @@ impl CommitScope {
     /// Number of committed units represented by this scope.
     #[inline]
     #[must_use]
-    pub const fn committed_units(&self) -> u64 {
+    pub const fn committed_units(&self) -> NonZeroU64 {
         self.committed_units
     }
 
@@ -400,18 +439,20 @@ pub struct CheckpointDurable {
 /// Skipping findings and jumping straight to done-ledger is a type error:
 ///
 /// ```compile_fail
+/// use std::num::NonZeroU64;
 /// use gossip_contracts::{
 ///     connector::Cursor,
-///     identity::{FenceEpoch, RunId, ShardId, TenantId},
+///     identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId},
 ///     persistence::{CheckpointBoundary, CommitScope, DoneLedgerCommitReceipt, PageCommit},
 /// };
 ///
 /// let page = PageCommit::new(CommitScope::new(
 ///     TenantId::from_bytes([1; 32]),
-///     RunId::from_raw(2),
-///     ShardId::from_raw(3),
-///     FenceEpoch::from_raw(4),
-///     1,
+///     PolicyHash::from_bytes([2; 32]),
+///     RunId::from_raw(3),
+///     ShardId::from_raw(4),
+///     FenceEpoch::from_raw(5),
+///     NonZeroU64::new(1).unwrap(),
 ///     CheckpointBoundary::ordered_content(Cursor::initial()),
 /// ));
 ///
@@ -422,9 +463,10 @@ pub struct CheckpointDurable {
 /// a type error:
 ///
 /// ```compile_fail
+/// use std::num::NonZeroU64;
 /// use gossip_contracts::{
 ///     connector::Cursor,
-///     identity::{FenceEpoch, LogicalTime, RunId, ShardId, TenantId},
+///     identity::{FenceEpoch, LogicalTime, PolicyHash, RunId, ShardId, TenantId},
 ///     persistence::{
 ///         CheckpointBoundary, CheckpointCommitReceipt, CommitScope, FindingsCommitReceipt,
 ///         PageCommit,
@@ -433,10 +475,11 @@ pub struct CheckpointDurable {
 ///
 /// let scope = CommitScope::new(
 ///     TenantId::from_bytes([1; 32]),
-///     RunId::from_raw(2),
-///     ShardId::from_raw(3),
-///     FenceEpoch::from_raw(4),
-///     1,
+///     PolicyHash::from_bytes([2; 32]),
+///     RunId::from_raw(3),
+///     ShardId::from_raw(4),
+///     FenceEpoch::from_raw(5),
+///     NonZeroU64::new(1).unwrap(),
 ///     CheckpointBoundary::ordered_content(Cursor::initial()),
 /// );
 /// let page = PageCommit::new(scope.clone()).record_findings(FindingsCommitReceipt::new(1, 1, 1));
@@ -447,6 +490,8 @@ pub struct CheckpointDurable {
 #[must_use = "page commits must be driven to a durable receipt or explicitly dropped"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageCommit<S> {
+    /// `Arc` because the scope is shared between the state machine and the
+    /// [`ItemCommitReceipt`] produced during the done-ledger transition.
     scope: Arc<CommitScope>,
     state: S,
 }
@@ -517,7 +562,7 @@ impl PageCommit<FindingsDurable> {
         self,
         receipt: DoneLedgerCommitReceipt,
     ) -> Result<PageCommit<ItemDurable>, PageCommitValidationError> {
-        let expected = self.scope.committed_units();
+        let expected = self.scope.committed_units().get();
         let actual = receipt.record_count();
         if expected != actual {
             return Err(PageCommitValidationError::LedgerUnitCountMismatch { expected, actual });
@@ -623,13 +668,18 @@ impl PageCommit<CheckpointDurable> {
     }
 }
 
+const _: () = assert!(core::mem::size_of::<CheckpointBoundary>() == 72);
+const _: () = assert!(core::mem::size_of::<CommitScope>() == 168);
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::num::NonZeroU64;
+
     use crate::{
         connector::ItemKey,
-        identity::LogicalTime,
+        identity::{LogicalTime, PolicyHash},
         test_util::{TestWaitError, tenant},
     };
 
@@ -642,10 +692,11 @@ mod tests {
     fn sample_scope() -> CommitScope {
         CommitScope::new(
             tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
             RunId::from_raw(2),
             ShardId::from_raw(3),
             FenceEpoch::from_raw(4),
-            2,
+            NonZeroU64::new(2).unwrap(),
             CheckpointBoundary::ordered_content(sample_cursor(5)),
         )
     }
@@ -666,7 +717,7 @@ mod tests {
         let scope = sample_scope();
         PageCommit::new(scope.clone())
             .record_findings(sample_findings_receipt())
-            .record_done_ledger(sample_done_ledger_receipt(scope.committed_units()))
+            .record_done_ledger(sample_done_ledger_receipt(scope.committed_units().get()))
             .unwrap()
     }
 
@@ -675,6 +726,7 @@ mod tests {
     fn checkpoint_with_wrong_scope(scope: &CommitScope) -> CheckpointCommitReceipt {
         let wrong_scope = CommitScope::new(
             tenant(99),
+            scope.policy_hash(),
             scope.run_id(),
             scope.shard_id(),
             scope.fence_epoch(),
@@ -706,7 +758,7 @@ mod tests {
             .unwrap()
             .wait_done_ledger(
                 ReadyCommitHandle::<DoneLedgerCommitReceipt, TestWaitError>::ok(
-                    sample_done_ledger_receipt(scope.committed_units()),
+                    sample_done_ledger_receipt(scope.committed_units().get()),
                 ),
             )
             .unwrap()
@@ -722,7 +774,7 @@ mod tests {
         assert_eq!(receipt.item_commit().findings(), sample_findings_receipt());
         assert_eq!(
             receipt.item_commit().done_ledger(),
-            sample_done_ledger_receipt(scope.committed_units())
+            sample_done_ledger_receipt(scope.committed_units().get())
         );
         assert_eq!(receipt.checkpoint(), &sample_checkpoint_receipt(&scope));
     }
@@ -745,11 +797,13 @@ mod tests {
         let page = PageCommit::new(scope.clone()).record_findings(sample_findings_receipt());
 
         assert_eq!(
-            page.record_done_ledger(sample_done_ledger_receipt(scope.committed_units() + 1))
-                .unwrap_err(),
+            page.record_done_ledger(sample_done_ledger_receipt(
+                scope.committed_units().get() + 1
+            ))
+            .unwrap_err(),
             PageCommitValidationError::LedgerUnitCountMismatch {
-                expected: scope.committed_units(),
-                actual: scope.committed_units() + 1,
+                expected: scope.committed_units().get(),
+                actual: scope.committed_units().get() + 1,
             }
         );
     }
@@ -775,14 +829,14 @@ mod tests {
         assert_eq!(
             page.wait_done_ledger(
                 ReadyCommitHandle::<DoneLedgerCommitReceipt, TestWaitError>::ok(
-                    sample_done_ledger_receipt(scope.committed_units() + 1),
+                    sample_done_ledger_receipt(scope.committed_units().get() + 1),
                 )
             )
             .unwrap_err(),
             CommitAdvanceError::<TestWaitError>::Validation(
                 PageCommitValidationError::LedgerUnitCountMismatch {
-                    expected: scope.committed_units(),
-                    actual: scope.committed_units() + 1,
+                    expected: scope.committed_units().get(),
+                    actual: scope.committed_units().get() + 1,
                 },
             )
         );
@@ -836,11 +890,12 @@ mod tests {
         // Two pages with different scopes but the same committed_units count.
         let scope_a = sample_scope(); // committed_units = 2
         let scope_b = CommitScope::new(
-            tenant(9),                // different tenant
-            RunId::from_raw(99),      // different run
-            ShardId::from_raw(88),    // different shard
-            FenceEpoch::from_raw(77), // different epoch
-            2,                        // same committed_units
+            tenant(9),                          // different tenant
+            PolicyHash::from_bytes([0xBB; 32]), // different policy
+            RunId::from_raw(99),                // different run
+            ShardId::from_raw(88),              // different shard
+            FenceEpoch::from_raw(77),           // different epoch
+            NonZeroU64::new(2).unwrap(),        // same committed_units
             CheckpointBoundary::repo_frontier(sample_cursor(6)),
         );
         assert_eq!(scope_a.committed_units(), scope_b.committed_units());
@@ -852,7 +907,7 @@ mod tests {
         // are produced by the same in-process pipeline.
         let page_a = PageCommit::new(scope_a)
             .record_findings(sample_findings_receipt())
-            .record_done_ledger(sample_done_ledger_receipt(scope_b.committed_units()))
+            .record_done_ledger(sample_done_ledger_receipt(scope_b.committed_units().get()))
             .expect("done-ledger stage validates count, not scope — by design");
 
         // The checkpoint stage is where full scope validation occurs.
@@ -868,15 +923,16 @@ mod tests {
     fn page_commit_happy_path_with_repo_frontier_boundary() {
         let scope = CommitScope::new(
             tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
             RunId::from_raw(2),
             ShardId::from_raw(3),
             FenceEpoch::from_raw(4),
-            2,
+            NonZeroU64::new(2).unwrap(),
             CheckpointBoundary::repo_frontier(sample_cursor(5)),
         );
         let page = PageCommit::new(scope.clone())
             .record_findings(sample_findings_receipt())
-            .record_done_ledger(sample_done_ledger_receipt(scope.committed_units()))
+            .record_done_ledger(sample_done_ledger_receipt(scope.committed_units().get()))
             .unwrap()
             .record_checkpoint(sample_checkpoint_receipt(&scope))
             .unwrap();
@@ -907,5 +963,30 @@ mod tests {
         assert_eq!(boundary.cursor(), &cursor);
         assert_eq!(boundary.as_ordered_content(), None);
         assert_eq!(boundary.as_repo_frontier(), Some(&cursor));
+    }
+
+    #[test]
+    fn commit_scope_from_write_context_preserves_shared_fields() {
+        use super::WriteContext;
+
+        let wc = WriteContext::new(
+            tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+        );
+        let committed_units = NonZeroU64::new(5).unwrap();
+        let boundary = CheckpointBoundary::ordered_content(sample_cursor(6));
+
+        let scope = CommitScope::from_write_context(wc, committed_units, boundary.clone());
+
+        assert_eq!(scope.tenant_id(), wc.tenant_id());
+        assert_eq!(scope.policy_hash(), wc.policy_hash());
+        assert_eq!(scope.run_id(), wc.run_id());
+        assert_eq!(scope.shard_id(), wc.shard_id());
+        assert_eq!(scope.fence_epoch(), wc.fence_epoch());
+        assert_eq!(scope.committed_units(), committed_units);
+        assert_eq!(scope.checkpoint_boundary(), &boundary);
     }
 }

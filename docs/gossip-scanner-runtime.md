@@ -8,7 +8,8 @@
 - typed scan configuration for filesystem and git entrypoints
 - CLI parsing and summary rendering
 - path and budget validation before runtime execution
-- owned report, checkpoint, cancellation, commit-model, and commit-sink types
+- owned report, checkpoint, cancellation, commit-model, commit-sink, and
+  coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
 - distributed runtime placeholder nouns for future worker-loop wiring
 
@@ -24,10 +25,10 @@ entrypoints share the same local runtime execution paths.
 |------|---------|
 | `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime` |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
-| `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput` |
-| `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink |
-| `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing |
-| `src/distributed.rs` | Distributed runtime family placeholders and shared config/report types |
+| `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
+| `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink that stamps one shared `WriteContext` onto emitted records |
+| `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing, including write-scoped progress and identity-chain records |
+| `src/distributed.rs` | Distributed runtime family placeholders, `ShardLease<A>`, and shared config/report types |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
@@ -216,8 +217,9 @@ future runtime commit stages build on:
 
 - `CompletedUnit` couples a monotonically increasing in-shard sequence number
   with a tagged `CheckpointBoundary`.
-- `CommitRequest<'a>` borrows findings and done-ledger payloads so the runtime
-  keeps buffer ownership outside the commit stage.
+- `CommitRequest<'a>` carries one `WriteContext` plus borrowed findings and
+  done-ledger payloads so the runtime keeps buffer ownership outside the commit
+  stage while keeping routing/fencing scope aligned across writes.
 - `UnitCommitReceipt` proves findings and done-ledger durability for one
   completed unit without implying checkpoint advancement.
 - `CheckpointAggregatorInput` wraps only durable unit receipts so the future
@@ -260,6 +262,10 @@ and persisted identity derivation. It computes:
 - finding ID
 - occurrence ID
 
+The sink stores one `WriteContext` per shard-scoped runtime instance. It uses
+that shared scope when deriving tenant-bound finding identity and forwards the
+same context on every `CommitProgressRecord` and `IdentityChainRecord`.
+
 When a source does not provide an explicit version, the sink derives a
 stable surrogate object version from the item-key bytes.
 
@@ -301,13 +307,25 @@ pub struct DistributedRunConfig {
 ```
 
 ```rust
+pub struct ShardLease<A> {
+    pub shard_id: Arc<str>,
+    pub assignment: A,
+    pub write_context: WriteContext,
+    pub tenant_secret_key: TenantSecretKey,
+}
+```
+
+```rust
 pub fn run_distributed(
     config: &DistributedRunConfig,
 ) -> Result<DistributedRunReport, DistributedRuntimeError>
 ```
 
-`run_distributed` validates budgets and then returns a family-specific
-runtime placeholder error.
+`ShardLease<A>` is the future hand-off object from coordination into the worker
+loop. It keeps the string shard label used for recorder routing separate from
+the numeric shard identity carried inside `WriteContext`. `run_distributed`
+still validates budgets and then returns a family-specific runtime placeholder
+error.
 
 ---
 
@@ -340,7 +358,8 @@ that worker-loop API is fully wired.
 | Core runtime types and validation | `crates/gossip-scanner-runtime/src/lib.rs` |
 | CLI parsing and summary rendering | `crates/gossip-scanner-runtime/src/cli.rs` |
 | Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
-| Distributed family placeholders | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
+| Distributed family placeholders and lease metadata | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |

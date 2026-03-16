@@ -17,6 +17,8 @@
 //! - `page_commit.rs` defines the family-neutral checkpoint boundary types and
 //!   the `PageCommit<S>` typestate machine that enforces findings →
 //!   done-ledger → checkpoint ordering.
+//! - `write_context.rs` defines the shared routing and fencing metadata carried
+//!   by runtime write paths.
 //! - `error.rs` defines shared input-validation errors used by persistence-only
 //!   value wrappers.
 //! - `conformance.rs` defines the backend-agnostic persistence conformance
@@ -87,6 +89,7 @@ mod error;
 mod findings;
 mod ovid;
 mod page_commit;
+mod write_context;
 
 /// Recommended maximum batch size for persistence operations.
 ///
@@ -118,3 +121,4 @@ pub use page_commit::{
     CommitAdvanceError, CommitScope, FindingsDurable, ItemDurable, PageCommit,
     PageCommitValidationError,
 };
+pub use write_context::WriteContext;

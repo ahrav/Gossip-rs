@@ -42,7 +42,7 @@ use crate::identity::{
 };
 
 use super::{
-    PersistenceInputError,
+    PersistenceInputError, WriteContext,
     commit::{CommitHandle, DoneLedgerCommitReceipt},
     ovid::OvidHash,
 };
@@ -395,6 +395,29 @@ impl DoneLedgerProvenance {
         }
     }
 
+    /// Construct provenance from a shared write context plus item-local scan
+    /// timing.
+    ///
+    /// `DoneLedgerProvenance` stores only the write-side fields that are not
+    /// already captured by [`DoneLedgerKey`]. The tenant and policy live on the
+    /// key, so this constructor extracts only `(run_id, shard_id, fence_epoch)`
+    /// from the full [`WriteContext`].
+    #[inline]
+    #[must_use]
+    pub fn from_write_context(
+        write_context: WriteContext,
+        started_at: LogicalTime,
+        finished_at: LogicalTime,
+    ) -> Self {
+        Self::new(
+            write_context.run_id(),
+            write_context.shard_id(),
+            write_context.fence_epoch(),
+            started_at,
+            finished_at,
+        )
+    }
+
     /// Globally unique run that produced this entry.
     #[inline]
     #[must_use]
@@ -530,6 +553,20 @@ impl DoneLedgerRecord {
         self.provenance
     }
 
+    /// Reconstruct the shared write context by combining the key's tenant and
+    /// policy with the provenance's run, shard, and fence fields.
+    #[inline]
+    #[must_use]
+    pub const fn write_context(&self) -> WriteContext {
+        WriteContext::new(
+            self.key.tenant_id(),
+            self.key.policy_hash(),
+            self.provenance.run_id(),
+            self.provenance.shard_id(),
+            self.provenance.fence_epoch(),
+        )
+    }
+
     /// Structured error code, conventionally present only for failure or skip
     /// statuses.
     ///
@@ -636,18 +673,17 @@ impl DoneLedgerRecord {
     ///
     /// # Errors
     ///
-    /// Returns [`PersistenceInputError`] if either operand fails
-    /// [`validate()`](Self::validate) or if the merged fields violate
+    /// Returns [`PersistenceInputError::KeyMismatch`] if the two records have
+    /// different keys, or any other [`PersistenceInputError`] if either operand
+    /// fails [`validate()`](Self::validate) or if the merged fields violate
     /// [`DoneLedgerRecord::try_new`] construction invariants.
     pub fn merge(&self, incoming: &DoneLedgerRecord) -> Result<Self, PersistenceInputError> {
         self.validate()?;
         incoming.validate()?;
 
-        debug_assert_eq!(
-            self.key, incoming.key,
-            "DoneLedgerRecord::merge requires matching keys: existing={:?}, incoming={:?}",
-            self.key, incoming.key
-        );
+        if self.key != incoming.key {
+            return Err(PersistenceInputError::KeyMismatch);
+        }
 
         let merged_status = self.status.merge(incoming.status);
         let bytes_scanned = self.bytes_scanned.max(incoming.bytes_scanned);

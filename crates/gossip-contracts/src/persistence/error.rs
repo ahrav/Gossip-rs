@@ -47,6 +47,8 @@ pub enum PersistenceInputError {
     InconsistentTenant,
     /// Provenance timestamps are out of order (`started_at > finished_at`).
     ProvenanceOrdering { started_at: u64, finished_at: u64 },
+    /// Two records with different keys were passed to a merge operation.
+    KeyMismatch,
 }
 
 impl fmt::Display for PersistenceInputError {
@@ -98,6 +100,7 @@ impl fmt::Display for PersistenceInputError {
                 f,
                 "provenance started_at ({started_at}) must not exceed finished_at ({finished_at})"
             ),
+            Self::KeyMismatch => write!(f, "merge requires records with the same key"),
         }
     }
 }
