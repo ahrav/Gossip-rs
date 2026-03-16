@@ -440,7 +440,7 @@ where
 ```rust
 pub struct DistributedRuntimeConfig {
     pub budgets: ScanBudgets,
-    pub commit_queue_capacity: usize,
+    pub commit_queue_capacity: NonZeroUsize,
 }
 ```
 
@@ -454,8 +454,9 @@ write context agree on policy scope.
 needs around a single lease: acquire, release, receipt-derived completion,
 done checks, done marking, and event recording.
 
-`DistributedPersistence<F, D>` groups the findings sink and done-ledger handle
-that the worker loop clones per shard, while `DistributedRuntimeError`
+`DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
+groups the findings sink and done-ledger handle that the worker loop clones
+per shard, while `DistributedRuntimeError`
 distinguishes coordinator failures, scan-runtime failures, and local durability
 pipeline failures.
 

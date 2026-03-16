@@ -5,6 +5,7 @@
 //! runtime configuration, run reports, and error layering.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use anyhow::{Error as AnyError, Result};
@@ -110,6 +111,13 @@ impl<A> ShardLease<A> {
 /// - `release_shard` validates lease ownership.
 /// - `event_recorder` is safe to share across event and commit telemetry for
 ///   one shard.
+///
+/// # Design note
+///
+/// This trait intentionally bundles shard lifecycle, done-ledger, and
+/// recorder access into one surface. The worker loop calls all six methods
+/// on the same coordinator instance. Split into focused traits when a
+/// second implementation or test double needs a subset.
 pub trait DistributedCoordinator<A>: Send + Sync
 where
     A: ShardLeaseAssignment,
@@ -146,14 +154,22 @@ where
 /// The runtime clones these handles per shard. Production backends should make
 /// that cheap, for example by cloning an `Arc` or a pool handle.
 #[derive(Clone)]
-pub struct DistributedPersistence<F, D> {
+pub struct DistributedPersistence<F, D>
+where
+    F: Clone + Send + Sync,
+    D: Clone + Send + Sync,
+{
     /// Findings sink handle cloned by the worker loop.
     pub findings_sink: F,
     /// Done-ledger handle cloned by the worker loop.
     pub done_ledger: D,
 }
 
-impl<F, D> DistributedPersistence<F, D> {
+impl<F, D> DistributedPersistence<F, D>
+where
+    F: Clone + Send + Sync,
+    D: Clone + Send + Sync,
+{
     /// Construct one runtime durability bundle.
     #[must_use]
     pub fn new(findings_sink: F, done_ledger: D) -> Self {
@@ -172,14 +188,14 @@ pub struct DistributedRuntimeConfig {
     /// Capacity of the bounded execution-to-commit queue. Matches the
     /// [`CommitPipelineConfig`](crate::commit_pipeline::CommitPipelineConfig)
     /// default.
-    pub commit_queue_capacity: usize,
+    pub commit_queue_capacity: NonZeroUsize,
 }
 
 impl Default for DistributedRuntimeConfig {
     fn default() -> Self {
         Self {
             budgets: ScanBudgets::default(),
-            commit_queue_capacity: 64,
+            commit_queue_capacity: NonZeroUsize::new(64).unwrap(),
         }
     }
 }
@@ -320,7 +336,7 @@ mod tests {
         let config = DistributedRuntimeConfig::default();
 
         assert_eq!(config.budgets, ScanBudgets::default());
-        assert_eq!(config.commit_queue_capacity, 64);
+        assert_eq!(config.commit_queue_capacity, NonZeroUsize::new(64).unwrap());
     }
 
     #[test]

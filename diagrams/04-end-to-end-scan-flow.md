@@ -51,7 +51,7 @@ sequenceDiagram
     RT-->>WRK: Result<ScanReport, ScanRuntimeError>
 
     note over DRT: distributed.rs foundation types
-    note over DRT: ShardLease<A>, DistributedCoordinator<A>, DistributedRuntimeConfig
+    note over DRT: ShardLease&lt;A&gt;, DistributedCoordinator&lt;A&gt;, DistributedRuntimeConfig
 ```
 
 **One public boundary.** `ExecutionMode` remains caller-visible, but both
@@ -88,8 +88,8 @@ graph TD
     end
 
     subgraph Distributed["distributed.rs foundation"]
-        DIST["ShardLease<A>"]
-        DF["DistributedCoordinator<A><br/>DistributedRuntimeConfig"]
+        DIST["ShardLease&lt;A&gt;"]
+        DF["DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
     end
 
     subgraph Contracts["gossip-contracts::connector"]
@@ -208,7 +208,7 @@ graph TD
     F["git_repo::local_repo_placeholder"]
     G["Result&lt;ScanReport, ScanRuntimeError&gt;"]
     H["distributed.rs foundation types"]
-    I["ShardLease<A><br/>DistributedCoordinator<A><br/>DistributedRuntimeConfig"]
+    I["ShardLease&lt;A&gt;<br/>DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
     J["DistributedRunReport /<br/>DistributedRuntimeError"]
 
     A --> B
@@ -218,6 +218,7 @@ graph TD
     D -- "git-repo" --> F
     E --> G
     F --> G
+    D -. "types only" .-> H
 
     H --> I
     I --> J
