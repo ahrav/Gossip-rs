@@ -388,8 +388,8 @@ where
         self.sender.cancel.cancel();
         let handle = self.worker.take();
         // Dropping `self` closes both channels, which unblocks the worker
-        // if it is waiting on `recv()` or `send()`. `Drop::drop` re-cancels
-        // the token (harmless) but finds `worker == None` — no-op.
+        // if it is waiting on `recv_timeout()` or `send()`. `Drop::drop`
+        // re-cancels the token (harmless) but finds `worker == None` — no-op.
         drop(self);
         match handle {
             Some(h) => h.join(),
@@ -1053,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_sender_returns_disconnected_after_worker_exits_on_cancellation() {
+    fn blocked_sender_returns_cancelled_after_worker_exits_on_cancellation() {
         let findings_sink = InMemoryFindingsSink::with_auto_complete(false);
         let done_ledger = InMemoryDoneLedger::new();
         let cancel = CancellationToken::new();
@@ -1124,9 +1124,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("blocked sender should unblock")
         {
-            // The worker exited because of cancellation, which also disconnected
-            // the channel. The secondary cancellation check in submit() now
-            // correctly reports Cancelled rather than Disconnected.
+            // The worker exits on cancellation, which also disconnects the
+            // channel. The secondary cancellation check in submit() classifies
+            // the send failure as Cancelled rather than Disconnected.
             Err(SubmitError::Cancelled(returned)) => assert_eq!(*returned, expected),
             other => panic!("expected cancelled submit result, got {other:?}"),
         }
