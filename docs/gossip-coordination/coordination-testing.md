@@ -27,7 +27,12 @@ auto-provisions `quay.io/coreos/etcd:v3.5.15` via testcontainers (or reuses
 creation/registration, acquire/checkpoint/renew, terminal shard transitions
 (`complete`, `park_shard`), unpark, split round trips, shard-limit rejection
 paths, derived-ID collision handling, and deterministic split-atomicity aborts
-via test-only owner-drop fault injection. The binary codec (`codec.rs`) has
+via test-only owner-drop fault injection. A separate `#[ignore]` test
+(`lease_ttl_expiry_full_cycle`) exercises wall-clock lease TTL expiry against
+live etcd: it verifies that the owner binding is auto-deleted while the shard
+record survives, that a second worker can reacquire with an advanced fence, and
+that the original worker's stale lease is rejected for both `renew` and
+`checkpoint`. The binary codec (`codec.rs`) has
 dedicated round-trip fuzz targets and proptest coverage for `ShardRecord`
 serialization in `codec_tests.rs`. Deterministic simulator tests cover the
 in-process etcd path via `SimulatedEtcdKV` and `SimEtcdCoordinator`, including
