@@ -32,8 +32,8 @@ pub struct SimWorker {
     /// Shards this worker believes it holds.
     ///
     /// Keyed by `(run_raw, shard_raw)` to provide deterministic iteration
-    /// order (matching the natural `(RunId, ShardId)` tuple ordering)
-    /// without requiring `Ord` on `ShardKey`.
+    /// order matching the natural `(RunId, ShardId)` tuple ordering, while
+    /// keeping the value as a `(ShardKey, Lease)` pair for typed access.
     held_shards: BTreeMap<(u64, u64), (ShardKey, Lease)>,
     /// Next op-ID to hand out within this worker's partition.
     /// Incremented monotonically; must stay below `op_ceiling`.

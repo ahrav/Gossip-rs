@@ -392,7 +392,9 @@ impl CheckpointAggregatorInput {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(core::mem::size_of::<CompletedUnit>() == 80);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(core::mem::size_of::<CommitRequest<'_>>() == 232);
 
 // Compile-time proof that runtime commit types can move across threads.

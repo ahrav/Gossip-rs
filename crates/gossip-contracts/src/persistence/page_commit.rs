@@ -711,7 +711,9 @@ impl PageCommit<CheckpointDurable> {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(core::mem::size_of::<CheckpointBoundary>() == 72);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(core::mem::size_of::<CommitScope>() == 168);
 
 #[cfg(test)]
