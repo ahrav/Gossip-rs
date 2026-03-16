@@ -56,8 +56,8 @@ use crate::test_support::{
     test_coordinator_with_tuning,
 };
 use crate::{
-    AsyncEtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
-    EtcdKeyspace, EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
+    AsyncEtcdCoordinator, EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError,
+    EtcdCoordinatorError, EtcdKeyspace, EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
 };
 use gossip_contracts::coordination::{
     CursorSemantics, CursorUpdate, ShardSpec, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
@@ -1950,6 +1950,28 @@ fn now(t: u64) -> LogicalTime {
     LogicalTime::from_raw(t)
 }
 
+/// Poll until the owner binding for `key` disappears, or panic if
+/// `ttl_secs + 10s` elapses without cleanup.
+fn wait_for_owner_binding_expiry(backend: &EtcdCoordinator, key: ShardKey, ttl_secs: i64) {
+    let deadline = Instant::now()
+        + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
+    let interval = Duration::from_millis(250);
+    loop {
+        if backend
+            .test_load_owner_binding(test_tenant(), key)
+            .expect("owner lookup should succeed while polling")
+            .is_none()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owner binding was not cleaned up within {ttl_secs}s + 10s margin"
+        );
+        std::thread::sleep(interval);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests: error paths and contention
 // ---------------------------------------------------------------------------
@@ -2109,9 +2131,9 @@ fn checkpoint_replay_remains_idempotent() {
     );
 }
 
-/// Minimal lease-expiry smoke test: a checkpoint after the etcd owner-lease
-/// TTL has elapsed must fail. Polls for owner-binding disappearance to avoid
-/// flakiness on slow CI nodes.
+/// A checkpoint after the etcd owner-lease TTL has elapsed must be rejected
+/// with `StaleFence`. Waits for the owner binding to disappear before
+/// attempting the checkpoint so the outcome is deterministic.
 #[test]
 fn lease_expiry_rejects_stale_checkpoint() {
     let ttl_secs: i64 = 5;
@@ -2144,23 +2166,7 @@ fn lease_expiry_rejects_stale_checkpoint() {
         .expect("acquire should succeed")
         .lease;
 
-    let expiry_deadline = Instant::now()
-        + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
-    let poll_interval = Duration::from_millis(250);
-    loop {
-        if backend
-            .test_load_owner_binding(test_tenant(), key)
-            .expect("owner lookup should succeed while polling")
-            .is_none()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < expiry_deadline,
-            "owner binding was not cleaned up within {ttl_secs}s + 10s margin"
-        );
-        std::thread::sleep(poll_interval);
-    }
+    wait_for_owner_binding_expiry(&backend, key, ttl_secs);
 
     let err = backend
         .checkpoint(
@@ -2236,23 +2242,7 @@ fn lease_ttl_expiry_full_cycle() {
     assert_eq!(owner_before_expiry.0, test_worker(7));
     assert_eq!(owner_before_expiry.1, lease_a.fence());
 
-    let expiry_deadline = Instant::now()
-        + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
-    let poll_interval = Duration::from_millis(250);
-    loop {
-        if backend_a
-            .test_load_owner_binding(test_tenant(), key)
-            .expect("owner lookup should succeed while polling")
-            .is_none()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < expiry_deadline,
-            "owner binding was not cleaned up within {ttl_secs}s + 10s margin"
-        );
-        std::thread::sleep(poll_interval);
-    }
+    wait_for_owner_binding_expiry(&backend_a, key, ttl_secs);
 
     // Guard against a concurrent reacquire between the poll break and the
     // assertions below. Under the current `unique_namespace` scheme this
