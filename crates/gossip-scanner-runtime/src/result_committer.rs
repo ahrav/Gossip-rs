@@ -108,9 +108,9 @@ impl fmt::Display for ResultCommitRequestError {
                 write!(f, "invalid done-ledger record: {err}")
             }
             Self::TenantMismatch {
-                layer, expected, ..
+                layer, expected, actual,
             } => {
-                write!(f, "{layer} tenant mismatch: expected {expected:?}")
+                write!(f, "{layer} tenant mismatch: expected {expected:?}, got {actual:?}")
             }
             Self::ObservationWriteContextMismatch { index } => write!(
                 f,
