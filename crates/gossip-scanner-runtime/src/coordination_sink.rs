@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
+use gossip_contracts::persistence::WriteContext;
 use scanner_git::{GitEvent, GitEventOutput};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
 
@@ -36,11 +37,15 @@ pub enum StoredGitEvent {
 pub enum CommitProgressRecord {
     /// Item processing has started; `size_hint` is the expected byte length.
     Begin {
+        write_context: WriteContext,
         item_key: Vec<u8>,
         size_hint: Option<u64>,
     },
     /// Item processing completed successfully.
-    Finish { item_key: Vec<u8> },
+    Finish {
+        write_context: WriteContext,
+        item_key: Vec<u8>,
+    },
 }
 
 /// Identity chain derived for distributed finding persistence.
@@ -49,6 +54,8 @@ pub enum CommitProgressRecord {
 /// downstream systems can verify the derivation chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityChainRecord {
+    /// Shared routing and fencing metadata for the emitted write.
+    pub write_context: WriteContext,
     /// Connector-provided item key (e.g. file path bytes).
     pub item_key: Vec<u8>,
     /// Numeric rule identifier that matched.

@@ -33,7 +33,7 @@ use gossip_contracts::{
     connector::Cursor,
     persistence::{
         CheckpointBoundary, CheckpointBoundaryKind, DoneLedgerRecord, FindingsUpsertBatch,
-        ItemCommitReceipt,
+        ItemCommitReceipt, WriteContext,
     },
 };
 
@@ -128,6 +128,7 @@ impl CompletedUnit {
 #[must_use = "commit requests must be submitted or explicitly dropped"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitRequest<'a> {
+    write_context: WriteContext,
     completed_unit: CompletedUnit,
     findings: FindingsUpsertBatch<'a>,
     done_ledger: &'a [DoneLedgerRecord],
@@ -135,16 +136,51 @@ pub struct CommitRequest<'a> {
 
 impl<'a> CommitRequest<'a> {
     /// Construct a runtime commit request.
+    ///
+    /// # Debug-mode invariant
+    ///
+    /// In debug builds, asserts that the first observation's tenant (if any)
+    /// matches `write_context.tenant_id()`, and likewise for the first
+    /// done-ledger record's tenant.
     pub fn new(
+        write_context: WriteContext,
         completed_unit: CompletedUnit,
         findings: FindingsUpsertBatch<'a>,
         done_ledger: &'a [DoneLedgerRecord],
     ) -> Self {
+        // Defense-in-depth for dev builds: sample the first element of each
+        // slice to catch tenant mismatches early.  The authoritative runtime
+        // check is `FindingsUpsertBatch::validate_tenant_consistency()`, which
+        // is called downstream before persistence and inspects every record.
+        // First-element sampling is sufficient here because upstream guarantees
+        // single-tenant batches.
+        debug_assert!(
+            findings
+                .observations()
+                .first()
+                .is_none_or(|obs| obs.tenant_id() == write_context.tenant_id()),
+            "write_context tenant must match observations tenant"
+        );
+        debug_assert!(
+            done_ledger
+                .first()
+                .is_none_or(|rec| rec.key().tenant_id() == write_context.tenant_id()),
+            "write_context tenant must match done-ledger tenant"
+        );
         Self {
+            write_context,
             completed_unit,
             findings,
             done_ledger,
         }
+    }
+
+    /// Shared routing and fencing metadata for the writes this request will
+    /// submit.
+    #[inline]
+    #[must_use]
+    pub const fn write_context(&self) -> WriteContext {
+        self.write_context
     }
 
     /// Completed unit this request will make durable.
@@ -172,11 +208,17 @@ impl<'a> CommitRequest<'a> {
     pub fn into_parts(
         self,
     ) -> (
+        WriteContext,
         CompletedUnit,
         FindingsUpsertBatch<'a>,
         &'a [DoneLedgerRecord],
     ) {
-        (self.completed_unit, self.findings, self.done_ledger)
+        (
+            self.write_context,
+            self.completed_unit,
+            self.findings,
+            self.done_ledger,
+        )
     }
 }
 
@@ -263,11 +305,49 @@ impl UnitCommitReceipt {
     }
 }
 
+/// Mismatch between a stream's declared boundary kind and a receipt's actual kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindMismatchError {
+    expected: CheckpointBoundaryKind,
+    actual: CheckpointBoundaryKind,
+}
+
+impl fmt::Display for KindMismatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "checkpoint aggregator expected {:?} receipts but got {:?}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for KindMismatchError {}
+
+impl KindMismatchError {
+    /// Boundary kind declared by the owning shard stream.
+    #[must_use]
+    pub fn expected(&self) -> CheckpointBoundaryKind {
+        self.expected
+    }
+
+    /// Boundary kind carried by the receipt.
+    #[must_use]
+    pub fn actual(&self) -> CheckpointBoundaryKind {
+        self.actual
+    }
+}
+
 /// Receipt-only input to the checkpoint aggregator.
 ///
 /// The checkpoint stage must never look at raw scan completion signals. By
 /// wrapping only [`UnitCommitReceipt`], this type makes the intended runtime
 /// shape explicit: checkpoint advancement is driven solely by durable receipts.
+///
+/// Construction requires an explicit `expected_kind` so that all receipts fed
+/// into the same shard stream are validated against a single declared family.
+/// This prevents accidental mixing of ordered-content and repo-frontier
+/// progress within one checkpoint computation.
 #[must_use = "checkpoint aggregator input must be consumed by the checkpoint stage"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointAggregatorInput {
@@ -276,9 +356,27 @@ pub struct CheckpointAggregatorInput {
 
 impl CheckpointAggregatorInput {
     /// Construct aggregator input from a durable runtime receipt.
-    #[inline]
-    pub fn new(receipt: UnitCommitReceipt) -> Self {
-        Self { receipt }
+    ///
+    /// `expected_kind` is the boundary family declared by the owning shard
+    /// stream. The receipt's boundary kind must match; mixing families within
+    /// a single checkpoint stream is a programming error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KindMismatchError`] if the receipt's boundary kind differs
+    /// from `expected_kind`.
+    pub fn new(
+        expected_kind: CheckpointBoundaryKind,
+        receipt: UnitCommitReceipt,
+    ) -> Result<Self, KindMismatchError> {
+        let actual = receipt.completed_unit().checkpoint_boundary_kind();
+        if actual != expected_kind {
+            return Err(KindMismatchError {
+                expected: expected_kind,
+                actual,
+            });
+        }
+        Ok(Self { receipt })
     }
 
     /// Durable receipt carried into the checkpoint stage.
@@ -294,12 +392,10 @@ impl CheckpointAggregatorInput {
     }
 }
 
-impl From<UnitCommitReceipt> for CheckpointAggregatorInput {
-    #[inline]
-    fn from(receipt: UnitCommitReceipt) -> Self {
-        Self::new(receipt)
-    }
-}
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<CompletedUnit>() == 80);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<CommitRequest<'_>>() == 232);
 
 // Compile-time proof that runtime commit types can move across threads.
 // Closure-in-const avoids dead_code warnings while keeping assertions local.
@@ -318,23 +414,38 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
+    use std::num::NonZeroU64;
+
     use gossip_contracts::{
         connector::ItemKey,
-        identity::{FenceEpoch, RunId, ShardId, TenantId},
-        persistence::{CommitScope, DoneLedgerCommitReceipt, FindingsCommitReceipt, PageCommit},
+        identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId},
+        persistence::{
+            CommitScope, DoneLedgerCommitReceipt, FindingsCommitReceipt, PageCommit, WriteContext,
+        },
     };
 
     fn sample_cursor(seed: u8) -> Cursor {
         Cursor::with_last_key(ItemKey::try_from_slice(&[seed]).expect("cursor key"))
     }
 
+    fn sample_write_context(seed: u8) -> WriteContext {
+        WriteContext::new(
+            TenantId::from_bytes([seed; 32]),
+            PolicyHash::from_bytes([seed.wrapping_add(1); 32]),
+            RunId::from_raw(u64::from(seed) + 2),
+            ShardId::from_raw(u64::from(seed) + 3),
+            FenceEpoch::from_raw(u64::from(seed) + 4),
+        )
+    }
+
     fn sample_item_receipt(boundary: CheckpointBoundary) -> ItemCommitReceipt {
         PageCommit::new(CommitScope::new(
             TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0xAA; 32]),
             RunId::from_raw(2),
             ShardId::from_raw(3),
             FenceEpoch::from_raw(4),
-            1,
+            NonZeroU64::new(1).unwrap(),
             boundary,
         ))
         .record_findings(FindingsCommitReceipt::new(1, 1, 1))
@@ -376,12 +487,15 @@ mod tests {
 
     #[test]
     fn commit_request_preserves_borrowed_payloads() {
+        let write_context = sample_write_context(4);
         let request = CommitRequest::new(
+            write_context,
             CompletedUnit::ordered_content(3, sample_cursor(3)),
             FindingsUpsertBatch::new(&[], &[], &[]),
             &[],
         );
 
+        assert_eq!(request.write_context(), write_context);
         assert_eq!(request.completed_unit().sequence_no(), 3);
         assert!(request.findings().is_empty());
         assert!(request.done_ledger().is_empty());
@@ -427,7 +541,9 @@ mod tests {
         let durable = sample_item_receipt(CheckpointBoundary::repo_frontier(cursor));
         let receipt =
             UnitCommitReceipt::new(completed.clone(), durable.clone()).expect("boundary matches");
-        let aggregator_input = CheckpointAggregatorInput::from(receipt.clone());
+        let aggregator_input =
+            CheckpointAggregatorInput::new(CheckpointBoundaryKind::RepoFrontier, receipt.clone())
+                .expect("kind matches");
 
         assert_eq!(aggregator_input.receipt(), &receipt);
         assert_eq!(aggregator_input.receipt().completed_unit(), &completed);
@@ -453,10 +569,12 @@ mod tests {
 
     #[test]
     fn commit_request_into_parts_round_trip() {
+        let write_context = sample_write_context(5);
         let unit = CompletedUnit::repo_frontier(7, sample_cursor(21));
         let findings = FindingsUpsertBatch::new(&[], &[], &[]);
-        let request = CommitRequest::new(unit.clone(), findings, &[]);
-        let (got_unit, got_findings, got_done_ledger) = request.into_parts();
+        let request = CommitRequest::new(write_context, unit.clone(), findings, &[]);
+        let (got_write_context, got_unit, got_findings, got_done_ledger) = request.into_parts();
+        assert_eq!(got_write_context, write_context);
         assert_eq!(got_unit, unit);
         assert!(got_findings.is_empty());
         assert!(got_done_ledger.is_empty());
@@ -482,12 +600,148 @@ mod tests {
     }
 
     #[test]
+    fn unit_commit_receipt_accepts_different_scope_same_boundary() {
+        // UnitCommitReceipt::new validates only checkpoint_boundary equality,
+        // not full CommitScope identity (tenant, run, shard, epoch, policy).
+        // CompletedUnit does not carry scope identity, so a stronger check
+        // is structurally impossible at this layer. Full scope validation
+        // happens downstream in PageCommit::record_checkpoint.
+        let cursor = sample_cursor(30);
+        let boundary = CheckpointBoundary::ordered_content(cursor.clone());
+
+        let unit = CompletedUnit::ordered_content(1, cursor);
+        let receipt_a = sample_item_receipt(boundary.clone());
+
+        let scope_b = CommitScope::new(
+            TenantId::from_bytes([0x99; 32]),
+            PolicyHash::from_bytes([0x88; 32]),
+            RunId::from_raw(99),
+            ShardId::from_raw(99),
+            FenceEpoch::from_raw(99),
+            NonZeroU64::new(1).unwrap(),
+            boundary,
+        );
+        let receipt_b = PageCommit::new(scope_b)
+            .record_findings(FindingsCommitReceipt::new(1, 1, 1))
+            .record_done_ledger(DoneLedgerCommitReceipt::new(1, 1, 1))
+            .expect("done-ledger count matches")
+            .into_item_commit_receipt();
+
+        assert!(UnitCommitReceipt::new(unit.clone(), receipt_a).is_ok());
+        assert!(UnitCommitReceipt::new(unit, receipt_b).is_ok());
+    }
+
+    #[test]
     fn unit_commit_receipt_rejects_same_kind_cursor_mismatch() {
         let unit = CompletedUnit::ordered_content(1, sample_cursor(1));
         let receipt = sample_item_receipt(CheckpointBoundary::ordered_content(sample_cursor(2)));
         assert!(
             UnitCommitReceipt::new(unit, receipt).is_err(),
             "same boundary kind but different cursor values must be rejected"
+        );
+    }
+
+    #[test]
+    fn checkpoint_aggregator_input_rejects_kind_mismatch() {
+        let cursor = sample_cursor(30);
+        let receipt = UnitCommitReceipt::new(
+            CompletedUnit::ordered_content(1, cursor.clone()),
+            sample_item_receipt(CheckpointBoundary::ordered_content(cursor)),
+        )
+        .expect("boundary matches");
+
+        let err = CheckpointAggregatorInput::new(CheckpointBoundaryKind::RepoFrontier, receipt)
+            .unwrap_err();
+        assert_eq!(err.expected(), CheckpointBoundaryKind::RepoFrontier);
+        assert_eq!(err.actual(), CheckpointBoundaryKind::OrderedContent);
+    }
+
+    #[test]
+    fn checkpoint_aggregator_input_accepts_matching_kind() {
+        let cursor = sample_cursor(31);
+        let receipt = UnitCommitReceipt::new(
+            CompletedUnit::ordered_content(5, cursor.clone()),
+            sample_item_receipt(CheckpointBoundary::ordered_content(cursor)),
+        )
+        .expect("boundary matches");
+
+        assert!(
+            CheckpointAggregatorInput::new(CheckpointBoundaryKind::OrderedContent, receipt).is_ok()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Debug-assertion coverage for tenant consistency sampling
+    // ------------------------------------------------------------------
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "write_context tenant must match observations tenant")]
+    fn commit_request_debug_asserts_mismatched_observation_tenant() {
+        use gossip_contracts::{
+            identity::{LogicalTime, OccurrenceId, PolicyHash as PH},
+            persistence::{ObservationRecord, OvidHash},
+        };
+
+        let write_ctx = sample_write_context(0xAA);
+
+        // Observation whose tenant differs from the write context.
+        let other_tenant = TenantId::from_bytes([0xBB; 32]);
+        let obs = ObservationRecord::new(
+            other_tenant,
+            OccurrenceId::from_bytes([0x01; 32]),
+            PH::from_bytes([0x02; 32]),
+            OvidHash::from_bytes([0x03; 32]),
+            RunId::from_raw(1),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            LogicalTime::from_raw(1),
+        );
+        let observations = [obs];
+        let findings = FindingsUpsertBatch::new(&[], &[], &observations);
+
+        let _request = CommitRequest::new(
+            write_ctx,
+            CompletedUnit::ordered_content(0, sample_cursor(1)),
+            findings,
+            &[],
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "write_context tenant must match done-ledger tenant")]
+    fn commit_request_debug_asserts_mismatched_done_ledger_tenant() {
+        use gossip_contracts::persistence::{
+            DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, OvidHash,
+        };
+
+        let write_ctx = sample_write_context(0xAA);
+
+        // Done-ledger record whose tenant differs from the write context.
+        let other_tenant = TenantId::from_bytes([0xCC; 32]);
+        let key = DoneLedgerKey::new(
+            other_tenant,
+            PolicyHash::from_bytes([0x01; 32]),
+            OvidHash::from_bytes([0x02; 32]),
+        );
+        let prov = DoneLedgerProvenance::new(
+            RunId::from_raw(1),
+            ShardId::from_raw(1),
+            FenceEpoch::from_raw(1),
+            gossip_contracts::identity::LogicalTime::from_raw(1),
+            gossip_contracts::identity::LogicalTime::from_raw(2),
+        );
+        let record =
+            DoneLedgerRecord::try_new(key, DoneLedgerStatus::ScannedClean, 1024, 0, prov, None)
+                .expect("test record should satisfy construction invariants");
+        let done_ledger = [record];
+
+        let _request = CommitRequest::new(
+            write_ctx,
+            CompletedUnit::ordered_content(0, sample_cursor(1)),
+            FindingsUpsertBatch::new(&[], &[], &[]),
+            &done_ledger,
         );
     }
 }

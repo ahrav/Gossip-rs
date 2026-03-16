@@ -11,9 +11,9 @@ use gossip_contracts::{
     connector::{ItemKey, VersionId},
     identity::{
         FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint,
-        StableItemId, TenantId, TenantSecretKey, derive_finding_id, derive_occurrence_id,
-        key_secret_hash,
+        StableItemId, TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
     },
+    persistence::WriteContext,
 };
 
 use crate::coordination_sink::{
@@ -90,26 +90,27 @@ impl CommitSink for CliNoOpCommitSink {
 /// `upsert_findings`, and `finish_item`. The Mutex satisfies the `Send + Sync`
 /// bound required by `CommitSink` without introducing real contention.
 pub struct DurableCommitSink {
-    shard_id: Arc<str>,
+    recorder_shard_label: Arc<str>,
     recorder: Arc<dyn CoordinationEventRecorder>,
-    tenant_id: TenantId,
+    write_context: WriteContext,
     tenant_secret_key: TenantSecretKey,
     in_flight_meta: Mutex<BTreeMap<Vec<u8>, ItemMeta>>,
 }
 
 impl DurableCommitSink {
-    /// Creates a durable commit sink bound to `shard_id`.
+    /// Creates a durable commit sink bound to one recorder shard label and one
+    /// shared write context.
     #[must_use]
     pub fn new(
         recorder: Arc<dyn CoordinationEventRecorder>,
-        shard_id: Arc<str>,
-        tenant_id: TenantId,
+        recorder_shard_label: Arc<str>,
+        write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
     ) -> Self {
         Self {
-            shard_id,
+            recorder_shard_label,
             recorder,
-            tenant_id,
+            write_context,
             tenant_secret_key,
             in_flight_meta: Mutex::new(BTreeMap::new()),
         }
@@ -136,7 +137,7 @@ impl DurableCommitSink {
         let secret_hash = key_secret_hash(&self.tenant_secret_key, &norm_hash);
 
         let finding_id = derive_finding_id(&FindingIdInputs {
-            tenant: self.tenant_id,
+            tenant: self.write_context.tenant_id(),
             item: meta.stable_item_id,
             rule: rule_fingerprint_from_rule_id(finding.rule_id),
             secret: secret_hash,
@@ -163,6 +164,7 @@ impl DurableCommitSink {
         });
 
         Ok(IdentityChainRecord {
+            write_context: self.write_context,
             item_key: item_key.as_bytes().to_vec(),
             rule_id: finding.rule_id,
             start: finding.start,
@@ -185,8 +187,9 @@ impl CommitSink for DurableCommitSink {
             .insert(key_bytes.clone(), meta.clone());
 
         self.recorder.record_commit_progress(
-            &self.shard_id,
+            &self.recorder_shard_label,
             CommitProgressRecord::Begin {
+                write_context: self.write_context,
                 item_key: key_bytes,
                 size_hint: meta.size_hint,
             },
@@ -198,22 +201,22 @@ impl CommitSink for DurableCommitSink {
         for finding in &batch.findings {
             let record = self.derive_identity_record(item_key, &meta, finding)?;
             self.recorder
-                .record_identity_chain(&self.shard_id, record)?;
+                .record_identity_chain(&self.recorder_shard_label, record)?;
         }
         Ok(())
     }
 
     fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
-        let key_bytes = item_key.as_bytes().to_vec();
         self.in_flight_meta
             .lock()
             .map_err(|_| anyhow!("durable commit sink metadata lock poisoned"))?
-            .remove(&key_bytes);
+            .remove(item_key.as_bytes());
 
         self.recorder.record_commit_progress(
-            &self.shard_id,
+            &self.recorder_shard_label,
             CommitProgressRecord::Finish {
-                item_key: key_bytes,
+                write_context: self.write_context,
+                item_key: item_key.as_bytes().to_vec(),
             },
         )
     }
@@ -240,6 +243,11 @@ fn rule_fingerprint_from_rule_id(rule_id: u32) -> RuleFingerprint {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    use gossip_contracts::{
+        identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey},
+        persistence::WriteContext,
+    };
 
     use super::*;
     use crate::OwnedCoreEvent;
@@ -282,10 +290,17 @@ mod tests {
     #[test]
     fn durable_commit_sink_derives_identity_chain() {
         let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
         let sink = DurableCommitSink::new(
             recorder.clone(),
             Arc::from("shard-a"),
-            TenantId::from_bytes([0x11; 32]),
+            write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
         );
 
@@ -320,18 +335,34 @@ mod tests {
         assert_eq!(identity[0].rule_id, 9);
         assert_eq!(identity[0].start, 2);
         assert_eq!(identity[0].end, 12);
+        assert_eq!(identity[0].write_context, write_context);
 
         let progress = recorder.progress.lock().expect("progress lock");
         assert_eq!(progress.len(), 2);
+        match &progress[0] {
+            CommitProgressRecord::Begin {
+                write_context: got, ..
+            } => {
+                assert_eq!(*got, write_context);
+            }
+            other => panic!("expected begin progress record, got {other:?}"),
+        }
     }
 
     #[test]
     fn upsert_without_begin_item_is_rejected() {
         let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
         let sink = DurableCommitSink::new(
             recorder.clone(),
             Arc::from("shard-b"),
-            TenantId::from_bytes([0x11; 32]),
+            write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
         );
 

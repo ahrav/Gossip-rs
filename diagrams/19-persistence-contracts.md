@@ -24,6 +24,12 @@ The [PageCommit typestate machine](08-pagecommit-typestate.md) enforces the
 cross-trait ordering contract (findings before done-ledger before checkpoint)
 and is documented in its own diagram.
 
+Runtime write paths also share a small `WriteContext` value carrying
+`tenant_id`, `policy_hash`, `run_id`, `shard_id`, and `fence_epoch`. That
+shared scope keeps observation writes and done-ledger writes aligned on the
+same routing and fencing metadata without repeating five scalar arguments at
+every runtime call site.
+
 > **Notation.** Solid lines represent data flow and composition. Dashed lines
 > represent trait bounds or type constraints. All diagrams use the B5 Persistence
 > color palette (purple theme: fill `#8B5CF6`, light fill `#EDE9FE`, stroke
@@ -521,6 +527,7 @@ graph TB
 | `crates/gossip-contracts/src/persistence/done_ledger.rs` | `DoneLedgerKey`, `DoneLedgerStatus`, `DoneLedgerRecord`, `DoneLedger` trait |
 | `crates/gossip-contracts/src/persistence/ovid.rs` | `OvidHash`, `OvidHashInputs`, `derive_ovid_hash()` |
 | `crates/gossip-contracts/src/persistence/page_commit.rs` | `PageCommit<S>` typestate, `CheckpointBoundary`, `CommitScope`, validation errors |
+| `crates/gossip-contracts/src/persistence/write_context.rs` | `WriteContext` shared routing and fencing metadata for runtime write paths |
 | `crates/gossip-contracts/src/persistence/error.rs` | `PersistenceInputError` shared validation errors |
 | `crates/gossip-contracts/src/persistence/conformance.rs` | `run_conformance()`, `FindingsConformanceProbe`, conformance report |
 | `crates/gossip-persistence-inmemory/src/` | Reference implementation: `InMemoryDoneLedger`, `InMemoryFindingsSink` |

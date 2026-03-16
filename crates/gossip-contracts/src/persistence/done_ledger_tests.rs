@@ -15,6 +15,60 @@ fn make_provenance() -> DoneLedgerProvenance {
     provenance(1, 2, 3, 100, 200)
 }
 
+#[test]
+fn provenance_from_write_context_preserves_fence_fields() {
+    let write_context = WriteContext::new(
+        tenant(1),
+        policy(2),
+        RunId::from_raw(3),
+        ShardId::from_raw(4),
+        FenceEpoch::from_raw(5),
+    );
+
+    let provenance = DoneLedgerProvenance::from_write_context(
+        write_context,
+        LogicalTime::from_raw(100),
+        LogicalTime::from_raw(200),
+    );
+
+    assert_eq!(provenance.run_id(), write_context.run_id());
+    assert_eq!(provenance.shard_id(), write_context.shard_id());
+    assert_eq!(provenance.fence_epoch(), write_context.fence_epoch());
+    assert_eq!(provenance.started_at(), LogicalTime::from_raw(100));
+    assert_eq!(provenance.finished_at(), LogicalTime::from_raw(200));
+}
+
+#[test]
+fn done_ledger_record_reconstructs_write_context() {
+    let write_context = WriteContext::new(
+        tenant(7),
+        policy(8),
+        RunId::from_raw(9),
+        ShardId::from_raw(10),
+        FenceEpoch::from_raw(11),
+    );
+
+    let record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(
+            write_context.tenant_id(),
+            write_context.policy_hash(),
+            ovid(12),
+        ),
+        ScannedClean,
+        123,
+        0,
+        DoneLedgerProvenance::from_write_context(
+            write_context,
+            LogicalTime::from_raw(200),
+            LogicalTime::from_raw(300),
+        ),
+        None,
+    )
+    .expect("record should be valid");
+
+    assert_eq!(record.write_context(), write_context);
+}
+
 // ---------------------------------------------------------------------------
 // DoneLedgerStatus lattice properties
 // ---------------------------------------------------------------------------
@@ -366,10 +420,8 @@ fn merge_equal_rank_prefers_newer_finished_then_started() {
     assert_eq!(merged.error_code(), Some(&code_b));
 }
 
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "DoneLedgerRecord::merge requires matching keys")]
-fn merge_different_keys_panics_in_debug() {
+fn merge_different_keys_returns_key_mismatch_error() {
     let key_a = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
     let key_b = DoneLedgerKey::new(tenant(9), policy(8), ovid(7));
     let a =
@@ -377,7 +429,20 @@ fn merge_different_keys_panics_in_debug() {
     let b =
         DoneLedgerRecord::try_new(key_b, ScannedClean, 200, 0, make_provenance(), None).unwrap();
 
-    let _ = a.merge(&b);
+    assert_eq!(
+        a.merge(&b).unwrap_err(),
+        PersistenceInputError::KeyMismatch {
+            existing: Box::new(key_a),
+            incoming: Box::new(key_b),
+        }
+    );
+    assert_eq!(
+        b.merge(&a).unwrap_err(),
+        PersistenceInputError::KeyMismatch {
+            existing: Box::new(key_b),
+            incoming: Box::new(key_a),
+        }
+    );
 }
 
 #[test]
