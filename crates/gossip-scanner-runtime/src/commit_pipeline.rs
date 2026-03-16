@@ -194,6 +194,25 @@ impl fmt::Display for SubmitError {
 
 impl Error for SubmitError {}
 
+impl SubmitError {
+    /// Recover the work item that failed to enter the queue.
+    #[inline]
+    #[must_use = "call site should resubmit or explicitly drop the recovered work"]
+    pub fn into_work(self) -> QueuedCommit {
+        match self {
+            Self::Cancelled(work) | Self::Disconnected(work) => *work,
+        }
+    }
+
+    /// Returns `true` when the submission was rejected due to cancellation
+    /// rather than a disconnected worker.
+    #[inline]
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
+    }
+}
+
 /// Cloneable execution-side handle for submitting work into the bounded commit
 /// queue.
 #[derive(Clone, Debug)]
