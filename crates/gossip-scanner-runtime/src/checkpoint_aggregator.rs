@@ -359,10 +359,11 @@ impl PrefixCheckpointAggregator {
     /// On success, the prefix is forgotten, the buffered receipts it covered
     /// are released, and the next required sequence number advances.
     ///
-    /// If a counter overflow occurs after `record_checkpoint` succeeds, the
-    /// pending prefix is restored so the caller can retry. However, the
-    /// `CheckpointCommitReceipt` is consumed by the attempt, so the caller
-    /// must construct a fresh receipt for the retry.
+    /// On counter overflow the pending prefix is restored and the receipt is
+    /// **not** consumed, so the caller can retry directly. On scope mismatch
+    /// from `record_checkpoint`, the pending prefix is also restored but the
+    /// `CheckpointCommitReceipt` has been consumed — the caller must construct
+    /// a fresh receipt for retry.
     pub fn acknowledge_checkpoint(
         &mut self,
         receipt: CheckpointCommitReceipt,
