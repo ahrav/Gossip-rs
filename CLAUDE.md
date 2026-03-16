@@ -1,5 +1,15 @@
 **NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
 
+## Agent Model Inheritance — MANDATORY
+
+When dispatching subagents via the Agent tool, **NEVER set the `model` parameter**.
+Omitting it lets agents inherit the parent session's model. This applies to all
+custom skills, agent definitions, and ad-hoc agent dispatches in this project.
+
+- Do NOT pass `model: "sonnet"`, `model: "haiku"`, or `model: "opus"` explicitly.
+- The parent model (whatever the user selected) propagates automatically.
+- This rule overrides any skill text that suggests a specific model.
+
 <!-- comment-policy-v2 -->
 
 ## Comment Policy — MANDATORY, HOOK-ENFORCED

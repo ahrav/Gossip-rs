@@ -94,8 +94,9 @@ pub enum CheckpointBoundaryKind {
 
 /// Family-neutral durable checkpoint boundary.
 ///
-/// The payload stays as a [`Cursor`] because both currently planned first-wave
-/// families reduce to a monotonic frontier position plus optional opaque token.
+/// The payload stays as a [`Cursor`] because both supported source families
+/// (ordered-content and repo-frontier) reduce to a monotonic frontier position
+/// plus optional opaque token.
 /// The enum tag carries the semantic domain that the runtime must preserve.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckpointBoundary {
@@ -170,6 +171,15 @@ impl CheckpointBoundary {
         match self {
             Self::OrderedContent(_) => None,
             Self::RepoFrontier(cursor) => Some(cursor),
+        }
+    }
+}
+
+impl fmt::Display for CheckpointBoundary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OrderedContent(cursor) => write!(f, "OrderedContent({cursor:?})"),
+            Self::RepoFrontier(cursor) => write!(f, "RepoFrontier({cursor:?})"),
         }
     }
 }
@@ -322,7 +332,10 @@ pub enum PageCommitValidationError {
     /// The done-ledger receipt covers a different number of units than the page.
     LedgerUnitCountMismatch { expected: u64, actual: u64 },
     /// The checkpoint receipt's scope does not match the page scope.
-    CheckpointScopeMismatch,
+    CheckpointScopeMismatch {
+        expected: Box<CommitScope>,
+        actual: Box<CommitScope>,
+    },
 }
 
 impl fmt::Display for PageCommitValidationError {
@@ -332,9 +345,26 @@ impl fmt::Display for PageCommitValidationError {
                 f,
                 "done-ledger receipt unit count mismatch: expected {expected}, got {actual}"
             ),
-            Self::CheckpointScopeMismatch => {
-                write!(f, "checkpoint receipt scope does not match page scope")
-            }
+            Self::CheckpointScopeMismatch { expected, actual } => write!(
+                f,
+                "checkpoint receipt scope does not match page scope \
+                 (expected tenant={:?}, shard={:?}, run={:?}, epoch={:?}, \
+                 units={}, boundary={}; \
+                 actual tenant={:?}, shard={:?}, run={:?}, epoch={:?}, \
+                 units={}, boundary={})",
+                expected.tenant_id(),
+                expected.shard_id(),
+                expected.run_id(),
+                expected.fence_epoch(),
+                expected.committed_units(),
+                expected.checkpoint_boundary(),
+                actual.tenant_id(),
+                actual.shard_id(),
+                actual.run_id(),
+                actual.fence_epoch(),
+                actual.committed_units(),
+                actual.checkpoint_boundary(),
+            ),
         }
     }
 }
@@ -410,6 +440,14 @@ pub struct ItemDurable {
 pub struct CheckpointDurable {
     page_commit: PageCommitReceipt,
 }
+
+// Compile-time proof that page-commit types can move across threads.
+const _: fn() = || {
+    fn assert_impl<T: Send + Sync>() {}
+    assert_impl::<CheckpointBoundaryKind>();
+    assert_impl::<CheckpointBoundary>();
+    assert_impl::<CommitScope>();
+};
 
 /// Typestate machine for the page-commit protocol.
 ///
@@ -624,7 +662,10 @@ impl PageCommit<ItemDurable> {
         receipt: CheckpointCommitReceipt,
     ) -> Result<PageCommit<CheckpointDurable>, PageCommitValidationError> {
         if receipt.scope() != self.scope() {
-            return Err(PageCommitValidationError::CheckpointScopeMismatch);
+            return Err(PageCommitValidationError::CheckpointScopeMismatch {
+                expected: Box::new(self.scope().clone()),
+                actual: Box::new(receipt.scope().clone()),
+            });
         }
 
         let page_commit = PageCommitReceipt::new(self.state.item_commit, receipt);
@@ -847,11 +888,11 @@ mod tests {
         let page = sample_item_commit();
         let scope = page.scope().clone();
 
-        assert_eq!(
+        assert!(matches!(
             page.record_checkpoint(checkpoint_with_wrong_scope(&scope))
                 .unwrap_err(),
-            PageCommitValidationError::CheckpointScopeMismatch
-        );
+            PageCommitValidationError::CheckpointScopeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -872,7 +913,7 @@ mod tests {
         let page = sample_item_commit();
         let scope = page.scope().clone();
 
-        assert_eq!(
+        assert!(matches!(
             page.wait_checkpoint(
                 ReadyCommitHandle::<CheckpointCommitReceipt, TestWaitError>::ok(
                     checkpoint_with_wrong_scope(&scope),
@@ -880,9 +921,9 @@ mod tests {
             )
             .unwrap_err(),
             CommitAdvanceError::<TestWaitError>::Validation(
-                PageCommitValidationError::CheckpointScopeMismatch,
+                PageCommitValidationError::CheckpointScopeMismatch { .. },
             )
-        );
+        ));
     }
 
     #[test]
@@ -913,10 +954,10 @@ mod tests {
         // The checkpoint stage is where full scope validation occurs.
         // A checkpoint receipt scoped to page B is rejected.
         let wrong_checkpoint = sample_checkpoint_receipt(&scope_b);
-        assert_eq!(
+        assert!(matches!(
             page_a.record_checkpoint(wrong_checkpoint).unwrap_err(),
-            PageCommitValidationError::CheckpointScopeMismatch
-        );
+            PageCommitValidationError::CheckpointScopeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -939,6 +980,40 @@ mod tests {
         let receipt = page.into_page_commit_receipt();
         assert_eq!(receipt.item_commit().scope(), &scope);
         assert!(scope.checkpoint_boundary().is_repo_frontier());
+    }
+
+    #[test]
+    fn record_checkpoint_rejects_boundary_family_mismatch() {
+        let cursor = sample_cursor(5);
+        let scope = CommitScope::new(
+            tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            NonZeroU64::new(2).unwrap(),
+            CheckpointBoundary::ordered_content(cursor.clone()),
+        );
+        let page = PageCommit::new(scope)
+            .record_findings(sample_findings_receipt())
+            .record_done_ledger(sample_done_ledger_receipt(2))
+            .unwrap();
+
+        // Same cursor, same scalars, but RepoFrontier instead of OrderedContent.
+        let wrong_scope = CommitScope::new(
+            tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            NonZeroU64::new(2).unwrap(),
+            CheckpointBoundary::repo_frontier(cursor),
+        );
+        let wrong_receipt = CheckpointCommitReceipt::new(wrong_scope, LogicalTime::from_raw(99));
+        assert!(matches!(
+            page.record_checkpoint(wrong_receipt).unwrap_err(),
+            PageCommitValidationError::CheckpointScopeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -988,5 +1063,63 @@ mod tests {
         assert_eq!(scope.fence_epoch(), wc.fence_epoch());
         assert_eq!(scope.committed_units(), committed_units);
         assert_eq!(scope.checkpoint_boundary(), &boundary);
+    }
+
+    /// Cursor-only mismatches must be visible in the formatted error message.
+    ///
+    /// When two commit scopes differ only in their checkpoint cursor (same
+    /// boundary kind, same scalars), the Display output must show distinct
+    /// values for expected vs actual so operators can diagnose the root cause.
+    #[test]
+    fn scope_mismatch_display_distinguishes_cursor_only_difference() {
+        let expected_scope = CommitScope::new(
+            tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            NonZeroU64::new(10).unwrap(),
+            CheckpointBoundary::ordered_content(sample_cursor(0xAA)),
+        );
+        let actual_scope = CommitScope::new(
+            tenant(1),
+            PolicyHash::from_bytes([0xAA; 32]),
+            RunId::from_raw(2),
+            ShardId::from_raw(3),
+            FenceEpoch::from_raw(4),
+            NonZeroU64::new(10).unwrap(),
+            CheckpointBoundary::ordered_content(sample_cursor(0xBB)),
+        );
+
+        // Scopes must differ (cursor is different).
+        assert_ne!(expected_scope, actual_scope);
+
+        let err = PageCommitValidationError::CheckpointScopeMismatch {
+            expected: Box::new(expected_scope),
+            actual: Box::new(actual_scope),
+        };
+
+        let msg = err.to_string();
+
+        // Split at the semicolon to isolate expected vs actual field values.
+        let halves: Vec<&str> = msg.splitn(2, ';').collect();
+        assert_eq!(halves.len(), 2, "Display must have expected;actual halves");
+
+        // Extract the boundary= value from each half — this is the only field
+        // that differs between the two scopes.
+        let expected_boundary = halves[0]
+            .rsplit_once("boundary=")
+            .map(|(_, v)| v)
+            .expect("expected half must contain boundary=");
+        let actual_boundary = halves[1]
+            .rsplit_once("boundary=")
+            .map(|(_, v)| v)
+            .expect("actual half must contain boundary=");
+
+        assert_ne!(
+            expected_boundary, actual_boundary,
+            "cursor-only mismatch must produce distinct boundary values in \
+             the formatted output:\n  {msg}"
+        );
     }
 }

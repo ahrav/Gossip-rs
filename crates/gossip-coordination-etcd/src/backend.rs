@@ -7,12 +7,11 @@
 //!   `get_run_progress`, `list_shards_into`, `collect_claim_candidates_into`,
 //!   `complete_run`, `fail_run`, `cancel_run`)
 //! - **Shard hot path** (`acquire_and_restore_into`, `renew`, `checkpoint`)
-//! - **Shard lifecycle** (`split_replace`, `split_residual`, `unpark_shard`)
+//! - **Shard lifecycle** (`complete`, `park_shard`, `split_replace`,
+//!   `split_residual`, `unpark_shard`)
 //! - **Shard claiming** (via [`default_claim_next_available`])
 //! - **Cold-path maintenance** (`list_active_runs_into`,
 //!   `gc_stale_initializing_runs_into`)
-//! - **Not yet persisted** (`complete`, `park_shard`) — panic until their
-//!   etcd transaction semantics are defined
 //!
 //! # Concurrency model
 //!
@@ -57,12 +56,6 @@
 //! `acquire_and_restore_into` and `renew` do **not** use OpId-based
 //! idempotency. They rely on CAS fencing (lease + epoch checks) for
 //! correctness instead.
-//!
-//! # Unimplemented operations
-//!
-//! Operations not yet persisted (`complete`, `park_shard`) panic with a
-//! descriptive message. They remain fail-closed until their etcd
-//! transaction semantics are defined.
 
 use std::time::Duration;
 

@@ -30,10 +30,9 @@
 //!   prefix, shard limits, tuning). Construction normalizes whitespace and
 //!   enforces keyspace prefix invariants.
 //! - **`backend`** — [`EtcdCoordinator`] and [`AsyncEtcdCoordinator`]:
-//!   the sync wrapper and async core respectively. Both implement most
-//!   coordination operations (sync and async variants); see the backend
-//!   module docs for per-operation coverage and any fail-closed stubs
-//!   (e.g., `complete` and `park_shard`). Each wraps
+//!   the sync wrapper and async core respectively. Both implement the
+//!   same coordination surface across blocking and native-async execution
+//!   models. Each wraps
 //!   etcd RPC calls, health-check (`status()`), and persisted
 //!   coordination transactions for run lifecycle, shard lifecycle, and
 //!   cold-path maintenance. Feature-gated test seeding and fault-injection
@@ -100,5 +99,7 @@ pub use sim_coordinator::SimEtcdCoordinator;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+#[cfg(test)]
+mod behavioral_conformance;
 #[cfg(test)]
 mod tests;

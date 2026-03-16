@@ -1,8 +1,8 @@
 //! Testcontainers-based etcd lifecycle management for integration tests.
 //!
-//! Provides [`test_coordinator`], [`test_coordinator_with_limits`], and
-//! [`test_coordinator_with_ttl`] to create [`EtcdCoordinator`] instances
-//! backed by either:
+//! Provides [`test_coordinator`], [`test_coordinator_with_limits`],
+//! [`test_coordinator_with_ttl`], and [`test_async_coordinator_config`] to
+//! create test coordinators or async-ready configs backed by either:
 //!
 //! - An auto-provisioned Docker container (default), or
 //! - A pre-existing etcd at the address in `ETCD_ENDPOINTS`.
@@ -149,6 +149,19 @@ pub fn test_coordinator() -> EtcdCoordinator {
     let config = EtcdCoordinatorConfig::from_endpoints_csv(&ep.endpoint, &namespace)
         .expect("test endpoint config should be valid");
     EtcdCoordinator::connect(config).expect("test etcd should be reachable")
+}
+
+/// Build a unique async-ready config for [`crate::AsyncEtcdCoordinator`] tests.
+///
+/// This helper performs Docker / endpoint discovery before the caller enters a
+/// Tokio runtime, so `AsyncEtcdCoordinator::connect(config).await` can run
+/// entirely inside that runtime without overlapping testcontainers startup on
+/// the same thread.
+pub fn test_async_coordinator_config() -> EtcdCoordinatorConfig {
+    let ep = shared_endpoint();
+    let namespace = unique_namespace();
+    EtcdCoordinatorConfig::from_endpoints_csv(&ep.endpoint, &namespace)
+        .expect("test endpoint config should be valid")
 }
 
 /// Create an [`EtcdCoordinator`] with explicit shard count limits.

@@ -42,15 +42,17 @@
 //!   cargo test -p gossip-coordination-etcd
 //! ```
 
+use std::future::Future;
+
 use crate::keyspace::PersistedShardSubtreeKey;
 use crate::test_support::{
-    contention_namespace, test_coordinator, test_coordinator_in_namespace,
-    test_coordinator_in_namespace_with_limits, test_coordinator_with_limits,
-    test_coordinator_with_ttl, test_coordinator_with_tuning,
+    contention_namespace, test_async_coordinator_config, test_coordinator,
+    test_coordinator_in_namespace, test_coordinator_in_namespace_with_limits,
+    test_coordinator_with_limits, test_coordinator_with_ttl, test_coordinator_with_tuning,
 };
 use crate::{
-    EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError, EtcdKeyspace,
-    EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
+    AsyncEtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
+    EtcdKeyspace, EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
 };
 use gossip_contracts::coordination::{
     CursorSemantics, CursorUpdate, ShardSpec, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
@@ -58,11 +60,12 @@ use gossip_contracts::coordination::{
 };
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
-    AcquireError, AcquireScratch, ByteSlab, CheckpointError, CoordinationBackend,
-    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, GetRunError,
-    IdempotentOutcome, InitialShardInput, ParkReason, RegisterShardsError, RunConfig,
-    RunManagement, RunStatus, RunTransitionError, ShardFilter, ShardLimitScope, ShardRecord,
-    ShardStatus, SplitReplaceError, SplitResidualError, UnparkError, derive_split_shard_id,
+    AcquireError, AcquireScratch, AsyncCoordinationBackend, AsyncRunManagement, ByteSlab,
+    CheckpointError, CompleteError, CoordinationBackend, DEFAULT_MAX_SHARDS_PER_TENANT,
+    DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, GetRunError, IdempotentOutcome, InitialShardInput,
+    ParkError, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
+    RunTransitionError, ShardFilter, ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError,
+    SplitResidualError, UnparkError, derive_split_shard_id,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -1831,8 +1834,8 @@ fn gc_stale_initializing_runs_decrements_tenant_counter() {
     );
 }
 
-/// Unpark a shard that was manually seeded as `Parked` (via
-/// `test_seed_shard_record`, since `park_shard` is unimplemented).
+/// Unpark a shard that was manually seeded as `Parked` via
+/// `test_seed_shard_record` to exercise the persisted parked state directly.
 /// Verifies: shard transitions to `Active`, fence epoch is bumped,
 /// owner binding is absent, cursor is preserved, park_reason is cleared,
 /// and the operation replays idempotently.
@@ -4035,4 +4038,622 @@ fn get_run_returns_not_found_for_wrong_tenant() {
         matches!(err, GetRunError::RunNotFound),
         "expected RunNotFound, got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AsyncEtcdCoordinator terminal shard operations
+// ---------------------------------------------------------------------------
+
+/// Async `complete` must persist the terminal transition, clear ownership
+/// state, and replay idempotently on the same `(op_id, payload)`.
+#[test]
+fn async_complete_transitions_done_and_replays() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+        let key = lease.shard_key();
+        let final_cursor = CursorUpdate::new(b"m");
+        let op_id = OpId::from_raw(10);
+
+        let outcome = backend
+            .complete(now(4), test_tenant(), &lease, &final_cursor, op_id)
+            .await
+            .expect("async complete should succeed");
+        assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+        let shard = backend
+            .test_load_shard_snapshot(test_tenant(), key)
+            .await
+            .expect("shard lookup should succeed")
+            .expect("shard must exist after complete");
+        assert_eq!(shard.status, ShardStatus::Done);
+        assert_eq!(shard.cursor.last_key(shard.slab()), Some(b"m".as_slice()));
+        assert!(
+            shard.lease.is_none(),
+            "lease must be cleared after complete"
+        );
+        assert!(
+            backend
+                .test_load_owner_binding(test_tenant(), key)
+                .await
+                .expect("owner lookup should succeed")
+                .is_none(),
+            "owner binding must be removed after complete"
+        );
+        assert!(
+            !backend
+                .test_active_shard_index_exists(test_tenant(), key)
+                .await
+                .expect("active index lookup should succeed"),
+            "active-shard index must be removed after complete"
+        );
+
+        let replay = backend
+            .complete(now(5), test_tenant(), &lease, &final_cursor, op_id)
+            .await
+            .expect("async complete replay should succeed");
+        assert!(matches!(replay, IdempotentOutcome::Replayed(())));
+    });
+}
+
+/// After completion, reusing a different `op_id` must report terminal state
+/// instead of replaying or panicking.
+#[test]
+fn async_complete_rejects_new_op_after_terminal() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+        let key = lease.shard_key();
+        let final_cursor = CursorUpdate::new(b"m");
+
+        let _ = backend
+            .complete(
+                now(4),
+                test_tenant(),
+                &lease,
+                &final_cursor,
+                OpId::from_raw(20),
+            )
+            .await
+            .expect("initial async complete should succeed");
+
+        let err = backend
+            .complete(
+                now(5),
+                test_tenant(),
+                &lease,
+                &final_cursor,
+                OpId::from_raw(21),
+            )
+            .await
+            .expect_err("new op_id after completion must be rejected");
+        assert!(
+            matches!(
+                err,
+                CompleteError::ShardTerminal { shard, status }
+                    if shard == key && status == ShardStatus::Done
+            ),
+            "expected ShardTerminal(Done), got {err:?}"
+        );
+    });
+}
+
+/// Async `park_shard` must persist the parked terminal transition, clear
+/// ownership state, and replay idempotently on the same `(op_id, reason)`.
+#[test]
+fn async_park_shard_transitions_parked_and_replays() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+        let key = lease.shard_key();
+        let reason = ParkReason::Poisoned;
+        let op_id = OpId::from_raw(30);
+
+        let outcome = backend
+            .park_shard(now(4), test_tenant(), &lease, reason, op_id)
+            .await
+            .expect("async park_shard should succeed");
+        assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+        let shard = backend
+            .test_load_shard_snapshot(test_tenant(), key)
+            .await
+            .expect("shard lookup should succeed")
+            .expect("shard must exist after park");
+        assert_eq!(shard.status, ShardStatus::Parked);
+        assert_eq!(shard.park_reason, Some(reason));
+        assert!(shard.lease.is_none(), "lease must be cleared after park");
+        assert!(
+            backend
+                .test_load_owner_binding(test_tenant(), key)
+                .await
+                .expect("owner lookup should succeed")
+                .is_none(),
+            "owner binding must be removed after park"
+        );
+        assert!(
+            !backend
+                .test_active_shard_index_exists(test_tenant(), key)
+                .await
+                .expect("active index lookup should succeed"),
+            "active-shard index must be removed after park"
+        );
+
+        let replay = backend
+            .park_shard(now(5), test_tenant(), &lease, reason, op_id)
+            .await
+            .expect("async park_shard replay should succeed");
+        assert!(matches!(replay, IdempotentOutcome::Replayed(())));
+    });
+}
+
+/// After parking, reusing a different `op_id` must report terminal state
+/// instead of replaying or panicking.
+#[test]
+fn async_park_shard_rejects_new_op_after_terminal() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+        let key = lease.shard_key();
+        let reason = ParkReason::Poisoned;
+
+        let _ = backend
+            .park_shard(now(4), test_tenant(), &lease, reason, OpId::from_raw(40))
+            .await
+            .expect("initial async park_shard should succeed");
+
+        let err = backend
+            .park_shard(now(5), test_tenant(), &lease, reason, OpId::from_raw(41))
+            .await
+            .expect_err("new op_id after park must be rejected");
+        assert!(
+            matches!(
+                err,
+                ParkError::ShardTerminal { shard, status }
+                    if shard == key && status == ShardStatus::Parked
+            ),
+            "expected ShardTerminal(Parked), got {err:?}"
+        );
+    });
+}
+
+fn run_async_test<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("async test runtime should build");
+    runtime.block_on(future);
+}
+
+async fn async_backend_with_run_and_lease(
+    config: EtcdCoordinatorConfig,
+) -> (AsyncEtcdCoordinator, gossip_coordination::Lease) {
+    let mut backend = AsyncEtcdCoordinator::connect(config)
+        .await
+        .expect("async test etcd should be reachable");
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .await
+        .expect("create_run should succeed");
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let reg = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(1),
+        )
+        .await
+        .expect("register_shards should succeed");
+    assert!(matches!(reg, IdempotentOutcome::Executed(_)));
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let acquire = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .await
+        .expect("acquire should succeed");
+    (backend, acquire.lease)
+}
+
+/// Verifies that complete rejects a stale fence after the lease has expired and been reacquired by another worker.
+#[test]
+fn async_complete_rejects_stale_fence() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let mut backend = AsyncEtcdCoordinator::connect(config)
+            .await
+            .expect("coordinator should initialize");
+
+        let run_cfg = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5))
+            .expect("run config should be valid");
+        backend
+            .create_run(now(1), test_tenant(), test_run(), run_cfg)
+            .await
+            .expect("create_run should succeed");
+
+        let manifest = [InitialShardInput::new(
+            test_shard(),
+            ShardSpecRef::new(b"a", b"z", b""),
+            CursorUpdate::initial(),
+        )];
+        let reg = backend
+            .register_shards(
+                now(2),
+                test_tenant(),
+                test_run(),
+                &manifest,
+                OpId::from_raw(2),
+            )
+            .await
+            .expect("register_shards should succeed");
+        assert!(matches!(reg, IdempotentOutcome::Executed(_)));
+
+        let key = ShardKey::new(test_run(), test_shard());
+        let mut scratch = AcquireScratch::new();
+        let acquire_a = backend
+            .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+            .await
+            .expect("acquire should succeed");
+        let lease_a = acquire_a.lease;
+
+        let reacquire_at = lease_a.deadline().as_raw() + 1;
+        let acquire_b = backend
+            .acquire_and_restore_into(
+                now(reacquire_at),
+                test_tenant(),
+                key,
+                test_worker(2),
+                &mut scratch,
+            )
+            .await
+            .expect("reacquire should succeed");
+        let lease_b = acquire_b.lease;
+
+        let err = backend
+            .complete(
+                now(reacquire_at + 1),
+                test_tenant(),
+                &lease_a,
+                &CursorUpdate::new(b"m"),
+                OpId::from_raw(10),
+            )
+            .await
+            .expect_err("complete with stale fence should fail");
+
+        match err {
+            CompleteError::StaleFence { presented, current } => {
+                assert_eq!(presented, lease_a.fence());
+                assert_eq!(current, lease_b.fence());
+            }
+            _ => panic!("expected CompleteError::StaleFence, got {err:?}"),
+        }
+    });
+}
+
+/// Verifies that park_shard rejects a stale fence after the lease has expired and been reacquired by another worker.
+#[test]
+fn async_park_shard_rejects_stale_fence() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let mut backend = AsyncEtcdCoordinator::connect(config)
+            .await
+            .expect("coordinator should initialize");
+
+        let run_cfg = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5))
+            .expect("run config should be valid");
+        backend
+            .create_run(now(1), test_tenant(), test_run(), run_cfg)
+            .await
+            .expect("create_run should succeed");
+
+        let manifest = [InitialShardInput::new(
+            test_shard(),
+            ShardSpecRef::new(b"a", b"z", b""),
+            CursorUpdate::initial(),
+        )];
+        let reg = backend
+            .register_shards(
+                now(2),
+                test_tenant(),
+                test_run(),
+                &manifest,
+                OpId::from_raw(2),
+            )
+            .await
+            .expect("register_shards should succeed");
+        assert!(matches!(reg, IdempotentOutcome::Executed(_)));
+
+        let key = ShardKey::new(test_run(), test_shard());
+        let mut scratch = AcquireScratch::new();
+        let acquire_a = backend
+            .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+            .await
+            .expect("acquire should succeed");
+        let lease_a = acquire_a.lease;
+
+        let reacquire_at = lease_a.deadline().as_raw() + 1;
+        let acquire_b = backend
+            .acquire_and_restore_into(
+                now(reacquire_at),
+                test_tenant(),
+                key,
+                test_worker(2),
+                &mut scratch,
+            )
+            .await
+            .expect("reacquire should succeed");
+        let lease_b = acquire_b.lease;
+
+        let err = backend
+            .park_shard(
+                now(reacquire_at + 1),
+                test_tenant(),
+                &lease_a,
+                ParkReason::Poisoned,
+                OpId::from_raw(30),
+            )
+            .await
+            .expect_err("park_shard with stale fence should fail");
+
+        match err {
+            ParkError::StaleFence { presented, current } => {
+                assert_eq!(presented, lease_a.fence());
+                assert_eq!(current, lease_b.fence());
+            }
+            _ => panic!("expected ParkError::StaleFence, got {err:?}"),
+        }
+    });
+}
+
+/// Verifies that complete rejects a cursor that regresses from the previously checkpointed position.
+#[test]
+fn async_complete_rejects_cursor_regression() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+
+        let _ = backend
+            .checkpoint(
+                now(4),
+                test_tenant(),
+                &lease,
+                &CursorUpdate::new(b"m"),
+                OpId::from_raw(5),
+            )
+            .await
+            .expect("checkpoint should succeed");
+
+        let err = backend
+            .complete(
+                now(5),
+                test_tenant(),
+                &lease,
+                &CursorUpdate::new(b"b"),
+                OpId::from_raw(10),
+            )
+            .await
+            .expect_err("complete with regressed cursor should fail");
+
+        assert!(
+            matches!(err, CompleteError::CursorRegression { .. }),
+            "expected CompleteError::CursorRegression, got {err:?}"
+        );
+    });
+}
+
+/// Verifies that complete rejects a cursor that falls outside the shard spec bounds.
+#[test]
+fn async_complete_rejects_cursor_out_of_bounds() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+
+        let err = backend
+            .complete(
+                now(4),
+                test_tenant(),
+                &lease,
+                &CursorUpdate::new(b"{"),
+                OpId::from_raw(10),
+            )
+            .await
+            .expect_err("complete with out-of-bounds cursor should fail");
+
+        assert!(
+            matches!(err, CompleteError::CursorOutOfBounds(_)),
+            "expected CompleteError::CursorOutOfBounds, got {err:?}"
+        );
+    });
+}
+
+/// Verifies that complete rejects replay of an existing op_id with a different payload hash.
+/// The first complete succeeds and transitions the shard to Done. A second complete call
+/// with the same op_id but different cursor data must detect the payload mismatch and return
+/// OpIdConflict.
+#[test]
+fn async_complete_rejects_op_id_conflict() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+
+        // First complete with op_id=10 and cursor="m"
+        let outcome = backend
+            .complete(
+                now(4),
+                test_tenant(),
+                &lease,
+                &CursorUpdate::new(b"m"),
+                OpId::from_raw(10),
+            )
+            .await
+            .expect("first complete should succeed");
+        assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+        // Second complete with same op_id=10 but different cursor="n"
+        // This should trigger OpIdConflict because the payload hash differs
+        let err = backend
+            .complete(
+                now(5),
+                test_tenant(),
+                &lease,
+                &CursorUpdate::new(b"n"),
+                OpId::from_raw(10),
+            )
+            .await
+            .expect_err("complete with conflicting op_id should fail");
+
+        assert!(
+            matches!(err, CompleteError::OpIdConflict { op_id, .. } if op_id == OpId::from_raw(10)),
+            "expected CompleteError::OpIdConflict with op_id=10, got {err:?}"
+        );
+    });
+}
+
+/// Verifies that park_shard rejects replay of an existing op_id with a different payload hash.
+/// The first park succeeds with one ParkReason. A second park with the same op_id but a
+/// different ParkReason must detect the payload mismatch and return OpIdConflict.
+#[test]
+fn async_park_shard_rejects_op_id_conflict() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+
+        // First park with op_id=30 and reason=Poisoned
+        let outcome = backend
+            .park_shard(
+                now(4),
+                test_tenant(),
+                &lease,
+                ParkReason::Poisoned,
+                OpId::from_raw(30),
+            )
+            .await
+            .expect("first park should succeed");
+        assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+        // Second park with same op_id=30 but different reason=TooManyErrors
+        // This should trigger OpIdConflict because the payload hash differs
+        let err = backend
+            .park_shard(
+                now(5),
+                test_tenant(),
+                &lease,
+                ParkReason::TooManyErrors,
+                OpId::from_raw(30),
+            )
+            .await
+            .expect_err("park with conflicting op_id should fail");
+
+        assert!(
+            matches!(err, ParkError::OpIdConflict { op_id, .. } if op_id == OpId::from_raw(30)),
+            "expected ParkError::OpIdConflict with op_id=30, got {err:?}"
+        );
+    });
+}
+
+/// Verifies that each ParkReason variant persists correctly through park_shard and is
+/// readable in the shard snapshot. All five variants must round-trip through etcd storage.
+#[rstest]
+#[case::permission_denied(ParkReason::PermissionDenied)]
+#[case::not_found(ParkReason::NotFound)]
+#[case::poisoned(ParkReason::Poisoned)]
+#[case::too_many_errors(ParkReason::TooManyErrors)]
+#[case::other(ParkReason::Other)]
+#[test]
+fn async_park_reason_round_trips(#[case] reason: ParkReason) {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+
+        // Park with the given reason
+        let outcome = backend
+            .park_shard(now(4), test_tenant(), &lease, reason, OpId::from_raw(40))
+            .await
+            .expect("park should succeed");
+        assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+        // Load snapshot and verify status and park_reason
+        let snapshot = backend
+            .test_load_shard_snapshot(test_tenant(), lease.shard_key())
+            .await
+            .expect("snapshot should load")
+            .expect("shard must exist");
+
+        assert_eq!(
+            snapshot.status,
+            ShardStatus::Parked,
+            "shard should be Parked"
+        );
+        assert_eq!(
+            snapshot.park_reason,
+            Some(reason),
+            "park_reason should match"
+        );
+    });
+}
+
+/// Verifies that a checkpoint followed by complete preserves cursor monotonicity and
+/// correctly transitions the shard to Done. The final cursor must be the one from complete,
+/// the lease must be cleared, and the status must be Done.
+#[test]
+fn async_checkpoint_then_complete_preserves_cursor_monotonicity() {
+    let config = test_async_coordinator_config();
+    run_async_test(async move {
+        let (mut backend, lease) = async_backend_with_run_and_lease(config).await;
+        let key = lease.shard_key();
+
+        // Checkpoint to "d"
+        let outcome = backend
+            .checkpoint(
+                now(4),
+                test_tenant(),
+                &lease,
+                &CursorUpdate::new(b"d"),
+                OpId::from_raw(5),
+            )
+            .await
+            .expect("checkpoint should succeed");
+        assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+        // Complete with "m" (later cursor)
+        let outcome = backend
+            .complete(
+                now(5),
+                test_tenant(),
+                &lease,
+                &CursorUpdate::new(b"m"),
+                OpId::from_raw(10),
+            )
+            .await
+            .expect("complete should succeed");
+        assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+        // Load snapshot and verify final state
+        let snapshot = backend
+            .test_load_shard_snapshot(test_tenant(), key)
+            .await
+            .expect("snapshot should load")
+            .expect("shard must exist");
+
+        assert_eq!(snapshot.status, ShardStatus::Done, "shard should be Done");
+        assert_eq!(
+            snapshot.cursor.last_key(snapshot.slab()),
+            Some(b"m".as_slice()),
+            "cursor should be 'm' from complete"
+        );
+        assert!(
+            snapshot.lease.is_none(),
+            "lease should be cleared after complete"
+        );
+    });
 }
