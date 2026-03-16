@@ -1,7 +1,7 @@
 //! Distributed runtime placeholders for family-oriented execution.
 //!
-//! This module exposes the high-level distributed runtime nouns without the
-//! removed driver-based lease execution surface.
+//! This module exposes the high-level distributed runtime nouns for the
+//! family-oriented worker loop.
 
 use std::fmt;
 use std::sync::Arc;
@@ -162,39 +162,10 @@ pub struct DistributedRunReport {
     pub shards_skipped_done: u64,
 }
 
-/// Error returned by distributed runtime entry points.
-#[derive(Debug)]
-pub enum DistributedRuntimeError {
-    /// Underlying runtime error.
-    Runtime(ScanRuntimeError),
-}
-
-impl std::fmt::Display for DistributedRuntimeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Runtime(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for DistributedRuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Runtime(error) => Some(error),
-        }
-    }
-}
-
-impl From<ScanRuntimeError> for DistributedRuntimeError {
-    fn from(value: ScanRuntimeError) -> Self {
-        Self::Runtime(value)
-    }
-}
-
 /// Run the distributed worker loop for the selected family.
 pub fn run_distributed(
     config: &DistributedRunConfig,
-) -> Result<DistributedRunReport, DistributedRuntimeError> {
+) -> Result<DistributedRunReport, ScanRuntimeError> {
     config.budgets.validate()?;
     let family = match config.family {
         DistributedFamily::OrderedContent => "ordered-content",
@@ -202,8 +173,7 @@ pub fn run_distributed(
     };
     Err(ScanRuntimeError::Driver(anyhow!(
         "{family} distributed runtime path is not implemented yet"
-    ))
-    .into())
+    )))
 }
 
 #[cfg(test)]
@@ -233,19 +203,13 @@ mod tests {
         })
         .expect_err("zero budget should fail");
 
-        assert!(matches!(
-            error,
-            DistributedRuntimeError::Runtime(ScanRuntimeError::ConnectorInput(_))
-        ));
+        assert!(matches!(error, ScanRuntimeError::ConnectorInput(_)));
     }
 
     #[test]
     fn distributed_runtime_returns_placeholder_error() {
         let error = run_distributed(&DistributedRunConfig::default()).expect_err("placeholder");
-        assert!(matches!(
-            error,
-            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(_))
-        ));
+        assert!(matches!(error, ScanRuntimeError::Driver(_)));
     }
 
     #[test]
