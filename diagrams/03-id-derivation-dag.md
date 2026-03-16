@@ -12,7 +12,7 @@ Three invariants govern the entire DAG:
 
 ## 1. Full 19-Type DAG
 
-The complete identity hierarchy shows how five root types (requiring no derivation) flow through intermediate structures into eight derived 32-byte identifiers and one policy hash. The graph is a DAG because several derived types consume outputs from multiple independent roots.
+The complete identity hierarchy shows how four root types (requiring no derivation) flow through intermediate structures into nine derived 32-byte identifiers and one policy hash. The graph is a DAG because several derived types consume outputs from multiple independent roots.
 
 ```mermaid
 %% Diagram: full-19-type-dag

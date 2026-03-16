@@ -364,6 +364,7 @@ which downstream IDs are invalidated when a given constant changes:
 
 | Changed Constant    | Directly Invalidated | Transitively Invalidated                  |
 | ------------------- | -------------------- | ----------------------------------------- |
+| `RULE_FINGERPRINT_V1` | `RuleFingerprint`  | `FindingId` → `OccurrenceId`              |
 | `ITEM_ID_V1`        | `StableItemId`       | `FindingId` → `OccurrenceId`              |
 | `OBJECT_VERSION_V1` | `ObjectVersionId`    | `OccurrenceId`                            |
 | `SECRET_HASH_V1`    | `SecretHash`         | `FindingId` → `OccurrenceId`              |

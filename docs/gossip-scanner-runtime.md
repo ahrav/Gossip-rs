@@ -290,7 +290,7 @@ The module owns:
 - `ResultTranslationError`
 - `translate_item_result`
 
-The translation is deterministic with respect to its inputs. Stable item
+The translation is deterministic for its inputs. Stable item
 identity, version claim, write scope, tenant secret key, a rule-fingerprint
 resolver callback, and scan findings fully determine the resulting OVID,
 finding IDs, occurrence IDs, observation IDs, and done-ledger key.
