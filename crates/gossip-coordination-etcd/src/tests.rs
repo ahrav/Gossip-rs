@@ -40,19 +40,24 @@
 //! # Or point to an existing cluster:
 //! ETCD_ENDPOINTS="http://10.0.0.1:2379,http://10.0.0.2:2379" \
 //!   cargo test -p gossip-coordination-etcd
+//!
+//! # Run the wall-clock TTL expiry test:
+//! cargo test -p gossip-coordination-etcd -- --ignored lease_ttl_expiry
 //! ```
 
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 use crate::keyspace::PersistedShardSubtreeKey;
 use crate::test_support::{
     contention_namespace, test_async_coordinator_config, test_coordinator,
     test_coordinator_in_namespace, test_coordinator_in_namespace_with_limits,
-    test_coordinator_with_limits, test_coordinator_with_ttl, test_coordinator_with_tuning,
+    test_coordinator_in_namespace_with_tuning, test_coordinator_with_limits,
+    test_coordinator_with_tuning,
 };
 use crate::{
-    AsyncEtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
-    EtcdKeyspace, EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
+    AsyncEtcdCoordinator, EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError,
+    EtcdCoordinatorError, EtcdKeyspace, EtcdKeyspaceError, EtcdOperation, EtcdTestFault,
 };
 use gossip_contracts::coordination::{
     CursorSemantics, CursorUpdate, ShardSpec, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
@@ -63,7 +68,7 @@ use gossip_coordination::{
     AcquireError, AcquireScratch, AsyncCoordinationBackend, AsyncRunManagement, ByteSlab,
     CheckpointError, CompleteError, CoordinationBackend, DEFAULT_MAX_SHARDS_PER_TENANT,
     DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, GetRunError, IdempotentOutcome, InitialShardInput,
-    ParkError, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
+    ParkError, ParkReason, RegisterShardsError, RenewError, RunConfig, RunManagement, RunStatus,
     RunTransitionError, ShardFilter, ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError,
     SplitResidualError, UnparkError, derive_split_shard_id,
 };
@@ -1945,6 +1950,33 @@ fn now(t: u64) -> LogicalTime {
     LogicalTime::from_raw(t)
 }
 
+/// Poll until the owner binding for `key` disappears, or panic if
+/// `ttl_secs + 10s` elapses without cleanup.
+fn wait_for_owner_binding_expiry(
+    backend: &EtcdCoordinator,
+    tenant: TenantId,
+    key: ShardKey,
+    ttl_secs: i64,
+) {
+    let deadline = Instant::now()
+        + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
+    let interval = Duration::from_millis(250);
+    loop {
+        if backend
+            .test_load_owner_binding(tenant, key)
+            .expect("owner lookup should succeed while polling")
+            .is_none()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owner binding was not cleaned up within {ttl_secs}s + 10s margin"
+        );
+        std::thread::sleep(interval);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests: error paths and contention
 // ---------------------------------------------------------------------------
@@ -2104,14 +2136,13 @@ fn checkpoint_replay_remains_idempotent() {
     );
 }
 
-/// After the etcd lease expires (owner key auto-deleted), checkpoint must
-/// fail because the owner binding no longer matches the presented lease.
+/// A checkpoint after the etcd owner-lease TTL has elapsed must be rejected
+/// with `StaleFence`. Waits for the owner binding to disappear before
+/// attempting the checkpoint so the outcome is deterministic.
 #[test]
 fn lease_expiry_rejects_stale_checkpoint() {
-    // Use a short owner-lease TTL so the etcd lease expires quickly.
-    // etcd enforces a minimum TTL of ~5s in most configurations.
-    let ttl_secs = 5;
-    let mut backend = test_coordinator_with_ttl(ttl_secs);
+    let ttl_secs: i64 = 5;
+    let mut backend = test_coordinator_with_tuning(ttl_secs, 8, 8);
 
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
     backend
@@ -2135,27 +2166,274 @@ fn lease_expiry_rejects_stale_checkpoint() {
 
     let key = ShardKey::new(test_run(), test_shard());
     let mut scratch = AcquireScratch::new();
-    let acquire = backend
-        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
-        .expect("acquire should succeed");
+    let lease = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
+        .expect("acquire should succeed")
+        .lease;
 
-    // Wait for the etcd lease to expire. The owner key is deleted by etcd's
-    // TTL mechanism, leaving the shard without a live owner binding.
-    std::thread::sleep(std::time::Duration::from_secs(ttl_secs as u64 + 3));
+    wait_for_owner_binding_expiry(&backend, test_tenant(), key, ttl_secs);
 
-    let checkpoint_result = backend.checkpoint(
-        now(4),
-        test_tenant(),
-        &acquire.lease,
-        &CursorUpdate::new(b"m"),
-        OpId::from_raw(100),
+    let err = backend
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease,
+            &CursorUpdate::new(b"m"),
+            OpId::from_raw(100),
+        )
+        .expect_err("checkpoint must fail after lease TTL expiry");
+    // After polling confirms the owner binding is absent, `load_shard_record`
+    // sees `owner = None` in a single atomic prefix-range GET — no CAS race
+    // window exists, so only `StaleFence` (not `BackendError`) is possible.
+    assert!(
+        matches!(err, CheckpointError::StaleFence { .. }),
+        "expected StaleFence after TTL expiry, got {err:?}"
+    );
+}
+
+/// Wall-clock expiry of the etcd owner lease must delete only the owner key,
+/// leaving the shard record intact until a new worker reacquires the shard and
+/// advances the fence.
+#[test]
+#[ignore = "requires wall-clock TTL expiry against live etcd"]
+fn lease_ttl_expiry_full_cycle() {
+    let ttl_secs = 5;
+    let namespace = contention_namespace();
+    let mut backend_a = test_coordinator_in_namespace_with_tuning(&namespace, ttl_secs, 8, 8);
+    let mut backend_b = test_coordinator_in_namespace_with_tuning(&namespace, ttl_secs, 8, 8);
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend_a
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend_a
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch_a = AcquireScratch::new();
+    let lease_a = backend_a
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch_a)
+        .expect("worker A acquire should succeed")
+        .lease;
+
+    let checkpoint_a = backend_a
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease_a,
+            &CursorUpdate::new(b"m"),
+            OpId::from_raw(100),
+        )
+        .expect("worker A checkpoint should succeed");
+    assert!(checkpoint_a.is_executed());
+
+    let owner_before_expiry = backend_a
+        .test_load_owner_binding(test_tenant(), key)
+        .expect("owner lookup should succeed")
+        .expect("owner binding must exist before TTL expiry");
+    assert_eq!(owner_before_expiry.0, test_worker(7));
+    assert_eq!(owner_before_expiry.1, lease_a.fence());
+
+    wait_for_owner_binding_expiry(&backend_a, test_tenant(), key, ttl_secs);
+
+    // Guard against a concurrent reacquire between the poll break and the
+    // assertions below. Under the current `unique_namespace` scheme this
+    // cannot happen, but the assertion documents the assumption explicitly.
+    assert!(
+        backend_a
+            .test_load_owner_binding(test_tenant(), key)
+            .expect("owner lookup should succeed after poll exit")
+            .is_none(),
+        "owner binding reappeared between poll exit and zombie assertions"
     );
 
-    match checkpoint_result {
-        Err(CheckpointError::StaleFence { .. }) => { /* expected */ }
-        Err(CheckpointError::BackendError { .. }) => { /* acceptable: CAS failed after owner key vanished */
+    let expired_shard = backend_a
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed after TTL expiry")
+        .expect("shard record must remain after owner binding expiry");
+    assert_eq!(expired_shard.status, ShardStatus::Active);
+    assert_eq!(expired_shard.fence_epoch, lease_a.fence());
+    assert_eq!(expired_shard.lease_owner(), Some(test_worker(7)));
+    assert_eq!(expired_shard.lease_deadline(), Some(lease_a.deadline()));
+    assert_eq!(
+        expired_shard.cursor.last_key(expired_shard.slab()),
+        Some(b"m".as_slice())
+    );
+
+    // Zombie-worker assertions: the owner binding is gone (etcd lease
+    // expired) but no new worker has reacquired. Worker A's checkpoint
+    // and renew must both be rejected with StaleFence.
+    //
+    // Because the poll loop confirmed owner-binding absence, `load_shard_record`
+    // sees `owner = None` in a single atomic prefix-range GET. No CAS is
+    // attempted, so `BackendError` (CAS failure from a vanished owner key
+    // between load and commit) is impossible here — only `StaleFence`.
+    //
+    // The fence epoch has not advanced (no reacquire), so both `presented`
+    // and `current` carry the same value. This is the expected etcd-backend
+    // behavior: the owner binding is absent, but the shard record's fence is
+    // unchanged. The `StaleFence` contract ("re-acquire") is correct for
+    // this case — callers must not interpret `presented == current` as
+    // "still valid."
+    let zombie_checkpoint_err = backend_a
+        .checkpoint(
+            now(5),
+            test_tenant(),
+            &lease_a,
+            &CursorUpdate::new(b"n"),
+            OpId::from_raw(200),
+        )
+        .expect_err("worker A checkpoint must fail in owner-absent window");
+    match zombie_checkpoint_err {
+        CheckpointError::StaleFence { presented, current } => {
+            assert_eq!(
+                presented,
+                lease_a.fence(),
+                "zombie checkpoint presented fence must match the original lease"
+            );
+            assert_eq!(
+                presented, current,
+                "in the owner-absent window (no reacquire), presented == current"
+            );
         }
-        other => panic!("expected StaleFence or BackendError after lease expiry, got {other:?}"),
+        other => panic!("expected StaleFence in owner-absent window, got {other:?}"),
+    }
+
+    let zombie_renew_err = backend_a
+        .renew(now(5), test_tenant(), &lease_a)
+        .expect_err("worker A renew must fail in owner-absent window");
+    match zombie_renew_err {
+        RenewError::StaleFence { presented, current } => {
+            assert_eq!(
+                presented,
+                lease_a.fence(),
+                "zombie renew presented fence must match the original lease"
+            );
+            assert_eq!(
+                presented, current,
+                "in the owner-absent window (no reacquire), presented == current"
+            );
+        }
+        other => panic!("expected StaleFence in owner-absent window, got {other:?}"),
+    }
+
+    // The zombie operations must not have mutated the shard record.
+    // Verify cursor, fence, and op-log are unchanged from the last
+    // successful checkpoint.
+    let post_zombie_shard = backend_a
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed after zombie assertions")
+        .expect("shard must still exist after zombie assertions");
+    assert_eq!(
+        post_zombie_shard.cursor.last_key(post_zombie_shard.slab()),
+        Some(b"m".as_slice()),
+        "zombie checkpoint must not mutate the cursor"
+    );
+    assert_eq!(
+        post_zombie_shard.fence_epoch,
+        lease_a.fence(),
+        "zombie operations must not advance the fence"
+    );
+    assert_eq!(
+        post_zombie_shard
+            .op_log
+            .iter()
+            .filter(|e| e.op_id() == OpId::from_raw(200))
+            .count(),
+        0,
+        "zombie checkpoint op must not appear in the op log"
+    );
+
+    let mut scratch_b = AcquireScratch::new();
+    let lease_b = backend_b
+        .acquire_and_restore_into(now(6), test_tenant(), key, test_worker(8), &mut scratch_b)
+        .expect("worker B reacquire should succeed after TTL expiry")
+        .lease;
+    assert!(
+        lease_b.fence() > lease_a.fence(),
+        "reacquire must advance the fence"
+    );
+
+    let owner_after_reacquire = backend_a
+        .test_load_owner_binding(test_tenant(), key)
+        .expect("owner lookup should succeed after reacquire")
+        .expect("owner binding must be recreated after reacquire");
+    assert_eq!(owner_after_reacquire.0, test_worker(8));
+    assert_eq!(owner_after_reacquire.1, lease_b.fence());
+    assert_ne!(owner_after_reacquire.2, owner_before_expiry.2);
+
+    let reacquired_shard = backend_a
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed after reacquire")
+        .expect("shard record must remain after reacquire");
+    assert_eq!(reacquired_shard.status, ShardStatus::Active);
+    assert_eq!(reacquired_shard.fence_epoch, lease_b.fence());
+    assert_eq!(reacquired_shard.lease_owner(), Some(test_worker(8)));
+    assert_eq!(reacquired_shard.lease_deadline(), Some(lease_b.deadline()));
+    assert_eq!(
+        reacquired_shard.cursor.last_key(reacquired_shard.slab()),
+        Some(b"m".as_slice())
+    );
+
+    let checkpoint_b = backend_b
+        .checkpoint(
+            now(7),
+            test_tenant(),
+            &lease_b,
+            &CursorUpdate::new(b"t"),
+            OpId::from_raw(101),
+        )
+        .expect("worker B checkpoint should succeed");
+    assert!(checkpoint_b.is_executed());
+
+    let advanced_shard = backend_a
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed after worker B checkpoint")
+        .expect("shard record must remain after worker B checkpoint");
+    assert_eq!(
+        advanced_shard.cursor.last_key(advanced_shard.slab()),
+        Some(b"t".as_slice())
+    );
+
+    let renew_err = backend_a
+        .renew(now(8), test_tenant(), &lease_a)
+        .expect_err("worker A renew should fail after worker B reacquires");
+    match renew_err {
+        RenewError::StaleFence { presented, current } => {
+            assert_eq!(presented, lease_a.fence());
+            assert_eq!(current, lease_b.fence());
+        }
+        other => panic!("expected RenewError::StaleFence, got {other:?}"),
+    }
+
+    let checkpoint_err = backend_a
+        .checkpoint(
+            now(8),
+            test_tenant(),
+            &lease_a,
+            &CursorUpdate::new(b"z"),
+            OpId::from_raw(102),
+        )
+        .expect_err("worker A checkpoint should fail after worker B reacquires");
+    match checkpoint_err {
+        CheckpointError::StaleFence { presented, current } => {
+            assert_eq!(presented, lease_a.fence());
+            assert_eq!(current, lease_b.fence());
+        }
+        other => panic!("expected CheckpointError::StaleFence, got {other:?}"),
     }
 }
 
