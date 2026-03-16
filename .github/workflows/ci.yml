@@ -311,7 +311,7 @@ jobs:
           --features test-support
           --run-ignored ignored-only
           --profile ci
-          -E 'binary(differential_oracle)'
+          -E 'binary(~differential_oracle)'
 
       - name: Run etcd integration tests (release)
         if: github.event_name == 'schedule'
