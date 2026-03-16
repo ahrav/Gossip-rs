@@ -723,7 +723,7 @@ mod tests {
     use crate::{
         connector::ItemKey,
         identity::{LogicalTime, PolicyHash},
-        test_util::{tenant, TestWaitError},
+        test_util::{TestWaitError, tenant},
     };
 
     use super::super::commit::ReadyCommitHandle;

@@ -677,8 +677,8 @@ mod tests {
     #[should_panic(expected = "write_context tenant must match observations tenant")]
     fn commit_request_debug_asserts_mismatched_observation_tenant() {
         use gossip_contracts::{
-            identity::{LogicalTime, OccurrenceId, OvidHash, PolicyHash as PH},
-            persistence::ObservationRecord,
+            identity::{LogicalTime, OccurrenceId, PolicyHash as PH},
+            persistence::{ObservationRecord, OvidHash},
         };
 
         let write_ctx = sample_write_context(0xAA);
