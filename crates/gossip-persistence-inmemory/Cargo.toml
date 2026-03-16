@@ -23,6 +23,6 @@ gossip-contracts = { workspace = true, features = ["test-support"] }
 gossip-done-ledger-postgres = { workspace = true, features = ["test-utils"] }
 gossip-pg-common = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
-postgres = "0.19"
+postgres.workspace = true
 rand = "0.9"
 rand_chacha = "0.9"
