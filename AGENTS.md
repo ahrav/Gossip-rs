@@ -1,15 +1,5 @@
 **NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
 
-## Agent Model Inheritance — MANDATORY
-
-When dispatching subagents via the Agent tool, **NEVER set the `model` parameter**.
-Omitting it lets agents inherit the parent session's model. This applies to all
-custom skills, agent definitions, and ad-hoc agent dispatches in this project.
-
-- Do NOT pass `model: "sonnet"`, `model: "haiku"`, or `model: "opus"` explicitly.
-- The parent model (whatever the user selected) propagates automatically.
-- This rule overrides any skill text that suggests a specific model.
-
 <!-- comment-policy-v2 -->
 
 ## Comment Policy — MANDATORY, HOOK-ENFORCED
@@ -25,16 +15,16 @@ them before moving on.
 
 ### What Is Banned
 
-| Category | Examples of BANNED comments |
-|----------|-----------------------------|
-| Tracking IDs | `// F-011: BatchValidation error variant`, `// C3: edge case` |
-| Milestone / phase labels | `// B0 scaffold`, `// until B1 lands`, `// B1/B2 will add`, `phase 1` |
-| PR / review references | `// PR #124`, `// per review feedback`, `// addressed reviewer concern` |
-| Test justification | `// Verification tests for PR review comments`, `// Added to cover finding F7` |
-| Temporal narration | `// Previously used linear scan`, `// Was changed from X to Y`, `// Newly added` |
-| Conversational | `// Good catch`, `// As discussed`, `// Note to reviewer` |
-| History narration | `// Refactored from module A`, `// Moved from old_engine.rs` |
-| Task IDs in docs | `gossip-8968`, `gossip-rs-8r9.25`, `Step gossip-rs-...` (in `.md` files) |
+| Category                 | Examples of BANNED comments                                                      |
+| ------------------------ | -------------------------------------------------------------------------------- |
+| Tracking IDs             | `// F-011: BatchValidation error variant`, `// C3: edge case`                    |
+| Milestone / phase labels | `// B0 scaffold`, `// until B1 lands`, `// B1/B2 will add`, `phase 1`            |
+| PR / review references   | `// PR #124`, `// per review feedback`, `// addressed reviewer concern`          |
+| Test justification       | `// Verification tests for PR review comments`, `// Added to cover finding F7`   |
+| Temporal narration       | `// Previously used linear scan`, `// Was changed from X to Y`, `// Newly added` |
+| Conversational           | `// Good catch`, `// As discussed`, `// Note to reviewer`                        |
+| History narration        | `// Refactored from module A`, `// Moved from old_engine.rs`                     |
+| Task IDs in docs         | `gossip-8968`, `gossip-rs-8r9.25`, `Step gossip-rs-...` (in `.md` files)         |
 
 ### What Is Required
 
@@ -74,7 +64,7 @@ task IDs, or step tracking references in documentation prose.
 If you are about to write a comment, ask:
 
 1. Does it reference a finding ID, PR number, or reviewer? **Delete it.**
-2. Does it explain *when* or *why it was changed* rather than *what the code does*? **Rewrite it.**
+2. Does it explain _when_ or _why it was changed_ rather than _what the code does_? **Rewrite it.**
 3. Would it make sense to someone who has never seen the PR? If not, **rewrite it.**
 
 ### Code-Internal Cross-References Are Fine
@@ -186,15 +176,15 @@ Use an operationally tiered policy instead of blanket no-allocation rules.
 
 ### Existing Infrastructure (use these, don't reinvent)
 
-| Type | Location | Purpose |
-|------|----------|---------|
-| `ByteSlab` / `ByteSlot` | `gossip-stdx/src/byte_slab.rs` | Core pre-allocated byte pool |
-| `PooledShardSpec` | `coordination/pooled.rs` | Slab-backed shard spec fields |
-| `PooledCursor` | `coordination/pooled.rs` | Slab-backed cursor fields |
-| `PooledSpawned` | `coordination/pooled.rs` | Slab-backed lineage storage |
-| `AcquireScratch` / `FixedBuf` | `coordination/error.rs` | Reusable fixed-capacity scratch |
-| `InlineVec<T, N>` | `gossip-stdx/src/inline_vec.rs` | Stack-first small collection |
-| `RingBuffer<T, N>` | `gossip-stdx/src/ring_buffer.rs` | Fixed-capacity circular queue |
+| Type                          | Location                         | Purpose                         |
+| ----------------------------- | -------------------------------- | ------------------------------- |
+| `ByteSlab` / `ByteSlot`       | `gossip-stdx/src/byte_slab.rs`   | Core pre-allocated byte pool    |
+| `PooledShardSpec`             | `coordination/pooled.rs`         | Slab-backed shard spec fields   |
+| `PooledCursor`                | `coordination/pooled.rs`         | Slab-backed cursor fields       |
+| `PooledSpawned`               | `coordination/pooled.rs`         | Slab-backed lineage storage     |
+| `AcquireScratch` / `FixedBuf` | `coordination/error.rs`          | Reusable fixed-capacity scratch |
+| `InlineVec<T, N>`             | `gossip-stdx/src/inline_vec.rs`  | Stack-first small collection    |
+| `RingBuffer<T, N>`            | `gossip-stdx/src/ring_buffer.rs` | Fixed-capacity circular queue   |
 
 ### Enforcement
 
@@ -449,11 +439,11 @@ Design docs in `docs/` describe architecture and invariants for specific source
 directories. The `design-doc-scope-check.sh` hook fires automatically when editing
 `.rs` files and produces three kinds of alerts:
 
-| Alert | Meaning |
-|-------|---------|
-| `DESIGN DOC CHECK: <path> is in scope of: -> <doc>` | Existing file — verify doc still matches code |
-| `DESIGN DOC CHECK [NEW FILE]: <path> is NEW and in scope of: -> <doc>` | New file — update doc's file list and counts |
-| `NOTE: <path> has no design doc coverage.` | No doc covers this directory — consider adding one |
+| Alert                                                                  | Meaning                                            |
+| ---------------------------------------------------------------------- | -------------------------------------------------- |
+| `DESIGN DOC CHECK: <path> is in scope of: -> <doc>`                    | Existing file — verify doc still matches code      |
+| `DESIGN DOC CHECK [NEW FILE]: <path> is NEW and in scope of: -> <doc>` | New file — update doc's file list and counts       |
+| `NOTE: <path> has no design doc coverage.`                             | No doc covers this directory — consider adding one |
 
 ### Rules
 

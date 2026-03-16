@@ -232,7 +232,7 @@ impl CanonicalBytes for LogicalTime {
 ///
 /// No `Ord` -- this is a lookup key, not an ordered value. Ordering shards
 /// by their key range is done via `ShardSpec`, not `ShardKey`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShardKey {
     run: RunId,
     shard: ShardId,
