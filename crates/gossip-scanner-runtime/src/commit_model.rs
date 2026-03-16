@@ -8,16 +8,19 @@
 //!    family-specific frontier only from durable receipts, never from raw scan
 //!    completion signals.
 //!
-//! This module freezes the family-neutral shapes the later runtime stages will
+//! This module freezes the family-neutral shapes that runtime durability stages
 //! build on:
 //!
 //! - [`CompletedUnit`] — smallest runtime work unit that can yield an
 //!   authoritative durable receipt.
-//! - [`CommitRequest`] — runtime-facing input to the future `ResultCommitter`.
+//! - [`CommitRequest`] — runtime-facing input to the commit stage that
+//!   drives findings and done-ledger durability.
 //! - [`UnitCommitReceipt`] — durable per-unit proof returned after the
 //!   findings and done-ledger stages succeed.
-//! - [`CheckpointAggregatorInput`] — the only thing the future checkpoint
+//! - [`CheckpointAggregatorInput`] — the only thing the checkpoint
 //!   aggregator is allowed to consume.
+//! - [`BoundaryMismatchError`] — returned when a completed unit's checkpoint
+//!   boundary does not match its durable receipt's scope boundary.
 //!
 //! The key design move is that both ordered-content and repo-frontier progress
 //! are represented by the shared [`CheckpointBoundary`] contract. That keeps
@@ -116,9 +119,9 @@ impl CompletedUnit {
 
 /// Runtime-facing commit request shape.
 ///
-/// The future `ResultCommitter` receives one request per completed unit and is
-/// responsible for deriving IDs, writing findings first, then writing the
-/// done-ledger rows, and finally returning a durable [`UnitCommitReceipt`].
+/// The commit stage receives one request per completed unit and is responsible
+/// for deriving IDs, writing findings first, then writing the done-ledger rows,
+/// and finally returning a durable [`UnitCommitReceipt`].
 ///
 /// The request borrows the findings batch and done-ledger rows so the runtime
 /// can keep buffer ownership outside the commit stage.
@@ -188,7 +191,7 @@ impl fmt::Display for BoundaryMismatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "completed unit boundary {:?} does not match receipt boundary {:?}",
+            "completed unit boundary {} does not match receipt boundary {}",
             self.unit_boundary, self.receipt_boundary
         )
     }
@@ -260,7 +263,7 @@ impl UnitCommitReceipt {
     }
 }
 
-/// Receipt-only input to the future checkpoint aggregator.
+/// Receipt-only input to the checkpoint aggregator.
 ///
 /// The checkpoint stage must never look at raw scan completion signals. By
 /// wrapping only [`UnitCommitReceipt`], this type makes the intended runtime
