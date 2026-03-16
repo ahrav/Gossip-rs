@@ -31,7 +31,7 @@ entrypoints share the same local runtime execution paths.
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink that stamps one shared `WriteContext` onto emitted records |
 | `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing, including write-scoped progress and identity-chain records |
-| `src/distributed.rs` | Distributed runtime family placeholders, `ShardLease<A>`, and shared config/report types |
+| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, and layered runtime errors |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
@@ -72,7 +72,7 @@ Current behavior after validation:
 
 - filesystem scans route to `ordered_content::scan_local_filesystem`
 - git scans route to `git_repo::scan_local_repo`
-- distributed runs route to `distributed::run_distributed`
+- distributed worker assembly uses the foundational types in `distributed.rs`
 
 Filesystem scans build a runtime engine, forward scheduler events through
 owned channel bridges, optionally forward persisted findings through the
@@ -83,7 +83,7 @@ Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
 
-The distributed entrypoint returns `ScanRuntimeError` directly.
+The distributed module currently exports types, not a callable worker entrypoint.
 
 ### Family split
 
@@ -114,7 +114,8 @@ old cross-crate driver seam.
 
 ### Distributed runs
 
-- `DistributedRunConfig.budgets` must validate before the family placeholder runs
+- `DistributedRuntimeConfig` stores the budgets that the future worker loop
+  must validate before executing a lease
 
 ---
 
@@ -403,48 +404,60 @@ imported from another crate.
 
 ---
 
-## Distributed Placeholder Surface
+## Distributed Runtime Foundation
 
-`src/distributed.rs` keeps the future distributed runtime nouns available
-without exposing the removed worker-loop implementation.
-
-```rust
-pub enum DistributedFamily {
-    OrderedContent,
-    GitRepo,
-}
-```
-
-```rust
-pub struct DistributedRunConfig {
-    pub family: DistributedFamily,
-    pub budgets: ScanBudgets,
-}
-```
+`src/distributed.rs` exposes the type layer that the receipt-driven worker loop
+builds on.
 
 ```rust
 pub struct ShardLease<A> {
-    shard_id: Arc<str>,
-    assignment: A,
-    write_context: WriteContext,
-    tenant_secret_key: TenantSecretKey,
+    pub shard_id: Arc<str>,
+    pub assignment: A,
+    pub write_context: WriteContext,
+    pub tenant_secret_key: TenantSecretKey,
 }
 ```
 
 ```rust
-pub fn run_distributed(
-    config: &DistributedRunConfig,
-) -> Result<DistributedRunReport, ScanRuntimeError>
+pub trait DistributedCoordinator<A>: Send + Sync
+where
+    A: ShardLeaseAssignment,
+{
+    fn acquire_shard(&self) -> anyhow::Result<Option<ShardLease<A>>>;
+    fn release_shard(&self, lease: &ShardLease<A>) -> anyhow::Result<()>;
+    fn complete_shard(
+        &self,
+        lease: &ShardLease<A>,
+        checkpoint: Option<Cursor>,
+        report: ScanReport,
+    ) -> anyhow::Result<()>;
+    fn is_shard_done(&self, shard_id: &str) -> anyhow::Result<bool>;
+    fn mark_shard_done(&self, lease: &ShardLease<A>) -> anyhow::Result<()>;
+    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder>;
+}
+```
+
+```rust
+pub struct DistributedRuntimeConfig {
+    pub budgets: ScanBudgets,
+    pub commit_queue_capacity: usize,
+}
 ```
 
 `ShardLease<A>` is the hand-off object from coordination into the worker loop.
 It keeps the string shard label used for recorder routing separate from the
 numeric shard identity carried inside `WriteContext`. Construction via
-`ShardLease::new` enforces that `assignment.policy_hash()` equals
-`write_context.policy_hash()`, returning `Err(PolicyMismatchError)` on
-mismatch. Fields are private; callers access them through getter methods.
-`run_distributed` validates budgets and then returns a family-specific runtime
-placeholder error.
+`ShardLease::new` uses a debug assertion to require that the assignment and
+write context agree on policy scope.
+
+`DistributedCoordinator<A>` defines the coordination callbacks the runtime
+needs around a single lease: acquire, release, receipt-derived completion,
+done checks, done marking, and event recording.
+
+`DistributedPersistence<F, D>` groups the findings sink and done-ledger handle
+that the worker loop clones per shard, while `DistributedRuntimeError`
+distinguishes coordinator failures, scan-runtime failures, and local durability
+pipeline failures.
 
 ---
 
@@ -461,7 +474,10 @@ The runtime tests focus on the behavior that exists today:
 - event forwarding for filesystem and git runtime entrypoints
 - commit forwarding for filesystem scans with persistence enabled
 - deterministic result translation into findings and done-ledger persistence rows
-- distributed placeholder error routing
+- lease policy-scope assertions
+- distributed config defaults
+- distributed persistence handle cloning
+- distributed runtime error layering
 - CLI parsing and summary formatting
 - durable commit-sink identity derivation
 - authoritative findings -> done-ledger commit ordering and item-level receipt
@@ -485,7 +501,7 @@ that worker-loop API is fully wired.
 | Durable findings -> done-ledger commit stage | `crates/gossip-scanner-runtime/src/result_committer.rs` |
 | Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
-| Distributed family placeholders and lease metadata | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| Distributed worker-loop foundation types | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |

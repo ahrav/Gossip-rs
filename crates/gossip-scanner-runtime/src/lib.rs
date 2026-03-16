@@ -232,7 +232,7 @@ impl Default for ScanBudgets {
 }
 
 impl ScanBudgets {
-    pub(crate) fn validate(self) -> Result<(), ScanRuntimeError> {
+    pub fn validate(self) -> Result<(), ScanRuntimeError> {
         if self.max_items == 0 {
             return Err(ScanRuntimeError::ConnectorInput(
                 ConnectorInputError::ZeroBudget { field: "max_items" },

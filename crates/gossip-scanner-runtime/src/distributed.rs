@@ -1,153 +1,161 @@
-//! Distributed runtime placeholders for family-oriented execution.
+//! Foundational distributed runtime types for receipt-driven worker execution.
 //!
-//! This module exposes the high-level distributed runtime nouns for the
-//! family-oriented worker loop.
+//! This module defines the shared nouns that later worker-loop subtasks build
+//! on: lease payloads, coordinator callbacks, cloned persistence handles,
+//! runtime configuration, run reports, and error layering.
 
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::anyhow;
+use anyhow::{Error as AnyError, Result};
 use gossip_contracts::{
+    connector::Cursor,
     identity::{PolicyHash, TenantSecretKey},
     persistence::WriteContext,
 };
 
-use crate::{ScanBudgets, ScanRuntimeError};
+use crate::{
+    ScanBudgets, ScanReport, ScanRuntimeError, coordination_sink::CoordinationEventRecorder,
+};
 
-/// Family selected for distributed execution.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DistributedFamily {
-    /// Ordered-content family worker loop.
-    OrderedContent,
-    /// Git repository family worker loop.
-    GitRepo,
-}
-
-/// Runtime config for distributed scans.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DistributedRunConfig {
-    /// Source family to execute.
-    pub family: DistributedFamily,
-    /// Budget controls applied to the run.
-    pub budgets: ScanBudgets,
-}
-
-impl Default for DistributedRunConfig {
-    fn default() -> Self {
-        Self {
-            family: DistributedFamily::OrderedContent,
-            budgets: ScanBudgets::default(),
-        }
-    }
-}
-
-/// Assignment payload that can report its policy scope for lease validation.
+/// Assignment payloads expose their policy scope so leases can assert that the
+/// payload agrees with the shared write context.
 pub trait ShardLeaseAssignment {
     /// Detection-policy hash carried by the assignment payload.
     fn policy_hash(&self) -> PolicyHash;
 }
 
-/// Lease payload consumed by the future distributed runtime.
+/// Lease payload consumed by the distributed runtime.
 ///
 /// One lease corresponds to one shard from the coordination layer. The string
-/// shard label routes runtime telemetry, while [`WriteContext`] carries the
-/// numeric shard identity used for fenced writes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// shard label routes telemetry, while [`WriteContext`] carries the numeric
+/// shard identity used for fenced writes.
+#[derive(Clone, Debug)]
 pub struct ShardLease<A> {
-    shard_id: Arc<str>,
-    assignment: A,
-    write_context: WriteContext,
-    tenant_secret_key: TenantSecretKey,
-}
-
-/// Policy-hash mismatch between a shard assignment and its write context.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyMismatchError {
-    assignment: PolicyHash,
-    context: PolicyHash,
-}
-
-impl fmt::Display for PolicyMismatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "assignment policy_hash ({:?}) does not match write_context policy_hash ({:?})",
-            self.assignment, self.context
-        )
-    }
-}
-
-impl std::error::Error for PolicyMismatchError {}
-
-impl PolicyMismatchError {
-    /// Policy hash carried by the assignment payload.
-    #[must_use]
-    pub fn assignment(&self) -> PolicyHash {
-        self.assignment
-    }
-
-    /// Policy hash carried by the write context.
-    #[must_use]
-    pub fn context(&self) -> PolicyHash {
-        self.context
-    }
+    /// String shard label used for routing recorder events.
+    pub shard_id: Arc<str>,
+    /// Scan assignment payload associated with this lease.
+    pub assignment: A,
+    /// Shared routing and fencing metadata for all writes emitted under the
+    /// lease.
+    pub write_context: WriteContext,
+    /// Tenant secret key used for secret-hash derivation.
+    pub tenant_secret_key: TenantSecretKey,
 }
 
 impl<A: ShardLeaseAssignment> ShardLease<A> {
-    /// Construct a lease payload, verifying that assignment and write context
-    /// agree on policy scope.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PolicyMismatchError`] if the assignment's policy hash differs
-    /// from the write context's policy hash.
+    /// Construct a lease payload and assert that the assignment and write
+    /// context agree on policy scope.
+    #[must_use]
     pub fn new(
         shard_id: Arc<str>,
         assignment: A,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
-    ) -> Result<Self, PolicyMismatchError> {
-        if assignment.policy_hash() != write_context.policy_hash() {
-            return Err(PolicyMismatchError {
-                assignment: assignment.policy_hash(),
-                context: write_context.policy_hash(),
-            });
-        }
+    ) -> Self {
+        debug_assert_eq!(
+            assignment.policy_hash(),
+            write_context.policy_hash(),
+            "lease assignment policy_hash must match write_context.policy_hash"
+        );
 
-        Ok(Self {
+        Self {
             shard_id,
             assignment,
             write_context,
             tenant_secret_key,
-        })
+        }
+    }
+}
+
+/// Coordinator surface required by the distributed runtime.
+///
+/// Implementors must guarantee:
+///
+/// - `acquire_shard` returns `None` when no more work is available.
+/// - Production coordinators make `complete_shard` idempotent or
+///   at-least-once tolerant because crash recovery may replay the call.
+/// - `mark_shard_done` is called only after `complete_shard` succeeds.
+/// - `release_shard` validates lease ownership.
+/// - `event_recorder` is safe to share across event and commit telemetry for
+///   one shard.
+pub trait DistributedCoordinator<A>: Send + Sync
+where
+    A: ShardLeaseAssignment,
+{
+    /// Acquire the next lease to process, or `None` when no work remains.
+    fn acquire_shard(&self) -> Result<Option<ShardLease<A>>>;
+
+    /// Release a lease without marking it complete.
+    fn release_shard(&self, lease: &ShardLease<A>) -> Result<()>;
+
+    /// Mark one lease complete with optional receipt-derived checkpoint
+    /// metadata.
+    fn complete_shard(
+        &self,
+        lease: &ShardLease<A>,
+        checkpoint: Option<Cursor>,
+        report: ScanReport,
+    ) -> Result<()>;
+
+    /// Query done-ledger status before scanning a shard.
+    fn is_shard_done(&self, shard_id: &str) -> Result<bool>;
+
+    /// Persist done-ledger completion after successful scan.
+    fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()>;
+
+    /// Shared recorder used by event and progress telemetry.
+    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder>;
+}
+
+/// Shared persistence backends used by the distributed runtime.
+///
+/// The runtime clones these handles per shard. Production backends should make
+/// that cheap, for example by cloning an `Arc` or a pool handle.
+#[derive(Clone)]
+pub struct DistributedPersistence<F, D> {
+    findings_sink: F,
+    done_ledger: D,
+}
+
+impl<F, D> DistributedPersistence<F, D> {
+    /// Construct one runtime durability bundle.
+    #[must_use]
+    pub fn new(findings_sink: F, done_ledger: D) -> Self {
+        Self {
+            findings_sink,
+            done_ledger,
+        }
     }
 
-    /// String shard label used for routing recorder events.
-    #[inline]
+    /// Findings sink handle cloned by the worker loop.
     #[must_use]
-    pub fn shard_id(&self) -> &str {
-        &self.shard_id
+    pub fn findings_sink(&self) -> &F {
+        &self.findings_sink
     }
 
-    /// Scan assignment payload associated with this lease.
-    #[inline]
+    /// Done-ledger handle cloned by the worker loop.
     #[must_use]
-    pub fn assignment(&self) -> &A {
-        &self.assignment
+    pub fn done_ledger(&self) -> &D {
+        &self.done_ledger
     }
+}
 
-    /// Shared routing and fencing metadata for all writes emitted under the lease.
-    #[inline]
-    #[must_use]
-    pub fn write_context(&self) -> WriteContext {
-        self.write_context
-    }
+/// Runtime config for distributed scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DistributedRuntimeConfig {
+    /// Scan execution budget controls applied to every shard assignment.
+    pub budgets: ScanBudgets,
+    /// Capacity of the bounded execution to commit queue.
+    pub commit_queue_capacity: usize,
+}
 
-    /// Tenant secret key used for secret-hash derivation.
-    #[inline]
-    #[must_use]
-    pub fn tenant_secret_key(&self) -> TenantSecretKey {
-        self.tenant_secret_key
+impl Default for DistributedRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            budgets: ScanBudgets::default(),
+            commit_queue_capacity: 64,
+        }
     }
 }
 
@@ -162,24 +170,47 @@ pub struct DistributedRunReport {
     pub shards_skipped_done: u64,
 }
 
-/// Run the distributed worker loop for the selected family.
-pub fn run_distributed(
-    config: &DistributedRunConfig,
-) -> Result<DistributedRunReport, ScanRuntimeError> {
-    config.budgets.validate()?;
-    let family = match config.family {
-        DistributedFamily::OrderedContent => "ordered-content",
-        DistributedFamily::GitRepo => "git-repo",
-    };
-    Err(ScanRuntimeError::Driver(anyhow!(
-        "{family} distributed runtime path is not implemented yet"
-    )))
+/// Distributed runtime error.
+#[derive(Debug)]
+pub enum DistributedRuntimeError {
+    /// The coordinator returned an error.
+    Coordinator(AnyError),
+    /// The scan runtime failed while executing an assignment.
+    Runtime(ScanRuntimeError),
+    /// The local durability pipeline failed.
+    Durability(AnyError),
+}
+
+impl fmt::Display for DistributedRuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Coordinator(error) => write!(f, "coordinator error: {error}"),
+            Self::Runtime(error) => write!(f, "runtime error: {error}"),
+            Self::Durability(error) => write!(f, "durability pipeline error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DistributedRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Coordinator(error) => Some(error.as_ref()),
+            Self::Runtime(error) => Some(error),
+            Self::Durability(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<ScanRuntimeError> for DistributedRuntimeError {
+    fn from(value: ScanRuntimeError) -> Self {
+        Self::Runtime(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gossip_contracts::identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId};
+    use gossip_contracts::identity::{FenceEpoch, RunId, ShardId, TenantId};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct StubAssignment {
@@ -192,25 +223,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn distributed_runtime_validates_budgets_before_placeholder_error() {
-        let error = run_distributed(&DistributedRunConfig {
-            family: DistributedFamily::OrderedContent,
-            budgets: ScanBudgets {
-                max_items: 0,
-                max_bytes: 1,
-            },
-        })
-        .expect_err("zero budget should fail");
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct StubFindings(u8);
 
-        assert!(matches!(error, ScanRuntimeError::ConnectorInput(_)));
-    }
-
-    #[test]
-    fn distributed_runtime_returns_placeholder_error() {
-        let error = run_distributed(&DistributedRunConfig::default()).expect_err("placeholder");
-        assert!(matches!(error, ScanRuntimeError::Driver(_)));
-    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct StubDoneLedger(u8);
 
     #[test]
     fn shard_lease_preserves_assignment_and_write_context() {
@@ -229,16 +246,20 @@ mod tests {
             assignment.clone(),
             write_context,
             TenantSecretKey::from_bytes([0x33; 32]),
-        )
-        .unwrap();
+        );
 
-        assert_eq!(lease.shard_id(), "shard-a");
-        assert_eq!(lease.assignment(), &assignment);
-        assert_eq!(lease.write_context(), write_context);
+        assert_eq!(lease.shard_id.as_ref(), "shard-a");
+        assert_eq!(lease.assignment, assignment);
+        assert_eq!(lease.write_context, write_context);
+        assert_eq!(
+            lease.tenant_secret_key,
+            TenantSecretKey::from_bytes([0x33; 32])
+        );
     }
 
     #[test]
-    fn shard_lease_rejects_mismatched_policy_hash() {
+    #[should_panic(expected = "lease assignment policy_hash must match write_context.policy_hash")]
+    fn shard_lease_debug_asserts_on_mismatched_policy_hash() {
         let write_context = WriteContext::new(
             TenantId::from_bytes([0x11; 32]),
             PolicyHash::from_bytes([0x22; 32]),
@@ -246,19 +267,56 @@ mod tests {
             ShardId::from_raw(4),
             FenceEpoch::from_raw(5),
         );
-        let assignment_hash = PolicyHash::from_bytes([0xFF; 32]);
         let assignment = StubAssignment {
-            policy_hash: assignment_hash,
+            policy_hash: PolicyHash::from_bytes([0xFF; 32]),
         };
-        let err = ShardLease::new(
+
+        let _ = ShardLease::new(
             Arc::from("shard-x"),
             assignment,
             write_context,
             TenantSecretKey::from_bytes([0x33; 32]),
-        )
-        .unwrap_err();
+        );
+    }
 
-        assert_eq!(err.assignment(), assignment_hash);
-        assert_eq!(err.context(), write_context.policy_hash());
+    #[test]
+    fn distributed_persistence_clones_backend_handles() {
+        let persistence = DistributedPersistence::new(StubFindings(1), StubDoneLedger(2));
+        let cloned = persistence.clone();
+
+        assert_eq!(*persistence.findings_sink(), StubFindings(1));
+        assert_eq!(*persistence.done_ledger(), StubDoneLedger(2));
+        assert_eq!(*cloned.findings_sink(), StubFindings(1));
+        assert_eq!(*cloned.done_ledger(), StubDoneLedger(2));
+    }
+
+    #[test]
+    fn distributed_runtime_config_defaults_commit_queue_capacity() {
+        let config = DistributedRuntimeConfig::default();
+
+        assert_eq!(config.budgets, ScanBudgets::default());
+        assert_eq!(config.commit_queue_capacity, 64);
+    }
+
+    #[test]
+    fn distributed_runtime_error_exposes_variant_sources() {
+        let coordinator = DistributedRuntimeError::Coordinator(AnyError::msg("coord boom"));
+        assert_eq!(coordinator.to_string(), "coordinator error: coord boom");
+        assert!(std::error::Error::source(&coordinator).is_some());
+
+        let runtime =
+            DistributedRuntimeError::from(ScanRuntimeError::Driver(AnyError::msg("scan")));
+        assert_eq!(
+            runtime.to_string(),
+            "runtime error: runtime execution failed: scan"
+        );
+        assert!(std::error::Error::source(&runtime).is_some());
+
+        let durability = DistributedRuntimeError::Durability(AnyError::msg("commit boom"));
+        assert_eq!(
+            durability.to_string(),
+            "durability pipeline error: commit boom"
+        );
+        assert!(std::error::Error::source(&durability).is_some());
     }
 }
