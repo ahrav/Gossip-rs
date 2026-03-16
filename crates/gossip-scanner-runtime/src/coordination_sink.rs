@@ -78,8 +78,8 @@ impl fmt::Debug for IdentityChainRecord {
             .field("confidence_score", &self.confidence_score)
             .field("norm_hash", &"[redacted]")
             .field("secret_hash", &"[redacted]")
-            .field("finding_id", &self.finding_id)
-            .field("occurrence_id", &self.occurrence_id)
+            .field("finding_id", &"[redacted]")
+            .field("occurrence_id", &"[redacted]")
             .finish()
     }
 }
@@ -384,13 +384,24 @@ mod tests {
             [0xBB; 32],
         );
         let debug = format!("{record:?}");
-        assert!(
-            debug.contains("[redacted]"),
-            "Debug output must redact sensitive hashes, got: {debug}"
+        // All four secret-derived fields must be redacted.
+        let redacted_count = debug.matches("[redacted]").count();
+        assert_eq!(
+            redacted_count, 4,
+            "expected 4 redacted fields (norm_hash, secret_hash, finding_id, occurrence_id), \
+             got {redacted_count} in: {debug}"
         );
         assert!(
             !debug.contains("dede"),
             "Debug output must not leak hash bytes, got: {debug}"
+        );
+        assert!(
+            !debug.contains("aaaa"),
+            "Debug output must not leak finding_id bytes, got: {debug}"
+        );
+        assert!(
+            !debug.contains("bbbb"),
+            "Debug output must not leak occurrence_id bytes, got: {debug}"
         );
     }
 }
