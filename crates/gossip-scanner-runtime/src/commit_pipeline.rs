@@ -484,6 +484,10 @@ fn run_commit_stage<F, D>(
             tracing::debug!("commit-stage worker exiting: cancellation observed after commit");
             break;
         }
+        // Blocking send is safe here: if the queue is full and cancellation fires
+        // in the window between the check above and this call, shutdown() or
+        // Drop will drop the outcome Receiver, which unblocks this send with
+        // Err(SendError) and the worker exits via the branch below.
         if outcome_tx.send(outcome).is_err() {
             tracing::warn!(
                 "commit-stage outcome channel disconnected; \
