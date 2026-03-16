@@ -560,6 +560,14 @@ impl WorkerHarness {
     }
 
     fn random_acquire_key(&mut self) -> ShardKey {
+        // Re-seed with root shards if the local catalog is exhausted (all
+        // known shards were completed or split away). The roots may be
+        // terminal, but acquire handles ShardTerminal gracefully.
+        if self.known_shards.is_empty() {
+            self.known_shards
+                .extend(root_shards().into_iter().map(|(id, _, _)| id));
+        }
+
         let mut candidates: Vec<ShardId> = self
             .known_shards
             .iter()
