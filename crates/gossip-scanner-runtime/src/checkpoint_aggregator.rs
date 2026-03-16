@@ -112,6 +112,11 @@ pub enum PrefixCheckpointError {
     /// Ordered-content mode requires strictly increasing keys at checkpoint
     /// unit boundaries. Equal keys would cause tokenless resume (which uses
     /// strictly-greater-than semantics) to skip items.
+    ///
+    /// This error is **unrecoverable** through the aggregator's public API:
+    /// the offending receipt remains in the reorder buffer and no method can
+    /// remove it. Callers that encounter this error must discard the
+    /// aggregator and reconstruct it from the last acknowledged checkpoint.
     OrderedContentEqualKey { sequence_no: u64 },
     /// The reorder buffer has reached its configured capacity. The caller
     /// should drain the buffer by acknowledging a pending checkpoint before
@@ -248,10 +253,19 @@ impl PrefixCheckpointAggregator {
     ///
     /// `max_buffered` sets the maximum number of out-of-order receipts the
     /// reorder buffer will hold before returning [`PrefixCheckpointError::BufferFull`].
-    /// A value of `0` rejects all receipts; callers should choose a capacity
-    /// that matches the per-shard in-flight window.
+    /// Callers should choose a capacity that matches the per-shard in-flight
+    /// window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_buffered` is zero. A zero-capacity buffer rejects every
+    /// receipt and can never make progress.
     #[must_use]
     pub fn new(write_context: WriteContext, next_sequence_no: u64, max_buffered: usize) -> Self {
+        assert!(
+            max_buffered > 0,
+            "max_buffered must be at least 1; a zero-capacity buffer can never make progress"
+        );
         Self {
             write_context,
             next_sequence_no,
@@ -331,8 +345,10 @@ impl PrefixCheckpointAggregator {
     ///
     /// The reorder buffer is bounded by `max_buffered` (set at construction).
     /// When a new receipt would exceed this capacity, `BufferFull` is returned.
-    /// Acknowledging a pending checkpoint drains buffered receipts and
-    /// re-enables insertion.
+    /// The receipt at exactly `next_sequence_no` is always admitted regardless
+    /// of capacity, because it fills the head gap needed for prefix
+    /// construction and draining. Acknowledging a pending checkpoint drains
+    /// buffered receipts and re-enables insertion.
     ///
     /// # Errors
     ///
@@ -364,7 +380,14 @@ impl PrefixCheckpointAggregator {
         let len = self.receipts.len();
         match self.receipts.entry(sequence_no) {
             Entry::Vacant(slot) => {
-                if len >= self.max_buffered {
+                // Always admit the receipt at `next_sequence_no` even when the
+                // buffer is at capacity. This receipt fills the gap at the head
+                // of the contiguous run, enabling prefix construction and
+                // draining via `acknowledge_checkpoint`. Rejecting it would
+                // permanently block progress because no other API can drain
+                // buffered out-of-order receipts.
+                let is_gap_filler = sequence_no == self.next_sequence_no;
+                if !is_gap_filler && len >= self.max_buffered {
                     return Err(PrefixCheckpointError::BufferFull {
                         buffered: len,
                         capacity: self.max_buffered,
@@ -386,6 +409,15 @@ impl PrefixCheckpointAggregator {
     ///
     /// If a prefix is already pending, this returns that same prefix again
     /// without widening it. The returned reference borrows from the aggregator.
+    ///
+    /// # Fatal errors
+    ///
+    /// [`PrefixCheckpointError::OrderedContentEqualKey`] and
+    /// [`PrefixCheckpointError::BoundaryRegression`] are **not recoverable**
+    /// through the aggregator's API. The offending receipt remains in the
+    /// buffer and every subsequent call will return the same error. Callers
+    /// must discard the aggregator and reconstruct it from the last
+    /// acknowledged checkpoint.
     pub fn prepare_checkpoint(
         &mut self,
     ) -> Result<Option<&PendingPrefixCheckpoint>, PrefixCheckpointError> {
@@ -1900,6 +1932,12 @@ mod tests {
     // --- Buffer capacity tests ---
 
     #[test]
+    #[should_panic(expected = "max_buffered must be at least 1")]
+    fn zero_capacity_panics_at_construction() {
+        let _ = PrefixCheckpointAggregator::new(write_context(0xA0), 0, 0);
+    }
+
+    #[test]
     fn buffer_full_rejects_new_receipt_at_capacity() {
         let wc = write_context(0xA0);
         let mut agg = PrefixCheckpointAggregator::new(wc, 0, 2);
@@ -1988,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_full_does_not_corrupt_aggregator_state() {
+    fn gap_filler_admitted_at_capacity_enables_progress() {
         let wc = write_context(0xA3);
         // Start at next_sequence_no = 0, capacity = 2.
         let mut agg = PrefixCheckpointAggregator::new(wc, 0, 2);
@@ -1999,7 +2037,7 @@ mod tests {
         agg.record_receipt(ordered_input(wc, 2, cursor_without_token(b'c'), 3))
             .unwrap();
 
-        // Buffer full — seq 3 rejected.
+        // Buffer full — seq 3 rejected (it does not fill the head gap).
         let error = agg
             .record_receipt(ordered_input(wc, 3, cursor_without_token(b'd'), 4))
             .unwrap_err();
@@ -2008,13 +2046,34 @@ mod tests {
         // No contiguous prefix (gap at seq 0).
         assert!(agg.prepare_checkpoint().unwrap().is_none());
 
-        // The gap-filling receipt (seq 0) is also rejected because the buffer
-        // is at capacity.
-        let error = agg
-            .record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
-            .unwrap_err();
-        assert!(matches!(error, PrefixCheckpointError::BufferFull { .. }));
-        assert_eq!(agg.buffered_receipt_count(), 2);
-        assert_eq!(agg.next_sequence_no(), 0);
+        // The gap-filling receipt (seq 0 == next_sequence_no) is admitted
+        // even though the buffer is at capacity, because it fills the head
+        // of the contiguous run and enables prefix construction.
+        assert_eq!(
+            agg.record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
+                .unwrap(),
+            ReceiptRecordOutcome::Buffered,
+        );
+        // Buffer temporarily exceeds max_buffered by one (the gap-filler).
+        assert_eq!(agg.buffered_receipt_count(), 3);
+
+        // A contiguous prefix [0,1,2] is now available.
+        let pending = agg
+            .prepare_checkpoint()
+            .unwrap()
+            .expect("contiguous prefix should be preparable after gap-filler admitted");
+        assert_eq!(pending.first_sequence_no(), 0);
+        assert_eq!(pending.last_sequence_no(), 2);
+        assert_eq!(pending.committed_units(), 3);
+
+        // Acknowledge to drain and restore buffer headroom.
+        let pending = pending.clone();
+        agg.acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            pending.scope().clone(),
+            LogicalTime::from_raw(1),
+        ))
+        .unwrap();
+        assert_eq!(agg.next_sequence_no(), 3);
+        assert_eq!(agg.buffered_receipt_count(), 0);
     }
 }
