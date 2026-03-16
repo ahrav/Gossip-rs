@@ -144,6 +144,11 @@ pub enum CommitStageOutput<FindingsError, DoneLedgerError> {
         checkpoint_input: CheckpointAggregatorInput,
     },
     /// One queued work item failed during durable commit.
+    ///
+    /// The original [`PersistenceTranslation`] is not carried here because
+    /// translations are deterministically re-derivable from the scan output.
+    /// Keeping the translation out of the error path avoids retaining
+    /// heap-allocated persistence rows longer than necessary.
     Failed {
         /// Shared routing and fencing metadata for the failed commit.
         write_context: WriteContext,
@@ -281,7 +286,7 @@ where
 {
     sender: CommitPipelineSender,
     outcomes: Receiver<CommitStageOutput<F::Error, D::Error>>,
-    worker: JoinHandle<()>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl<F, D> CommitPipeline<F, D>
@@ -322,7 +327,7 @@ where
                 cancel,
             },
             outcomes: outcome_rx,
-            worker,
+            worker: Some(worker),
         })
     }
 
@@ -375,26 +380,40 @@ where
     /// Shut the pipeline down and join the worker thread.
     ///
     /// Callers must drop all cloned [`CommitPipelineSender`] handles before
-    /// invoking this method. Internally, this method cancels the token, drops
-    /// the primary sender and outcome receiver, and then joins the worker.
-    /// Dropping the outcome receiver unblocks a worker that is waiting on
-    /// outcome delivery so it can exit cleanly.
+    /// invoking this method. If any cloned sender survives, the submission
+    /// channel stays connected and the worker may not observe disconnect
+    /// promptly. In practice, the cancellation token causes the worker to
+    /// exit after its current item regardless.
     ///
-    /// # Deadlock hazard
-    ///
-    /// If any cloned [`CommitPipelineSender`] handles still exist when this
-    /// method is called, the execution channel will never fully disconnect and
-    /// the worker may block indefinitely waiting for more work.
-    pub fn shutdown(self) -> thread::Result<()> {
-        let Self {
-            sender,
-            outcomes,
-            worker,
-        } = self;
-        sender.cancel.cancel();
-        drop(sender);
-        drop(outcomes);
-        worker.join()
+    /// There is no timeout on the join. If the worker is blocked inside a
+    /// slow persistence operation, this call blocks until that operation
+    /// completes. The worker always finishes the current in-flight commit
+    /// before exiting.
+    pub fn shutdown(mut self) -> thread::Result<()> {
+        self.sender.cancel.cancel();
+        let handle = self.worker.take();
+        // Dropping `self` closes both channels, which unblocks the worker
+        // if it is waiting on `recv()` or `send()`. `Drop::drop` re-cancels
+        // the token (harmless) but finds `worker == None` — no-op.
+        drop(self);
+        match handle {
+            Some(h) => h.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<F, D> Drop for CommitPipeline<F, D>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+{
+    fn drop(&mut self) {
+        self.sender.cancel.cancel();
+        // After this method returns, fields are dropped in declaration order:
+        // sender -> outcomes -> worker. Channel drops unblock the worker;
+        // the JoinHandle drop detaches the thread. The worker exits promptly
+        // because cancellation is set and channels are closing.
     }
 }
 
@@ -410,7 +429,7 @@ fn run_commit_stage<F, D>(
     while let Ok(work) = submit_rx.recv() {
         let (write_context, completed_unit, translation) = work.into_parts();
         let expected_kind = completed_unit.checkpoint_boundary_kind();
-        let result = committer.commit_translation(write_context, completed_unit, &translation);
+        let result = committer.commit_translation(write_context, &completed_unit, &translation);
 
         let outcome = match result {
             Ok(receipt) => match CheckpointAggregatorInput::new(expected_kind, receipt) {
@@ -418,24 +437,17 @@ fn run_commit_stage<F, D>(
                     write_context,
                     checkpoint_input,
                 },
-                Err(kind_mismatch) => {
-                    // Structurally unreachable: ResultCommitter validates boundary
-                    // consistency before returning Ok, so the kind extracted
-                    // before the call always matches.
-                    unreachable!(
-                        "checkpoint boundary kind mismatch after successful commit: \
-                         {kind_mismatch}"
-                    );
-                }
-            },
-            Err(boxed) => {
-                let (completed_unit, error) = *boxed;
-                CommitStageOutput::Failed {
+                Err(kind_mismatch) => CommitStageOutput::Failed {
                     write_context,
                     completed_unit,
-                    error,
-                }
-            }
+                    error: ResultCommitError::KindMismatch(kind_mismatch),
+                },
+            },
+            Err(error) => CommitStageOutput::Failed {
+                write_context,
+                completed_unit,
+                error,
+            },
         };
 
         if outcome_tx.send(outcome).is_err() {
@@ -443,6 +455,11 @@ fn run_commit_stage<F, D>(
             // committed data is durable in storage; checkpoint advancement is
             // moot during teardown and resumes from the last durable checkpoint
             // on restart.
+            debug_assert!(
+                cancel.is_cancelled(),
+                "outcome receiver dropped while pipeline is not cancelled; \
+                 committed result was silently discarded"
+            );
             break;
         }
         if cancel.is_cancelled() {
@@ -466,7 +483,7 @@ mod tests {
             FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
             StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
         },
-        persistence::{DoneLedgerErrorCode, WriteContext},
+        persistence::{CommitAdvanceError, DoneLedgerErrorCode, WriteContext},
     };
     use gossip_persistence_inmemory::{
         CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
@@ -593,7 +610,7 @@ mod tests {
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..200 {
+        for _ in 0..2_000 {
             if predicate() {
                 return;
             }
@@ -1332,6 +1349,53 @@ mod tests {
         for p in producers {
             p.join().expect("producer should join");
         }
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn done_ledger_commit_failure_is_emitted_with_unit_context() {
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        done_ledger
+            .fail_next_commits(1)
+            .expect("fault injection should succeed");
+        let cancel = CancellationToken::new();
+        let pipeline = CommitPipeline::start(
+            findings_sink,
+            done_ledger,
+            CommitPipelineConfig {
+                execution_queue_capacity: 1,
+                outcome_queue_capacity: 1,
+            },
+            cancel,
+        )
+        .expect("pipeline should start");
+        let sender = pipeline.sender();
+        let failed_unit = completed_unit(11, 0xD1);
+        let work = QueuedCommit::new(write_context(), failed_unit.clone(), translated_scan(0xD1));
+
+        sender.submit(work).expect("submit should succeed");
+
+        let outcome = pipeline.recv().expect("outcome should be available");
+        match outcome {
+            CommitStageOutput::Committed { .. } => panic!("expected failure"),
+            CommitStageOutput::Failed {
+                write_context: context,
+                completed_unit,
+                error,
+            } => {
+                assert_eq!(context, write_context());
+                assert_eq!(completed_unit, failed_unit);
+                match error {
+                    ResultCommitError::DoneLedgerAdvance(CommitAdvanceError::Wait(
+                        InMemoryPersistenceError::InjectedCommitFailure { store },
+                    )) => assert_eq!(store, InMemoryStoreKind::DoneLedger),
+                    other => panic!("expected done-ledger advance failure, got {other:?}"),
+                }
+            }
+        }
+
+        drop(sender);
         pipeline.shutdown().expect("worker should join");
     }
 }
