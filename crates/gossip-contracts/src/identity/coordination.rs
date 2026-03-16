@@ -230,9 +230,9 @@ impl CanonicalBytes for LogicalTime {
 ///
 /// Fields are private with accessors (codebase convention).
 ///
-/// No `Ord` -- this is a lookup key, not an ordered value. Ordering shards
-/// by their key range is done via `ShardSpec`, not `ShardKey`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` is structural (run, shard) for collection key use. Domain ordering
+/// by key range is via `ShardSpec`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShardKey {
     run: RunId,
     shard: ShardId,
@@ -409,6 +409,16 @@ mod tests {
         assert!(dbg.contains("ShardKey"));
         assert!(dbg.contains("RunId(10)"));
         assert!(dbg.contains("ShardId(20)"));
+    }
+
+    /// Derived `Ord` on `ShardKey` sorts by field declaration order: `run`
+    /// first, then `shard`. If the struct fields are ever reordered, this
+    /// test catches the silent ordering change.
+    #[test]
+    fn shard_key_ord_is_run_major() {
+        let a = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(99));
+        let b = ShardKey::new(RunId::from_raw(2), ShardId::from_raw(1));
+        assert!(a < b, "ShardKey ordering must be run-major");
     }
 
     // -------------------------------------------------------------------
