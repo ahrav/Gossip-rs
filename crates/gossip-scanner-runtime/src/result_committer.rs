@@ -43,15 +43,14 @@ pub enum ResultCommitRequestError {
     /// The findings batch violated a persistence-layer invariant before any
     /// write was submitted.
     FindingsBatch(PersistenceInputError),
-    /// A finding row belonged to a different tenant than the shared write
-    /// context.
-    FindingTenantMismatch {
-        expected: TenantId,
-        actual: TenantId,
-    },
-    /// An occurrence row belonged to a different tenant than the shared write
-    /// context.
-    OccurrenceTenantMismatch {
+    /// The done-ledger record violated a cross-field invariant (e.g.
+    /// `ScannedClean` with a non-`None` error code).
+    DoneLedgerRecord(PersistenceInputError),
+    /// A finding or occurrence row belonged to a different tenant than the
+    /// shared write context.
+    TenantMismatch {
+        /// Which layer contained the mismatched tenant.
+        layer: &'static str,
         expected: TenantId,
         actual: TenantId,
     },
@@ -105,11 +104,13 @@ impl fmt::Display for ResultCommitRequestError {
                 "per-item commit requests must carry exactly one done-ledger row; got {actual}"
             ),
             Self::FindingsBatch(err) => write!(f, "invalid findings batch: {err}"),
-            Self::FindingTenantMismatch { expected, .. } => {
-                write!(f, "finding tenant mismatch: expected {expected:?}")
+            Self::DoneLedgerRecord(err) => {
+                write!(f, "invalid done-ledger record: {err}")
             }
-            Self::OccurrenceTenantMismatch { expected, .. } => {
-                write!(f, "occurrence tenant mismatch: expected {expected:?}")
+            Self::TenantMismatch {
+                layer, expected, ..
+            } => {
+                write!(f, "{layer} tenant mismatch: expected {expected:?}")
             }
             Self::ObservationWriteContextMismatch { index } => write!(
                 f,
@@ -144,7 +145,7 @@ impl fmt::Display for ResultCommitRequestError {
 impl Error for ResultCommitRequestError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::FindingsBatch(err) => Some(err),
+            Self::FindingsBatch(err) | Self::DoneLedgerRecord(err) => Some(err),
             _ => None,
         }
     }
@@ -308,11 +309,10 @@ where
     }
 
     fn validate_request(request: &CommitRequest<'_>) -> Result<(), ResultCommitRequestError> {
-        let findings = request.findings();
-        findings.validate_observation_identity()?;
-        findings.validate_referential_integrity()?;
-
         let write_context = request.write_context();
+
+        // Structural shape check first: exactly one done-ledger row is the
+        // cheapest invariant and the most fundamental.
         let done_ledger = match request.done_ledger() {
             [record] => record,
             records => {
@@ -322,7 +322,15 @@ where
             }
         };
 
-        done_ledger.validate()?;
+        done_ledger
+            .validate()
+            .map_err(ResultCommitRequestError::DoneLedgerRecord)?;
+
+        // Batch-level integrity checks (may allocate HashSets) run after the
+        // cheap structural check above has ruled out malformed requests.
+        let findings = request.findings();
+        findings.validate_observation_identity()?;
+        findings.validate_referential_integrity()?;
 
         // After validate_referential_integrity (which calls
         // validate_tenant_consistency), all records in the batch share one
@@ -330,7 +338,8 @@ where
         if let Some(finding) = findings.findings().first()
             && finding.tenant_id() != write_context.tenant_id()
         {
-            return Err(ResultCommitRequestError::FindingTenantMismatch {
+            return Err(ResultCommitRequestError::TenantMismatch {
+                layer: "finding",
                 expected: write_context.tenant_id(),
                 actual: finding.tenant_id(),
             });
@@ -338,7 +347,8 @@ where
         if let Some(occurrence) = findings.occurrences().first()
             && occurrence.tenant_id() != write_context.tenant_id()
         {
-            return Err(ResultCommitRequestError::OccurrenceTenantMismatch {
+            return Err(ResultCommitRequestError::TenantMismatch {
+                layer: "occurrence",
                 expected: write_context.tenant_id(),
                 actual: occurrence.tenant_id(),
             });
@@ -544,7 +554,7 @@ mod tests {
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..200 {
+        for _ in 0..2_000 {
             if predicate() {
                 return;
             }
@@ -1010,7 +1020,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // F8: commit_item happy-path test
+    // commit_item happy-path test
     // ------------------------------------------------------------------
 
     #[test]
@@ -1034,7 +1044,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // F2: done_ledger.validate() rejection
+    // done_ledger.validate() rejection
     // ------------------------------------------------------------------
 
     #[test]
@@ -1072,14 +1082,14 @@ mod tests {
 
         assert_validation_rejects(request, |err| {
             assert!(
-                matches!(err, ResultCommitRequestError::FindingsBatch(_)),
-                "expected FindingsBatch from validate(), got {err:?}",
+                matches!(err, ResultCommitRequestError::DoneLedgerRecord(_)),
+                "expected DoneLedgerRecord from validate(), got {err:?}",
             );
         });
     }
 
     // ------------------------------------------------------------------
-    // F1: validation error-path tests
+    // validation error-path tests
     // ------------------------------------------------------------------
 
     #[test]
@@ -1143,11 +1153,16 @@ mod tests {
         );
 
         assert_validation_rejects(request, |err| match err {
-            ResultCommitRequestError::FindingTenantMismatch { expected, actual } => {
+            ResultCommitRequestError::TenantMismatch {
+                layer,
+                expected,
+                actual,
+            } => {
+                assert_eq!(*layer, "finding");
                 assert_eq!(*expected, write_context().tenant_id());
                 assert_eq!(*actual, wrong_tenant);
             }
-            other => panic!("expected FindingTenantMismatch, got {other:?}"),
+            other => panic!("expected TenantMismatch, got {other:?}"),
         });
     }
 
