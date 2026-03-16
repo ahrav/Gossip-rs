@@ -32,7 +32,7 @@ pub use coordination::{FenceEpoch, JobId, LogicalTime, OpId, RunId, ShardId, Sha
 pub use finding::{
     FindingId, FindingIdInputs, NormHash, ObservationId, ObservationIdInputs, OccurrenceId,
     OccurrenceIdInputs, RuleFingerprint, SecretHash, derive_finding_id, derive_observation_id,
-    derive_occurrence_id, key_secret_hash,
+    derive_occurrence_id, derive_rule_fingerprint, key_secret_hash,
 };
 pub use hashing::{domain_hasher, finalize_32, finalize_64};
 pub use item::{

@@ -4,7 +4,7 @@
 //! backed by either Docker (testcontainers) or an external instance advertised
 //! through `GOSSIP_POSTGRES_TEST_URL`.
 
-use std::slice;
+use std::{slice, sync::Arc};
 
 use gossip_contracts::{
     connector::{Location, VersionId},
@@ -350,13 +350,13 @@ impl FindingsFixture {
             FenceEpoch::from_raw(fence_epoch),
             LogicalTime::from_raw(seen_at),
         )
-        .with_location(
+        .with_location(Arc::new(
             Location::try_new(
                 self.safe_location_display.clone(),
                 Some(self.safe_location_url.clone()),
             )
             .expect("fixture location should be valid"),
-        )
+        ))
     }
 }
 
@@ -412,7 +412,7 @@ pub fn sample_fixture(seed: u8) -> FindingsFixture {
         FenceEpoch::from_raw(30_000 + u64::from(seed)),
         LogicalTime::from_raw(40_000 + u64::from(seed)),
     )
-    .with_location(location);
+    .with_location(Arc::new(location));
 
     FindingsFixture {
         tenant_id,

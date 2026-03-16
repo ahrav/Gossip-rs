@@ -49,7 +49,7 @@
 //! probe: [`FindingsConformanceProbe`]. Production code does not depend on this
 //! trait; backend test suites implement it in their test harnesses.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use super::{
     CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey,
@@ -1211,7 +1211,7 @@ fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError
         FenceEpoch::from_raw(30_000 + u64::from(seed)),
         LogicalTime::from_raw(40_000 + u64::from(seed)),
     )
-    .with_location(location);
+    .with_location(Arc::new(location));
 
     let key = DoneLedgerKey::new(tenant_id, policy_hash, ovid_hash);
     let failed_record = DoneLedgerRecord::try_new(

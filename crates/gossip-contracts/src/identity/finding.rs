@@ -58,7 +58,8 @@ use blake3::Hasher;
 
 use super::domain;
 use super::hashing::{
-    FINDING_HASHER, OBSERVATION_HASHER, OCCURRENCE_HASHER, derive_from_cached, finalize_32,
+    FINDING_HASHER, OBSERVATION_HASHER, OCCURRENCE_HASHER, RULE_FINGERPRINT_HASHER,
+    derive_from_cached, finalize_32,
 };
 use super::item::{ObjectVersionId, StableItemId};
 use super::types::{PolicyHash, TenantId, TenantSecretKey};
@@ -144,6 +145,30 @@ crate::define_id_32! {
     /// `RuleFingerprint`. If a rule's detection semantics change, its
     /// fingerprint MUST change.
     RuleFingerprint
+}
+
+/// Derive a stable [`RuleFingerprint`] from a rule's name.
+///
+/// Uses BLAKE3 derive-key mode with [`domain::RULE_FINGERPRINT_V1`].
+/// The fingerprint depends only on the rule name, not on positional
+/// indices or compilation order, so the same rule always produces the
+/// same fingerprint regardless of where it appears in the rule list.
+///
+/// # Examples
+///
+/// ```
+/// use gossip_contracts::identity::{RuleFingerprint, derive_rule_fingerprint};
+///
+/// let fp = derive_rule_fingerprint("generic-api-key");
+/// // Same name always produces the same fingerprint.
+/// assert_eq!(fp, derive_rule_fingerprint("generic-api-key"));
+/// // Different names produce different fingerprints.
+/// assert_ne!(fp, derive_rule_fingerprint("aws-access-key"));
+/// ```
+pub fn derive_rule_fingerprint(rule_name: &str) -> RuleFingerprint {
+    let mut h = RULE_FINGERPRINT_HASHER.clone();
+    h.update(rule_name.as_bytes());
+    RuleFingerprint::from_bytes(finalize_32(&h))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +441,37 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    // -- derive_rule_fingerprint --
+
+    #[test]
+    fn derive_rule_fingerprint_is_deterministic() {
+        let a = derive_rule_fingerprint("generic-api-key");
+        let b = derive_rule_fingerprint("generic-api-key");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_rule_fingerprint_differs_for_different_names() {
+        let a = derive_rule_fingerprint("generic-api-key");
+        let b = derive_rule_fingerprint("aws-access-key");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_rule_fingerprint_matches_engine_computation() {
+        // The engine computes fingerprints with raw blake3 derive-key.
+        // This test verifies the contracts crate's function produces the
+        // same bytes, catching any domain-string or encoding drift.
+        let name = "test-rule";
+        let from_contracts = derive_rule_fingerprint(name);
+
+        let mut h = blake3::Hasher::new_derive_key("gossip/rule/v1");
+        h.update(name.as_bytes());
+        let from_raw_blake3 = *h.finalize().as_bytes();
+
+        assert_eq!(*from_contracts.as_bytes(), from_raw_blake3);
+    }
 
     // -- Debug format safety --
 

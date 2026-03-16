@@ -568,7 +568,7 @@ pub const TRUNCATE_ALL_SQL: &str = "TRUNCATE TABLE observations, occurrences, fi
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, num::NonZeroU64};
+    use std::{collections::HashSet, num::NonZeroU64, sync::Arc};
 
     use crate::types::{PgU64ConversionError, pg_bigint_to_u64_bits};
     use gossip_contracts::{
@@ -744,15 +744,17 @@ mod tests {
 
         let no_location = observation_record(tenant_id, occurrence.occurrence_id(), 1, 2);
         let display_only = observation_record(tenant_id, occurrence.occurrence_id(), 3, 4)
-            .with_location(Location::try_new("repo/path".into(), None).expect("valid location"));
+            .with_location(Arc::new(
+                Location::try_new("repo/path".into(), None).expect("valid location"),
+            ));
         let with_url = observation_record(tenant_id, occurrence.occurrence_id(), 5, 6)
-            .with_location(
+            .with_location(Arc::new(
                 Location::try_new(
                     "repo/path".into(),
                     Some("https://example.test/findings/42".into()),
                 )
                 .expect("valid location"),
-            );
+            ));
 
         let no_location_row =
             ObservationRow::from_record(&no_location).expect("projection should succeed");

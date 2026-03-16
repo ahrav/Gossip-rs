@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use gossip_contracts::{
     connector::{Location, VersionId},
     identity::key_secret_hash,
@@ -67,7 +69,7 @@ fn additional_finding_records(
         FenceEpoch::from_raw(70_000 + u64::from(disambiguator)),
         LogicalTime::from_raw(seen_at),
     )
-    .with_location(location);
+    .with_location(Arc::new(location));
 
     AdditionalFindingRecords {
         finding,
@@ -587,13 +589,13 @@ fn list_findings_needing_triage_picks_latest_across_multiple_occurrences() {
         FenceEpoch::from_raw(77_003),
         LogicalTime::from_raw(later_seen_at),
     )
-    .with_location(
+    .with_location(Arc::new(
         Location::try_new(
             "safe/path/second-occ.txt".to_owned(),
             Some("https://example.invalid/second-occ".to_owned()),
         )
         .expect("fixture location should be valid"),
-    );
+    ));
 
     backend
         .upsert_batch(FindingsUpsertBatch::new(

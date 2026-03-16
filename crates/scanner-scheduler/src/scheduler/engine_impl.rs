@@ -281,6 +281,10 @@ impl ScanEngine for Engine {
         self.rule_name(rule_id)
     }
 
+    fn rule_fingerprint_bytes(&self, rule_id: u32) -> [u8; 32] {
+        Engine::rule_fingerprint_bytes(self, rule_id)
+    }
+
     fn max_findings_per_chunk(&self) -> usize {
         Engine::max_findings_per_chunk(self)
     }

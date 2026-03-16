@@ -1,4 +1,9 @@
-use std::{num::NonZeroU64, sync::mpsc, thread, time::Duration};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 
 use gossip_contracts::{
     connector::Location,
@@ -300,9 +305,9 @@ fn findings_upsert_is_idempotent_and_merges_observation_provenance() {
         .unwrap();
 
     let updated_observation = observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100)
-        .with_location(
+        .with_location(Arc::new(
             Location::try_new("repo/path".into(), Some("https://example.test".into())).unwrap(),
-        );
+        ));
     let updated_observations = [updated_observation.clone()];
     store
         .upsert_batch(FindingsUpsertBatch::new(&[], &[], &updated_observations))
@@ -1040,9 +1045,10 @@ fn observation_merge_preserves_location_from_either_record() {
         .unwrap();
 
     // Second observation: earlier seen_at, but with location.
-    let obs_with_loc = observation_record(1, &occurrence, 30, 40, 90, 91, 92, 80).with_location(
-        Location::try_new("repo/path".into(), Some("https://example.test".into())).unwrap(),
-    );
+    let obs_with_loc =
+        observation_record(1, &occurrence, 30, 40, 90, 91, 92, 80).with_location(Arc::new(
+            Location::try_new("repo/path".into(), Some("https://example.test".into())).unwrap(),
+        ));
     let observations2 = [obs_with_loc];
     store
         .upsert_batch(FindingsUpsertBatch::new(&[], &[], &observations2))
@@ -1378,9 +1384,11 @@ fn observation_merge_equal_seen_at_both_with_location_keeps_existing() {
     let finding = finding_record(1, 10);
     let occurrence = occurrence_record(1, &finding, 20, 100);
 
-    let existing_obs = observation_record(1, &occurrence, 30, 40, 50, 60, 70, 100).with_location(
-        Location::try_new("existing/path".into(), Some("https://existing.test".into())).unwrap(),
-    );
+    let existing_obs =
+        observation_record(1, &occurrence, 30, 40, 50, 60, 70, 100).with_location(Arc::new(
+            Location::try_new("existing/path".into(), Some("https://existing.test".into()))
+                .unwrap(),
+        ));
 
     let findings = [finding.clone()];
     let occurrences = [occurrence.clone()];
@@ -1396,9 +1404,11 @@ fn observation_merge_equal_seen_at_both_with_location_keeps_existing() {
         .unwrap();
 
     // Same seen_at (100), both with location → existing provenance wins.
-    let incoming_obs = observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100).with_location(
-        Location::try_new("incoming/path".into(), Some("https://incoming.test".into())).unwrap(),
-    );
+    let incoming_obs =
+        observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100).with_location(Arc::new(
+            Location::try_new("incoming/path".into(), Some("https://incoming.test".into()))
+                .unwrap(),
+        ));
     let incoming_arr = [incoming_obs];
     store
         .upsert_batch(FindingsUpsertBatch::new(&[], &[], &incoming_arr))
@@ -1438,9 +1448,11 @@ fn observation_merge_earlier_incoming_keeps_existing_provenance() {
         .unwrap();
 
     // Incoming has earlier seen_at=100 → existing wins entirely.
-    let incoming_obs = observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100).with_location(
-        Location::try_new("incoming/path".into(), Some("https://incoming.test".into())).unwrap(),
-    );
+    let incoming_obs =
+        observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100).with_location(Arc::new(
+            Location::try_new("incoming/path".into(), Some("https://incoming.test".into()))
+                .unwrap(),
+        ));
     let incoming_arr = [incoming_obs];
     store
         .upsert_batch(FindingsUpsertBatch::new(&[], &[], &incoming_arr))
@@ -1468,9 +1480,11 @@ fn observation_merge_equal_seen_at_existing_has_location_keeps_existing() {
     let finding = finding_record(1, 10);
     let occurrence = occurrence_record(1, &finding, 20, 100);
 
-    let existing_obs = observation_record(1, &occurrence, 30, 40, 50, 60, 70, 100).with_location(
-        Location::try_new("existing/path".into(), Some("https://existing.test".into())).unwrap(),
-    );
+    let existing_obs =
+        observation_record(1, &occurrence, 30, 40, 50, 60, 70, 100).with_location(Arc::new(
+            Location::try_new("existing/path".into(), Some("https://existing.test".into()))
+                .unwrap(),
+        ));
 
     let findings = [finding.clone()];
     let occurrences = [occurrence.clone()];

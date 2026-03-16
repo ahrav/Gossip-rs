@@ -76,6 +76,7 @@ pub mod event_sink;
 pub mod git_repo;
 pub mod ordered_content;
 pub mod parity;
+pub mod result_translation;
 
 /// How the runtime acquires source items.
 ///
