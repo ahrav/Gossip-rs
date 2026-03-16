@@ -85,7 +85,45 @@ impl fmt::Debug for IdentityChainRecord {
 }
 
 impl IdentityChainRecord {
+    /// Fallible constructor that validates span boundaries.
+    ///
+    /// Returns `Err` when `end <= start` (empty or inverted span).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        write_context: WriteContext,
+        item_key: Vec<u8>,
+        rule_id: u32,
+        start: u64,
+        end: u64,
+        confidence_score: i8,
+        norm_hash: [u8; 32],
+        secret_hash: [u8; 32],
+        finding_id: [u8; 32],
+        occurrence_id: [u8; 32],
+    ) -> Result<Self> {
+        if end <= start {
+            return Err(anyhow::anyhow!(
+                "identity chain record requires a non-empty span: start={start}, end={end}",
+            ));
+        }
+        Ok(Self {
+            write_context,
+            item_key,
+            rule_id,
+            start,
+            end,
+            confidence_score,
+            norm_hash,
+            secret_hash,
+            finding_id,
+            occurrence_id,
+        })
+    }
+
     /// Construct an identity chain record from all component fields.
+    ///
+    /// Panics when `end <= start`. Prefer [`Self::try_new`] when the caller
+    /// can handle the error.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -100,11 +138,7 @@ impl IdentityChainRecord {
         finding_id: [u8; 32],
         occurrence_id: [u8; 32],
     ) -> Self {
-        assert!(
-            end > start,
-            "identity chain record requires a non-empty span: start={start}, end={end}",
-        );
-        Self {
+        Self::try_new(
             write_context,
             item_key,
             rule_id,
@@ -115,7 +149,8 @@ impl IdentityChainRecord {
             secret_hash,
             finding_id,
             occurrence_id,
-        }
+        )
+        .expect("identity chain record requires a non-empty span")
     }
 
     /// Shared routing and fencing metadata for the emitted write.

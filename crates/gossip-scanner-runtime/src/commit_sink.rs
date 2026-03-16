@@ -189,7 +189,7 @@ impl DurableCommitSink {
             byte_length: finding.end - finding.start,
         });
 
-        Ok(IdentityChainRecord::new(
+        IdentityChainRecord::try_new(
             self.write_context,
             item_key.as_bytes().to_vec(),
             finding.rule_id,
@@ -200,7 +200,7 @@ impl DurableCommitSink {
             *secret_hash.as_bytes(),
             *finding_id.as_bytes(),
             *occurrence_id.as_bytes(),
-        ))
+        )
     }
 }
 
