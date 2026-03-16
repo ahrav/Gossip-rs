@@ -8,11 +8,15 @@
 use std::collections::BTreeMap;
 
 use gossip_contracts::coordination::{PooledCursor, PooledShardSpec, PooledSpawned};
+use gossip_coordination::sim::test_util::arb_sim_op;
 use gossip_coordination::sim::{CoordinationSim, SimIntrospection, SimOp, SimulationBackend};
 use gossip_coordination::{
     LogicalTime, OpId, OpKind, RunConfig, RunId, RunOpKind, RunOpResult, RunRecord, RunStatus,
     ShardId, ShardKey, ShardRecord, ShardStatus, TenantId, WorkerId,
 };
+use gossip_coordination_etcd::EtcdCoordinatorConfig;
+use proptest::strategy::{Strategy, ValueTree};
+use proptest::test_runner::{Config as ProptestConfig, RngAlgorithm, TestRng, TestRunner};
 
 /// Pairs two simulation harnesses and panics on any behavioral drift.
 pub(crate) struct DifferentialOracle<L: SimulationBackend, R: SimulationBackend> {
@@ -383,6 +387,45 @@ fn comparable_state<B: SimIntrospection>(backend: &B) -> Result<ComparableBacken
     }
 
     Ok(ComparableBackendState { runs, shards })
+}
+
+pub(crate) const N_WORKERS: u64 = 4;
+pub(crate) const N_SHARDS: u64 = 8;
+pub(crate) const OWNER_LEASE_TTL_SECS: i64 = 300;
+pub(crate) const OPTIMISTIC_TXN_RETRIES: usize = 8;
+pub(crate) const MAX_CHILDREN_PER_OP: usize = 8;
+
+pub(crate) fn proptest_seed(seed: u64) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    bytes
+}
+
+pub(crate) fn generated_ops(seed: u64) -> Vec<SimOp> {
+    let strategy = proptest::collection::vec(arb_sim_op(N_WORKERS, N_SHARDS), 15..50);
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig {
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        },
+        TestRng::from_seed(RngAlgorithm::ChaCha, &proptest_seed(seed)),
+    );
+
+    strategy
+        .new_tree(&mut runner)
+        .expect("SimOp strategy must generate a sequence")
+        .current()
+}
+
+pub(crate) fn etcd_sim_config(namespace: &str) -> EtcdCoordinatorConfig {
+    EtcdCoordinatorConfig::new_with_tuning(
+        ["http://127.0.0.1:2379"],
+        namespace,
+        OWNER_LEASE_TTL_SECS,
+        OPTIMISTIC_TXN_RETRIES,
+        MAX_CHILDREN_PER_OP,
+    )
+    .expect("differential oracle config must be valid")
 }
 
 #[cfg(test)]

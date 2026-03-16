@@ -5,7 +5,7 @@
 //! state through `batch_get` for every key written so far — both after each
 //! individual batch and once more at the end of the full sequence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use gossip_contracts::identity::{PolicyHash, TenantId};
 use gossip_contracts::persistence::{
@@ -86,17 +86,17 @@ fn truncate_postgres(admin: &mut Client) {
         .expect("done-ledger differential oracle should clear postgres state between seeds");
 }
 
-fn group_keys(keys: &HashSet<DoneLedgerKey>) -> HashMap<(TenantId, PolicyHash), Vec<OvidHash>> {
-    let mut grouped = HashMap::new();
+fn group_keys(keys: &HashSet<DoneLedgerKey>) -> BTreeMap<(TenantId, PolicyHash), Vec<OvidHash>> {
+    let mut grouped: BTreeMap<(TenantId, PolicyHash), Vec<OvidHash>> = BTreeMap::new();
     for key in keys {
         grouped
             .entry((key.tenant_id(), key.policy_hash()))
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(key.ovid_hash());
     }
 
     for ovids in grouped.values_mut() {
-        ovids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        ovids.sort_unstable();
     }
 
     grouped

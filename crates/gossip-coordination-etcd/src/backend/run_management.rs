@@ -421,21 +421,19 @@ macro_rules! impl_sync_run_management {
 
     /// Collect shard IDs eligible for claiming (active and unowned).
     ///
-    /// Uses two keys-only prefix scans instead of loading full shard
-    /// record blobs:
+    /// Uses a keys-only active-index scan to find `Active` shards, then a
+    /// keys-only owner-key scan to identify which have a live etcd-level
+    /// owner binding.
     ///
-    /// 1. **Active-index scan** — entries in `shards_active/` exist only
-    ///    for `Active` shards, skipping terminal records entirely.
-    /// 2. **Owner-key scan** — owner keys (`shards/{hex}/owner`) indicate
-    ///    a live etcd-level owner binding. Their presence means the shard
-    ///    is owned; absence means it is available for claiming.
+    /// Shards without an `/owner` key are always candidates. Shards with
+    /// an `/owner` key are candidates only if the coordination-level
+    /// lease deadline has already passed — the etcd key TTL can outlive
+    /// the protocol-level deadline, so key presence alone is not
+    /// sufficient to determine ownership.
     ///
-    /// Active shards without an owner key are candidates. The earliest
-    /// lease deadline among owned shards is not computed (would require
-    /// loading full record blobs); `None` is returned instead. The
-    /// caller ([`default_claim_next_available`]) handles `None`
-    /// gracefully — per-shard acquire attempts refine the deadline as
-    /// `AlreadyLeased` errors are encountered.
+    /// For owned shards with a live coordination lease, the earliest
+    /// deadline is tracked and returned so the caller can sleep until a
+    /// shard becomes available.
     ///
     /// The candidate list is sorted by shard ID for deterministic claim
     /// ordering.
@@ -449,7 +447,7 @@ macro_rules! impl_sync_run_management {
         self.sync_logical_time(now);
         let _ = self.get_run(tenant, run)?;
 
-        // Keys-only scan of the active-shard index to find unleased candidates.
+        // Keys-only scan of the active-shard index.
         let mut active_prefix = self.keyspace.shards_active_prefix(tenant, run);
         active_prefix.push('/');
         let active_resp = self
@@ -476,7 +474,7 @@ macro_rules! impl_sync_run_management {
         }
 
         // Keys-only scan of the shard record prefix to discover
-        // which active shards have a live `/owner` key.
+        // which active shards have an etcd `/owner` key.
         let shards_prefix = self.keyspace.shard_records_scan_prefix(tenant, run);
         let keys_resp = self
             .etcd_get(
@@ -497,14 +495,44 @@ macro_rules! impl_sync_run_management {
             .collect();
 
         candidates.clear();
+        let mut earliest_deadline: Option<LogicalTime> = None;
+
         for shard_id in &active_ids {
             if !owned_ids.contains(shard_id) {
+                // No owner key — shard is available.
                 candidates.push(*shard_id);
+            } else {
+                // Owner key exists in etcd, but the coordination-level
+                // lease may have expired (etcd TTL can outlive the
+                // protocol-level deadline). Load the record and check.
+                let key = ShardKey::new(run, *shard_id);
+                match self.load_shard_record(tenant, key) {
+                    Ok(Some(persisted)) if persisted.record.is_leased_at(now) => {
+                        // Coordination lease still active — not a candidate.
+                        if let Some(deadline) = persisted.record.lease_deadline() {
+                            earliest_deadline = Some(match earliest_deadline {
+                                Some(prev) => core::cmp::min(prev, deadline),
+                                None => deadline,
+                            });
+                        }
+                    }
+                    Ok(_) => {
+                        // Coordination lease expired or record absent —
+                        // include as candidate despite the etcd key.
+                        candidates.push(*shard_id);
+                    }
+                    Err(err) => {
+                        return Err(GetRunError::BackendError(super::map_etcd_err(
+                            "collect_claim_candidates.check_owned_deadline",
+                            err,
+                        )));
+                    }
+                }
             }
         }
-        candidates.sort_unstable();
 
-        Ok(None)
+        candidates.sort_unstable();
+        Ok(earliest_deadline)
     }
 
     /// Transition an `Active` run to `Done`. Requires the active-run index
@@ -1089,7 +1117,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
 
     async fn collect_claim_candidates_into(
         &self,
-        _now: LogicalTime,
+        now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         candidates: &mut Vec<ShardId>,
@@ -1136,14 +1164,41 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             .iter()
             .filter_map(|kv| ShardOwnerKey::parse_owned_shard(shards_prefix.as_bytes(), kv.key()))
             .collect();
+
         candidates.clear();
+        let mut earliest_deadline: Option<LogicalTime> = None;
+
         for id in &active_ids {
             if !owned_ids.contains(id) {
                 candidates.push(*id);
+            } else {
+                // Owner key exists, but the coordination-level lease may
+                // have expired. Load the record to check the deadline.
+                let key = ShardKey::new(run, *id);
+                match self.load_shard_record(tenant, key).await {
+                    Ok(Some(persisted)) if persisted.record.is_leased_at(now) => {
+                        if let Some(deadline) = persisted.record.lease_deadline() {
+                            earliest_deadline = Some(match earliest_deadline {
+                                Some(prev) => core::cmp::min(prev, deadline),
+                                None => deadline,
+                            });
+                        }
+                    }
+                    Ok(_) => {
+                        candidates.push(*id);
+                    }
+                    Err(e) => {
+                        return Err(GetRunError::BackendError(super::map_etcd_err(
+                            "collect_claim_candidates.check_owned_deadline",
+                            e,
+                        )));
+                    }
+                }
             }
         }
+
         candidates.sort_unstable();
-        Ok(None)
+        Ok(earliest_deadline)
     }
 
     async fn complete_run(

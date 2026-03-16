@@ -12,43 +12,13 @@ mod oracle;
 mod support;
 
 use gossip_contracts::test_util::selected_seeds_from_env;
-use gossip_coordination::sim::test_util::arb_sim_op;
 use gossip_coordination::sim::{CoordinationSim, FaultLevel};
+use gossip_coordination_etcd::SimEtcdCoordinator;
 use gossip_coordination_etcd::test_support::test_coordinator_with_tuning;
-use gossip_coordination_etcd::{EtcdCoordinatorConfig, SimEtcdCoordinator};
 use oracle::DifferentialOracle;
-use proptest::strategy::{Strategy, ValueTree};
-use proptest::test_runner::{Config as ProptestConfig, RngAlgorithm, TestRng, TestRunner};
 use support::ObservedEtcdCoordinator;
 
 const CASES: usize = 50;
-const N_WORKERS: u64 = 4;
-const N_SHARDS: u64 = 8;
-const OWNER_LEASE_TTL_SECS: i64 = 300;
-const OPTIMISTIC_TXN_RETRIES: usize = 8;
-const MAX_CHILDREN_PER_OP: usize = 8;
-
-fn proptest_seed(seed: u64) -> [u8; 32] {
-    let mut bytes = [0_u8; 32];
-    bytes[..8].copy_from_slice(&seed.to_le_bytes());
-    bytes
-}
-
-fn generated_ops(seed: u64) -> Vec<gossip_coordination::sim::SimOp> {
-    let strategy = proptest::collection::vec(arb_sim_op(N_WORKERS, N_SHARDS), 15..50);
-    let mut runner = TestRunner::new_with_rng(
-        ProptestConfig {
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        },
-        TestRng::from_seed(RngAlgorithm::ChaCha, &proptest_seed(seed)),
-    );
-
-    strategy
-        .new_tree(&mut runner)
-        .expect("SimOp strategy must generate a sequence")
-        .current()
-}
 
 fn repro_command(seed: u64) -> String {
     format!(
@@ -58,31 +28,22 @@ fn repro_command(seed: u64) -> String {
     )
 }
 
-fn sim_config(namespace: &str) -> EtcdCoordinatorConfig {
-    EtcdCoordinatorConfig::new_with_tuning(
-        ["http://127.0.0.1:2379"],
-        namespace,
-        OWNER_LEASE_TTL_SECS,
-        OPTIMISTIC_TXN_RETRIES,
-        MAX_CHILDREN_PER_OP,
-    )
-    .expect("differential oracle config must be valid")
-}
-
 fn build_oracle(seed: u64) -> DifferentialOracle<SimEtcdCoordinator, ObservedEtcdCoordinator> {
-    let sim_backend =
-        SimEtcdCoordinator::new(sim_config(&format!("/gossip/diff/live/{seed}")), seed)
-            .expect("simulated etcd backend must construct");
+    let sim_backend = SimEtcdCoordinator::new(
+        oracle::etcd_sim_config(&format!("/gossip/diff/live/{seed}")),
+        seed,
+    )
+    .expect("simulated etcd backend must construct");
     let etcd_backend = ObservedEtcdCoordinator::new(test_coordinator_with_tuning(
-        OWNER_LEASE_TTL_SECS,
-        OPTIMISTIC_TXN_RETRIES,
-        MAX_CHILDREN_PER_OP,
+        oracle::OWNER_LEASE_TTL_SECS,
+        oracle::OPTIMISTIC_TXN_RETRIES,
+        oracle::MAX_CHILDREN_PER_OP,
     ));
 
     let sim = CoordinationSim::with_backend(seed, FaultLevel::SunnyDay, sim_backend)
-        .with_workers_and_shards(N_WORKERS, N_SHARDS);
+        .with_workers_and_shards(oracle::N_WORKERS, oracle::N_SHARDS);
     let etcd = CoordinationSim::with_backend(seed, FaultLevel::SunnyDay, etcd_backend)
-        .with_workers_and_shards(N_WORKERS, N_SHARDS);
+        .with_workers_and_shards(oracle::N_WORKERS, oracle::N_SHARDS);
 
     DifferentialOracle::new(
         sim,
@@ -102,7 +63,7 @@ fn no_model_drift_against_real_etcd() {
         "GOSSIP_COORD_DIFF_LIVE_CASES",
         CASES,
     ) {
-        let ops = generated_ops(seed);
+        let ops = oracle::generated_ops(seed);
         let mut oracle = build_oracle(seed);
         oracle.run_sequence(&ops);
     }

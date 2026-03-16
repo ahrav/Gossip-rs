@@ -230,6 +230,14 @@ jobs:
           --features test-utils
           --profile ci
 
+      - name: Run PostgreSQL integration tests (persistence differential oracle)
+        run: >-
+          cargo nextest run
+          -p gossip-persistence-inmemory
+          --run-ignored ignored-only
+          --profile ci
+          -E 'test(done_ledger_pg_matches_in_memory)'
+
   # ── Test (etcd integration) ──────────────────────────────────────
   # Runs etcd-dependent tests against a real service container.
   # ETCD_ENDPOINTS bypasses testcontainers so all tests share the
@@ -296,6 +304,14 @@ jobs:
           --features test-support
           --profile ci
 
+      - name: Run etcd integration tests (ignored, needs service container)
+        run: >-
+          cargo nextest run
+          -p gossip-coordination-etcd
+          --features test-support
+          --run-ignored ignored-only
+          --profile ci
+
       - name: Run etcd integration tests (release)
         if: github.event_name == 'schedule'
         run: >-
@@ -303,6 +319,16 @@ jobs:
           -p gossip-coordination-etcd
           --features test-support
           --release
+          --profile nightly
+
+      - name: Run etcd integration tests (release, ignored)
+        if: github.event_name == 'schedule'
+        run: >-
+          cargo nextest run
+          -p gossip-coordination-etcd
+          --features test-support
+          --release
+          --run-ignored ignored-only
           --profile nightly
 
   # ── Benchmark (compile check) ────────────────────────────────────
@@ -526,6 +552,13 @@ jobs:
           cargo nextest run --all-features ${{ matrix.release-flag }}
           --profile nightly
           --exclude gossip-coordination-etcd
+
+      - name: Run ignored slow tests (${{ matrix.profile }})
+        run: >-
+          cargo nextest run --all-features ${{ matrix.release-flag }}
+          --profile nightly
+          --exclude gossip-coordination-etcd
+          --run-ignored ignored-only
 
       - name: Run doctests (${{ matrix.profile }})
         run: >-

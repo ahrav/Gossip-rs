@@ -38,7 +38,7 @@ sha2 = "0.10"
 [features]
 default = []
 kani = []
-perf-stats = ["gossip-stdx/perf-stats"]
+perf-stats = ["gossip-stdx/perf-stats", "scanner-engine/perf-stats"]
 stats = ["perf-stats"]
 git-perf = ["perf-stats", "scanner-engine/perf-counters"]
 bench = []

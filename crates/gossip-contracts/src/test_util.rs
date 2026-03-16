@@ -351,6 +351,11 @@ pub fn selected_seeds_from_env(seed_var: &str, count_var: &str, default: usize) 
     if let Some(seed) = parse_env_seed(seed_var) {
         vec![seed]
     } else {
-        (0..parse_env_case_count(count_var, default) as u64).collect()
+        let count = parse_env_case_count(count_var, default);
+        assert!(
+            count > 0,
+            "{count_var} resolved to 0 — oracle would run no cases"
+        );
+        (0..count as u64).collect()
     }
 }
