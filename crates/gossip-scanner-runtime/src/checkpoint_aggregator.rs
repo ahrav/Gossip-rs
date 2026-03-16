@@ -423,7 +423,7 @@ impl PrefixCheckpointAggregator {
         };
 
         // The overflow check on `pending.last_sequence_no + 1` at the top of
-        // this method guarantees `checked_add` succeeds here.
+        // this method guarantees this addition cannot overflow.
         self.receipts = self.receipts.split_off(&(pending.last_sequence_no + 1));
 
         self.next_sequence_no = new_next_sequence_no;
