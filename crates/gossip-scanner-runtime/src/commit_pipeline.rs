@@ -279,6 +279,16 @@ impl CommitPipelineSender {
 /// The worker owns a [`ResultCommitter`] and is therefore the only place where
 /// runtime work becomes authoritatively durable. Execution threads only enqueue
 /// [`QueuedCommit`] values; they do not write sinks directly.
+///
+/// # Shutdown vs implicit drop
+///
+/// [`shutdown`](Self::shutdown) cancels, closes both channels, and **joins**
+/// the worker thread — the caller blocks until the in-flight commit finishes.
+///
+/// Dropping without calling `shutdown` cancels the token; the field
+/// destructors then close both channels (unblocking the worker) and the
+/// `JoinHandle` is dropped, **detaching** the thread. The worker still
+/// exits promptly, but the caller does not wait for it.
 pub struct CommitPipeline<F, D>
 where
     F: FindingsSink,
