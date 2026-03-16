@@ -219,8 +219,16 @@ impl CommitSink for DurableCommitSink {
 
     fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()> {
         let meta = self.metadata_for_item(item_key)?;
-        for finding in &batch.findings {
-            let record = self.derive_identity_record(item_key, &meta, finding)?;
+
+        // Derive all records before writing any so that a validation failure in
+        // a later finding does not leave partial identity-chain state behind.
+        let records = batch
+            .findings
+            .iter()
+            .map(|finding| self.derive_identity_record(item_key, &meta, finding))
+            .collect::<Result<Vec<_>>>()?;
+
+        for record in records {
             self.recorder
                 .record_identity_chain(&self.recorder_shard_label, record)?;
         }
@@ -558,6 +566,71 @@ mod tests {
             versioned_identity[0].finding_id(),
             none_identity[0].finding_id(),
             "finding_id is version-independent"
+        );
+    }
+
+    /// A batch with a valid finding followed by an invalid one must not leave
+    /// partial identity-chain records from the valid finding behind.
+    #[test]
+    fn mixed_batch_rejects_atomically_without_partial_writes() {
+        let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-atomic"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"path/to/mixed.txt").expect("item key");
+        sink.begin_item(
+            &item_key,
+            &ItemMeta {
+                stable_item_id: StableItemId::from_bytes([0x33; 32]),
+                version: None,
+                size_hint: None,
+            },
+        )
+        .expect("begin item");
+
+        let result = sink.upsert_findings(
+            &item_key,
+            &FindingsBatch {
+                findings: vec![
+                    // Valid finding
+                    FindingRecord {
+                        rule_id: 1,
+                        start: 10,
+                        end: 20,
+                        norm_hash: [0xAA; 32],
+                        confidence_score: 5,
+                    },
+                    // Invalid finding (inverted span)
+                    FindingRecord {
+                        rule_id: 2,
+                        start: 30,
+                        end: 25,
+                        norm_hash: [0xBB; 32],
+                        confidence_score: 3,
+                    },
+                ],
+            },
+        );
+
+        assert!(result.is_err(), "batch with invalid finding must fail");
+
+        let identity = recorder.identity.lock().expect("identity lock");
+        assert!(
+            identity.is_empty(),
+            "no identity records should be produced when batch contains an invalid finding — \
+             found {} partial records from valid findings that preceded the invalid one",
+            identity.len(),
         );
     }
 }

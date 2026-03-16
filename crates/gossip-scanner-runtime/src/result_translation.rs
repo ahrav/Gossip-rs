@@ -54,7 +54,7 @@ impl ScanTiming {
     #[inline]
     #[must_use]
     pub fn new(started_at: LogicalTime, finished_at: LogicalTime) -> Self {
-        debug_assert!(
+        assert!(
             started_at.as_raw() <= finished_at.as_raw(),
             "scan timing must be monotonic: started_at ({started_at:?}) > finished_at ({finished_at:?})",
         );
@@ -322,6 +322,9 @@ pub fn translate_item_result(
         provenance,
         result.error_code().cloned(),
     )?;
+    // `try_new` checks findings_count vs status; `validate` additionally
+    // enforces error_code consistency (failure/skip require a code, clean
+    // scans forbid one). Both passes are intentional.
     done_ledger.validate()?;
 
     let translation =
