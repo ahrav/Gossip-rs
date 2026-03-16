@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gossip_contracts::{
     connector::{ItemKey, VersionId},
     identity::{
-        derive_finding_id, derive_occurrence_id, key_secret_hash, FindingIdInputs, NormHash,
-        ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, StableItemId, TenantSecretKey,
+        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint,
+        StableItemId, TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
     },
     persistence::WriteContext,
 };
@@ -291,8 +291,8 @@ mod tests {
     use gossip_contracts::identity::derive_rule_fingerprint;
 
     use super::*;
-    use crate::coordination_sink::StoredGitEvent;
     use crate::OwnedCoreEvent;
+    use crate::coordination_sink::StoredGitEvent;
 
     /// Test-only rule fingerprint lookup that derives from a synthetic name.
     fn test_rule_fingerprint(rule_id: u32) -> gossip_contracts::identity::RuleFingerprint {

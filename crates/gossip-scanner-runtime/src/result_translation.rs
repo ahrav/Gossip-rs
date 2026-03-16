@@ -24,11 +24,11 @@ use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
 use gossip_contracts::{
     connector::ScanItem,
-    identity::{key_secret_hash, LogicalTime, NormHash, RuleFingerprint, TenantSecretKey},
+    identity::{LogicalTime, NormHash, RuleFingerprint, TenantSecretKey, key_secret_hash},
     persistence::{
-        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
-        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
-        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceInputError, WriteContext,
+        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
+        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
+        OvidHash, OvidHashInputs, PersistenceInputError, WriteContext, derive_ovid_hash,
     },
 };
 use scanner_scheduler::store::FsFindingRecord;
@@ -458,16 +458,16 @@ mod tests {
     use gossip_contracts::{
         connector::{ItemKey, ItemRef, Location, ScanItem, VersionId},
         identity::{
-            derive_rule_fingerprint, FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash,
-            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
+            FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
+            StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, WriteContext},
     };
     use scanner_scheduler::store::FsFindingRecord;
 
     use super::{
-        translate_item_result, ItemResult, PersistenceTranslation, ResultTranslationError,
-        ScanTiming,
+        ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
+        translate_item_result,
     };
 
     /// Test-only rule fingerprint lookup that derives from a synthetic name.
