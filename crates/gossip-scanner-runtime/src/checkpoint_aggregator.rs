@@ -280,7 +280,9 @@ impl PrefixCheckpointAggregator {
     }
 
     /// Discard the currently prepared checkpoint prefix without acknowledging
-    /// it. Returns the discarded prefix, if any.
+    /// it. Returns the discarded prefix, if any. Buffered receipts are not
+    /// released; a subsequent `prepare_checkpoint` can reconstruct the prefix
+    /// from them.
     #[inline]
     pub fn discard_pending(&mut self) -> Option<PendingPrefixCheckpoint> {
         self.pending.take()
@@ -290,8 +292,13 @@ impl PrefixCheckpointAggregator {
     ///
     /// Replayed receipts whose sequence number is already durably checkpointed
     /// are ignored idempotently. Replayed receipts for a still-buffered
-    /// sequence are ignored only if they are byte-for-byte identical to the
-    /// buffered one.
+    /// sequence are ignored only if they are structurally identical (by
+    /// `PartialEq`) to the buffered one.
+    ///
+    /// The reorder buffer grows without bound until a contiguous prefix
+    /// forms and is acknowledged. Callers that control receipt submission
+    /// rate should bound the gap between `next_sequence_no` and the highest
+    /// buffered sequence externally.
     ///
     /// # Errors
     ///
@@ -359,11 +366,12 @@ impl PrefixCheckpointAggregator {
     /// On success, the prefix is forgotten, the buffered receipts it covered
     /// are released, and the next required sequence number advances.
     ///
-    /// On counter overflow the pending prefix is restored and the receipt is
-    /// **not** consumed, so the caller can retry directly. On scope mismatch
-    /// from `record_checkpoint`, the pending prefix is also restored but the
-    /// `CheckpointCommitReceipt` has been consumed — the caller must construct
-    /// a fresh receipt for retry.
+    /// On counter overflow the pending prefix is restored but the error is
+    /// deterministic — retrying with the same inputs produces the same
+    /// failure. On scope mismatch from `record_checkpoint`, the pending
+    /// prefix is also restored; the caller can retry with a corrected
+    /// `CheckpointCommitReceipt`. Returns `NoPendingCheckpoint` without
+    /// modifying aggregator state if no prefix has been prepared.
     pub fn acknowledge_checkpoint(
         &mut self,
         receipt: CheckpointCommitReceipt,
@@ -391,6 +399,10 @@ impl PrefixCheckpointAggregator {
                 field: "checkpointed_units",
             });
 
+        // When both counters overflow, only the first error (`next_sequence_no`)
+        // is reported. This is intentional: the recovery action (unable to
+        // advance the checkpoint) is the same regardless of which counter
+        // saturated.
         let (new_next_sequence_no, new_checkpointed_units) =
             match (new_next_sequence_no, new_checkpointed_units) {
                 (Ok(next_sequence_no), Ok(checkpointed_units)) => {
@@ -410,11 +422,9 @@ impl PrefixCheckpointAggregator {
             }
         };
 
-        let split_key = pending
-            .last_sequence_no
-            .checked_add(1)
-            .expect("overflow already checked before receipt validation");
-        self.receipts = self.receipts.split_off(&split_key);
+        // The overflow check on `pending.last_sequence_no + 1` at the top of
+        // this method guarantees `checked_add` succeeds here.
+        self.receipts = self.receipts.split_off(&(pending.last_sequence_no + 1));
 
         self.next_sequence_no = new_next_sequence_no;
         self.checkpointed_units = new_checkpointed_units;
@@ -448,13 +458,7 @@ impl PrefixCheckpointAggregator {
         let first_sequence_no = self.next_sequence_no;
 
         let mut previous_key: Option<&ItemKey> = self.last_checkpoint_key.as_ref();
-        let mut finding_count = 0_u64;
-        let mut occurrence_count = 0_u64;
-        let mut observation_count = 0_u64;
-        let mut record_count = 0_u64;
-        let mut scanned_count = 0_u64;
-        let mut done_ledger_findings_count = 0_u64;
-        let mut committed_units = 0_u64;
+        let mut totals = Totals::default();
 
         for (&sequence_no, receipt) in self.receipts.range(first_sequence_no..=last_sequence_no) {
             let current_key = receipt
@@ -472,64 +476,21 @@ impl PrefixCheckpointAggregator {
             }
             previous_key = Some(current_key);
 
-            let findings = receipt.durable().findings();
-            finding_count = checked_add(
-                finding_count,
-                findings.finding_count(),
-                sequence_no,
-                "finding_count",
-            )?;
-            occurrence_count = checked_add(
-                occurrence_count,
-                findings.occurrence_count(),
-                sequence_no,
-                "occurrence_count",
-            )?;
-            observation_count = checked_add(
-                observation_count,
-                findings.observation_count(),
-                sequence_no,
-                "observation_count",
-            )?;
-
-            let done_ledger = receipt.durable().done_ledger();
-            record_count = checked_add(
-                record_count,
-                done_ledger.record_count(),
-                sequence_no,
-                "record_count",
-            )?;
-            scanned_count = checked_add(
-                scanned_count,
-                done_ledger.scanned_count(),
-                sequence_no,
-                "scanned_count",
-            )?;
-            done_ledger_findings_count = checked_add(
-                done_ledger_findings_count,
-                done_ledger.findings_count(),
-                sequence_no,
-                "done_ledger_findings_count",
-            )?;
-            committed_units = checked_add(
-                committed_units,
-                receipt.durable().scope().committed_units().get(),
-                sequence_no,
-                "committed_units",
-            )?;
+            totals.accumulate(receipt, sequence_no)?;
         }
 
-        let last_receipt = self
-            .receipts
-            .get(&last_sequence_no)
-            .expect("contiguous prefix must contain last sequence");
+        let last_receipt = self.receipts.get(&last_sequence_no).ok_or(
+            PrefixCheckpointError::InternalInconsistency {
+                detail: "contiguous prefix must contain last sequence",
+            },
+        )?;
         let checkpoint_boundary = strip_checkpoint_token(
             last_receipt.completed_unit().checkpoint_boundary(),
         )
         .ok_or(PrefixCheckpointError::MissingProgressKey {
             sequence_no: last_sequence_no,
         })?;
-        let committed_units = NonZeroU64::new(committed_units).ok_or(
+        let committed_units = NonZeroU64::new(totals.committed_units).ok_or(
             PrefixCheckpointError::InternalInconsistency {
                 detail: "non-empty contiguous prefix committed zero units",
             },
@@ -539,10 +500,16 @@ impl PrefixCheckpointAggregator {
             committed_units,
             checkpoint_boundary,
         );
-        let findings_receipt =
-            FindingsCommitReceipt::new(finding_count, occurrence_count, observation_count);
-        let done_ledger_receipt =
-            DoneLedgerCommitReceipt::new(record_count, scanned_count, done_ledger_findings_count);
+        let findings_receipt = FindingsCommitReceipt::new(
+            totals.finding_count,
+            totals.occurrence_count,
+            totals.observation_count,
+        );
+        let done_ledger_receipt = DoneLedgerCommitReceipt::new(
+            totals.record_count,
+            totals.scanned_count,
+            totals.done_ledger_findings_count,
+        );
         let page = PageCommit::new(scope)
             .record_findings(findings_receipt)
             .record_done_ledger(done_ledger_receipt)
@@ -569,13 +536,7 @@ fn validate_receipt(
     let sequence_no = receipt.completed_unit().sequence_no();
     let scope = receipt.durable().scope();
 
-    let actual_write_context = WriteContext::new(
-        scope.tenant_id(),
-        scope.policy_hash(),
-        scope.run_id(),
-        scope.shard_id(),
-        scope.fence_epoch(),
-    );
+    let actual_write_context = scope.write_context();
     if actual_write_context != write_context {
         return Err(PrefixCheckpointError::OwnershipMismatch {
             sequence_no,
@@ -615,6 +576,73 @@ fn strip_checkpoint_token(boundary: &CheckpointBoundary) -> Option<CheckpointBou
         CheckpointBoundary::OrderedContent(_) => CheckpointBoundary::ordered_content(cursor),
         CheckpointBoundary::RepoFrontier(_) => CheckpointBoundary::repo_frontier(cursor),
     })
+}
+
+/// Running totals accumulated across receipts in a contiguous prefix.
+#[derive(Default)]
+struct Totals {
+    finding_count: u64,
+    occurrence_count: u64,
+    observation_count: u64,
+    record_count: u64,
+    scanned_count: u64,
+    done_ledger_findings_count: u64,
+    committed_units: u64,
+}
+
+impl Totals {
+    fn accumulate(
+        &mut self,
+        receipt: &UnitCommitReceipt,
+        sequence_no: u64,
+    ) -> Result<(), PrefixCheckpointError> {
+        let findings = receipt.durable().findings();
+        self.finding_count = checked_add(
+            self.finding_count,
+            findings.finding_count(),
+            sequence_no,
+            "finding_count",
+        )?;
+        self.occurrence_count = checked_add(
+            self.occurrence_count,
+            findings.occurrence_count(),
+            sequence_no,
+            "occurrence_count",
+        )?;
+        self.observation_count = checked_add(
+            self.observation_count,
+            findings.observation_count(),
+            sequence_no,
+            "observation_count",
+        )?;
+
+        let done_ledger = receipt.durable().done_ledger();
+        self.record_count = checked_add(
+            self.record_count,
+            done_ledger.record_count(),
+            sequence_no,
+            "record_count",
+        )?;
+        self.scanned_count = checked_add(
+            self.scanned_count,
+            done_ledger.scanned_count(),
+            sequence_no,
+            "scanned_count",
+        )?;
+        self.done_ledger_findings_count = checked_add(
+            self.done_ledger_findings_count,
+            done_ledger.findings_count(),
+            sequence_no,
+            "done_ledger_findings_count",
+        )?;
+        self.committed_units = checked_add(
+            self.committed_units,
+            receipt.durable().scope().committed_units().get(),
+            sequence_no,
+            "committed_units",
+        )?;
+        Ok(())
+    }
 }
 
 fn checked_add(
@@ -1619,6 +1647,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn receipts_beyond_prefix_survive_acknowledge() {
+        let wc = write_context(0xF2);
+        let mut agg = PrefixCheckpointAggregator::new(wc, 0);
+
+        // Buffer contiguous [0,1] plus non-contiguous [5,6].
+        agg.record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 1, cursor_without_token(b'b'), 2))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 5, cursor_without_token(b'f'), 3))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 6, cursor_without_token(b'g'), 4))
+            .unwrap();
+        assert_eq!(agg.buffered_receipt_count(), 4);
+
+        // Prepare and acknowledge prefix [0,1].
+        let pending = agg.prepare_checkpoint().unwrap().unwrap().clone();
+        assert_eq!(pending.last_sequence_no(), 1);
+        agg.acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            pending.scope().clone(),
+            LogicalTime::from_raw(1),
+        ))
+        .unwrap();
+
+        // Receipts 5 and 6 survive the split_off.
+        assert_eq!(agg.next_sequence_no(), 2);
+        assert_eq!(agg.buffered_receipt_count(), 2);
+
+        // No contiguous prefix yet (gap at 2,3,4).
+        assert!(agg.prepare_checkpoint().unwrap().is_none());
+
+        // Close the gap — full prefix [2..6] available.
+        agg.record_receipt(ordered_input(wc, 2, cursor_without_token(b'c'), 5))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 3, cursor_without_token(b'd'), 6))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 4, cursor_without_token(b'e'), 7))
+            .unwrap();
+
+        let pending2 = agg.prepare_checkpoint().unwrap().unwrap();
+        assert_eq!(pending2.first_sequence_no(), 2);
+        assert_eq!(pending2.last_sequence_no(), 6);
+        assert_eq!(pending2.committed_units(), 5);
+    }
+
     // `ReceiptBoundaryMismatch` is structurally unreachable: `UnitCommitReceipt::new`
     // validates that the completed-unit boundary matches the durable scope boundary
     // before the receipt can be constructed. No public API bypasses this check.
@@ -1627,4 +1701,49 @@ mod tests {
     // construction: every per-unit receipt has record_count == committed_units == 1
     // (enforced by `PageCommit::record_done_ledger`), so the aggregate always
     // satisfies record_count == committed_units.
+
+    // `InternalInconsistency` is structurally unreachable: every per-unit
+    // receipt has `committed_units() == 1` (enforced by `validate_receipt`),
+    // so `NonZeroU64::new(committed_units)` on the aggregate always succeeds
+    // for a non-empty contiguous prefix.
+
+    #[test]
+    fn error_display_messages_are_meaningful() {
+        let err = PrefixCheckpointError::CountOverflow {
+            sequence_no: Some(42),
+            field: "finding_count",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("finding_count"));
+        assert!(msg.contains("42"));
+
+        let err_none = PrefixCheckpointError::CountOverflow {
+            sequence_no: None,
+            field: "next_sequence_no",
+        };
+        let msg_none = err_none.to_string();
+        assert!(msg_none.contains("next_sequence_no"));
+    }
+
+    #[test]
+    fn error_source_chains_for_wrapped_variants() {
+        let wc = write_context(0xF1);
+        let mut agg = PrefixCheckpointAggregator::new(wc, 0);
+        agg.record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
+            .unwrap();
+        agg.prepare_checkpoint().unwrap();
+
+        let wrong_scope = CommitScope::from_write_context(
+            wc,
+            NonZeroU64::new(1).unwrap(),
+            CheckpointBoundary::ordered_content(cursor_without_token(b'z')),
+        );
+        let err = agg
+            .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+                wrong_scope,
+                LogicalTime::from_raw(1),
+            ))
+            .unwrap_err();
+        assert!(err.source().is_some());
+    }
 }

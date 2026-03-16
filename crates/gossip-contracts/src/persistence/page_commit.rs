@@ -319,6 +319,20 @@ impl CommitScope {
     pub fn checkpoint_cursor(&self) -> &Cursor {
         self.checkpoint_boundary.cursor()
     }
+
+    /// Reconstruct the shared write context from this scope's routing and
+    /// fencing fields.
+    #[inline]
+    #[must_use]
+    pub const fn write_context(&self) -> WriteContext {
+        WriteContext::new(
+            self.tenant_id,
+            self.policy_hash,
+            self.run_id,
+            self.shard_id,
+            self.fence_epoch,
+        )
+    }
 }
 
 /// Validation failures when advancing a page commit through its durable stages.
