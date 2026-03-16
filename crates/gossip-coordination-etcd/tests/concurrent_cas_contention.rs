@@ -361,6 +361,9 @@ impl WorkerHarness {
             Ok(_) => {
                 self.leases.remove(&key);
                 self.parked_hints.remove(&key.shard());
+                // Done shards are terminal; remove from acquire candidates
+                // so this worker stops targeting a dead shard.
+                self.known_shards.remove(&key.shard());
                 self.report.record_success("complete");
                 Ok(())
             }
