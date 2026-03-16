@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::Arc};
 
 use crate::{
     connector::Location,
@@ -152,9 +152,9 @@ fn observation_record_preserves_optional_location() {
         FenceEpoch::from_raw(8),
         LogicalTime::from_raw(9),
     )
-    .with_location(
+    .with_location(Arc::new(
         Location::try_new("repo/path".into(), Some("https://example.test".into())).unwrap(),
-    );
+    ));
 
     assert_eq!(observation.location().unwrap().display(), "repo/path");
 }
@@ -257,7 +257,7 @@ fn observation_record_from_persisted_rejects_mismatched_id() {
 fn from_persisted_preserves_location_metadata() {
     let location =
         Location::try_new("repo/path".into(), Some("https://example.test".into())).unwrap();
-    let record = make_observation_record(0x03).with_location(location.clone());
+    let record = make_observation_record(0x03).with_location(Arc::new(location.clone()));
 
     let rebuilt = ObservationRecord::from_persisted(
         record.tenant_id(),

@@ -167,6 +167,12 @@ impl ScanEngine for DuplicateDropEngine {
         "duplicate-drop"
     }
 
+    fn rule_fingerprint_bytes(&self, rule_id: u32) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_derive_key("gossip/rule/v1");
+        h.update(self.rule_name(rule_id).as_bytes());
+        *h.finalize().as_bytes()
+    }
+
     fn max_findings_per_chunk(&self) -> usize {
         4
     }

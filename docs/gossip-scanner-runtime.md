@@ -32,6 +32,7 @@ entrypoints share the same local runtime execution paths.
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
+| `src/result_translation.rs` | Deterministic translation from completed item results into persistence rows (findings, occurrences, observations, done-ledger) |
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
 | `src/lib_tests.rs` | Validation and local scan execution tests for the runtime core |
 | `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
@@ -78,8 +79,7 @@ Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
 
-The distributed entrypoint still returns `DistributedRuntimeError`, which
-wraps `ScanRuntimeError`.
+The distributed entrypoint returns `ScanRuntimeError` directly.
 
 ### Family split
 
@@ -244,7 +244,7 @@ distributed family path.
 
 ## Commit Sink Surface
 
-`src/commit_sink.rs` defines the local persistence-facing types used by the
+`src/commit_sink.rs` defines the scan-loop lifecycle sink used by the
 runtime:
 
 - `ItemMeta`
@@ -255,19 +255,61 @@ runtime:
 - `DurableCommitSink`
 
 `DurableCommitSink` is the bridge between scan-loop item lifecycle events
-and persisted identity derivation. It computes:
+and identity-chain recording for coordination diagnostics. It computes:
 
 - normalized secret hash input
 - tenant-scoped secret hash
-- finding ID
+- finding ID (using the rule-fingerprint resolver for position-independent rule identity)
 - occurrence ID
 
-The sink stores one `WriteContext` per shard-scoped runtime instance. It uses
-that shared scope when deriving tenant-bound finding identity and forwards the
-same context on every `CommitProgressRecord` and `IdentityChainRecord`.
+The sink stores one `WriteContext` per shard-scoped runtime instance and a
+rule-fingerprint resolver (`Arc<dyn Fn(u32) -> RuleFingerprint>`). It uses
+the shared scope when deriving tenant-bound finding identity and forwards the
+same context on every `CommitProgressRecord` and `IdentityChainRecord`. The
+rule-fingerprint resolver translates positional `rule_id` values into stable
+`RuleFingerprint` values derived from the rule name.
 
 When a source does not provide an explicit version, the sink derives a
 stable surrogate object version from the item-key bytes.
+
+The sink's compact `FindingRecord` and `FindingsBatch` types are local bridge
+shapes. They are not the persistence-layer `FindingRecord`,
+`OccurrenceRecord`, `ObservationRecord`, or `DoneLedgerRecord` types.
+
+---
+
+## Result Translation Surface
+
+`src/result_translation.rs` translates one completed `ScanItem` result into
+the persistence rows consumed by durable findings and done-ledger backends.
+The module owns:
+
+- `ScanTiming`
+- `ItemResult<'a>`
+- `PersistenceTranslation` (crate-visible constructor; only `translate_item_result` can build one)
+- `ResultTranslationError`
+- `translate_item_result`
+
+The translation is deterministic for its inputs. Stable item
+identity, version claim, write scope, tenant secret key, a rule-fingerprint
+resolver callback, and scan findings fully determine the resulting OVID,
+finding IDs, occurrence IDs, observation IDs, and done-ledger key.
+
+`translate_item_result` accepts a `&dyn Fn(u32) -> RuleFingerprint` callback
+that resolves positional `rule_id` values to stable, name-derived
+`RuleFingerprint` values. This decouples translation from compilation
+order: the same rule always maps to the same fingerprint regardless of its
+position in the rule list.
+
+Input order is preserved while each persistence layer is deduplicated by its
+own identity:
+
+- findings by `FindingId`
+- occurrences by `OccurrenceId`
+- observations by `ObservationId`
+
+The module validates the translated batch before returning so runtime callers
+only see observation-consistent, referentially closed persistence payloads.
 
 ---
 
@@ -318,7 +360,7 @@ pub struct ShardLease<A> {
 ```rust
 pub fn run_distributed(
     config: &DistributedRunConfig,
-) -> Result<DistributedRunReport, DistributedRuntimeError>
+) -> Result<DistributedRunReport, ScanRuntimeError>
 ```
 
 `ShardLease<A>` is the hand-off object from coordination into the worker loop.
@@ -344,6 +386,7 @@ The runtime tests focus on the behavior that exists today:
 - successful filesystem and git scans with custom rules
 - event forwarding for filesystem and git runtime entrypoints
 - commit forwarding for filesystem scans with persistence enabled
+- deterministic result translation into findings and done-ledger persistence rows
 - distributed placeholder error routing
 - CLI parsing and summary formatting
 - durable commit-sink identity derivation
@@ -361,6 +404,7 @@ that worker-loop API is fully wired.
 | Core runtime types and validation | `crates/gossip-scanner-runtime/src/lib.rs` |
 | CLI parsing and summary rendering | `crates/gossip-scanner-runtime/src/cli.rs` |
 | Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Deterministic result-to-persistence translation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Distributed family placeholders and lease metadata | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |

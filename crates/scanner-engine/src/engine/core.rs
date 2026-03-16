@@ -224,6 +224,17 @@ impl VectorscanCounters {
     }
 }
 
+/// Derive a stable 32-byte fingerprint from a rule name via BLAKE3 derive-key.
+///
+/// Uses the `"gossip/rule/v1"` domain constant for domain separation. This
+/// must produce the same bytes as `gossip_contracts::identity::derive_rule_fingerprint`
+/// so that fingerprints computed here match the contracts crate's `RuleFingerprint` type.
+fn derive_rule_name_fingerprint(name: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("gossip/rule/v1");
+    h.update(name.as_bytes());
+    *h.finalize().as_bytes()
+}
+
 // --------------------------
 // Engine
 // --------------------------
@@ -488,9 +499,11 @@ impl Engine {
                 char_class_gates.push(cc);
             }
             let min_confidence = derive_min_confidence(spec);
+            let fingerprint = derive_rule_name_fingerprint(spec.name);
             rules_compiled.push(rule);
             rules_cold.push(RuleCold {
                 name: spec.name,
+                fingerprint,
                 min_confidence,
             });
         }
@@ -2033,6 +2046,21 @@ impl Engine {
             .get(rule_id as usize)
             .map(|r| r.name)
             .unwrap_or("<unknown-rule>")
+    }
+
+    /// Returns the stable BLAKE3 fingerprint bytes for a rule.
+    ///
+    /// Precomputed during engine construction from the rule name via
+    /// BLAKE3 derive-key with the `"gossip/rule/v1"` domain constant.
+    /// Position-independent: the same rule name always produces the same
+    /// fingerprint regardless of its index in the rule list.
+    ///
+    /// Returns all-zeros if `rule_id` is out of bounds.
+    pub fn rule_fingerprint_bytes(&self, rule_id: u32) -> [u8; 32] {
+        self.rules_cold
+            .get(rule_id as usize)
+            .map(|r| r.fingerprint)
+            .unwrap_or([0u8; 32])
     }
 
     /// Returns the effective per-rule minimum confidence threshold.

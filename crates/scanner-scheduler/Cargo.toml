@@ -16,6 +16,7 @@ undocumented_unsafe_blocks = "warn"
 [dependencies]
 scanner-engine.workspace = true
 gossip-stdx.workspace = true
+blake3 = "1.5"
 bzip2 = "0.5"
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"

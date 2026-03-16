@@ -590,11 +590,12 @@ fn merge_observations(
     );
 
     // Location fallback chain: winner -> existing -> incoming.
+    // Uses Arc::clone instead of cloning the underlying String fields.
     if let Some(location) = provenance_source
-        .location()
+        .location_arc()
+        .or_else(|| existing.location_arc())
+        .or_else(|| incoming.location_arc())
         .cloned()
-        .or_else(|| existing.location().cloned())
-        .or_else(|| incoming.location().cloned())
     {
         merged = merged.with_location(location);
     }
