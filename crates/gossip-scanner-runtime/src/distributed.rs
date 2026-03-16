@@ -33,14 +33,14 @@ pub trait ShardLeaseAssignment {
 #[derive(Clone, Debug)]
 pub struct ShardLease<A> {
     /// String shard label used for routing recorder events.
-    pub shard_id: Arc<str>,
+    shard_id: Arc<str>,
     /// Scan assignment payload associated with this lease.
-    pub assignment: A,
+    assignment: A,
     /// Shared routing and fencing metadata for all writes emitted under the
     /// lease.
-    pub write_context: WriteContext,
+    write_context: WriteContext,
     /// Tenant secret key used for secret-hash derivation.
-    pub tenant_secret_key: TenantSecretKey,
+    tenant_secret_key: TenantSecretKey,
 }
 
 impl<A: ShardLeaseAssignment> ShardLease<A> {
@@ -53,7 +53,7 @@ impl<A: ShardLeaseAssignment> ShardLease<A> {
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
     ) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             assignment.policy_hash(),
             write_context.policy_hash(),
             "lease assignment policy_hash must match write_context.policy_hash"
@@ -65,6 +65,37 @@ impl<A: ShardLeaseAssignment> ShardLease<A> {
             write_context,
             tenant_secret_key,
         }
+    }
+}
+
+impl<A> ShardLease<A> {
+    /// String shard label used for routing recorder events.
+    #[inline]
+    #[must_use]
+    pub fn shard_id(&self) -> &str {
+        &self.shard_id
+    }
+
+    /// Scan assignment payload associated with this lease.
+    #[inline]
+    #[must_use]
+    pub fn assignment(&self) -> &A {
+        &self.assignment
+    }
+
+    /// Shared routing and fencing metadata for all writes emitted under the
+    /// lease.
+    #[inline]
+    #[must_use]
+    pub fn write_context(&self) -> WriteContext {
+        self.write_context
+    }
+
+    /// Tenant secret key used for secret-hash derivation.
+    #[inline]
+    #[must_use]
+    pub fn tenant_secret_key(&self) -> TenantSecretKey {
+        self.tenant_secret_key
     }
 }
 
@@ -90,7 +121,9 @@ where
     fn release_shard(&self, lease: &ShardLease<A>) -> Result<()>;
 
     /// Mark one lease complete with optional receipt-derived checkpoint
-    /// metadata.
+    /// metadata. The [`Cursor`] is the connector-layer owned cursor; the
+    /// coordinator adapter bridges it to `CursorUpdate` for the coordination
+    /// backend.
     fn complete_shard(
         &self,
         lease: &ShardLease<A>,
@@ -99,7 +132,7 @@ where
     ) -> Result<()>;
 
     /// Query done-ledger status before scanning a shard.
-    fn is_shard_done(&self, shard_id: &str) -> Result<bool>;
+    fn is_shard_done(&self, lease: &ShardLease<A>) -> Result<bool>;
 
     /// Persist done-ledger completion after successful scan.
     fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()>;
@@ -114,8 +147,10 @@ where
 /// that cheap, for example by cloning an `Arc` or a pool handle.
 #[derive(Clone)]
 pub struct DistributedPersistence<F, D> {
-    findings_sink: F,
-    done_ledger: D,
+    /// Findings sink handle cloned by the worker loop.
+    pub findings_sink: F,
+    /// Done-ledger handle cloned by the worker loop.
+    pub done_ledger: D,
 }
 
 impl<F, D> DistributedPersistence<F, D> {
@@ -127,18 +162,6 @@ impl<F, D> DistributedPersistence<F, D> {
             done_ledger,
         }
     }
-
-    /// Findings sink handle cloned by the worker loop.
-    #[must_use]
-    pub fn findings_sink(&self) -> &F {
-        &self.findings_sink
-    }
-
-    /// Done-ledger handle cloned by the worker loop.
-    #[must_use]
-    pub fn done_ledger(&self) -> &D {
-        &self.done_ledger
-    }
 }
 
 /// Runtime config for distributed scans.
@@ -146,7 +169,9 @@ impl<F, D> DistributedPersistence<F, D> {
 pub struct DistributedRuntimeConfig {
     /// Scan execution budget controls applied to every shard assignment.
     pub budgets: ScanBudgets,
-    /// Capacity of the bounded execution to commit queue.
+    /// Capacity of the bounded execution-to-commit queue. Matches the
+    /// [`CommitPipelineConfig`](crate::commit_pipeline::CommitPipelineConfig)
+    /// default.
     pub commit_queue_capacity: usize,
 }
 
@@ -248,18 +273,18 @@ mod tests {
             TenantSecretKey::from_bytes([0x33; 32]),
         );
 
-        assert_eq!(lease.shard_id.as_ref(), "shard-a");
-        assert_eq!(lease.assignment, assignment);
-        assert_eq!(lease.write_context, write_context);
+        assert_eq!(lease.shard_id(), "shard-a");
+        assert_eq!(*lease.assignment(), assignment);
+        assert_eq!(lease.write_context(), write_context);
         assert_eq!(
-            lease.tenant_secret_key,
+            lease.tenant_secret_key(),
             TenantSecretKey::from_bytes([0x33; 32])
         );
     }
 
     #[test]
     #[should_panic(expected = "lease assignment policy_hash must match write_context.policy_hash")]
-    fn shard_lease_debug_asserts_on_mismatched_policy_hash() {
+    fn shard_lease_panics_on_mismatched_policy_hash() {
         let write_context = WriteContext::new(
             TenantId::from_bytes([0x11; 32]),
             PolicyHash::from_bytes([0x22; 32]),
@@ -284,10 +309,10 @@ mod tests {
         let persistence = DistributedPersistence::new(StubFindings(1), StubDoneLedger(2));
         let cloned = persistence.clone();
 
-        assert_eq!(*persistence.findings_sink(), StubFindings(1));
-        assert_eq!(*persistence.done_ledger(), StubDoneLedger(2));
-        assert_eq!(*cloned.findings_sink(), StubFindings(1));
-        assert_eq!(*cloned.done_ledger(), StubDoneLedger(2));
+        assert_eq!(persistence.findings_sink, StubFindings(1));
+        assert_eq!(persistence.done_ledger, StubDoneLedger(2));
+        assert_eq!(cloned.findings_sink, StubFindings(1));
+        assert_eq!(cloned.done_ledger, StubDoneLedger(2));
     }
 
     #[test]

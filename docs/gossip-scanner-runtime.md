@@ -411,10 +411,10 @@ builds on.
 
 ```rust
 pub struct ShardLease<A> {
-    pub shard_id: Arc<str>,
-    pub assignment: A,
-    pub write_context: WriteContext,
-    pub tenant_secret_key: TenantSecretKey,
+    shard_id: Arc<str>,
+    assignment: A,
+    write_context: WriteContext,
+    tenant_secret_key: TenantSecretKey,
 }
 ```
 
@@ -431,7 +431,7 @@ where
         checkpoint: Option<Cursor>,
         report: ScanReport,
     ) -> anyhow::Result<()>;
-    fn is_shard_done(&self, shard_id: &str) -> anyhow::Result<bool>;
+    fn is_shard_done(&self, lease: &ShardLease<A>) -> anyhow::Result<bool>;
     fn mark_shard_done(&self, lease: &ShardLease<A>) -> anyhow::Result<()>;
     fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder>;
 }
@@ -447,7 +447,7 @@ pub struct DistributedRuntimeConfig {
 `ShardLease<A>` is the hand-off object from coordination into the worker loop.
 It keeps the string shard label used for recorder routing separate from the
 numeric shard identity carried inside `WriteContext`. Construction via
-`ShardLease::new` uses a debug assertion to require that the assignment and
+`ShardLease::new` asserts at construction that the assignment and
 write context agree on policy scope.
 
 `DistributedCoordinator<A>` defines the coordination callbacks the runtime
