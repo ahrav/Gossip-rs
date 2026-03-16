@@ -100,6 +100,10 @@ impl IdentityChainRecord {
         finding_id: [u8; 32],
         occurrence_id: [u8; 32],
     ) -> Self {
+        assert!(
+            end > start,
+            "identity chain record requires a non-empty span: start={start}, end={end}",
+        );
         Self {
             write_context,
             item_key,
@@ -142,7 +146,7 @@ impl IdentityChainRecord {
         self.start
     }
 
-    /// Byte offset of the finding end within the item.
+    /// Byte offset one past the finding end within the item.
     #[inline]
     #[must_use]
     pub fn end(&self) -> u64 {
@@ -279,5 +283,79 @@ impl GitEventOutput for CoordinationEventSink {
                 "recorder failed to persist git event; subsequent failures suppressed",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gossip_contracts::{
+        identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId},
+        persistence::WriteContext,
+    };
+
+    use super::IdentityChainRecord;
+
+    fn write_context() -> WriteContext {
+        WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x22; 32]),
+            RunId::from_raw(33),
+            ShardId::from_raw(44),
+            FenceEpoch::from_raw(55),
+        )
+    }
+
+    #[test]
+    fn identity_chain_record_round_trips_all_fields() {
+        let wc = write_context();
+        let item_key = b"test-item-key".to_vec();
+        let record = IdentityChainRecord::new(
+            wc,
+            item_key.clone(),
+            42,
+            100,
+            200,
+            -3,
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            [0x44; 32],
+        );
+
+        assert_eq!(record.write_context(), wc);
+        assert_eq!(record.item_key(), item_key.as_slice());
+        assert_eq!(record.rule_id(), 42);
+        assert_eq!(record.start(), 100);
+        assert_eq!(record.end(), 200);
+        assert_eq!(record.confidence_score(), -3);
+        assert_eq!(record.norm_hash(), &[0x11; 32]);
+        assert_eq!(record.secret_hash(), &[0x22; 32]);
+        assert_eq!(record.finding_id(), &[0x33; 32]);
+        assert_eq!(record.occurrence_id(), &[0x44; 32]);
+    }
+
+    #[test]
+    fn identity_chain_record_debug_redacts_hashes() {
+        let record = IdentityChainRecord::new(
+            write_context(),
+            b"item-key".to_vec(),
+            1,
+            10,
+            20,
+            5,
+            [0xDE; 32],
+            [0xDE; 32],
+            [0xAA; 32],
+            [0xBB; 32],
+        );
+        let debug = format!("{record:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug output must redact sensitive hashes, got: {debug}"
+        );
+        assert!(
+            !debug.contains("dede"),
+            "Debug output must not leak hash bytes, got: {debug}"
+        );
     }
 }

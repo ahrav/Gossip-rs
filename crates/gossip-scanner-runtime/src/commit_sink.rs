@@ -137,10 +137,9 @@ impl DurableCommitSink {
     }
 
     fn metadata_for_item(&self, item_key: &ItemKey) -> Result<ItemMeta> {
-        let guard = self
-            .in_flight_meta
-            .lock()
-            .map_err(|_| anyhow!("durable commit sink metadata lock poisoned"))?;
+        let guard = self.in_flight_meta.lock().map_err(|_| {
+            anyhow!("durable commit sink metadata lock poisoned during item lookup")
+        })?;
         guard
             .get(item_key.as_bytes())
             .cloned()
@@ -210,7 +209,7 @@ impl CommitSink for DurableCommitSink {
         let key_bytes = item_key.as_bytes().to_vec();
         self.in_flight_meta
             .lock()
-            .map_err(|_| anyhow!("durable commit sink metadata lock poisoned"))?
+            .map_err(|_| anyhow!("durable commit sink metadata lock poisoned during begin_item"))?
             .insert(key_bytes.clone(), meta.clone());
 
         self.recorder.record_commit_progress(
@@ -242,10 +241,16 @@ impl CommitSink for DurableCommitSink {
     }
 
     fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
-        self.in_flight_meta
+        let removed = self
+            .in_flight_meta
             .lock()
-            .map_err(|_| anyhow!("durable commit sink metadata lock poisoned"))?
+            .map_err(|_| anyhow!("durable commit sink metadata lock poisoned during finish_item"))?
             .remove(item_key.as_bytes());
+        if removed.is_none() {
+            return Err(anyhow!(
+                "finish_item called for item that was never started or already finished"
+            ));
+        }
 
         self.recorder.record_commit_progress(
             &self.recorder_shard_label,
@@ -651,6 +656,102 @@ mod tests {
             "no identity records should be produced when batch contains an invalid finding — \
              found {} partial records from valid findings that preceded the invalid one",
             identity.len(),
+        );
+    }
+
+    #[test]
+    fn finish_without_begin_is_rejected() {
+        let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-f"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"never-started").expect("item key");
+        let err = sink.finish_item(&item_key).unwrap_err();
+        assert!(
+            err.to_string().contains("never"),
+            "expected lifecycle error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn finding_record_debug_redacts_norm_hash() {
+        let record = FindingRecord {
+            rule_id: 1,
+            start: 0,
+            end: 10,
+            norm_hash: [0xDE; 32],
+            confidence_score: 5,
+        };
+        let debug = format!("{record:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug output must redact norm_hash, got: {debug}"
+        );
+        assert!(
+            !debug.contains("dede"),
+            "Debug output must not leak norm_hash bytes, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn upsert_after_finish_is_rejected() {
+        let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-u"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"item-1").expect("item key");
+        sink.begin_item(
+            &item_key,
+            &ItemMeta {
+                stable_item_id: StableItemId::from_bytes([0x33; 32]),
+                version: None,
+                size_hint: None,
+            },
+        )
+        .expect("begin item");
+        sink.finish_item(&item_key).expect("finish item");
+
+        let err = sink
+            .upsert_findings(
+                &item_key,
+                &FindingsBatch {
+                    findings: vec![FindingRecord {
+                        rule_id: 1,
+                        start: 0,
+                        end: 10,
+                        norm_hash: [0xAA; 32],
+                        confidence_score: 5,
+                    }],
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("before begin_item"),
+            "expected lifecycle error, got: {err}"
         );
     }
 }
