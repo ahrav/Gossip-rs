@@ -364,12 +364,12 @@ which downstream IDs are invalidated when a given constant changes:
 
 | Changed Constant    | Directly Invalidated | Transitively Invalidated                  |
 | ------------------- | -------------------- | ----------------------------------------- |
-| `RULE_FINGERPRINT_V1` | `RuleFingerprint`  | `FindingId` → `OccurrenceId`              |
-| `ITEM_ID_V1`        | `StableItemId`       | `FindingId` → `OccurrenceId`              |
-| `OBJECT_VERSION_V1` | `ObjectVersionId`    | `OccurrenceId`                            |
-| `SECRET_HASH_V1`    | `SecretHash`         | `FindingId` → `OccurrenceId`              |
-| `FINDING_ID_V1`     | `FindingId`          | `OccurrenceId`                            |
-| `OCCURRENCE_ID_V1`  | `OccurrenceId`       | (leaf)                                    |
+| `RULE_FINGERPRINT_V1` | `RuleFingerprint`  | `FindingId` → `OccurrenceId` → `ObservationId` |
+| `ITEM_ID_V1`        | `StableItemId`       | `FindingId` → `OccurrenceId` → `ObservationId` |
+| `OBJECT_VERSION_V1` | `ObjectVersionId`    | `OccurrenceId` → `ObservationId`          |
+| `SECRET_HASH_V1`    | `SecretHash`         | `FindingId` → `OccurrenceId` → `ObservationId` |
+| `FINDING_ID_V1`     | `FindingId`          | `OccurrenceId` → `ObservationId`          |
+| `OCCURRENCE_ID_V1`  | `OccurrenceId`       | `ObservationId`                           |
 | `POLICY_HASH_V2`    | `PolicyHash`         | (independent — triggers rescan via RunId) |
 
 ### Dual-version coexistence
