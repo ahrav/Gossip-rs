@@ -8,8 +8,8 @@
 - typed scan configuration for filesystem and git entrypoints
 - CLI parsing and summary rendering
 - path and budget validation before runtime execution
-- owned report, checkpoint, cancellation, commit-model, commit-sink, and
-  coordination-recorder types
+- owned report, checkpoint, cancellation, commit-model, checkpoint-aggregator,
+  commit-sink, and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
 - distributed runtime placeholder nouns for future worker-loop wiring
 
@@ -26,6 +26,7 @@ entrypoints share the same local runtime execution paths.
 | `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime` |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
+| `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink that stamps one shared `WriteContext` onto emitted records |
 | `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing, including write-scoped progress and identity-chain records |
 | `src/distributed.rs` | Distributed runtime family placeholders, `ShardLease<A>`, and shared config/report types |
@@ -225,6 +226,15 @@ future runtime commit stages build on:
 - `CheckpointAggregatorInput` wraps only durable unit receipts so the future
   checkpoint stage never consumes raw scan completion signals.
 
+`src/checkpoint_aggregator.rs` implements the next stage in that pipeline. It
+keeps a shard-local reorder buffer keyed by completed-unit sequence number,
+prepares only the highest contiguous durable prefix, normalizes checkpoint
+boundaries to key-only durable progress, and waits for a matching
+`CheckpointCommitReceipt` before it releases buffered receipts and advances the
+authoritative checkpoint floor. Durable checkpoint boundaries carry only the
+item key, not the connector resume token, because tokens are ephemeral and not
+stable across process restarts.
+
 ### ScanRuntimeError
 
 The runtime error surface has six current categories:
@@ -411,4 +421,5 @@ that worker-loop API is fully wired.
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |
 | Frozen runtime commit vocabulary | `crates/gossip-scanner-runtime/src/commit_model.rs` |
+| Receipt-driven prefix checkpoint aggregation | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` |
 | JSONL parity helpers | `crates/gossip-scanner-runtime/src/parity.rs` |
