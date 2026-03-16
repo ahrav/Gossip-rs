@@ -304,13 +304,14 @@ jobs:
           --features test-support
           --profile ci
 
-      - name: Run etcd integration tests (ignored, needs service container)
+      - name: Run etcd ignored tests (differential oracle, needs service container)
         run: >-
           cargo nextest run
           -p gossip-coordination-etcd
           --features test-support
           --run-ignored ignored-only
           --profile ci
+          -E 'test(differential_oracle)'
 
       - name: Run etcd integration tests (release)
         if: github.event_name == 'schedule'
@@ -321,7 +322,7 @@ jobs:
           --release
           --profile nightly
 
-      - name: Run etcd integration tests (release, ignored)
+      - name: Run all etcd ignored tests (release, nightly)
         if: github.event_name == 'schedule'
         run: >-
           cargo nextest run
