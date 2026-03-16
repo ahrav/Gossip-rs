@@ -109,6 +109,14 @@ pub enum PrefixCheckpointError {
     ConflictingReceiptForSequence { sequence_no: u64 },
     /// The contiguous prefix would move the checkpoint boundary backwards.
     BoundaryRegression { sequence_no: u64 },
+    /// Ordered-content mode requires strictly increasing keys at checkpoint
+    /// unit boundaries. Equal keys would cause tokenless resume (which uses
+    /// strictly-greater-than semantics) to skip items.
+    OrderedContentEqualKey { sequence_no: u64 },
+    /// The reorder buffer has reached its configured capacity. The caller
+    /// should drain the buffer by acknowledging a pending checkpoint before
+    /// submitting more receipts.
+    BufferFull { buffered: usize, capacity: usize },
     /// A `u64` counter overflowed during prefix aggregation or acknowledgement.
     CountOverflow {
         sequence_no: Option<u64>,
@@ -162,6 +170,16 @@ impl fmt::Display for PrefixCheckpointError {
                 f,
                 "checkpoint boundary regressed while aggregating sequence {sequence_no}"
             ),
+            Self::OrderedContentEqualKey { sequence_no } => write!(
+                f,
+                "ordered-content checkpoint key at sequence {sequence_no} equals the previous \
+                 key; strictly increasing keys are required for safe tokenless resume"
+            ),
+            Self::BufferFull { buffered, capacity } => write!(
+                f,
+                "reorder buffer is full ({buffered}/{capacity}); acknowledge a pending \
+                 checkpoint to drain buffered receipts"
+            ),
             Self::CountOverflow {
                 sequence_no: Some(seq),
                 field,
@@ -203,6 +221,8 @@ impl Error for PrefixCheckpointError {
             | Self::BoundaryKindMismatch { .. }
             | Self::ConflictingReceiptForSequence { .. }
             | Self::BoundaryRegression { .. }
+            | Self::OrderedContentEqualKey { .. }
+            | Self::BufferFull { .. }
             | Self::CountOverflow { .. }
             | Self::NoPendingCheckpoint
             | Self::InternalInconsistency { .. } => None,
@@ -216,6 +236,7 @@ pub struct PrefixCheckpointAggregator {
     write_context: WriteContext,
     next_sequence_no: u64,
     checkpointed_units: u64,
+    max_buffered: usize,
     boundary_kind: Option<CheckpointBoundaryKind>,
     last_checkpoint_key: Option<ItemKey>,
     receipts: BTreeMap<u64, UnitCommitReceipt>,
@@ -224,12 +245,18 @@ pub struct PrefixCheckpointAggregator {
 
 impl PrefixCheckpointAggregator {
     /// Construct a fresh aggregator starting at `next_sequence_no`.
+    ///
+    /// `max_buffered` sets the maximum number of out-of-order receipts the
+    /// reorder buffer will hold before returning [`PrefixCheckpointError::BufferFull`].
+    /// A value of `0` rejects all receipts; callers should choose a capacity
+    /// that matches the per-shard in-flight window.
     #[must_use]
-    pub fn new(write_context: WriteContext, next_sequence_no: u64) -> Self {
+    pub fn new(write_context: WriteContext, next_sequence_no: u64, max_buffered: usize) -> Self {
         Self {
             write_context,
             next_sequence_no,
             checkpointed_units: 0,
+            max_buffered,
             boundary_kind: None,
             last_checkpoint_key: None,
             receipts: BTreeMap::new(),
@@ -272,6 +299,13 @@ impl PrefixCheckpointAggregator {
         self.receipts.len()
     }
 
+    /// Configured maximum number of receipts the reorder buffer will hold.
+    #[inline]
+    #[must_use]
+    pub const fn buffer_capacity(&self) -> usize {
+        self.max_buffered
+    }
+
     /// Currently prepared checkpoint prefix, if any.
     #[inline]
     #[must_use]
@@ -295,15 +329,15 @@ impl PrefixCheckpointAggregator {
     /// sequence are ignored only if they are structurally identical (by
     /// `PartialEq`) to the buffered one.
     ///
-    /// The reorder buffer grows without bound until a contiguous prefix
-    /// forms and is acknowledged. Callers that control receipt submission
-    /// rate should bound the gap between `next_sequence_no` and the highest
-    /// buffered sequence externally.
+    /// The reorder buffer is bounded by `max_buffered` (set at construction).
+    /// When a new receipt would exceed this capacity, `BufferFull` is returned.
+    /// Acknowledging a pending checkpoint drains buffered receipts and
+    /// re-enables insertion.
     ///
     /// # Errors
     ///
     /// Returns [`PrefixCheckpointError`] when the incoming receipt violates the
-    /// checkpoint aggregation contract.
+    /// checkpoint aggregation contract or when the buffer is full.
     pub fn record_receipt(
         &mut self,
         input: CheckpointAggregatorInput,
@@ -327,8 +361,15 @@ impl PrefixCheckpointAggregator {
             Some(_) => {}
         }
 
+        let len = self.receipts.len();
         match self.receipts.entry(sequence_no) {
             Entry::Vacant(slot) => {
+                if len >= self.max_buffered {
+                    return Err(PrefixCheckpointError::BufferFull {
+                        buffered: len,
+                        capacity: self.max_buffered,
+                    });
+                }
                 slot.insert(receipt);
                 Ok(ReceiptRecordOutcome::Buffered)
             }
@@ -352,12 +393,9 @@ impl PrefixCheckpointAggregator {
             return Ok(self.pending.as_ref());
         }
 
-        let Some(last_sequence_no) = self.contiguous_last_sequence_no() else {
-            return Ok(None);
-        };
-
-        let pending = self.build_pending_checkpoint(last_sequence_no)?;
-        self.pending = Some(pending);
+        if let Some(pending) = self.build_contiguous_prefix()? {
+            self.pending = Some(pending);
+        }
         Ok(self.pending.as_ref())
     }
 
@@ -433,63 +471,71 @@ impl PrefixCheckpointAggregator {
         Ok(checkpointed.into_page_commit_receipt())
     }
 
-    fn contiguous_last_sequence_no(&self) -> Option<u64> {
-        let mut expected = self.next_sequence_no;
-        let mut last = None;
-
-        for (&key, _) in self.receipts.range(expected..) {
-            if key != expected {
-                break;
-            }
-            last = Some(key);
-            let Some(next) = expected.checked_add(1) else {
-                break;
-            };
-            expected = next;
-        }
-
-        last
-    }
-
-    fn build_pending_checkpoint(
+    /// Single-pass contiguous prefix discovery and construction.
+    ///
+    /// Iterates the reorder buffer once from `next_sequence_no`, verifying
+    /// contiguity, enforcing boundary monotonicity, and accumulating totals
+    /// in a single traversal.
+    fn build_contiguous_prefix(
         &self,
-        last_sequence_no: u64,
-    ) -> Result<PendingPrefixCheckpoint, PrefixCheckpointError> {
+    ) -> Result<Option<PendingPrefixCheckpoint>, PrefixCheckpointError> {
         let first_sequence_no = self.next_sequence_no;
-
+        let mut expected = first_sequence_no;
         let mut previous_key: Option<&ItemKey> = self.last_checkpoint_key.as_ref();
         let mut totals = Totals::default();
+        let mut last_sequence_no = None;
+        let mut last_boundary: Option<&CheckpointBoundary> = None;
 
-        for (&sequence_no, receipt) in self.receipts.range(first_sequence_no..=last_sequence_no) {
+        for (&sequence_no, receipt) in self.receipts.range(expected..) {
+            if sequence_no != expected {
+                break;
+            }
+
             let current_key = receipt
                 .completed_unit()
                 .checkpoint_cursor()
                 .last_key()
                 .ok_or(PrefixCheckpointError::MissingProgressKey { sequence_no })?;
 
-            // Non-strict comparison: equal keys are valid for repo-frontier
-            // mode where multiple units can share the same ItemKey.
-            if let Some(prev) = previous_key
-                && current_key < prev
-            {
-                return Err(PrefixCheckpointError::BoundaryRegression { sequence_no });
+            if let Some(prev) = previous_key {
+                if current_key < prev {
+                    return Err(PrefixCheckpointError::BoundaryRegression { sequence_no });
+                }
+                // Ordered-content requires strictly increasing keys at
+                // checkpoint unit boundaries. Tokenless resume uses
+                // strictly-greater-than semantics, so equal keys would
+                // cause items to be skipped on recovery. Repo-frontier
+                // allows equal keys because multiple units can share the
+                // same ItemKey.
+                if current_key == prev
+                    && self.boundary_kind == Some(CheckpointBoundaryKind::OrderedContent)
+                {
+                    return Err(PrefixCheckpointError::OrderedContentEqualKey { sequence_no });
+                }
             }
             previous_key = Some(current_key);
 
             totals.accumulate(receipt, sequence_no)?;
+            last_sequence_no = Some(sequence_no);
+            last_boundary = Some(receipt.completed_unit().checkpoint_boundary());
+
+            let Some(next) = expected.checked_add(1) else {
+                break;
+            };
+            expected = next;
         }
 
-        let last_receipt = self.receipts.get(&last_sequence_no).ok_or(
-            PrefixCheckpointError::InternalInconsistency {
-                detail: "contiguous prefix must contain last sequence",
-            },
-        )?;
-        let checkpoint_boundary = strip_checkpoint_token(
-            last_receipt.completed_unit().checkpoint_boundary(),
-        )
-        .ok_or(PrefixCheckpointError::MissingProgressKey {
-            sequence_no: last_sequence_no,
-        })?;
+        let Some(last_seq) = last_sequence_no else {
+            return Ok(None);
+        };
+        // `last_boundary` is always `Some` when `last_sequence_no` is `Some`
+        // because both are set in the same loop iteration.
+        let boundary = last_boundary.expect("set in the same iteration as last_sequence_no");
+
+        let checkpoint_boundary =
+            strip_checkpoint_token(boundary).ok_or(PrefixCheckpointError::MissingProgressKey {
+                sequence_no: last_seq,
+            })?;
         let committed_units = NonZeroU64::new(totals.committed_units).ok_or(
             PrefixCheckpointError::InternalInconsistency {
                 detail: "non-empty contiguous prefix committed zero units",
@@ -515,11 +561,11 @@ impl PrefixCheckpointAggregator {
             .record_done_ledger(done_ledger_receipt)
             .map_err(PrefixCheckpointError::InvalidPreparedCheckpoint)?;
 
-        Ok(PendingPrefixCheckpoint {
+        Ok(Some(PendingPrefixCheckpoint {
             first_sequence_no,
-            last_sequence_no,
+            last_sequence_no: last_seq,
             page,
-        })
+        }))
     }
 }
 
@@ -673,6 +719,17 @@ mod tests {
 
     use crate::commit_model::CompletedUnit;
 
+    /// Default buffer capacity for tests. Large enough that existing tests
+    /// never hit the limit unless testing capacity behavior explicitly.
+    const TEST_CAPACITY: usize = 64;
+
+    fn test_aggregator(
+        write_context: WriteContext,
+        next_sequence_no: u64,
+    ) -> PrefixCheckpointAggregator {
+        PrefixCheckpointAggregator::new(write_context, next_sequence_no, TEST_CAPACITY)
+    }
+
     fn item_key(byte: u8) -> ItemKey {
         ItemKey::try_from_slice(&[byte]).expect("item key")
     }
@@ -769,7 +826,7 @@ mod tests {
     #[test]
     fn prefix_checkpoint_waits_for_contiguous_receipts() {
         let write_context = write_context(0x11);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 10);
+        let mut aggregator = test_aggregator(write_context, 10);
 
         assert_eq!(
             aggregator
@@ -848,7 +905,7 @@ mod tests {
     #[test]
     fn prepare_checkpoint_returns_none_without_next_receipt() {
         let write_context = write_context(0x12);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 3);
+        let mut aggregator = test_aggregator(write_context, 3);
 
         aggregator
             .record_receipt(ordered_input(
@@ -867,7 +924,7 @@ mod tests {
     #[test]
     fn prefix_commit_drops_resume_token_but_preserves_last_key() {
         let write_context = write_context(0x22);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         aggregator
             .record_receipt(ordered_input(
@@ -889,7 +946,7 @@ mod tests {
     #[test]
     fn duplicate_and_already_checkpointed_receipts_are_idempotent() {
         let write_context = write_context(0x33);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
         let receipt = ordered_input(write_context, 0, cursor_without_token(b'a'), 1);
 
         assert_eq!(
@@ -918,7 +975,7 @@ mod tests {
     #[test]
     fn conflicting_duplicate_sequence_is_rejected() {
         let write_context = write_context(0x44);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 1);
+        let mut aggregator = test_aggregator(write_context, 1);
 
         aggregator
             .record_receipt(ordered_input(
@@ -948,7 +1005,7 @@ mod tests {
     fn mismatched_write_scope_is_rejected() {
         let expected = write_context(0x55);
         let actual = write_context(0x56);
-        let mut aggregator = PrefixCheckpointAggregator::new(expected, 0);
+        let mut aggregator = test_aggregator(expected, 0);
 
         let error = aggregator
             .record_receipt(ordered_input(actual, 0, cursor_without_token(b'a'), 1))
@@ -967,7 +1024,7 @@ mod tests {
     #[test]
     fn checkpoint_scope_mismatch_keeps_pending_for_retry() {
         let write_context = write_context(0x66);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         aggregator
             .record_receipt(ordered_input(
@@ -1012,7 +1069,7 @@ mod tests {
 
     #[test]
     fn cannot_ack_checkpoint_without_pending_prefix() {
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context(0x77), 0);
+        let mut aggregator = test_aggregator(write_context(0x77), 0);
 
         let error = aggregator
             .acknowledge_checkpoint(CheckpointCommitReceipt::new(
@@ -1031,7 +1088,7 @@ mod tests {
     #[test]
     fn boundary_kind_is_frozen_from_first_receipt() {
         let write_context = write_context(0x88);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         aggregator
             .record_receipt(ordered_input(
@@ -1058,7 +1115,7 @@ mod tests {
     #[test]
     fn boundary_regression_is_rejected_when_building_prefix() {
         let write_context = write_context(0x99);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         aggregator
             .record_receipt(ordered_input(
@@ -1087,7 +1144,7 @@ mod tests {
     #[test]
     fn pending_prefix_does_not_widen_before_acknowledge() {
         let write_context = write_context(0xBC);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         aggregator
             .record_receipt(ordered_input(
@@ -1129,7 +1186,7 @@ mod tests {
     #[test]
     fn next_sequence_overflow_preserves_pending_prefix() {
         let write_context = write_context(0xCD);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, u64::MAX);
+        let mut aggregator = test_aggregator(write_context, u64::MAX);
 
         aggregator
             .record_receipt(ordered_input(
@@ -1162,7 +1219,7 @@ mod tests {
     #[test]
     fn boundary_regression_detected_against_last_checkpointed_key() {
         let write_context = write_context(0xDA);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         // Checkpoint seq 0 with key 'z'.
         aggregator
@@ -1203,9 +1260,9 @@ mod tests {
     }
 
     #[test]
-    fn equal_keys_across_consecutive_sequences_are_permitted() {
+    fn ordered_content_rejects_equal_keys_within_prefix() {
         let write_context = write_context(0xDB);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         aggregator
             .record_receipt(ordered_input(
@@ -1224,10 +1281,33 @@ mod tests {
             ))
             .unwrap();
 
-        // The regression check uses strict `<`, so equal keys must be accepted.
+        // Ordered-content requires strictly increasing keys. Equal keys
+        // would cause tokenless resume (strictly-greater-than semantics)
+        // to skip items at the duplicated key position.
+        let error = aggregator.prepare_checkpoint().unwrap_err();
+        assert_eq!(
+            error,
+            PrefixCheckpointError::OrderedContentEqualKey { sequence_no: 1 }
+        );
+    }
+
+    #[test]
+    fn repo_frontier_permits_equal_keys_within_prefix() {
+        let write_context = write_context(0xDB);
+        let mut aggregator = test_aggregator(write_context, 0);
+
+        aggregator
+            .record_receipt(repo_input(write_context, 0, cursor_without_token(b'a'), 1))
+            .unwrap();
+        aggregator
+            .record_receipt(repo_input(write_context, 1, cursor_without_token(b'a'), 2))
+            .unwrap();
+
+        // Repo-frontier allows equal keys because multiple units can
+        // share the same ItemKey.
         let pending = aggregator
             .prepare_checkpoint()
-            .expect("equal keys must not be treated as regression")
+            .expect("equal keys must not be treated as regression for repo-frontier")
             .expect("contiguous prefix should be preparable");
 
         assert_eq!(pending.first_sequence_no(), 0);
@@ -1237,6 +1317,75 @@ mod tests {
             pending.checkpoint_cursor().last_key(),
             Some(&item_key(b'a'))
         );
+    }
+
+    #[test]
+    fn ordered_content_rejects_equal_key_across_checkpoint_boundary() {
+        let write_context = write_context(0xDB);
+        let mut aggregator = test_aggregator(write_context, 0);
+
+        // Checkpoint seq 0 with key 'a'.
+        aggregator
+            .record_receipt(ordered_input(
+                write_context,
+                0,
+                cursor_without_token(b'a'),
+                1,
+            ))
+            .unwrap();
+        let pending = aggregator.prepare_checkpoint().unwrap().unwrap().clone();
+        aggregator
+            .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+                pending.scope().clone(),
+                LogicalTime::from_raw(1),
+            ))
+            .unwrap();
+
+        // Buffer seq 1 with key 'a' — equal to the last checkpointed key.
+        aggregator
+            .record_receipt(ordered_input(
+                write_context,
+                1,
+                cursor_without_token(b'a'),
+                2,
+            ))
+            .unwrap();
+
+        let error = aggregator.prepare_checkpoint().unwrap_err();
+        assert_eq!(
+            error,
+            PrefixCheckpointError::OrderedContentEqualKey { sequence_no: 1 }
+        );
+    }
+
+    #[test]
+    fn repo_frontier_permits_equal_key_across_checkpoint_boundary() {
+        let write_context = write_context(0xDB);
+        let mut aggregator = test_aggregator(write_context, 0);
+
+        // Checkpoint seq 0 with key 'a'.
+        aggregator
+            .record_receipt(repo_input(write_context, 0, cursor_without_token(b'a'), 1))
+            .unwrap();
+        let pending = aggregator.prepare_checkpoint().unwrap().unwrap().clone();
+        aggregator
+            .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+                pending.scope().clone(),
+                LogicalTime::from_raw(1),
+            ))
+            .unwrap();
+
+        // Buffer seq 1 with key 'a' — equal to the last checkpointed key.
+        aggregator
+            .record_receipt(repo_input(write_context, 1, cursor_without_token(b'a'), 2))
+            .unwrap();
+
+        let pending = aggregator
+            .prepare_checkpoint()
+            .expect("repo-frontier allows equal keys across checkpoint boundaries")
+            .expect("contiguous prefix should be preparable");
+        assert_eq!(pending.first_sequence_no(), 1);
+        assert_eq!(pending.last_sequence_no(), 1);
     }
 
     #[test]
@@ -1250,6 +1399,7 @@ mod tests {
             write_context,
             next_sequence_no: 0,
             checkpointed_units: u64::MAX,
+            max_buffered: TEST_CAPACITY,
             boundary_kind: None,
             last_checkpoint_key: None,
             receipts: BTreeMap::new(),
@@ -1288,7 +1438,7 @@ mod tests {
     #[test]
     fn repo_frontier_lifecycle_prepare_and_acknowledge() {
         let write_context = write_context(0xDD);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         // Record two repo-frontier receipts out of sequence order.
         aggregator
@@ -1359,7 +1509,7 @@ mod tests {
     #[test]
     fn boundary_kind_freeze_is_symmetric() {
         let write_context = write_context(0xDE);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         // Pin RepoFrontier first.
         aggregator
@@ -1388,7 +1538,7 @@ mod tests {
     #[test]
     fn count_overflow_during_aggregation() {
         let write_context = write_context(0xE0);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         // First receipt with finding_count = u64::MAX.
         let r0 = aggregator_input(
@@ -1429,7 +1579,7 @@ mod tests {
     #[test]
     fn missing_progress_key_rejected() {
         let write_context = write_context(0xE1);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         let boundary = CheckpointBoundary::ordered_content(Cursor::initial());
         let scope = CommitScope::from_write_context(
@@ -1456,7 +1606,7 @@ mod tests {
     #[test]
     fn per_unit_receipt_expected() {
         let write_context = write_context(0xE2);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         let boundary = CheckpointBoundary::ordered_content(cursor_without_token(b'a'));
         let scope = CommitScope::from_write_context(
@@ -1486,7 +1636,7 @@ mod tests {
     #[test]
     fn prepare_checkpoint_returns_none_when_buffer_is_empty() {
         let write_context = write_context(0xE3);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         assert!(aggregator.prepare_checkpoint().unwrap().is_none());
         assert!(aggregator.pending_checkpoint().is_none());
@@ -1496,7 +1646,7 @@ mod tests {
     #[test]
     fn multi_round_acknowledge_carries_last_checkpoint_key() {
         let write_context = write_context(0xE4);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         // Round 1: checkpoint key 'a'.
         aggregator
@@ -1555,7 +1705,7 @@ mod tests {
     #[test]
     fn boundary_regression_preserves_aggregator_state() {
         let write_context = write_context(0xE5);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         aggregator
             .record_receipt(ordered_input(
@@ -1590,7 +1740,7 @@ mod tests {
     #[test]
     fn discard_pending_returns_and_clears_prepared_prefix() {
         let write_context = write_context(0xE6);
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0);
+        let mut aggregator = test_aggregator(write_context, 0);
 
         assert!(aggregator.discard_pending().is_none());
 
@@ -1624,7 +1774,7 @@ mod tests {
         // Simulate a resumed aggregator: `next_sequence_no > 0` but
         // `boundary_kind` is still `None` (the aggregator was freshly
         // constructed with a non-zero starting sequence).
-        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 5);
+        let mut aggregator = test_aggregator(write_context, 5);
         assert!(aggregator.checkpoint_boundary_kind().is_none());
 
         // A replayed receipt with sequence_no < next_sequence_no must be
@@ -1650,7 +1800,7 @@ mod tests {
     #[test]
     fn receipts_beyond_prefix_survive_acknowledge() {
         let wc = write_context(0xF2);
-        let mut agg = PrefixCheckpointAggregator::new(wc, 0);
+        let mut agg = test_aggregator(wc, 0);
 
         // Buffer contiguous [0,1] plus non-contiguous [5,6].
         agg.record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
@@ -1728,7 +1878,7 @@ mod tests {
     #[test]
     fn error_source_chains_for_wrapped_variants() {
         let wc = write_context(0xF1);
-        let mut agg = PrefixCheckpointAggregator::new(wc, 0);
+        let mut agg = test_aggregator(wc, 0);
         agg.record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
             .unwrap();
         agg.prepare_checkpoint().unwrap();
@@ -1745,5 +1895,126 @@ mod tests {
             ))
             .unwrap_err();
         assert!(err.source().is_some());
+    }
+
+    // --- Buffer capacity tests ---
+
+    #[test]
+    fn buffer_full_rejects_new_receipt_at_capacity() {
+        let wc = write_context(0xA0);
+        let mut agg = PrefixCheckpointAggregator::new(wc, 0, 2);
+        assert_eq!(agg.buffer_capacity(), 2);
+
+        agg.record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 1, cursor_without_token(b'b'), 2))
+            .unwrap();
+        assert_eq!(agg.buffered_receipt_count(), 2);
+
+        // Third receipt exceeds capacity.
+        let error = agg
+            .record_receipt(ordered_input(wc, 2, cursor_without_token(b'c'), 3))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            PrefixCheckpointError::BufferFull {
+                buffered: 2,
+                capacity: 2,
+            }
+        );
+        assert_eq!(agg.buffered_receipt_count(), 2);
+    }
+
+    #[test]
+    fn acknowledge_drains_buffer_and_re_enables_insertion() {
+        let wc = write_context(0xA1);
+        let mut agg = PrefixCheckpointAggregator::new(wc, 0, 2);
+
+        agg.record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 1, cursor_without_token(b'b'), 2))
+            .unwrap();
+
+        // Buffer is at capacity — acknowledge prefix [0,1] to drain.
+        let pending = agg.prepare_checkpoint().unwrap().unwrap().clone();
+        agg.acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            pending.scope().clone(),
+            LogicalTime::from_raw(1),
+        ))
+        .unwrap();
+        assert_eq!(agg.buffered_receipt_count(), 0);
+
+        // New receipts can now be accepted.
+        agg.record_receipt(ordered_input(wc, 2, cursor_without_token(b'c'), 3))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 3, cursor_without_token(b'd'), 4))
+            .unwrap();
+        assert_eq!(agg.buffered_receipt_count(), 2);
+    }
+
+    #[test]
+    fn buffer_full_does_not_reject_duplicates_or_already_checkpointed() {
+        let wc = write_context(0xA2);
+        let mut agg = PrefixCheckpointAggregator::new(wc, 0, 1);
+
+        let receipt = ordered_input(wc, 0, cursor_without_token(b'a'), 1);
+        agg.record_receipt(receipt.clone()).unwrap();
+        assert_eq!(agg.buffered_receipt_count(), 1);
+
+        // Duplicate of an existing buffered receipt bypasses the capacity check.
+        assert_eq!(
+            agg.record_receipt(receipt.clone()).unwrap(),
+            ReceiptRecordOutcome::DuplicateBuffered,
+        );
+
+        // Acknowledge to advance next_sequence_no.
+        let pending = agg.prepare_checkpoint().unwrap().unwrap().clone();
+        agg.acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            pending.scope().clone(),
+            LogicalTime::from_raw(1),
+        ))
+        .unwrap();
+
+        // Fill the buffer again.
+        agg.record_receipt(ordered_input(wc, 1, cursor_without_token(b'b'), 2))
+            .unwrap();
+        assert_eq!(agg.buffered_receipt_count(), 1);
+
+        // Already-checkpointed receipt bypasses the capacity check.
+        assert_eq!(
+            agg.record_receipt(receipt).unwrap(),
+            ReceiptRecordOutcome::AlreadyCheckpointed,
+        );
+    }
+
+    #[test]
+    fn buffer_full_does_not_corrupt_aggregator_state() {
+        let wc = write_context(0xA3);
+        // Start at next_sequence_no = 0, capacity = 2.
+        let mut agg = PrefixCheckpointAggregator::new(wc, 0, 2);
+
+        // Skip seq 0 (the gap), buffer seq 1 and seq 2.
+        agg.record_receipt(ordered_input(wc, 1, cursor_without_token(b'b'), 2))
+            .unwrap();
+        agg.record_receipt(ordered_input(wc, 2, cursor_without_token(b'c'), 3))
+            .unwrap();
+
+        // Buffer full — seq 3 rejected.
+        let error = agg
+            .record_receipt(ordered_input(wc, 3, cursor_without_token(b'd'), 4))
+            .unwrap_err();
+        assert!(matches!(error, PrefixCheckpointError::BufferFull { .. }));
+
+        // No contiguous prefix (gap at seq 0).
+        assert!(agg.prepare_checkpoint().unwrap().is_none());
+
+        // The gap-filling receipt (seq 0) is also rejected because the buffer
+        // is at capacity.
+        let error = agg
+            .record_receipt(ordered_input(wc, 0, cursor_without_token(b'a'), 1))
+            .unwrap_err();
+        assert!(matches!(error, PrefixCheckpointError::BufferFull { .. }));
+        assert_eq!(agg.buffered_receipt_count(), 2);
+        assert_eq!(agg.next_sequence_no(), 0);
     }
 }
