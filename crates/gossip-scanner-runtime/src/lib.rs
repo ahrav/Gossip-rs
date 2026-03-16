@@ -69,6 +69,7 @@ use scanner_scheduler::store::{
 pub mod checkpoint_aggregator;
 pub mod cli;
 pub mod commit_model;
+pub mod commit_pipeline;
 pub mod commit_sink;
 pub mod coordination_sink;
 pub mod distributed;

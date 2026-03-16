@@ -25,7 +25,9 @@ use gossip_contracts::{
 };
 
 use crate::{
-    commit_model::{BoundaryMismatchError, CommitRequest, CompletedUnit, UnitCommitReceipt},
+    commit_model::{
+        BoundaryMismatchError, CommitRequest, CompletedUnit, KindMismatchError, UnitCommitReceipt,
+    },
     result_translation::PersistenceTranslation,
 };
 
@@ -163,6 +165,13 @@ impl From<PersistenceInputError> for ResultCommitRequestError {
     }
 }
 
+/// Result of [`ResultCommitter::commit_translation`].
+///
+/// The caller retains ownership of the [`CompletedUnit`] and passes it by
+/// reference. On failure only the error is returned; the caller still holds
+/// the unit for attaching to a failure outcome.
+pub type TranslationCommitResult<F, D> = Result<UnitCommitReceipt, ResultCommitError<F, D>>;
+
 /// Immediate submit, wait, or validation failure while committing one runtime
 /// unit through findings -> done-ledger.
 #[derive(Debug)]
@@ -185,6 +194,9 @@ pub enum ResultCommitError<FindingsError, DoneLedgerError> {
     /// The durable receipt's checkpoint boundary did not match the completed
     /// unit's boundary.
     BoundaryMismatch(Box<BoundaryMismatchError>),
+    /// The durable receipt's checkpoint boundary kind did not match the
+    /// expected kind for this shard stream.
+    KindMismatch(KindMismatchError),
 }
 
 impl<FindingsError, DoneLedgerError> fmt::Display
@@ -204,6 +216,9 @@ where
                 f,
                 "boundary mismatch between completed unit and receipt: {err}"
             ),
+            Self::KindMismatch(err) => {
+                write!(f, "checkpoint boundary kind mismatch: {err}")
+            }
         }
     }
 }
@@ -220,6 +235,7 @@ where
             Self::DoneLedgerSubmit(err) => Some(err),
             Self::DoneLedgerAdvance(err) => Some(err),
             Self::BoundaryMismatch(err) => Some(err.as_ref()),
+            Self::KindMismatch(err) => Some(err),
         }
     }
 }
@@ -257,19 +273,31 @@ where
     /// Commit one translated item bundle without re-deriving IDs.
     ///
     /// This accepts pre-translated persistence rows directly instead of
-    /// re-deriving them inside the commit stage.
+    /// re-deriving them inside the commit stage. The caller retains ownership
+    /// of the [`CompletedUnit`]; the committer clones it internally when
+    /// building the [`CommitRequest`].
+    ///
+    /// Delegates to [`commit_item`](Self::commit_item) after constructing the
+    /// request, so validation, the findings -> done-ledger ordering, and
+    /// receipt creation share a single implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResultCommitError`] on any validation, findings-sink, or
+    /// done-ledger failure.
     pub fn commit_translation(
         &self,
         write_context: WriteContext,
-        completed_unit: CompletedUnit,
+        completed_unit: &CompletedUnit,
         translation: &PersistenceTranslation,
-    ) -> Result<UnitCommitReceipt, ResultCommitError<F::Error, D::Error>> {
+    ) -> TranslationCommitResult<F::Error, D::Error> {
         let request = CommitRequest::new(
             write_context,
-            completed_unit,
+            completed_unit.clone(),
             translation.findings_batch(),
             std::slice::from_ref(translation.done_ledger()),
         );
+
         self.commit_item(request)
     }
 
@@ -579,7 +607,7 @@ mod tests {
         let translation = translated_scan();
 
         let receipt = committer
-            .commit_translation(write_context(), completed_unit(1), &translation)
+            .commit_translation(write_context(), &completed_unit(1), &translation)
             .expect("commit should succeed");
 
         assert_eq!(
@@ -619,10 +647,10 @@ mod tests {
         let translation = translated_scan();
 
         let first = committer
-            .commit_translation(write_context(), completed_unit(2), &translation)
+            .commit_translation(write_context(), &completed_unit(2), &translation)
             .expect("first commit should succeed");
         let second = committer
-            .commit_translation(write_context(), completed_unit(2), &translation)
+            .commit_translation(write_context(), &completed_unit(2), &translation)
             .expect("retry should also succeed");
 
         assert_eq!(
@@ -662,7 +690,7 @@ mod tests {
         let translation = translated_scan();
 
         let worker = thread::spawn(move || {
-            committer.commit_translation(write_context(), completed_unit(3), &translation)
+            committer.commit_translation(write_context(), &completed_unit(3), &translation)
         });
 
         wait_until(|| findings_sink.pending_count().expect("pending count") == 1);
@@ -695,7 +723,7 @@ mod tests {
         let translation = translated_scan();
 
         let err = committer
-            .commit_translation(write_context(), completed_unit(4), &translation)
+            .commit_translation(write_context(), &completed_unit(4), &translation)
             .expect_err("findings submission should fail");
 
         match err {
@@ -719,7 +747,7 @@ mod tests {
         let translation = translated_scan();
 
         let err = committer
-            .commit_translation(write_context(), completed_unit(5), &translation)
+            .commit_translation(write_context(), &completed_unit(5), &translation)
             .expect_err("done-ledger commit should fail");
 
         match err {
@@ -783,7 +811,7 @@ mod tests {
         let translation = translated_clean_scan();
 
         let receipt = committer
-            .commit_translation(write_context(), completed_unit(7), &translation)
+            .commit_translation(write_context(), &completed_unit(7), &translation)
             .expect("clean commit should succeed");
 
         assert!(
@@ -810,7 +838,7 @@ mod tests {
         let translation = translated_scan();
 
         let err = committer
-            .commit_translation(write_context(), completed_unit(8), &translation)
+            .commit_translation(write_context(), &completed_unit(8), &translation)
             .expect_err("findings durability should fail");
 
         match err {
@@ -834,7 +862,7 @@ mod tests {
         let translation = translated_scan();
 
         let err = committer
-            .commit_translation(write_context(), completed_unit(9), &translation)
+            .commit_translation(write_context(), &completed_unit(9), &translation)
             .expect_err("done-ledger submission should fail");
 
         match err {
