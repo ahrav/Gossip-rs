@@ -55,26 +55,16 @@ pub enum CommitProgressRecord {
 /// downstream systems can verify the derivation chain.
 #[derive(Clone, PartialEq, Eq)]
 pub struct IdentityChainRecord {
-    /// Shared routing and fencing metadata for the emitted write.
-    pub write_context: WriteContext,
-    /// Connector-provided item key (e.g. file path bytes).
-    pub item_key: Vec<u8>,
-    /// Numeric rule identifier that matched.
-    pub rule_id: u32,
-    /// Byte offset of the finding start within the item.
-    pub start: u64,
-    /// Byte offset of the finding end within the item.
-    pub end: u64,
-    /// Engine-assigned confidence score for this finding.
-    pub confidence_score: i8,
-    /// Normalised hash of the secret value.
-    pub norm_hash: [u8; 32],
-    /// Tenant-scoped secret hash derived from `norm_hash`.
-    pub secret_hash: [u8; 32],
-    /// Stable finding identifier derived from tenant, item, rule, and secret.
-    pub finding_id: [u8; 32],
-    /// Version-specific occurrence identifier.
-    pub occurrence_id: [u8; 32],
+    write_context: WriteContext,
+    item_key: Vec<u8>,
+    rule_id: u32,
+    start: u64,
+    end: u64,
+    confidence_score: i8,
+    norm_hash: [u8; 32],
+    secret_hash: [u8; 32],
+    finding_id: [u8; 32],
+    occurrence_id: [u8; 32],
 }
 
 impl fmt::Debug for IdentityChainRecord {
@@ -91,6 +81,107 @@ impl fmt::Debug for IdentityChainRecord {
             .field("finding_id", &self.finding_id)
             .field("occurrence_id", &self.occurrence_id)
             .finish()
+    }
+}
+
+impl IdentityChainRecord {
+    /// Construct an identity chain record from all component fields.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        write_context: WriteContext,
+        item_key: Vec<u8>,
+        rule_id: u32,
+        start: u64,
+        end: u64,
+        confidence_score: i8,
+        norm_hash: [u8; 32],
+        secret_hash: [u8; 32],
+        finding_id: [u8; 32],
+        occurrence_id: [u8; 32],
+    ) -> Self {
+        Self {
+            write_context,
+            item_key,
+            rule_id,
+            start,
+            end,
+            confidence_score,
+            norm_hash,
+            secret_hash,
+            finding_id,
+            occurrence_id,
+        }
+    }
+
+    /// Shared routing and fencing metadata for the emitted write.
+    #[inline]
+    #[must_use]
+    pub fn write_context(&self) -> WriteContext {
+        self.write_context
+    }
+
+    /// Connector-provided item key (e.g. file path bytes).
+    #[inline]
+    #[must_use]
+    pub fn item_key(&self) -> &[u8] {
+        &self.item_key
+    }
+
+    /// Numeric rule identifier that matched.
+    #[inline]
+    #[must_use]
+    pub fn rule_id(&self) -> u32 {
+        self.rule_id
+    }
+
+    /// Byte offset of the finding start within the item.
+    #[inline]
+    #[must_use]
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// Byte offset of the finding end within the item.
+    #[inline]
+    #[must_use]
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// Engine-assigned confidence score for this finding.
+    #[inline]
+    #[must_use]
+    pub fn confidence_score(&self) -> i8 {
+        self.confidence_score
+    }
+
+    /// Normalised hash of the secret value.
+    #[inline]
+    #[must_use]
+    pub fn norm_hash(&self) -> &[u8; 32] {
+        &self.norm_hash
+    }
+
+    /// Tenant-scoped secret hash derived from `norm_hash`.
+    #[inline]
+    #[must_use]
+    pub fn secret_hash(&self) -> &[u8; 32] {
+        &self.secret_hash
+    }
+
+    /// Stable finding identifier derived from tenant, item, rule, and secret.
+    #[inline]
+    #[must_use]
+    pub fn finding_id(&self) -> &[u8; 32] {
+        &self.finding_id
+    }
+
+    /// Version-specific occurrence identifier.
+    #[inline]
+    #[must_use]
+    pub fn occurrence_id(&self) -> &[u8; 32] {
+        &self.occurrence_id
     }
 }
 

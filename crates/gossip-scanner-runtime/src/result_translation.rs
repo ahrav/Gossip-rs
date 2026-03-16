@@ -342,6 +342,10 @@ fn translate_findings(
     seen_at: LogicalTime,
     findings_input: &[FsFindingRecord],
 ) -> Result<FindingsLayers, ResultTranslationError> {
+    if findings_input.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+
     let mut findings = Vec::with_capacity(findings_input.len());
     let mut occurrences = Vec::with_capacity(findings_input.len());
     let mut observations = Vec::with_capacity(findings_input.len());

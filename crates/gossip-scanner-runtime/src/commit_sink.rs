@@ -184,18 +184,18 @@ impl DurableCommitSink {
             byte_length: finding.end - finding.start,
         });
 
-        Ok(IdentityChainRecord {
-            write_context: self.write_context,
-            item_key: item_key.as_bytes().to_vec(),
-            rule_id: finding.rule_id,
-            start: finding.start,
-            end: finding.end,
-            confidence_score: finding.confidence_score,
-            norm_hash: *norm_hash.as_bytes(),
-            secret_hash: *secret_hash.as_bytes(),
-            finding_id: *finding_id.as_bytes(),
-            occurrence_id: *occurrence_id.as_bytes(),
-        })
+        Ok(IdentityChainRecord::new(
+            self.write_context,
+            item_key.as_bytes().to_vec(),
+            finding.rule_id,
+            finding.start,
+            finding.end,
+            finding.confidence_score,
+            *norm_hash.as_bytes(),
+            *secret_hash.as_bytes(),
+            *finding_id.as_bytes(),
+            *occurrence_id.as_bytes(),
+        ))
     }
 }
 
@@ -337,10 +337,10 @@ mod tests {
 
         let identity = recorder.identity.lock().expect("identity lock");
         assert_eq!(identity.len(), 1);
-        assert_eq!(identity[0].rule_id, 9);
-        assert_eq!(identity[0].start, 2);
-        assert_eq!(identity[0].end, 12);
-        assert_eq!(identity[0].write_context, write_context);
+        assert_eq!(identity[0].rule_id(), 9);
+        assert_eq!(identity[0].start(), 2);
+        assert_eq!(identity[0].end(), 12);
+        assert_eq!(identity[0].write_context(), write_context);
 
         let progress = recorder.progress.lock().expect("progress lock");
         assert_eq!(progress.len(), 2);
@@ -506,7 +506,7 @@ mod tests {
 
         let versioned_identity = recorder.identity.lock().expect("identity lock");
         assert_eq!(versioned_identity.len(), 1);
-        assert_eq!(versioned_identity[0].rule_id, 9);
+        assert_eq!(versioned_identity[0].rule_id(), 9);
 
         // The version-present path should produce a different occurrence_id
         // than the None-version path for the same item key.
@@ -549,12 +549,14 @@ mod tests {
         let versioned_identity = recorder.identity.lock().expect("identity lock");
 
         assert_ne!(
-            versioned_identity[0].occurrence_id, none_identity[0].occurrence_id,
+            versioned_identity[0].occurrence_id(),
+            none_identity[0].occurrence_id(),
             "explicit version must produce a different occurrence_id than None-version"
         );
         // Finding IDs should be identical (version doesn't affect finding identity).
         assert_eq!(
-            versioned_identity[0].finding_id, none_identity[0].finding_id,
+            versioned_identity[0].finding_id(),
+            none_identity[0].finding_id(),
             "finding_id is version-independent"
         );
     }

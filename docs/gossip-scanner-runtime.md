@@ -79,8 +79,7 @@ Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
 
-The distributed entrypoint still returns `DistributedRuntimeError`, which
-wraps `ScanRuntimeError`.
+The distributed entrypoint returns `ScanRuntimeError` directly.
 
 ### Family split
 
@@ -352,7 +351,7 @@ pub struct ShardLease<A> {
 ```rust
 pub fn run_distributed(
     config: &DistributedRunConfig,
-) -> Result<DistributedRunReport, DistributedRuntimeError>
+) -> Result<DistributedRunReport, ScanRuntimeError>
 ```
 
 `ShardLease<A>` is the hand-off object from coordination into the worker loop.
