@@ -5,7 +5,6 @@
 //! Migration-compatibility shims (for example `stdx::FixedVec` and
 //! harness-gated re-exports) keep extracted scanner-rs modules building
 //! without changing runtime behavior.
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_macros)]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -48,7 +47,7 @@ mod api;
 #[cfg(any(test, feature = "test-support"))]
 mod demo;
 mod engine;
-mod perf_stats;
+use gossip_stdx::perf_stats;
 mod rules;
 
 #[cfg(feature = "b64-stats")]

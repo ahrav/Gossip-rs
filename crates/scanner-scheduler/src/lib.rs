@@ -10,7 +10,6 @@
 //! The local [`api`] module is a compatibility shim that re-exports
 //! `scanner-engine` API types so migrated scheduler modules can keep their
 //! historical `crate::api::*` imports.
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_macros)]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -36,8 +35,8 @@ pub mod finding_output;
 pub mod git_scan;
 /// Provides shared JSON write helpers for event encoding paths.
 pub mod json_write;
-/// Provides small arithmetic helpers for scan-time performance counters.
-pub mod perf_stats;
+/// Re-exports small arithmetic helpers for scan-time performance counters.
+pub use gossip_stdx::perf_stats;
 /// Defines configuration and statistics types for file-scanning pipelines.
 pub mod pipeline;
 /// Re-exports scanner-engine pool types used by extracted runtime helpers.

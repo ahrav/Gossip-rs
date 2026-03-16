@@ -42,7 +42,6 @@
 //! (repo open/artifact acquisition, commit loading, tree diff/candidate
 //! extraction, spill/dedup/mapping, pack planning/execution, engine scanning,
 //! and finalize/persist) instead of individual internal modules.
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_macros)]
 // Targeted clippy overrides for patterns used intentionally in this crate.
@@ -161,7 +160,7 @@ pub mod pack_plan_model;
 pub mod pack_reader;
 /// Implements a path policy classifier for tree diff candidates.
 pub mod path_policy;
-mod perf_stats;
+use gossip_stdx::perf_stats;
 /// Defines the write-only persistence store contract and helpers.
 pub mod persist;
 /// Provides RocksDB-backed persistence adapters (feature-gated).

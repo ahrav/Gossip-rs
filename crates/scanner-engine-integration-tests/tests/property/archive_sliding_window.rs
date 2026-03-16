@@ -16,7 +16,6 @@ use scanner_scheduler::archive::{
 // ── RecordingSink (duplicated from scan.rs unit tests for property scope) ──
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RecordedChunk {
     data: Vec<u8>,
     base_offset: u64,

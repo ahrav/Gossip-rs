@@ -14,7 +14,6 @@ struct RecordedChunk {
 
 /// Captured events for a single entry start/chunk*/end cycle.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RecordedEntry {
     display_path: Vec<u8>,
     size_hint: u64,

@@ -1,9 +1,8 @@
-//! Shared live-etcd observation helpers for integration tests.
+//! Live-etcd observation adapter for integration tests.
 //!
-//! `ObservedEtcdCoordinator` wraps a real `EtcdCoordinator` with a cache backed
-//! by the test-only snapshot loaders. Tests use it when they need the real
-//! backend's mutation semantics together with `SimIntrospection` for invariant
-//! checking or state comparison.
+//! `ObservedEtcdCoordinator` wraps a real `EtcdCoordinator` with a local cache
+//! so tests can satisfy the `SimIntrospection` contract while using a live (or
+//! testcontainers-provisioned) etcd backend.
 
 use std::collections::{BTreeMap, BTreeSet};
 
