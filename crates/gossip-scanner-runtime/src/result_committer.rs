@@ -25,7 +25,9 @@ use gossip_contracts::{
 };
 
 use crate::{
-    commit_model::{BoundaryMismatchError, CommitRequest, CompletedUnit, UnitCommitReceipt},
+    commit_model::{
+        BoundaryMismatchError, CommitRequest, CompletedUnit, KindMismatchError, UnitCommitReceipt,
+    },
     result_translation::PersistenceTranslation,
 };
 
@@ -108,9 +110,14 @@ impl fmt::Display for ResultCommitRequestError {
                 write!(f, "invalid done-ledger record: {err}")
             }
             Self::TenantMismatch {
-                layer, expected, actual,
+                layer,
+                expected,
+                actual,
             } => {
-                write!(f, "{layer} tenant mismatch: expected {expected:?}, got {actual:?}")
+                write!(
+                    f,
+                    "{layer} tenant mismatch: expected {expected:?}, got {actual:?}"
+                )
             }
             Self::ObservationWriteContextMismatch { index } => write!(
                 f,
@@ -158,6 +165,14 @@ impl From<PersistenceInputError> for ResultCommitRequestError {
     }
 }
 
+/// Result of [`ResultCommitter::commit_translation`].
+///
+/// On failure the consumed [`CompletedUnit`] is returned alongside the error
+/// so the caller can attach it to a failure outcome without pre-cloning.
+/// The error pair is boxed to keep the `Result` size small on the success path.
+pub type TranslationCommitResult<F, D> =
+    Result<UnitCommitReceipt, Box<(CompletedUnit, ResultCommitError<F, D>)>>;
+
 /// Immediate submit, wait, or validation failure while committing one runtime
 /// unit through findings -> done-ledger.
 #[derive(Debug)]
@@ -180,6 +195,9 @@ pub enum ResultCommitError<FindingsError, DoneLedgerError> {
     /// The durable receipt's checkpoint boundary did not match the completed
     /// unit's boundary.
     BoundaryMismatch(Box<BoundaryMismatchError>),
+    /// The durable receipt's checkpoint boundary kind did not match the
+    /// expected kind for this shard stream.
+    KindMismatch(KindMismatchError),
 }
 
 impl<FindingsError, DoneLedgerError> fmt::Display
@@ -199,6 +217,9 @@ where
                 f,
                 "boundary mismatch between completed unit and receipt: {err}"
             ),
+            Self::KindMismatch(err) => {
+                write!(f, "checkpoint boundary kind mismatch: {err}")
+            }
         }
     }
 }
@@ -215,6 +236,7 @@ where
             Self::DoneLedgerSubmit(err) => Some(err),
             Self::DoneLedgerAdvance(err) => Some(err),
             Self::BoundaryMismatch(err) => Some(err.as_ref()),
+            Self::KindMismatch(err) => Some(err),
         }
     }
 }
@@ -252,20 +274,86 @@ where
     /// Commit one translated item bundle without re-deriving IDs.
     ///
     /// This accepts pre-translated persistence rows directly instead of
-    /// re-deriving them inside the commit stage.
+    /// re-deriving them inside the commit stage. On failure the consumed
+    /// [`CompletedUnit`] is returned alongside the error so the caller can
+    /// attach it to a failure outcome without pre-cloning.
+    ///
+    /// # Errors
+    ///
+    /// Returns `(CompletedUnit, ResultCommitError)` on any validation,
+    /// findings-sink, or done-ledger failure.
     pub fn commit_translation(
         &self,
         write_context: WriteContext,
         completed_unit: CompletedUnit,
         translation: &PersistenceTranslation,
-    ) -> Result<UnitCommitReceipt, ResultCommitError<F::Error, D::Error>> {
+    ) -> TranslationCommitResult<F::Error, D::Error> {
         let request = CommitRequest::new(
             write_context,
             completed_unit,
             translation.findings_batch(),
             std::slice::from_ref(translation.done_ledger()),
         );
-        self.commit_item(request)
+
+        if let Err(e) = Self::validate_request(&request) {
+            let (_, completed_unit, _, _) = request.into_parts();
+            return Err(Box::new((completed_unit, e.into())));
+        }
+
+        let (write_context, completed_unit, findings, done_ledger) = request.into_parts();
+
+        let scope = CommitScope::from_write_context(
+            write_context,
+            NonZeroU64::MIN,
+            completed_unit.checkpoint_boundary().clone(),
+        );
+        let page = PageCommit::new(scope);
+
+        let findings_handle = match self.findings_sink.upsert_batch(findings) {
+            Ok(h) => h,
+            Err(e) => {
+                return Err(Box::new((
+                    completed_unit,
+                    ResultCommitError::FindingsSubmit(e),
+                )));
+            }
+        };
+        let page = match page.wait_findings(findings_handle) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(Box::new((
+                    completed_unit,
+                    ResultCommitError::FindingsWait(e),
+                )));
+            }
+        };
+
+        let done_handle = match self.done_ledger.batch_upsert(done_ledger) {
+            Ok(h) => h,
+            Err(e) => {
+                return Err(Box::new((
+                    completed_unit,
+                    ResultCommitError::DoneLedgerSubmit(e),
+                )));
+            }
+        };
+        let page = match page.wait_done_ledger(done_handle) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(Box::new((
+                    completed_unit,
+                    ResultCommitError::DoneLedgerAdvance(e),
+                )));
+            }
+        };
+
+        // The scope was derived from this completed_unit's checkpoint_boundary,
+        // so the boundary in the receipt always matches. UnitCommitReceipt::new
+        // cannot fail here.
+        Ok(
+            UnitCommitReceipt::new(completed_unit, page.into_item_commit_receipt())
+                .expect("boundary always matches when scope is derived from the same unit"),
+        )
     }
 
     /// Commit one completed runtime unit through findings -> done-ledger.
@@ -689,7 +777,7 @@ mod tests {
         let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
         let translation = translated_scan();
 
-        let err = committer
+        let (_, err) = *committer
             .commit_translation(write_context(), completed_unit(4), &translation)
             .expect_err("findings submission should fail");
 
@@ -713,7 +801,7 @@ mod tests {
         let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
         let translation = translated_scan();
 
-        let err = committer
+        let (_, err) = *committer
             .commit_translation(write_context(), completed_unit(5), &translation)
             .expect_err("done-ledger commit should fail");
 
@@ -804,7 +892,7 @@ mod tests {
         let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
         let translation = translated_scan();
 
-        let err = committer
+        let (_, err) = *committer
             .commit_translation(write_context(), completed_unit(8), &translation)
             .expect_err("findings durability should fail");
 
@@ -828,7 +916,7 @@ mod tests {
         let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
         let translation = translated_scan();
 
-        let err = committer
+        let (_, err) = *committer
             .commit_translation(write_context(), completed_unit(9), &translation)
             .expect_err("done-ledger submission should fail");
 

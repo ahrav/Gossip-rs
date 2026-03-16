@@ -8,8 +8,9 @@
 - typed scan configuration for filesystem and git entrypoints
 - CLI parsing and summary rendering
 - path and budget validation before runtime execution
-- owned report, checkpoint, cancellation, commit-model, result-translation,
-  result-committer, checkpoint-aggregator, commit-sink, and coordination-recorder types
+- owned report, checkpoint, cancellation, commit-model, commit-pipeline,
+  result-translation, result-committer, checkpoint-aggregator, commit-sink,
+  and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
 - distributed runtime placeholder nouns for future worker-loop wiring
 
@@ -26,6 +27,7 @@ entrypoints share the same local runtime execution paths.
 | `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime` |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
+| `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink that stamps one shared `WriteContext` onto emitted records |
 | `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing, including write-scoped progress and identity-chain records |
@@ -246,6 +248,20 @@ records cannot enforce on their own:
 - referential integrity of the findings batch (every observation references
   an existing occurrence, every occurrence references an existing finding)
 
+`src/commit_pipeline.rs` wraps `ResultCommitter` in the next structural layer:
+execution threads submit owned `QueuedCommit` values to a bounded
+`sync_channel`, one dedicated worker drains that queue, and the worker emits
+either `CommitStageOutput::Committed { checkpoint_input, .. }` or
+`CommitStageOutput::Failed { .. }` on a second bounded channel. This is the
+runtime's backpressure boundary: slow persistence or a slow downstream
+checkpoint stage eventually fills one of the bounded queues, which pauses
+execution instead of buffering unbounded translated work in memory.
+
+The commit pipeline also reuses `CancellationToken` for lease loss and
+shutdown. New submissions check cancellation before attempting a blocking send,
+while the worker still finishes the current commit before exiting. That keeps
+the pipeline responsive to lease loss without risking half-committed state.
+
 `src/checkpoint_aggregator.rs` implements the next stage in that pipeline. It
 keeps a shard-local reorder buffer keyed by completed-unit sequence number,
 prepares only the highest contiguous durable prefix, normalizes checkpoint
@@ -450,6 +466,7 @@ The runtime tests focus on the behavior that exists today:
 - durable commit-sink identity derivation
 - authoritative findings -> done-ledger commit ordering and item-level receipt
   construction
+- bounded execution -> commit backpressure and cancellation semantics
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources while keeping the distributed placeholder surface covered until
@@ -466,6 +483,7 @@ that worker-loop API is fully wired.
 | Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
 | Deterministic result-to-persistence translation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Durable findings -> done-ledger commit stage | `crates/gossip-scanner-runtime/src/result_committer.rs` |
+| Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Distributed family placeholders and lease metadata | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
