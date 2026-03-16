@@ -439,6 +439,14 @@ impl ScanEngine for MockEngine {
         self.rule_name(RuleId(rule_id as u16))
     }
 
+    fn rule_fingerprint_bytes(&self, rule_id: u32) -> [u8; 32] {
+        let name = self.rule_name(RuleId(rule_id as u16));
+        // Must match gossip_contracts::identity::derive_rule_fingerprint.
+        let mut h = blake3::Hasher::new_derive_key("gossip/rule/v1");
+        h.update(name.as_bytes());
+        *h.finalize().as_bytes()
+    }
+
     fn max_findings_per_chunk(&self) -> usize {
         self.tuning.max_findings_per_chunk
     }

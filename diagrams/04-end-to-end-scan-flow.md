@@ -166,6 +166,7 @@ sequenceDiagram
 
     loop For each finding in item
         LOOP->>CS: upsert_findings(item_key, FindingsBatch)
+        CS->>CS: rule_fingerprint_resolver(rule_id) → RuleFingerprint
         CS->>ID: NormHash::from_digest(...)
         CS->>ID: key_secret_hash(...)
         CS->>ID: derive_finding_id(...)
@@ -183,7 +184,9 @@ runtime events.
 
 **Identity derivation stays local to the runtime.** `DurableCommitSink`
 computes the finding and occurrence identity chain without leaking identity
-logic into the family contracts.
+logic into the family contracts. A rule-fingerprint resolver callback
+translates positional `rule_id` values into stable, name-derived
+`RuleFingerprint` values, ensuring finding identity is position-independent.
 
 ---
 

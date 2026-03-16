@@ -143,6 +143,14 @@ Processing order follows the parent-to-child hierarchy:
    match, but provenance (`seen_at`, `location`, run context) may change
    across retries. Missing parent occurrence → `MissingOccurrence`.
 
+### Observation merge location optimization
+
+Observation location metadata is stored as `Arc<Location>`. The merge
+function uses `location_arc()` to perform cheap `Arc::clone` operations
+instead of cloning the underlying `String` fields during the provenance
+winner / fallback chain. This matters in batch-heavy workloads where many
+observations share the same location.
+
 ### Validate-then-mutate
 
 The function builds temporary `batch_*` maps and validates every invariant

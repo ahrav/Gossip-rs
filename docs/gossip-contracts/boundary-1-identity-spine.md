@@ -19,6 +19,10 @@ The module provides three core capabilities:
 - **Domain-separated hashing** -- a registry of 15 domain constants and two
   hashing modes (keyed and derive-key) that prevent cross-derivation and
   cross-tenant collisions.
+- **Rule fingerprint derivation** -- `derive_rule_fingerprint` computes a
+  position-independent `RuleFingerprint` from a rule's name via BLAKE3
+  derive-key with `RULE_FINGERPRINT_V1`, so the same rule always
+  produces the same fingerprint regardless of compilation order.
 
 Every piece of data that flows through the detection pipeline receives a
 cryptographic identity derived through this spine. The module enforces
@@ -36,7 +40,7 @@ macros.
 | `hashing.rs`      | `domain_hasher`, `finalize_32`, `finalize_64`, `derive_from_cached`                           |
 | `domain.rs`       | 15 domain-separation constants + `ALL` registry                                                                               |
 | `item.rs`         | `ConnectorTag`, `ConnectorInstanceIdHash`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`, `IdentityInputError` |
-| `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId`, `ObservationId` + derivation fns                    |
+| `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId`, `ObservationId` + derivation fns (`derive_rule_fingerprint`, `derive_finding_id`, `derive_occurrence_id`, `derive_observation_id`) |
 | `policy.rs`       | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                                                       |
 | `macros.rs`       | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                                                                |
 | `coordination.rs` | `RunId`, `ShardId`, `WorkerId`, `OpId`, `JobId`, `FenceEpoch`, `LogicalTime`, `ShardKey` — 64-bit coordination identity types |
@@ -58,7 +62,7 @@ ConnectorTag ────────────┼─ ItemIdentityKey         
 locator ─────────────────┘       │                       │                                      │
                           StableItemId ──────────────────┤                                      │
                                                          │                                      │
-            RuleFingerprint ─────────────────────────────┘                                      │
+rule_name ──── derive_rule_fingerprint() ──> RuleFingerprint ───┘                               │
                                                                                                 │
                                                          ├─ derive_occurrence_id() ──> OccurrenceId ──┐
             ObjectVersionId ─────────────────────────────┤                                            │
@@ -80,7 +84,7 @@ locator ─────────────────┘       │        
 | `StableItemId`             | Fixed-width (32 B) content-addressed identity derived from `ItemIdentityKey` via `domain::ITEM_ID_V1` |
 | `NormHash`                 | Normalized secret digest from the detection engine (tenant-agnostic)                                  |
 | `SecretHash`               | Tenant-scoped secret identity, derived by keying `NormHash` with `TenantSecretKey`                    |
-| `RuleFingerprint`          | Identity of the detection rule that matched                                                           |
+| `RuleFingerprint`          | Position-independent identity of the detection rule, derived from the rule name via `derive_rule_fingerprint()` using BLAKE3 derive-key with `RULE_FINGERPRINT_V1` |
 | `FindingId`                | Version-stable finding identity: `(TenantId, StableItemId, RuleFingerprint, SecretHash)`              |
 | `ObjectVersionId`          | Version-specific content identity (commit SHA, S3 ETag, etc.)                                         |
 | `OccurrenceId`             | Version-specific occurrence: `(FindingId, ObjectVersionId, byte_offset, byte_length)`                 |
@@ -204,7 +208,7 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 | `ObjectVersionId`    | 32 B             | `from_version_bytes` / `from_bytes`                | `OBJECT_VERSION_V1`                  | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `NormHash`           | 32 B             | `from_digest` (pub) / `from_bytes_internal` (pub(crate)) | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
 | `SecretHash`         | 32 B             | `from_bytes_internal` (pub(crate))                 | `SECRET_HASH_V1` (keyed mode)        | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
-| `RuleFingerprint`    | 32 B             | `from_bytes` (pub)                                 | `RULE_FINGERPRINT_V1`                | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `RuleFingerprint`    | 32 B             | `derive_rule_fingerprint(rule_name)` / `from_bytes` (pub) | `RULE_FINGERPRINT_V1`          | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `FindingId`          | 32 B             | `from_bytes` (pub)                                 | `FINDING_ID_V1`                      | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `OccurrenceId`       | 32 B             | `from_bytes` (pub)                                 | `OCCURRENCE_ID_V1`                   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `ObservationId`      | 32 B             | `from_bytes` (pub)                                 | `OBSERVATION_ID_V1`                  | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
@@ -233,7 +237,7 @@ All 15 domain constants live in `domain.rs` and follow the naming convention
 | `ITEM_ID_V1`          | `gossip/item-id/v1`                  | Identity     | derive-key | `StableItemId` derivation                           |
 | `CONNECTOR_INSTANCE_ID_V1` | `gossip/connector-instance-id/v1` | Identity     | derive-key | `ConnectorInstanceIdHash` derivation                |
 | `OBJECT_VERSION_V1`   | `gossip/object-version/v1`           | Identity     | derive-key | `ObjectVersionId` derivation                        |
-| `RULE_FINGERPRINT_V1` | `gossip/rule/v1`                     | Identity     | derive-key | `RuleFingerprint` derivation (registry placeholder) |
+| `RULE_FINGERPRINT_V1` | `gossip/rule/v1`                     | Identity     | derive-key | `RuleFingerprint` derivation from rule name via `derive_rule_fingerprint()` |
 | `POLICY_HASH_V2`      | `gossip/policy-hash/v2`              | Policy       | derive-key | `PolicyHash` derivation (v2: redesigned after spec) |
 | `RULES_DIGEST_V1`     | `gossip/rules-digest/v1`             | Policy       | derive-key | Content-addressed hash of the full rule set         |
 | `OVID_V1`             | `gossip/persistence/v1/ovid`         | Persistence  | derive-key | OVID (Object-Version Identity) hash                 |

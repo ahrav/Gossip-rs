@@ -11,8 +11,8 @@ use anyhow::{Result, anyhow};
 use gossip_contracts::{
     connector::{ItemKey, VersionId},
     identity::{
-        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, StableItemId,
-        TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
+        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint,
+        StableItemId, TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
     },
     persistence::WriteContext,
 };
@@ -20,7 +20,6 @@ use gossip_contracts::{
 use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, IdentityChainRecord,
 };
-use crate::result_translation::rule_fingerprint_from_rule_id;
 
 /// Per-item metadata passed to [`CommitSink::begin_item`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,24 +107,31 @@ pub struct DurableCommitSink {
     recorder: Arc<dyn CoordinationEventRecorder>,
     write_context: WriteContext,
     tenant_secret_key: TenantSecretKey,
+    rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
     in_flight_meta: Mutex<BTreeMap<Vec<u8>, ItemMeta>>,
 }
 
 impl DurableCommitSink {
     /// Creates a durable commit sink bound to one recorder shard label and one
     /// shared write context.
+    ///
+    /// `rule_fingerprint` maps an engine-local `rule_id` to the stable
+    /// [`RuleFingerprint`] derived from the rule name. Callers typically
+    /// construct this from `ScanEngine::rule_fingerprint_bytes`.
     #[must_use]
     pub fn new(
         recorder: Arc<dyn CoordinationEventRecorder>,
         recorder_shard_label: Arc<str>,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
+        rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
     ) -> Self {
         Self {
             recorder_shard_label,
             recorder,
             write_context,
             tenant_secret_key,
+            rule_fingerprint,
             in_flight_meta: Mutex::new(BTreeMap::new()),
         }
     }
@@ -153,7 +159,7 @@ impl DurableCommitSink {
         let finding_id = derive_finding_id(&FindingIdInputs {
             tenant: self.write_context.tenant_id(),
             item: meta.stable_item_id,
-            rule: rule_fingerprint_from_rule_id(finding.rule_id),
+            rule: (self.rule_fingerprint)(finding.rule_id),
             secret: secret_hash,
         });
 
@@ -262,9 +268,17 @@ mod tests {
         persistence::WriteContext,
     };
 
+    use gossip_contracts::identity::derive_rule_fingerprint;
+
     use super::*;
     use crate::OwnedCoreEvent;
     use crate::coordination_sink::StoredGitEvent;
+
+    /// Test-only rule fingerprint lookup that derives from a synthetic name.
+    fn test_rule_fingerprint(rule_id: u32) -> gossip_contracts::identity::RuleFingerprint {
+        let name = format!("test-rule-{rule_id}");
+        derive_rule_fingerprint(&name)
+    }
 
     #[derive(Default)]
     struct Recorder {
@@ -315,6 +329,7 @@ mod tests {
             Arc::from("shard-a"),
             write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/file.txt").expect("item key");
@@ -377,6 +392,7 @@ mod tests {
             Arc::from("shard-b"),
             write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/other.txt").expect("item key");
@@ -417,6 +433,7 @@ mod tests {
             Arc::from("shard-c"),
             write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/bad.txt").expect("item key");
@@ -488,6 +505,7 @@ mod tests {
             Arc::from("shard-v"),
             write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/versioned.txt").expect("item key");
@@ -526,6 +544,7 @@ mod tests {
             Arc::from("shard-v2"),
             write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
         );
         sink2
             .begin_item(
@@ -586,6 +605,7 @@ mod tests {
             Arc::from("shard-atomic"),
             write_context,
             TenantSecretKey::from_bytes([0x22; 32]),
+            Arc::new(test_rule_fingerprint),
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/mixed.txt").expect("item key");

@@ -67,6 +67,14 @@ collisions with real filesystem file IDs.
 
 **Contract**: Returns the rule name on success; returns `"<unknown-rule>"` for invalid IDs. Used for output formatting and reporting.
 
+#### `rule_fingerprint_bytes(&self, rule_id: u32) -> [u8; 32]`
+
+**Purpose**: Returns the stable 32-byte BLAKE3 fingerprint for a rule.
+
+**Contract**: The fingerprint is precomputed at engine construction from the rule name via BLAKE3 derive-key with the `"gossip/rule/v1"` domain constant. Position-independent: the same rule name always produces the same fingerprint regardless of compilation order. Returns all-zeros for invalid IDs.
+
+**Usage**: Used for durable finding-identity derivation instead of the positional `rule_id`. Callers wrap the returned bytes in `RuleFingerprint::from_bytes` when crossing the boundary into `gossip-contracts`. Returned as raw `[u8; 32]` because the `ScanEngine` trait lives in `scanner-scheduler`, which does not depend on `gossip-contracts`.
+
 #### `max_findings_per_chunk(&self) -> usize`
 
 **Purpose**: Returns the maximum number of findings retained per chunk scan.

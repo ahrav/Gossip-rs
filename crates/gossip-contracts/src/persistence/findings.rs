@@ -32,7 +32,7 @@
 //! implement as an idempotent upsert. Replaying the same batch — or
 //! overlapping batches — must not create duplicate rows.
 
-use std::{collections::HashSet, error::Error, num::NonZeroU64};
+use std::{collections::HashSet, error::Error, num::NonZeroU64, sync::Arc};
 
 use crate::{
     connector::Location,
@@ -309,7 +309,7 @@ pub struct ObservationRecord {
     shard_id: ShardId,
     fence_epoch: FenceEpoch,
     seen_at: LogicalTime,
-    location: Option<Location>,
+    location: Option<Arc<Location>>,
 }
 
 impl ObservationRecord {
@@ -413,7 +413,7 @@ impl ObservationRecord {
             });
         }
 
-        record.location = location;
+        record.location = location.map(Arc::new);
         Ok(record)
     }
 
@@ -450,7 +450,7 @@ impl ObservationRecord {
             shard_id,
             fence_epoch,
             seen_at,
-            location,
+            location: location.map(Arc::new),
         }
     }
 
@@ -470,8 +470,11 @@ impl ObservationRecord {
     }
 
     /// Attach display-safe location metadata (path and optional URL).
+    ///
+    /// Accepts `Arc<Location>` so multiple observations sharing the same
+    /// location can avoid cloning the underlying `String` fields.
     #[must_use]
-    pub fn with_location(self, location: Location) -> Self {
+    pub fn with_location(self, location: Arc<Location>) -> Self {
         Self {
             location: Some(location),
             ..self
@@ -570,6 +573,17 @@ impl ObservationRecord {
     #[inline]
     #[must_use]
     pub fn location(&self) -> Option<&Location> {
+        self.location.as_deref()
+    }
+
+    /// Shared reference to the `Arc`-wrapped location, if attached.
+    ///
+    /// Use this when you need a cheap `Arc::clone` of the location rather
+    /// than cloning the underlying `String` fields — for example, during
+    /// observation merges or batch translation loops.
+    #[inline]
+    #[must_use]
+    pub fn location_arc(&self) -> Option<&Arc<Location>> {
         self.location.as_ref()
     }
 

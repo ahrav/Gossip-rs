@@ -1,6 +1,6 @@
 # ID Derivation DAG
 
-The identity system in Gossip defines 19 types organized into a directed acyclic graph (DAG) of derivations. Unlike a tree, many derived types have multiple inputs -- for example, `FindingId` depends on four separate upstream types simultaneously. Every derivation uses BLAKE3 with an explicit domain-separation constant so that the same raw bytes fed to different derivation functions produce cryptographically independent outputs.
+The identity system in Gossip defines 19 types organized into a directed acyclic graph (DAG) of derivations. Unlike a tree, many derived types have multiple inputs -- for example, `FindingId` depends on four separate upstream types simultaneously. Every derivation uses BLAKE3 with an explicit domain-separation constant so that the same raw bytes fed to different derivation functions produce cryptographically independent outputs. `RuleFingerprint` is derived from a rule's name via BLAKE3 derive-key with `RULE_FINGERPRINT_V1`, making it position-independent: the same rule always produces the same fingerprint regardless of its index in the compiled rule list.
 
 Three invariants govern the entire DAG:
 
@@ -21,8 +21,12 @@ graph TD
         TenantId["TenantId<br/><i>32B</i>"]
         TenantSecretKey["TenantSecretKey<br/><i>32B</i>"]
         ConnectorTag["ConnectorTag<br/><i>8B</i>"]
-        RuleFingerprint["RuleFingerprint<br/><i>32B</i>"]
         NormHash["NormHash<br/><i>32B</i>"]
+    end
+
+    subgraph RuleIdentity ["Rule Identity"]
+        rule_name["rule_name<br/><i>&amp;str</i>"]
+        RuleFingerprint["RuleFingerprint<br/><i>32B</i>"]
     end
 
     subgraph ItemIdentity ["Item Identity"]
@@ -63,6 +67,9 @@ graph TD
         PolicyHashInputs["PolicyHashInputs<br/><i>41B struct</i>"]
         PolicyHash["PolicyHash<br/><i>32B</i>"]
     end
+
+    %% Rule fingerprint chain
+    rule_name -->|"RULE_FINGERPRINT_V1"| RuleFingerprint
 
     %% Item chain
     ConnectorTag --> ItemIdentityKey
@@ -106,8 +113,10 @@ graph TD
     style TenantId fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
     style TenantSecretKey fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
     style ConnectorTag fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
-    style RuleFingerprint fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
     style NormHash fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
+
+    style rule_name fill:#F3F4F6,stroke:#374151,color:#374151
+    style RuleFingerprint fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
 
     style StableItemId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
     style ObjectVersionId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
@@ -136,8 +145,9 @@ graph TD
 
 Key observations about the full DAG:
 
-- **Five root types** require no derivation: `TenantId`, `TenantSecretKey`, `ConnectorTag`, `RuleFingerprint`, and `NormHash`.
-- **Eight derived 32-byte types** are produced via BLAKE3: `StableItemId`, `ObjectVersionId`, `SecretHash`, `FindingId`, `OccurrenceId`, `PolicyHash`, `ConnectorInstanceIdHash`, and `ObservationId`.
+- **Four root types** require no derivation: `TenantId`, `TenantSecretKey`, `ConnectorTag`, and `NormHash`.
+- **Nine derived 32-byte types** are produced via BLAKE3: `RuleFingerprint`, `StableItemId`, `ObjectVersionId`, `SecretHash`, `FindingId`, `OccurrenceId`, `PolicyHash`, `ConnectorInstanceIdHash`, and `ObservationId`.
+- `RuleFingerprint` is derived from a rule's name string via BLAKE3 derive-key with `RULE_FINGERPRINT_V1`. This makes fingerprints position-independent: the same rule always produces the same fingerprint regardless of its index in the compiled rule list.
 - **Four input structs** (`FindingIdInputs`, `OccurrenceIdInputs`, `ObservationIdInputs`, `PolicyHashInputs`) aggregate multiple fields before hashing, and `ItemIdentityKey` serves the same aggregation role for item identity.
 - Every edge labeled with a domain constant (e.g., `FINDING_ID_V1`) represents a BLAKE3 derive-key invocation, except `SECRET_HASH_V1` which uses BLAKE3 keyed mode.
 
@@ -225,7 +235,7 @@ The finding identity chain answers "what finding was detected?" in a version-sta
 graph TD
     TenantId["TenantId<br/>(32B)"]
     StableItemId["StableItemId<br/>(32B)"]
-    RuleFingerprint["RuleFingerprint<br/>(32B)"]
+    RuleFingerprint["RuleFingerprint<br/>(32B, derived from rule name)"]
     SecretHash["SecretHash<br/>(32B)"]
 
     FindingIdInputs["FindingIdInputs<br/>(4 x 32 = 128B)"]
@@ -245,7 +255,7 @@ graph TD
 
     style TenantId fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
     style StableItemId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
-    style RuleFingerprint fill:#DBEAFE,stroke:#1E40AF,color:#1E40AF
+    style RuleFingerprint fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
     style SecretHash fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF
     style FindingIdInputs fill:#F3F4F6,stroke:#374151,color:#374151
     style FindingId fill:#3B82F6,stroke:#1E40AF,color:#FFFFFF

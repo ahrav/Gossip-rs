@@ -86,6 +86,10 @@ pub(crate) static OBJECT_VERSION_HASHER: LazyLock<Hasher> =
 pub(crate) static POLICY_HASH_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::POLICY_HASH_V2));
 
+/// Cached derive-key hasher for [`RuleFingerprint`](super::RuleFingerprint) derivation.
+pub static RULE_FINGERPRINT_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::RULE_FINGERPRINT_V1));
+
 /// Cached derive-key hasher for split shard-ID derivation in the coordination layer.
 pub static SPLIT_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::SPLIT_ID_V1));

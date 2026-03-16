@@ -345,6 +345,17 @@ pub trait ScanEngine: Send + Sync + 'static {
     /// Used for output formatting. Returns `"<unknown-rule>"` for invalid IDs.
     fn rule_name(&self, rule_id: u32) -> &str;
 
+    /// Stable 32-byte rule fingerprint derived from the rule name.
+    ///
+    /// Position-independent: the same rule name always produces the same
+    /// fingerprint regardless of compilation order. Used for durable
+    /// finding-identity derivation instead of the positional `rule_id`.
+    ///
+    /// Returned as raw bytes because the `ScanEngine` trait lives in
+    /// `scanner-scheduler` which does not depend on `gossip-contracts`.
+    /// Callers wrap the result in `RuleFingerprint::from_bytes`.
+    fn rule_fingerprint_bytes(&self, rule_id: u32) -> [u8; 32];
+
     /// Hard cap on findings per chunk scan.
     ///
     /// Used by the scheduler to pre-size per-worker buffers so that no

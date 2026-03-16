@@ -20,7 +20,7 @@
 //! [`FsFindingRecord::span_end`]. Root-hint fields remain scanner-local
 //! metadata and never participate in persistence identity derivation.
 
-use std::{collections::HashSet, error::Error, fmt};
+use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
 use gossip_contracts::{
     connector::ScanItem,
@@ -135,8 +135,12 @@ pub struct PersistenceTranslation {
 
 impl PersistenceTranslation {
     /// Construct a translated record bundle.
+    ///
+    /// Restricted to the crate because the only validated construction path is
+    /// [`translate_item_result`], which runs done-ledger, observation-identity,
+    /// and referential-integrity checks after building the bundle.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         ovid_hash: OvidHash,
         findings: Vec<FindingRecord>,
         occurrences: Vec<OccurrenceRecord>,
@@ -277,6 +281,7 @@ pub fn translate_item_result(
     bytes_scanned: u64,
     timing: ScanTiming,
     result: ItemResult<'_>,
+    rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
 ) -> Result<PersistenceTranslation, ResultTranslationError> {
     let ovid_hash = derive_ovid_hash(&OvidHashInputs {
         stable_item_id: item.stable_item_id(),
@@ -301,6 +306,7 @@ pub fn translate_item_result(
             ovid_hash,
             timing.finished_at(),
             findings,
+            rule_fingerprint,
         )?,
         ItemResult::FailedRetryable { .. }
         | ItemResult::FailedPermanent { .. }
@@ -344,6 +350,7 @@ fn translate_findings(
     ovid_hash: OvidHash,
     seen_at: LogicalTime,
     findings_input: &[FsFindingRecord],
+    rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
 ) -> Result<FindingsLayers, ResultTranslationError> {
     if findings_input.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
@@ -355,7 +362,9 @@ fn translate_findings(
     let mut seen_findings = HashSet::with_capacity(findings_input.len());
     let mut seen_occurrences = HashSet::with_capacity(findings_input.len());
     let mut seen_observations = HashSet::with_capacity(findings_input.len());
-    let location = item.location().cloned();
+    // Wrap in Arc once so repeated observations share the same allocation
+    // instead of cloning the underlying String fields per iteration.
+    let location: Option<Arc<_>> = item.location().map(|l| Arc::new(l.clone()));
 
     for (index, finding) in findings_input.iter().enumerate() {
         if finding.span_end <= finding.span_start {
@@ -371,7 +380,7 @@ fn translate_findings(
         let finding_record = FindingRecord::new(
             write_context.tenant_id(),
             item.stable_item_id(),
-            rule_fingerprint_from_rule_id(finding.rule_id),
+            rule_fingerprint(finding.rule_id),
             secret_hash,
         );
         let occurrence_record = OccurrenceRecord::try_new(
@@ -405,27 +414,13 @@ fn translate_findings(
     Ok((findings, occurrences, observations))
 }
 
-/// Expand a numeric runtime rule id into the fixed 32-byte fingerprint shape
-/// used by finding identity derivation.
-///
-/// The mapping writes the little-endian `rule_id` into the first four bytes and
-/// zero-fills the remainder. It remains injective as long as rule ids are
-/// unique within the runtime that produced the findings.
-#[inline]
-#[must_use]
-pub(crate) fn rule_fingerprint_from_rule_id(rule_id: u32) -> RuleFingerprint {
-    let mut bytes = [0u8; 32];
-    bytes[..4].copy_from_slice(&rule_id.to_le_bytes());
-    RuleFingerprint::from_bytes(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use gossip_contracts::{
         connector::{ItemKey, ItemRef, Location, ScanItem, VersionId},
         identity::{
-            FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RunId, ShardId, StableItemId,
-            TenantId, TenantSecretKey,
+            FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
+            StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, WriteContext},
     };
@@ -435,6 +430,15 @@ mod tests {
         ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
         translate_item_result,
     };
+
+    /// Test-only rule fingerprint lookup that derives from a synthetic name.
+    ///
+    /// Uses `"test-rule-{rule_id}"` so that different rule IDs produce
+    /// different stable fingerprints within tests.
+    fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
+        let name = format!("test-rule-{rule_id}");
+        derive_rule_fingerprint(&name)
+    }
 
     fn write_context() -> WriteContext {
         WriteContext::new(
@@ -503,6 +507,7 @@ mod tests {
             4_096,
             timing(),
             ItemResult::Scanned { findings },
+            &test_rule_fingerprint,
         )
         .expect("translation should succeed")
     }
@@ -643,6 +648,7 @@ mod tests {
                 ItemResult::Scanned {
                     findings: std::slice::from_ref(&bad),
                 },
+                &test_rule_fingerprint,
             )
             .expect_err("invalid span must fail");
 
@@ -671,6 +677,7 @@ mod tests {
             ItemResult::Scanned {
                 findings: std::slice::from_ref(&boundary),
             },
+            &test_rule_fingerprint,
         )
         .expect("1-byte span (end == start + 1) must be accepted");
         assert_eq!(ok.occurrence_count(), 1);
@@ -687,6 +694,7 @@ mod tests {
             512,
             timing(),
             ItemResult::FailedRetryable { error_code },
+            &test_rule_fingerprint,
         )
         .expect("translation should succeed");
 
@@ -762,6 +770,7 @@ mod tests {
             ItemResult::Scanned {
                 findings: &findings,
             },
+            &test_rule_fingerprint,
         )
         .expect("strong translation");
         let weak = translate_item_result(
@@ -773,6 +782,7 @@ mod tests {
             ItemResult::Scanned {
                 findings: &findings,
             },
+            &test_rule_fingerprint,
         )
         .expect("weak translation");
 
@@ -791,6 +801,7 @@ mod tests {
             512,
             timing(),
             ItemResult::FailedPermanent { error_code },
+            &test_rule_fingerprint,
         )
         .expect("translation should succeed");
 
@@ -823,6 +834,7 @@ mod tests {
             256,
             timing(),
             ItemResult::Skipped { error_code },
+            &test_rule_fingerprint,
         )
         .expect("translation should succeed");
 
@@ -853,6 +865,7 @@ mod tests {
             ItemResult::Scanned {
                 findings: &findings,
             },
+            &test_rule_fingerprint,
         )
         .expect("translation should succeed");
 
@@ -885,9 +898,9 @@ mod tests {
         assert_eq!(
             finding_rules,
             vec![
-                super::rule_fingerprint_from_rule_id(30),
-                super::rule_fingerprint_from_rule_id(10),
-                super::rule_fingerprint_from_rule_id(20),
+                test_rule_fingerprint(30),
+                test_rule_fingerprint(10),
+                test_rule_fingerprint(20),
             ],
             "finding output order must match input order",
         );

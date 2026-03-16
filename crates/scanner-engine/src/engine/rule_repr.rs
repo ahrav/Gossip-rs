@@ -672,6 +672,14 @@ impl RuleCompiled {
 pub(super) struct RuleCold {
     /// Human-readable rule name used in finding reports.
     pub(super) name: &'static str,
+    /// BLAKE3 derive-key fingerprint of the rule name.
+    ///
+    /// Precomputed at engine construction via BLAKE3 derive-key mode over
+    /// the `"gossip/rule/v1"` domain constant and `name`. Stored as raw
+    /// bytes because `scanner-engine` does not depend on `gossip-contracts`
+    /// (which owns `RuleFingerprint`). The `ScanEngine` trait adapter in
+    /// `scanner-scheduler` wraps these bytes into `RuleFingerprint`.
+    pub(super) fingerprint: [u8; 32],
     /// Effective minimum confidence threshold for this rule.
     ///
     /// Precomputed by [`derive_min_confidence`] during engine construction.
@@ -742,7 +750,11 @@ pub(super) fn derive_min_confidence(spec: &RuleSpec) -> i8 {
 // struct within a single cache line pair.
 const _: () = assert!(std::mem::size_of::<u32>() == 4);
 const _: () = assert!(std::mem::size_of::<RuleCompiled>() <= 88);
-const _: () = assert!(std::mem::size_of::<RuleCold>() <= 24);
+// RuleCold grew from 24 to 56 bytes after adding the precomputed 32-byte
+// rule fingerprint. This is acceptable because RuleCold lives on the cold
+// path (accessed only at finding emission time, not in the hot per-window
+// scan loop).
+const _: () = assert!(std::mem::size_of::<RuleCold>() <= 56);
 
 // --------------------------
 // Compile helpers

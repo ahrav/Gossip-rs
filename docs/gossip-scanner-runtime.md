@@ -259,12 +259,15 @@ and identity-chain recording for coordination diagnostics. It computes:
 
 - normalized secret hash input
 - tenant-scoped secret hash
-- finding ID
+- finding ID (using the rule-fingerprint resolver for position-independent rule identity)
 - occurrence ID
 
-The sink stores one `WriteContext` per shard-scoped runtime instance. It uses
-that shared scope when deriving tenant-bound finding identity and forwards the
-same context on every `CommitProgressRecord` and `IdentityChainRecord`.
+The sink stores one `WriteContext` per shard-scoped runtime instance and a
+rule-fingerprint resolver (`Arc<dyn Fn(u32) -> RuleFingerprint>`). It uses
+the shared scope when deriving tenant-bound finding identity and forwards the
+same context on every `CommitProgressRecord` and `IdentityChainRecord`. The
+rule-fingerprint resolver translates positional `rule_id` values into stable
+`RuleFingerprint` values derived from the rule name.
 
 When a source does not provide an explicit version, the sink derives a
 stable surrogate object version from the item-key bytes.
@@ -283,14 +286,20 @@ The module owns:
 
 - `ScanTiming`
 - `ItemResult<'a>`
-- `PersistenceTranslation`
+- `PersistenceTranslation` (crate-visible constructor; only `translate_item_result` can build one)
 - `ResultTranslationError`
 - `translate_item_result`
 
-The translation is pure with respect to its inputs. Stable item identity,
-version claim, write scope, tenant secret key, and scan findings fully
-determine the resulting OVID, finding IDs, occurrence IDs, observation IDs,
-and done-ledger key.
+The translation is deterministic with respect to its inputs. Stable item
+identity, version claim, write scope, tenant secret key, a rule-fingerprint
+resolver callback, and scan findings fully determine the resulting OVID,
+finding IDs, occurrence IDs, observation IDs, and done-ledger key.
+
+`translate_item_result` accepts a `&dyn Fn(u32) -> RuleFingerprint` callback
+that resolves positional `rule_id` values to stable, name-derived
+`RuleFingerprint` values. This decouples translation from compilation
+order: the same rule always maps to the same fingerprint regardless of its
+position in the rule list.
 
 Input order is preserved while each persistence layer is deduplicated by its
 own identity:
