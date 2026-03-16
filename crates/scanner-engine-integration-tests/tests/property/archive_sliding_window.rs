@@ -16,10 +16,8 @@ use scanner_scheduler::archive::{
 // ── RecordingSink (duplicated from scan.rs unit tests for property scope) ──
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RecordedChunk {
     data: Vec<u8>,
-    base_offset: u64,
     new_bytes_start: u64,
     new_bytes_len: usize,
 }
@@ -47,7 +45,6 @@ impl ArchiveEntrySink for RecordingSink {
     fn on_entry_chunk(&mut self, chunk: EntryChunk<'_>) -> Result<(), Self::Error> {
         self.current.as_mut().unwrap().chunks.push(RecordedChunk {
             data: chunk.data.to_vec(),
-            base_offset: chunk.base_offset,
             new_bytes_start: chunk.new_bytes_start,
             new_bytes_len: chunk.new_bytes_len,
         });

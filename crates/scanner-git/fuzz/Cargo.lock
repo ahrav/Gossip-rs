@@ -1031,6 +1031,7 @@ dependencies = [
 name = "scanner-scheduler"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bzip2",
  "crc32fast",
  "crossbeam-channel",
@@ -1275,9 +1276,9 @@ checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "vectorscan-rs-sys"
-version = "0.0.5"
+version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "473f4b86c4c9e42140712b9790079bca554f6341c8ce19f0f1a3ad3b9509dbd5"
+checksum = "195d07e20b78923c2e8542f95a9bfd31d0cacf19f9134181c292b84055c5c7c1"
 dependencies = [
  "cmake",
  "flate2",

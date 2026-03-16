@@ -14,7 +14,7 @@ default = []
 test-support = ["dep:testcontainers"]
 
 [dependencies]
-postgres = "0.19"
+postgres.workspace = true
 blake3 = "1.8"
 testcontainers = { workspace = true, optional = true }
 

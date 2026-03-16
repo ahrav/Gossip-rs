@@ -14,10 +14,8 @@ struct RecordedChunk {
 
 /// Captured events for a single entry start/chunk*/end cycle.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RecordedEntry {
     display_path: Vec<u8>,
-    size_hint: u64,
     chunks: Vec<RecordedChunk>,
 }
 
@@ -55,7 +53,6 @@ impl ArchiveEntrySink for RecordingSink {
         );
         self.current = Some(RecordedEntry {
             display_path: meta.display_path.to_vec(),
-            size_hint: meta.size_hint,
             chunks: Vec::new(),
         });
         Ok(())

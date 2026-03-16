@@ -150,7 +150,11 @@ pub(crate) trait IdleHooks {
 /// - `shared_state_*` operations follow the combined `(count<<1)|accepting` layout.
 /// - `pop_local` is LIFO; `steal_from_victim` is FIFO for stolen tasks.
 /// - `record_panic` must signal shutdown and wake sleeping workers.
-#[allow(dead_code)] // Trait surface reserves hooks for alternate schedulers.
+///
+/// Implemented by both `WorkerCtx` (production, `executor.rs`) and
+/// `SimExecutor` (deterministic harness, `sim_executor_harness.rs`).
+/// Not all methods are called in every feature configuration.
+#[allow(dead_code)]
 pub(crate) trait WorkerCtxLike<T, S> {
     fn worker_id(&self) -> usize;
     fn worker_count(&self) -> usize;
