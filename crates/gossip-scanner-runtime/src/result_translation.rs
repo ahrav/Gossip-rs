@@ -16,7 +16,7 @@
 //! - observations are deduplicated by `ObservationId`;
 //! - `done_ledger.findings_count` is the number of distinct stable findings.
 //!
-//! Span identity comes only from [`FsFindingRecord::span_start`] and
+//! Occurrence span boundaries come only from [`FsFindingRecord::span_start`] and
 //! [`FsFindingRecord::span_end`]. Root-hint fields remain scanner-local
 //! metadata and never participate in persistence identity derivation.
 
@@ -50,18 +50,37 @@ pub struct ScanTiming {
 }
 
 impl ScanTiming {
+    /// Construct item-local scan timing metadata, returning an error when
+    /// `started_at` exceeds `finished_at`.
+    #[inline]
+    pub fn try_new(
+        started_at: LogicalTime,
+        finished_at: LogicalTime,
+    ) -> Result<Self, ResultTranslationError> {
+        if started_at.as_raw() > finished_at.as_raw() {
+            return Err(ResultTranslationError::InvalidScanTiming {
+                started_at: started_at.as_raw(),
+                finished_at: finished_at.as_raw(),
+            });
+        }
+        Ok(Self {
+            started_at,
+            finished_at,
+        })
+    }
+
     /// Construct item-local scan timing metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `started_at > finished_at`. Callers must validate timing
+    /// monotonicity before construction when timestamps originate from
+    /// external sources (connectors, deserialized data). Prefer
+    /// [`Self::try_new`] when the caller can handle the error.
     #[inline]
     #[must_use]
     pub fn new(started_at: LogicalTime, finished_at: LogicalTime) -> Self {
-        assert!(
-            started_at.as_raw() <= finished_at.as_raw(),
-            "scan timing must be monotonic: started_at ({started_at:?}) > finished_at ({finished_at:?})",
-        );
-        Self {
-            started_at,
-            finished_at,
-        }
+        Self::try_new(started_at, finished_at).expect("scan timing must be monotonic")
     }
 
     /// Logical time when scanning began for this item.
@@ -184,7 +203,7 @@ impl PersistenceTranslation {
         &self.observations
     }
 
-    /// Borrow the three-layer findings payload without copying.
+    /// View of the three-layer findings payload as a batch reference.
     #[inline]
     #[must_use]
     pub fn findings_batch(&self) -> FindingsUpsertBatch<'_> {
@@ -227,8 +246,15 @@ pub enum ResultTranslationError {
     InvalidFindingSpan { index: usize, start: u64, end: u64 },
     /// Distinct findings exceeded the `u32` capacity used by done-ledger rows.
     TooManyDistinctFindings { count: usize },
+    /// Scan timing was inverted: `started_at` exceeded `finished_at`.
+    InvalidScanTiming { started_at: u64, finished_at: u64 },
     /// A persistence constructor or validator rejected the translated rows.
     Persistence(PersistenceInputError),
+    /// A persistence constructor rejected a finding at a known index.
+    PersistenceAtIndex {
+        index: usize,
+        source: PersistenceInputError,
+    },
 }
 
 impl fmt::Display for ResultTranslationError {
@@ -244,7 +270,17 @@ impl fmt::Display for ResultTranslationError {
                 f,
                 "distinct finding count {count} exceeds done-ledger u32 capacity",
             ),
+            Self::InvalidScanTiming {
+                started_at,
+                finished_at,
+            } => write!(
+                f,
+                "scan timing inverted: started_at ({started_at}) > finished_at ({finished_at})",
+            ),
             Self::Persistence(err) => write!(f, "persistence translation error: {err}"),
+            Self::PersistenceAtIndex { index, source } => {
+                write!(f, "persistence error at finding index {index}: {source}")
+            }
         }
     }
 }
@@ -252,8 +288,10 @@ impl fmt::Display for ResultTranslationError {
 impl Error for ResultTranslationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Persistence(err) => Some(err),
-            Self::InvalidFindingSpan { .. } | Self::TooManyDistinctFindings { .. } => None,
+            Self::Persistence(err) | Self::PersistenceAtIndex { source: err, .. } => Some(err),
+            Self::InvalidFindingSpan { .. }
+            | Self::TooManyDistinctFindings { .. }
+            | Self::InvalidScanTiming { .. } => None,
         }
     }
 }
@@ -367,6 +405,10 @@ fn translate_findings(
     let location: Option<Arc<_>> = item.location().map(|l| Arc::new(l.clone()));
 
     for (index, finding) in findings_input.iter().enumerate() {
+        // confidence_score is intentionally omitted: the persistence schema does not
+        // carry confidence. It is preserved in IdentityChainRecord (commit_sink path)
+        // for coordination-level diagnostics only.
+
         if finding.span_end <= finding.span_start {
             return Err(ResultTranslationError::InvalidFindingSpan {
                 index,
@@ -389,7 +431,8 @@ fn translate_findings(
             item.version().object_version_id(),
             finding.span_start,
             finding.span_end - finding.span_start,
-        )?;
+        )
+        .map_err(|e| ResultTranslationError::PersistenceAtIndex { index, source: e })?;
         let mut observation_record = ObservationRecord::from_write_context(
             write_context,
             occurrence_record.occurrence_id(),
@@ -967,5 +1010,14 @@ mod tests {
             translated_b.observations()[0].observation_id(),
             "root_hint fields must not participate in ObservationId derivation",
         );
+    }
+
+    #[test]
+    fn inverted_scan_timing_is_rejected() {
+        let later = LogicalTime::from_raw(100);
+        let earlier = LogicalTime::from_raw(50);
+        assert!(ScanTiming::try_new(later, earlier).is_err());
+        // Equal times are accepted (zero-duration scan).
+        assert!(ScanTiming::try_new(later, later).is_ok());
     }
 }

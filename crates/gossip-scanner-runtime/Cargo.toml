@@ -27,5 +27,6 @@ serde_json = "1"
 tracing.workspace = true
 
 [dev-dependencies]
+gossip-persistence-inmemory.workspace = true
 rstest.workspace = true
 tempfile = "3"
