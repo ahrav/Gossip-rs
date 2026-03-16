@@ -17,6 +17,7 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -232,7 +233,7 @@ impl WorkerHarness {
                 }
                 Ok(())
             }
-            Err(AcquireError::ShardTerminal { .. }) => Ok(()),
+            Err(AcquireError::ShardTerminal { .. } | AcquireError::ShardNotFound { .. }) => Ok(()),
             Err(AcquireError::BackendError(err)) => Err(format!(
                 "worker {} acquire {key:?} failed with backend error: {err}",
                 self.worker_index + 1
@@ -482,6 +483,9 @@ impl WorkerHarness {
                 let SplitReplaceResult { children } = outcome.into_inner();
                 self.leases.remove(&key);
                 self.parked_hints.remove(&key.shard());
+                // The parent shard is now terminal; remove it from acquire
+                // candidates. It stays in `discovered_shards` for S7 verification.
+                self.known_shards.remove(&key.shard());
                 for &child in &children {
                     self.known_shards.insert(child);
                     self.report.discovered_shards.insert(child);
@@ -700,13 +704,45 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
                     for round in 0..TOTAL_ROUNDS {
                         barrier_start.wait();
                         if !stop.load(Ordering::Acquire) {
-                            let logical_now = now((round + 10) as u64);
-                            if let Err(err) = harness.run_round(round, logical_now) {
-                                stop.store(true, Ordering::Release);
-                                hard_errors
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .push(err);
+                            let round_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                // Advance time 3x faster in mixed rounds so
+                                // leases acquired early expire mid-test
+                                // (lease duration = 30 ticks).
+                                let base_ticks = if round < ROOT_RACE_ROUNDS {
+                                    (round + 10) as u64
+                                } else {
+                                    ((round - ROOT_RACE_ROUNDS) * 3 + ROOT_RACE_ROUNDS + 10) as u64
+                                };
+                                // Per-worker offset so different workers
+                                // present slightly different clocks.
+                                let logical_now = now(base_ticks + worker_index as u64);
+                                harness.run_round(round, logical_now)
+                            }));
+                            match round_result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => {
+                                    stop.store(true, Ordering::Release);
+                                    if let Ok(mut errors) = hard_errors.lock() {
+                                        errors.push(err);
+                                    }
+                                }
+                                Err(panic_payload) => {
+                                    stop.store(true, Ordering::Release);
+                                    let msg = match panic_payload.downcast_ref::<&str>() {
+                                        Some(s) => (*s).to_string(),
+                                        None => panic_payload
+                                            .downcast_ref::<String>()
+                                            .cloned()
+                                            .unwrap_or_else(|| "unknown panic".to_string()),
+                                    };
+                                    if let Ok(mut errors) = hard_errors.lock() {
+                                        errors.push(format!(
+                                            "worker {} panicked in round {round}: \
+                                             {msg}",
+                                            worker_index + 1
+                                        ));
+                                    }
+                                }
                             }
                         }
                         barrier_end.wait();
@@ -734,6 +770,14 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
             .extend(report.discovered_shards.iter().copied());
     }
 
+    if aggregate.discovered_shards.len() <= ROOT_RACE_ROUNDS {
+        return Err(format!(
+            "expected splits to produce new shards beyond the {ROOT_RACE_ROUNDS} roots, \
+             but only discovered {} total shard IDs",
+            aggregate.discovered_shards.len()
+        ));
+    }
+
     assert_single_winner_per_race(&reports)?;
     verify_quiescent_state(&namespace, &aggregate.discovered_shards)?;
 
@@ -758,6 +802,12 @@ fn seed_shared_namespace(namespace: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Verify structural invariants at quiescence.
+///
+/// The `InvariantChecker` runs once after all workers have finished, so it
+/// can only verify structural invariants (S4, S6, S7), static state (S1, S8),
+/// and counter conservation. Temporal invariants (S2, S3, S5) require
+/// per-step checking, which the differential oracle test provides.
 fn verify_quiescent_state(
     namespace: &str,
     discovered_shards: &BTreeSet<ShardId>,
@@ -823,11 +873,18 @@ fn assert_single_winner_per_race(reports: &[ThreadReport]) -> Result<(), String>
             .filter_map(|report| report.acquire_races.get(&root_id))
             .filter(|outcome| matches!(outcome, AcquireRaceOutcome::LostContention))
             .count();
-        if winners != 1 || losers != N_WORKERS - 1 {
+        let total = winners + losers;
+        if total != N_WORKERS {
             return Err(format!(
-                "expected exactly one winner and {} losers for acquire race on {:?}, got winners={winners}, losers={losers}",
-                N_WORKERS - 1,
-                root_id
+                "acquire race on {root_id:?}: only {total}/{N_WORKERS} workers recorded \
+                 an outcome (winners={winners}, losers={losers}); {} workers did not participate",
+                N_WORKERS - total
+            ));
+        }
+        if winners != 1 {
+            return Err(format!(
+                "expected exactly one winner for acquire race on {root_id:?}, \
+                 got winners={winners}, losers={losers}",
             ));
         }
     }
@@ -845,11 +902,13 @@ fn root_manifest() -> [InitialShardInput<'static>; ROOT_RACE_ROUNDS] {
 }
 
 fn root_shards() -> [(ShardId, &'static [u8], &'static [u8]); ROOT_RACE_ROUNDS] {
+    // Wide byte ranges (64 bytes each) allow deeper split trees than the
+    // original single-letter ASCII ranges.
     [
-        (ShardId::from_raw(0x9020_1401), b"a", b"g"),
-        (ShardId::from_raw(0x9020_1402), b"g", b"n"),
-        (ShardId::from_raw(0x9020_1403), b"n", b"t"),
-        (ShardId::from_raw(0x9020_1404), b"t", b"z"),
+        (ShardId::from_raw(0x9020_1401), &[0x00], &[0x40]),
+        (ShardId::from_raw(0x9020_1402), &[0x40], &[0x80]),
+        (ShardId::from_raw(0x9020_1403), &[0x80], &[0xC0]),
+        (ShardId::from_raw(0x9020_1404), &[0xC0], &[0xFF]),
     ]
 }
 

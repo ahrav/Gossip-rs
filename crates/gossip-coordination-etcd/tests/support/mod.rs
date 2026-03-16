@@ -117,6 +117,14 @@ impl ObservedEtcdCoordinator {
     ///   the cache and the known-set.
     /// - **Run deleted**: purge all cached state for the `(tenant, run)`.
     /// - **Read error**: panic — test infrastructure failures are not recoverable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the etcd read for the run record or any known shard fails.
+    /// A read failure during invariant checking indicates a broken test
+    /// environment, not a recoverable condition. Callers in the contention
+    /// harness catch these panics via `std::panic::catch_unwind` in the
+    /// worker loop.
     pub fn refresh_run_state(&mut self, tenant: TenantId, run: RunId, context: &'static str) {
         let run_key = (tenant, run);
         match self.inner.test_load_run_snapshot(tenant, run) {
