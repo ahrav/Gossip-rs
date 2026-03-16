@@ -82,6 +82,12 @@ impl ScanEngine for DuplicateDropEngine {
         "dup"
     }
 
+    fn rule_fingerprint_bytes(&self, _rule_id: u32) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_derive_key("gossip/rule/v1");
+        h.update(b"dup");
+        *h.finalize().as_bytes()
+    }
+
     fn max_findings_per_chunk(&self) -> usize {
         8
     }
@@ -153,6 +159,12 @@ impl ScanEngine for DistinctHashEngine {
 
     fn rule_name(&self, _rule_id: u32) -> &str {
         "distinct-hash"
+    }
+
+    fn rule_fingerprint_bytes(&self, _rule_id: u32) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_derive_key("gossip/rule/v1");
+        h.update(b"distinct-hash");
+        *h.finalize().as_bytes()
     }
 
     fn max_findings_per_chunk(&self) -> usize {
