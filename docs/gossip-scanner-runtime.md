@@ -449,8 +449,9 @@ pub struct DistributedRuntimeConfig {
 `ShardLease<A>` is the hand-off object from coordination into the worker loop.
 It keeps the string shard label used for recorder routing separate from the
 numeric shard identity carried inside `WriteContext`. Construction via
-`ShardLease::new` asserts at construction that the assignment and
-write context agree on policy scope.
+`ShardLease::new` validates that the assignment and write context agree on
+policy scope, returning `PolicyMismatchError` on divergence so the worker
+loop can skip the shard instead of crashing.
 
 `DistributedCoordinator<A>` defines the coordination callbacks the runtime
 needs around a single lease: acquire, release, receipt-derived completion,
