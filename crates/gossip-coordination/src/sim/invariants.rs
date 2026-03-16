@@ -205,9 +205,10 @@ pub enum InvariantViolation {
 /// Composite key for per-shard temporal history.
 ///
 /// Scoped by `TenantId` so a single [`InvariantChecker`] can validate
-/// multiple tenants without cross-contamination. Uses a tuple rather than
-/// `ShardKey` because `ShardKey` intentionally omits `Ord` (it is an opaque
-/// identity, not an ordered quantity), and `BTreeMap` requires `Ord` keys.
+/// multiple tenants without cross-contamination. Uses a `(TenantId, RunId,
+/// ShardId)` tuple rather than `ShardKey` because `ShardKey` covers only
+/// `(RunId, ShardId)` — the `TenantId` dimension is needed here for
+/// multi-tenant history isolation.
 type HistoryKey = (TenantId, RunId, ShardId);
 
 /// Stateful external observer that tracks per-shard history across
@@ -224,9 +225,9 @@ type HistoryKey = (TenantId, RunId, ShardId);
 ///
 /// Map keys include `TenantId` so a single checker instance can validate
 /// multiple tenants without cross-contamination. Uses `BTreeMap` for
-/// deterministic iteration order. `ShardKey` intentionally omits `Ord`
-/// (it is an opaque identity, not an ordered quantity), so the raw
-/// `(TenantId, RunId, ShardId)` tuple serves as a comparable surrogate.
+/// deterministic iteration order. Keys are `(TenantId, RunId, ShardId)`
+/// tuples rather than `ShardKey` because `ShardKey` covers only the
+/// `(RunId, ShardId)` pair — the `TenantId` dimension is needed here.
 pub struct InvariantChecker {
     /// Last-seen fence epoch per (tenant, run, shard), for S2 monotonicity.
     prev_epochs: BTreeMap<HistoryKey, FenceEpoch>,

@@ -666,10 +666,10 @@ const MAX_STALE_LEASES: usize = 64;
 
 /// Saved checkpoint data for idempotency and conflict testing.
 ///
-/// Keyed by `(worker_raw, run_raw, shard_raw)` because `ShardKey` intentionally
-/// omits `Ord` (it is an opaque identity, not an ordered quantity). Each entry
-/// stores the `(OpId, last_key, WorkerId, ShardKey)` from the last successful
-/// checkpoint, enabling:
+/// Keyed by `(worker_raw, run_raw, shard_raw)` because the key includes a
+/// `WorkerId` dimension that `ShardKey` does not carry. Each entry stores the
+/// `(OpId, last_key, WorkerId, ShardKey)` from the last successful checkpoint,
+/// enabling:
 ///
 /// - [`SimOp::ReplayCheckpoint`]: resubmit the same OpId + same payload to
 ///   exercise idempotent deduplication.
@@ -681,9 +681,9 @@ const MAX_STALE_LEASES: usize = 64;
 /// dedup window is bounded and older ops may already be evicted.
 /// Per-(worker, run, shard) checkpoint history for replay/conflict testing.
 ///
-/// Key is `(worker_raw, run_raw, shard_raw)` using raw `u64` identifiers
-/// because `ShardKey` omits `Ord`. Value stores the last successful
-/// checkpoint's `(OpId, last_key_bytes, WorkerId, ShardKey)`.
+/// Key is `(worker_raw, run_raw, shard_raw)` because the key includes a
+/// `WorkerId` dimension that `ShardKey` does not carry. Value stores the
+/// last successful checkpoint's `(OpId, last_key_bytes, WorkerId, ShardKey)`.
 type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Vec<u8>, WorkerId, ShardKey)>;
 
 /// Stack-owned copy of a shard's spec bounds: `(start_buf, start_len, end_buf, end_len)`.
@@ -850,7 +850,7 @@ pub struct CoordinationSim<B: SimulationBackend = InMemoryCoordinator> {
     /// zombie checkpoint injection to exercise the `StaleFence` path.
     stale_leases: Vec<(WorkerId, ShardKey, Lease)>,
     /// Last successful checkpoint info per `(worker_raw, run_raw, shard_raw)`.
-    /// Uses raw u64 keys because `ShardKey` intentionally omits `Ord`.
+    /// Uses `(worker, run, shard)` raw keys because the key includes `WorkerId`.
     last_checkpoint_ops: CheckpointOpMap,
     /// Shard IDs per run, used to seed run records for `claim_next_available`.
     run_shard_ids: BTreeMap<RunId, Vec<ShardId>>,

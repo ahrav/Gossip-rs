@@ -18,31 +18,6 @@ use gossip_coordination::{
 };
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdTestShardSnapshot};
 
-/// Composite key for the `ObservedEtcdCoordinator` shard cache.
-///
-/// `ShardKey` intentionally omits `Ord`, so this struct unpacks its components
-/// into `Ord`-capable fields for use in `BTreeMap`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ShardCacheKey {
-    tenant: TenantId,
-    run: RunId,
-    shard: ShardId,
-}
-
-impl ShardCacheKey {
-    pub fn from_parts(tenant: TenantId, key: ShardKey) -> Self {
-        Self {
-            tenant,
-            run: key.run(),
-            shard: key.shard(),
-        }
-    }
-
-    fn shard_key(self) -> ShardKey {
-        ShardKey::new(self.run, self.shard)
-    }
-}
-
 /// Adapter that pairs a real [`EtcdCoordinator`] with a local cache so tests
 /// can observe shard and run state through [`SimIntrospection`].
 ///
@@ -65,8 +40,8 @@ pub struct ObservedEtcdCoordinator {
     inner: EtcdCoordinator,
     /// Cached run records, keyed by `(tenant, run)`.
     runs: BTreeMap<(TenantId, RunId), RunRecord>,
-    /// Cached shard snapshots, keyed by `(tenant, run, shard)`.
-    shards: BTreeMap<ShardCacheKey, EtcdTestShardSnapshot>,
+    /// Cached shard snapshots, keyed by `(TenantId, ShardKey)`.
+    shards: BTreeMap<(TenantId, ShardKey), EtcdTestShardSnapshot>,
     /// Known shard IDs per `(tenant, run)`. Drives the per-shard refresh loop
     /// in [`Self::refresh_run_state`] — only IDs present here are re-fetched
     /// from etcd.
@@ -75,7 +50,7 @@ pub struct ObservedEtcdCoordinator {
 
 /// Iterator adapter for [`SimIntrospection::shards`] on the observation cache.
 pub struct ObservedEtcdShardIter<'a> {
-    inner: std::collections::btree_map::Iter<'a, ShardCacheKey, EtcdTestShardSnapshot>,
+    inner: std::collections::btree_map::Iter<'a, (TenantId, ShardKey), EtcdTestShardSnapshot>,
 }
 
 /// Iterator adapter for [`SimIntrospection::runs`] on the observation cache.
@@ -122,9 +97,8 @@ impl ObservedEtcdCoordinator {
     ///
     /// Panics if the etcd read for the run record or any known shard fails.
     /// A read failure during invariant checking indicates a broken test
-    /// environment, not a recoverable condition. Callers in the contention
-    /// harness catch these panics via `std::panic::catch_unwind` in the
-    /// worker loop.
+    /// environment, not a recoverable condition. Callers that need fault
+    /// tolerance should wrap mutation sequences in `std::panic::catch_unwind`.
     pub fn refresh_run_state(&mut self, tenant: TenantId, run: RunId, context: &'static str) {
         let run_key = (tenant, run);
         match self.inner.test_load_run_snapshot(tenant, run) {
@@ -134,8 +108,7 @@ impl ObservedEtcdCoordinator {
             Ok(None) => {
                 self.runs.remove(&run_key);
                 self.known_shards.remove(&run_key);
-                self.shards
-                    .retain(|key, _| (key.tenant, key.run) != run_key);
+                self.shards.retain(|&(t, k), _| (t, k.run()) != run_key);
                 return;
             }
             Err(err) => panic!("{context}: failed to refresh run snapshot for {run:?}: {err}"),
@@ -152,11 +125,10 @@ impl ObservedEtcdCoordinator {
             let key = ShardKey::new(run, shard_id);
             match self.inner.test_load_shard_snapshot(tenant, key) {
                 Ok(Some(snapshot)) => {
-                    self.shards
-                        .insert(ShardCacheKey::from_parts(tenant, key), snapshot);
+                    self.shards.insert((tenant, key), snapshot);
                 }
                 Ok(None) => {
-                    self.shards.remove(&ShardCacheKey::from_parts(tenant, key));
+                    self.shards.remove(&(tenant, key));
                     missing.push(shard_id);
                 }
                 Err(err) => {
@@ -198,11 +170,7 @@ impl ObservedEtcdCoordinator {
     /// is not in the cache — this would indicate a harness bug where the cache
     /// drifted from the iteration set.
     fn snapshot_for_record<'a>(&'a self, record: &ShardRecord) -> &'a EtcdTestShardSnapshot {
-        let key = ShardCacheKey {
-            tenant: record.tenant,
-            run: record.run,
-            shard: record.shard,
-        };
+        let key = (record.tenant, ShardKey::new(record.run, record.shard));
         self.shards
             .get(&key)
             .expect("observed etcd cache must contain any record yielded by shards()")
@@ -215,7 +183,7 @@ impl<'a> Iterator for ObservedEtcdShardIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .next()
-            .map(|(key, snapshot)| ((key.tenant, key.shard_key()), &**snapshot))
+            .map(|(&(tenant, key), snapshot)| ((tenant, key), &**snapshot))
     }
 }
 
@@ -259,7 +227,7 @@ impl SimIntrospection for ObservedEtcdCoordinator {
 
     fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
         self.shards
-            .get(&ShardCacheKey::from_parts(*tenant, *key))
+            .get(&(*tenant, *key))
             .map(|snapshot| &**snapshot)
     }
 
@@ -290,6 +258,8 @@ impl SimIntrospection for ObservedEtcdCoordinator {
             .into_iter()
     }
 
+    /// No-op: each snapshot owns its own `ByteSlab`, so pooled fields are
+    /// freed automatically when the snapshot drops.
     fn release_record_fields(&mut self, _record: &mut ShardRecord) {}
 }
 

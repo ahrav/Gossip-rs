@@ -17,6 +17,7 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -145,6 +146,20 @@ impl WorkerHarness {
         }
     }
 
+    fn backend_err(&self, op: &str, key: ShardKey, err: impl fmt::Display) -> String {
+        format!(
+            "worker {} {op} {key:?} failed with backend error: {err}",
+            self.worker_index + 1
+        )
+    }
+
+    fn unexpected_err(&self, op: &str, key: ShardKey, err: impl fmt::Debug) -> String {
+        format!(
+            "worker {} {op} {key:?} returned unexpected error: {err:?}",
+            self.worker_index + 1
+        )
+    }
+
     fn plan_for_round(&mut self, round: usize) -> PlannedOp {
         if round < ROOT_RACE_ROUNDS {
             return PlannedOp::Acquire(root_key_for_round(round));
@@ -233,15 +248,17 @@ impl WorkerHarness {
                 }
                 Ok(())
             }
+            Err(
+                err @ (AcquireError::ShardTerminal { .. } | AcquireError::ShardNotFound { .. }),
+            ) if strict_race => Err(format!(
+                "worker {} acquire {:?} in root-race phase hit non-contention error \
+                 (expected only Won/AlreadyLeased): {err:?}",
+                self.worker_index + 1,
+                key,
+            )),
             Err(AcquireError::ShardTerminal { .. } | AcquireError::ShardNotFound { .. }) => Ok(()),
-            Err(AcquireError::BackendError(err)) => Err(format!(
-                "worker {} acquire {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} acquire {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            Err(AcquireError::BackendError(err)) => Err(self.backend_err("acquire", key, err)),
+            Err(err) => Err(self.unexpected_err("acquire", key, err)),
         }
     }
 
@@ -273,14 +290,8 @@ impl WorkerHarness {
                 self.leases.remove(&key);
                 Ok(())
             }
-            Err(RenewError::BackendError(err)) => Err(format!(
-                "worker {} renew {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} renew {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            Err(RenewError::BackendError(err)) => Err(self.backend_err("renew", key, err)),
+            Err(err) => Err(self.unexpected_err("renew", key, err)),
         }
     }
 
@@ -320,14 +331,10 @@ impl WorkerHarness {
                 self.leases.remove(&key);
                 Ok(())
             }
-            Err(CheckpointError::BackendError(err)) => Err(format!(
-                "worker {} checkpoint {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} checkpoint {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            Err(CheckpointError::BackendError(err)) => {
+                Err(self.backend_err("checkpoint", key, err))
+            }
+            Err(err) => Err(self.unexpected_err("checkpoint", key, err)),
         }
     }
 
@@ -366,14 +373,8 @@ impl WorkerHarness {
                 self.leases.remove(&key);
                 Ok(())
             }
-            Err(CompleteError::BackendError(err)) => Err(format!(
-                "worker {} complete {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} complete {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            Err(CompleteError::BackendError(err)) => Err(self.backend_err("complete", key, err)),
+            Err(err) => Err(self.unexpected_err("complete", key, err)),
         }
     }
 
@@ -409,14 +410,8 @@ impl WorkerHarness {
                 self.leases.remove(&key);
                 Ok(())
             }
-            Err(ParkError::BackendError(err)) => Err(format!(
-                "worker {} park {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} park {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            Err(ParkError::BackendError(err)) => Err(self.backend_err("park", key, err)),
+            Err(err) => Err(self.unexpected_err("park", key, err)),
         }
     }
 
@@ -440,15 +435,14 @@ impl WorkerHarness {
                 UnparkError::NotParked { .. }
                 | UnparkError::RunTerminal { .. }
                 | UnparkError::ShardNotFound,
-            ) => Ok(()),
-            Err(UnparkError::BackendError(err)) => Err(format!(
-                "worker {} unpark {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} unpark {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            ) => {
+                // Shard is not actually parked (or no longer exists); clear
+                // the stale hint so future rounds don't retry unpark on it.
+                self.parked_hints.remove(&key.shard());
+                Ok(())
+            }
+            Err(UnparkError::BackendError(err)) => Err(self.backend_err("unpark", key, err)),
+            Err(err) => Err(self.unexpected_err("unpark", key, err)),
         }
     }
 
@@ -502,14 +496,10 @@ impl WorkerHarness {
                 self.leases.remove(&key);
                 Ok(())
             }
-            Err(SplitReplaceError::BackendError(err)) => Err(format!(
-                "worker {} split_replace {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} split_replace {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            Err(SplitReplaceError::BackendError(err)) => {
+                Err(self.backend_err("split_replace", key, err))
+            }
+            Err(err) => Err(self.unexpected_err("split_replace", key, err)),
         }
     }
 
@@ -559,14 +549,10 @@ impl WorkerHarness {
                 self.leases.remove(&key);
                 Ok(())
             }
-            Err(SplitResidualError::BackendError(err)) => Err(format!(
-                "worker {} split_residual {key:?} failed with backend error: {err}",
-                self.worker_index + 1
-            )),
-            Err(err) => Err(format!(
-                "worker {} split_residual {key:?} returned unexpected error: {err:?}",
-                self.worker_index + 1
-            )),
+            Err(SplitResidualError::BackendError(err)) => {
+                Err(self.backend_err("split_residual", key, err))
+            }
+            Err(err) => Err(self.unexpected_err("split_residual", key, err)),
         }
     }
 
@@ -696,11 +682,38 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
                 let stop = Arc::clone(&stop);
                 let hard_errors = Arc::clone(&hard_errors);
                 scope.spawn(move || {
-                    let mut harness = WorkerHarness::new(
-                        worker_index,
-                        &namespace,
-                        seed ^ ((worker_index as u64 + 1) << 32),
-                    );
+                    let mut harness = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        WorkerHarness::new(
+                            worker_index,
+                            &namespace,
+                            seed ^ ((worker_index as u64 + 1) << 32),
+                        )
+                    })) {
+                        Ok(h) => h,
+                        Err(panic_payload) => {
+                            stop.store(true, Ordering::Release);
+                            let msg = match panic_payload.downcast_ref::<&str>() {
+                                Some(s) => (*s).to_string(),
+                                None => panic_payload
+                                    .downcast_ref::<String>()
+                                    .cloned()
+                                    .unwrap_or_else(|| "unknown panic".to_string()),
+                            };
+                            hard_errors
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(format!(
+                                    "worker {} panicked during construction: {msg}",
+                                    worker_index + 1
+                                ));
+                            // Drain barriers so other threads are not stuck waiting.
+                            for _ in 0..TOTAL_ROUNDS {
+                                barrier_start.wait();
+                                barrier_end.wait();
+                            }
+                            return ThreadReport::default();
+                        }
+                    };
                     for round in 0..TOTAL_ROUNDS {
                         barrier_start.wait();
                         if !stop.load(Ordering::Acquire) {
@@ -722,9 +735,10 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
                                 Ok(Ok(())) => {}
                                 Ok(Err(err)) => {
                                     stop.store(true, Ordering::Release);
-                                    if let Ok(mut errors) = hard_errors.lock() {
-                                        errors.push(err);
-                                    }
+                                    hard_errors
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(err);
                                 }
                                 Err(panic_payload) => {
                                     stop.store(true, Ordering::Release);
@@ -735,13 +749,13 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
                                             .cloned()
                                             .unwrap_or_else(|| "unknown panic".to_string()),
                                     };
-                                    if let Ok(mut errors) = hard_errors.lock() {
-                                        errors.push(format!(
+                                    hard_errors.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                        format!(
                                             "worker {} panicked in round {round}: \
                                              {msg}",
                                             worker_index + 1
-                                        ));
-                                    }
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -757,9 +771,9 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
             .collect()
     });
 
-    let hard_errors = hard_errors.lock().unwrap();
-    if let Some(err) = hard_errors.first() {
-        return Err(err.clone());
+    let hard_errors = hard_errors.lock().unwrap_or_else(|e| e.into_inner());
+    if !hard_errors.is_empty() {
+        return Err(hard_errors.join("\n---\n"));
     }
 
     let mut aggregate = ThreadReport::default();
@@ -770,12 +784,15 @@ fn run_seed(seed: u64) -> Result<ThreadReport, String> {
             .extend(report.discovered_shards.iter().copied());
     }
 
+    // Split success depends on CAS contention outcomes and scheduling;
+    // individual seeds may not produce splits. The suite-level aggregate
+    // assertion enforces overall split coverage across all seeds.
     if aggregate.discovered_shards.len() <= ROOT_RACE_ROUNDS {
-        return Err(format!(
-            "expected splits to produce new shards beyond the {ROOT_RACE_ROUNDS} roots, \
-             but only discovered {} total shard IDs",
+        eprintln!(
+            "note: seed did not observe splits beyond the {ROOT_RACE_ROUNDS} roots \
+             (discovered {} total shard IDs); suite-level check will enforce coverage",
             aggregate.discovered_shards.len()
-        ));
+        );
     }
 
     assert_single_winner_per_race(&reports)?;
@@ -790,7 +807,7 @@ fn seed_shared_namespace(namespace: &str) -> Result<(), String> {
         .create_run(now(1), test_tenant(), run_id(), short_lease_run_config())
         .map_err(|err| format!("create_run failed during setup: {err}"))?;
     let manifest = root_manifest();
-    let _ = setup
+    let outcome = setup
         .register_shards(
             now(2),
             test_tenant(),
@@ -799,20 +816,31 @@ fn seed_shared_namespace(namespace: &str) -> Result<(), String> {
             OpId::from_raw(1),
         )
         .map_err(|err| format!("register_shards failed during setup: {err}"))?;
+    assert!(
+        matches!(outcome, gossip_coordination::IdempotentOutcome::Executed(_)),
+        "expected fresh registration in unique namespace, got replayed outcome"
+    );
     Ok(())
 }
 
 /// Verify structural invariants at quiescence.
 ///
 /// The `InvariantChecker` runs once after all workers have finished, so it
-/// can only verify structural invariants (S4, S6, S7), static state (S1, S8),
-/// and counter conservation. Temporal invariants (S2, S3, S5) require
+/// can only verify structural invariants (S4 record validity, S6 cursor bounds,
+/// S7 split coverage), static state (S1 mutual exclusion, S8 run-terminal
+/// irreversibility), and counter conservation. Temporal invariants (S2, S3, S5) require
 /// per-step checking, which the differential oracle test provides.
 fn verify_quiescent_state(
     namespace: &str,
     discovered_shards: &BTreeSet<ShardId>,
 ) -> Result<(), String> {
-    let final_now = now((TOTAL_ROUNDS + 10) as u64);
+    // Mirror the worker time formula: the last mixed round (TOTAL_ROUNDS - 1)
+    // produces base_ticks = (MIXED_ROUNDS - 1) * 3 + ROOT_RACE_ROUNDS + 10,
+    // plus the maximum per-worker offset (N_WORKERS - 1). Add a margin past
+    // the lease duration so the checker observes a truly quiescent post-expiry
+    // state.
+    let max_worker_tick = ((MIXED_ROUNDS - 1) * 3 + ROOT_RACE_ROUNDS + 10 + (N_WORKERS - 1)) as u64;
+    let final_now = now(max_worker_tick + 50);
     let mut observed = ObservedEtcdCoordinator::new(test_coordinator_in_namespace(namespace));
     observed.note_run(test_tenant(), run_id());
     observed.note_shards(test_tenant(), run_id(), discovered_shards.iter().copied());
@@ -902,8 +930,8 @@ fn root_manifest() -> [InitialShardInput<'static>; ROOT_RACE_ROUNDS] {
 }
 
 fn root_shards() -> [(ShardId, &'static [u8], &'static [u8]); ROOT_RACE_ROUNDS] {
-    // Wide byte ranges (64 bytes each) allow deeper split trees than the
-    // original single-letter ASCII ranges.
+    // Wide single-byte ranges (~64 values each) allow multiple levels of
+    // binary splits before the range becomes too narrow.
     [
         (ShardId::from_raw(0x9020_1401), &[0x00], &[0x40]),
         (ShardId::from_raw(0x9020_1402), &[0x40], &[0x80]),
@@ -1007,15 +1035,19 @@ fn op_id_for_round(round: usize, worker_index: usize) -> OpId {
 
 fn parse_seed_count(default: usize) -> usize {
     match std::env::var("GOSSIP_CAS_SEEDS") {
-        Ok(value) => value.parse().unwrap_or(default),
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|err| panic!("GOSSIP_CAS_SEEDS={value:?} is not a valid usize: {err}")),
         Err(_) => default,
     }
 }
 
 fn parse_single_seed() -> Option<u64> {
-    std::env::var("GOSSIP_CAS_SEED")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    std::env::var("GOSSIP_CAS_SEED").ok().map(|value| {
+        value
+            .parse()
+            .unwrap_or_else(|err| panic!("GOSSIP_CAS_SEED={value:?} is not a valid u64: {err}"))
+    })
 }
 
 fn selected_seeds(default_count: usize) -> Vec<u64> {

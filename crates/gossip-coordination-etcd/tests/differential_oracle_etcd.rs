@@ -71,12 +71,12 @@ use gossip_coordination::sim::test_util::arb_sim_op;
 use gossip_coordination::sim::{CoordinationSim, FaultLevel, SimIntrospection, SimOp};
 use gossip_coordination::{
     LogicalTime, OpId, OpKind, RunConfig, RunId, RunOpKind, RunOpResult, RunRecord, RunStatus,
-    ShardId, ShardRecord, ShardStatus, TenantId, WorkerId,
+    ShardId, ShardKey, ShardRecord, ShardStatus, TenantId, WorkerId,
 };
 use gossip_coordination_etcd::test_support::test_coordinator_with_tuning;
 use gossip_coordination_etcd::{EtcdCoordinatorConfig, SimEtcdCoordinator};
 use proptest::prelude::*;
-use support::{ObservedEtcdCoordinator, ShardCacheKey};
+use support::ObservedEtcdCoordinator;
 
 // ---------------------------------------------------------------------------
 // Simulation topology constants
@@ -185,7 +185,7 @@ struct ComparableRunState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComparableBackendState {
     runs: BTreeMap<(TenantId, RunId), ComparableRunState>,
-    shards: BTreeMap<ShardCacheKey, ComparableShardState>,
+    shards: BTreeMap<(TenantId, ShardKey), ComparableShardState>,
 }
 
 // Tripwire: if ShardRecord or RunRecord layout changes, audit `comparable_state`
@@ -452,7 +452,7 @@ fn comparable_state<B: SimIntrospection>(backend: &B) -> Result<ComparableBacken
             .collect();
 
         shards.insert(
-            ShardCacheKey::from_parts(tenant, key),
+            (tenant, key),
             ComparableShardState {
                 status: record.status,
                 park_reason: record.park_reason,
