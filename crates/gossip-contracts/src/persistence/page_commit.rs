@@ -71,11 +71,11 @@ use crate::{
 };
 
 use super::{
+    WriteContext,
     commit::{
         CheckpointCommitReceipt, CommitHandle, DoneLedgerCommitReceipt, FindingsCommitReceipt,
         ItemCommitReceipt, PageCommitReceipt,
     },
-    WriteContext,
 };
 
 /// Semantic domain for a durable checkpoint boundary.
