@@ -321,10 +321,16 @@ impl std::error::Error for TestWaitError {}
 /// Returns `None` when the variable is absent. Panics with a descriptive
 /// message when the variable is present but not a valid `u64`.
 pub fn parse_env_seed(var: &str) -> Option<u64> {
-    std::env::var(var).ok().map(|raw| {
-        raw.parse::<u64>()
-            .unwrap_or_else(|err| panic!("{var}={raw:?} is not a valid u64: {err}"))
-    })
+    match std::env::var(var) {
+        Ok(raw) => Some(
+            raw.parse::<u64>()
+                .unwrap_or_else(|err| panic!("{var}={raw:?} is not a valid u64: {err}")),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            panic!("{var}={raw:?} is not valid Unicode")
+        }
+    }
 }
 
 /// Parse a case count from the environment variable `var`, falling back to
@@ -337,7 +343,10 @@ pub fn parse_env_case_count(var: &str, default: usize) -> usize {
         Ok(raw) => raw
             .parse::<usize>()
             .unwrap_or_else(|err| panic!("{var}={raw:?} is not a valid usize: {err}")),
-        Err(_) => default,
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            panic!("{var}={raw:?} is not valid Unicode")
+        }
     }
 }
 

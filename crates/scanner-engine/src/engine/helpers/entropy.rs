@@ -137,7 +137,6 @@ pub(crate) enum EntropyGateOutcome {
 
 impl EntropyGateOutcome {
     /// Returns true when the candidate should proceed through detection flow.
-    /// Used in bench (feature = "bench") and test configurations.
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn allows_candidate(self) -> bool {
@@ -223,8 +222,6 @@ pub(crate) fn compute_entropy_metrics(
 ///
 /// # Returns
 /// - 0.0 for empty input.
-/// Called from bench wrappers (feature = "bench") and from
-/// `#[cfg(test)]` entropy round-trip tests in this module.
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn shannon_entropy_bits_per_byte(

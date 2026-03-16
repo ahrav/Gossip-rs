@@ -507,8 +507,9 @@ macro_rules! impl_sync_run_management {
                 // protocol-level deadline). Load the record and check.
                 let key = ShardKey::new(run, *shard_id);
                 match self.load_shard_record(tenant, key) {
-                    Ok(Some(persisted)) if persisted.record.is_leased_at(now) => {
-                        // Coordination lease still active — not a candidate.
+                    Ok(Some(persisted)) if persisted.owner_is_live_at(now) => {
+                        // Owner key present and coordination lease still
+                        // active — not a candidate.
                         if let Some(deadline) = persisted.record.lease_deadline() {
                             earliest_deadline = Some(match earliest_deadline {
                                 Some(prev) => core::cmp::min(prev, deadline),
@@ -1176,7 +1177,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                 // have expired. Load the record to check the deadline.
                 let key = ShardKey::new(run, *id);
                 match self.load_shard_record(tenant, key).await {
-                    Ok(Some(persisted)) if persisted.record.is_leased_at(now) => {
+                    Ok(Some(persisted)) if persisted.owner_is_live_at(now) => {
                         if let Some(deadline) = persisted.record.lease_deadline() {
                             earliest_deadline = Some(match earliest_deadline {
                                 Some(prev) => core::cmp::min(prev, deadline),
