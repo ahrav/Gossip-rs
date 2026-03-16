@@ -24,11 +24,11 @@ use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
 use gossip_contracts::{
     connector::ScanItem,
-    identity::{LogicalTime, NormHash, RuleFingerprint, TenantSecretKey, key_secret_hash},
+    identity::{key_secret_hash, LogicalTime, NormHash, RuleFingerprint, TenantSecretKey},
     persistence::{
-        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
-        OvidHash, OvidHashInputs, PersistenceInputError, WriteContext, derive_ovid_hash,
+        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
+        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
+        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceInputError, WriteContext,
     },
 };
 use scanner_scheduler::store::FsFindingRecord;
@@ -404,7 +404,6 @@ fn translate_findings(
         // confidence_score is intentionally omitted: the persistence schema does not
         // carry confidence. It is preserved in IdentityChainRecord (commit_sink path)
         // for coordination-level diagnostics only.
-        let _confidence_score = finding.confidence_score;
 
         if finding.span_end <= finding.span_start {
             return Err(ResultTranslationError::InvalidFindingSpan {
@@ -459,16 +458,16 @@ mod tests {
     use gossip_contracts::{
         connector::{ItemKey, ItemRef, Location, ScanItem, VersionId},
         identity::{
-            FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
-            StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
+            derive_rule_fingerprint, FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash,
+            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, WriteContext},
     };
     use scanner_scheduler::store::FsFindingRecord;
 
     use super::{
-        ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
-        translate_item_result,
+        translate_item_result, ItemResult, PersistenceTranslation, ResultTranslationError,
+        ScanTiming,
     };
 
     /// Test-only rule fingerprint lookup that derives from a synthetic name.
