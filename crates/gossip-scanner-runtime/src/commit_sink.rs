@@ -4,14 +4,15 @@
 //! on enumeration and detection.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use gossip_contracts::{
     connector::{ItemKey, VersionId},
     identity::{
-        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint,
-        StableItemId, TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
+        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, StableItemId,
+        TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
     },
     persistence::WriteContext,
 };
@@ -19,6 +20,7 @@ use gossip_contracts::{
 use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, IdentityChainRecord,
 };
+use crate::result_translation::rule_fingerprint_from_rule_id;
 
 /// Per-item metadata passed to [`CommitSink::begin_item`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +34,7 @@ pub struct ItemMeta {
 }
 
 /// Compact finding record forwarded through the [`CommitSink`] bridge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FindingRecord {
     /// Numeric identifier of the detection rule that matched.
     pub rule_id: u32,
@@ -44,6 +46,18 @@ pub struct FindingRecord {
     pub norm_hash: [u8; 32],
     /// Additive confidence score from gate signals.
     pub confidence_score: i8,
+}
+
+impl fmt::Debug for FindingRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FindingRecord")
+            .field("rule_id", &self.rule_id)
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("norm_hash", &"[redacted]")
+            .field("confidence_score", &self.confidence_score)
+            .finish()
+    }
 }
 
 /// All findings for a single item.
@@ -156,11 +170,18 @@ impl DurableCommitSink {
                 );
                 ObjectVersionId::from_version_bytes(item_key.as_bytes())
             });
+        if finding.end <= finding.start {
+            return Err(anyhow!(
+                "finding has invalid span [{}, {}): end must exceed start",
+                finding.start,
+                finding.end
+            ));
+        }
         let occurrence_id = derive_occurrence_id(&OccurrenceIdInputs {
             finding: finding_id,
             version: object_version,
             byte_offset: finding.start,
-            byte_length: finding.end.saturating_sub(finding.start),
+            byte_length: finding.end - finding.start,
         });
 
         Ok(IdentityChainRecord {
@@ -222,30 +243,14 @@ impl CommitSink for DurableCommitSink {
     }
 }
 
-/// Expand a numeric rule identifier into the fixed fingerprint shape used by
-/// identity derivation.
-///
-/// The 4-byte `rule_id` is written into the first 4 bytes of a 32-byte
-/// `RuleFingerprint`, with the remaining 28 bytes zeroed. This mapping is
-/// injective as long as `rule_id` values are unique within a single engine
-/// instance — guaranteed by `Engine::new`, which assigns rule IDs by
-/// sequential position in the input `Vec<RuleSpec>`.
-///
-/// If rule IDs are ever shared or reused across engine instances within the
-/// same tenant/item scope, the resulting fingerprint collisions would produce
-/// incorrect finding identity chains.
-fn rule_fingerprint_from_rule_id(rule_id: u32) -> RuleFingerprint {
-    let mut bytes = [0u8; 32];
-    bytes[..4].copy_from_slice(&rule_id.to_le_bytes());
-    RuleFingerprint::from_bytes(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use gossip_contracts::{
-        identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey},
+        identity::{
+            FenceEpoch, ObjectVersionId, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey,
+        },
         persistence::WriteContext,
     };
 
@@ -387,5 +392,170 @@ mod tests {
 
         let identity = recorder.identity.lock().expect("identity lock");
         assert!(identity.is_empty(), "identity record must not be produced");
+    }
+
+    #[test]
+    fn invalid_span_is_rejected_not_silently_zeroed() {
+        let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-c"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"path/to/bad.txt").expect("item key");
+        sink.begin_item(
+            &item_key,
+            &ItemMeta {
+                stable_item_id: StableItemId::from_bytes([0x33; 32]),
+                version: None,
+                size_hint: None,
+            },
+        )
+        .expect("begin item");
+
+        // end == start (empty span)
+        let result = sink.upsert_findings(
+            &item_key,
+            &FindingsBatch {
+                findings: vec![FindingRecord {
+                    rule_id: 1,
+                    start: 10,
+                    end: 10,
+                    norm_hash: [0xAA; 32],
+                    confidence_score: 5,
+                }],
+            },
+        );
+        assert!(
+            result.is_err(),
+            "empty span (end == start) must be rejected"
+        );
+
+        // end < start (inverted span)
+        let result = sink.upsert_findings(
+            &item_key,
+            &FindingsBatch {
+                findings: vec![FindingRecord {
+                    rule_id: 2,
+                    start: 20,
+                    end: 15,
+                    norm_hash: [0xBB; 32],
+                    confidence_score: 3,
+                }],
+            },
+        );
+        assert!(
+            result.is_err(),
+            "inverted span (end < start) must be rejected"
+        );
+
+        let identity = recorder.identity.lock().expect("identity lock");
+        assert!(
+            identity.is_empty(),
+            "no identity records should be produced for invalid spans"
+        );
+    }
+
+    #[test]
+    fn durable_commit_sink_uses_explicit_version_for_identity() {
+        let recorder = Arc::new(Recorder::default());
+        let write_context = WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x12; 32]),
+            RunId::from_raw(13),
+            ShardId::from_raw(14),
+            FenceEpoch::from_raw(15),
+        );
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-v"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"path/to/versioned.txt").expect("item key");
+        let versioned_meta = ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x33; 32]),
+            version: Some(VersionId::Strong(ObjectVersionId::from_bytes([0x55; 32]))),
+            size_hint: Some(1024),
+        };
+        sink.begin_item(&item_key, &versioned_meta)
+            .expect("begin item");
+        sink.upsert_findings(
+            &item_key,
+            &FindingsBatch {
+                findings: vec![FindingRecord {
+                    rule_id: 9,
+                    start: 2,
+                    end: 12,
+                    norm_hash: [0x33; 32],
+                    confidence_score: 7,
+                }],
+            },
+        )
+        .expect("upsert findings");
+
+        let versioned_identity = recorder.identity.lock().expect("identity lock");
+        assert_eq!(versioned_identity.len(), 1);
+        assert_eq!(versioned_identity[0].rule_id, 9);
+
+        // The version-present path should produce a different occurrence_id
+        // than the None-version path for the same item key.
+        drop(versioned_identity);
+
+        let recorder2 = Arc::new(Recorder::default());
+        let sink2 = DurableCommitSink::new(
+            recorder2.clone(),
+            Arc::from("shard-v2"),
+            write_context,
+            TenantSecretKey::from_bytes([0x22; 32]),
+        );
+        sink2
+            .begin_item(
+                &item_key,
+                &ItemMeta {
+                    stable_item_id: StableItemId::from_bytes([0x33; 32]),
+                    version: None,
+                    size_hint: None,
+                },
+            )
+            .expect("begin item");
+        sink2
+            .upsert_findings(
+                &item_key,
+                &FindingsBatch {
+                    findings: vec![FindingRecord {
+                        rule_id: 9,
+                        start: 2,
+                        end: 12,
+                        norm_hash: [0x33; 32],
+                        confidence_score: 7,
+                    }],
+                },
+            )
+            .expect("upsert findings");
+
+        let none_identity = recorder2.identity.lock().expect("identity lock");
+        assert_eq!(none_identity.len(), 1);
+        let versioned_identity = recorder.identity.lock().expect("identity lock");
+
+        assert_ne!(
+            versioned_identity[0].occurrence_id, none_identity[0].occurrence_id,
+            "explicit version must produce a different occurrence_id than None-version"
+        );
+        // Finding IDs should be identical (version doesn't affect finding identity).
+        assert_eq!(
+            versioned_identity[0].finding_id, none_identity[0].finding_id,
+            "finding_id is version-independent"
+        );
     }
 }

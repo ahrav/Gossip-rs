@@ -5,6 +5,7 @@
 //! intentionally non-fatal for event emission: commit durability is enforced by
 //! `DurableCommitSink`, while event recording remains best-effort telemetry.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -52,7 +53,7 @@ pub enum CommitProgressRecord {
 ///
 /// Contains all intermediate hashes from norm through occurrence so
 /// downstream systems can verify the derivation chain.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityChainRecord {
     /// Shared routing and fencing metadata for the emitted write.
     pub write_context: WriteContext,
@@ -74,6 +75,23 @@ pub struct IdentityChainRecord {
     pub finding_id: [u8; 32],
     /// Version-specific occurrence identifier.
     pub occurrence_id: [u8; 32],
+}
+
+impl fmt::Debug for IdentityChainRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdentityChainRecord")
+            .field("write_context", &self.write_context)
+            .field("item_key", &self.item_key)
+            .field("rule_id", &self.rule_id)
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("confidence_score", &self.confidence_score)
+            .field("norm_hash", &"[redacted]")
+            .field("secret_hash", &"[redacted]")
+            .field("finding_id", &self.finding_id)
+            .field("occurrence_id", &self.occurrence_id)
+            .finish()
+    }
 }
 
 /// Coordinator-facing recorder for distributed scan output.
