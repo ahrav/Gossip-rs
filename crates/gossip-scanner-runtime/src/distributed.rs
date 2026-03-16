@@ -1,8 +1,11 @@
 //! Foundational distributed runtime types for receipt-driven worker execution.
 //!
-//! This module defines the shared nouns that later worker-loop subtasks build
-//! on: lease payloads, coordinator callbacks, cloned persistence handles,
-//! runtime configuration, run reports, and error layering.
+//! This module defines the shared nouns consumed by the distributed worker
+//! loop: lease payloads ([`ShardLease`]), coordinator callbacks
+//! ([`DistributedCoordinator`]), cloned persistence handles
+//! ([`DistributedPersistence`]), runtime configuration
+//! ([`DistributedRuntimeConfig`]), run reports ([`DistributedRunReport`]),
+//! and error layering ([`DistributedRuntimeError`]).
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -14,6 +17,35 @@ use gossip_contracts::{
     identity::{PolicyHash, TenantSecretKey},
     persistence::WriteContext,
 };
+
+/// Error returned when a [`ShardLease`] construction detects that the
+/// assignment's policy hash does not match the write context's policy hash.
+///
+/// This is a boundary-validation failure: the coordinator adapter produced
+/// inconsistent shard data, typically during rolling policy updates or
+/// coordinator bugs. Surfacing this as a recoverable error lets the worker
+/// loop skip the shard and continue draining the queue instead of crashing.
+#[derive(Debug, Clone)]
+pub struct PolicyMismatchError {
+    /// Shard label that triggered the mismatch.
+    pub shard_id: Arc<str>,
+    /// Policy hash carried by the assignment payload.
+    pub assignment_hash: PolicyHash,
+    /// Policy hash carried by the write context.
+    pub write_context_hash: PolicyHash,
+}
+
+impl fmt::Display for PolicyMismatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "shard {:?}: assignment policy_hash ({:?}) != write_context policy_hash ({:?})",
+            self.shard_id, self.assignment_hash, self.write_context_hash,
+        )
+    }
+}
+
+impl std::error::Error for PolicyMismatchError {}
 
 use crate::{
     ScanBudgets, ScanReport, ScanRuntimeError, coordination_sink::CoordinationEventRecorder,
@@ -45,27 +77,37 @@ pub struct ShardLease<A> {
 }
 
 impl<A: ShardLeaseAssignment> ShardLease<A> {
-    /// Construct a lease payload and assert that the assignment and write
+    /// Construct a lease payload, validating that the assignment and write
     /// context agree on policy scope.
-    #[must_use]
+    ///
+    /// Returns [`PolicyMismatchError`] when the hashes diverge. This is a
+    /// boundary-validation check: the coordinator adapter is responsible for
+    /// producing consistent shard data, but a mismatch must be surfaced as a
+    /// recoverable error so the worker loop can skip the shard instead of
+    /// crashing.
     pub fn new(
         shard_id: Arc<str>,
         assignment: A,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
-    ) -> Self {
-        assert_eq!(
-            assignment.policy_hash(),
-            write_context.policy_hash(),
-            "lease assignment policy_hash must match write_context.policy_hash"
-        );
+    ) -> std::result::Result<Self, PolicyMismatchError> {
+        let assignment_hash = assignment.policy_hash();
+        let write_context_hash = write_context.policy_hash();
 
-        Self {
+        if assignment_hash != write_context_hash {
+            return Err(PolicyMismatchError {
+                shard_id,
+                assignment_hash,
+                write_context_hash,
+            });
+        }
+
+        Ok(Self {
             shard_id,
             assignment,
             write_context,
             tenant_secret_key,
-        }
+        })
     }
 }
 
@@ -118,6 +160,12 @@ impl<A> ShardLease<A> {
 /// recorder access into one surface. The worker loop calls all six methods
 /// on the same coordinator instance. Split into focused traits when a
 /// second implementation or test double needs a subset.
+///
+/// Methods are synchronous so the trait can be used in deterministic
+/// simulation tests without an async runtime. Implementations that wrap
+/// remote I/O should run on a dedicated OS thread or use interior
+/// `block_on`; the worker loop must not call these methods from a Tokio
+/// reactor thread.
 pub trait DistributedCoordinator<A>: Send + Sync
 where
     A: ShardLeaseAssignment,
@@ -153,7 +201,7 @@ where
 ///
 /// The runtime clones these handles per shard. Production backends should make
 /// that cheap, for example by cloning an `Arc` or a pool handle.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DistributedPersistence<F, D>
 where
     F: Clone + Send + Sync,
@@ -201,6 +249,11 @@ impl Default for DistributedRuntimeConfig {
 }
 
 /// Summary report from one distributed runtime invocation.
+///
+/// Invariant: `shards_scanned + shards_skipped_done <= leases_seen`.
+/// The difference (`leases_seen - shards_scanned - shards_skipped_done`)
+/// represents leases that were acquired but released without completion,
+/// for example due to a per-shard runtime error or a coordinator-level skip.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DistributedRunReport {
     /// Total number of leases dequeued from the coordinator.
@@ -287,10 +340,11 @@ mod tests {
             assignment.clone(),
             write_context,
             TenantSecretKey::from_bytes([0x33; 32]),
-        );
+        )
+        .expect("matching hashes should succeed");
 
         assert_eq!(lease.shard_id(), "shard-a");
-        assert_eq!(*lease.assignment(), assignment);
+        assert_eq!(lease.assignment(), &assignment);
         assert_eq!(lease.write_context(), write_context);
         assert_eq!(
             lease.tenant_secret_key(),
@@ -299,8 +353,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "lease assignment policy_hash must match write_context.policy_hash")]
-    fn shard_lease_panics_on_mismatched_policy_hash() {
+    fn shard_lease_rejects_mismatched_policy_hash() {
         let write_context = WriteContext::new(
             TenantId::from_bytes([0x11; 32]),
             PolicyHash::from_bytes([0x22; 32]),
@@ -312,12 +365,17 @@ mod tests {
             policy_hash: PolicyHash::from_bytes([0xFF; 32]),
         };
 
-        let _ = ShardLease::new(
+        let err = ShardLease::new(
             Arc::from("shard-x"),
             assignment,
             write_context,
             TenantSecretKey::from_bytes([0x33; 32]),
-        );
+        )
+        .expect_err("mismatched hashes should fail");
+
+        assert_eq!(&*err.shard_id, "shard-x");
+        assert_eq!(err.assignment_hash, PolicyHash::from_bytes([0xFF; 32]));
+        assert_eq!(err.write_context_hash, PolicyHash::from_bytes([0x22; 32]));
     }
 
     #[test]

@@ -12,7 +12,7 @@
   result-translation, result-committer, checkpoint-aggregator, commit-sink,
   and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
-- distributed runtime placeholder nouns for future worker-loop wiring
+- distributed runtime types: lease payloads, coordinator callbacks, persistence handles, runtime configuration, run reports, and error layering
 
 The crate no longer depends on a separate scan-driver abstraction. Its
 public surface stays stable for callers while direct and connector-mode
@@ -83,7 +83,9 @@ Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
 
-The distributed module currently exports types, not a callable worker entrypoint.
+The distributed module exports foundational types consumed by the worker loop:
+`ShardLease`, `DistributedCoordinator`, `DistributedPersistence`,
+`DistributedRuntimeConfig`, `DistributedRunReport`, and `DistributedRuntimeError`.
 
 ### Family split
 
@@ -91,7 +93,7 @@ The runtime is organized around source families rather than driver traits:
 
 - `ordered_content` covers sources that behave like forward-only item streams
 - `git_repo` covers repository discovery and repository execution paths
-- `distributed` exposes the future worker-loop nouns for family-based execution
+- `distributed` exposes the worker-loop nouns for distributed shard execution
 
 This keeps the public orchestration types available without requiring the
 old cross-crate driver seam.
@@ -486,8 +488,8 @@ The runtime tests focus on the behavior that exists today:
 - bounded execution -> commit backpressure and cancellation semantics
 
 These tests exercise the live local runtime paths for valid filesystem and
-git sources while keeping the distributed placeholder surface covered until
-that worker-loop API is fully wired.
+git sources and verify the distributed type surface (lease construction,
+persistence cloning, config defaults, error layering).
 
 ---
 

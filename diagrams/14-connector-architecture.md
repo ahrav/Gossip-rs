@@ -156,8 +156,8 @@ graph LR
     end
 
     subgraph Runtime["gossip-scanner-runtime"]
-        OCR["<b>OrderedContentRuntime</b><br/>execute_source(...)<br/>filesystem_placeholder(...)"]
-        GRR["<b>GitRepoRuntime</b><br/>execute_discovery(...)<br/>execute_repo(...)<br/>local_repo_placeholder(...)"]
+        OCR["<b>OrderedContentRuntime</b><br/>execute_source(...)<br/>scan_local_filesystem(...)"]
+        GRR["<b>GitRepoRuntime</b><br/>execute_discovery(...)<br/>execute_repo(...)<br/>scan_local_repo(...)"]
         DRT["<b>distributed.rs foundation</b><br/>ShardLease&lt;A&gt;<br/>DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
     end
 
@@ -207,10 +207,10 @@ graph LR
 | Runtime entry | Purpose |
 | ------------- | ------- |
 | `OrderedContentRuntime::execute_source` | Generic ordered-content execution hook |
-| `ordered_content::filesystem_placeholder` | Filesystem-facing ordered-content entrypoint |
+| `ordered_content::scan_local_filesystem` | Filesystem-facing ordered-content entrypoint |
 | `GitRepoRuntime::execute_discovery` | Generic repository-discovery hook |
 | `GitRepoRuntime::execute_repo` | Generic mirror + executor hook |
-| `git_repo::local_repo_placeholder` | Local repository entrypoint |
+| `git_repo::scan_local_repo` | Local repository entrypoint |
 | `distributed.rs` foundation types | Lease, coordinator, persistence, config, and error layer for the distributed worker loop |
 
 **Boundary split.** `gossip-connectors` owns concrete source implementations;
@@ -313,6 +313,6 @@ for system-wide recovery patterns.
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/git.rs` | `GitConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector`, `MemItem` |
-| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `filesystem_placeholder` (pub(crate)) |
-| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `local_repo_placeholder` (pub(crate)) |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/ordered_content.rs` | `OrderedContentRuntime`, `scan_local_filesystem` (pub(crate)) |
+| `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/git_repo.rs` | `GitRepoRuntime`, `scan_local_repo` (pub(crate)) |
 | `gossip-scanner-runtime` | `crates/gossip-scanner-runtime/src/distributed.rs` | `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, `DistributedRuntimeConfig`, `DistributedRunReport`, `DistributedRuntimeError` |
