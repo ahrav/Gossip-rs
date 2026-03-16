@@ -6,7 +6,9 @@ Source integration is organized by **family**: each family defines its own
 trait surface tuned to the semantics of that source category. Families compose
 from a shared paging and value vocabulary (`PageBuf`, `Cursor`, `ItemKey`,
 `Budgets`, error types in `gossip-contracts/src/connector/`) but have
-independent trait surfaces.
+independent trait surfaces. Once a family runtime finishes executing one work
+unit, it can hand that unit to the shared runtime commit pipeline to make
+durable progress through a family-neutral path.
 
 ---
 
@@ -105,6 +107,7 @@ and `types.rs`.
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
+| `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
 
 ---
 
