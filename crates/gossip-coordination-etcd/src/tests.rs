@@ -1952,13 +1952,18 @@ fn now(t: u64) -> LogicalTime {
 
 /// Poll until the owner binding for `key` disappears, or panic if
 /// `ttl_secs + 10s` elapses without cleanup.
-fn wait_for_owner_binding_expiry(backend: &EtcdCoordinator, key: ShardKey, ttl_secs: i64) {
+fn wait_for_owner_binding_expiry(
+    backend: &EtcdCoordinator,
+    tenant: TenantId,
+    key: ShardKey,
+    ttl_secs: i64,
+) {
     let deadline = Instant::now()
         + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
     let interval = Duration::from_millis(250);
     loop {
         if backend
-            .test_load_owner_binding(test_tenant(), key)
+            .test_load_owner_binding(tenant, key)
             .expect("owner lookup should succeed while polling")
             .is_none()
         {
@@ -2166,7 +2171,7 @@ fn lease_expiry_rejects_stale_checkpoint() {
         .expect("acquire should succeed")
         .lease;
 
-    wait_for_owner_binding_expiry(&backend, key, ttl_secs);
+    wait_for_owner_binding_expiry(&backend, test_tenant(), key, ttl_secs);
 
     let err = backend
         .checkpoint(
@@ -2242,7 +2247,7 @@ fn lease_ttl_expiry_full_cycle() {
     assert_eq!(owner_before_expiry.0, test_worker(7));
     assert_eq!(owner_before_expiry.1, lease_a.fence());
 
-    wait_for_owner_binding_expiry(&backend_a, key, ttl_secs);
+    wait_for_owner_binding_expiry(&backend_a, test_tenant(), key, ttl_secs);
 
     // Guard against a concurrent reacquire between the poll break and the
     // assertions below. Under the current `unique_namespace` scheme this
