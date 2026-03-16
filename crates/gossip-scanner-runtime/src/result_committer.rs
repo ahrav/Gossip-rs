@@ -277,6 +277,10 @@ where
     /// of the [`CompletedUnit`]; the committer clones it internally when
     /// building the [`CommitRequest`].
     ///
+    /// Delegates to [`commit_item`](Self::commit_item) after constructing the
+    /// request, so validation, the findings -> done-ledger ordering, and
+    /// receipt creation share a single implementation.
+    ///
     /// # Errors
     ///
     /// Returns [`ResultCommitError`] on any validation, findings-sink, or
@@ -294,42 +298,7 @@ where
             std::slice::from_ref(translation.done_ledger()),
         );
 
-        if let Err(e) = Self::validate_request(&request) {
-            return Err(e.into());
-        }
-
-        let (write_context, completed_unit, findings, done_ledger) = request.into_parts();
-
-        let scope = CommitScope::from_write_context(
-            write_context,
-            NonZeroU64::MIN,
-            completed_unit.checkpoint_boundary().clone(),
-        );
-        let page = PageCommit::new(scope);
-
-        let findings_handle = self
-            .findings_sink
-            .upsert_batch(findings)
-            .map_err(ResultCommitError::FindingsSubmit)?;
-        let page = page
-            .wait_findings(findings_handle)
-            .map_err(ResultCommitError::FindingsWait)?;
-
-        let done_handle = self
-            .done_ledger
-            .batch_upsert(done_ledger)
-            .map_err(ResultCommitError::DoneLedgerSubmit)?;
-        let page = page
-            .wait_done_ledger(done_handle)
-            .map_err(ResultCommitError::DoneLedgerAdvance)?;
-
-        // The scope was derived from this completed_unit's checkpoint_boundary,
-        // so the boundary in the receipt always matches. UnitCommitReceipt::new
-        // cannot fail here.
-        Ok(
-            UnitCommitReceipt::new(completed_unit, page.into_item_commit_receipt())
-                .expect("boundary always matches when scope is derived from the same unit"),
-        )
+        self.commit_item(request)
     }
 
     /// Commit one completed runtime unit through findings -> done-ledger.

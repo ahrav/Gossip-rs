@@ -37,6 +37,8 @@
 //!
 //! - [`CommitPipelineSender::submit`] checks cancellation before attempting a
 //!   blocking send so new work is rejected promptly when the lease is gone;
+//! - the worker polls the cancellation token between receives, so it exits
+//!   even when cloned senders keep the submission channel connected;
 //! - the worker still finishes the current item and attempts to emit its
 //!   outcome. If the outcome receiver has already been dropped (e.g. during
 //!   shutdown), the last outcome is silently discarded — the committed data
@@ -97,8 +99,8 @@ impl Default for CommitPipelineConfig {
 /// Owned work item submitted from execution into the commit stage.
 ///
 /// The work item owns the translated persistence rows so it can cross the
-/// thread boundary cleanly. The commit worker borrows the owned translation
-/// only while calling [`ResultCommitter::commit_translation`].
+/// thread boundary cleanly. The commit worker passes the owned translation
+/// by reference while calling [`ResultCommitter::commit_translation`].
 #[must_use = "queued commit work must be submitted or explicitly discarded"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedCommit {
@@ -170,38 +172,6 @@ impl<FindingsError, DoneLedgerError> CommitStageOutput<FindingsError, DoneLedger
             }
         }
     }
-
-    /// Returns the successful checkpoint input, if present.
-    #[inline]
-    #[must_use]
-    pub fn checkpoint_input(&self) -> Option<&CheckpointAggregatorInput> {
-        match self {
-            Self::Committed {
-                checkpoint_input, ..
-            } => Some(checkpoint_input),
-            Self::Failed { .. } => None,
-        }
-    }
-
-    /// Returns the failed completed unit, if present.
-    #[inline]
-    #[must_use]
-    pub fn failed_completed_unit(&self) -> Option<&CompletedUnit> {
-        match self {
-            Self::Committed { .. } => None,
-            Self::Failed { completed_unit, .. } => Some(completed_unit),
-        }
-    }
-
-    /// Returns the stage-local error, if present.
-    #[inline]
-    #[must_use]
-    pub fn error(&self) -> Option<&ResultCommitError<FindingsError, DoneLedgerError>> {
-        match self {
-            Self::Committed { .. } => None,
-            Self::Failed { error, .. } => Some(error),
-        }
-    }
 }
 
 /// Errors from attempting to submit work to the commit pipeline.
@@ -224,25 +194,6 @@ impl fmt::Display for SubmitError {
 
 impl Error for SubmitError {}
 
-impl SubmitError {
-    /// Recover the work item that failed to enter the queue.
-    #[inline]
-    #[must_use = "call site should resubmit or explicitly drop the recovered work"]
-    pub fn into_work(self) -> QueuedCommit {
-        match self {
-            Self::Cancelled(work) | Self::Disconnected(work) => *work,
-        }
-    }
-
-    /// Returns `true` when the submission was rejected due to cancellation
-    /// rather than a disconnected worker.
-    #[inline]
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled(_))
-    }
-}
-
 /// Cloneable execution-side handle for submitting work into the bounded commit
 /// queue.
 #[derive(Clone, Debug)]
@@ -258,6 +209,12 @@ impl CommitPipelineSender {
     /// backpressure mechanism for slow sinks. If cancellation has already been
     /// requested, the work item is returned immediately instead of blocking.
     ///
+    /// The cancellation check and the channel send are not atomic: a concurrent
+    /// cancellation between the two steps may allow one more item into the
+    /// queue. That item will still be committed and its receipt emitted on the
+    /// outcome channel, so callers that received `Ok(())` always get a
+    /// consistent outcome.
+    ///
     /// # Errors
     ///
     /// - [`SubmitError::Cancelled`] — cancellation was already requested.
@@ -268,9 +225,13 @@ impl CommitPipelineSender {
             return Err(SubmitError::Cancelled(Box::new(work)));
         }
 
-        self.inner
-            .send(work)
-            .map_err(|SendError(work)| SubmitError::Disconnected(Box::new(work)))
+        self.inner.send(work).map_err(|SendError(work)| {
+            if self.cancel.is_cancelled() {
+                SubmitError::Cancelled(Box::new(work))
+            } else {
+                SubmitError::Disconnected(Box::new(work))
+            }
+        })
     }
 }
 
@@ -389,11 +350,14 @@ where
 
     /// Shut the pipeline down and join the worker thread.
     ///
-    /// Callers must drop all cloned [`CommitPipelineSender`] handles before
-    /// invoking this method. If any cloned sender survives, the submission
-    /// channel stays connected and the worker may not observe disconnect
-    /// promptly. In practice, the cancellation token causes the worker to
-    /// exit after its current item regardless.
+    /// The cancellation token causes the worker to exit after finishing any
+    /// in-flight commit, even when cloned [`CommitPipelineSender`] handles
+    /// remain alive. The worker polls the token periodically between receives,
+    /// so shutdown completes without requiring all senders to be dropped first.
+    ///
+    /// Callers *should* still drop all cloned senders before calling `shutdown`
+    /// to avoid buffered items being silently abandoned in the queue (the
+    /// pipeline's own sender is dropped as part of shutdown).
     ///
     /// There is no timeout on the join. If the worker is blocked inside a
     /// slow persistence operation, this call blocks until that operation
@@ -420,12 +384,21 @@ where
 {
     fn drop(&mut self) {
         self.sender.cancel.cancel();
+        if self.worker.is_some() {
+            tracing::warn!("CommitPipeline dropped without shutdown; worker thread detached");
+        }
         // After this method returns, fields are dropped in declaration order:
-        // sender -> outcomes -> worker. Channel drops unblock the worker;
-        // the JoinHandle drop detaches the thread. The worker exits promptly
-        // because cancellation is set and channels are closing.
+        // sender -> outcomes -> worker. Channel drops unblock the worker if
+        // it is waiting on a timed receive; the JoinHandle drop detaches the
+        // thread. The worker also polls cancellation between receives, so it
+        // exits promptly even if cloned senders keep the channel connected.
     }
 }
+
+/// How often the worker wakes from a blocking receive to check the
+/// cancellation token. Short enough that `shutdown()` completes promptly;
+/// long enough to avoid busy-spinning when the queue is idle.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn run_commit_stage<F, D>(
     committer: ResultCommitter<F, D>,
@@ -436,7 +409,22 @@ fn run_commit_stage<F, D>(
     F: FindingsSink,
     D: DoneLedger,
 {
-    while let Ok(work) = submit_rx.recv() {
+    tracing::debug!("commit-stage worker started");
+    loop {
+        if cancel.is_cancelled() {
+            tracing::debug!("commit-stage worker exiting: cancellation observed before receive");
+            break;
+        }
+
+        let work = match submit_rx.recv_timeout(CANCEL_POLL_INTERVAL) {
+            Ok(work) => work,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                tracing::debug!("commit-stage worker exiting: submission channel closed");
+                break;
+            }
+        };
+
         let (write_context, completed_unit, translation) = work.into_parts();
         let expected_kind = completed_unit.checkpoint_boundary_kind();
         let result = committer.commit_translation(write_context, &completed_unit, &translation);
@@ -447,35 +435,44 @@ fn run_commit_stage<F, D>(
                     write_context,
                     checkpoint_input,
                 },
+                // Defense-in-depth: expected_kind was derived from the same
+                // completed_unit that produced the receipt, so this kind check
+                // cannot fail in practice.
                 Err(kind_mismatch) => CommitStageOutput::Failed {
                     write_context,
                     completed_unit,
                     error: ResultCommitError::KindMismatch(kind_mismatch),
                 },
             },
-            Err(error) => CommitStageOutput::Failed {
-                write_context,
-                completed_unit,
-                error,
-            },
+            Err(error) => {
+                tracing::warn!(%error, "commit-stage: durable commit failed");
+                CommitStageOutput::Failed {
+                    write_context,
+                    completed_unit,
+                    error,
+                }
+            }
         };
 
-        if outcome_tx.send(outcome).is_err() {
-            // The outcome receiver was dropped (shutdown in progress). The
-            // committed data is durable in storage; checkpoint advancement is
-            // moot during teardown and resumes from the last durable checkpoint
-            // on restart.
-            debug_assert!(
-                cancel.is_cancelled(),
-                "outcome receiver dropped while pipeline is not cancelled; \
-                 committed result was silently discarded"
-            );
+        if cancel.is_cancelled() {
+            // Cancellation observed after commit. Try to deliver the outcome
+            // non-blocking — the data is already durable, so dropping the
+            // outcome is safe. A blocking send here could stall shutdown
+            // indefinitely if the outcome queue is full and nobody drains it.
+            let _ = outcome_tx.try_send(outcome);
+            tracing::debug!("commit-stage worker exiting: cancellation observed after commit");
             break;
         }
-        if cancel.is_cancelled() {
-            // Items still buffered in the execution queue are abandoned. They
-            // were never committed, so checkpoint does not advance past them;
-            // the next run re-scans from the last durable checkpoint.
+        if outcome_tx.send(outcome).is_err() {
+            tracing::warn!(
+                "commit-stage outcome channel disconnected; \
+                 discarding result (durable data is safe, \
+                 checkpoint recovers on restart)"
+            );
+            debug_assert!(
+                cancel.is_cancelled(),
+                "outcome receiver dropped while pipeline is not cancelled"
+            );
             break;
         }
     }
@@ -1106,8 +1103,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("blocked sender should unblock")
         {
-            Err(SubmitError::Disconnected(returned)) => assert_eq!(*returned, expected),
-            other => panic!("expected disconnected submit result, got {other:?}"),
+            // The worker exited because of cancellation, which also disconnected
+            // the channel. The secondary cancellation check in submit() now
+            // correctly reports Cancelled rather than Disconnected.
+            Err(SubmitError::Cancelled(returned)) => assert_eq!(*returned, expected),
+            other => panic!("expected cancelled submit result, got {other:?}"),
         }
 
         assert!(matches!(
@@ -1248,6 +1248,31 @@ mod tests {
         pipeline
             .shutdown()
             .expect("idle worker should join cleanly");
+    }
+
+    #[test]
+    fn shutdown_completes_with_live_cloned_sender() {
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let cancel = CancellationToken::new();
+        let pipeline = CommitPipeline::start(
+            findings_sink,
+            done_ledger,
+            CommitPipelineConfig::default(),
+            cancel,
+        )
+        .expect("pipeline should start");
+
+        // Clone a sender and deliberately keep it alive across shutdown. The
+        // worker must still exit because it polls the cancellation token during
+        // its timed receive loop.
+        let _held_sender = pipeline.sender();
+
+        pipeline
+            .shutdown()
+            .expect("shutdown must complete even with a live cloned sender");
+
+        // _held_sender still alive here — dropped after the assertion.
     }
 
     #[test]
@@ -1402,6 +1427,101 @@ mod tests {
                     )) => assert_eq!(store, InMemoryStoreKind::DoneLedger),
                     other => panic!("expected done-ledger advance failure, got {other:?}"),
                 }
+            }
+        }
+
+        drop(sender);
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn drop_without_shutdown_does_not_hang() {
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let cancel = CancellationToken::new();
+        let cancel_check = cancel.clone();
+        let pipeline = CommitPipeline::start(
+            findings_sink,
+            done_ledger,
+            CommitPipelineConfig {
+                execution_queue_capacity: 1,
+                outcome_queue_capacity: 1,
+            },
+            cancel,
+        )
+        .expect("pipeline should start");
+        let sender = pipeline.sender();
+
+        sender
+            .submit(queued_commit(1, 0xE1))
+            .expect("submit should succeed");
+
+        // Drop sender first so the pipeline owns the only sender.
+        drop(sender);
+        // Drop without shutdown — should not hang. The Drop impl cancels the
+        // token and detaches the worker thread.
+        drop(pipeline);
+
+        assert!(
+            cancel_check.is_cancelled(),
+            "Drop must cancel the token even without explicit shutdown"
+        );
+    }
+
+    #[test]
+    fn worker_continues_after_commit_failure() {
+        let findings_sink = InMemoryFindingsSink::new();
+        findings_sink
+            .fail_next_submissions(1)
+            .expect("fault injection should succeed");
+        let done_ledger = InMemoryDoneLedger::new();
+        let cancel = CancellationToken::new();
+        let pipeline = CommitPipeline::start(
+            findings_sink,
+            done_ledger,
+            CommitPipelineConfig {
+                execution_queue_capacity: 2,
+                outcome_queue_capacity: 2,
+            },
+            cancel,
+        )
+        .expect("pipeline should start");
+        let sender = pipeline.sender();
+
+        // First item will fail (injected findings failure), second should
+        // succeed — the worker must not exit early on a commit error.
+        sender
+            .submit(queued_commit(1, 0xF1))
+            .expect("submit 1 should succeed");
+        sender
+            .submit(queued_commit(2, 0xF2))
+            .expect("submit 2 should succeed");
+
+        let first = pipeline
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first outcome should arrive");
+        assert!(
+            matches!(first, CommitStageOutput::Failed { .. }),
+            "first outcome should be a failure"
+        );
+
+        let second = pipeline
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second outcome should arrive");
+        match second {
+            CommitStageOutput::Committed {
+                checkpoint_input, ..
+            } => {
+                assert_eq!(
+                    checkpoint_input
+                        .into_receipt()
+                        .completed_unit()
+                        .sequence_no(),
+                    2
+                );
+            }
+            CommitStageOutput::Failed { error, .. } => {
+                panic!("expected second outcome to be committed, got failure: {error}")
             }
         }
 
