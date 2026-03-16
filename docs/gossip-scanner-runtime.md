@@ -8,8 +8,8 @@
 - typed scan configuration for filesystem and git entrypoints
 - CLI parsing and summary rendering
 - path and budget validation before runtime execution
-- owned report, checkpoint, cancellation, commit-model, checkpoint-aggregator,
-  commit-sink, and coordination-recorder types
+- owned report, checkpoint, cancellation, commit-model, result-translation,
+  result-committer, checkpoint-aggregator, commit-sink, and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
 - distributed runtime placeholder nouns for future worker-loop wiring
 
@@ -34,6 +34,7 @@ entrypoints share the same local runtime execution paths.
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
 | `src/result_translation.rs` | Deterministic translation from completed item results into persistence rows (findings, occurrences, observations, done-ledger) |
+| `src/result_committer.rs` | Authoritative findings -> done-ledger durability stage for one completed unit, with request validation and `UnitCommitReceipt` construction |
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
 | `src/lib_tests.rs` | Validation and local scan execution tests for the runtime core |
 | `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
@@ -226,6 +227,25 @@ future runtime commit stages build on:
 - `CheckpointAggregatorInput` wraps only durable unit receipts so the future
   checkpoint stage never consumes raw scan completion signals.
 
+`src/result_committer.rs` is the concrete runtime stage that applies this
+vocabulary. It validates the request before any write, builds a single-unit
+`CommitScope`, drives `PageCommit` through findings durability and then
+done-ledger durability, and returns the resulting `UnitCommitReceipt`.
+Request validation covers cross-record consistency that individual persistence
+records cannot enforce on their own:
+
+- exactly one done-ledger row per completed unit
+- tenant consistency across findings, occurrences, and the shared write context
+- observation `WriteContext` and `ovid_hash` alignment with the request and
+  done-ledger row
+- done-ledger `WriteContext` alignment with the request
+- findings-count agreement between scanned done-ledger statuses and the
+  distinct stable findings in the batch
+- rejection of findings payloads for unscanned terminal statuses
+- observation-identity consistency within the findings batch
+- referential integrity of the findings batch (every observation references
+  an existing occurrence, every occurrence references an existing finding)
+
 `src/checkpoint_aggregator.rs` implements the next stage in that pipeline. It
 keeps a shard-local reorder buffer keyed by completed-unit sequence number,
 prepares only the highest contiguous durable prefix, normalizes checkpoint
@@ -323,6 +343,34 @@ only see observation-consistent, referentially closed persistence payloads.
 
 ---
 
+## Result Commit Surface
+
+`src/result_committer.rs` turns a validated `CommitRequest<'_>` or
+`PersistenceTranslation` into one authoritative durable runtime receipt. The
+module owns:
+
+- `ResultCommitRequestError`
+- `ResultCommitError<FindingsError, DoneLedgerError>`
+- `ResultCommitter<F, D>`
+
+`ResultCommitter<F, D>` is generic over `F: FindingsSink` and `D: DoneLedger`.
+Its responsibilities are intentionally narrow:
+
+1. validate the request shape before any sink call;
+2. submit the findings batch and wait for durability;
+3. submit the done-ledger row only after findings durability is confirmed;
+4. return `UnitCommitReceipt` only after both stages complete durably.
+
+This keeps the runtime's authoritative write ordering in one place and makes
+"no early ACK" structural: the runtime cannot construct a durable unit receipt
+before both persistence layers confirm success.
+
+The module also exposes `commit_translation(...)`, which reuses pre-translated
+persistence rows directly instead of re-deriving them inside the commit stage. Idempotency comes from deterministic IDs plus the sink contracts,
+not from runtime-side dedup caches.
+
+---
+
 ## CLI Surface
 
 `src/cli.rs` owns the full `scanner-rs scan {fs|git}` grammar. Its
@@ -400,6 +448,8 @@ The runtime tests focus on the behavior that exists today:
 - distributed placeholder error routing
 - CLI parsing and summary formatting
 - durable commit-sink identity derivation
+- authoritative findings -> done-ledger commit ordering and item-level receipt
+  construction
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources while keeping the distributed placeholder surface covered until
@@ -415,6 +465,7 @@ that worker-loop API is fully wired.
 | CLI parsing and summary rendering | `crates/gossip-scanner-runtime/src/cli.rs` |
 | Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
 | Deterministic result-to-persistence translation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
+| Durable findings -> done-ledger commit stage | `crates/gossip-scanner-runtime/src/result_committer.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Distributed family placeholders and lease metadata | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
