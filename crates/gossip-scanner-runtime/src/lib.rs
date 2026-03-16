@@ -66,6 +66,7 @@ use scanner_scheduler::store::{
     FsFindingBatch, FsFindingRecord, FsRunLoss, FsStoreError, StoreProducer,
 };
 
+pub mod checkpoint_aggregator;
 pub mod cli;
 pub mod commit_model;
 pub mod commit_sink;
