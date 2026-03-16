@@ -305,6 +305,10 @@ impl PrefixCheckpointAggregator {
         let sequence_no = receipt.completed_unit().sequence_no();
         let boundary_kind = validate_receipt(self.write_context, &receipt)?;
 
+        if sequence_no < self.next_sequence_no {
+            return Ok(ReceiptRecordOutcome::AlreadyCheckpointed);
+        }
+
         match self.boundary_kind {
             Some(expected) if expected != boundary_kind => {
                 return Err(PrefixCheckpointError::BoundaryKindMismatch {
@@ -314,10 +318,6 @@ impl PrefixCheckpointAggregator {
             }
             None => self.boundary_kind = Some(boundary_kind),
             Some(_) => {}
-        }
-
-        if sequence_no < self.next_sequence_no {
-            return Ok(ReceiptRecordOutcome::AlreadyCheckpointed);
         }
 
         match self.receipts.entry(sequence_no) {
@@ -410,11 +410,11 @@ impl PrefixCheckpointAggregator {
             }
         };
 
-        if let Some(split_key) = pending.last_sequence_no.checked_add(1) {
-            self.receipts = self.receipts.split_off(&split_key);
-        } else {
-            self.receipts.clear();
-        }
+        let split_key = pending
+            .last_sequence_no
+            .checked_add(1)
+            .expect("overflow already checked before receipt validation");
+        self.receipts = self.receipts.split_off(&split_key);
 
         self.next_sequence_no = new_next_sequence_no;
         self.checkpointed_units = new_checkpointed_units;
@@ -453,7 +453,7 @@ impl PrefixCheckpointAggregator {
         let mut observation_count = 0_u64;
         let mut record_count = 0_u64;
         let mut scanned_count = 0_u64;
-        let mut findings_count = 0_u64;
+        let mut done_ledger_findings_count = 0_u64;
         let mut committed_units = 0_u64;
 
         for (&sequence_no, receipt) in self.receipts.range(first_sequence_no..=last_sequence_no) {
@@ -505,11 +505,11 @@ impl PrefixCheckpointAggregator {
                 sequence_no,
                 "scanned_count",
             )?;
-            findings_count = checked_add(
-                findings_count,
+            done_ledger_findings_count = checked_add(
+                done_ledger_findings_count,
                 done_ledger.findings_count(),
                 sequence_no,
-                "findings_count",
+                "done_ledger_findings_count",
             )?;
             committed_units = checked_add(
                 committed_units,
@@ -542,7 +542,7 @@ impl PrefixCheckpointAggregator {
         let findings_receipt =
             FindingsCommitReceipt::new(finding_count, occurrence_count, observation_count);
         let done_ledger_receipt =
-            DoneLedgerCommitReceipt::new(record_count, scanned_count, findings_count);
+            DoneLedgerCommitReceipt::new(record_count, scanned_count, done_ledger_findings_count);
         let page = PageCommit::new(scope)
             .record_findings(findings_receipt)
             .record_done_ledger(done_ledger_receipt)
@@ -1587,6 +1587,36 @@ mod tests {
         // A new prepare should re-build from the still-buffered receipt.
         let reprepared = aggregator.prepare_checkpoint().unwrap().unwrap();
         assert_eq!(reprepared.first_sequence_no(), 0);
+    }
+
+    #[test]
+    fn replayed_receipt_does_not_set_boundary_kind() {
+        let write_context = write_context(0xF0);
+
+        // Simulate a resumed aggregator: `next_sequence_no > 0` but
+        // `boundary_kind` is still `None` (the aggregator was freshly
+        // constructed with a non-zero starting sequence).
+        let mut aggregator = PrefixCheckpointAggregator::new(write_context, 5);
+        assert!(aggregator.checkpoint_boundary_kind().is_none());
+
+        // A replayed receipt with sequence_no < next_sequence_no must be
+        // ignored idempotently — including no side-effect on boundary_kind.
+        let outcome = aggregator
+            .record_receipt(ordered_input(
+                write_context,
+                3,
+                cursor_without_token(b'x'),
+                1,
+            ))
+            .expect("replayed receipt should not error");
+        assert_eq!(outcome, ReceiptRecordOutcome::AlreadyCheckpointed);
+
+        // The boundary kind must remain unset — the replayed receipt must not
+        // lock it.
+        assert!(
+            aggregator.checkpoint_boundary_kind().is_none(),
+            "boundary_kind must not be set by an already-checkpointed receipt"
+        );
     }
 
     // `ReceiptBoundaryMismatch` is structurally unreachable: `UnitCommitReceipt::new`
