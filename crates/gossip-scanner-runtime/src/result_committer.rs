@@ -12,7 +12,7 @@
 //! The implementation deliberately reuses [`PageCommit`] instead of inventing
 //! a second runtime-only ordering protocol. That keeps findings ->
 //! done-ledger ordering in one typestate machine and preserves the same
-//! durable receipt model the checkpoint stage will consume.
+//! durable receipt model a future checkpoint stage can consume.
 
 use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 
@@ -166,12 +166,16 @@ pub enum ResultCommitError<FindingsError, DoneLedgerError> {
     InvalidRequest(ResultCommitRequestError),
     /// The findings sink rejected the submission before returning a handle.
     FindingsSubmit(FindingsError),
-    /// Waiting for findings durability failed.
+    /// Findings durability wait failed. The findings batch may or may not
+    /// be durable. Retrying the full `commit_item` call is safe because
+    /// `FindingsSink::upsert` has upsert (idempotent) semantics.
     FindingsWait(FindingsError),
-    /// The done-ledger rejected the submission before returning a handle.
+    /// Done-ledger submission failed. Findings are already durable at this
+    /// point. Retrying the full `commit_item` call is safe.
     DoneLedgerSubmit(DoneLedgerError),
-    /// Waiting for done-ledger durability failed, or the receipt did not match
-    /// the expected per-item commit scope.
+    /// Done-ledger durability wait failed, or the receipt did not match the
+    /// expected commit scope. Findings are already durable. Retrying the
+    /// full `commit_item` call is safe.
     DoneLedgerAdvance(CommitAdvanceError<DoneLedgerError>),
     /// The durable receipt's checkpoint boundary did not match the completed
     /// unit's boundary.
@@ -332,9 +336,8 @@ where
         findings.validate_observation_identity()?;
         findings.validate_referential_integrity()?;
 
-        // After validate_referential_integrity (which calls
-        // validate_tenant_consistency), all records in the batch share one
-        // tenant. Checking just the first element suffices.
+        // validate_referential_integrity already enforces single-tenant batches,
+        // so checking the first element suffices.
         if let Some(finding) = findings.findings().first()
             && finding.tenant_id() != write_context.tenant_id()
         {
@@ -1163,6 +1166,50 @@ mod tests {
                 assert_eq!(*actual, wrong_tenant);
             }
             other => panic!("expected TenantMismatch, got {other:?}"),
+        });
+    }
+
+    /// An occurrence with a different tenant than the write-context finding is
+    /// rejected. When the finding has the correct tenant but the occurrence
+    /// does not, `validate_tenant_consistency` (inside
+    /// `validate_referential_integrity`) catches the cross-layer inconsistency
+    /// before the explicit occurrence-vs-write-context check fires.
+    #[test]
+    fn rejects_occurrence_tenant_mismatch() {
+        let wrong_tenant = TenantId::from_bytes([0xFF; 32]);
+        let norm = NormHash::from_digest([0xAA; 32]);
+        let secret = key_secret_hash(&tenant_secret_key(), &norm);
+        let good_finding = FindingRecord::new(
+            write_context().tenant_id(),
+            StableItemId::from_bytes([0x33; 32]),
+            test_rule_fingerprint(7),
+            secret,
+        );
+        let bad_occurrence = OccurrenceRecord::try_new(
+            wrong_tenant,
+            good_finding.finding_id(),
+            ObjectVersionId::from_bytes([0x44; 32]),
+            10,
+            20,
+        )
+        .expect("occurrence construction");
+
+        let clean = translated_clean_scan();
+        let findings = [good_finding];
+        let occurrences = [bad_occurrence];
+        let batch = FindingsUpsertBatch::new(&findings, &occurrences, &[]);
+        let request = CommitRequest::new(
+            write_context(),
+            completed_unit(35),
+            batch,
+            std::slice::from_ref(clean.done_ledger()),
+        );
+
+        assert_validation_rejects(request, |err| {
+            assert!(
+                matches!(err, ResultCommitRequestError::FindingsBatch(_)),
+                "cross-tenant occurrence must be rejected (caught by tenant consistency): {err:?}",
+            );
         });
     }
 
