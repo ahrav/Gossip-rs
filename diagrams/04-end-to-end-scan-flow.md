@@ -167,16 +167,16 @@ sequenceDiagram
     LOOP->>CS: begin_item(item_key, ItemMeta { stable_item_id, version })
     CS->>REC: record_commit_progress(Begin { item_key, size_hint })
 
-    loop For each finding in item
+    loop For each finding batch in item
         LOOP->>CS: upsert_findings(item_key, FindingsBatch)
-        CS->>CS: rule_fingerprint_resolver(rule_id) → RuleFingerprint
-        CS->>ID: NormHash::from_digest(...)
-        CS->>ID: key_secret_hash(...)
-        CS->>ID: derive_finding_id(...)
-        CS->>ID: derive_occurrence_id(...)
+        CS->>CS: accumulate FsFindingRecord values
     end
 
     LOOP->>CS: finish_item(item_key)
+    CS->>CS: translate_in_flight(item_key, InFlightItem)
+    CS->>CS: translate_item_result(findings, rule_fingerprint_resolver)
+    note right of CS: Batch identity derivation (NormHash, FindingId, OccurrenceId)
+    CS->>CS: submit QueuedCommit to commit pipeline
     CS->>REC: record_commit_progress(Finish { item_key })
 ```
 

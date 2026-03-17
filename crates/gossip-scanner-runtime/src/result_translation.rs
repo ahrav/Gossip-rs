@@ -1012,6 +1012,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_valid_and_invalid_batch_rejects_at_correct_index() {
+        let item = scan_item();
+        let findings = [finding(1, 10, 20, 0xAA), finding(2, 30, 30, 0xBB)];
+
+        let err = translate_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            &item,
+            64,
+            timing(),
+            ItemResult::Scanned {
+                findings: &findings,
+            },
+            &test_rule_fingerprint,
+        )
+        .expect_err("batch with invalid finding at index 1 must fail");
+
+        match err {
+            ResultTranslationError::InvalidFindingSpan { index, start, end } => {
+                assert_eq!(index, 1, "error must identify the invalid finding index");
+                assert_eq!(start, 30);
+                assert_eq!(end, 30);
+            }
+            other => panic!("expected InvalidFindingSpan, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn inverted_scan_timing_is_rejected() {
         let later = LogicalTime::from_raw(100);
         let earlier = LogicalTime::from_raw(50);

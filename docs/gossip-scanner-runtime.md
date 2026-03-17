@@ -586,7 +586,7 @@ The runtime tests focus on the behavior that exists today:
 - distributed persistence handle cloning
 - distributed runtime error layering
 - CLI parsing and summary formatting
-- receipt-driven commit-pipeline identity derivation
+- receipt-driven identity derivation via translate_item_result
 - authoritative findings -> done-ledger commit ordering and item-level receipt
   construction
 - bounded execution -> commit backpressure and cancellation semantics
@@ -603,7 +603,7 @@ persistence cloning, config defaults, error layering).
 |---------|------|
 | Core runtime types and validation | `crates/gossip-scanner-runtime/src/lib.rs` |
 | CLI parsing and summary rendering | `crates/gossip-scanner-runtime/src/cli.rs` |
-| Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Commit sink trait and bridge record types | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
 | Deterministic result-to-persistence translation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Durable findings -> done-ledger commit stage | `crates/gossip-scanner-runtime/src/result_committer.rs` |
 | Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |

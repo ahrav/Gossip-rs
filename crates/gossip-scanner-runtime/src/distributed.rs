@@ -2070,6 +2070,32 @@ mod tests {
     }
 
     #[test]
+    fn upsert_after_finish_is_rejected() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/finished.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.finish_item(&key).expect("finish item");
+
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![finding()],
+                },
+            )
+            .expect_err("upsert after finish should fail");
+
+        assert!(
+            err.to_string()
+                .contains("upsert_findings called before begin_item"),
+            "unexpected error: {err}"
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
     fn run_filesystem_lease_persists_checkpoint_and_marks_done() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
