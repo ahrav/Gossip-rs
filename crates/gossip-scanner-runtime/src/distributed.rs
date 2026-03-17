@@ -1088,7 +1088,6 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         progress: Mutex<Vec<CommitProgressRecord>>,
-        identity: Mutex<Vec<IdentityChainRecord>>,
     }
 
     impl CoordinationEventRecorder for Recorder {
@@ -1106,15 +1105,6 @@ mod tests {
             event: CommitProgressRecord,
         ) -> Result<()> {
             self.progress.lock().expect("progress lock").push(event);
-            Ok(())
-        }
-
-        fn record_identity_chain(
-            &self,
-            _shard_id: &str,
-            record: crate::coordination_sink::IdentityChainRecord,
-        ) -> Result<()> {
-            self.identity.lock().expect("identity lock").push(record);
             Ok(())
         }
     }
