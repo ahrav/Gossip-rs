@@ -353,26 +353,7 @@ struct InFlightItem {
     findings: Vec<FsFindingRecord>,
 }
 
-/// Ordered record of one item successfully handed to the commit pipeline.
-///
-/// Bookkeeping only — used by [`wait_for_submitted_commits`] to verify that
-/// every submitted sequence number produced a matching durable outcome.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SubmittedCommit {
-    sequence_no: u64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl SubmittedCommit {
-    #[inline]
-    #[must_use]
-    fn sequence_no(&self) -> u64 {
-        self.sequence_no
-    }
-}
-
-/// Scan-loop commit sink that bridges begin/upsert/finish callbacks into the
+/// Scan-driver commit sink that bridges begin/upsert/finish callbacks into the
 /// receipt-driven commit pipeline.
 ///
 /// The existing scan-loop seam still emits compact `ItemMeta` and
@@ -399,7 +380,7 @@ struct ReceiptCommitSink {
     submitter: CommitPipelineSender,
     next_sequence_no: AtomicU64,
     in_flight: Mutex<BTreeMap<ItemKey, InFlightItem>>,
-    submitted: Mutex<Vec<SubmittedCommit>>,
+    submitted: Mutex<Vec<u64>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -425,10 +406,11 @@ impl ReceiptCommitSink {
         }
     }
 
-    /// Consume the sink and return the ordered list of successfully submitted
-    /// commits. Returns an error if any items remain in-flight (indicating a
-    /// protocol violation by the caller) or if a mutex is poisoned.
-    fn finish(self) -> Result<Vec<SubmittedCommit>> {
+    /// Consume the sink and return the sequence numbers of successfully
+    /// submitted commits. Returns an error if any items remain in-flight
+    /// (indicating a protocol violation by the caller) or if a mutex is
+    /// poisoned.
+    fn finish(self) -> Result<Vec<u64>> {
         let in_flight = self
             .in_flight
             .into_inner()
@@ -557,6 +539,25 @@ impl ReceiptCommitSink {
             translation,
         ))
     }
+
+    /// Re-insert a removed item into the in-flight map on translation or
+    /// submission failure.
+    ///
+    /// Uses `unwrap_or_else` to recover through a poisoned mutex because the
+    /// rollback is not on the durability path — see the struct-level threading
+    /// model documentation.
+    fn rollback_in_flight(&self, key: ItemKey, item: InFlightItem) {
+        let overwritten = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, item);
+        debug_assert!(
+            overwritten.is_none(),
+            "rollback re-insert overwrote a concurrent begin_item entry; \
+             ReceiptCommitSink must be driven by a single-threaded drain loop"
+        );
+    }
 }
 
 impl CommitSink for ReceiptCommitSink {
@@ -645,33 +646,13 @@ impl CommitSink for ReceiptCommitSink {
         let work = match self.translate_in_flight(&removed_key, &item) {
             Ok(work) => work,
             Err(err) => {
-                // Rollback: re-insert with the same owned key — zero allocations.
-                let overwritten = self
-                    .in_flight
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(removed_key, item);
-                debug_assert!(
-                    overwritten.is_none(),
-                    "rollback re-insert overwrote a concurrent begin_item entry; \
-                     ReceiptCommitSink must be driven by a single-threaded drain loop"
-                );
+                self.rollback_in_flight(removed_key, item);
                 return Err(err);
             }
         };
 
         if let Err(error) = self.submitter.submit(work) {
-            // Rollback: re-insert with the same owned key — zero allocations.
-            let overwritten = self
-                .in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(removed_key, item);
-            debug_assert!(
-                overwritten.is_none(),
-                "rollback re-insert overwrote a concurrent begin_item entry; \
-                 ReceiptCommitSink must be driven by a single-threaded drain loop"
-            );
+            self.rollback_in_flight(removed_key, item);
             return Err(anyhow::anyhow!(
                 "execution to commit submission failed: {error}"
             ));
@@ -684,7 +665,7 @@ impl CommitSink for ReceiptCommitSink {
         self.submitted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(SubmittedCommit { sequence_no });
+            .push(sequence_no);
 
         self.record_finish(item_key);
         Ok(())
@@ -806,10 +787,21 @@ where
 /// against the committed sequence numbers drained from that stream.
 #[cfg_attr(not(test), allow(dead_code))]
 fn wait_for_submitted_commits(
-    mut submitted: Vec<SubmittedCommit>,
+    mut submitted: Vec<u64>,
     mut committed_sequence_nos: Vec<u64>,
 ) -> Result<()> {
-    submitted.sort_by_key(SubmittedCommit::sequence_no);
+    debug_assert!(
+        submitted.windows(2).all(|w| w[0] <= w[1]),
+        "submitted sequence numbers should be monotonically ordered; \
+         sorting as defense-in-depth"
+    );
+    submitted.sort_unstable();
+
+    debug_assert!(
+        committed_sequence_nos.windows(2).all(|w| w[0] <= w[1]),
+        "committed sequence numbers should be in drain order; \
+         sorting as defense-in-depth"
+    );
     committed_sequence_nos.sort_unstable();
 
     // Reject duplicate sequence numbers — structurally impossible today
@@ -817,7 +809,7 @@ fn wait_for_submitted_commits(
     // guard against future regressions.
     if let Some(dup) = submitted
         .windows(2)
-        .find_map(|w| (w[0].sequence_no() == w[1].sequence_no()).then_some(w[0].sequence_no()))
+        .find_map(|w| (w[0] == w[1]).then_some(w[0]))
     {
         return Err(anyhow!("duplicate submitted sequence number {dup}"));
     }
@@ -836,11 +828,7 @@ fn wait_for_submitted_commits(
         ));
     }
 
-    for (expected, actual) in submitted
-        .into_iter()
-        .map(|entry| entry.sequence_no())
-        .zip(committed_sequence_nos.into_iter())
-    {
+    for (expected, actual) in submitted.into_iter().zip(committed_sequence_nos) {
         if expected != actual {
             return Err(anyhow!(
                 "submitted commit sequence {} did not match durable outcome sequence {}",
@@ -1663,21 +1651,14 @@ mod tests {
 
     #[test]
     fn wait_for_submitted_commits_accepts_matching_sequences_out_of_order() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 2 },
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-        ];
+        let submitted = vec![2, 0, 1];
 
         wait_for_submitted_commits(submitted, vec![1, 2, 0]).expect("matching sequences");
     }
 
     #[test]
     fn wait_for_submitted_commits_rejects_mismatched_sequences() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-        ];
+        let submitted = vec![0, 1];
         let err = wait_for_submitted_commits(submitted, vec![0, 2])
             .expect_err("mismatched sequences should fail");
 
@@ -1690,11 +1671,7 @@ mod tests {
 
     #[test]
     fn wait_for_submitted_commits_rejects_duplicate_submitted_sequences() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-            SubmittedCommit { sequence_no: 1 },
-        ];
+        let submitted = vec![0, 1, 1];
         let err = wait_for_submitted_commits(submitted, vec![0, 1, 1])
             .expect_err("duplicate submitted sequences should fail");
 
@@ -1707,11 +1684,7 @@ mod tests {
 
     #[test]
     fn wait_for_submitted_commits_rejects_duplicate_committed_sequences() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-            SubmittedCommit { sequence_no: 2 },
-        ];
+        let submitted = vec![0, 1, 2];
         let err = wait_for_submitted_commits(submitted, vec![0, 2, 2])
             .expect_err("duplicate committed sequences should fail");
 
@@ -1763,7 +1736,7 @@ mod tests {
 
         let submitted = sink.finish().expect("sink finish");
         assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].sequence_no(), 0);
+        assert_eq!(submitted[0], 0);
 
         match pipeline
             .recv_timeout(Duration::from_secs(1))
