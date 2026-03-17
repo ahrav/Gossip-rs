@@ -461,16 +461,22 @@ where
     }
 }
 
-/// Validate the upward evidence chain required for scanned requests.
+/// Validate the upward evidence chain required for scanned requests and return
+/// the distinct stable findings count.
 ///
 /// Findings are version-independent, so scanned commits must prove that each
 /// finding is bound to the target item through an occurrence and then an
 /// observation. Observations are the first layer that carries the done-ledger
 /// OVID, which is why this helper requires occurrences to reach that layer
 /// instead of trying to infer OVID equality from occurrence rows alone.
+///
+/// On success, returns the number of distinct `FindingId`s in the batch.
+/// Callers rely on `validate_referential_integrity` having run first: that
+/// guarantees every occurrence references a finding in the batch, so the
+/// occurrence-derived finding-ID set is exactly the distinct findings set.
 fn validate_scanned_findings_chain(
     findings: FindingsUpsertBatch<'_>,
-) -> Result<(), ResultCommitRequestError> {
+) -> Result<u32, ResultCommitRequestError> {
     let finding_ids_with_occurrences: HashSet<_> = findings
         .occurrences()
         .iter()
@@ -495,18 +501,7 @@ fn validate_scanned_findings_chain(
         }
     }
 
-    Ok(())
-}
-
-fn distinct_findings_count(
-    findings: FindingsUpsertBatch<'_>,
-) -> Result<u32, ResultCommitRequestError> {
-    let count = findings
-        .findings()
-        .iter()
-        .map(|f| f.finding_id())
-        .collect::<HashSet<_>>()
-        .len();
+    let count = finding_ids_with_occurrences.len();
     u32::try_from(count).map_err(|_| ResultCommitRequestError::DistinctFindingsOverflow { count })
 }
 
