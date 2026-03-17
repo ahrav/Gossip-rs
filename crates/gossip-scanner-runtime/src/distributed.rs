@@ -420,8 +420,9 @@ impl ReceiptCommitSink {
 
     /// Consume the sink and return the sequence numbers of successfully
     /// submitted commits. Returns an error if any items remain in-flight
-    /// (indicating a protocol violation by the caller) or if a mutex is
-    /// poisoned.
+    /// (either because the caller violated the begin/upsert/finish protocol
+    /// or because an earlier translation/submission failure rolled the item
+    /// back into the in-flight map) or if a mutex is poisoned.
     fn finish(self) -> Result<Vec<u64>> {
         let in_flight = self
             .in_flight
@@ -2521,8 +2522,8 @@ mod tests {
 
     #[test]
     fn run_worker_releases_lease_on_filesystem_scan_failure() {
-        // Point the lease at a guaranteed-unique non-existent path so
-        // `run_filesystem_lease` fails during engine construction.
+        // Point the lease at a guaranteed-unique non-existent path so the
+        // filesystem scan fails when the worker tries to enumerate it.
         let tmp = tempdir().expect("tempdir");
         let bogus_path = tmp.path().join("nonexistent-child");
 
