@@ -312,6 +312,19 @@ pub struct DistributedRunReport {
     pub shards_skipped_done: u64,
 }
 
+impl DistributedRunReport {
+    /// Assert the structural invariant in debug builds.
+    fn debug_assert_invariant(&self) {
+        debug_assert!(
+            self.shards_scanned + self.shards_skipped_done <= self.leases_seen,
+            "report invariant violated: scanned({}) + skipped({}) > seen({})",
+            self.shards_scanned,
+            self.shards_skipped_done,
+            self.leases_seen,
+        );
+    }
+}
+
 /// Distributed runtime error.
 #[derive(Debug)]
 pub enum DistributedRuntimeError {
@@ -899,6 +912,14 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
 /// 6. `mark_shard_done` records the shard as complete in the done-ledger.
 ///
 /// If any step fails, the shard is not marked done and will be retried.
+/// On error, the caller is responsible for releasing the lease.
+///
+/// # Completion protocol — `acknowledge_checkpoint` failure
+///
+/// If `acknowledge_checkpoint` fails after `complete_shard` succeeds, the
+/// shard is not marked done and will be re-scanned on retry. This relies on
+/// the `complete_shard` idempotency contract documented on
+/// [`DistributedCoordinator`].
 ///
 /// # At-least-once delivery
 ///
@@ -1101,6 +1122,16 @@ where
     let recorder = coordinator.event_recorder();
     let mut report = DistributedRunReport::default();
 
+    let release_best_effort = |lease: &ShardLease<A>| {
+        if let Err(release_err) = coordinator.release_shard(lease) {
+            tracing::warn!(
+                shard_id = %lease.shard_id(),
+                %release_err,
+                "best-effort lease release failed; may remain acquired until lease TTL expires",
+            );
+        }
+    };
+
     loop {
         let lease = match coordinator.acquire_shard() {
             Ok(Some(l)) => l,
@@ -1120,13 +1151,7 @@ where
         let is_done = match coordinator.is_shard_done(&lease) {
             Ok(done) => done,
             Err(e) => {
-                if let Err(release_err) = coordinator.release_shard(&lease) {
-                    tracing::warn!(
-                        shard_id = %lease.shard_id(),
-                        %release_err,
-                        "failed to release shard; may remain acquired until lease TTL expires",
-                    );
-                }
+                release_best_effort(&lease);
                 tracing::info!(
                     leases_seen = report.leases_seen,
                     shards_scanned = report.shards_scanned,
@@ -1138,13 +1163,7 @@ where
         };
 
         if is_done {
-            if let Err(release_err) = coordinator.release_shard(&lease) {
-                tracing::warn!(
-                    shard_id = %lease.shard_id(),
-                    %release_err,
-                    "best-effort lease release failed for done shard; will expire via TTL",
-                );
-            }
+            release_best_effort(&lease);
             report.shards_skipped_done = report.shards_skipped_done.saturating_add(1);
             continue;
         }
@@ -1156,13 +1175,7 @@ where
             &lease,
             config,
         ) {
-            if let Err(release_err) = coordinator.release_shard(&lease) {
-                tracing::warn!(
-                    shard_id = %lease.shard_id(),
-                    %release_err,
-                    "best-effort lease release failed after scan error",
-                );
-            }
+            release_best_effort(&lease);
             tracing::info!(
                 leases_seen = report.leases_seen,
                 shards_scanned = report.shards_scanned,
@@ -1174,6 +1187,7 @@ where
         report.shards_scanned = report.shards_scanned.saturating_add(1);
     }
 
+    report.debug_assert_invariant();
     Ok(report)
 }
 
@@ -1224,7 +1238,7 @@ impl<A> Default for InMemoryCoordinatorState<A> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedShard {
     pub shard_id: String,
     pub checkpoint: Option<Cursor>,
@@ -1236,8 +1250,7 @@ impl<A> InMemoryCoordinator<A> {
     /// Create a coordinator pre-loaded with the provided lease queue.
     #[must_use]
     pub fn new(leases: Vec<ShardLease<A>>) -> Self {
-        let mut queue = VecDeque::new();
-        queue.extend(leases);
+        let queue = VecDeque::from(leases);
         Self {
             state: Arc::new(Mutex::new(InMemoryCoordinatorState {
                 queue,
@@ -1281,28 +1294,6 @@ impl<A> InMemoryCoordinator<A> {
     #[must_use]
     pub fn completed_shards(&self) -> Vec<CompletedShard> {
         self.state.lock().expect("state lock").completed.clone()
-    }
-
-    /// Snapshot of recorded core events.
-    #[must_use]
-    pub fn core_events(&self) -> Vec<(String, OwnedCoreEvent)> {
-        self.state.lock().expect("state lock").core_events.clone()
-    }
-
-    /// Snapshot of recorded git events.
-    #[must_use]
-    pub fn git_events(&self) -> Vec<(String, StoredGitEvent)> {
-        self.state.lock().expect("state lock").git_events.clone()
-    }
-
-    /// Snapshot of recorded commit-progress events.
-    #[must_use]
-    pub fn commit_progress_events(&self) -> Vec<(String, CommitProgressRecord)> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .commit_progress
-            .clone()
     }
 
     /// Cause the next `count` calls to `acquire_shard` to return an error.
@@ -1792,6 +1783,30 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("duplicate committed sequence number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_fewer_committed_than_submitted() {
+        let err = wait_for_submitted_commits(vec![0, 1], vec![0])
+            .expect_err("fewer committed than submitted should fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("submitted 2 commit(s) but commit stage produced 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_more_committed_than_submitted() {
+        let err = wait_for_submitted_commits(vec![0], vec![0, 1])
+            .expect_err("more committed than submitted should fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("submitted 1 commit(s) but commit stage produced 2"),
             "unexpected error: {err}"
         );
     }

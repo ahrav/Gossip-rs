@@ -581,8 +581,8 @@ done checks, done marking, and event recording.
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones
 per shard, while `DistributedRuntimeError`
-distinguishes coordinator failures, scan-runtime failures, and local durability
-pipeline failures.
+distinguishes coordinator failures, scan-runtime failures, local durability
+pipeline failures, and unsupported assignment types.
 
 `run_worker` ties those types together into the lease loop, and
 `InMemoryCoordinator<A>` provides a harness implementation for unit tests and
