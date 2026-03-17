@@ -971,16 +971,18 @@ where
         (outcome, submitted, stage_result)
     });
 
-    // Unwrap in priority order: scan errors are more informative than drain
-    // thread failures, so propagate them first.
-    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
-    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
+    // Prefer durability errors: when the drain stage fails and cancels the
+    // pipeline, the scan typically sees a downstream "pipeline cancelled"
+    // Runtime error. Evaluating the drain result first exposes the root cause
+    // instead of the cancellation symptom.
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
     } = stage_result
         .map_err(DistributedRuntimeError::Durability)?
         .map_err(DistributedRuntimeError::Durability)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
+    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
 
     let submitted_units = committed_sequence_nos.len() as u64;
 

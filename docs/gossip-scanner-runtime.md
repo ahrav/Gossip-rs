@@ -296,7 +296,7 @@ stable across process restarts.
 
 Dropping the sender closes the submission channel. Once the commit worker
 drains all remaining queued items, it exits, allowing the drainer to consume
-the final outcomes and join the thread. This separation lets distributed
+the outcomes and join the thread. This separation lets distributed
 runtimes run scan execution and receipt draining on concurrent scoped
 threads: one thread holds the sender and feeds translated scan results,
 while another thread holds the drainer and builds the checkpoint prefix from
