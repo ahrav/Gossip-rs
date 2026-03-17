@@ -348,6 +348,16 @@ impl SubmittedCommit {
 /// `ReceiptCommitSink` reconstructs the deterministic translation inputs
 /// expected by the shared commit pipeline so ordered-content execution can
 /// produce durable receipts without changing the scheduler callback surface.
+///
+/// # Threading model
+///
+/// Like [`DurableCommitSink`](crate::commit_sink::DurableCommitSink), this
+/// sink is driven by a single-threaded drain loop. The interior `Mutex`
+/// fields satisfy the `Send + Sync` bound required by [`CommitSink`] without
+/// introducing real contention. Sequence numbers assigned by
+/// [`next_sequence_no`](Self::next_sequence_no) are therefore monotonically
+/// ordered with respect to submission; `Ordering::Relaxed` is sufficient
+/// because there is no concurrent caller to race against.
 #[cfg_attr(not(test), allow(dead_code))]
 struct ReceiptCommitSink {
     shard_id: Arc<str>,
@@ -409,9 +419,9 @@ impl ReceiptCommitSink {
         let started = sequence_no.checked_mul(2).ok_or_else(|| {
             anyhow::anyhow!("sequence number overflow while deriving scan timing")
         })?;
-        let finished = started.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("sequence number overflow while deriving scan timing")
-        })?;
+        // When checked_mul(2) succeeds, started is even and <= u64::MAX - 1
+        // (u64::MAX is odd), so started + 1 fits without overflow.
+        let finished = started + 1;
 
         Ok(ScanTiming::new(
             LogicalTime::from_raw(started),
@@ -438,8 +448,11 @@ impl ReceiptCommitSink {
 
     /// Records a finish-progress event for telemetry.
     ///
-    /// See [`record_begin`](Self::record_begin) for the non-fatal error
-    /// rationale.
+    /// This records that the item's scan completed and was submitted to the
+    /// commit pipeline — not that the commit landed durably. Durability
+    /// confirmation flows through the receipt/checkpoint path, not through
+    /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
+    /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
         let _ = self.recorder.record_commit_progress(
             &self.shard_id,
@@ -558,43 +571,53 @@ impl CommitSink for ReceiptCommitSink {
 
     fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
         let key_bytes = item_key.as_bytes();
-        let mut guard = self
-            .in_flight
-            .lock()
-            .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
-        let item = guard
-            .remove(key_bytes)
-            .ok_or_else(|| anyhow::anyhow!("finish_item called before begin_item for item"))?;
+
+        // Remove the item under a short-lived lock. Translation and
+        // submission happen outside the critical section so concurrent
+        // begin_item / upsert_findings calls are not blocked by expensive
+        // work (crypto derivations, channel send).
+        let item = {
+            let mut guard = self.in_flight.lock().map_err(|_| {
+                anyhow::anyhow!("receipt commit sink in-flight state lock poisoned")
+            })?;
+            guard
+                .remove(key_bytes)
+                .ok_or_else(|| anyhow::anyhow!("finish_item called before begin_item for item"))?
+        };
 
         let sequence_no = item.sequence_no;
         let work = match self.translate_in_flight(&item) {
             Ok(work) => work,
             Err(err) => {
-                guard.insert(key_bytes.to_vec(), item);
+                // Rollback: re-insert so the caller can retry. Recover
+                // through a poisoned mutex rather than losing the item.
+                self.in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key_bytes.to_vec(), item);
                 return Err(err);
             }
         };
-        drop(guard);
 
         if let Err(error) = self.submitter.submit(work) {
-            // Re-insert so the caller can retry; mirrors DurableCommitSink's
-            // rollback-on-recorder-failure pattern.
+            // Rollback: re-insert so the caller can retry. Recover through
+            // a poisoned mutex rather than silently losing the item.
             self.in_flight
                 .lock()
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "receipt commit sink in-flight state lock poisoned during rollback"
-                    )
-                })?
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(key_bytes.to_vec(), item);
             return Err(anyhow::anyhow!(
                 "execution to commit submission failed: {error}"
             ));
         }
 
+        // The commit is in the pipeline. The submitted vec is bookkeeping
+        // for ordering assertions, not the durability path — recover
+        // through a poisoned mutex rather than returning an error that
+        // would mislead the caller into thinking the commit was lost.
         self.submitted
             .lock()
-            .map_err(|_| anyhow::anyhow!("receipt commit sink submitted state lock poisoned"))?
+            .unwrap_or_else(|e| e.into_inner())
             .push(SubmittedCommit { sequence_no });
 
         self.record_finish(item_key);
