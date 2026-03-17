@@ -454,8 +454,7 @@ where
         }
 
         if done_ledger.status().is_scanned() {
-            validate_scanned_findings_chain(findings)?;
-            let distinct_findings = distinct_findings_count(findings)?;
+            let distinct_findings = validate_scanned_chain_and_count(findings)?;
             let expected = done_ledger.findings_count();
             if expected != distinct_findings {
                 return Err(ResultCommitRequestError::FindingsCountMismatch {
@@ -475,25 +474,33 @@ where
     }
 }
 
-/// Validate the upward evidence chain required for scanned requests.
+/// Validate the upward evidence chain and count distinct findings in one pass.
 ///
 /// Findings are version-independent, so scanned commits must prove that each
 /// finding is bound to the target item through an occurrence and then an
 /// observation. Observations are the first layer that carries the done-ledger
 /// OVID, which is why this helper requires occurrences to reach that layer
 /// instead of trying to infer OVID equality from occurrence rows alone.
-fn validate_scanned_findings_chain(
+///
+/// Returns the distinct finding count on success, or `Err` if the chain is
+/// broken or the count exceeds `u32::MAX`.
+fn validate_scanned_chain_and_count(
     findings: FindingsUpsertBatch<'_>,
-) -> Result<(), ResultCommitRequestError> {
+) -> Result<u32, ResultCommitRequestError> {
     let finding_ids_with_occurrences: HashSet<_> = findings
         .occurrences()
         .iter()
         .map(|occ| occ.finding_id())
         .collect();
+
+    // Validate each finding has an occurrence and collect distinct IDs in
+    // the same pass, avoiding a separate deduplication HashSet.
+    let mut distinct_finding_ids = HashSet::with_capacity(findings.findings().len());
     for (index, finding) in findings.findings().iter().enumerate() {
         if !finding_ids_with_occurrences.contains(&finding.finding_id()) {
             return Err(ResultCommitRequestError::FindingWithoutOccurrence { index });
         }
+        distinct_finding_ids.insert(finding.finding_id());
     }
 
     // Observations carry the OVID that preserves connector version-claim
@@ -509,22 +516,7 @@ fn validate_scanned_findings_chain(
         }
     }
 
-    Ok(())
-}
-
-/// Count distinct finding IDs in the batch, deduplicating by `finding_id`.
-///
-/// Returns `Err` if the count exceeds `u32::MAX`, which is the done-ledger
-/// field width for `findings_count`.
-fn distinct_findings_count(
-    findings: FindingsUpsertBatch<'_>,
-) -> Result<u32, ResultCommitRequestError> {
-    let count = findings
-        .findings()
-        .iter()
-        .map(|f| f.finding_id())
-        .collect::<HashSet<_>>()
-        .len();
+    let count = distinct_finding_ids.len();
     u32::try_from(count).map_err(|_| ResultCommitRequestError::DistinctFindingsOverflow { count })
 }
 

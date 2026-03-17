@@ -509,12 +509,6 @@ where
         self.outcomes.recv_timeout(timeout)
     }
 
-    /// Try to receive one commit-stage outcome without blocking.
-    #[inline]
-    pub fn try_recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, TryRecvError> {
-        self.outcomes.try_recv()
-    }
-
     /// Join the commit worker after outcome draining has finished.
     pub fn join(mut self) -> thread::Result<()> {
         match self.worker.take() {

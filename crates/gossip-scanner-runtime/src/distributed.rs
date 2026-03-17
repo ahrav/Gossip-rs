@@ -726,7 +726,7 @@ where
 {
     let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0, max_buffered);
     let mut processed = 0_u64;
-    let mut committed_sequence_nos = Vec::new();
+    let mut committed_sequence_nos = Vec::with_capacity(max_buffered);
     let mut drain_error = None;
 
     loop {
@@ -794,6 +794,22 @@ fn wait_for_submitted_commits(
 ) -> Result<()> {
     submitted.sort_by_key(SubmittedCommit::sequence_no);
     committed_sequence_nos.sort_unstable();
+
+    // Reject duplicate sequence numbers — structurally impossible today
+    // (atomic counter + aggregator rejection), but a cheap defense-in-depth
+    // guard against future regressions.
+    if let Some(dup) = submitted
+        .windows(2)
+        .find_map(|w| (w[0].sequence_no() == w[1].sequence_no()).then_some(w[0].sequence_no()))
+    {
+        return Err(anyhow!("duplicate submitted sequence number {dup}"));
+    }
+    if let Some(dup) = committed_sequence_nos
+        .windows(2)
+        .find_map(|w| (w[0] == w[1]).then_some(w[0]))
+    {
+        return Err(anyhow!("duplicate committed sequence number {dup}"));
+    }
 
     if submitted.len() != committed_sequence_nos.len() {
         return Err(anyhow!(
@@ -878,6 +894,13 @@ where
         .with_workers(1)
         .with_budgets(config.budgets)
         .with_persist_findings(true);
+
+    // Relaxed ordering on ReceiptCommitSink::next_sequence_no is sound only
+    // when exactly one scan worker thread exists.
+    debug_assert_eq!(
+        scan_config.workers, 1,
+        "receipt-driven execution requires single-threaded scanning"
+    );
 
     let engine = build_runtime_engine(
         scan_config.rules_file.as_deref(),
@@ -1443,6 +1466,40 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("did not match durable outcome sequence"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_duplicate_submitted_sequences() {
+        let submitted = vec![
+            SubmittedCommit { sequence_no: 0 },
+            SubmittedCommit { sequence_no: 1 },
+            SubmittedCommit { sequence_no: 1 },
+        ];
+        let err = wait_for_submitted_commits(submitted, vec![0, 1, 1])
+            .expect_err("duplicate submitted sequences should fail");
+
+        assert!(
+            err.to_string()
+                .contains("duplicate submitted sequence number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_duplicate_committed_sequences() {
+        let submitted = vec![
+            SubmittedCommit { sequence_no: 0 },
+            SubmittedCommit { sequence_no: 1 },
+            SubmittedCommit { sequence_no: 2 },
+        ];
+        let err = wait_for_submitted_commits(submitted, vec![0, 2, 2])
+            .expect_err("duplicate committed sequences should fail");
+
+        assert!(
+            err.to_string()
+                .contains("duplicate committed sequence number"),
             "unexpected error: {err}"
         );
     }
