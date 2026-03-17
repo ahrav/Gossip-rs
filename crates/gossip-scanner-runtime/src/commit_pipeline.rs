@@ -37,15 +37,17 @@
 //!
 //! - [`CommitPipelineSender::submit`] checks cancellation before attempting a
 //!   blocking send so new work is rejected promptly when the lease is gone;
-//! - the worker polls the cancellation token between receives, so it exits
-//!   even when cloned senders keep the submission channel connected;
-//! - the worker still finishes the current item and attempts to emit its
-//!   outcome. If the outcome receiver has already been dropped (e.g. during
-//!   shutdown), the last outcome is silently discarded — the committed data
-//!   is durable in storage and checkpoint advancement resumes from the last
-//!   durable checkpoint on restart;
-//! - the worker exits before dequeuing more items once it observes
-//!   cancellation.
+//! - the worker polls the cancellation token before receive and again after
+//!   dequeue, so it exits even when cloned senders keep the submission
+//!   channel connected;
+//! - the worker still finishes the current in-flight item and attempts to
+//!   emit its outcome. If the outcome receiver has already been dropped,
+//!   for example during shutdown, the last outcome is silently discarded —
+//!   the committed data is durable in storage and checkpoint advancement
+//!   resumes from the last durable checkpoint on restart;
+//! - once cancellation is observed, the worker exits before committing any
+//!   newly dequeued item, so at most the current in-flight commit can finish
+//!   after cancellation.
 //!
 //! Already-blocked producers may still observe a disconnected channel rather
 //! than a cancellation error. That delay is bounded by the time needed for the
@@ -134,7 +136,7 @@ impl QueuedCommit {
 ///
 /// Success is represented as a receipt-ready checkpoint input paired with the
 /// original [`WriteContext`]. Failure keeps the completed unit attached so the
-/// runtime can reason about which unit stalled or needs retry handling.
+/// runtime can reason about which unit stalled or needs follow-up handling.
 #[derive(Debug)]
 pub enum CommitStageOutput<FindingsError, DoneLedgerError> {
     /// One queued work item became durably committed and is now eligible for
@@ -145,16 +147,19 @@ pub enum CommitStageOutput<FindingsError, DoneLedgerError> {
         /// Receipt-only checkpoint-stage input produced by the durable commit.
         checkpoint_input: CheckpointAggregatorInput,
     },
-    /// One queued work item failed during durable commit.
+    /// One queued work item failed during durable commit or hit a
+    /// post-commit invariant violation while preparing checkpoint input.
     ///
     /// The original [`PersistenceTranslation`] is not carried here because
     /// translations are deterministically re-derivable from the scan output.
     /// Keeping the translation out of the error path avoids retaining
     /// heap-allocated persistence rows longer than necessary.
     Failed {
-        /// Shared routing and fencing metadata for the failed commit.
+        /// Shared routing and fencing metadata for the failed commit-stage
+        /// outcome.
         write_context: WriteContext,
-        /// Completed unit that failed to become durable.
+        /// Completed unit whose commit path could not produce usable
+        /// checkpoint-stage output.
         completed_unit: CompletedUnit,
         /// Stage-local commit error.
         error: ResultCommitError<FindingsError, DoneLedgerError>,
@@ -230,9 +235,11 @@ impl CommitPipelineSender {
     ///
     /// The cancellation check and the channel send are not atomic: a concurrent
     /// cancellation between the two steps may allow one more item into the
-    /// queue. That item will still be committed and its receipt emitted on the
-    /// outcome channel, so callers that received `Ok(())` always get a
-    /// consistent outcome.
+    /// queue. The worker re-checks cancellation after dequeue, so an item
+    /// admitted during that race may be abandoned before durable commit rather
+    /// than producing an outcome. Callers that need an authoritative completion
+    /// signal must wait for [`CommitStageOutput`] instead of treating `Ok(())`
+    /// as proof of commit.
     ///
     /// # Errors
     ///
@@ -446,6 +453,13 @@ fn run_commit_stage<F, D>(
             }
         };
 
+        if cancel.is_cancelled() {
+            tracing::debug!(
+                "commit-stage worker exiting: cancellation observed after dequeue, before commit"
+            );
+            break;
+        }
+
         let (write_context, completed_unit, translation) = work.into_parts();
         let expected_kind = completed_unit.checkpoint_boundary_kind();
         let result = committer.commit_translation(write_context, &completed_unit, &translation);
@@ -457,13 +471,27 @@ fn run_commit_stage<F, D>(
                     checkpoint_input,
                 },
                 // Defense-in-depth: expected_kind was derived from the same
-                // completed_unit that produced the receipt, so this kind check
-                // cannot fail in practice.
-                Err(kind_mismatch) => CommitStageOutput::Failed {
-                    write_context,
-                    completed_unit,
-                    error: ResultCommitError::KindMismatch(kind_mismatch),
-                },
+                // completed_unit used to build the receipt, so a mismatch here
+                // means durable data was committed but receipt construction
+                // violated an internal invariant.
+                Err(kind_mismatch) => {
+                    debug_assert!(
+                        false,
+                        "KindMismatch after successful commit is an internal invariant violation: \
+                         expected_kind was derived from the same completed_unit that produced the \
+                         receipt: {kind_mismatch}"
+                    );
+                    tracing::error!(
+                        %kind_mismatch,
+                        "commit-stage: internal invariant violation; durable data was committed \
+                         but receipt kind does not match completed unit"
+                    );
+                    CommitStageOutput::Failed {
+                        write_context,
+                        completed_unit,
+                        error: ResultCommitError::KindMismatch(kind_mismatch),
+                    }
+                }
             },
             Err(error) => {
                 tracing::warn!(%error, "commit-stage: durable commit failed");
