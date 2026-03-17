@@ -393,6 +393,10 @@ struct ReceiptCommitSink {
     next_sequence_no: AtomicU64,
     in_flight: Mutex<BTreeMap<ItemKey, InFlightItem>>,
     submitted: Mutex<Vec<SubmittedCommit>>,
+    /// First-failure-only flag for progress telemetry. Mirrors
+    /// `CoordinationEventSink`'s suppression to avoid flooding logs during
+    /// sustained recorder outages.
+    progress_error_logged: AtomicBool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -415,6 +419,7 @@ impl ReceiptCommitSink {
             next_sequence_no: AtomicU64::new(0),
             in_flight: Mutex::new(BTreeMap::new()),
             submitted: Mutex::new(Vec::new()),
+            progress_error_logged: AtomicBool::new(false),
         }
     }
 
@@ -469,15 +474,21 @@ impl ReceiptCommitSink {
     /// Recorder errors are intentionally non-fatal: durability flows through
     /// the commit pipeline, not the recorder.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
-        if let Err(e) = self.recorder.record_commit_progress(
+        if let Err(error) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Begin {
                 write_context: self.write_context,
                 item_key: item_key.clone(),
                 size_hint: meta.size_hint,
             },
-        ) {
-            tracing::warn!(shard_id = %self.shard_id, %e, "record_begin telemetry failed");
+        )
+            && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
         }
     }
 
@@ -489,14 +500,20 @@ impl ReceiptCommitSink {
     /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
     /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
-        if let Err(e) = self.recorder.record_commit_progress(
+        if let Err(error) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Finish {
                 write_context: self.write_context,
                 item_key: item_key.clone(),
             },
-        ) {
-            tracing::warn!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
+        )
+            && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
         }
     }
 
