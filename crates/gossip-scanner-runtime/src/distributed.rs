@@ -481,8 +481,7 @@ impl ReceiptCommitSink {
                 item_key: item_key.clone(),
                 size_hint: meta.size_hint,
             },
-        )
-            && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
                 shard_id = %self.shard_id,
@@ -506,8 +505,7 @@ impl ReceiptCommitSink {
                 write_context: self.write_context,
                 item_key: item_key.clone(),
             },
-        )
-            && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
                 shard_id = %self.shard_id,
