@@ -90,7 +90,7 @@ _Now that every component has been introduced and the data flow explained,
 show a diagram that makes the structure visible. The reader should be able
 to match every box and arrow back to the prose above._
 
-```
+```text
   Thread 1 (scan)              Thread 2 (commit)
   ┌──────────────────┐         ┌───────────────────┐
   │ scan files       │         │ commit results    │

@@ -984,12 +984,13 @@ where
     let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
 
-    let submitted_units = committed_sequence_nos.len() as u64;
+    let committed_units = committed_sequence_nos.len() as u64;
 
-    // Zero-item shards (empty directories) complete without a checkpoint
-    // cursor because no items were committed and no cursor position exists.
+    // Shards with zero durable commit units (empty directories or directories
+    // where no file produced findings) complete without a checkpoint cursor
+    // because no receipt-derived cursor position exists.
     // Guard early to avoid calling prepare_checkpoint on an empty aggregator.
-    if submitted_units == 0 {
+    if committed_units == 0 {
         coordinator
             .complete_shard(lease, None, outcome.report)
             .map_err(DistributedRuntimeError::Coordinator)?;
@@ -1013,15 +1014,15 @@ where
         DistributedRuntimeError::Durability(anyhow!(
             "filesystem shard '{}' committed {} unit(s) but no receipt-driven checkpoint prefix was prepared",
             lease.shard_id(),
-            submitted_units
+            committed_units
         ))
     })?;
-    if pending.committed_units() != submitted_units {
+    if pending.committed_units() != committed_units {
         return Err(DistributedRuntimeError::Durability(anyhow!(
             "filesystem shard '{}' prepared checkpoint for {} unit(s), expected {}",
             lease.shard_id(),
             pending.committed_units(),
-            submitted_units
+            committed_units
         )));
     }
 

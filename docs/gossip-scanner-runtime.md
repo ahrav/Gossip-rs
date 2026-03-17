@@ -336,9 +336,8 @@ intentionally non-fatal because durability flows through the commit pipeline.
 `CommitStageDrainResult` containing:
 
 - a `PrefixCheckpointAggregator` that tracks the contiguous committed prefix
-- a count of successfully committed items
 - the sequence numbers of committed items (for cross-checking against the
-  submitted list)
+  submitted list); the committed count is derived from this list's length
 
 The function loops over `CommitStageOutput` values from the drainer. On
 `Committed` outcomes, it feeds the checkpoint input to the aggregator. On
