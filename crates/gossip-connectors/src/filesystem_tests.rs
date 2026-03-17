@@ -91,30 +91,15 @@ fn resolve_rejects_malicious_paths(#[case] path: &[u8]) {
 // Error classification tests
 // ---------------------------------------------------------------
 
-#[test]
-fn eloop_classified_as_permanent() {
-    let err = io::Error::from_raw_os_error(libc::ELOOP);
+#[rstest]
+#[case::eloop(libc::ELOOP, "ELOOP")]
+#[case::enotdir(libc::ENOTDIR, "ENOTDIR")]
+#[case::eisdir(libc::EISDIR, "EISDIR")]
+fn permanent_error_codes_are_classified_as_permanent(#[case] errno: i32, #[case] label: &str) {
+    let err = io::Error::from_raw_os_error(errno);
     assert!(
         crate::common::is_permanent_io_error(&err),
-        "ELOOP should be permanent"
-    );
-}
-
-#[test]
-fn enotdir_classified_as_permanent() {
-    let err = io::Error::from_raw_os_error(libc::ENOTDIR);
-    assert!(
-        crate::common::is_permanent_io_error(&err),
-        "ENOTDIR should be permanent"
-    );
-}
-
-#[test]
-fn eisdir_classified_as_permanent() {
-    let err = io::Error::from_raw_os_error(libc::EISDIR);
-    assert!(
-        crate::common::is_permanent_io_error(&err),
-        "EISDIR should be permanent"
+        "{label} should be permanent"
     );
 }
 

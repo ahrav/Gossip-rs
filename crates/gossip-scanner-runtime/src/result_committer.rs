@@ -482,8 +482,10 @@ where
 /// OVID, which is why this helper requires occurrences to reach that layer
 /// instead of trying to infer OVID equality from occurrence rows alone.
 ///
-/// Returns the distinct finding count on success, or `Err` if the chain is
-/// broken or the count exceeds `u32::MAX`.
+/// On success, returns the number of distinct `FindingId`s in the batch.
+/// Callers rely on `validate_referential_integrity` having run first: that
+/// guarantees every occurrence references a finding in the batch, so the
+/// occurrence-derived finding-ID set is exactly the distinct findings set.
 fn validate_scanned_chain_and_count(
     findings: FindingsUpsertBatch<'_>,
 ) -> Result<u32, ResultCommitRequestError> {
@@ -493,14 +495,10 @@ fn validate_scanned_chain_and_count(
         .map(|occ| occ.finding_id())
         .collect();
 
-    // Validate each finding has an occurrence and collect distinct IDs in
-    // the same pass, avoiding a separate deduplication HashSet.
-    let mut distinct_finding_ids = HashSet::with_capacity(findings.findings().len());
     for (index, finding) in findings.findings().iter().enumerate() {
         if !finding_ids_with_occurrences.contains(&finding.finding_id()) {
             return Err(ResultCommitRequestError::FindingWithoutOccurrence { index });
         }
-        distinct_finding_ids.insert(finding.finding_id());
     }
 
     // Observations carry the OVID that preserves connector version-claim
@@ -516,7 +514,7 @@ fn validate_scanned_chain_and_count(
         }
     }
 
-    let count = distinct_finding_ids.len();
+    let count = finding_ids_with_occurrences.len();
     u32::try_from(count).map_err(|_| ResultCommitRequestError::DistinctFindingsOverflow { count })
 }
 
