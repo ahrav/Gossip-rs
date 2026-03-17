@@ -1331,6 +1331,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-coordination-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gossip-contracts",
+ "gossip-coordination",
+ "gossip-coordination-etcd",
+ "gossip-frontier",
+ "gossip-scanner-runtime",
+ "tempfile",
+]
+
+[[package]]
 name = "gossip-coordination-etcd"
 version = "0.1.0"
 dependencies = [

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/gossip-stdx",
     "crates/gossip-contracts",
+    "crates/gossip-coordination-bridge",
     "crates/gossip-pg-common",
     "crates/gossip-done-ledger-postgres",
     "crates/gossip-findings-postgres",
@@ -41,6 +42,7 @@ gossip-scanner-runtime = { path = "crates/gossip-scanner-runtime" }
 gossip-connectors = { path = "crates/gossip-connectors" }
 gossip-coordination = { path = "crates/gossip-coordination" }
 gossip-coordination-etcd = { path = "crates/gossip-coordination-etcd" }
+gossip-coordination-bridge = { path = "crates/gossip-coordination-bridge" }
 gossip-persistence-inmemory = { path = "crates/gossip-persistence-inmemory" }
 gossip-frontier = { path = "crates/gossip-frontier" }
 
@@ -68,4 +70,3 @@ opt-level = 1
 
 [profile.test.package."*"]
 opt-level = 1
-

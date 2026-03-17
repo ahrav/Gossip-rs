@@ -249,6 +249,10 @@ where
 ///
 /// The runtime clones these handles per shard. Production backends should make
 /// that cheap, for example by cloning an `Arc` or a pool handle.
+///
+/// Both backends must tolerate duplicate writes for the same
+/// `(write_context, item_key)` pair because the worker loop provides
+/// at-least-once delivery (see `run_filesystem_lease` for details).
 #[derive(Clone, Debug)]
 pub struct DistributedPersistence<F, D> {
     /// Findings sink handle cloned by the worker loop.
@@ -620,15 +624,7 @@ impl CommitSink for ReceiptCommitSink {
             .get_mut(item_key)
             .ok_or_else(|| anyhow::anyhow!("upsert_findings called before begin_item for item"))?;
 
-        for (i, finding) in batch.findings.iter().enumerate() {
-            if finding.end <= finding.start {
-                anyhow::bail!(
-                    "finding at index {i} has invalid span [{}, {})",
-                    finding.start,
-                    finding.end,
-                );
-            }
-        }
+        batch.validate()?;
 
         // The CommitSink surface provides only start/end offsets.
         // Root-hint fields are unavailable through this bridge, so both
@@ -893,6 +889,14 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
 /// 6. `mark_shard_done` records the shard as complete in the done-ledger.
 ///
 /// If any step fails, the shard is not marked done and will be retried.
+///
+/// # At-least-once delivery
+///
+/// If `complete_shard` succeeds but `mark_shard_done` fails, the shard will
+/// be re-leased on the next worker iteration. The re-execution replays the
+/// full scan-and-commit cycle, producing duplicate `FindingsSink` writes and
+/// `DoneLedger` upserts. Both persistence backends must therefore be
+/// idempotent for the same `(write_context, item_key)` pair.
 #[cfg_attr(not(test), allow(dead_code))]
 fn run_filesystem_lease<A, F, D>(
     coordinator: &dyn DistributedCoordinator<A>,
@@ -914,10 +918,10 @@ where
         .assignment()
         .filesystem_scan_config()
         .ok_or_else(|| {
-            DistributedRuntimeError::Coordinator(anyhow!(
+            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
                 "shard '{}' lease assignment does not carry a filesystem scan config",
                 lease.shard_id()
-            ))
+            )))
         })?
         .with_workers(1)
         .with_budgets(config.budgets)
@@ -1091,11 +1095,18 @@ where
     let mut report = DistributedRunReport::default();
 
     loop {
-        let Some(lease) = coordinator
-            .acquire_shard()
-            .map_err(DistributedRuntimeError::Coordinator)?
-        else {
-            break;
+        let lease = match coordinator.acquire_shard() {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::info!(
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shards_skipped_done = report.shards_skipped_done,
+                    "worker loop terminating with partial progress",
+                );
+                return Err(DistributedRuntimeError::Coordinator(e));
+            }
         };
         report.leases_seen = report.leases_seen.saturating_add(1);
 
@@ -1109,31 +1120,26 @@ where
                         "failed to release shard; may remain acquired until lease TTL expires",
                     );
                 }
+                tracing::info!(
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shards_skipped_done = report.shards_skipped_done,
+                    "worker loop terminating with partial progress",
+                );
                 return Err(DistributedRuntimeError::Coordinator(e));
             }
         };
 
         if is_done {
-            coordinator
-                .release_shard(&lease)
-                .map_err(DistributedRuntimeError::Coordinator)?;
-            report.shards_skipped_done = report.shards_skipped_done.saturating_add(1);
-            continue;
-        }
-
-        if lease.assignment().filesystem_scan_config().is_none() {
             if let Err(release_err) = coordinator.release_shard(&lease) {
                 tracing::warn!(
                     shard_id = %lease.shard_id(),
                     %release_err,
-                    "best-effort lease release failed on unsupported assignment type",
+                    "best-effort lease release failed for done shard; will expire via TTL",
                 );
             }
-            return Err(DistributedRuntimeError::Coordinator(anyhow!(
-                "distributed receipt-driven runtime is not yet wired for non-filesystem assignments; \
-                 refusing to advance shard '{}' without receipts",
-                lease.shard_id()
-            )));
+            report.shards_skipped_done = report.shards_skipped_done.saturating_add(1);
+            continue;
         }
 
         if let Err(e) = run_filesystem_lease(
@@ -1150,6 +1156,12 @@ where
                     "best-effort lease release failed after scan error",
                 );
             }
+            tracing::info!(
+                leases_seen = report.leases_seen,
+                shards_scanned = report.shards_scanned,
+                shards_skipped_done = report.shards_skipped_done,
+                "worker loop terminating with partial progress",
+            );
             return Err(e);
         }
         report.shards_scanned = report.shards_scanned.saturating_add(1);
@@ -1180,6 +1192,9 @@ struct InMemoryCoordinatorState<A> {
     core_events: Vec<(String, OwnedCoreEvent)>,
     git_events: Vec<(String, StoredGitEvent)>,
     commit_progress: Vec<(String, CommitProgressRecord)>,
+    acquire_fail_count: usize,
+    release_fail_count: usize,
+    is_done_fail_count: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1194,6 +1209,9 @@ impl<A> Default for InMemoryCoordinatorState<A> {
             core_events: Vec::new(),
             git_events: Vec::new(),
             commit_progress: Vec::new(),
+            acquire_fail_count: 0,
+            release_fail_count: 0,
+            is_done_fail_count: 0,
         }
     }
 }
@@ -1279,6 +1297,21 @@ impl<A> InMemoryCoordinator<A> {
             .commit_progress
             .clone()
     }
+
+    /// Cause the next `count` calls to `acquire_shard` to return an error.
+    pub fn fail_next_acquires(&self, count: usize) {
+        self.state.lock().expect("state lock").acquire_fail_count = count;
+    }
+
+    /// Cause the next `count` calls to `release_shard` to return an error.
+    pub fn fail_next_releases(&self, count: usize) {
+        self.state.lock().expect("state lock").release_fail_count = count;
+    }
+
+    /// Cause the next `count` calls to `is_shard_done` to return an error.
+    pub fn fail_next_is_done_checks(&self, count: usize) {
+        self.state.lock().expect("state lock").is_done_fail_count = count;
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1287,15 +1320,21 @@ where
     A: ShardLeaseAssignment + Send + Sync + 'static,
 {
     fn acquire_shard(&self) -> Result<Option<ShardLease<A>>> {
-        Ok(self.state.lock().expect("state lock").queue.pop_front())
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.acquire_fail_count > 0 {
+            guard.acquire_fail_count -= 1;
+            return Err(anyhow!("injected acquire_shard failure"));
+        }
+        Ok(guard.queue.pop_front())
     }
 
     fn release_shard(&self, lease: &ShardLease<A>) -> Result<()> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .released
-            .push(lease.shard_id().to_owned());
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.release_fail_count > 0 {
+            guard.release_fail_count -= 1;
+            return Err(anyhow!("injected release_shard failure"));
+        }
+        guard.released.push(lease.shard_id().to_owned());
         Ok(())
     }
 
@@ -1318,12 +1357,12 @@ where
     }
 
     fn is_shard_done(&self, lease: &ShardLease<A>) -> Result<bool> {
-        Ok(self
-            .state
-            .lock()
-            .expect("state lock")
-            .done
-            .contains(lease.shard_id()))
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.is_done_fail_count > 0 {
+            guard.is_done_fail_count -= 1;
+            return Err(anyhow!("injected is_shard_done failure"));
+        }
+        Ok(guard.done.contains(lease.shard_id()))
     }
 
     fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()> {
@@ -2503,12 +2542,12 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("not yet wired for non-filesystem assignments"),
+                .contains("does not carry a filesystem scan config"),
             "unexpected error: {error}"
         );
         assert!(
-            matches!(error, DistributedRuntimeError::Coordinator(_)),
-            "non-filesystem rejection should use Coordinator variant, got: {error:?}"
+            matches!(error, DistributedRuntimeError::Runtime(_)),
+            "non-filesystem rejection should use Runtime variant, got: {error:?}"
         );
         assert_eq!(
             coordinator.released_shards(),
@@ -2521,16 +2560,14 @@ mod tests {
 
     #[test]
     fn run_worker_releases_lease_on_filesystem_scan_failure() {
-        // Point the lease at a non-existent directory so `run_filesystem_lease`
-        // fails during engine construction.
-        let bogus_path = std::path::Path::new("/tmp/gossip-rs-nonexistent-dir-test");
-        assert!(
-            !bogus_path.exists(),
-            "test expects this directory not to exist"
-        );
+        // Create then immediately drop a tempdir so the path is guaranteed
+        // nonexistent and unique, avoiding CI flakiness from hardcoded paths.
+        let dir = tempdir().expect("tempdir");
+        let bogus_path = dir.path().to_owned();
+        drop(dir);
 
         let coordinator =
-            InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", bogus_path)]);
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", &bogus_path)]);
 
         let error = run_worker(
             &coordinator,
@@ -2734,8 +2771,8 @@ mod tests {
         .expect_err("missing filesystem config should be rejected");
 
         assert!(
-            matches!(error, DistributedRuntimeError::Coordinator(_)),
-            "missing filesystem config is a lease/coordinator contract error"
+            matches!(error, DistributedRuntimeError::Runtime(_)),
+            "missing filesystem config is a runtime execution precondition error"
         );
         assert!(coordinator.completed_shards().is_empty());
         assert!(!coordinator.done_set().contains("shard-missing-config"));
@@ -2893,5 +2930,110 @@ mod tests {
             vec!["shard-done".to_owned()],
             "only the done shard should be released without completion"
         );
+    }
+
+    #[test]
+    fn run_worker_returns_coordinator_error_on_acquire_failure() {
+        let dir = tempdir().expect("tempdir");
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_acquires(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected acquire failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "acquire failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("injected acquire_shard failure"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn run_worker_returns_coordinator_error_on_is_done_failure() {
+        let dir = tempdir().expect("tempdir");
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_is_done_checks(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected is_done failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "is_done failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("injected is_shard_done failure"),
+            "unexpected error: {error}"
+        );
+        // The is_done error handler does a best-effort release.
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-a".to_owned()],
+            "is_done failure must attempt best-effort lease release"
+        );
+    }
+
+    #[test]
+    fn run_worker_preserves_original_error_when_release_fails_after_is_done_error() {
+        let dir = tempdir().expect("tempdir");
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        // Both is_done and release will fail; the original is_done error
+        // should be returned, not the release error.
+        coordinator.fail_next_is_done_checks(1);
+        coordinator.fail_next_releases(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected is_done failure should propagate");
+
+        assert!(
+            error.to_string().contains("injected is_shard_done failure"),
+            "original is_done error should be preserved, got: {error}"
+        );
+        // Release failed too, so no shard appears in released list.
+        assert!(
+            coordinator.released_shards().is_empty(),
+            "failed release should not record the shard"
+        );
+    }
+
+    #[test]
+    fn run_worker_continues_after_release_failure_on_done_shard() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![
+            filesystem_lease("shard-done", dir.path()),
+            filesystem_lease("shard-active", dir.path()),
+        ]);
+        coordinator.mark_done("shard-done");
+        // Release will fail for the done shard, but the loop should continue
+        // to process the active shard (F-02 made done-shard release best-effort).
+        coordinator.fail_next_releases(1);
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("done-shard release failure should not abort the loop");
+
+        assert_eq!(report.leases_seen, 2);
+        assert_eq!(report.shards_skipped_done, 1);
+        assert_eq!(report.shards_scanned, 1);
     }
 }

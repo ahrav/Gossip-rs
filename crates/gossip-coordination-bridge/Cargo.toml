@@ -1,0 +1,19 @@
+[package]
+name = "gossip-coordination-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Adapters bridging coordination backends into scanner runtime coordinators"
+
+[dependencies]
+anyhow.workspace = true
+gossip-contracts.workspace = true
+gossip-coordination.workspace = true
+gossip-coordination-etcd.workspace = true
+gossip-frontier.workspace = true
+gossip-scanner-runtime.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
