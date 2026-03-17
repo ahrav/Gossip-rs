@@ -11,8 +11,8 @@ surfaces.
 ## 1. Dual Entry Points -- CLI, Worker, and Distributed Runtime
 
 The CLI and worker binaries call the same filesystem and Git entrypoints.
-The distributed module currently exposes worker-loop foundation types instead
-of a callable placeholder entrypoint.
+The distributed module provides a receipt-driven `run_worker` loop and
+foundation types for coordinator-backed execution.
 
 ```mermaid
 %% Diagram: dual-entry-point-sequence
@@ -30,11 +30,11 @@ sequenceDiagram
     CLI->>RT: scan_fs(config) / scan_git(config)
     RT->>RT: validate path + budgets
     alt Filesystem request
-        RT->>OC: filesystem_placeholder(config, canonical_path)
-        OC-->>RT: ScanRuntimeError::Driver(...)
+        RT->>OC: scan_local_filesystem(config, canonical_path)
+        OC-->>RT: ScanReport
     else Git request
-        RT->>GR: local_repo_placeholder(config, canonical_repo)
-        GR-->>RT: ScanRuntimeError::Driver(...)
+        RT->>GR: scan_local_repo(config, canonical_repo)
+        GR-->>RT: ScanReport
     end
     RT-->>CLI: Result<ScanReport, ScanRuntimeError>
 
@@ -42,11 +42,11 @@ sequenceDiagram
     WRK->>RT: scan_fs(config) / scan_git(config)
     RT->>RT: validate path + budgets
     alt Filesystem request
-        RT->>OC: filesystem_placeholder(config, canonical_path)
-        OC-->>RT: ScanRuntimeError::Driver(...)
+        RT->>OC: scan_local_filesystem(config, canonical_path)
+        OC-->>RT: ScanReport
     else Git request
-        RT->>GR: local_repo_placeholder(config, canonical_repo)
-        GR-->>RT: ScanRuntimeError::Driver(...)
+        RT->>GR: scan_local_repo(config, canonical_repo)
+        GR-->>RT: ScanReport
     end
     RT-->>WRK: Result<ScanReport, ScanRuntimeError>
 
@@ -58,10 +58,9 @@ sequenceDiagram
 `Direct` and `Connector` modes converge on the same family modules inside the
 runtime crate.
 
-**Typed placeholders.** The filesystem and Git family modules report
-unimplemented execution through `ScanRuntimeError::Driver(...)` rather than
-panicking or relying on `todo!()`. The distributed type layer already carries a
-dedicated `DistributedRuntimeError` enum for the upcoming worker loop.
+**Family dispatch.** The filesystem and Git family modules route scan requests
+to `scan_local_filesystem` and `scan_local_repo` respectively. The distributed
+layer carries a dedicated `DistributedRuntimeError` enum for the worker loop.
 
 ---
 
@@ -83,8 +82,8 @@ graph TD
     end
 
     subgraph Runtime["gossip-scanner-runtime"]
-        OC["OrderedContentRuntime<br/>filesystem_placeholder(...)"]
-        GR["GitRepoRuntime<br/>local_repo_placeholder(...)"]
+        OC["OrderedContentRuntime<br/>scan_local_filesystem(...)"]
+        GR["GitRepoRuntime<br/>scan_local_repo(...)"]
     end
 
     subgraph Distributed["distributed.rs foundation"]
@@ -204,8 +203,8 @@ graph TD
     B["scan_fs / scan_git"]
     C["Validate path + budgets"]
     D{"Source family"}
-    E["ordered_content::filesystem_placeholder"]
-    F["git_repo::local_repo_placeholder"]
+    E["ordered_content::scan_local_filesystem"]
+    F["git_repo::scan_local_repo"]
     G["Result&lt;ScanReport, ScanRuntimeError&gt;"]
     H["distributed.rs foundation types"]
     I["ShardLease&lt;A&gt;<br/>DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
