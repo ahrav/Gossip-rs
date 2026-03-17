@@ -8,7 +8,7 @@
 //! and error layering ([`DistributedRuntimeError`]).
 //!
 //! It also provides `ReceiptCommitSink`, the compatibility adapter that
-//! translates scan-driver `CommitSink` callbacks into receipt-driven commit
+//! translates scan-loop `CommitSink` callbacks into receipt-driven commit
 //! pipeline work.
 
 use std::collections::BTreeMap;
@@ -365,10 +365,10 @@ impl SubmittedCommit {
     }
 }
 
-/// Scan-driver commit sink that bridges begin/upsert/finish callbacks into the
+/// Scan-loop commit sink that bridges begin/upsert/finish callbacks into the
 /// receipt-driven commit pipeline.
 ///
-/// The existing scan-driver seam still emits compact `ItemMeta` and
+/// The existing scan-loop seam still emits compact `ItemMeta` and
 /// `FindingRecord` batches rather than the richer runtime commit inputs.
 /// `ReceiptCommitSink` reconstructs the deterministic translation inputs
 /// expected by the shared commit pipeline so ordered-content execution can
@@ -477,7 +477,7 @@ impl ReceiptCommitSink {
                 size_hint: meta.size_hint,
             },
         ) {
-            tracing::debug!(shard_id = %self.shard_id, %e, "record_begin telemetry failed");
+            tracing::warn!(shard_id = %self.shard_id, %e, "record_begin telemetry failed");
         }
     }
 
@@ -496,7 +496,7 @@ impl ReceiptCommitSink {
                 item_key: item_key.clone(),
             },
         ) {
-            tracing::debug!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
+            tracing::warn!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
         }
     }
 
@@ -589,6 +589,16 @@ impl CommitSink for ReceiptCommitSink {
         let item = guard
             .get_mut(item_key)
             .ok_or_else(|| anyhow::anyhow!("upsert_findings called before begin_item for item"))?;
+
+        for (i, finding) in batch.findings.iter().enumerate() {
+            if finding.end <= finding.start {
+                anyhow::bail!(
+                    "finding at index {i} has invalid span [{}, {})",
+                    finding.start,
+                    finding.end,
+                );
+            }
+        }
 
         // The CommitSink surface provides only start/end offsets.
         // Root-hint fields are unavailable through this bridge, so both
@@ -1946,54 +1956,78 @@ mod tests {
     }
 
     #[test]
-    fn finish_item_rejects_invalid_span_without_submitting_partial_work() {
+    fn upsert_findings_rejects_empty_span() {
         let (pipeline, sink, _recorder) = make_receipt_sink();
         let key = item_key("tenant/repo/bad-span.txt");
 
         sink.begin_item(&key, &item_meta()).expect("begin item");
-        sink.upsert_findings(
-            &key,
-            &FindingsBatch {
-                findings: vec![
-                    finding(),
-                    FindingRecord {
-                        rule_id: 8,
-                        start: 30,
-                        end: 30,
-                        norm_hash: [0x66; 32],
-                        confidence_score: 9,
-                    },
-                ],
-            },
-        )
-        .expect("upsert findings");
-
         let err = sink
-            .finish_item(&key)
-            .expect_err("invalid span must fail translation");
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![
+                        finding(),
+                        FindingRecord {
+                            rule_id: 8,
+                            start: 30,
+                            end: 30,
+                            norm_hash: [0x66; 32],
+                            confidence_score: 9,
+                        },
+                    ],
+                },
+            )
+            .expect_err("empty span must be rejected at upsert time");
         assert!(
             err.to_string()
                 .contains("finding at index 1 has invalid span"),
             "unexpected error: {err}"
         );
 
+        // The item is still in-flight — the batch was rejected before any
+        // findings were appended, so finish_item can still be called.
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
             guard.contains_key(&key),
-            "translation failure must restore the item so finish_item can be retried"
+            "rejected batch must not remove the in-flight item"
         );
         drop(guard);
 
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn upsert_findings_rejects_inverted_span() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/inverted-span.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![FindingRecord {
+                        rule_id: 9,
+                        start: 40,
+                        end: 30,
+                        norm_hash: [0x77; 32],
+                        confidence_score: 7,
+                    }],
+                },
+            )
+            .expect_err("inverted span must be rejected at upsert time");
         assert!(
-            sink.submitted.lock().expect("submitted lock").is_empty(),
-            "failed translation must not record a submitted commit"
+            err.to_string()
+                .contains("finding at index 0 has invalid span"),
+            "unexpected error: {err}"
         );
 
-        match pipeline.recv_timeout(Duration::from_millis(50)) {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(outcome) => panic!("expected no commit-stage outcome, got {outcome:?}"),
-            Err(other) => panic!("expected timeout while pipeline stayed idle, got {other:?}"),
-        }
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(&key),
+            "rejected batch must not remove the in-flight item"
+        );
+        drop(guard);
 
         pipeline.shutdown().expect("worker should join");
     }

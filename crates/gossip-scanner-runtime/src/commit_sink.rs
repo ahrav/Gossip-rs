@@ -25,7 +25,7 @@ pub struct ItemMeta {
 /// Compact finding record forwarded through the [`CommitSink`] bridge.
 ///
 /// This bridge carries only the identity-relevant finding fields available at
-/// the scan-driver seam. Runtime-local metadata such as root-hint offsets is
+/// the scan-loop seam. Runtime-local metadata such as root-hint offsets is
 /// reconstructed or defaulted by the concrete sink implementation when it
 /// translates into persistence rows.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,8 +33,10 @@ pub struct FindingRecord {
     /// Numeric identifier of the detection rule that matched.
     pub rule_id: u32,
     /// Byte offset of the match start within the item payload.
+    /// Must be strictly less than `end`; empty and inverted spans are rejected.
     pub start: u64,
     /// Byte offset one past the match end.
+    /// Must be strictly greater than `start`.
     pub end: u64,
     /// Digest of the normalized secret bytes.
     pub norm_hash: [u8; 32],

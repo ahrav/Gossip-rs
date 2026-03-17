@@ -29,8 +29,8 @@ entrypoints share the same local runtime execution paths.
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
 | `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
-| `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink that stamps one shared `WriteContext` onto emitted records |
-| `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing, including write-scoped progress and identity-chain records |
+| `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
+| `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
 | `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, layered runtime errors, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), and `run_filesystem_lease` (single-shard execution entrypoint) |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
@@ -312,7 +312,7 @@ decomposition.
 
 `ReceiptCommitSink` implements the `CommitSink` trait to bridge scan-driver
 item lifecycle callbacks into the receipt-driven commit pipeline. It tracks
-in-flight items in a `BTreeMap` keyed by item-key bytes:
+in-flight items in a `BTreeMap<ItemKey, InFlightItem>`:
 
 - `begin_item` assigns a monotonically increasing sequence number and
   inserts an `InFlightItem` into the in-flight map.
