@@ -50,7 +50,6 @@ pub enum CommitProgressRecord {
     },
 }
 
-
 /// Coordinator-facing recorder for distributed scan output.
 pub trait CoordinationEventRecorder: Send + Sync {
     /// Persists a scanner core event (finding, progress, summary, diagnostic).

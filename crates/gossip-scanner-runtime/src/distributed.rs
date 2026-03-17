@@ -73,7 +73,7 @@ use crate::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::OwnedCoreEvent;
 #[cfg(any(test, feature = "test-support"))]
-use crate::coordination_sink::{IdentityChainRecord, StoredGitEvent};
+use crate::coordination_sink::StoredGitEvent;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::{HashSet, VecDeque};
 
@@ -1048,11 +1048,12 @@ where
 /// filesystem lease through the receipt-driven durability path, or stops with a
 /// safe error when the assignment does not expose a filesystem scan config.
 ///
-/// The loop is **fail-fast**: it terminates on the first per-shard error and
-/// returns a partial [`DistributedRunReport`] reflecting only the shards
-/// processed before the failure. The caller is responsible for retry or
-/// requeue. Leases are always released back to the coordinator on error so
-/// they can be re-acquired on a subsequent attempt.
+/// The loop is **fail-fast**: it terminates on the first per-shard error.
+/// Progress accumulated before the failure is not returned to the caller —
+/// the `Err` variant carries only the error. The caller is responsible for
+/// retry or requeue. Lease release on error paths is best-effort: the
+/// original error is returned even if the release itself fails (a warning is
+/// logged in that case).
 pub fn run_worker<A, F, D>(
     coordinator: &dyn DistributedCoordinator<A>,
     persistence: DistributedPersistence<F, D>,
@@ -1089,7 +1090,13 @@ where
         }
 
         if lease.assignment().filesystem_scan_config().is_none() {
-            let _ = coordinator.release_shard(&lease);
+            if let Err(release_err) = coordinator.release_shard(&lease) {
+                tracing::warn!(
+                    shard_id = %lease.shard_id(),
+                    %release_err,
+                    "best-effort lease release failed on unsupported assignment type",
+                );
+            }
             return Err(DistributedRuntimeError::Coordinator(anyhow!(
                 "distributed receipt-driven runtime is not yet wired for non-filesystem assignments; \
                  refusing to advance shard '{}' without receipts",
@@ -1104,7 +1111,13 @@ where
             &lease,
             config,
         ) {
-            let _ = coordinator.release_shard(&lease);
+            if let Err(release_err) = coordinator.release_shard(&lease) {
+                tracing::warn!(
+                    shard_id = %lease.shard_id(),
+                    %release_err,
+                    "best-effort lease release failed after scan error",
+                );
+            }
             return Err(e);
         }
         report.shards_scanned = report.shards_scanned.saturating_add(1);
@@ -1135,7 +1148,6 @@ struct InMemoryCoordinatorState<A> {
     core_events: Vec<(String, OwnedCoreEvent)>,
     git_events: Vec<(String, StoredGitEvent)>,
     commit_progress: Vec<(String, CommitProgressRecord)>,
-    identity_records: Vec<(String, IdentityChainRecord)>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1150,17 +1162,16 @@ impl<A> Default for InMemoryCoordinatorState<A> {
             core_events: Vec::new(),
             git_events: Vec::new(),
             commit_progress: Vec::new(),
-            identity_records: Vec::new(),
         }
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
-struct CompletedShard {
-    shard_id: String,
-    checkpoint: Option<Cursor>,
-    report: ScanReport,
+pub struct CompletedShard {
+    pub shard_id: String,
+    pub checkpoint: Option<Cursor>,
+    pub report: ScanReport,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1211,20 +1222,8 @@ impl<A> InMemoryCoordinator<A> {
 
     /// Snapshot of completed shard records.
     #[must_use]
-    pub fn completed_shards(&self) -> Vec<(String, Option<Cursor>, ScanReport)> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .completed
-            .iter()
-            .map(|entry| {
-                (
-                    entry.shard_id.clone(),
-                    entry.checkpoint.clone(),
-                    entry.report,
-                )
-            })
-            .collect()
+    pub fn completed_shards(&self) -> Vec<CompletedShard> {
+        self.state.lock().expect("state lock").completed.clone()
     }
 
     /// Snapshot of recorded core events.
@@ -1233,13 +1232,19 @@ impl<A> InMemoryCoordinator<A> {
         self.state.lock().expect("state lock").core_events.clone()
     }
 
-    /// Snapshot of recorded identity-chain records.
+    /// Snapshot of recorded git events.
     #[must_use]
-    pub fn identity_records(&self) -> Vec<(String, IdentityChainRecord)> {
+    pub fn git_events(&self) -> Vec<(String, StoredGitEvent)> {
+        self.state.lock().expect("state lock").git_events.clone()
+    }
+
+    /// Snapshot of recorded commit-progress events.
+    #[must_use]
+    pub fn commit_progress_events(&self) -> Vec<(String, CommitProgressRecord)> {
         self.state
             .lock()
             .expect("state lock")
-            .identity_records
+            .commit_progress
             .clone()
     }
 }
@@ -1332,15 +1337,6 @@ where
             .expect("state lock")
             .commit_progress
             .push((shard_id.to_owned(), event));
-        Ok(())
-    }
-
-    fn record_identity_chain(&self, shard_id: &str, record: IdentityChainRecord) -> Result<()> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .identity_records
-            .push((shard_id.to_owned(), record));
         Ok(())
     }
 }
@@ -2389,13 +2385,13 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].0, "shard-worker");
+        assert_eq!(completed[0].shard_id, "shard-worker");
         assert!(
-            completed[0].2.items_scanned >= 1,
+            completed[0].report.items_scanned >= 1,
             "scan report should record the scanned file"
         );
         let checkpoint = completed[0]
-            .1
+            .checkpoint
             .as_ref()
             .expect("non-empty shard should checkpoint");
         assert!(
@@ -2444,10 +2440,10 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].0, "shard-dup");
-        assert_eq!(completed[1].0, "shard-dup");
-        assert_eq!(completed[0].1, completed[1].1);
-        assert_eq!(completed[0].2, completed[1].2);
+        assert_eq!(completed[0].shard_id, "shard-dup");
+        assert_eq!(completed[1].shard_id, "shard-dup");
+        assert_eq!(completed[0].checkpoint, completed[1].checkpoint);
+        assert_eq!(completed[0].report, completed[1].report);
     }
 
     #[test]
@@ -2504,12 +2500,20 @@ mod tests {
         let coordinator =
             InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", bogus_path)]);
 
-        let _error = run_worker(
+        let error = run_worker(
             &coordinator,
             DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
             DistributedRuntimeConfig::default(),
         )
         .expect_err("scan on non-existent path should fail");
+
+        assert!(
+            matches!(
+                error,
+                DistributedRuntimeError::Runtime(_) | DistributedRuntimeError::Durability(_)
+            ),
+            "filesystem scan failure should produce a Runtime or Durability error, got: {error:?}"
+        );
 
         assert_eq!(
             coordinator.released_shards(),
@@ -2542,13 +2546,13 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].0, "shard-fs");
+        assert_eq!(completed[0].shard_id, "shard-fs");
         assert!(
-            completed[0].2.items_scanned >= 1,
+            completed[0].report.items_scanned >= 1,
             "scan report should record the scanned file"
         );
         let checkpoint = completed[0]
-            .1
+            .checkpoint
             .as_ref()
             .expect("non-empty shard should checkpoint");
         assert!(
@@ -2601,13 +2605,13 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].0, "shard-empty");
+        assert_eq!(completed[0].shard_id, "shard-empty");
         assert_eq!(
-            completed[0].2.items_scanned, 0,
+            completed[0].report.items_scanned, 0,
             "empty directory should scan zero items"
         );
         assert!(
-            completed[0].1.is_none(),
+            completed[0].checkpoint.is_none(),
             "zero-item shard must complete without a checkpoint"
         );
         assert!(coordinator.done_set().contains("shard-empty"));
@@ -2733,10 +2737,10 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].0, "shard-mixed");
+        assert_eq!(completed[0].shard_id, "shard-mixed");
 
         let checkpoint = completed[0]
-            .1
+            .checkpoint
             .as_ref()
             .expect("non-empty shard should checkpoint");
         assert!(
