@@ -377,8 +377,7 @@ impl SubmittedCommit {
 ///
 /// # Threading model
 ///
-/// Like [`DurableCommitSink`](crate::commit_sink::DurableCommitSink), this
-/// sink is driven by a single-threaded drain loop. The interior `Mutex`
+/// This sink is driven by a single-threaded drain loop. The interior `Mutex`
 /// fields satisfy the `Send + Sync` bound required by [`CommitSink`] without
 /// introducing real contention. Sequence numbers assigned by
 /// [`next_sequence_no`](Self::next_sequence_no) are therefore monotonically
@@ -469,9 +468,7 @@ impl ReceiptCommitSink {
     /// Records a begin-progress event for telemetry.
     ///
     /// Recorder errors are intentionally non-fatal: durability flows through
-    /// the commit pipeline, not the recorder. This diverges from
-    /// `DurableCommitSink` where recorder errors are propagated because the
-    /// recorder IS the durability path.
+    /// the commit pipeline, not the recorder.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
         if let Err(e) = self.recorder.record_commit_progress(
             &self.shard_id,
@@ -1910,6 +1907,118 @@ mod tests {
             CommitStageOutput::Failed { error, .. } => {
                 panic!("expected committed outcome, got failure: {error}");
             }
+        }
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn translate_in_flight_uses_item_key_surrogate_version_when_version_is_missing() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/version-compare.txt");
+        let meta_without_version = ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x44; 32]),
+            version: None,
+            size_hint: Some(256),
+        };
+        let meta_with_explicit_version = ItemMeta {
+            stable_item_id: meta_without_version.stable_item_id,
+            version: Some(VersionId::Strong(ObjectVersionId::from_version_bytes(
+                b"explicit-v1",
+            ))),
+            size_hint: meta_without_version.size_hint,
+        };
+        let findings = vec![FsFindingRecord {
+            rule_id: 7,
+            root_hint_start: 10,
+            root_hint_end: 20,
+            span_start: 10,
+            span_end: 20,
+            norm_hash: [0x55; 32],
+            confidence_score: 6,
+        }];
+
+        let (_, _, implicit_translation) = sink
+            .translate_in_flight(&InFlightItem {
+                sequence_no: 0,
+                item_key: key.clone(),
+                meta: meta_without_version,
+                findings: findings.clone(),
+            })
+            .expect("surrogate-version translation")
+            .into_parts();
+        let (_, _, explicit_translation) = sink
+            .translate_in_flight(&InFlightItem {
+                sequence_no: 0,
+                item_key: key,
+                meta: meta_with_explicit_version,
+                findings,
+            })
+            .expect("explicit-version translation")
+            .into_parts();
+
+        assert_eq!(
+            implicit_translation.findings()[0].finding_id(),
+            explicit_translation.findings()[0].finding_id(),
+            "finding identity must stay version-independent",
+        );
+        assert_ne!(
+            implicit_translation.occurrences()[0].occurrence_id(),
+            explicit_translation.occurrences()[0].occurrence_id(),
+            "missing-version translation must derive occurrence identity from the item-key surrogate version",
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_item_rejects_invalid_span_without_submitting_partial_work() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/bad-span.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.upsert_findings(
+            &key,
+            &FindingsBatch {
+                findings: vec![
+                    finding(),
+                    FindingRecord {
+                        rule_id: 8,
+                        start: 30,
+                        end: 30,
+                        norm_hash: [0x66; 32],
+                        confidence_score: 9,
+                    },
+                ],
+            },
+        )
+        .expect("upsert findings");
+
+        let err = sink
+            .finish_item(&key)
+            .expect_err("invalid span must fail translation");
+        assert!(
+            err.to_string()
+                .contains("finding at index 1 has invalid span"),
+            "unexpected error: {err}"
+        );
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(key.as_bytes()),
+            "translation failure must restore the item so finish_item can be retried"
+        );
+        drop(guard);
+
+        assert!(
+            sink.submitted.lock().expect("submitted lock").is_empty(),
+            "failed translation must not record a submitted commit"
+        );
+
+        match pipeline.recv_timeout(Duration::from_millis(50)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(outcome) => panic!("expected no commit-stage outcome, got {outcome:?}"),
+            Err(other) => panic!("expected timeout while pipeline stayed idle, got {other:?}"),
         }
 
         pipeline.shutdown().expect("worker should join");

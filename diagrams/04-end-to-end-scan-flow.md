@@ -185,11 +185,12 @@ sequenceDiagram
 enumerated and executed, while `EventOutput` receives a stable stream of
 runtime events.
 
-**Identity derivation stays local to the runtime.** `DurableCommitSink`
-computes the finding and occurrence identity chain without leaking identity
-logic into the family contracts. A rule-fingerprint resolver callback
-translates positional `rule_id` values into stable, name-derived
-`RuleFingerprint` values, ensuring finding identity is position-independent.
+**Identity derivation stays local to the runtime.** `ReceiptCommitSink`
+rebuilds the translation inputs for `translate_item_result`, which computes
+the finding and occurrence identity chain without leaking identity logic into
+the family contracts. A rule-fingerprint resolver callback translates
+positional `rule_id` values into stable, name-derived `RuleFingerprint`
+values, ensuring finding identity is position-independent.
 
 ---
 

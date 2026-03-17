@@ -2,8 +2,9 @@
 //!
 //! This sink captures both scheduler core events and git-specific events and
 //! forwards owned copies to a coordinator-facing recorder. Recorder failures are
-//! intentionally non-fatal for event emission: commit durability is enforced by
-//! `DurableCommitSink`, while event recording remains best-effort telemetry.
+//! intentionally non-fatal for event emission: durability flows through the
+//! receipt-driven commit pipeline, while event recording remains best-effort
+//! telemetry.
 
 use std::fmt;
 use std::sync::Arc;

@@ -471,7 +471,7 @@ a receipt is in hand.
   shard lifecycle that checkpoint-boundary advancement feeds into
 - [Fencing Protocol](06-fencing-protocol.md) -- the checkpoint call in
   stage 3 passes through the 5-check fencing preamble
-- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) -- DurableCommitSink
+- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) -- receipt-driven
   identity derivation flow and findings persistence architecture
 - [System Overview](01-system-overview.md) -- where PageCommit fits in the
   overall architecture

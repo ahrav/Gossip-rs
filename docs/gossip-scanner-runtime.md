@@ -402,25 +402,28 @@ runtime:
 - `FindingsBatch`
 - `CommitSink`
 - `CliNoOpCommitSink`
-- `DurableCommitSink`
 
-`DurableCommitSink` is the bridge between scan-loop item lifecycle events
-and identity-chain recording for coordination diagnostics. It computes:
+Distributed receipt-driven execution implements that surface with
+`ReceiptCommitSink` in `src/distributed.rs`. The adapter accumulates compact
+finding batches, reconstructs the richer translation inputs expected by
+`translate_item_result`, and submits the resulting persistence work to the
+bounded commit pipeline. That translation path computes:
 
 - normalized secret hash input
 - tenant-scoped secret hash
 - finding ID (using the rule-fingerprint resolver for position-independent rule identity)
 - occurrence ID
 
-The sink stores one `WriteContext` per shard-scoped runtime instance and a
-rule-fingerprint resolver (`Arc<dyn Fn(u32) -> RuleFingerprint>`). It uses
-the shared scope when deriving tenant-bound finding identity and forwards the
-same context on every `CommitProgressRecord` and `IdentityChainRecord`. The
+The distributed adapter stores one `WriteContext` per shard-scoped runtime
+instance and a rule-fingerprint resolver (`Arc<dyn Fn(u32) -> RuleFingerprint>`).
+It uses the shared scope when translating item results for durable persistence
+and forwards the same context on every `CommitProgressRecord`. The
 rule-fingerprint resolver translates positional `rule_id` values into stable
 `RuleFingerprint` values derived from the rule name.
 
-When a source does not provide an explicit version, the sink derives a
-stable surrogate object version from the item-key bytes.
+When a source does not provide an explicit version, `ReceiptCommitSink`
+derives a stable surrogate object version from the item-key bytes before
+calling `translate_item_result`.
 
 The sink's compact `FindingRecord` and `FindingsBatch` types are local bridge
 shapes. They are not the persistence-layer `FindingRecord`,
