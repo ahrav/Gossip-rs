@@ -68,10 +68,7 @@ fn assert_split_point(files: &[(&str, &[u8])], expected: &[u8]) {
     assert_eq!(split.as_bytes(), expected);
 }
 
-// ---------------------------------------------------------------
-// Split point tests
-// ---------------------------------------------------------------
-
+// Verifies split-point selection behavior across weighted fixture layouts.
 #[test]
 fn choose_split_point_selects_byte_weighted_midpoint() {
     assert_split_point(
