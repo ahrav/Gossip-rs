@@ -265,7 +265,9 @@ shutdown. New submissions check cancellation before attempting a blocking send,
 and the worker re-checks cancellation after dequeue so at most the current
 in-flight commit can finish once cancellation is observed. Any item dequeued
 but not yet committed emits a `Failed` outcome with `Cancelled` so consumers
-always receive exactly one outcome per dequeued item. Buffered items still in
+attempts to emit a `Failed` outcome with `Cancelled`; delivery is best-effort
+because the outcome queue may be full or disconnected at cancellation time.
+Buffered items still in
 the channel queue are abandoned during shutdown instead of opening new durable
 writes after lease loss, which keeps the pipeline responsive without risking
 half-committed state.
@@ -364,7 +366,8 @@ the receipt-driven durability model:
    `drain_commit_stage` with the drainer.
 6. After both threads complete, cross-checks submitted vs. committed
    sequence numbers via `wait_for_submitted_commits` and verifies that the
-   durable receipt count matches the scan report's `items_scanned`.
+   durable receipt count matches the number of items submitted to the commit
+   pipeline.
 7. Prepares a checkpoint prefix from the aggregator, persists the checkpoint
    cursor via `complete_shard`, acknowledges the checkpoint to advance the
    aggregator watermark, and marks the shard done. Zero-item shards

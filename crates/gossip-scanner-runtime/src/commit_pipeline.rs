@@ -227,7 +227,7 @@ impl SubmitError {
 #[derive(Clone, Debug)]
 pub struct CommitPipelineSender {
     inner: SyncSender<QueuedCommit>,
-    pub(crate) cancel: CancellationToken,
+    cancel: CancellationToken,
 }
 
 impl CommitPipelineSender {
@@ -582,11 +582,19 @@ fn run_commit_stage<F, D>(
                 "commit-stage worker exiting: cancellation observed after dequeue, before commit"
             );
             let (write_context, completed_unit, _translation) = work.into_parts();
-            let _ = outcome_tx.try_send(CommitStageOutput::Failed {
-                write_context,
-                completed_unit,
-                error: ResultCommitError::Cancelled,
-            });
+            if outcome_tx
+                .try_send(CommitStageOutput::Failed {
+                    write_context,
+                    completed_unit,
+                    error: ResultCommitError::Cancelled,
+                })
+                .is_err()
+            {
+                tracing::warn!(
+                    "commit-stage: outcome delivery failed on cancellation; \
+                     queue full or disconnected"
+                );
+            }
             break;
         }
 
@@ -643,7 +651,12 @@ fn run_commit_stage<F, D>(
             // non-blocking — the data is already durable, so dropping the
             // outcome is safe. A blocking send here could stall shutdown
             // indefinitely if the outcome queue is full and nobody drains it.
-            let _ = outcome_tx.try_send(outcome);
+            if outcome_tx.try_send(outcome).is_err() {
+                tracing::warn!(
+                    "commit-stage: outcome delivery failed after commit; \
+                     queue full or disconnected"
+                );
+            }
             tracing::debug!("commit-stage worker exiting: cancellation observed after commit");
             break;
         }

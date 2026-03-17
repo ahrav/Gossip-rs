@@ -473,14 +473,16 @@ impl ReceiptCommitSink {
     /// `DurableCommitSink` where recorder errors are propagated because the
     /// recorder IS the durability path.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
-        let _ = self.recorder.record_commit_progress(
+        if let Err(e) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Begin {
                 write_context: self.write_context,
                 item_key: item_key.as_bytes().to_vec(),
                 size_hint: meta.size_hint,
             },
-        );
+        ) {
+            tracing::debug!(shard_id = %self.shard_id, %e, "record_begin telemetry failed");
+        }
     }
 
     /// Records a finish-progress event for telemetry.
@@ -491,13 +493,15 @@ impl ReceiptCommitSink {
     /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
     /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
-        let _ = self.recorder.record_commit_progress(
+        if let Err(e) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Finish {
                 write_context: self.write_context,
                 item_key: item_key.as_bytes().to_vec(),
             },
-        );
+        ) {
+            tracing::debug!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
+        }
     }
 
     /// Reconstruct the deterministic translation inputs from an in-flight
@@ -598,7 +602,8 @@ impl CommitSink for ReceiptCommitSink {
         // Root-hint fields are unavailable through this bridge, so both
         // root_hint_start/end mirror span_start/end. This is safe because
         // root-hint fields never participate in persistence identity
-        // derivation (see result_translation.rs module docs).
+        // derivation (see the `Identity derivation` section in
+        // result_translation.rs).
         item.findings
             .extend(batch.findings.iter().map(|finding| FsFindingRecord {
                 rule_id: finding.rule_id,
@@ -617,9 +622,9 @@ impl CommitSink for ReceiptCommitSink {
         let key_bytes = item_key.as_bytes();
 
         // Remove the item under a short-lived lock. Translation and
-        // submission happen outside the critical section so concurrent
-        // begin_item / upsert_findings calls are not blocked by expensive
-        // work (crypto derivations, channel send).
+        // submission happen outside the critical section to minimize lock
+        // hold duration. The interior mutex satisfies `Send + Sync` bounds
+        // but the sink is driven by a single-threaded drain loop.
         let item = {
             let mut guard = self.in_flight.lock().map_err(|_| {
                 anyhow::anyhow!("receipt commit sink in-flight state lock poisoned")
@@ -697,8 +702,6 @@ impl From<PolicyMismatchError> for DistributedRuntimeError {
 struct CommitStageDrainResult {
     /// Receipt aggregator that tracks the contiguous committed prefix.
     aggregator: PrefixCheckpointAggregator,
-    /// Count of successfully committed items (receipt aggregation succeeded).
-    processed: u64,
     /// Sequence numbers of committed items, in drain order (not necessarily
     /// sorted). Compared against the submitted list by
     /// [`wait_for_submitted_commits`].
@@ -741,7 +744,6 @@ where
     // Use an uncapped limit; actual memory is bounded by the number of items
     // the shard produces, which is always finite.
     let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0, usize::MAX);
-    let mut processed = 0_u64;
     let mut committed_sequence_nos = Vec::with_capacity(max_buffered);
     let mut drain_error = None;
 
@@ -753,17 +755,7 @@ where
                 if drain_error.is_none() {
                     let sequence_no = checkpoint_input.receipt().completed_unit().sequence_no();
                     match aggregator.record_receipt(checkpoint_input) {
-                        Ok(_) => match processed.checked_add(1) {
-                            Some(next) => {
-                                processed = next;
-                                committed_sequence_nos.push(sequence_no);
-                            }
-                            None => {
-                                drain_error =
-                                    Some(anyhow!("commit-stage processed counter overflow"));
-                                drainer.cancel();
-                            }
-                        },
+                        Ok(_) => committed_sequence_nos.push(sequence_no),
                         Err(error) => {
                             drain_error = Some(anyhow!("receipt aggregation failed: {error}"));
                             drainer.cancel();
@@ -798,7 +790,6 @@ where
 
     Ok(CommitStageDrainResult {
         aggregator,
-        processed,
         committed_sequence_nos,
     })
 }
@@ -859,14 +850,22 @@ fn wait_for_submitted_commits(
 
 /// Derive the logical time used when acknowledging a prepared checkpoint.
 ///
-/// Returns `last_sequence_no + 1` (saturating at `u64::MAX`), placing the
-/// checkpoint acknowledgment strictly after the last committed item's
-/// sequence number. This operates in sequence-number space, not the
-/// `(2n, 2n+1)` logical-time space used by `ReceiptCommitSink`.
+/// Returns `last_sequence_no + 1`, placing the checkpoint acknowledgment
+/// strictly after the last committed item's sequence number. The raw value
+/// passed to `LogicalTime::from_raw` is derived from the sequence-number
+/// domain, intentionally distinct from the `(2n, 2n+1)` logical-time
+/// mapping used by `ReceiptCommitSink`.
+///
+/// # Errors
+///
+/// Returns an error if `last_sequence_no` is `u64::MAX` (no room for +1).
 #[cfg_attr(not(test), allow(dead_code))]
 #[inline]
-fn checkpoint_logical_time(last_sequence_no: u64) -> LogicalTime {
-    LogicalTime::from_raw(last_sequence_no.saturating_add(1))
+fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
+    last_sequence_no
+        .checked_add(1)
+        .map(LogicalTime::from_raw)
+        .ok_or_else(|| anyhow!("checkpoint logical time overflow: last_sequence_no is u64::MAX"))
 }
 
 /// Execute one filesystem lease under the receipt-driven durability model.
@@ -967,18 +966,23 @@ where
 
         let outcome = scan_fs_with_prebuilt_engine(&scan_config, engine, &sink, &commit, &cancel);
         let submitted = commit.finish();
-        let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread")?;
+        let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread");
 
-        Ok::<_, AnyError>((outcome, submitted, stage_result))
-    })
-    .map_err(DistributedRuntimeError::Durability)?;
+        (outcome, submitted, stage_result)
+    });
 
+    // Unwrap in priority order: scan errors are more informative than drain
+    // thread failures, so propagate them first.
     let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
     let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
-    let mut stage_result = stage_result.map_err(DistributedRuntimeError::Durability)?;
+    let CommitStageDrainResult {
+        mut aggregator,
+        committed_sequence_nos,
+    } = stage_result
+        .map_err(DistributedRuntimeError::Durability)?
+        .map_err(DistributedRuntimeError::Durability)?;
 
-    let committed_sequence_nos = std::mem::take(&mut stage_result.committed_sequence_nos);
-    let submitted_units = stage_result.processed;
+    let submitted_units = committed_sequence_nos.len() as u64;
 
     // Zero-item shards (empty directories) complete without a checkpoint
     // cursor because no items were committed and no cursor position exists.
@@ -999,8 +1003,7 @@ where
     wait_for_submitted_commits(submitted, committed_sequence_nos)
         .map_err(DistributedRuntimeError::Durability)?;
 
-    let pending = stage_result
-        .aggregator
+    let pending = aggregator
         .prepare_checkpoint()
         .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
@@ -1030,10 +1033,10 @@ where
 
     let checkpoint_receipt = CheckpointCommitReceipt::new(
         pending.scope().clone(),
-        checkpoint_logical_time(pending.last_sequence_no()),
+        checkpoint_logical_time(pending.last_sequence_no())
+            .map_err(DistributedRuntimeError::Durability)?,
     );
-    stage_result
-        .aggregator
+    aggregator
         .acknowledge_checkpoint(checkpoint_receipt)
         .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
@@ -1523,11 +1526,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_logical_time_saturates_at_u64_max() {
-        assert_eq!(
-            checkpoint_logical_time(u64::MAX),
-            LogicalTime::from_raw(u64::MAX)
-        );
+    fn checkpoint_logical_time_overflows_at_u64_max() {
+        assert!(checkpoint_logical_time(u64::MAX).is_err());
     }
 
     #[test]
