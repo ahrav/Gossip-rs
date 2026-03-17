@@ -507,18 +507,16 @@ impl ReceiptCommitSink {
     /// When the item has no explicit `version`, a weak version derived from
     /// the item key bytes is used. When the item key is valid UTF-8, a
     /// display-only [`Location`] is attached for diagnostics.
-    fn translate_in_flight(&self, item: &InFlightItem) -> Result<QueuedCommit> {
+    fn translate_in_flight(&self, item_key: &ItemKey, item: &InFlightItem) -> Result<QueuedCommit> {
         let timing = Self::logical_timing_for(item.sequence_no)?;
         let bytes_scanned = item.meta.size_hint.unwrap_or(0);
         let version = item.meta.version.unwrap_or_else(|| {
-            VersionId::Weak(ObjectVersionId::from_version_bytes(
-                item.item_key.as_bytes(),
-            ))
+            VersionId::Weak(ObjectVersionId::from_version_bytes(item_key.as_bytes()))
         });
-        let checkpoint_cursor = Cursor::with_last_key(item.item_key.clone());
-        let item_ref = ItemRef::try_from_slice(item.item_key.as_bytes())?;
+        let checkpoint_cursor = Cursor::with_last_key(item_key.clone());
+        let item_ref = ItemRef::try_from_slice(item_key.as_bytes())?;
         let mut scan_item = ScanItem::new(
-            item.item_key.clone(),
+            item_key.clone(),
             item_ref,
             item.meta.stable_item_id,
             version,
@@ -556,14 +554,13 @@ impl ReceiptCommitSink {
 
 impl CommitSink for ReceiptCommitSink {
     fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()> {
-        let key_bytes = item_key.as_bytes().to_vec();
         let mut guard = self
             .in_flight
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
 
         use std::collections::btree_map::Entry;
-        match guard.entry(key_bytes) {
+        match guard.entry(item_key.clone()) {
             Entry::Occupied(_) => {
                 return Err(anyhow::anyhow!(
                     "begin_item called twice without finish_item for the same item"
@@ -573,7 +570,6 @@ impl CommitSink for ReceiptCommitSink {
                 let sequence_no = self.next_sequence_no();
                 slot.insert(InFlightItem {
                     sequence_no,
-                    item_key: item_key.clone(),
                     meta: meta.clone(),
                     findings: Vec::new(),
                 });
@@ -591,7 +587,7 @@ impl CommitSink for ReceiptCommitSink {
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
         let item = guard
-            .get_mut(item_key.as_bytes())
+            .get_mut(item_key)
             .ok_or_else(|| anyhow::anyhow!("upsert_findings called before begin_item for item"))?;
 
         // The CommitSink surface provides only start/end offsets.
@@ -615,32 +611,29 @@ impl CommitSink for ReceiptCommitSink {
     }
 
     fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
-        let key_bytes = item_key.as_bytes();
-
         // Remove the item under a short-lived lock. Translation and
         // submission happen outside the critical section to minimize lock
         // hold duration. The interior mutex satisfies `Send + Sync` bounds
         // but the sink is driven by a single-threaded drain loop.
-        let item = {
+        let (removed_key, item) = {
             let mut guard = self.in_flight.lock().map_err(|_| {
                 anyhow::anyhow!("receipt commit sink in-flight state lock poisoned")
             })?;
             guard
-                .remove(key_bytes)
+                .remove_entry(item_key)
                 .ok_or_else(|| anyhow::anyhow!("finish_item called before begin_item for item"))?
         };
 
         let sequence_no = item.sequence_no;
-        let work = match self.translate_in_flight(&item) {
+        let work = match self.translate_in_flight(&removed_key, &item) {
             Ok(work) => work,
             Err(err) => {
-                // Rollback: re-insert so the caller can retry. Recover
-                // through a poisoned mutex rather than losing the item.
+                // Rollback: re-insert with the same owned key — zero allocations.
                 let overwritten = self
                     .in_flight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(key_bytes.to_vec(), item);
+                    .insert(removed_key, item);
                 debug_assert!(
                     overwritten.is_none(),
                     "rollback re-insert overwrote a concurrent begin_item entry; \
@@ -651,13 +644,12 @@ impl CommitSink for ReceiptCommitSink {
         };
 
         if let Err(error) = self.submitter.submit(work) {
-            // Rollback: re-insert so the caller can retry. Recover through
-            // a poisoned mutex rather than silently losing the item.
+            // Rollback: re-insert with the same owned key — zero allocations.
             let overwritten = self
                 .in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(key_bytes.to_vec(), item);
+                .insert(removed_key, item);
             debug_assert!(
                 overwritten.is_none(),
                 "rollback re-insert overwrote a concurrent begin_item entry; \
@@ -1537,17 +1529,8 @@ mod tests {
         sink.begin_item(&second, &meta).expect("begin second item");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        assert_eq!(
-            guard.get(first.as_bytes()).expect("first item").sequence_no,
-            0
-        );
-        assert_eq!(
-            guard
-                .get(second.as_bytes())
-                .expect("second item")
-                .sequence_no,
-            1
-        );
+        assert_eq!(guard.get(&first).expect("first item").sequence_no, 0);
+        assert_eq!(guard.get(&second).expect("second item").sequence_no, 1);
         drop(guard);
 
         pipeline.shutdown().expect("worker should join");
@@ -1605,7 +1588,7 @@ mod tests {
                 size_hint,
             } => {
                 assert_eq!(*got, write_context());
-                assert_eq!(got_key, item_key.as_bytes());
+                assert_eq!(got_key, &item_key);
                 assert_eq!(*size_hint, meta.size_hint);
             }
             other => panic!("expected begin progress record, got {other:?}"),
@@ -1616,7 +1599,7 @@ mod tests {
                 item_key: got_key,
             } => {
                 assert_eq!(*got, write_context());
-                assert_eq!(got_key, item_key.as_bytes());
+                assert_eq!(got_key, &item_key);
             }
             other => panic!("expected finish progress record, got {other:?}"),
         }
@@ -1640,9 +1623,7 @@ mod tests {
         .expect("upsert findings");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        let item = guard
-            .get(item_key.as_bytes())
-            .expect("item should remain in flight");
+        let item = guard.get(&item_key).expect("item should remain in flight");
         assert_eq!(
             item.findings,
             vec![FsFindingRecord {
@@ -1683,10 +1664,7 @@ mod tests {
             .expect("begin after failed duplicate");
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert_eq!(
-            guard
-                .get(next_key.as_bytes())
-                .expect("next item")
-                .sequence_no,
+            guard.get(&next_key).expect("next item").sequence_no,
             1,
             "failed begin must not waste a sequence number"
         );
@@ -1799,7 +1777,7 @@ mod tests {
         .expect("second upsert");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        let item = guard.get(key.as_bytes()).expect("item in flight");
+        let item = guard.get(&key).expect("item in flight");
         assert_eq!(item.findings.len(), 2, "both batches should accumulate");
         assert_eq!(item.findings[0].rule_id, 7);
         assert_eq!(item.findings[1].rule_id, 8);
@@ -1938,21 +1916,25 @@ mod tests {
         }];
 
         let (_, _, implicit_translation) = sink
-            .translate_in_flight(&InFlightItem {
-                sequence_no: 0,
-                item_key: key.clone(),
-                meta: meta_without_version,
-                findings: findings.clone(),
-            })
+            .translate_in_flight(
+                &key,
+                &InFlightItem {
+                    sequence_no: 0,
+                    meta: meta_without_version,
+                    findings: findings.clone(),
+                },
+            )
             .expect("surrogate-version translation")
             .into_parts();
         let (_, _, explicit_translation) = sink
-            .translate_in_flight(&InFlightItem {
-                sequence_no: 0,
-                item_key: key,
-                meta: meta_with_explicit_version,
-                findings,
-            })
+            .translate_in_flight(
+                &key,
+                &InFlightItem {
+                    sequence_no: 0,
+                    meta: meta_with_explicit_version,
+                    findings,
+                },
+            )
             .expect("explicit-version translation")
             .into_parts();
 
@@ -2004,7 +1986,7 @@ mod tests {
 
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
-            guard.contains_key(key.as_bytes()),
+            guard.contains_key(&key),
             "translation failure must restore the item so finish_item can be retried"
         );
         drop(guard);
@@ -2043,7 +2025,7 @@ mod tests {
 
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
-            guard.contains_key(key.as_bytes()),
+            guard.contains_key(&key),
             "item must remain in in_flight after translation failure"
         );
         drop(guard);
@@ -2083,7 +2065,7 @@ mod tests {
 
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
-            guard.contains_key(key.as_bytes()),
+            guard.contains_key(&key),
             "item must remain in in_flight after submit failure"
         );
         drop(guard);
