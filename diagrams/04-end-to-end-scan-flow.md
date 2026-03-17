@@ -261,7 +261,8 @@ assemble around coordination and durability backends.
 | Ordered-content runtime module | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Git runtime module | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Distributed runtime module | `crates/gossip-scanner-runtime/src/distributed.rs` |
-| Commit sink and identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Commit sink trait and bridge record types | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Deterministic identity derivation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Coordination event recorder types | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Filesystem execution engine | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`, `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
 | Git execution engine | `crates/scanner-git/src/runner.rs` |

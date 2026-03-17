@@ -408,7 +408,7 @@ finding batches, reconstructs the richer translation inputs expected by
 `translate_item_result`, and submits the resulting persistence work to the
 bounded commit pipeline. That translation path computes:
 
-- normalized secret hash input
+- tenant-scoped secret hash (derived from the bridge batch's `norm_hash`)
 - tenant-scoped secret hash
 - finding ID (using the rule-fingerprint resolver for position-independent rule identity)
 - occurrence ID

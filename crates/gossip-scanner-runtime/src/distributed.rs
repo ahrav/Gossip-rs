@@ -973,14 +973,20 @@ where
     // pipeline, the scan typically sees a downstream "pipeline cancelled"
     // Runtime error. Evaluating the drain result first exposes the root cause
     // instead of the cancellation symptom.
+    //
+    // Runtime errors are checked before submitted-commit accounting because a
+    // failed `finish_item` rolls the item back into the in-flight map, which
+    // makes `commit.finish()` return "items still in flight". Checking
+    // `outcome` first preserves the original translation/span error rather
+    // than surfacing its consequence.
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
     } = stage_result
         .map_err(DistributedRuntimeError::Durability)?
         .map_err(DistributedRuntimeError::Durability)?;
-    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
 
     let committed_units = committed_sequence_nos.len() as u64;
 
