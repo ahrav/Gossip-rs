@@ -441,8 +441,7 @@ where
         }
 
         if done_ledger.status().is_scanned() {
-            validate_scanned_findings_chain(findings)?;
-            let distinct_findings = distinct_findings_count(findings)?;
+            let distinct_findings = validate_scanned_findings_chain(findings)?;
             let expected = done_ledger.findings_count();
             if expected != distinct_findings {
                 return Err(ResultCommitRequestError::FindingsCountMismatch {
