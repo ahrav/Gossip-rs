@@ -33,10 +33,8 @@ pub struct FindingRecord {
     /// Numeric identifier of the detection rule that matched.
     pub rule_id: u32,
     /// Byte offset of the match start within the item payload.
-    /// Must be strictly less than `end`; empty and inverted spans are rejected.
     pub start: u64,
     /// Byte offset one past the match end.
-    /// Must be strictly greater than `start`.
     pub end: u64,
     /// Digest of the normalized secret bytes.
     pub norm_hash: [u8; 32],
@@ -82,6 +80,9 @@ pub trait CommitSink: Send + Sync {
     fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()>;
 
     /// Record one batch of findings for an in-progress item.
+    ///
+    /// Implementations must reject findings with empty or inverted spans
+    /// (`end <= start`).
     fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()>;
 
     /// Mark the item as fully scanned.

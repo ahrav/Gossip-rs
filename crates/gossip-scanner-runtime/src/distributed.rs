@@ -1078,10 +1078,21 @@ where
         };
         report.leases_seen = report.leases_seen.saturating_add(1);
 
-        if coordinator
-            .is_shard_done(&lease)
-            .map_err(DistributedRuntimeError::Coordinator)?
-        {
+        let is_done = match coordinator.is_shard_done(&lease) {
+            Ok(done) => done,
+            Err(e) => {
+                if let Err(release_err) = coordinator.release_shard(&lease) {
+                    tracing::warn!(
+                        shard_id = %lease.shard_id(),
+                        %release_err,
+                        "failed to release shard; may remain acquired until lease TTL expires",
+                    );
+                }
+                return Err(DistributedRuntimeError::Coordinator(e));
+            }
+        };
+
+        if is_done {
             coordinator
                 .release_shard(&lease)
                 .map_err(DistributedRuntimeError::Coordinator)?;
@@ -2765,5 +2776,101 @@ mod tests {
             "only the file with findings should produce a done-ledger row"
         );
         assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
+    }
+
+    #[test]
+    fn run_worker_returns_zero_report_on_empty_queue() {
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
+
+        let report = run_worker(
+            &coordinator,
+            persistence,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("empty queue should succeed");
+
+        assert_eq!(report.leases_seen, 0);
+        assert_eq!(report.shards_scanned, 0);
+        assert_eq!(report.shards_skipped_done, 0);
+        assert!(coordinator.released_shards().is_empty());
+        assert!(coordinator.completed_shards().is_empty());
+    }
+
+    #[test]
+    fn run_worker_processes_multiple_shards_from_queue() {
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        fs::write(dir_a.path().join("secret.txt"), secret_fixture()).expect("write fixture a");
+        fs::write(dir_b.path().join("secret.txt"), secret_fixture()).expect("write fixture b");
+
+        let coordinator = InMemoryCoordinator::new(vec![
+            filesystem_lease("shard-a", dir_a.path()),
+            filesystem_lease("shard-b", dir_b.path()),
+        ]);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink, done_ledger),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("multi-shard run should succeed");
+
+        assert_eq!(report.leases_seen, 2);
+        assert_eq!(report.shards_scanned, 2);
+        assert_eq!(report.shards_skipped_done, 0);
+
+        let completed: Vec<String> = coordinator
+            .completed_shards()
+            .into_iter()
+            .map(|c| c.shard_id)
+            .collect();
+        assert!(completed.contains(&"shard-a".to_owned()));
+        assert!(completed.contains(&"shard-b".to_owned()));
+    }
+
+    #[test]
+    fn run_worker_mixed_done_and_active_shards() {
+        let dir_active = tempdir().expect("tempdir active");
+        fs::write(dir_active.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let dir_done = tempdir().expect("tempdir done");
+        fs::write(dir_done.path().join("secret.txt"), secret_fixture())
+            .expect("write done fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![
+            filesystem_lease("shard-done", dir_done.path()),
+            filesystem_lease("shard-active", dir_active.path()),
+        ]);
+        coordinator.mark_done("shard-done");
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink, done_ledger),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("mixed done/active run should succeed");
+
+        assert_eq!(report.leases_seen, 2);
+        assert_eq!(report.shards_scanned, 1);
+        assert_eq!(report.shards_skipped_done, 1);
+
+        let completed: Vec<String> = coordinator
+            .completed_shards()
+            .into_iter()
+            .map(|c| c.shard_id)
+            .collect();
+        assert_eq!(completed, vec!["shard-active".to_owned()]);
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-done".to_owned()],
+            "only the done shard should be released without completion"
+        );
     }
 }

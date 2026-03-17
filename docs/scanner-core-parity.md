@@ -29,7 +29,7 @@ focused on the surfaces with pinned fixtures and canonicalized outputs:
 - CLI parsing and summary rendering
 - event-sink formatting
 - JSONL canonicalization in `parity.rs`
-- durable identity derivation in the local commit sink
+- deterministic identity derivation via `translate_item_result`
 
 As additional receipt-driven distributed paths land, the same public runtime
 API can widen detection-path parity work without another caller-facing surface
