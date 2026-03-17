@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
+use gossip_contracts::connector::ItemKey;
 use gossip_contracts::persistence::WriteContext;
 use scanner_git::{GitEvent, GitEventOutput};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
@@ -40,13 +41,13 @@ pub enum CommitProgressRecord {
     /// Item processing has started; `size_hint` is the expected byte length.
     Begin {
         write_context: WriteContext,
-        item_key: Vec<u8>,
+        item_key: ItemKey,
         size_hint: Option<u64>,
     },
     /// Item processing completed successfully.
     Finish {
         write_context: WriteContext,
-        item_key: Vec<u8>,
+        item_key: ItemKey,
     },
 }
 

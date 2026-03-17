@@ -474,7 +474,7 @@ impl ReceiptCommitSink {
             &self.shard_id,
             CommitProgressRecord::Begin {
                 write_context: self.write_context,
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: item_key.clone(),
                 size_hint: meta.size_hint,
             },
         ) {
@@ -494,7 +494,7 @@ impl ReceiptCommitSink {
             &self.shard_id,
             CommitProgressRecord::Finish {
                 write_context: self.write_context,
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: item_key.clone(),
             },
         ) {
             tracing::debug!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
