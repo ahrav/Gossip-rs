@@ -50,6 +50,8 @@ fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     dir
 }
 
+/// Asserts the split point over the full key range (`\x00`..`\xff`).
+/// For tests that require different bounds, call `choose_split_point_range` directly.
 fn assert_split_point(files: &[(&str, &[u8])], expected: &[u8]) {
     let dir = create_test_repo(files);
     let mut connector = GitConnector::new(dir.path());
