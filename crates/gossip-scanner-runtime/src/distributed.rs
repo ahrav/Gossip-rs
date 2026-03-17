@@ -2521,16 +2521,13 @@ mod tests {
 
     #[test]
     fn run_worker_releases_lease_on_filesystem_scan_failure() {
-        // Point the lease at a non-existent directory so `run_filesystem_lease`
-        // fails during engine construction.
-        let bogus_path = std::path::Path::new("/tmp/gossip-rs-nonexistent-dir-test");
-        assert!(
-            !bogus_path.exists(),
-            "test expects this directory not to exist"
-        );
+        // Point the lease at a guaranteed-unique non-existent path so
+        // `run_filesystem_lease` fails during engine construction.
+        let tmp = tempdir().expect("tempdir");
+        let bogus_path = tmp.path().join("nonexistent-child");
 
         let coordinator =
-            InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", bogus_path)]);
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", &bogus_path)]);
 
         let error = run_worker(
             &coordinator,

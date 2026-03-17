@@ -81,8 +81,9 @@ pub trait CommitSink: Send + Sync {
 
     /// Record one batch of findings for an in-progress item.
     ///
-    /// Implementations must reject findings with empty or inverted spans
-    /// (`end <= start`).
+    /// Durability-enabled implementations must reject findings with empty or
+    /// inverted spans (`end <= start`). No-op sinks that discard all data may
+    /// skip this check.
     fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()>;
 
     /// Mark the item as fully scanned.
