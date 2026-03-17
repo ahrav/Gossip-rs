@@ -91,6 +91,18 @@ pub enum ResultCommitRequestError {
         /// Distinct stable findings present in the request.
         actual: u32,
     },
+    /// A scanned request carried a finding that was not bound to any
+    /// version-specific occurrence in the same batch.
+    FindingWithoutOccurrence {
+        /// Zero-based finding index within the batch.
+        index: usize,
+    },
+    /// A scanned request carried an occurrence that was not bound to any
+    /// observation in the same batch.
+    OccurrenceWithoutObservation {
+        /// Zero-based occurrence index within the batch.
+        index: usize,
+    },
     /// Distinct stable findings exceeded the current `u32` done-ledger field.
     DistinctFindingsOverflow {
         /// Number of distinct stable findings observed in the request.
@@ -140,6 +152,14 @@ impl fmt::Display for ResultCommitRequestError {
             Self::FindingsCountMismatch { expected, actual } => write!(
                 f,
                 "done-ledger findings_count mismatch: expected {expected}, got {actual}"
+            ),
+            Self::FindingWithoutOccurrence { index } => write!(
+                f,
+                "finding at index {index} is missing occurrence evidence for this scanned request"
+            ),
+            Self::OccurrenceWithoutObservation { index } => write!(
+                f,
+                "occurrence at index {index} is missing observation evidence for this scanned request"
             ),
             Self::DistinctFindingsOverflow { count } => write!(
                 f,
@@ -420,8 +440,8 @@ where
             });
         }
 
-        let distinct_findings = distinct_findings_count(findings)?;
         if done_ledger.status().is_scanned() {
+            let distinct_findings = validate_scanned_findings_chain(findings)?;
             let expected = done_ledger.findings_count();
             if expected != distinct_findings {
                 return Err(ResultCommitRequestError::FindingsCountMismatch {
@@ -441,15 +461,47 @@ where
     }
 }
 
-fn distinct_findings_count(
+/// Validate the upward evidence chain required for scanned requests and return
+/// the distinct stable findings count.
+///
+/// Findings are version-independent, so scanned commits must prove that each
+/// finding is bound to the target item through an occurrence and then an
+/// observation. Observations are the first layer that carries the done-ledger
+/// OVID, which is why this helper requires occurrences to reach that layer
+/// instead of trying to infer OVID equality from occurrence rows alone.
+///
+/// On success, returns the number of distinct `FindingId`s in the batch.
+/// Callers rely on `validate_referential_integrity` having run first: that
+/// guarantees every occurrence references a finding in the batch, so the
+/// occurrence-derived finding-ID set is exactly the distinct findings set.
+fn validate_scanned_findings_chain(
     findings: FindingsUpsertBatch<'_>,
 ) -> Result<u32, ResultCommitRequestError> {
-    let count = findings
-        .findings()
+    let finding_ids_with_occurrences: HashSet<_> = findings
+        .occurrences()
         .iter()
-        .map(|f| f.finding_id())
-        .collect::<HashSet<_>>()
-        .len();
+        .map(|occ| occ.finding_id())
+        .collect();
+    for (index, finding) in findings.findings().iter().enumerate() {
+        if !finding_ids_with_occurrences.contains(&finding.finding_id()) {
+            return Err(ResultCommitRequestError::FindingWithoutOccurrence { index });
+        }
+    }
+
+    // Observations carry the OVID that preserves connector version-claim
+    // strength, so scanned commits require each occurrence to reach that layer.
+    let occurrence_ids_with_observations: HashSet<_> = findings
+        .observations()
+        .iter()
+        .map(|obs| obs.occurrence_id())
+        .collect();
+    for (index, occurrence) in findings.occurrences().iter().enumerate() {
+        if !occurrence_ids_with_observations.contains(&occurrence.occurrence_id()) {
+            return Err(ResultCommitRequestError::OccurrenceWithoutObservation { index });
+        }
+    }
+
+    let count = finding_ids_with_occurrences.len();
     u32::try_from(count).map_err(|_| ResultCommitRequestError::DistinctFindingsOverflow { count })
 }
 
@@ -1320,6 +1372,70 @@ mod tests {
                 ),
                 "expected DoneLedgerWriteContextMismatch, got {err:?}",
             );
+        });
+    }
+
+    #[test]
+    fn rejects_scanned_findings_without_occurrences() {
+        let translation = translated_scan();
+        let findings = translation.findings_batch();
+        let batch = FindingsUpsertBatch::new(findings.findings(), &[], &[]);
+        let request = CommitRequest::new(
+            write_context(),
+            completed_unit(36),
+            batch,
+            std::slice::from_ref(translation.done_ledger()),
+        );
+
+        assert_validation_rejects(request, |err| match err {
+            ResultCommitRequestError::FindingWithoutOccurrence { index } => {
+                assert_eq!(*index, 0);
+            }
+            other => panic!("expected FindingWithoutOccurrence, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn rejects_scanned_finding_without_matching_occurrence() {
+        let translation = translated_scan();
+        let findings = translation.findings_batch();
+        let batch = FindingsUpsertBatch::new(
+            findings.findings(),
+            &findings.occurrences()[..1],
+            &findings.observations()[..1],
+        );
+        let request = CommitRequest::new(
+            write_context(),
+            completed_unit(37),
+            batch,
+            std::slice::from_ref(translation.done_ledger()),
+        );
+
+        assert_validation_rejects(request, |err| match err {
+            ResultCommitRequestError::FindingWithoutOccurrence { index } => {
+                assert_eq!(*index, 1);
+            }
+            other => panic!("expected FindingWithoutOccurrence, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn rejects_scanned_occurrence_without_observation() {
+        let translation = translated_scan();
+        let findings = translation.findings_batch();
+        let batch = FindingsUpsertBatch::new(findings.findings(), findings.occurrences(), &[]);
+        let request = CommitRequest::new(
+            write_context(),
+            completed_unit(38),
+            batch,
+            std::slice::from_ref(translation.done_ledger()),
+        );
+
+        assert_validation_rejects(request, |err| match err {
+            ResultCommitRequestError::OccurrenceWithoutObservation { index } => {
+                assert_eq!(*index, 0);
+            }
+            other => panic!("expected OccurrenceWithoutObservation, got {other:?}"),
         });
     }
 }
