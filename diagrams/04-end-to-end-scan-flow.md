@@ -174,7 +174,6 @@ sequenceDiagram
         CS->>ID: key_secret_hash(...)
         CS->>ID: derive_finding_id(...)
         CS->>ID: derive_occurrence_id(...)
-        CS->>REC: record_identity_chain(IdentityChainRecord)
     end
 
     LOOP->>CS: finish_item(item_key)

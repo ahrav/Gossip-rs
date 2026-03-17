@@ -586,7 +586,7 @@ The runtime tests focus on the behavior that exists today:
 - distributed persistence handle cloning
 - distributed runtime error layering
 - CLI parsing and summary formatting
-- durable commit-sink identity derivation
+- receipt-driven commit-pipeline identity derivation
 - authoritative findings -> done-ledger commit ordering and item-level receipt
   construction
 - bounded execution -> commit backpressure and cancellation semantics

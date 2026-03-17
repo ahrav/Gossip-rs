@@ -406,8 +406,7 @@ fn translate_findings(
 
     for (index, finding) in findings_input.iter().enumerate() {
         // confidence_score is intentionally omitted: the persistence schema does not
-        // carry confidence. It is preserved in IdentityChainRecord (commit_sink path)
-        // for coordination-level diagnostics only.
+        // carry confidence.
 
         if finding.span_end <= finding.span_start {
             return Err(ResultTranslationError::InvalidFindingSpan {

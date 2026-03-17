@@ -1060,7 +1060,7 @@ mod tests {
         CancellationToken, OwnedCoreEvent,
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
-        coordination_sink::{CommitProgressRecord, IdentityChainRecord, StoredGitEvent},
+        coordination_sink::{CommitProgressRecord, StoredGitEvent},
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
