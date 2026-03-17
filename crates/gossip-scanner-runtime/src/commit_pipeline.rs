@@ -65,7 +65,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::mpsc::{
-    sync_channel, Receiver, RecvError, RecvTimeoutError, SendError, SyncSender, TryRecvError,
+    Receiver, RecvError, RecvTimeoutError, SendError, SyncSender, TryRecvError, sync_channel,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -73,10 +73,10 @@ use std::time::Duration;
 use gossip_contracts::persistence::{DoneLedger, FindingsSink, WriteContext};
 
 use crate::{
+    CancellationToken,
     commit_model::{CheckpointAggregatorInput, CompletedUnit},
     result_committer::{ResultCommitError, ResultCommitter},
     result_translation::PersistenceTranslation,
-    CancellationToken,
 };
 
 /// Queue sizing for the bounded execution -> commit pipeline.
@@ -555,8 +555,8 @@ mod tests {
     use gossip_contracts::{
         connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
         identity::{
-            derive_rule_fingerprint, FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash,
-            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
+            FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
+            StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
         },
         persistence::{CommitAdvanceError, DoneLedgerErrorCode, WriteContext},
     };
@@ -570,7 +570,7 @@ mod tests {
     use crate::{
         commit_model::CompletedUnit,
         result_committer::ResultCommitError,
-        result_translation::{translate_item_result, ItemResult, ScanTiming},
+        result_translation::{ItemResult, ScanTiming, translate_item_result},
     };
 
     fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
@@ -1058,9 +1058,16 @@ mod tests {
             }
         }
 
+        // Wait for item 2 to be in-flight in the findings sink before
+        // cancelling. This closes the race where the OS could preempt the
+        // worker thread between the outcome send for item 1 and the dequeue
+        // of item 2, allowing cancel to fire at the pre-receive or
+        // post-dequeue check and preventing item 2 from ever reaching the
+        // findings sink.
+        wait_until(|| findings_sink.pending_count().expect("pending count") == 1);
         cancel.cancel();
 
-        wait_until(|| findings_sink.pending_count().expect("pending count") == 1);
+        findings_sink
             .release_next(CompletionOrder::OldestFirst)
             .expect("release second findings write")
             .expect("second pending write");
