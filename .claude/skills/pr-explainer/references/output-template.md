@@ -90,7 +90,7 @@ _Now that every component has been introduced and the data flow explained,
 show a diagram that makes the structure visible. The reader should be able
 to match every box and arrow back to the prose above._
 
-```
+```text
   Thread 1 (scan)              Thread 2 (commit)
   ┌──────────────────┐         ┌───────────────────┐
   │ scan files       │         │ commit results    │
@@ -137,13 +137,14 @@ _Non-obvious design choices and trade-offs. For each decision:_
 
 _Example:_
 > **Single-worker enforcement.** The receipt sink assigns sequence numbers
-> using `AtomicU64::fetch_add(Relaxed)`. `Relaxed` ordering is sound only
-> when there is exactly one caller — with multiple scan workers, two
-> threads could observe the same sequence number due to reordering. Rather
-> than upgrading to `SeqCst` (which adds fence overhead on every item), the
-> runtime forces `workers=1` for distributed scans. This is acceptable
-> because distributed shards are already parallelized at the shard level,
-> not the intra-shard level.
+> using `AtomicU64::fetch_add(Relaxed)`. Atomic RMW guarantees unique IDs
+> regardless of ordering; however, `Relaxed` provides no synchronization
+> with surrounding state (the in-flight map, findings buffer, and sequence
+> ordering all rely on single-threaded access). Rather than upgrading to
+> `SeqCst` (which adds fence overhead on every item), the runtime forces
+> `workers=1` for distributed scans. This is acceptable because distributed
+> shards are already parallelized at the shard level, not the intra-shard
+> level.
 
 _If there are no notable decisions, write "Straightforward implementation —
 no non-obvious trade-offs."_

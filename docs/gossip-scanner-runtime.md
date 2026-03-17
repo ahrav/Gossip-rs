@@ -296,7 +296,7 @@ stable across process restarts.
 
 Dropping the sender closes the submission channel. Once the commit worker
 drains all remaining queued items, it exits, allowing the drainer to consume
-the final outcomes and join the thread. This separation lets distributed
+the outcomes and join the thread. This separation lets distributed
 runtimes run scan execution and receipt draining on concurrent scoped
 threads: one thread holds the sender and feeds translated scan results,
 while another thread holds the drainer and builds the checkpoint prefix from
@@ -336,9 +336,8 @@ intentionally non-fatal because durability flows through the commit pipeline.
 `CommitStageDrainResult` containing:
 
 - a `PrefixCheckpointAggregator` that tracks the contiguous committed prefix
-- a count of successfully committed items
 - the sequence numbers of committed items (for cross-checking against the
-  submitted list)
+  submitted list); the committed count is derived from this list's length
 
 The function loops over `CommitStageOutput` values from the drainer. On
 `Committed` outcomes, it feeds the checkpoint input to the aggregator. On
