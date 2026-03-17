@@ -157,6 +157,13 @@ impl<A> ShardLease<A> {
         &self.shard_id
     }
 
+    /// Arc-wrapped shard label for zero-allocation sharing.
+    #[inline]
+    #[must_use]
+    pub fn shard_id_arc(&self) -> &Arc<str> {
+        &self.shard_id
+    }
+
     /// Scan assignment payload associated with this lease.
     #[inline]
     #[must_use]
@@ -790,18 +797,11 @@ fn wait_for_submitted_commits(
     mut submitted: Vec<u64>,
     mut committed_sequence_nos: Vec<u64>,
 ) -> Result<()> {
-    debug_assert!(
-        submitted.windows(2).all(|w| w[0] <= w[1]),
-        "submitted sequence numbers should be monotonically ordered; \
-         sorting as defense-in-depth"
-    );
+    // Items can finish out of sequence-number order (the atomic counter
+    // assigns sequence numbers at begin_item, but finish_item order depends
+    // on scan duration per item). Sort both sides so the pairwise comparison
+    // below can detect mismatches by value, not by arrival order.
     submitted.sort_unstable();
-
-    debug_assert!(
-        committed_sequence_nos.windows(2).all(|w| w[0] <= w[1]),
-        "committed sequence numbers should be in drain order; \
-         sorting as defense-in-depth"
-    );
     committed_sequence_nos.sort_unstable();
 
     // Reject duplicate sequence numbers — structurally impossible today
@@ -929,7 +929,7 @@ where
             as Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>
     };
 
-    let sink = CoordinationEventSink::new(recorder.clone(), Arc::from(lease.shard_id()));
+    let sink = CoordinationEventSink::new(recorder.clone(), Arc::clone(lease.shard_id_arc()));
     let cancel = CancellationToken::new();
     let pipeline = CommitPipeline::start(
         persistence.findings_sink.clone(),
@@ -944,7 +944,7 @@ where
     let (submitter, drainer) = pipeline.split();
     let commit = ReceiptCommitSink::new(
         recorder,
-        Arc::from(lease.shard_id()),
+        Arc::clone(lease.shard_id_arc()),
         lease.write_context(),
         lease.tenant_secret_key(),
         rule_fingerprint,
@@ -1047,6 +1047,12 @@ where
 /// Each iteration either skips an already-complete shard, executes one
 /// filesystem lease through the receipt-driven durability path, or stops with a
 /// safe error when the assignment does not expose a filesystem scan config.
+///
+/// The loop is **fail-fast**: it terminates on the first per-shard error and
+/// returns a partial [`DistributedRunReport`] reflecting only the shards
+/// processed before the failure. The caller is responsible for retry or
+/// requeue. Leases are always released back to the coordinator on error so
+/// they can be re-acquired on a subsequent attempt.
 pub fn run_worker<A, F, D>(
     coordinator: &dyn DistributedCoordinator<A>,
     persistence: DistributedPersistence<F, D>,
@@ -1083,19 +1089,24 @@ where
         }
 
         if lease.assignment().filesystem_scan_config().is_none() {
-            return Err(DistributedRuntimeError::Durability(anyhow!(
-                "distributed receipt-driven runtime is not yet wired for non-filesystem assignments; refusing to advance shard '{}' without receipts",
+            let _ = coordinator.release_shard(&lease);
+            return Err(DistributedRuntimeError::Coordinator(anyhow!(
+                "distributed receipt-driven runtime is not yet wired for non-filesystem assignments; \
+                 refusing to advance shard '{}' without receipts",
                 lease.shard_id()
             )));
         }
 
-        run_filesystem_lease(
+        if let Err(e) = run_filesystem_lease(
             coordinator,
             Arc::clone(&recorder),
             &persistence,
             &lease,
             config,
-        )?;
+        ) {
+            let _ = coordinator.release_shard(&lease);
+            return Err(e);
+        }
         report.shards_scanned = report.shards_scanned.saturating_add(1);
     }
 
@@ -2467,8 +2478,46 @@ mod tests {
                 .contains("not yet wired for non-filesystem assignments"),
             "unexpected error: {error}"
         );
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "non-filesystem rejection should use Coordinator variant, got: {error:?}"
+        );
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-non-fs".to_owned()],
+            "non-filesystem rejection must release the lease"
+        );
         assert!(coordinator.completed_shards().is_empty());
         assert!(!coordinator.done_set().contains("shard-non-fs"));
+    }
+
+    #[test]
+    fn run_worker_releases_lease_on_filesystem_scan_failure() {
+        // Point the lease at a non-existent directory so `run_filesystem_lease`
+        // fails during engine construction.
+        let bogus_path = std::path::Path::new("/tmp/gossip-rs-nonexistent-dir-test");
+        assert!(
+            !bogus_path.exists(),
+            "test expects this directory not to exist"
+        );
+
+        let coordinator =
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", bogus_path)]);
+
+        let _error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("scan on non-existent path should fail");
+
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-fail".to_owned()],
+            "filesystem scan failure must release the lease"
+        );
+        assert!(coordinator.completed_shards().is_empty());
+        assert!(!coordinator.done_set().contains("shard-fail"));
     }
 
     #[test]
