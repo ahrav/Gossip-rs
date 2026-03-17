@@ -6,17 +6,24 @@
 //! ([`DistributedPersistence`]), runtime configuration
 //! ([`DistributedRuntimeConfig`]), run reports ([`DistributedRunReport`]),
 //! and error layering ([`DistributedRuntimeError`]).
+//!
+//! It also provides `ReceiptCommitSink`, the compatibility adapter that
+//! translates scan-driver `CommitSink` callbacks into receipt-driven commit
+//! pipeline work.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Error as AnyError, Result};
 use gossip_contracts::{
-    connector::Cursor,
-    identity::{PolicyHash, TenantSecretKey},
+    connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    identity::{LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, TenantSecretKey},
     persistence::WriteContext,
 };
+use scanner_scheduler::store::FsFindingRecord;
 
 /// Error returned when a [`ShardLease`] construction detects that the
 /// assignment's policy hash does not match the write context's policy hash.
@@ -48,7 +55,12 @@ impl fmt::Display for PolicyMismatchError {
 impl std::error::Error for PolicyMismatchError {}
 
 use crate::{
-    ScanBudgets, ScanReport, ScanRuntimeError, coordination_sink::CoordinationEventRecorder,
+    ScanBudgets, ScanReport, ScanRuntimeError,
+    commit_model::CompletedUnit,
+    commit_pipeline::{CommitPipelineSender, QueuedCommit},
+    commit_sink::{CommitSink, FindingsBatch, ItemMeta},
+    coordination_sink::{CommitProgressRecord, CoordinationEventRecorder},
+    result_translation::{ItemResult, ScanTiming, translate_item_result},
 };
 
 /// Assignment payloads expose their policy scope so leases can assert that the
@@ -302,6 +314,317 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
     }
 }
 
+/// One item that has begun scanning but has not yet been submitted to commit.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+struct InFlightItem {
+    sequence_no: u64,
+    item_key: ItemKey,
+    meta: ItemMeta,
+    findings: Vec<FsFindingRecord>,
+}
+
+/// Ordered record of one item successfully handed to the commit pipeline.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubmittedCommit {
+    sequence_no: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SubmittedCommit {
+    #[inline]
+    #[must_use]
+    fn sequence_no(&self) -> u64 {
+        self.sequence_no
+    }
+}
+
+/// Scan-driver commit sink that bridges begin/upsert/finish callbacks into the
+/// receipt-driven commit pipeline.
+///
+/// The existing scan-driver seam still emits compact `ItemMeta` and
+/// `FindingRecord` batches rather than the richer runtime commit inputs.
+/// `ReceiptCommitSink` reconstructs the deterministic translation inputs
+/// expected by the shared commit pipeline so ordered-content execution can
+/// produce durable receipts without changing the scheduler callback surface.
+///
+/// # Threading model
+///
+/// Like [`DurableCommitSink`](crate::commit_sink::DurableCommitSink), this
+/// sink is driven by a single-threaded drain loop. The interior `Mutex`
+/// fields satisfy the `Send + Sync` bound required by [`CommitSink`] without
+/// introducing real contention. Sequence numbers assigned by
+/// [`next_sequence_no`](Self::next_sequence_no) are therefore monotonically
+/// ordered with respect to submission; `Ordering::Relaxed` is sufficient
+/// because there is no concurrent caller to race against.
+#[cfg_attr(not(test), allow(dead_code))]
+struct ReceiptCommitSink {
+    shard_id: Arc<str>,
+    recorder: Arc<dyn CoordinationEventRecorder>,
+    write_context: WriteContext,
+    tenant_secret_key: TenantSecretKey,
+    rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
+    submitter: CommitPipelineSender,
+    next_sequence_no: AtomicU64,
+    in_flight: Mutex<BTreeMap<Vec<u8>, InFlightItem>>,
+    submitted: Mutex<Vec<SubmittedCommit>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ReceiptCommitSink {
+    fn new(
+        recorder: Arc<dyn CoordinationEventRecorder>,
+        shard_id: Arc<str>,
+        write_context: WriteContext,
+        tenant_secret_key: TenantSecretKey,
+        rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
+        submitter: CommitPipelineSender,
+    ) -> Self {
+        Self {
+            shard_id,
+            recorder,
+            write_context,
+            tenant_secret_key,
+            rule_fingerprint,
+            submitter,
+            next_sequence_no: AtomicU64::new(0),
+            in_flight: Mutex::new(BTreeMap::new()),
+            submitted: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn finish(self) -> Result<Vec<SubmittedCommit>> {
+        let in_flight = self
+            .in_flight
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
+        if !in_flight.is_empty() {
+            return Err(anyhow::anyhow!(
+                "receipt commit sink finished with {} item(s) still in flight",
+                in_flight.len()
+            ));
+        }
+
+        self.submitted
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("receipt commit sink submitted state lock poisoned"))
+    }
+
+    fn next_sequence_no(&self) -> u64 {
+        self.next_sequence_no.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn logical_timing_for(sequence_no: u64) -> Result<ScanTiming> {
+        let started = sequence_no.checked_mul(2).ok_or_else(|| {
+            anyhow::anyhow!("sequence number overflow while deriving scan timing")
+        })?;
+        // When checked_mul(2) succeeds, started is even and <= u64::MAX - 1
+        // (u64::MAX is odd), so started + 1 fits without overflow.
+        let finished = started + 1;
+
+        Ok(ScanTiming::new(
+            LogicalTime::from_raw(started),
+            LogicalTime::from_raw(finished),
+        ))
+    }
+
+    /// Records a begin-progress event for telemetry.
+    ///
+    /// Recorder errors are intentionally non-fatal: durability flows through
+    /// the commit pipeline, not the recorder. This diverges from
+    /// `DurableCommitSink` where recorder errors are propagated because the
+    /// recorder IS the durability path.
+    fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
+        let _ = self.recorder.record_commit_progress(
+            &self.shard_id,
+            CommitProgressRecord::Begin {
+                write_context: self.write_context,
+                item_key: item_key.as_bytes().to_vec(),
+                size_hint: meta.size_hint,
+            },
+        );
+    }
+
+    /// Records a finish-progress event for telemetry.
+    ///
+    /// This records that the item's scan completed and was submitted to the
+    /// commit pipeline — not that the commit landed durably. Durability
+    /// confirmation flows through the receipt/checkpoint path, not through
+    /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
+    /// error rationale.
+    fn record_finish(&self, item_key: &ItemKey) {
+        let _ = self.recorder.record_commit_progress(
+            &self.shard_id,
+            CommitProgressRecord::Finish {
+                write_context: self.write_context,
+                item_key: item_key.as_bytes().to_vec(),
+            },
+        );
+    }
+
+    fn translate_in_flight(&self, item: &InFlightItem) -> Result<QueuedCommit> {
+        let timing = Self::logical_timing_for(item.sequence_no)?;
+        let bytes_scanned = item.meta.size_hint.unwrap_or(0);
+        let version = item.meta.version.unwrap_or_else(|| {
+            VersionId::Weak(ObjectVersionId::from_version_bytes(
+                item.item_key.as_bytes(),
+            ))
+        });
+        let checkpoint_cursor = Cursor::with_last_key(item.item_key.clone());
+        let item_ref = ItemRef::try_from_slice(item.item_key.as_bytes())?;
+        let mut scan_item = ScanItem::new(
+            item.item_key.clone(),
+            item_ref,
+            item.meta.stable_item_id,
+            version,
+        );
+
+        if let Some(size_hint) = item.meta.size_hint {
+            scan_item = scan_item.with_size_hint(size_hint);
+        }
+
+        if let Ok(display) = std::str::from_utf8(scan_item.item_key().as_bytes())
+            && let Ok(location) = Location::try_new(display.to_owned(), None)
+        {
+            scan_item = scan_item.with_location(location);
+        }
+
+        let translation = translate_item_result(
+            self.write_context,
+            &self.tenant_secret_key,
+            &scan_item,
+            bytes_scanned,
+            timing,
+            ItemResult::Scanned {
+                findings: &item.findings,
+            },
+            &*self.rule_fingerprint,
+        )?;
+
+        Ok(QueuedCommit::new(
+            self.write_context,
+            CompletedUnit::ordered_content(item.sequence_no, checkpoint_cursor),
+            translation,
+        ))
+    }
+}
+
+impl CommitSink for ReceiptCommitSink {
+    fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()> {
+        let key_bytes = item_key.as_bytes().to_vec();
+        let mut guard = self
+            .in_flight
+            .lock()
+            .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
+
+        use std::collections::btree_map::Entry;
+        match guard.entry(key_bytes) {
+            Entry::Occupied(_) => {
+                return Err(anyhow::anyhow!(
+                    "begin_item called twice without finish_item for the same item"
+                ));
+            }
+            Entry::Vacant(slot) => {
+                let sequence_no = self.next_sequence_no();
+                slot.insert(InFlightItem {
+                    sequence_no,
+                    item_key: item_key.clone(),
+                    meta: meta.clone(),
+                    findings: Vec::new(),
+                });
+            }
+        }
+        drop(guard);
+
+        self.record_begin(item_key, meta);
+        Ok(())
+    }
+
+    fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()> {
+        let mut guard = self
+            .in_flight
+            .lock()
+            .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
+        let item = guard
+            .get_mut(item_key.as_bytes())
+            .ok_or_else(|| anyhow::anyhow!("upsert_findings called before begin_item for item"))?;
+
+        // The CommitSink surface provides only start/end offsets.
+        // Root-hint fields are unavailable through this bridge, so both
+        // root_hint_start/end mirror span_start/end. This is safe because
+        // root-hint fields never participate in persistence identity
+        // derivation (see result_translation.rs module docs).
+        item.findings
+            .extend(batch.findings.iter().map(|finding| FsFindingRecord {
+                rule_id: finding.rule_id,
+                root_hint_start: finding.start,
+                root_hint_end: finding.end,
+                span_start: finding.start,
+                span_end: finding.end,
+                norm_hash: finding.norm_hash,
+                confidence_score: finding.confidence_score,
+            }));
+
+        Ok(())
+    }
+
+    fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
+        let key_bytes = item_key.as_bytes();
+
+        // Remove the item under a short-lived lock. Translation and
+        // submission happen outside the critical section so concurrent
+        // begin_item / upsert_findings calls are not blocked by expensive
+        // work (crypto derivations, channel send).
+        let item = {
+            let mut guard = self.in_flight.lock().map_err(|_| {
+                anyhow::anyhow!("receipt commit sink in-flight state lock poisoned")
+            })?;
+            guard
+                .remove(key_bytes)
+                .ok_or_else(|| anyhow::anyhow!("finish_item called before begin_item for item"))?
+        };
+
+        let sequence_no = item.sequence_no;
+        let work = match self.translate_in_flight(&item) {
+            Ok(work) => work,
+            Err(err) => {
+                // Rollback: re-insert so the caller can retry. Recover
+                // through a poisoned mutex rather than losing the item.
+                self.in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key_bytes.to_vec(), item);
+                return Err(err);
+            }
+        };
+
+        if let Err(error) = self.submitter.submit(work) {
+            // Rollback: re-insert so the caller can retry. Recover through
+            // a poisoned mutex rather than silently losing the item.
+            self.in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key_bytes.to_vec(), item);
+            return Err(anyhow::anyhow!(
+                "execution to commit submission failed: {error}"
+            ));
+        }
+
+        // The commit is in the pipeline. The submitted vec is bookkeeping
+        // for ordering assertions, not the durability path — recover
+        // through a poisoned mutex rather than returning an error that
+        // would mislead the caller into thinking the commit was lost.
+        self.submitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(SubmittedCommit { sequence_no });
+
+        self.record_finish(item_key);
+        Ok(())
+    }
+}
+
 impl From<PolicyMismatchError> for DistributedRuntimeError {
     fn from(value: PolicyMismatchError) -> Self {
         Self::Coordinator(value.into())
@@ -310,8 +633,26 @@ impl From<PolicyMismatchError> for DistributedRuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
     use super::*;
-    use gossip_contracts::identity::{FenceEpoch, RunId, ShardId, TenantId};
+    use gossip_contracts::{
+        connector::ItemKey,
+        identity::{
+            FenceEpoch, PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId,
+            TenantSecretKey, derive_rule_fingerprint,
+        },
+        persistence::WriteContext,
+    };
+    use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
+
+    use crate::{
+        CancellationToken, OwnedCoreEvent,
+        commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
+        commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
+        coordination_sink::{CommitProgressRecord, StoredGitEvent},
+    };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct StubAssignment {
@@ -329,6 +670,107 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct StubDoneLedger(u8);
+
+    #[derive(Default)]
+    struct Recorder {
+        progress: Mutex<Vec<CommitProgressRecord>>,
+    }
+
+    impl CoordinationEventRecorder for Recorder {
+        fn record_core_event(&self, _shard_id: &str, _event: OwnedCoreEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn record_git_event(&self, _shard_id: &str, _event: StoredGitEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn record_commit_progress(
+            &self,
+            _shard_id: &str,
+            event: CommitProgressRecord,
+        ) -> Result<()> {
+            self.progress.lock().expect("progress lock").push(event);
+            Ok(())
+        }
+
+        fn record_identity_chain(
+            &self,
+            _shard_id: &str,
+            _record: crate::coordination_sink::IdentityChainRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
+        let name = format!("test-rule-{rule_id}");
+        derive_rule_fingerprint(&name)
+    }
+
+    fn write_context() -> WriteContext {
+        WriteContext::new(
+            TenantId::from_bytes([0x11; 32]),
+            PolicyHash::from_bytes([0x22; 32]),
+            RunId::from_raw(3),
+            ShardId::from_raw(4),
+            FenceEpoch::from_raw(5),
+        )
+    }
+
+    fn tenant_secret_key() -> TenantSecretKey {
+        TenantSecretKey::from_bytes([0x33; 32])
+    }
+
+    fn item_key(path: &str) -> ItemKey {
+        ItemKey::try_from_slice(path.as_bytes()).expect("item key")
+    }
+
+    fn item_meta() -> ItemMeta {
+        ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x44; 32]),
+            version: None,
+            size_hint: Some(128),
+        }
+    }
+
+    fn finding() -> FindingRecord {
+        FindingRecord {
+            rule_id: 7,
+            start: 10,
+            end: 20,
+            norm_hash: [0x55; 32],
+            confidence_score: 6,
+        }
+    }
+
+    fn make_receipt_sink() -> (
+        CommitPipeline<InMemoryFindingsSink, InMemoryDoneLedger>,
+        ReceiptCommitSink,
+        Arc<Recorder>,
+    ) {
+        let recorder = Arc::new(Recorder::default());
+        let pipeline = CommitPipeline::start(
+            InMemoryFindingsSink::new(),
+            InMemoryDoneLedger::new(),
+            CommitPipelineConfig {
+                execution_queue_capacity: 1,
+                outcome_queue_capacity: 1,
+            },
+            CancellationToken::new(),
+        )
+        .expect("pipeline should start");
+        let sink = ReceiptCommitSink::new(
+            recorder.clone(),
+            Arc::from("shard-a"),
+            write_context(),
+            tenant_secret_key(),
+            Arc::new(test_rule_fingerprint),
+            pipeline.sender(),
+        );
+
+        (pipeline, sink, recorder)
+    }
 
     #[test]
     fn shard_lease_preserves_assignment_and_write_context() {
@@ -475,5 +917,461 @@ mod tests {
             shards_skipped_done: 3,
         };
         assert!(nonzero.shards_scanned + nonzero.shards_skipped_done <= nonzero.leases_seen);
+    }
+
+    #[test]
+    fn begin_item_assigns_monotonic_sequence_numbers() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let first = item_key("tenant/repo/first.txt");
+        let second = item_key("tenant/repo/second.txt");
+        let meta = item_meta();
+
+        sink.begin_item(&first, &meta).expect("begin first item");
+        sink.begin_item(&second, &meta).expect("begin second item");
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert_eq!(
+            guard.get(first.as_bytes()).expect("first item").sequence_no,
+            0
+        );
+        assert_eq!(
+            guard
+                .get(second.as_bytes())
+                .expect("second item")
+                .sequence_no,
+            1
+        );
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn receipt_commit_sink_translates_and_submits_item() {
+        let (pipeline, sink, recorder) = make_receipt_sink();
+        let item_key = item_key("tenant/repo/file.txt");
+        let meta = item_meta();
+
+        sink.begin_item(&item_key, &meta).expect("begin item");
+        sink.upsert_findings(
+            &item_key,
+            &FindingsBatch {
+                findings: vec![finding()],
+            },
+        )
+        .expect("upsert findings");
+        sink.finish_item(&item_key).expect("finish item");
+
+        let submitted = sink.finish().expect("sink finish");
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].sequence_no(), 0);
+
+        match pipeline
+            .recv_timeout(Duration::from_secs(1))
+            .expect("commit outcome")
+        {
+            CommitStageOutput::Committed {
+                write_context: got,
+                checkpoint_input,
+            } => {
+                assert_eq!(got, write_context());
+                let receipt = checkpoint_input.into_receipt();
+                assert_eq!(receipt.completed_unit().sequence_no(), 0);
+                assert_eq!(
+                    receipt.completed_unit().checkpoint_cursor(),
+                    &Cursor::with_last_key(item_key.clone())
+                );
+                assert_eq!(receipt.durable().findings().finding_count(), 1);
+                assert_eq!(receipt.durable().done_ledger().record_count(), 1);
+            }
+            CommitStageOutput::Failed { error, .. } => {
+                panic!("expected committed outcome, got failure: {error}");
+            }
+        }
+
+        let progress = recorder.progress.lock().expect("progress lock");
+        assert_eq!(progress.len(), 2);
+        match &progress[0] {
+            CommitProgressRecord::Begin {
+                write_context: got,
+                item_key: got_key,
+                size_hint,
+            } => {
+                assert_eq!(*got, write_context());
+                assert_eq!(got_key, item_key.as_bytes());
+                assert_eq!(*size_hint, meta.size_hint);
+            }
+            other => panic!("expected begin progress record, got {other:?}"),
+        }
+        match &progress[1] {
+            CommitProgressRecord::Finish {
+                write_context: got,
+                item_key: got_key,
+            } => {
+                assert_eq!(*got, write_context());
+                assert_eq!(got_key, item_key.as_bytes());
+            }
+            other => panic!("expected finish progress record, got {other:?}"),
+        }
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn upsert_findings_maps_runtime_records_into_fs_findings() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let item_key = item_key("tenant/repo/file.txt");
+
+        sink.begin_item(&item_key, &item_meta())
+            .expect("begin item");
+        sink.upsert_findings(
+            &item_key,
+            &FindingsBatch {
+                findings: vec![finding()],
+            },
+        )
+        .expect("upsert findings");
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        let item = guard
+            .get(item_key.as_bytes())
+            .expect("item should remain in flight");
+        assert_eq!(
+            item.findings,
+            vec![FsFindingRecord {
+                rule_id: 7,
+                root_hint_start: 10,
+                root_hint_end: 20,
+                span_start: 10,
+                span_end: 20,
+                norm_hash: [0x55; 32],
+                confidence_score: 6,
+            }]
+        );
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn begin_item_rejects_double_begin_for_same_key() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let item_key = item_key("tenant/repo/file.txt");
+        let meta = item_meta();
+
+        sink.begin_item(&item_key, &meta).expect("first begin item");
+        let err = sink
+            .begin_item(&item_key, &meta)
+            .expect_err("duplicate begin should fail");
+
+        assert!(
+            err.to_string()
+                .contains("begin_item called twice without finish_item"),
+            "unexpected error: {err}"
+        );
+
+        // A failed duplicate begin must not consume a sequence number.
+        let next_key = ItemKey::try_from_slice(b"tenant/repo/next.txt").expect("next key");
+        sink.begin_item(&next_key, &meta)
+            .expect("begin after failed duplicate");
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert_eq!(
+            guard
+                .get(next_key.as_bytes())
+                .expect("next item")
+                .sequence_no,
+            1,
+            "failed begin must not waste a sequence number"
+        );
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn upsert_findings_rejects_unknown_item() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let item_key = item_key("tenant/repo/missing.txt");
+        let err = sink
+            .upsert_findings(
+                &item_key,
+                &FindingsBatch {
+                    findings: vec![finding()],
+                },
+            )
+            .expect_err("upsert without begin should fail");
+
+        assert!(
+            err.to_string()
+                .contains("upsert_findings called before begin_item"),
+            "unexpected error: {err}"
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_item_rejects_unknown_item() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let item_key = item_key("tenant/repo/missing.txt");
+        let err = sink
+            .finish_item(&item_key)
+            .expect_err("finish without begin should fail");
+
+        assert!(
+            err.to_string()
+                .contains("finish_item called before begin_item"),
+            "unexpected error: {err}"
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_rejects_remaining_in_flight_items() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let item_key = item_key("tenant/repo/file.txt");
+
+        sink.begin_item(&item_key, &item_meta())
+            .expect("begin item");
+        let err = sink
+            .finish()
+            .expect_err("finish should reject remaining in-flight items");
+
+        assert!(
+            err.to_string().contains("still in flight"),
+            "unexpected error: {err}"
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn logical_timing_rejects_sequence_overflow() {
+        let err = ReceiptCommitSink::logical_timing_for(u64::MAX)
+            .expect_err("overflowing timing should fail");
+
+        assert!(
+            err.to_string()
+                .contains("sequence number overflow while deriving scan timing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn upsert_findings_accumulates_across_multiple_batches() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/multi.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.upsert_findings(
+            &key,
+            &FindingsBatch {
+                findings: vec![FindingRecord {
+                    rule_id: 7,
+                    start: 10,
+                    end: 20,
+                    norm_hash: [0x55; 32],
+                    confidence_score: 6,
+                }],
+            },
+        )
+        .expect("first upsert");
+        sink.upsert_findings(
+            &key,
+            &FindingsBatch {
+                findings: vec![FindingRecord {
+                    rule_id: 8,
+                    start: 30,
+                    end: 40,
+                    norm_hash: [0x66; 32],
+                    confidence_score: 9,
+                }],
+            },
+        )
+        .expect("second upsert");
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        let item = guard.get(key.as_bytes()).expect("item in flight");
+        assert_eq!(item.findings.len(), 2, "both batches should accumulate");
+        assert_eq!(item.findings[0].rule_id, 7);
+        assert_eq!(item.findings[1].rule_id, 8);
+        assert_eq!(item.findings[1].span_start, 30);
+        assert_eq!(item.findings[1].span_end, 40);
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_item_succeeds_with_zero_findings() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/clean.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.finish_item(&key)
+            .expect("finish item with zero findings");
+
+        let submitted = sink.finish().expect("sink finish");
+        assert_eq!(submitted.len(), 1);
+
+        match pipeline
+            .recv_timeout(Duration::from_secs(1))
+            .expect("commit outcome")
+        {
+            CommitStageOutput::Committed {
+                checkpoint_input, ..
+            } => {
+                let receipt = checkpoint_input.into_receipt();
+                assert_eq!(receipt.durable().findings().finding_count(), 0);
+                assert_eq!(receipt.durable().done_ledger().record_count(), 1);
+            }
+            CommitStageOutput::Failed { error, .. } => {
+                panic!("expected committed outcome, got failure: {error}");
+            }
+        }
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn translate_handles_size_hint_none() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/nohint.txt");
+        let meta = ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x44; 32]),
+            version: None,
+            size_hint: None,
+        };
+
+        sink.begin_item(&key, &meta).expect("begin item");
+        sink.finish_item(&key).expect("finish item");
+
+        let submitted = sink.finish().expect("sink finish");
+        assert_eq!(submitted.len(), 1);
+
+        match pipeline
+            .recv_timeout(Duration::from_secs(1))
+            .expect("commit outcome")
+        {
+            CommitStageOutput::Committed {
+                checkpoint_input, ..
+            } => {
+                let receipt = checkpoint_input.into_receipt();
+                assert_eq!(receipt.durable().done_ledger().record_count(), 1);
+            }
+            CommitStageOutput::Failed { error, .. } => {
+                panic!("expected committed outcome, got failure: {error}");
+            }
+        }
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn translate_uses_explicit_version_when_provided() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/versioned.txt");
+        let meta = ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x44; 32]),
+            version: Some(VersionId::Strong(ObjectVersionId::from_version_bytes(
+                b"explicit-v1",
+            ))),
+            size_hint: Some(256),
+        };
+
+        sink.begin_item(&key, &meta).expect("begin item");
+        sink.finish_item(&key).expect("finish item");
+
+        let submitted = sink.finish().expect("sink finish");
+        assert_eq!(submitted.len(), 1);
+
+        match pipeline
+            .recv_timeout(Duration::from_secs(1))
+            .expect("commit outcome")
+        {
+            CommitStageOutput::Committed {
+                checkpoint_input, ..
+            } => {
+                let receipt = checkpoint_input.into_receipt();
+                assert_eq!(receipt.durable().done_ledger().record_count(), 1);
+            }
+            CommitStageOutput::Failed { error, .. } => {
+                panic!("expected committed outcome, got failure: {error}");
+            }
+        }
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_item_preserves_in_flight_on_translation_failure() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/overflow.txt");
+
+        // Force sequence counter to u64::MAX so the next begin_item assigns
+        // a sequence_no whose logical_timing_for computation overflows.
+        sink.next_sequence_no.store(u64::MAX, Ordering::Relaxed);
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+
+        let err = sink
+            .finish_item(&key)
+            .expect_err("translate should fail on timing overflow");
+        assert!(
+            err.to_string().contains("sequence number overflow"),
+            "unexpected error: {err}"
+        );
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(key.as_bytes()),
+            "item must remain in in_flight after translation failure"
+        );
+        drop(guard);
+
+        assert!(
+            sink.submitted.lock().expect("submitted lock").is_empty(),
+            "submitted must be empty after translation failure"
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_item_preserves_in_flight_on_submit_failure() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/disconnected.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.upsert_findings(
+            &key,
+            &FindingsBatch {
+                findings: vec![finding()],
+            },
+        )
+        .expect("upsert findings");
+
+        // Shut down the pipeline so the sender channel is disconnected.
+        pipeline.shutdown().expect("pipeline shutdown");
+
+        let err = sink
+            .finish_item(&key)
+            .expect_err("submit should fail after pipeline shutdown");
+        assert!(
+            err.to_string().contains("submission failed"),
+            "unexpected error: {err}"
+        );
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(key.as_bytes()),
+            "item must remain in in_flight after submit failure"
+        );
+        drop(guard);
+
+        assert!(
+            sink.submitted.lock().expect("submitted lock").is_empty(),
+            "submitted must be empty after submit failure"
+        );
     }
 }
