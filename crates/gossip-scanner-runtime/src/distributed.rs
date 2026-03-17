@@ -408,7 +408,10 @@ mod tests {
         let config = DistributedRuntimeConfig::default();
 
         assert_eq!(config.budgets, ScanBudgets::default());
-        assert_eq!(config.commit_queue_capacity, NonZeroUsize::new(64).unwrap());
+        assert_eq!(
+            config.commit_queue_capacity,
+            NonZeroUsize::new(64).expect("hardcoded non-zero constant"),
+        );
     }
 
     #[test]
@@ -443,6 +446,16 @@ mod tests {
             "PolicyMismatchError should route to Coordinator variant"
         );
         assert!(std::error::Error::source(&from_mismatch).is_some());
+
+        let msg = from_mismatch.to_string();
+        assert!(
+            msg.starts_with("coordinator error:"),
+            "should use Coordinator display prefix"
+        );
+        assert!(
+            msg.contains("shard-z"),
+            "should propagate shard id through display chain"
+        );
     }
 
     #[test]
@@ -452,5 +465,15 @@ mod tests {
         assert_eq!(report.shards_scanned, 0);
         assert_eq!(report.shards_skipped_done, 0);
         assert!(report.shards_scanned + report.shards_skipped_done <= report.leases_seen);
+
+        // Non-trivial case: demonstrates the invariant holds for realistic
+        // field values and guards against field-ordering mistakes in future
+        // construction sites.
+        let nonzero = DistributedRunReport {
+            leases_seen: 10,
+            shards_scanned: 7,
+            shards_skipped_done: 3,
+        };
+        assert!(nonzero.shards_scanned + nonzero.shards_skipped_done <= nonzero.leases_seen);
     }
 }
