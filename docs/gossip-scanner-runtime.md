@@ -263,9 +263,11 @@ execution instead of buffering unbounded translated work in memory.
 The commit pipeline also reuses `CancellationToken` for lease loss and
 shutdown. New submissions check cancellation before attempting a blocking send,
 and the worker re-checks cancellation after dequeue so at most the current
-in-flight commit can finish once cancellation is observed. Buffered items may
-therefore be abandoned during shutdown instead of opening new durable writes
-after lease loss, which keeps the pipeline responsive without risking
+in-flight commit can finish once cancellation is observed. Any item dequeued
+but not yet committed emits a `Failed` outcome with `Cancelled` so consumers
+always receive exactly one outcome per dequeued item. Buffered items still in
+the channel queue are abandoned during shutdown instead of opening new durable
+writes after lease loss, which keeps the pipeline responsive without risking
 half-committed state.
 
 `src/checkpoint_aggregator.rs` implements the next stage in that pipeline. It

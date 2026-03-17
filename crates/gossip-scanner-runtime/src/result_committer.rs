@@ -217,6 +217,10 @@ pub enum ResultCommitError<FindingsError, DoneLedgerError> {
     /// The durable receipt's checkpoint boundary kind did not match the
     /// expected kind for this shard stream.
     KindMismatch(KindMismatchError),
+    /// The commit was not attempted because the pipeline was cancelled after
+    /// the item was dequeued but before the durable write began. No data was
+    /// written for this item.
+    Cancelled,
 }
 
 impl<FindingsError, DoneLedgerError> fmt::Display
@@ -239,6 +243,7 @@ where
             Self::KindMismatch(err) => {
                 write!(f, "checkpoint boundary kind mismatch: {err}")
             }
+            Self::Cancelled => write!(f, "commit cancelled before durable write"),
         }
     }
 }
@@ -256,6 +261,7 @@ where
             Self::DoneLedgerAdvance(err) => Some(err),
             Self::BoundaryMismatch(err) => Some(err.as_ref()),
             Self::KindMismatch(err) => Some(err),
+            Self::Cancelled => None,
         }
     }
 }

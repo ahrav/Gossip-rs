@@ -40,6 +40,10 @@
 //! - the worker polls the cancellation token before receive and again after
 //!   dequeue, so it exits even when cloned senders keep the submission
 //!   channel connected;
+//! - if a newly dequeued item is abandoned before durable commit, the worker
+//!   emits a [`CommitStageOutput::Failed`] with
+//!   [`ResultCommitError::Cancelled`] so consumers always receive exactly
+//!   one outcome per dequeued item;
 //! - the worker still finishes the current in-flight item and attempts to
 //!   emit its outcome. If the outcome receiver has already been dropped,
 //!   for example during shutdown, the last outcome is silently discarded —
@@ -235,11 +239,11 @@ impl CommitPipelineSender {
     ///
     /// The cancellation check and the channel send are not atomic: a concurrent
     /// cancellation between the two steps may allow one more item into the
-    /// queue. The worker re-checks cancellation after dequeue, so an item
-    /// admitted during that race may be abandoned before durable commit rather
-    /// than producing an outcome. Callers that need an authoritative completion
-    /// signal must wait for [`CommitStageOutput`] instead of treating `Ok(())`
-    /// as proof of commit.
+    /// queue. The worker re-checks cancellation after dequeue and emits a
+    /// [`CommitStageOutput::Failed`] with [`ResultCommitError::Cancelled`]
+    /// for any item abandoned before durable commit. Callers that need an
+    /// authoritative completion signal must wait for [`CommitStageOutput`]
+    /// instead of treating `Ok(())` as proof of commit.
     ///
     /// # Errors
     ///
@@ -457,6 +461,12 @@ fn run_commit_stage<F, D>(
             tracing::debug!(
                 "commit-stage worker exiting: cancellation observed after dequeue, before commit"
             );
+            let (write_context, completed_unit, _translation) = work.into_parts();
+            let _ = outcome_tx.try_send(CommitStageOutput::Failed {
+                write_context,
+                completed_unit,
+                error: ResultCommitError::Cancelled,
+            });
             break;
         }
 
@@ -474,6 +484,11 @@ fn run_commit_stage<F, D>(
                 // completed_unit used to build the receipt, so a mismatch here
                 // means durable data was committed but receipt construction
                 // violated an internal invariant.
+                //
+                // The debug_assert panics the worker in debug/CI builds to
+                // surface the violation immediately. The tracing::error and
+                // Failed outcome below are the release-build recovery path
+                // so the worker does not crash in production.
                 Err(kind_mismatch) => {
                     debug_assert!(
                         false,
@@ -1043,9 +1058,15 @@ mod tests {
             }
         }
 
+        // Wait for item 2 to be in-flight in the findings sink before
+        // cancelling. This closes the race where the OS could preempt the
+        // worker thread between the outcome send for item 1 and the dequeue
+        // of item 2, allowing cancel to fire at the pre-receive or
+        // post-dequeue check and preventing item 2 from ever reaching the
+        // findings sink.
+        wait_until(|| findings_sink.pending_count().expect("pending count") == 1);
         cancel.cancel();
 
-        wait_until(|| findings_sink.pending_count().expect("pending count") == 1);
         findings_sink
             .release_next(CompletionOrder::OldestFirst)
             .expect("release second findings write")
