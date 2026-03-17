@@ -31,7 +31,7 @@ entrypoints share the same local runtime execution paths.
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
-| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, layered runtime errors, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), and `run_filesystem_lease` (single-shard execution entrypoint) |
+| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, layered runtime errors, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), `run_worker` (lease loop), and `InMemoryCoordinator` (test-support coordinator harness) |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
@@ -116,8 +116,8 @@ old cross-crate driver seam.
 
 ### Distributed runs
 
-- `DistributedRuntimeConfig` stores the budgets that the future worker loop
-  must validate before executing a lease
+- `DistributedRuntimeConfig` stores the budgets that the worker loop threads
+  into receipt-driven shard execution
 
 ---
 
@@ -374,6 +374,26 @@ the receipt-driven durability model:
 If any step fails, the shard is not marked done and will be retried on the
 next lease acquisition.
 
+#### `run_worker`
+
+`run_worker` is the top-level distributed lease loop. It acquires leases until
+the coordinator returns `None`, counts every lease in
+`DistributedRunReport`, releases already-done shards without scanning them,
+routes filesystem leases through `run_filesystem_lease`, and rejects
+assignments that do not expose a filesystem scan config instead of advancing
+them without receipt-derived durability.
+
+#### `InMemoryCoordinator`
+
+`InMemoryCoordinator<A>` is available in test builds and under the
+`test-support` feature. It keeps the lease queue, completion bookkeeping, and
+recorded coordination events behind one `Arc<Mutex<...>>` state bundle so
+tests can exercise the worker loop without a real coordination backend.
+
+The coordinator intentionally does not deduplicate `complete_shard` calls.
+Crash-retry tests can therefore observe duplicate completion records when a
+shard is re-leased after completion but before done-marking.
+
 ### ScanRuntimeError
 
 The runtime error surface has six current categories:
@@ -386,8 +406,7 @@ The runtime error surface has six current categories:
 - `Driver`
 
 `Driver(anyhow::Error)` is the catch-all for runtime execution failures such
-as scan-loop errors, event-forwarder join failures, and the still-unwired
-distributed family path.
+as scan-loop errors and event-forwarder join failures.
 
 ---
 
@@ -566,6 +585,10 @@ per shard, while `DistributedRuntimeError`
 distinguishes coordinator failures, scan-runtime failures, and local durability
 pipeline failures.
 
+`run_worker` ties those types together into the lease loop, and
+`InMemoryCoordinator<A>` provides a harness implementation for unit tests and
+feature-gated downstream test support.
+
 ---
 
 ## Tests
@@ -585,6 +608,9 @@ The runtime tests focus on the behavior that exists today:
 - distributed config defaults
 - distributed persistence handle cloning
 - distributed runtime error layering
+- distributed worker-loop lease accounting, done-ledger skips, and
+  receipt-derived completion
+- in-memory coordinator snapshots for completed shards and recorded events
 - CLI parsing and summary formatting
 - receipt-driven identity derivation via translate_item_result
 - authoritative findings -> done-ledger commit ordering and item-level receipt
@@ -593,7 +619,8 @@ The runtime tests focus on the behavior that exists today:
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources and verify the distributed type surface (lease construction,
-persistence cloning, config defaults, error layering).
+persistence cloning, config defaults, error layering, worker-loop accounting,
+and in-memory coordinator observations).
 
 ---
 

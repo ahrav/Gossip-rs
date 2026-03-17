@@ -9,6 +9,7 @@ description = "Runtime orchestration APIs for scanner-rs direct and connector ex
 
 [features]
 default = []
+test-support = []
 aegis-pure-rust = [
     "scanner-engine/aegis-pure-rust",
     "scanner-scheduler/aegis-pure-rust",

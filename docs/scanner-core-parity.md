@@ -21,17 +21,19 @@ summary, and parity plumbing local to `gossip-scanner-runtime`:
 - `crates/scanner-engine` owns the detection pipeline: vectorscan prefilter,
   regex, transform decode, offline validation, and finding emission.
 
-At the moment the runtime validates scan inputs and preserves these typed
-surfaces, then routes execution to family placeholders. End-to-end engine
-execution parity is therefore scoped to the pieces that still run today:
+At the moment the runtime validates scan inputs, routes filesystem and git
+requests through live family runtimes, and exposes a receipt-driven
+distributed worker loop for filesystem leases. End-to-end parity work remains
+focused on the surfaces with pinned fixtures and canonicalized outputs:
 
 - CLI parsing and summary rendering
 - event-sink formatting
 - JSONL canonicalization in `parity.rs`
 - durable identity derivation in the local commit sink
 
-When the family runtime loops land, the same public runtime API can resume
-full detection-path parity work without another caller-facing surface change.
+As additional receipt-driven distributed paths land, the same public runtime
+API can widen detection-path parity work without another caller-facing surface
+change.
 
 ## Throughput Policy
 

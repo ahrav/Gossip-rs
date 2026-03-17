@@ -70,6 +70,13 @@ use crate::{
     scan_fs_with_prebuilt_engine,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::OwnedCoreEvent;
+#[cfg(any(test, feature = "test-support"))]
+use crate::coordination_sink::{IdentityChainRecord, StoredGitEvent};
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::{HashSet, VecDeque};
+
 /// Assignment payloads expose their policy scope so leases can assert that the
 /// payload agrees with the shared write context.
 pub trait ShardLeaseAssignment {
@@ -1047,9 +1054,300 @@ where
     Ok(())
 }
 
+/// Run the distributed worker loop until the coordinator has no more leases.
+///
+/// Each iteration either skips an already-complete shard, executes one
+/// filesystem lease through the receipt-driven durability path, or stops with a
+/// safe error when the assignment does not expose a filesystem scan config.
+pub fn run_worker<A, F, D>(
+    coordinator: &dyn DistributedCoordinator<A>,
+    persistence: DistributedPersistence<F, D>,
+    config: DistributedRuntimeConfig,
+) -> Result<DistributedRunReport, DistributedRuntimeError>
+where
+    A: ShardLeaseAssignment,
+    F: FindingsSink + Clone + Send + Sync + 'static,
+    D: DoneLedger + Clone + Send + Sync + 'static,
+    F::Error: std::error::Error + Send + Sync + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    let recorder = coordinator.event_recorder();
+    let mut report = DistributedRunReport::default();
+
+    loop {
+        let Some(lease) = coordinator
+            .acquire_shard()
+            .map_err(DistributedRuntimeError::Coordinator)?
+        else {
+            break;
+        };
+        report.leases_seen = report.leases_seen.saturating_add(1);
+
+        if coordinator
+            .is_shard_done(&lease)
+            .map_err(DistributedRuntimeError::Coordinator)?
+        {
+            coordinator
+                .release_shard(&lease)
+                .map_err(DistributedRuntimeError::Coordinator)?;
+            report.shards_skipped_done = report.shards_skipped_done.saturating_add(1);
+            continue;
+        }
+
+        if lease.assignment().filesystem_scan_config().is_none() {
+            return Err(DistributedRuntimeError::Durability(anyhow!(
+                "distributed receipt-driven runtime is not yet wired for non-filesystem assignments; refusing to advance shard '{}' without receipts",
+                lease.shard_id()
+            )));
+        }
+
+        run_filesystem_lease(
+            coordinator,
+            Arc::clone(&recorder),
+            &persistence,
+            &lease,
+            config,
+        )?;
+        report.shards_scanned = report.shards_scanned.saturating_add(1);
+    }
+
+    Ok(report)
+}
+
+/// In-memory coordinator used by tests and local harnesses.
+///
+/// The coordinator stores leases, shard lifecycle transitions, and recorder
+/// output behind one mutex-protected state bundle. `complete_shard` is
+/// intentionally non-idempotent so crash-retry tests can observe duplicate
+/// completions when a shard is re-leased between completion and done-marking.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub struct InMemoryCoordinator<A> {
+    state: Arc<Mutex<InMemoryCoordinatorState<A>>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct InMemoryCoordinatorState<A> {
+    queue: VecDeque<ShardLease<A>>,
+    done: HashSet<String>,
+    done_mark_contexts: Vec<WriteContext>,
+    released: Vec<String>,
+    completed: Vec<CompletedShard>,
+    core_events: Vec<(String, OwnedCoreEvent)>,
+    git_events: Vec<(String, StoredGitEvent)>,
+    commit_progress: Vec<(String, CommitProgressRecord)>,
+    identity_records: Vec<(String, IdentityChainRecord)>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> Default for InMemoryCoordinatorState<A> {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            done: HashSet::new(),
+            done_mark_contexts: Vec::new(),
+            released: Vec::new(),
+            completed: Vec::new(),
+            core_events: Vec::new(),
+            git_events: Vec::new(),
+            commit_progress: Vec::new(),
+            identity_records: Vec::new(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug)]
+struct CompletedShard {
+    shard_id: String,
+    checkpoint: Option<Cursor>,
+    report: ScanReport,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> InMemoryCoordinator<A> {
+    /// Create a coordinator pre-loaded with the provided lease queue.
+    #[must_use]
+    pub fn new(leases: Vec<ShardLease<A>>) -> Self {
+        let mut queue = VecDeque::new();
+        queue.extend(leases);
+        Self {
+            state: Arc::new(Mutex::new(InMemoryCoordinatorState {
+                queue,
+                ..InMemoryCoordinatorState::default()
+            })),
+        }
+    }
+
+    /// Pre-mark a shard as done so the worker loop skips it.
+    pub fn mark_done(&self, shard_id: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .done
+            .insert(shard_id.into());
+    }
+
+    /// Snapshot of the in-memory done set.
+    #[must_use]
+    pub fn done_set(&self) -> HashSet<String> {
+        self.state.lock().expect("state lock").done.clone()
+    }
+
+    /// Snapshot of the write contexts used for `mark_shard_done`.
+    #[must_use]
+    pub fn done_mark_contexts(&self) -> Vec<WriteContext> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .done_mark_contexts
+            .clone()
+    }
+
+    /// Snapshot of shards released without completion.
+    #[must_use]
+    pub fn released_shards(&self) -> Vec<String> {
+        self.state.lock().expect("state lock").released.clone()
+    }
+
+    /// Snapshot of completed shard records.
+    #[must_use]
+    pub fn completed_shards(&self) -> Vec<(String, Option<Cursor>, ScanReport)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .completed
+            .iter()
+            .map(|entry| {
+                (
+                    entry.shard_id.clone(),
+                    entry.checkpoint.clone(),
+                    entry.report,
+                )
+            })
+            .collect()
+    }
+
+    /// Snapshot of recorded core events.
+    #[must_use]
+    pub fn core_events(&self) -> Vec<(String, OwnedCoreEvent)> {
+        self.state.lock().expect("state lock").core_events.clone()
+    }
+
+    /// Snapshot of recorded identity-chain records.
+    #[must_use]
+    pub fn identity_records(&self) -> Vec<(String, IdentityChainRecord)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .identity_records
+            .clone()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> DistributedCoordinator<A> for InMemoryCoordinator<A>
+where
+    A: ShardLeaseAssignment + Send + Sync + 'static,
+{
+    fn acquire_shard(&self) -> Result<Option<ShardLease<A>>> {
+        Ok(self.state.lock().expect("state lock").queue.pop_front())
+    }
+
+    fn release_shard(&self, lease: &ShardLease<A>) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .released
+            .push(lease.shard_id().to_owned());
+        Ok(())
+    }
+
+    fn complete_shard(
+        &self,
+        lease: &ShardLease<A>,
+        checkpoint: Option<Cursor>,
+        report: ScanReport,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .completed
+            .push(CompletedShard {
+                shard_id: lease.shard_id().to_owned(),
+                checkpoint,
+                report,
+            });
+        Ok(())
+    }
+
+    fn is_shard_done(&self, lease: &ShardLease<A>) -> Result<bool> {
+        Ok(self
+            .state
+            .lock()
+            .expect("state lock")
+            .done
+            .contains(lease.shard_id()))
+    }
+
+    fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()> {
+        let mut guard = self.state.lock().expect("state lock");
+        guard.done.insert(lease.shard_id().to_owned());
+        guard.done_mark_contexts.push(lease.write_context());
+        Ok(())
+    }
+
+    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
+        Arc::new(Self {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> CoordinationEventRecorder for InMemoryCoordinator<A>
+where
+    A: Send + Sync + 'static,
+{
+    fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .core_events
+            .push((shard_id.to_owned(), event));
+        Ok(())
+    }
+
+    fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .git_events
+            .push((shard_id.to_owned(), event));
+        Ok(())
+    }
+
+    fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .commit_progress
+            .push((shard_id.to_owned(), event));
+        Ok(())
+    }
+
+    fn record_identity_chain(&self, shard_id: &str, record: IdentityChainRecord) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .identity_records
+            .push((shard_id.to_owned(), record));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::fs;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1116,98 +1414,6 @@ mod tests {
         ) -> Result<()> {
             self.progress.lock().expect("progress lock").push(event);
             Ok(())
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct CompletedShard {
-        shard_id: String,
-        checkpoint: Option<Cursor>,
-        report: ScanReport,
-    }
-
-    #[derive(Default)]
-    struct TestCoordinatorState {
-        completed: Vec<CompletedShard>,
-        released: Vec<String>,
-        done: HashSet<String>,
-        done_mark_contexts: Vec<WriteContext>,
-    }
-
-    #[derive(Clone, Default)]
-    struct TestCoordinator {
-        recorder: Arc<Recorder>,
-        state: Arc<Mutex<TestCoordinatorState>>,
-    }
-
-    impl TestCoordinator {
-        fn completed_shards(&self) -> Vec<CompletedShard> {
-            self.state.lock().expect("state lock").completed.clone()
-        }
-
-        fn done_set(&self) -> HashSet<String> {
-            self.state.lock().expect("state lock").done.clone()
-        }
-
-        fn done_mark_contexts(&self) -> Vec<WriteContext> {
-            self.state
-                .lock()
-                .expect("state lock")
-                .done_mark_contexts
-                .clone()
-        }
-    }
-
-    impl DistributedCoordinator<StubAssignment> for TestCoordinator {
-        fn acquire_shard(&self) -> Result<Option<ShardLease<StubAssignment>>> {
-            Ok(None)
-        }
-
-        fn release_shard(&self, lease: &ShardLease<StubAssignment>) -> Result<()> {
-            self.state
-                .lock()
-                .expect("state lock")
-                .released
-                .push(lease.shard_id().to_owned());
-            Ok(())
-        }
-
-        fn complete_shard(
-            &self,
-            lease: &ShardLease<StubAssignment>,
-            checkpoint: Option<Cursor>,
-            report: ScanReport,
-        ) -> Result<()> {
-            self.state
-                .lock()
-                .expect("state lock")
-                .completed
-                .push(CompletedShard {
-                    shard_id: lease.shard_id().to_owned(),
-                    checkpoint,
-                    report,
-                });
-            Ok(())
-        }
-
-        fn is_shard_done(&self, lease: &ShardLease<StubAssignment>) -> Result<bool> {
-            Ok(self
-                .state
-                .lock()
-                .expect("state lock")
-                .done
-                .contains(lease.shard_id()))
-        }
-
-        fn mark_shard_done(&self, lease: &ShardLease<StubAssignment>) -> Result<()> {
-            let mut guard = self.state.lock().expect("state lock");
-            guard.done.insert(lease.shard_id().to_owned());
-            guard.done_mark_contexts.push(lease.write_context());
-            Ok(())
-        }
-
-        fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
-            self.recorder.clone()
         }
     }
 
@@ -2130,11 +2336,174 @@ mod tests {
     }
 
     #[test]
+    fn run_worker_skips_done_shards_before_scan() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator =
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-done", dir.path())]);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        coordinator.mark_done("shard-done");
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("run worker");
+
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 0);
+        assert_eq!(report.shards_skipped_done, 1);
+        assert_eq!(
+            report.leases_seen,
+            report.shards_scanned + report.shards_skipped_done
+        );
+        assert_eq!(coordinator.released_shards(), vec!["shard-done".to_owned()]);
+        assert!(coordinator.completed_shards().is_empty());
+        assert!(
+            findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "skipped shard must not emit findings durability writes"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "skipped shard must not emit done-ledger writes"
+        );
+    }
+
+    #[test]
+    fn run_worker_persists_findings_done_ledger_checkpoint_and_marks_done() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator =
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-worker", dir.path())]);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("run worker");
+
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 1);
+        assert_eq!(report.shards_skipped_done, 0);
+        assert_eq!(
+            report.leases_seen,
+            report.shards_scanned + report.shards_skipped_done
+        );
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, "shard-worker");
+        assert!(
+            completed[0].2.items_scanned >= 1,
+            "scan report should record the scanned file"
+        );
+        let checkpoint = completed[0]
+            .1
+            .as_ref()
+            .expect("non-empty shard should checkpoint");
+        assert!(
+            checkpoint.last_key().is_some(),
+            "receipt-driven checkpoint should carry a progress key"
+        );
+        assert!(
+            checkpoint.token().is_none(),
+            "receipt-driven checkpoint should be tokenless"
+        );
+
+        assert!(coordinator.done_set().contains("shard-worker"));
+        assert_eq!(coordinator.done_mark_contexts(), vec![write_context()]);
+
+        let observations = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot");
+        assert!(
+            !observations.is_empty(),
+            "durable findings observations should be present"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one scanned file should produce one done row"
+        );
+        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
+        assert_eq!(rows[0].write_context(), write_context());
+    }
+
+    #[test]
+    fn complete_shard_duplicate_call_produces_duplicate_entry() {
+        let dir = tempdir().expect("tempdir");
+        let lease = filesystem_lease("shard-dup", dir.path());
+        let coordinator = InMemoryCoordinator::new(Vec::<ShardLease<StubAssignment>>::new());
+        let report = ScanReport::default();
+
+        coordinator
+            .complete_shard(&lease, None, report)
+            .expect("first complete_shard");
+        coordinator
+            .complete_shard(&lease, None, report)
+            .expect("second complete_shard");
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].0, "shard-dup");
+        assert_eq!(completed[1].0, "shard-dup");
+        assert_eq!(completed[0].1, completed[1].1);
+        assert_eq!(completed[0].2, completed[1].2);
+    }
+
+    #[test]
+    fn run_worker_rejects_non_filesystem_assignment_without_receipts() {
+        let coordinator = InMemoryCoordinator::new(vec![
+            ShardLease::new(
+                Arc::from("shard-non-fs"),
+                StubAssignment {
+                    policy_hash: write_context().policy_hash(),
+                    filesystem_scan_config: None,
+                },
+                write_context(),
+                tenant_secret_key(),
+            )
+            .expect("lease"),
+        ]);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("non-filesystem lease should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not yet wired for non-filesystem assignments"),
+            "unexpected error: {error}"
+        );
+        assert!(coordinator.completed_shards().is_empty());
+        assert!(!coordinator.done_set().contains("shard-non-fs"));
+    }
+
+    #[test]
     fn run_filesystem_lease_persists_checkpoint_and_marks_done() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
@@ -2151,13 +2520,13 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-fs");
+        assert_eq!(completed[0].0, "shard-fs");
         assert!(
-            completed[0].report.items_scanned >= 1,
+            completed[0].2.items_scanned >= 1,
             "scan report should record the scanned file"
         );
         let checkpoint = completed[0]
-            .checkpoint
+            .1
             .as_ref()
             .expect("non-empty shard should checkpoint");
         assert!(
@@ -2193,7 +2562,7 @@ mod tests {
     #[test]
     fn run_filesystem_lease_zero_item_shard_completes_without_checkpoint() {
         let dir = tempdir().expect("tempdir");
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink, done_ledger.clone());
@@ -2210,13 +2579,13 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-empty");
+        assert_eq!(completed[0].0, "shard-empty");
         assert_eq!(
-            completed[0].report.items_scanned, 0,
+            completed[0].2.items_scanned, 0,
             "empty directory should scan zero items"
         );
         assert!(
-            completed[0].checkpoint.is_none(),
+            completed[0].1.is_none(),
             "zero-item shard must complete without a checkpoint"
         );
         assert!(coordinator.done_set().contains("shard-empty"));
@@ -2234,7 +2603,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         done_ledger
@@ -2283,7 +2652,7 @@ mod tests {
 
     #[test]
     fn run_filesystem_lease_rejects_assignment_without_filesystem_config() {
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let persistence =
             DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
         let lease = ShardLease::new(
@@ -2325,7 +2694,7 @@ mod tests {
         fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
             .expect("write clean fixture");
 
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
@@ -2342,10 +2711,10 @@ mod tests {
 
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-mixed");
+        assert_eq!(completed[0].0, "shard-mixed");
 
         let checkpoint = completed[0]
-            .checkpoint
+            .1
             .as_ref()
             .expect("non-empty shard should checkpoint");
         assert!(
