@@ -264,10 +264,9 @@ The commit pipeline also reuses `CancellationToken` for lease loss and
 shutdown. New submissions check cancellation before attempting a blocking send,
 and the worker re-checks cancellation after dequeue so at most the current
 in-flight commit can finish once cancellation is observed. Any item dequeued
-but not yet committed emits a `Failed` outcome with `Cancelled` so consumers
-attempts to emit a `Failed` outcome with `Cancelled`; delivery is best-effort
-because the outcome queue may be full or disconnected at cancellation time.
-Buffered items still in
+but not yet committed attempts to emit a `Failed` outcome with `Cancelled`;
+delivery is best-effort because the outcome queue may be full or disconnected
+at cancellation time. Buffered items still in
 the channel queue are abandoned during shutdown instead of opening new durable
 writes after lease loss, which keeps the pipeline responsive without risking
 half-committed state.
