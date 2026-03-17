@@ -50,18 +50,10 @@ fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     dir
 }
 
-// ---------------------------------------------------------------
-// Split point tests
-// ---------------------------------------------------------------
-
-#[test]
-fn choose_split_point_selects_byte_weighted_midpoint() {
-    let dir = create_test_repo(&[
-        ("a.txt", b"1"),
-        ("b.txt", b"22"),
-        ("c.txt", b"333"),
-        ("d.txt", b"4444"),
-    ]);
+/// Asserts the split point over the full key range (`\x00`..`\xff`).
+/// For tests that require different bounds, call `choose_split_point_range` directly.
+fn assert_split_point(files: &[(&str, &[u8])], expected: &[u8]) {
+    let dir = create_test_repo(files);
     let mut connector = GitConnector::new(dir.path());
 
     let split = connector
@@ -73,27 +65,32 @@ fn choose_split_point_selects_byte_weighted_midpoint() {
         )
         .unwrap();
     let split = split.expect("expected split candidate for multi-item range");
+    assert_eq!(split.as_bytes(), expected);
+}
+
+// Verifies split-point selection behavior across weighted fixture layouts.
+#[test]
+fn choose_split_point_selects_byte_weighted_midpoint() {
+    assert_split_point(
+        &[
+            ("a.txt", b"1"),
+            ("b.txt", b"22"),
+            ("c.txt", b"333"),
+            ("d.txt", b"4444"),
+        ],
+        b"c.txt",
+    );
     // The byte-weighted candidate is d.txt (position 6, closest to midpoint 5),
     // but the last-key guard prevents an empty right shard. Rank-fallback
     // selects the rank midpoint: c.txt (rank 2 of 4).
-    assert_eq!(split.as_bytes(), b"c.txt");
 }
 
 #[test]
 fn choose_split_point_avoids_first_file_when_weight_is_front_loaded() {
-    let dir = create_test_repo(&[("a.txt", &[0u8; 64]), ("b.txt", b"1"), ("c.txt", b"2")]);
-    let mut connector = GitConnector::new(dir.path());
-
-    let split = connector
-        .choose_split_point_range(
-            &make_key(b"\x00"),
-            &make_key(b"\xff"),
-            &Cursor::initial(),
-            None,
-        )
-        .unwrap();
-    let split = split.expect("expected split candidate for multi-item range");
-    assert_eq!(split.as_bytes(), b"b.txt");
+    assert_split_point(
+        &[("a.txt", &[0u8; 64]), ("b.txt", b"1"), ("c.txt", b"2")],
+        b"b.txt",
+    );
 }
 
 // ---------------------------------------------------------------
