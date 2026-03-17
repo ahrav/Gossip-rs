@@ -419,11 +419,12 @@ impl ReceiptCommitSink {
         ))
     }
 
-    /// Record begin-item progress as best-effort telemetry.
+    /// Records a begin-progress event for telemetry.
     ///
-    /// Recorder errors are non-fatal: the commit pipeline submission is the
-    /// authoritative durability signal for the receipt-driven path. Telemetry
-    /// loss does not affect checkpoint correctness.
+    /// Recorder errors are intentionally non-fatal: durability flows through
+    /// the commit pipeline, not the recorder. This diverges from
+    /// `DurableCommitSink` where recorder errors are propagated because the
+    /// recorder IS the durability path.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
         let _ = self.recorder.record_commit_progress(
             &self.shard_id,
@@ -435,10 +436,10 @@ impl ReceiptCommitSink {
         );
     }
 
-    /// Record finish-item progress as best-effort telemetry.
+    /// Records a finish-progress event for telemetry.
     ///
-    /// See [`record_begin`](Self::record_begin) for rationale on error
-    /// suppression.
+    /// See [`record_begin`](Self::record_begin) for the non-fatal error
+    /// rationale.
     fn record_finish(&self, item_key: &ItemKey) {
         let _ = self.recorder.record_commit_progress(
             &self.shard_id,
@@ -504,22 +505,23 @@ impl CommitSink for ReceiptCommitSink {
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
 
-        if guard.contains_key(&key_bytes) {
-            return Err(anyhow::anyhow!(
-                "begin_item called twice without finish_item for the same item"
-            ));
+        use std::collections::btree_map::Entry;
+        match guard.entry(key_bytes) {
+            Entry::Occupied(_) => {
+                return Err(anyhow::anyhow!(
+                    "begin_item called twice without finish_item for the same item"
+                ));
+            }
+            Entry::Vacant(slot) => {
+                let sequence_no = self.next_sequence_no();
+                slot.insert(InFlightItem {
+                    sequence_no,
+                    item_key: item_key.clone(),
+                    meta: meta.clone(),
+                    findings: Vec::new(),
+                });
+            }
         }
-
-        let sequence_no = self.next_sequence_no();
-        guard.insert(
-            key_bytes,
-            InFlightItem {
-                sequence_no,
-                item_key: item_key.clone(),
-                meta: meta.clone(),
-                findings: Vec::new(),
-            },
-        );
         drop(guard);
 
         self.record_begin(item_key, meta);
@@ -535,6 +537,11 @@ impl CommitSink for ReceiptCommitSink {
             .get_mut(item_key.as_bytes())
             .ok_or_else(|| anyhow::anyhow!("upsert_findings called before begin_item for item"))?;
 
+        // The CommitSink surface provides only start/end offsets.
+        // Root-hint fields are unavailable through this bridge, so both
+        // root_hint_start/end mirror span_start/end. This is safe because
+        // root-hint fields never participate in persistence identity
+        // derivation (see result_translation.rs module docs).
         item.findings
             .extend(batch.findings.iter().map(|finding| FsFindingRecord {
                 rule_id: finding.rule_id,
@@ -556,18 +563,34 @@ impl CommitSink for ReceiptCommitSink {
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
         let item = guard
-            .get(key_bytes)
+            .remove(key_bytes)
             .ok_or_else(|| anyhow::anyhow!("finish_item called before begin_item for item"))?;
 
         let sequence_no = item.sequence_no;
-        let work = self.translate_in_flight(item)?;
-
-        guard.remove(key_bytes);
+        let work = match self.translate_in_flight(&item) {
+            Ok(work) => work,
+            Err(err) => {
+                guard.insert(key_bytes.to_vec(), item);
+                return Err(err);
+            }
+        };
         drop(guard);
 
-        self.submitter
-            .submit(work)
-            .map_err(|error| anyhow::anyhow!("execution to commit submission failed: {error}"))?;
+        if let Err(error) = self.submitter.submit(work) {
+            // Re-insert so the caller can retry; mirrors DurableCommitSink's
+            // rollback-on-recorder-failure pattern.
+            self.in_flight
+                .lock()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "receipt commit sink in-flight state lock poisoned during rollback"
+                    )
+                })?
+                .insert(key_bytes.to_vec(), item);
+            return Err(anyhow::anyhow!(
+                "execution to commit submission failed: {error}"
+            ));
+        }
 
         self.submitted
             .lock()
@@ -1256,5 +1279,76 @@ mod tests {
         }
 
         pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_item_preserves_in_flight_on_translation_failure() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/overflow.txt");
+
+        // Force sequence counter to u64::MAX so the next begin_item assigns
+        // a sequence_no whose logical_timing_for computation overflows.
+        sink.next_sequence_no.store(u64::MAX, Ordering::Relaxed);
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+
+        let err = sink
+            .finish_item(&key)
+            .expect_err("translate should fail on timing overflow");
+        assert!(
+            err.to_string().contains("sequence number overflow"),
+            "unexpected error: {err}"
+        );
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(key.as_bytes()),
+            "item must remain in in_flight after translation failure"
+        );
+        drop(guard);
+
+        assert!(
+            sink.submitted.lock().expect("submitted lock").is_empty(),
+            "submitted must be empty after translation failure"
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn finish_item_preserves_in_flight_on_submit_failure() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/disconnected.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.upsert_findings(
+            &key,
+            &FindingsBatch {
+                findings: vec![finding()],
+            },
+        )
+        .expect("upsert findings");
+
+        // Shut down the pipeline so the sender channel is disconnected.
+        pipeline.shutdown().expect("pipeline shutdown");
+
+        let err = sink
+            .finish_item(&key)
+            .expect_err("submit should fail after pipeline shutdown");
+        assert!(
+            err.to_string().contains("submission failed"),
+            "unexpected error: {err}"
+        );
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(key.as_bytes()),
+            "item must remain in in_flight after submit failure"
+        );
+        drop(guard);
+
+        assert!(
+            sink.submitted.lock().expect("submitted lock").is_empty(),
+            "submitted must be empty after submit failure"
+        );
     }
 }
