@@ -342,7 +342,6 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 #[derive(Debug)]
 struct InFlightItem {
     sequence_no: u64,
-    item_key: ItemKey,
     meta: ItemMeta,
     findings: Vec<FsFindingRecord>,
 }
@@ -392,7 +391,7 @@ struct ReceiptCommitSink {
     rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
     submitter: CommitPipelineSender,
     next_sequence_no: AtomicU64,
-    in_flight: Mutex<BTreeMap<Vec<u8>, InFlightItem>>,
+    in_flight: Mutex<BTreeMap<ItemKey, InFlightItem>>,
     submitted: Mutex<Vec<SubmittedCommit>>,
 }
 
@@ -979,7 +978,7 @@ where
         .map_err(DistributedRuntimeError::Durability)?
         .map_err(DistributedRuntimeError::Durability)?;
 
-    let submitted_units = committed_sequence_nos.len() as u64;
+    let submitted_units = submitted.len() as u64;
 
     // Zero-item shards (empty directories) complete without a checkpoint
     // cursor because no items were committed and no cursor position exists.
