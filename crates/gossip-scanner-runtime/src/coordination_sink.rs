@@ -34,7 +34,11 @@ pub enum StoredGitEvent {
     IdentityDictionary { id: u32, value: Vec<u8> },
 }
 
-/// Commit lifecycle checkpoints emitted by commit sinks.
+/// Commit lifecycle progress markers emitted by commit sinks.
+///
+/// These are best-effort telemetry events for observability; durability
+/// flows through the receipt-driven commit pipeline, not through these
+/// markers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitProgressRecord {
     /// Item processing has started; `size_hint` is the expected byte length.
@@ -56,7 +60,7 @@ pub trait CoordinationEventRecorder: Send + Sync {
     fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()>;
     /// Persists a git-specific event (commit metadata or identity dictionary entry).
     fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()>;
-    /// Persists a commit lifecycle checkpoint (begin/finish).
+    /// Persists a commit lifecycle progress marker (begin/finish).
     fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()>;
 }
 
