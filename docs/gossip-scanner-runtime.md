@@ -24,14 +24,14 @@ entrypoints share the same local runtime execution paths.
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime` |
+| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime`, and `scan_fs_with_prebuilt_engine` (crate-internal entrypoint that reuses a caller-provided engine for distributed scans) |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
-| `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input |
+| `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink that stamps one shared `WriteContext` onto emitted records |
 | `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing, including write-scoped progress and identity-chain records |
-| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, and layered runtime errors |
+| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, layered runtime errors, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), and `run_filesystem_lease` (single-shard execution entrypoint) |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
@@ -264,8 +264,9 @@ The commit pipeline also reuses `CancellationToken` for lease loss and
 shutdown. New submissions check cancellation before attempting a blocking send,
 and the worker re-checks cancellation after dequeue so at most the current
 in-flight commit can finish once cancellation is observed. Any item dequeued
-but not yet committed emits a `Failed` outcome with `Cancelled` so consumers
-always receive exactly one outcome per dequeued item. Buffered items still in
+but not yet committed attempts to emit a `Failed` outcome with `Cancelled`;
+delivery is best-effort because the outcome queue may be full or disconnected
+at cancellation time. Buffered items still in
 the channel queue are abandoned during shutdown instead of opening new durable
 writes after lease loss, which keeps the pipeline responsive without risking
 half-committed state.
@@ -278,6 +279,100 @@ boundaries to key-only durable progress, and waits for a matching
 authoritative checkpoint floor. Durable checkpoint boundaries carry only the
 item key, not the connector resume token, because tokens are ephemeral and not
 stable across process restarts.
+
+### CommitPipeline decomposition: `split()`
+
+`CommitPipeline::split()` consumes the pipeline and returns two handles:
+
+- `CommitPipelineSender` — a cloneable execution-side handle that submits
+  owned `QueuedCommit` values into the bounded queue. It checks the
+  `CancellationToken` before each blocking send so cancelled pipelines reject
+  new work immediately.
+- `CommitPipelineDrainer` — an outcome-drain handle that owns the outcome
+  receiver and the worker `JoinHandle`. It exposes `recv()` and
+  `recv_timeout()` for consuming `CommitStageOutput` values, a `cancel()`
+  method for stopping the worker, and `join()` for waiting on the worker
+  thread after draining completes.
+
+Dropping the sender closes the submission channel. Once the commit worker
+drains all remaining queued items, it exits, allowing the drainer to consume
+the outcomes and join the thread. This separation lets distributed
+runtimes run scan execution and receipt draining on concurrent scoped
+threads: one thread holds the sender and feeds translated scan results,
+while another thread holds the drainer and builds the checkpoint prefix from
+durable receipts.
+
+### Receipt-driven execution path
+
+The distributed module provides a complete receipt-driven execution path for
+single-shard filesystem scans, built on top of the commit pipeline
+decomposition.
+
+#### `ReceiptCommitSink`
+
+`ReceiptCommitSink` implements the `CommitSink` trait to bridge scan-driver
+item lifecycle callbacks into the receipt-driven commit pipeline. It tracks
+in-flight items in a `BTreeMap` keyed by item-key bytes:
+
+- `begin_item` assigns a monotonically increasing sequence number and
+  inserts an `InFlightItem` into the in-flight map.
+- `upsert_findings` appends `FsFindingRecord` entries to the in-flight
+  item's accumulated findings vector.
+- `finish_item` removes the item from the in-flight map, runs deterministic
+  result translation (via `translate_item_result`) to produce persistence
+  rows, wraps them in a `QueuedCommit`, and submits to the pipeline through
+  `CommitPipelineSender`. On translation or submission failure, the item is
+  re-inserted into the in-flight map so the caller can retry.
+
+The sink derives logical timing from sequence numbers (`2n, 2n+1` intervals)
+and uses a weak object-version derived from item-key bytes when the source
+does not provide an explicit version. It records begin/finish progress events
+through the coordination recorder for telemetry, but recorder errors are
+intentionally non-fatal because durability flows through the commit pipeline.
+
+#### `drain_commit_stage`
+
+`drain_commit_stage` consumes a `CommitPipelineDrainer` and builds a
+`CommitStageDrainResult` containing:
+
+- a `PrefixCheckpointAggregator` that tracks the contiguous committed prefix
+- the sequence numbers of committed items (for cross-checking against the
+  submitted list); the committed count is derived from this list's length
+
+The function loops over `CommitStageOutput` values from the drainer. On
+`Committed` outcomes, it feeds the checkpoint input to the aggregator. On
+`Failed` outcomes or aggregation errors, it cancels the pipeline worker to
+stop scan execution from queuing further work, then continues draining to
+consume remaining buffered outcomes before joining the worker thread. Any
+failure aborts the shard.
+
+#### `run_filesystem_lease`
+
+`run_filesystem_lease` orchestrates single-shard filesystem execution under
+the receipt-driven durability model:
+
+1. Validates budgets and extracts the filesystem scan config from the lease
+   assignment. Forces single-worker execution so `ReceiptCommitSink` sequence
+   assignment remains deterministic.
+2. Builds the runtime engine and a rule-fingerprint resolver closure from the
+   same engine instance (shared via `Arc`).
+3. Starts a `CommitPipeline` and splits it into sender and drainer.
+4. Constructs a `ReceiptCommitSink` with the sender handle.
+5. Uses `std::thread::scope` to run scan execution and commit-stage draining
+   concurrently: scan execution calls `scan_fs_with_prebuilt_engine` with
+   the `ReceiptCommitSink`, while a second thread calls
+   `drain_commit_stage` with the drainer.
+6. After both threads complete, cross-checks submitted vs. committed
+   sequence numbers via `wait_for_submitted_commits` and verifies that the
+   durable receipt count matches the number of items submitted to the commit
+   pipeline.
+7. Prepares a checkpoint prefix from the aggregator, persists the checkpoint
+   cursor via `complete_shard`, acknowledges the checkpoint to advance the
+   aggregator watermark, and marks the shard done. Zero-item shards
+   (empty directories) complete without a checkpoint cursor.
+
+If any step fails, the shard is not marked done and will be retried on the
+next lease acquisition.
 
 ### ScanRuntimeError
 

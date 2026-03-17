@@ -371,6 +371,19 @@ where
             .map_err(ResultCommitError::BoundaryMismatch)
     }
 
+    /// Validate a commit request before any I/O.
+    ///
+    /// Checks are ordered cheapest-first so malformed requests fail fast:
+    ///
+    /// 1. **Structural shape**: exactly one done-ledger row.
+    /// 2. **Done-ledger cross-field invariants** (e.g. status vs error code).
+    /// 3. **Batch referential integrity**: every occurrence references a
+    ///    finding present in the batch, and all rows share a single tenant.
+    /// 4. **Tenant / write-context consistency** across findings, occurrences,
+    ///    observations, and the done-ledger row.
+    /// 5. **Evidence chain** (scanned items only): every finding has an
+    ///    occurrence, every occurrence has an observation, and the distinct
+    ///    findings count matches the done-ledger's `findings_count` field.
     fn validate_request(request: &CommitRequest<'_>) -> Result<(), ResultCommitRequestError> {
         let write_context = request.write_context();
 
@@ -441,7 +454,7 @@ where
         }
 
         if done_ledger.status().is_scanned() {
-            let distinct_findings = validate_scanned_findings_chain(findings)?;
+            let distinct_findings = validate_scanned_chain_and_count(findings)?;
             let expected = done_ledger.findings_count();
             if expected != distinct_findings {
                 return Err(ResultCommitRequestError::FindingsCountMismatch {
@@ -461,8 +474,7 @@ where
     }
 }
 
-/// Validate the upward evidence chain required for scanned requests and return
-/// the distinct stable findings count.
+/// Validate the upward evidence chain and count distinct findings in one pass.
 ///
 /// Findings are version-independent, so scanned commits must prove that each
 /// finding is bound to the target item through an occurrence and then an
@@ -474,7 +486,7 @@ where
 /// Callers rely on `validate_referential_integrity` having run first: that
 /// guarantees every occurrence references a finding in the batch, so the
 /// occurrence-derived finding-ID set is exactly the distinct findings set.
-fn validate_scanned_findings_chain(
+fn validate_scanned_chain_and_count(
     findings: FindingsUpsertBatch<'_>,
 ) -> Result<u32, ResultCommitRequestError> {
     let finding_ids_with_occurrences: HashSet<_> = findings
@@ -482,6 +494,7 @@ fn validate_scanned_findings_chain(
         .iter()
         .map(|occ| occ.finding_id())
         .collect();
+
     for (index, finding) in findings.findings().iter().enumerate() {
         if !finding_ids_with_occurrences.contains(&finding.finding_id()) {
             return Err(ResultCommitRequestError::FindingWithoutOccurrence { index });

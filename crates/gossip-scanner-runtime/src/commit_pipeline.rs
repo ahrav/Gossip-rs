@@ -41,9 +41,9 @@
 //!   dequeue, so it exits even when cloned senders keep the submission
 //!   channel connected;
 //! - if a newly dequeued item is abandoned before durable commit, the worker
-//!   emits a [`CommitStageOutput::Failed`] with
-//!   [`ResultCommitError::Cancelled`] so consumers always receive exactly
-//!   one outcome per dequeued item;
+//!   attempts to emit a [`CommitStageOutput::Failed`] with
+//!   [`ResultCommitError::Cancelled`]; delivery is best-effort because the
+//!   outcome queue may be full or disconnected at cancellation time;
 //! - the worker still finishes the current in-flight item and attempts to
 //!   emit its outcome. If the outcome receiver has already been dropped,
 //!   for example during shutdown, the last outcome is silently discarded —
@@ -227,7 +227,7 @@ impl SubmitError {
 #[derive(Clone, Debug)]
 pub struct CommitPipelineSender {
     inner: SyncSender<QueuedCommit>,
-    pub(crate) cancel: CancellationToken,
+    cancel: CancellationToken,
 }
 
 impl CommitPipelineSender {
@@ -287,9 +287,24 @@ where
     F: FindingsSink,
     D: DoneLedger,
 {
-    sender: CommitPipelineSender,
+    sender: Option<CommitPipelineSender>,
+    outcomes: Option<Receiver<CommitStageOutput<F::Error, D::Error>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// Outcome-drain handle returned by [`CommitPipeline::split`].
+///
+/// This handle owns the outcome receiver and worker join handle but not the
+/// submission sender. Distributed runtimes use it to drain durable receipts
+/// concurrently while scan execution continues on another thread.
+pub struct CommitPipelineDrainer<F, D>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+{
     outcomes: Receiver<CommitStageOutput<F::Error, D::Error>>,
     worker: Option<JoinHandle<()>>,
+    cancel: CancellationToken,
 }
 
 impl<F, D> CommitPipeline<F, D>
@@ -325,11 +340,11 @@ where
             })?;
 
         Ok(Self {
-            sender: CommitPipelineSender {
+            sender: Some(CommitPipelineSender {
                 inner: submit_tx,
                 cancel,
-            },
-            outcomes: outcome_rx,
+            }),
+            outcomes: Some(outcome_rx),
             worker: Some(worker),
         })
     }
@@ -338,7 +353,34 @@ where
     #[inline]
     #[must_use]
     pub fn sender(&self) -> CommitPipelineSender {
-        self.sender.clone()
+        self.sender
+            .as_ref()
+            .expect("commit pipeline sender must exist until split or shutdown")
+            .clone()
+    }
+
+    /// Split the pipeline into an execution-side sender and an outcome drainer.
+    ///
+    /// Dropping the returned sender closes the submission channel once all of
+    /// its clones are gone, allowing the commit worker to exit naturally after
+    /// draining queued work. The returned drainer can receive outcomes and join
+    /// the worker thread without retaining an extra submission handle.
+    #[must_use = "both the sender and drainer must be used or explicitly dropped"]
+    pub fn split(mut self) -> (CommitPipelineSender, CommitPipelineDrainer<F, D>) {
+        let sender = self
+            .sender
+            .take()
+            .expect("commit pipeline sender must exist before split");
+        let outcomes = self
+            .outcomes
+            .take()
+            .expect("commit pipeline outcomes must exist before split");
+        let drainer = CommitPipelineDrainer {
+            outcomes,
+            worker: self.worker.take(),
+            cancel: sender.cancel.clone(),
+        };
+        (sender, drainer)
     }
 
     /// Receive the next commit-stage outcome, blocking until one arrives or the
@@ -350,7 +392,10 @@ where
     /// outcomes have been consumed.
     #[inline]
     pub fn recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, RecvError> {
-        self.outcomes.recv()
+        self.outcomes
+            .as_ref()
+            .expect("commit pipeline outcomes must exist until split or shutdown")
+            .recv()
     }
 
     /// Receive the next commit-stage outcome, blocking for at most `timeout`.
@@ -365,7 +410,10 @@ where
         &self,
         timeout: Duration,
     ) -> Result<CommitStageOutput<F::Error, D::Error>, RecvTimeoutError> {
-        self.outcomes.recv_timeout(timeout)
+        self.outcomes
+            .as_ref()
+            .expect("commit pipeline outcomes must exist until split or shutdown")
+            .recv_timeout(timeout)
     }
 
     /// Try to receive one commit-stage outcome without blocking.
@@ -377,7 +425,10 @@ where
     /// buffered outcomes have been consumed.
     #[inline]
     pub fn try_recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, TryRecvError> {
-        self.outcomes.try_recv()
+        self.outcomes
+            .as_ref()
+            .expect("commit pipeline outcomes must exist until split or shutdown")
+            .try_recv()
     }
 
     /// Shut the pipeline down and join the worker thread.
@@ -396,7 +447,9 @@ where
     /// completes. The worker always finishes the current in-flight commit
     /// before exiting.
     pub fn shutdown(mut self) -> thread::Result<()> {
-        self.sender.cancel.cancel();
+        if let Some(sender) = self.sender.as_ref() {
+            sender.cancel.cancel();
+        }
         let handle = self.worker.take();
         // Dropping `self` closes both channels, which unblocks the worker
         // if it is waiting on `recv_timeout()` or `send()`. `Drop::drop`
@@ -415,7 +468,9 @@ where
     D: DoneLedger,
 {
     fn drop(&mut self) {
-        self.sender.cancel.cancel();
+        if let Some(sender) = self.sender.as_ref() {
+            sender.cancel.cancel();
+        }
         if self.worker.is_some() {
             tracing::warn!("CommitPipeline dropped without shutdown; worker thread detached");
         }
@@ -427,11 +482,76 @@ where
     }
 }
 
+impl<F, D> CommitPipelineDrainer<F, D>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+{
+    /// Request cancellation of the underlying commit worker.
+    #[inline]
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Receive the next commit-stage outcome, blocking until one arrives or the
+    /// worker exits.
+    #[inline]
+    pub fn recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, RecvError> {
+        self.outcomes.recv()
+    }
+
+    /// Receive the next commit-stage outcome, blocking for at most `timeout`.
+    #[inline]
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<CommitStageOutput<F::Error, D::Error>, RecvTimeoutError> {
+        self.outcomes.recv_timeout(timeout)
+    }
+
+    /// Join the commit worker after outcome draining has finished.
+    pub fn join(mut self) -> thread::Result<()> {
+        match self.worker.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<F, D> Drop for CommitPipelineDrainer<F, D>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+{
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if self.worker.is_some() {
+            tracing::warn!(
+                "CommitPipelineDrainer dropped without join; commit worker thread detached"
+            );
+        }
+    }
+}
+
 /// How often the worker wakes from a blocking receive to check the
 /// cancellation token. Short enough that `shutdown()` completes promptly;
 /// long enough to avoid busy-spinning when the queue is idle.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Worker loop that dequeues [`QueuedCommit`] items and commits each through
+/// the [`ResultCommitter`], emitting one [`CommitStageOutput`] per item.
+///
+/// The loop exits on cancellation or channel closure. Between receives, it
+/// wakes every [`CANCEL_POLL_INTERVAL`] to check the cancellation token,
+/// bounding shutdown latency even when the submission channel is idle.
+///
+/// Invariant: every successfully dequeued item produces exactly one outcome
+/// on `outcome_tx` — either `Committed` or `Failed` — in the non-cancelled
+/// path (blocking `send`). During cancellation, the worker uses `try_send`
+/// for any in-flight or post-dequeue outcomes; if the outcome queue is full
+/// or disconnected, the outcome is silently dropped. Committed data remains
+/// durable in storage and checkpoint advancement resumes from the last
+/// durable checkpoint on restart.
 fn run_commit_stage<F, D>(
     committer: ResultCommitter<F, D>,
     submit_rx: Receiver<QueuedCommit>,
@@ -462,11 +582,19 @@ fn run_commit_stage<F, D>(
                 "commit-stage worker exiting: cancellation observed after dequeue, before commit"
             );
             let (write_context, completed_unit, _translation) = work.into_parts();
-            let _ = outcome_tx.try_send(CommitStageOutput::Failed {
-                write_context,
-                completed_unit,
-                error: ResultCommitError::Cancelled,
-            });
+            if outcome_tx
+                .try_send(CommitStageOutput::Failed {
+                    write_context,
+                    completed_unit,
+                    error: ResultCommitError::Cancelled,
+                })
+                .is_err()
+            {
+                tracing::warn!(
+                    "commit-stage: outcome delivery failed on cancellation; \
+                     queue full or disconnected"
+                );
+            }
             break;
         }
 
@@ -523,7 +651,12 @@ fn run_commit_stage<F, D>(
             // non-blocking — the data is already durable, so dropping the
             // outcome is safe. A blocking send here could stall shutdown
             // indefinitely if the outcome queue is full and nobody drains it.
-            let _ = outcome_tx.try_send(outcome);
+            if outcome_tx.try_send(outcome).is_err() {
+                tracing::warn!(
+                    "commit-stage: outcome delivery failed after commit; \
+                     queue full or disconnected"
+                );
+            }
             tracing::debug!("commit-stage worker exiting: cancellation observed after commit");
             break;
         }

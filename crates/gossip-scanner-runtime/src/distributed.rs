@@ -17,11 +17,11 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Error as AnyError, Result};
+use anyhow::{Error as AnyError, Result, anyhow};
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     identity::{LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, TenantSecretKey},
-    persistence::WriteContext,
+    persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
 };
 use scanner_scheduler::store::FsFindingRecord;
 
@@ -55,12 +55,19 @@ impl fmt::Display for PolicyMismatchError {
 impl std::error::Error for PolicyMismatchError {}
 
 use crate::{
-    ScanBudgets, ScanReport, ScanRuntimeError,
+    CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
+    build_runtime_engine,
+    checkpoint_aggregator::PrefixCheckpointAggregator,
     commit_model::CompletedUnit,
-    commit_pipeline::{CommitPipelineSender, QueuedCommit},
+    commit_pipeline::{
+        CommitPipeline, CommitPipelineConfig, CommitPipelineDrainer, CommitPipelineSender,
+        CommitStageOutput, QueuedCommit,
+    },
     commit_sink::{CommitSink, FindingsBatch, ItemMeta},
-    coordination_sink::{CommitProgressRecord, CoordinationEventRecorder},
+    coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink},
+    join_scoped,
     result_translation::{ItemResult, ScanTiming, translate_item_result},
+    scan_fs_with_prebuilt_engine,
 };
 
 /// Assignment payloads expose their policy scope so leases can assert that the
@@ -70,6 +77,16 @@ pub trait ShardLeaseAssignment {
     ///
     /// Implementations must return the same value for the lifetime of `self`.
     fn policy_hash(&self) -> PolicyHash;
+
+    /// Filesystem scan config carried by the assignment payload, if any.
+    ///
+    /// Distributed receipt-driven execution currently supports only filesystem
+    /// leases. Assignment types that do not represent a filesystem shard should
+    /// use the default `None` implementation.
+    #[must_use]
+    fn filesystem_scan_config(&self) -> Option<FsScanConfig> {
+        None
+    }
 }
 
 /// Lease payload consumed by the distributed runtime.
@@ -246,9 +263,9 @@ where
 pub struct DistributedRuntimeConfig {
     /// Scan execution budget controls applied to every shard assignment.
     pub budgets: ScanBudgets,
-    /// Capacity of the bounded execution-to-commit queue. Matches the
-    /// [`CommitPipelineConfig`](crate::commit_pipeline::CommitPipelineConfig)
-    /// default.
+    /// Capacity used for both the bounded execution-to-commit queue and the
+    /// commit-to-checkpoint outcome queue. Matches the
+    /// [`CommitPipelineConfig`] default.
     pub commit_queue_capacity: NonZeroUsize,
 }
 
@@ -315,6 +332,12 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 }
 
 /// One item that has begun scanning but has not yet been submitted to commit.
+///
+/// Accumulates findings through [`ReceiptCommitSink::upsert_findings`] until
+/// [`finish_item`](ReceiptCommitSink::finish_item) translates the accumulated
+/// state into a [`QueuedCommit`] and submits it to the pipeline. On
+/// translation or submission failure, the item is re-inserted into the
+/// in-flight map so the caller can retry.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct InFlightItem {
@@ -325,6 +348,9 @@ struct InFlightItem {
 }
 
 /// Ordered record of one item successfully handed to the commit pipeline.
+///
+/// Bookkeeping only — used by [`wait_for_submitted_commits`] to verify that
+/// every submitted sequence number produced a matching durable outcome.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SubmittedCommit {
@@ -394,6 +420,9 @@ impl ReceiptCommitSink {
         }
     }
 
+    /// Consume the sink and return the ordered list of successfully submitted
+    /// commits. Returns an error if any items remain in-flight (indicating a
+    /// protocol violation by the caller) or if a mutex is poisoned.
     fn finish(self) -> Result<Vec<SubmittedCommit>> {
         let in_flight = self
             .in_flight
@@ -415,6 +444,14 @@ impl ReceiptCommitSink {
         self.next_sequence_no.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Derive a pair of non-overlapping logical timestamps from a sequence number.
+    ///
+    /// Maps sequence `n` to `(2n, 2n+1)`, giving each item a unique
+    /// `[started, finished)` interval that never collides with another item's
+    /// interval. This is sufficient for the done-ledger provenance columns,
+    /// which only require monotonicity within a single shard.
+    ///
+    /// Returns `Err` when `2 * sequence_no` would overflow `u64`.
     fn logical_timing_for(sequence_no: u64) -> Result<ScanTiming> {
         let started = sequence_no.checked_mul(2).ok_or_else(|| {
             anyhow::anyhow!("sequence number overflow while deriving scan timing")
@@ -436,14 +473,16 @@ impl ReceiptCommitSink {
     /// `DurableCommitSink` where recorder errors are propagated because the
     /// recorder IS the durability path.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
-        let _ = self.recorder.record_commit_progress(
+        if let Err(e) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Begin {
                 write_context: self.write_context,
                 item_key: item_key.as_bytes().to_vec(),
                 size_hint: meta.size_hint,
             },
-        );
+        ) {
+            tracing::debug!(shard_id = %self.shard_id, %e, "record_begin telemetry failed");
+        }
     }
 
     /// Records a finish-progress event for telemetry.
@@ -454,15 +493,24 @@ impl ReceiptCommitSink {
     /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
     /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
-        let _ = self.recorder.record_commit_progress(
+        if let Err(e) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Finish {
                 write_context: self.write_context,
                 item_key: item_key.as_bytes().to_vec(),
             },
-        );
+        ) {
+            tracing::debug!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
+        }
     }
 
+    /// Reconstruct the deterministic translation inputs from an in-flight
+    /// item's accumulated state and produce a [`QueuedCommit`] ready for the
+    /// commit pipeline.
+    ///
+    /// When the item has no explicit `version`, a weak version derived from
+    /// the item key bytes is used. When the item key is valid UTF-8, a
+    /// display-only [`Location`] is attached for diagnostics.
     fn translate_in_flight(&self, item: &InFlightItem) -> Result<QueuedCommit> {
         let timing = Self::logical_timing_for(item.sequence_no)?;
         let bytes_scanned = item.meta.size_hint.unwrap_or(0);
@@ -554,7 +602,8 @@ impl CommitSink for ReceiptCommitSink {
         // Root-hint fields are unavailable through this bridge, so both
         // root_hint_start/end mirror span_start/end. This is safe because
         // root-hint fields never participate in persistence identity
-        // derivation (see result_translation.rs module docs).
+        // derivation (see the `Identity derivation` section in
+        // result_translation.rs).
         item.findings
             .extend(batch.findings.iter().map(|finding| FsFindingRecord {
                 rule_id: finding.rule_id,
@@ -573,9 +622,9 @@ impl CommitSink for ReceiptCommitSink {
         let key_bytes = item_key.as_bytes();
 
         // Remove the item under a short-lived lock. Translation and
-        // submission happen outside the critical section so concurrent
-        // begin_item / upsert_findings calls are not blocked by expensive
-        // work (crypto derivations, channel send).
+        // submission happen outside the critical section to minimize lock
+        // hold duration. The interior mutex satisfies `Send + Sync` bounds
+        // but the sink is driven by a single-threaded drain loop.
         let item = {
             let mut guard = self.in_flight.lock().map_err(|_| {
                 anyhow::anyhow!("receipt commit sink in-flight state lock poisoned")
@@ -591,10 +640,16 @@ impl CommitSink for ReceiptCommitSink {
             Err(err) => {
                 // Rollback: re-insert so the caller can retry. Recover
                 // through a poisoned mutex rather than losing the item.
-                self.in_flight
+                let overwritten = self
+                    .in_flight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key_bytes.to_vec(), item);
+                debug_assert!(
+                    overwritten.is_none(),
+                    "rollback re-insert overwrote a concurrent begin_item entry; \
+                     ReceiptCommitSink must be driven by a single-threaded drain loop"
+                );
                 return Err(err);
             }
         };
@@ -602,10 +657,16 @@ impl CommitSink for ReceiptCommitSink {
         if let Err(error) = self.submitter.submit(work) {
             // Rollback: re-insert so the caller can retry. Recover through
             // a poisoned mutex rather than silently losing the item.
-            self.in_flight
+            let overwritten = self
+                .in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key_bytes.to_vec(), item);
+            debug_assert!(
+                overwritten.is_none(),
+                "rollback re-insert overwrote a concurrent begin_item entry; \
+                 ReceiptCommitSink must be driven by a single-threaded drain loop"
+            );
             return Err(anyhow::anyhow!(
                 "execution to commit submission failed: {error}"
             ));
@@ -631,37 +692,402 @@ impl From<PolicyMismatchError> for DistributedRuntimeError {
     }
 }
 
+/// Accumulated state from draining the commit-stage outcome stream.
+///
+/// Produced by [`drain_commit_stage`] and consumed by
+/// [`run_filesystem_lease`] to build the checkpoint and verify that every
+/// submitted commit produced a durable outcome.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+struct CommitStageDrainResult {
+    /// Receipt aggregator that tracks the contiguous committed prefix.
+    aggregator: PrefixCheckpointAggregator,
+    /// Sequence numbers of committed items, in drain order (not necessarily
+    /// sorted). Compared against the submitted list by
+    /// [`wait_for_submitted_commits`].
+    committed_sequence_nos: Vec<u64>,
+}
+
+/// Drain commit-stage outcomes to completion while building the receipt-driven
+/// checkpoint prefix.
+///
+/// Any durable commit failure, receipt aggregation violation, or worker panic
+/// aborts the shard. The drainer cancels the worker before joining when the
+/// first such failure is observed so scan execution does not keep queuing work
+/// behind a broken durability path.
+///
+/// # Cancellation and outcome delivery
+///
+/// After `drainer.cancel()`, the commit worker uses `try_send` for any
+/// in-progress or post-commit outcomes. If the outcome queue is full or
+/// disconnected at that moment, the outcome is silently dropped. This is safe
+/// because `drain_error` is always set before `drainer.cancel()` is called,
+/// so the function returns the original error without reaching the downstream
+/// sequence-number cross-check. If external cancellation were introduced,
+/// callers would need to distinguish cancellation-induced outcome gaps from
+/// genuine durability failures.
+#[cfg_attr(not(test), allow(dead_code))]
+fn drain_commit_stage<F, D>(
+    drainer: CommitPipelineDrainer<F, D>,
+    write_context: WriteContext,
+    max_buffered: usize,
+) -> Result<CommitStageDrainResult>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+    F::Error: std::error::Error + Send + Sync + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    // The aggregator's receipt buffer must not share the channel-backpressure
+    // limit: the drain model buffers ALL committed receipts before a single
+    // checkpoint is prepared (no intermediate `acknowledge_checkpoint` calls).
+    // Use an uncapped limit; actual memory is bounded by the number of items
+    // the shard produces, which is always finite.
+    let mut aggregator = PrefixCheckpointAggregator::new(write_context, 0, usize::MAX);
+    let mut committed_sequence_nos = Vec::with_capacity(max_buffered);
+    let mut drain_error = None;
+
+    loop {
+        match drainer.recv() {
+            Ok(CommitStageOutput::Committed {
+                checkpoint_input, ..
+            }) => {
+                if drain_error.is_none() {
+                    let sequence_no = checkpoint_input.receipt().completed_unit().sequence_no();
+                    match aggregator.record_receipt(checkpoint_input) {
+                        Ok(_) => committed_sequence_nos.push(sequence_no),
+                        Err(error) => {
+                            drain_error = Some(anyhow!("receipt aggregation failed: {error}"));
+                            drainer.cancel();
+                        }
+                    }
+                }
+            }
+            Ok(CommitStageOutput::Failed {
+                completed_unit,
+                error,
+                ..
+            }) => {
+                if drain_error.is_none() {
+                    drain_error = Some(anyhow!(
+                        "durable commit failed for sequence {}: {error}",
+                        completed_unit.sequence_no()
+                    ));
+                    drainer.cancel();
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    drainer
+        .join()
+        .map_err(|_| anyhow!("receipt commit worker thread panicked"))?;
+
+    if let Some(error) = drain_error {
+        return Err(error);
+    }
+
+    Ok(CommitStageDrainResult {
+        aggregator,
+        committed_sequence_nos,
+    })
+}
+
+/// Verify that every submitted commit sequence produced one durable outcome.
+///
+/// The local commit pipeline exposes an outcome stream rather than per-item
+/// completion handles, so this helper matches submitted sequence numbers
+/// against the committed sequence numbers drained from that stream.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wait_for_submitted_commits(
+    mut submitted: Vec<SubmittedCommit>,
+    mut committed_sequence_nos: Vec<u64>,
+) -> Result<()> {
+    submitted.sort_by_key(SubmittedCommit::sequence_no);
+    committed_sequence_nos.sort_unstable();
+
+    // Reject duplicate sequence numbers — structurally impossible today
+    // (atomic counter + aggregator rejection), but a cheap defense-in-depth
+    // guard against future regressions.
+    if let Some(dup) = submitted
+        .windows(2)
+        .find_map(|w| (w[0].sequence_no() == w[1].sequence_no()).then_some(w[0].sequence_no()))
+    {
+        return Err(anyhow!("duplicate submitted sequence number {dup}"));
+    }
+    if let Some(dup) = committed_sequence_nos
+        .windows(2)
+        .find_map(|w| (w[0] == w[1]).then_some(w[0]))
+    {
+        return Err(anyhow!("duplicate committed sequence number {dup}"));
+    }
+
+    if submitted.len() != committed_sequence_nos.len() {
+        return Err(anyhow!(
+            "submitted {} commit(s) but commit stage produced {} durable outcome(s)",
+            submitted.len(),
+            committed_sequence_nos.len()
+        ));
+    }
+
+    for (expected, actual) in submitted
+        .into_iter()
+        .map(|entry| entry.sequence_no())
+        .zip(committed_sequence_nos.into_iter())
+    {
+        if expected != actual {
+            return Err(anyhow!(
+                "submitted commit sequence {} did not match durable outcome sequence {}",
+                expected,
+                actual
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Derive the logical time used when acknowledging a prepared checkpoint.
+///
+/// Returns `last_sequence_no + 1`, placing the checkpoint acknowledgment
+/// strictly after the last committed item's sequence number. The raw value
+/// passed to `LogicalTime::from_raw` is derived from the sequence-number
+/// domain, intentionally distinct from the `(2n, 2n+1)` logical-time
+/// mapping used by `ReceiptCommitSink`.
+///
+/// # Errors
+///
+/// Returns an error if `last_sequence_no` is `u64::MAX` (no room for +1).
+#[cfg_attr(not(test), allow(dead_code))]
+#[inline]
+fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
+    last_sequence_no
+        .checked_add(1)
+        .map(LogicalTime::from_raw)
+        .ok_or_else(|| anyhow!("checkpoint logical time overflow: last_sequence_no is u64::MAX"))
+}
+
+/// Execute one filesystem lease under the receipt-driven durability model.
+///
+/// The scan path runs with finding persistence enabled and a single execution
+/// worker so `ReceiptCommitSink` sequence assignment remains deterministic.
+/// The shard completes only after every submitted item has produced a durable
+/// commit outcome and the resulting committed prefix has been checkpointed.
+///
+/// # Completion protocol
+///
+/// 1. Scan execution and commit-stage drain run concurrently on scoped threads.
+/// 2. After both finish, the submitted vs committed sequence lists are compared.
+/// 3. The aggregator prepares a checkpoint prefix from the committed receipts.
+/// 4. `complete_shard` persists the checkpoint cursor with the coordinator.
+/// 5. The checkpoint is acknowledged, advancing the aggregator's watermark.
+/// 6. `mark_shard_done` records the shard as complete in the done-ledger.
+///
+/// If any step fails, the shard is not marked done and will be retried.
+#[cfg_attr(not(test), allow(dead_code))]
+fn run_filesystem_lease<A, F, D>(
+    coordinator: &dyn DistributedCoordinator<A>,
+    recorder: Arc<dyn CoordinationEventRecorder>,
+    persistence: &DistributedPersistence<F, D>,
+    lease: &ShardLease<A>,
+    config: DistributedRuntimeConfig,
+) -> Result<(), DistributedRuntimeError>
+where
+    A: ShardLeaseAssignment,
+    F: FindingsSink + Clone + Send + Sync + 'static,
+    D: DoneLedger + Clone + Send + Sync + 'static,
+    F::Error: std::error::Error + Send + Sync + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    config.budgets.validate()?;
+
+    let scan_config = lease
+        .assignment()
+        .filesystem_scan_config()
+        .ok_or_else(|| {
+            DistributedRuntimeError::Coordinator(anyhow!(
+                "shard '{}' lease assignment does not carry a filesystem scan config",
+                lease.shard_id()
+            ))
+        })?
+        .with_workers(1)
+        .with_budgets(config.budgets)
+        .with_persist_findings(true);
+
+    // Relaxed ordering on ReceiptCommitSink::next_sequence_no is sound only
+    // when exactly one scan worker thread exists. Hard assert rather than
+    // debug_assert: this is a soundness invariant that must hold in release
+    // builds, and the cost (one integer comparison per shard) is negligible.
+    assert_eq!(
+        scan_config.workers, 1,
+        "receipt-driven execution requires single-threaded scanning"
+    );
+
+    let engine = build_runtime_engine(
+        scan_config.rules_file.as_deref(),
+        &scan_config.transform_filter,
+        scan_config.decode_depth,
+        scan_config.anchor_mode,
+    )?;
+    let rule_fingerprint = {
+        let engine = Arc::clone(&engine);
+        Arc::new(move |rule_id| RuleFingerprint::from_bytes(engine.rule_fingerprint_bytes(rule_id)))
+            as Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>
+    };
+
+    let sink = CoordinationEventSink::new(recorder.clone(), Arc::from(lease.shard_id()));
+    let cancel = CancellationToken::new();
+    let pipeline = CommitPipeline::start(
+        persistence.findings_sink.clone(),
+        persistence.done_ledger.clone(),
+        CommitPipelineConfig {
+            execution_queue_capacity: config.commit_queue_capacity.get(),
+            outcome_queue_capacity: config.commit_queue_capacity.get(),
+        },
+        cancel.clone(),
+    )
+    .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
+    let (submitter, drainer) = pipeline.split();
+    let commit = ReceiptCommitSink::new(
+        recorder,
+        Arc::from(lease.shard_id()),
+        lease.write_context(),
+        lease.tenant_secret_key(),
+        rule_fingerprint,
+        submitter,
+    );
+
+    let (outcome, submitted, stage_result) = std::thread::scope(|scope| {
+        let write_context = lease.write_context();
+        let max_buffered = config.commit_queue_capacity.get();
+        let stage_handle =
+            scope.spawn(move || drain_commit_stage(drainer, write_context, max_buffered));
+
+        let outcome = scan_fs_with_prebuilt_engine(&scan_config, engine, &sink, &commit, &cancel);
+        let submitted = commit.finish();
+        let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread");
+
+        (outcome, submitted, stage_result)
+    });
+
+    // Prefer durability errors: when the drain stage fails and cancels the
+    // pipeline, the scan typically sees a downstream "pipeline cancelled"
+    // Runtime error. Evaluating the drain result first exposes the root cause
+    // instead of the cancellation symptom.
+    let CommitStageDrainResult {
+        mut aggregator,
+        committed_sequence_nos,
+    } = stage_result
+        .map_err(DistributedRuntimeError::Durability)?
+        .map_err(DistributedRuntimeError::Durability)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
+    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+
+    let committed_units = committed_sequence_nos.len() as u64;
+
+    // Shards with zero durable commit units (empty directories or directories
+    // where no file produced findings) complete without a checkpoint cursor
+    // because no receipt-derived cursor position exists.
+    // Guard early to avoid calling prepare_checkpoint on an empty aggregator.
+    if committed_units == 0 {
+        coordinator
+            .complete_shard(lease, None, outcome.report)
+            .map_err(DistributedRuntimeError::Coordinator)?;
+        coordinator
+            .mark_shard_done(lease)
+            .map_err(DistributedRuntimeError::Coordinator)?;
+        return Ok(());
+    }
+
+    // Files without findings never reach the commit pipeline (the scanner's
+    // emit_persistence_batch early-returns), so `submitted.len()` can be less
+    // than items_scanned.
+    wait_for_submitted_commits(submitted, committed_sequence_nos)
+        .map_err(DistributedRuntimeError::Durability)?;
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
+
+    let pending = pending.ok_or_else(|| {
+        DistributedRuntimeError::Durability(anyhow!(
+            "filesystem shard '{}' committed {} unit(s) but no receipt-driven checkpoint prefix was prepared",
+            lease.shard_id(),
+            committed_units
+        ))
+    })?;
+    if pending.committed_units() != committed_units {
+        return Err(DistributedRuntimeError::Durability(anyhow!(
+            "filesystem shard '{}' prepared checkpoint for {} unit(s), expected {}",
+            lease.shard_id(),
+            pending.committed_units(),
+            committed_units
+        )));
+    }
+
+    coordinator
+        .complete_shard(
+            lease,
+            Some(pending.checkpoint_cursor().clone()),
+            outcome.report,
+        )
+        .map_err(DistributedRuntimeError::Coordinator)?;
+
+    let checkpoint_receipt = CheckpointCommitReceipt::new(
+        pending.scope().clone(),
+        checkpoint_logical_time(pending.last_sequence_no())
+            .map_err(DistributedRuntimeError::Durability)?,
+    );
+    aggregator
+        .acknowledge_checkpoint(checkpoint_receipt)
+        .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
+
+    coordinator
+        .mark_shard_done(lease)
+        .map_err(DistributedRuntimeError::Coordinator)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::fs;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
     use gossip_contracts::{
-        connector::ItemKey,
+        connector::{Cursor, ItemKey},
         identity::{
             FenceEpoch, PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId,
             TenantSecretKey, derive_rule_fingerprint,
         },
-        persistence::WriteContext,
+        persistence::{DoneLedgerStatus, WriteContext},
     };
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
+    use tempfile::tempdir;
 
     use crate::{
         CancellationToken, OwnedCoreEvent,
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
-        coordination_sink::{CommitProgressRecord, StoredGitEvent},
+        coordination_sink::{CommitProgressRecord, IdentityChainRecord, StoredGitEvent},
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct StubAssignment {
         policy_hash: PolicyHash,
+        filesystem_scan_config: Option<FsScanConfig>,
     }
 
     impl ShardLeaseAssignment for StubAssignment {
         fn policy_hash(&self) -> PolicyHash {
             self.policy_hash
+        }
+
+        fn filesystem_scan_config(&self) -> Option<FsScanConfig> {
+            self.filesystem_scan_config.clone()
         }
     }
 
@@ -674,6 +1100,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         progress: Mutex<Vec<CommitProgressRecord>>,
+        identity: Mutex<Vec<IdentityChainRecord>>,
     }
 
     impl CoordinationEventRecorder for Recorder {
@@ -697,9 +1124,102 @@ mod tests {
         fn record_identity_chain(
             &self,
             _shard_id: &str,
-            _record: crate::coordination_sink::IdentityChainRecord,
+            record: crate::coordination_sink::IdentityChainRecord,
         ) -> Result<()> {
+            self.identity.lock().expect("identity lock").push(record);
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CompletedShard {
+        shard_id: String,
+        checkpoint: Option<Cursor>,
+        report: ScanReport,
+    }
+
+    #[derive(Default)]
+    struct TestCoordinatorState {
+        completed: Vec<CompletedShard>,
+        released: Vec<String>,
+        done: HashSet<String>,
+        done_mark_contexts: Vec<WriteContext>,
+    }
+
+    #[derive(Clone, Default)]
+    struct TestCoordinator {
+        recorder: Arc<Recorder>,
+        state: Arc<Mutex<TestCoordinatorState>>,
+    }
+
+    impl TestCoordinator {
+        fn completed_shards(&self) -> Vec<CompletedShard> {
+            self.state.lock().expect("state lock").completed.clone()
+        }
+
+        fn done_set(&self) -> HashSet<String> {
+            self.state.lock().expect("state lock").done.clone()
+        }
+
+        fn done_mark_contexts(&self) -> Vec<WriteContext> {
+            self.state
+                .lock()
+                .expect("state lock")
+                .done_mark_contexts
+                .clone()
+        }
+    }
+
+    impl DistributedCoordinator<StubAssignment> for TestCoordinator {
+        fn acquire_shard(&self) -> Result<Option<ShardLease<StubAssignment>>> {
+            Ok(None)
+        }
+
+        fn release_shard(&self, lease: &ShardLease<StubAssignment>) -> Result<()> {
+            self.state
+                .lock()
+                .expect("state lock")
+                .released
+                .push(lease.shard_id().to_owned());
+            Ok(())
+        }
+
+        fn complete_shard(
+            &self,
+            lease: &ShardLease<StubAssignment>,
+            checkpoint: Option<Cursor>,
+            report: ScanReport,
+        ) -> Result<()> {
+            self.state
+                .lock()
+                .expect("state lock")
+                .completed
+                .push(CompletedShard {
+                    shard_id: lease.shard_id().to_owned(),
+                    checkpoint,
+                    report,
+                });
+            Ok(())
+        }
+
+        fn is_shard_done(&self, lease: &ShardLease<StubAssignment>) -> Result<bool> {
+            Ok(self
+                .state
+                .lock()
+                .expect("state lock")
+                .done
+                .contains(lease.shard_id()))
+        }
+
+        fn mark_shard_done(&self, lease: &ShardLease<StubAssignment>) -> Result<()> {
+            let mut guard = self.state.lock().expect("state lock");
+            guard.done.insert(lease.shard_id().to_owned());
+            guard.done_mark_contexts.push(lease.write_context());
+            Ok(())
+        }
+
+        fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
+            self.recorder.clone()
         }
     }
 
@@ -744,6 +1264,32 @@ mod tests {
         }
     }
 
+    fn filesystem_assignment(path: &std::path::Path) -> StubAssignment {
+        StubAssignment {
+            policy_hash: write_context().policy_hash(),
+            filesystem_scan_config: Some(FsScanConfig::new(path)),
+        }
+    }
+
+    /// Build a secret-shaped test fixture from non-secret fragments.
+    ///
+    /// The assembled string matches gitleaks' generic-api-key rule at scan
+    /// time, but keeping the fragments separate avoids committing a literal
+    /// that trips secret-detection CI on the source file itself.
+    fn secret_fixture() -> String {
+        ["password=", "xK9mP2qL7wN4vR8t"].concat()
+    }
+
+    fn filesystem_lease(shard_id: &str, path: &std::path::Path) -> ShardLease<StubAssignment> {
+        ShardLease::new(
+            Arc::from(shard_id),
+            filesystem_assignment(path),
+            write_context(),
+            tenant_secret_key(),
+        )
+        .expect("filesystem lease")
+    }
+
     fn make_receipt_sink() -> (
         CommitPipeline<InMemoryFindingsSink, InMemoryDoneLedger>,
         ReceiptCommitSink,
@@ -783,6 +1329,7 @@ mod tests {
         );
         let assignment = StubAssignment {
             policy_hash: write_context.policy_hash(),
+            filesystem_scan_config: None,
         };
         let lease = ShardLease::new(
             Arc::from("shard-a"),
@@ -812,6 +1359,7 @@ mod tests {
         );
         let assignment = StubAssignment {
             policy_hash: PolicyHash::from_bytes([0xFF; 32]),
+            filesystem_scan_config: None,
         };
 
         let err = ShardLease::new(
@@ -917,6 +1465,72 @@ mod tests {
             shards_skipped_done: 3,
         };
         assert!(nonzero.shards_scanned + nonzero.shards_skipped_done <= nonzero.leases_seen);
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_accepts_matching_sequences_out_of_order() {
+        let submitted = vec![
+            SubmittedCommit { sequence_no: 2 },
+            SubmittedCommit { sequence_no: 0 },
+            SubmittedCommit { sequence_no: 1 },
+        ];
+
+        wait_for_submitted_commits(submitted, vec![1, 2, 0]).expect("matching sequences");
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_mismatched_sequences() {
+        let submitted = vec![
+            SubmittedCommit { sequence_no: 0 },
+            SubmittedCommit { sequence_no: 1 },
+        ];
+        let err = wait_for_submitted_commits(submitted, vec![0, 2])
+            .expect_err("mismatched sequences should fail");
+
+        assert!(
+            err.to_string()
+                .contains("did not match durable outcome sequence"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_duplicate_submitted_sequences() {
+        let submitted = vec![
+            SubmittedCommit { sequence_no: 0 },
+            SubmittedCommit { sequence_no: 1 },
+            SubmittedCommit { sequence_no: 1 },
+        ];
+        let err = wait_for_submitted_commits(submitted, vec![0, 1, 1])
+            .expect_err("duplicate submitted sequences should fail");
+
+        assert!(
+            err.to_string()
+                .contains("duplicate submitted sequence number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_duplicate_committed_sequences() {
+        let submitted = vec![
+            SubmittedCommit { sequence_no: 0 },
+            SubmittedCommit { sequence_no: 1 },
+            SubmittedCommit { sequence_no: 2 },
+        ];
+        let err = wait_for_submitted_commits(submitted, vec![0, 2, 2])
+            .expect_err("duplicate committed sequences should fail");
+
+        assert!(
+            err.to_string()
+                .contains("duplicate committed sequence number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_logical_time_overflows_at_u64_max() {
+        assert!(checkpoint_logical_time(u64::MAX).is_err());
     }
 
     #[test]
@@ -1373,5 +1987,248 @@ mod tests {
             sink.submitted.lock().expect("submitted lock").is_empty(),
             "submitted must be empty after submit failure"
         );
+    }
+
+    #[test]
+    fn run_filesystem_lease_persists_checkpoint_and_marks_done() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = TestCoordinator::default();
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+        let lease = filesystem_lease("shard-fs", dir.path());
+
+        run_filesystem_lease(
+            &coordinator,
+            coordinator.event_recorder(),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("filesystem lease should succeed");
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].shard_id, "shard-fs");
+        assert!(
+            completed[0].report.items_scanned >= 1,
+            "scan report should record the scanned file"
+        );
+        let checkpoint = completed[0]
+            .checkpoint
+            .as_ref()
+            .expect("non-empty shard should checkpoint");
+        assert!(
+            checkpoint.last_key().is_some(),
+            "receipt-driven checkpoint should carry a progress key"
+        );
+        assert!(
+            checkpoint.token().is_none(),
+            "receipt-driven checkpoint should be tokenless"
+        );
+
+        assert!(coordinator.done_set().contains("shard-fs"));
+        assert_eq!(coordinator.done_mark_contexts(), vec![write_context()]);
+
+        let observations = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot");
+        assert!(
+            !observations.is_empty(),
+            "durable findings observations should be present"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one scanned file should produce one done row"
+        );
+        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
+        assert_eq!(rows[0].write_context(), write_context());
+    }
+
+    #[test]
+    fn run_filesystem_lease_zero_item_shard_completes_without_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        let coordinator = TestCoordinator::default();
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink, done_ledger.clone());
+        let lease = filesystem_lease("shard-empty", dir.path());
+
+        run_filesystem_lease(
+            &coordinator,
+            coordinator.event_recorder(),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("empty filesystem shard should succeed");
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].shard_id, "shard-empty");
+        assert_eq!(
+            completed[0].report.items_scanned, 0,
+            "empty directory should scan zero items"
+        );
+        assert!(
+            completed[0].checkpoint.is_none(),
+            "zero-item shard must complete without a checkpoint"
+        );
+        assert!(coordinator.done_set().contains("shard-empty"));
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "zero-item shard should not emit done-ledger rows"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_commit_failure_prevents_completion_and_done_mark() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = TestCoordinator::default();
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        done_ledger
+            .fail_next_commits(1)
+            .expect("inject done-ledger commit failure");
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+        let lease = filesystem_lease("shard-fail", dir.path());
+
+        let error = run_filesystem_lease(
+            &coordinator,
+            coordinator.event_recorder(),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("commit failure should abort shard completion");
+
+        assert!(
+            error.to_string().contains("durable commit failed")
+                || error.to_string().contains("done-ledger durability failed"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            coordinator.completed_shards().is_empty(),
+            "checkpoint must not be recorded without a durable receipt"
+        );
+        assert!(
+            !coordinator.done_set().contains("shard-fail"),
+            "shard must not be marked done after durability failure"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "done-ledger rows must remain absent after commit failure"
+        );
+        assert!(
+            !findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "findings may still be durable before the done-ledger failure"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_rejects_assignment_without_filesystem_config() {
+        let coordinator = TestCoordinator::default();
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
+        let lease = ShardLease::new(
+            Arc::from("shard-missing-config"),
+            StubAssignment {
+                policy_hash: write_context().policy_hash(),
+                filesystem_scan_config: None,
+            },
+            write_context(),
+            tenant_secret_key(),
+        )
+        .expect("lease");
+
+        let error = run_filesystem_lease(
+            &coordinator,
+            coordinator.event_recorder(),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("missing filesystem config should be rejected");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "missing filesystem config is a lease/coordinator contract error"
+        );
+        assert!(coordinator.completed_shards().is_empty());
+        assert!(!coordinator.done_set().contains("shard-missing-config"));
+    }
+
+    #[test]
+    fn run_filesystem_lease_succeeds_with_mixed_finding_and_clean_files() {
+        let dir = tempdir().expect("tempdir");
+        // File with a detectable secret — will produce findings and enter the
+        // commit pipeline.
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write secret fixture");
+        // Clean file — no findings, so the scanner's emit_persistence_batch
+        // early-returns and this file never enters the commit pipeline.
+        fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
+            .expect("write clean fixture");
+
+        let coordinator = TestCoordinator::default();
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+        let lease = filesystem_lease("shard-mixed", dir.path());
+
+        run_filesystem_lease(
+            &coordinator,
+            coordinator.event_recorder(),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("mixed shard with clean files should succeed");
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].shard_id, "shard-mixed");
+
+        let checkpoint = completed[0]
+            .checkpoint
+            .as_ref()
+            .expect("non-empty shard should checkpoint");
+        assert!(
+            checkpoint.last_key().is_some(),
+            "receipt-driven checkpoint should carry a progress key"
+        );
+
+        assert!(coordinator.done_set().contains("shard-mixed"));
+
+        let observations = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot");
+        assert!(
+            !observations.is_empty(),
+            "durable findings observations should be present for the secret file"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the file with findings should produce a done-ledger row"
+        );
+        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
     }
 }
