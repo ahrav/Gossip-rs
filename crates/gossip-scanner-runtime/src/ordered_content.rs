@@ -10,8 +10,8 @@
 //! `scan_local_filesystem` uses [`std::thread::scope`] to spawn two forwarder
 //! threads:
 //!
-//! 1. **Event forwarder** — drains core events (findings, progress, summary)
-//!    from the scan workers into the caller's [`EventOutput`] sink.
+//! 1. **Event forwarder** — drains core events (findings, progress, summary,
+//!    diagnostics) from the scan workers into the caller's [`EventOutput`] sink.
 //! 2. **Commit forwarder** — drains persistence batches into the caller's
 //!    [`CommitSink`](crate::commit_sink::CommitSink) (a no-op sink for CLI
 //!    scans, a durable sink for distributed scans).
@@ -106,6 +106,11 @@ pub(crate) fn scan_local_filesystem(
 ///
 /// Distributed execution uses this to share one engine instance between the
 /// scan workers and the receipt commit sink's rule-fingerprint lookup.
+///
+/// Returns early with a default (zero-count) report if cancellation has
+/// already been requested. Otherwise spawns two scoped forwarder threads
+/// (event and commit), runs the parallel scanner, and joins both forwarders
+/// before returning.
 pub(crate) fn scan_local_filesystem_with_engine(
     config: &FsScanConfig,
     canonical_path: PathBuf,

@@ -41,9 +41,9 @@
 //!   dequeue, so it exits even when cloned senders keep the submission
 //!   channel connected;
 //! - if a newly dequeued item is abandoned before durable commit, the worker
-//!   emits a [`CommitStageOutput::Failed`] with
-//!   [`ResultCommitError::Cancelled`] so consumers always receive exactly
-//!   one outcome per dequeued item;
+//!   attempts to emit a [`CommitStageOutput::Failed`] with
+//!   [`ResultCommitError::Cancelled`]; delivery is best-effort because the
+//!   outcome queue may be full or disconnected at cancellation time;
 //! - the worker still finishes the current in-flight item and attempts to
 //!   emit its outcome. If the outcome receiver has already been dropped,
 //!   for example during shutdown, the last outcome is silently discarded —
@@ -544,6 +544,17 @@ where
 /// long enough to avoid busy-spinning when the queue is idle.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Worker loop that dequeues [`QueuedCommit`] items and commits each through
+/// the [`ResultCommitter`], emitting one [`CommitStageOutput`] per item.
+///
+/// The loop exits on cancellation or channel closure. Between receives, it
+/// wakes every [`CANCEL_POLL_INTERVAL`] to check the cancellation token,
+/// bounding shutdown latency even when the submission channel is idle.
+///
+/// Invariant: every successfully dequeued item produces exactly one outcome
+/// on `outcome_tx` — either `Committed` or `Failed`. If the outcome channel
+/// is disconnected (e.g. during shutdown), the last outcome may be silently
+/// dropped; committed data remains durable in storage.
 fn run_commit_stage<F, D>(
     committer: ResultCommitter<F, D>,
     submit_rx: Receiver<QueuedCommit>,

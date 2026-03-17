@@ -998,8 +998,10 @@ impl GitEventOutput for ChannelEventOutput {
 
 /// Drain the event channel and replay each event into `out`.
 ///
-/// Runs on a scoped forwarder thread. Exits when the channel is closed
-/// (all senders dropped), then flushes the output sink.
+/// Runs on a scoped forwarder thread spawned by the git scan path. Exits
+/// when the channel is closed (all senders dropped), then flushes the output
+/// sink. Both core and git event variants are replayed so a single channel
+/// can carry the full event stream.
 pub(crate) fn forward_git_events(out: &dyn GitEventOutput, rx: Receiver<OwnedDriverEvent>) {
     while let Ok(event) = rx.recv() {
         match event {
@@ -1348,6 +1350,11 @@ impl OwnedCoreEvent {
         }
     }
 
+    /// Replay this owned event into a borrowed [`EventOutput`] sink.
+    ///
+    /// Reconstructs the original borrowed `CoreEvent<'_>` from owned fields
+    /// and emits it. This is the second half of the channel-based forwarding
+    /// pattern: `from_core` on the producer side, `emit_into` on the consumer.
     fn emit_into(&self, out: &dyn EventOutput) {
         match self {
             Self::Finding {
@@ -1538,6 +1545,7 @@ impl OwnedGitEvent {
         }
     }
 
+    /// Replay this owned git event into a borrowed [`GitEventOutput`] sink.
     fn emit_into(&self, out: &dyn GitEventOutput) {
         match self {
             Self::CommitMeta {

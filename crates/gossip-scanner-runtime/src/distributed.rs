@@ -263,7 +263,8 @@ where
 pub struct DistributedRuntimeConfig {
     /// Scan execution budget controls applied to every shard assignment.
     pub budgets: ScanBudgets,
-    /// Capacity of the bounded execution-to-commit queue. Matches the
+    /// Capacity used for both the bounded execution-to-commit queue and the
+    /// commit-to-checkpoint outcome queue. Matches the
     /// [`CommitPipelineConfig`] default.
     pub commit_queue_capacity: NonZeroUsize,
 }
@@ -331,6 +332,12 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 }
 
 /// One item that has begun scanning but has not yet been submitted to commit.
+///
+/// Accumulates findings through [`ReceiptCommitSink::upsert_findings`] until
+/// [`finish_item`](ReceiptCommitSink::finish_item) translates the accumulated
+/// state into a [`QueuedCommit`] and submits it to the pipeline. On
+/// translation or submission failure, the item is re-inserted into the
+/// in-flight map so the caller can retry.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct InFlightItem {
@@ -341,6 +348,9 @@ struct InFlightItem {
 }
 
 /// Ordered record of one item successfully handed to the commit pipeline.
+///
+/// Bookkeeping only — used by [`wait_for_submitted_commits`] to verify that
+/// every submitted sequence number produced a matching durable outcome.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SubmittedCommit {
@@ -410,6 +420,9 @@ impl ReceiptCommitSink {
         }
     }
 
+    /// Consume the sink and return the ordered list of successfully submitted
+    /// commits. Returns an error if any items remain in-flight (indicating a
+    /// protocol violation by the caller) or if a mutex is poisoned.
     fn finish(self) -> Result<Vec<SubmittedCommit>> {
         let in_flight = self
             .in_flight
@@ -431,6 +444,14 @@ impl ReceiptCommitSink {
         self.next_sequence_no.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Derive a pair of non-overlapping logical timestamps from a sequence number.
+    ///
+    /// Maps sequence `n` to `(2n, 2n+1)`, giving each item a unique
+    /// `[started, finished)` interval that never collides with another item's
+    /// interval. This is sufficient for the done-ledger provenance columns,
+    /// which only require monotonicity within a single shard.
+    ///
+    /// Returns `Err` when `2 * sequence_no` would overflow `u64`.
     fn logical_timing_for(sequence_no: u64) -> Result<ScanTiming> {
         let started = sequence_no.checked_mul(2).ok_or_else(|| {
             anyhow::anyhow!("sequence number overflow while deriving scan timing")
@@ -479,6 +500,13 @@ impl ReceiptCommitSink {
         );
     }
 
+    /// Reconstruct the deterministic translation inputs from an in-flight
+    /// item's accumulated state and produce a [`QueuedCommit`] ready for the
+    /// commit pipeline.
+    ///
+    /// When the item has no explicit `version`, a weak version derived from
+    /// the item key bytes is used. When the item key is valid UTF-8, a
+    /// display-only [`Location`] is attached for diagnostics.
     fn translate_in_flight(&self, item: &InFlightItem) -> Result<QueuedCommit> {
         let timing = Self::logical_timing_for(item.sequence_no)?;
         let bytes_scanned = item.meta.size_hint.unwrap_or(0);
@@ -607,10 +635,16 @@ impl CommitSink for ReceiptCommitSink {
             Err(err) => {
                 // Rollback: re-insert so the caller can retry. Recover
                 // through a poisoned mutex rather than losing the item.
-                self.in_flight
+                let overwritten = self
+                    .in_flight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key_bytes.to_vec(), item);
+                debug_assert!(
+                    overwritten.is_none(),
+                    "rollback re-insert overwrote a concurrent begin_item entry; \
+                     ReceiptCommitSink must be driven by a single-threaded drain loop"
+                );
                 return Err(err);
             }
         };
@@ -618,10 +652,16 @@ impl CommitSink for ReceiptCommitSink {
         if let Err(error) = self.submitter.submit(work) {
             // Rollback: re-insert so the caller can retry. Recover through
             // a poisoned mutex rather than silently losing the item.
-            self.in_flight
+            let overwritten = self
+                .in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key_bytes.to_vec(), item);
+            debug_assert!(
+                overwritten.is_none(),
+                "rollback re-insert overwrote a concurrent begin_item entry; \
+                 ReceiptCommitSink must be driven by a single-threaded drain loop"
+            );
             return Err(anyhow::anyhow!(
                 "execution to commit submission failed: {error}"
             ));
@@ -647,11 +687,21 @@ impl From<PolicyMismatchError> for DistributedRuntimeError {
     }
 }
 
+/// Accumulated state from draining the commit-stage outcome stream.
+///
+/// Produced by [`drain_commit_stage`] and consumed by
+/// [`run_filesystem_lease`] to build the checkpoint and verify that every
+/// submitted commit produced a durable outcome.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct CommitStageDrainResult {
+    /// Receipt aggregator that tracks the contiguous committed prefix.
     aggregator: PrefixCheckpointAggregator,
+    /// Count of successfully committed items (receipt aggregation succeeded).
     processed: u64,
+    /// Sequence numbers of committed items, in drain order (not necessarily
+    /// sorted). Compared against the submitted list by
+    /// [`wait_for_submitted_commits`].
     committed_sequence_nos: Vec<u64>,
 }
 
@@ -771,6 +821,11 @@ fn wait_for_submitted_commits(
 }
 
 /// Derive the logical time used when acknowledging a prepared checkpoint.
+///
+/// Returns `last_sequence_no + 1` (saturating at `u64::MAX`), placing the
+/// checkpoint acknowledgment strictly after the last committed item's
+/// sequence number. This operates in sequence-number space, not the
+/// `(2n, 2n+1)` logical-time space used by `ReceiptCommitSink`.
 #[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 fn checkpoint_logical_time(last_sequence_no: u64) -> LogicalTime {
@@ -783,6 +838,17 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> LogicalTime {
 /// worker so `ReceiptCommitSink` sequence assignment remains deterministic.
 /// The shard completes only after every submitted item has produced a durable
 /// commit outcome and the resulting committed prefix has been checkpointed.
+///
+/// # Completion protocol
+///
+/// 1. Scan execution and commit-stage drain run concurrently on scoped threads.
+/// 2. After both finish, the submitted vs committed sequence lists are compared.
+/// 3. The aggregator prepares a checkpoint prefix from the committed receipts.
+/// 4. `complete_shard` persists the checkpoint cursor with the coordinator.
+/// 5. The checkpoint is acknowledged, advancing the aggregator's watermark.
+/// 6. `mark_shard_done` records the shard as complete in the done-ledger.
+///
+/// If any step fails, the shard is not marked done and will be retried.
 #[cfg_attr(not(test), allow(dead_code))]
 fn run_filesystem_lease<A, F, D>(
     coordinator: &dyn DistributedCoordinator<A>,
@@ -865,23 +931,26 @@ where
     let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let mut stage_result = stage_result.map_err(DistributedRuntimeError::Durability)?;
 
+    // Capture the count of items that actually entered the commit pipeline
+    // before `submitted` is consumed by the sequence-number cross-check.
+    // Files without findings never reach the commit pipeline (the scanner's
+    // emit_persistence_batch early-returns), so this count can be less than
+    // items_scanned.
+    let expected_units = u64::try_from(submitted.len()).unwrap_or(u64::MAX);
+
     let committed_sequence_nos = std::mem::take(&mut stage_result.committed_sequence_nos);
     wait_for_submitted_commits(submitted, committed_sequence_nos)
         .map_err(DistributedRuntimeError::Durability)?;
 
+    // Cross-check: the number of durable receipts must match the number
+    // of items submitted to the commit pipeline. Any discrepancy means the
+    // receipt pipeline lost or duplicated work.
     let submitted_units = stage_result.processed;
-    if submitted_units == 0 && outcome.report.items_scanned > 0 {
+    if submitted_units != expected_units {
         return Err(DistributedRuntimeError::Durability(anyhow!(
-            "filesystem shard '{}' scanned {} item(s) but produced no durable commit receipts",
+            "filesystem shard '{}' submitted {} item(s) but commit stage produced {} durable unit(s)",
             lease.shard_id(),
-            outcome.report.items_scanned
-        )));
-    }
-    if submitted_units != outcome.report.items_scanned {
-        return Err(DistributedRuntimeError::Durability(anyhow!(
-            "filesystem shard '{}' reported {} scanned item(s) but commit stage produced {} durable unit(s)",
-            lease.shard_id(),
-            outcome.report.items_scanned,
+            expected_units,
             submitted_units
         )));
     }
@@ -891,6 +960,8 @@ where
         .prepare_checkpoint()
         .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
+    // Zero-item shards (empty directories) complete without a checkpoint
+    // cursor because no items were committed and no cursor position exists.
     if submitted_units == 0 {
         coordinator
             .complete_shard(lease, None, outcome.report)
@@ -2025,5 +2096,64 @@ mod tests {
         );
         assert!(coordinator.completed_shards().is_empty());
         assert!(!coordinator.done_set().contains("shard-missing-config"));
+    }
+
+    #[test]
+    fn run_filesystem_lease_succeeds_with_mixed_finding_and_clean_files() {
+        let dir = tempdir().expect("tempdir");
+        // File with a detectable secret — will produce findings and enter the
+        // commit pipeline.
+        fs::write(dir.path().join("secret.txt"), "password=xK9mP2qL7wN4vR8t")
+            .expect("write secret fixture");
+        // Clean file — no findings, so the scanner's emit_persistence_batch
+        // early-returns and this file never enters the commit pipeline.
+        fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
+            .expect("write clean fixture");
+
+        let coordinator = TestCoordinator::default();
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+        let lease = filesystem_lease("shard-mixed", dir.path());
+
+        run_filesystem_lease(
+            &coordinator,
+            coordinator.event_recorder(),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("mixed shard with clean files should succeed");
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].shard_id, "shard-mixed");
+
+        let checkpoint = completed[0]
+            .checkpoint
+            .as_ref()
+            .expect("non-empty shard should checkpoint");
+        assert!(
+            checkpoint.last_key().is_some(),
+            "receipt-driven checkpoint should carry a progress key"
+        );
+
+        assert!(coordinator.done_set().contains("shard-mixed"));
+
+        let observations = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot");
+        assert!(
+            !observations.is_empty(),
+            "durable findings observations should be present for the secret file"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the file with findings should produce a done-ledger row"
+        );
+        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
     }
 }

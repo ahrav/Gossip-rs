@@ -371,6 +371,19 @@ where
             .map_err(ResultCommitError::BoundaryMismatch)
     }
 
+    /// Validate a commit request before any I/O.
+    ///
+    /// Checks are ordered cheapest-first so malformed requests fail fast:
+    ///
+    /// 1. **Structural shape**: exactly one done-ledger row.
+    /// 2. **Done-ledger cross-field invariants** (e.g. status vs error code).
+    /// 3. **Batch referential integrity**: every occurrence references a
+    ///    finding present in the batch, and all rows share a single tenant.
+    /// 4. **Tenant / write-context consistency** across findings, occurrences,
+    ///    observations, and the done-ledger row.
+    /// 5. **Evidence chain** (scanned items only): every finding has an
+    ///    occurrence, every occurrence has an observation, and the distinct
+    ///    findings count matches the done-ledger's `findings_count` field.
     fn validate_request(request: &CommitRequest<'_>) -> Result<(), ResultCommitRequestError> {
         let write_context = request.write_context();
 
@@ -499,6 +512,10 @@ fn validate_scanned_findings_chain(
     Ok(())
 }
 
+/// Count distinct finding IDs in the batch, deduplicating by `finding_id`.
+///
+/// Returns `Err` if the count exceeds `u32::MAX`, which is the done-ledger
+/// field width for `findings_count`.
 fn distinct_findings_count(
     findings: FindingsUpsertBatch<'_>,
 ) -> Result<u32, ResultCommitRequestError> {
