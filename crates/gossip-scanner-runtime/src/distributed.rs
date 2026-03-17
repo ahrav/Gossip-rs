@@ -321,6 +321,12 @@ pub enum DistributedRuntimeError {
     Runtime(ScanRuntimeError),
     /// The local durability pipeline failed.
     Durability(AnyError),
+    /// The lease assignment is not a supported type for this runtime
+    /// (e.g. non-filesystem assignment in a filesystem-only worker).
+    UnsupportedAssignment {
+        /// Shard label for the unsupported assignment.
+        shard_id: Arc<str>,
+    },
 }
 
 impl fmt::Display for DistributedRuntimeError {
@@ -329,6 +335,9 @@ impl fmt::Display for DistributedRuntimeError {
             Self::Coordinator(error) => write!(f, "coordinator error: {error}"),
             Self::Runtime(error) => write!(f, "runtime error: {error}"),
             Self::Durability(error) => write!(f, "durability pipeline error: {error}"),
+            Self::UnsupportedAssignment { shard_id } => {
+                write!(f, "unsupported assignment for shard {shard_id:?}")
+            }
         }
     }
 }
@@ -339,6 +348,7 @@ impl std::error::Error for DistributedRuntimeError {
             Self::Coordinator(error) => Some(error.as_ref()),
             Self::Runtime(error) => Some(error),
             Self::Durability(error) => Some(error.as_ref()),
+            Self::UnsupportedAssignment { .. } => None,
         }
     }
 }
@@ -917,11 +927,8 @@ where
     let scan_config = lease
         .assignment()
         .filesystem_scan_config()
-        .ok_or_else(|| {
-            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
-                "shard '{}' lease assignment does not carry a filesystem scan config",
-                lease.shard_id()
-            )))
+        .ok_or_else(|| DistributedRuntimeError::UnsupportedAssignment {
+            shard_id: Arc::clone(lease.shard_id_arc()),
         })?
         .with_workers(1)
         .with_budgets(config.budgets)
@@ -1705,6 +1712,22 @@ mod tests {
         assert!(
             msg.contains("shard-z"),
             "should propagate shard id through display chain"
+        );
+
+        let unsupported = DistributedRuntimeError::UnsupportedAssignment {
+            shard_id: Arc::from("shard-nope"),
+        };
+        assert!(
+            unsupported.to_string().contains("unsupported assignment"),
+            "should contain variant description"
+        );
+        assert!(
+            unsupported.to_string().contains("shard-nope"),
+            "should include shard id"
+        );
+        assert!(
+            std::error::Error::source(&unsupported).is_none(),
+            "UnsupportedAssignment is a leaf error"
         );
     }
 
@@ -2540,14 +2563,16 @@ mod tests {
         .expect_err("non-filesystem lease should be rejected");
 
         assert!(
-            error
-                .to_string()
-                .contains("does not carry a filesystem scan config"),
+            matches!(error, DistributedRuntimeError::UnsupportedAssignment { .. }),
+            "non-filesystem rejection should use UnsupportedAssignment variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("unsupported assignment"),
             "unexpected error: {error}"
         );
         assert!(
-            matches!(error, DistributedRuntimeError::Runtime(_)),
-            "non-filesystem rejection should use Runtime variant, got: {error:?}"
+            std::error::Error::source(&error).is_none(),
+            "UnsupportedAssignment is a leaf error with no source"
         );
         assert_eq!(
             coordinator.released_shards(),
@@ -2771,8 +2796,8 @@ mod tests {
         .expect_err("missing filesystem config should be rejected");
 
         assert!(
-            matches!(error, DistributedRuntimeError::Runtime(_)),
-            "missing filesystem config is a runtime execution precondition error"
+            matches!(error, DistributedRuntimeError::UnsupportedAssignment { .. }),
+            "missing filesystem config should use UnsupportedAssignment variant, got: {error:?}"
         );
         assert!(coordinator.completed_shards().is_empty());
         assert!(!coordinator.done_set().contains("shard-missing-config"));
