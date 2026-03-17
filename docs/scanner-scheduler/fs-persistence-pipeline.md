@@ -28,7 +28,10 @@ emits). The consumer side (actual backend storage) is plugged in via the
 The `StoreProducer` trait in `store.rs` defines *how findings flow from
 scan workers into a backend*. Concrete producers receive `FsFindingRecord`
 batches. Identity chain derivation (stable finding IDs, occurrence IDs,
-rule fingerprints) is handled by `DurableCommitSink` in `gossip-scanner-runtime`.
+rule fingerprints) is handled by the receipt-driven runtime path in
+`gossip-scanner-runtime`: `ReceiptCommitSink` rebuilds per-item translation
+inputs, and `translate_item_result` derives the stable identities before the
+commit pipeline writes them durably.
 
 ## Data Flow
 

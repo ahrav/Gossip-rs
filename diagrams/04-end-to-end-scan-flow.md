@@ -167,17 +167,16 @@ sequenceDiagram
     LOOP->>CS: begin_item(item_key, ItemMeta { stable_item_id, version })
     CS->>REC: record_commit_progress(Begin { item_key, size_hint })
 
-    loop For each finding in item
+    loop For each finding batch in item
         LOOP->>CS: upsert_findings(item_key, FindingsBatch)
-        CS->>CS: rule_fingerprint_resolver(rule_id) → RuleFingerprint
-        CS->>ID: NormHash::from_digest(...)
-        CS->>ID: key_secret_hash(...)
-        CS->>ID: derive_finding_id(...)
-        CS->>ID: derive_occurrence_id(...)
-        CS->>REC: record_identity_chain(IdentityChainRecord)
+        CS->>CS: accumulate FsFindingRecord values
     end
 
     LOOP->>CS: finish_item(item_key)
+    CS->>CS: translate_in_flight(item_key, InFlightItem)
+    CS->>CS: translate_item_result(findings, rule_fingerprint_resolver)
+    note right of CS: Batch identity derivation (NormHash, FindingId, OccurrenceId)
+    CS->>CS: submit QueuedCommit to commit pipeline
     CS->>REC: record_commit_progress(Finish { item_key })
 ```
 
@@ -185,11 +184,12 @@ sequenceDiagram
 enumerated and executed, while `EventOutput` receives a stable stream of
 runtime events.
 
-**Identity derivation stays local to the runtime.** `DurableCommitSink`
-computes the finding and occurrence identity chain without leaking identity
-logic into the family contracts. A rule-fingerprint resolver callback
-translates positional `rule_id` values into stable, name-derived
-`RuleFingerprint` values, ensuring finding identity is position-independent.
+**Identity derivation stays local to the runtime.** `ReceiptCommitSink`
+rebuilds the translation inputs for `translate_item_result`, which computes
+the finding and occurrence identity chain without leaking identity logic into
+the family contracts. A rule-fingerprint resolver callback translates
+positional `rule_id` values into stable, name-derived `RuleFingerprint`
+values, ensuring finding identity is position-independent.
 
 ---
 
@@ -261,7 +261,8 @@ assemble around coordination and durability backends.
 | Ordered-content runtime module | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Git runtime module | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Distributed runtime module | `crates/gossip-scanner-runtime/src/distributed.rs` |
-| Commit sink and identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Commit sink trait and bridge record types | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Deterministic identity derivation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Coordination event recorder types | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Filesystem execution engine | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`, `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
 | Git execution engine | `crates/scanner-git/src/runner.rs` |

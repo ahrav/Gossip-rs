@@ -8,13 +8,13 @@
 //! and error layering ([`DistributedRuntimeError`]).
 //!
 //! It also provides `ReceiptCommitSink`, the compatibility adapter that
-//! translates scan-driver `CommitSink` callbacks into receipt-driven commit
+//! translates scan-loop `CommitSink` callbacks into receipt-driven commit
 //! pipeline work.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Error as AnyError, Result, anyhow};
@@ -342,7 +342,6 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 #[derive(Debug)]
 struct InFlightItem {
     sequence_no: u64,
-    item_key: ItemKey,
     meta: ItemMeta,
     findings: Vec<FsFindingRecord>,
 }
@@ -366,10 +365,10 @@ impl SubmittedCommit {
     }
 }
 
-/// Scan-driver commit sink that bridges begin/upsert/finish callbacks into the
+/// Scan-loop commit sink that bridges begin/upsert/finish callbacks into the
 /// receipt-driven commit pipeline.
 ///
-/// The existing scan-driver seam still emits compact `ItemMeta` and
+/// The existing scan-loop seam still emits compact `ItemMeta` and
 /// `FindingRecord` batches rather than the richer runtime commit inputs.
 /// `ReceiptCommitSink` reconstructs the deterministic translation inputs
 /// expected by the shared commit pipeline so ordered-content execution can
@@ -377,8 +376,7 @@ impl SubmittedCommit {
 ///
 /// # Threading model
 ///
-/// Like [`DurableCommitSink`](crate::commit_sink::DurableCommitSink), this
-/// sink is driven by a single-threaded drain loop. The interior `Mutex`
+/// This sink is driven by a single-threaded drain loop. The interior `Mutex`
 /// fields satisfy the `Send + Sync` bound required by [`CommitSink`] without
 /// introducing real contention. Sequence numbers assigned by
 /// [`next_sequence_no`](Self::next_sequence_no) are therefore monotonically
@@ -393,8 +391,12 @@ struct ReceiptCommitSink {
     rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
     submitter: CommitPipelineSender,
     next_sequence_no: AtomicU64,
-    in_flight: Mutex<BTreeMap<Vec<u8>, InFlightItem>>,
+    in_flight: Mutex<BTreeMap<ItemKey, InFlightItem>>,
     submitted: Mutex<Vec<SubmittedCommit>>,
+    /// First-failure-only flag for progress telemetry. Mirrors
+    /// `CoordinationEventSink`'s suppression to avoid flooding logs during
+    /// sustained recorder outages.
+    progress_error_logged: AtomicBool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -417,6 +419,7 @@ impl ReceiptCommitSink {
             next_sequence_no: AtomicU64::new(0),
             in_flight: Mutex::new(BTreeMap::new()),
             submitted: Mutex::new(Vec::new()),
+            progress_error_logged: AtomicBool::new(false),
         }
     }
 
@@ -469,19 +472,22 @@ impl ReceiptCommitSink {
     /// Records a begin-progress event for telemetry.
     ///
     /// Recorder errors are intentionally non-fatal: durability flows through
-    /// the commit pipeline, not the recorder. This diverges from
-    /// `DurableCommitSink` where recorder errors are propagated because the
-    /// recorder IS the durability path.
+    /// the commit pipeline, not the recorder.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
-        if let Err(e) = self.recorder.record_commit_progress(
+        if let Err(error) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Begin {
                 write_context: self.write_context,
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: item_key.clone(),
                 size_hint: meta.size_hint,
             },
-        ) {
-            tracing::debug!(shard_id = %self.shard_id, %e, "record_begin telemetry failed");
+        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
         }
     }
 
@@ -493,14 +499,19 @@ impl ReceiptCommitSink {
     /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
     /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
-        if let Err(e) = self.recorder.record_commit_progress(
+        if let Err(error) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Finish {
                 write_context: self.write_context,
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: item_key.clone(),
             },
-        ) {
-            tracing::debug!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
+        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
         }
     }
 
@@ -511,18 +522,16 @@ impl ReceiptCommitSink {
     /// When the item has no explicit `version`, a weak version derived from
     /// the item key bytes is used. When the item key is valid UTF-8, a
     /// display-only [`Location`] is attached for diagnostics.
-    fn translate_in_flight(&self, item: &InFlightItem) -> Result<QueuedCommit> {
+    fn translate_in_flight(&self, item_key: &ItemKey, item: &InFlightItem) -> Result<QueuedCommit> {
         let timing = Self::logical_timing_for(item.sequence_no)?;
         let bytes_scanned = item.meta.size_hint.unwrap_or(0);
         let version = item.meta.version.unwrap_or_else(|| {
-            VersionId::Weak(ObjectVersionId::from_version_bytes(
-                item.item_key.as_bytes(),
-            ))
+            VersionId::Weak(ObjectVersionId::from_version_bytes(item_key.as_bytes()))
         });
-        let checkpoint_cursor = Cursor::with_last_key(item.item_key.clone());
-        let item_ref = ItemRef::try_from_slice(item.item_key.as_bytes())?;
+        let checkpoint_cursor = Cursor::with_last_key(item_key.clone());
+        let item_ref = ItemRef::try_from_slice(item_key.as_bytes())?;
         let mut scan_item = ScanItem::new(
-            item.item_key.clone(),
+            item_key.clone(),
             item_ref,
             item.meta.stable_item_id,
             version,
@@ -560,14 +569,13 @@ impl ReceiptCommitSink {
 
 impl CommitSink for ReceiptCommitSink {
     fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()> {
-        let key_bytes = item_key.as_bytes().to_vec();
         let mut guard = self
             .in_flight
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
 
         use std::collections::btree_map::Entry;
-        match guard.entry(key_bytes) {
+        match guard.entry(item_key.clone()) {
             Entry::Occupied(_) => {
                 return Err(anyhow::anyhow!(
                     "begin_item called twice without finish_item for the same item"
@@ -577,7 +585,6 @@ impl CommitSink for ReceiptCommitSink {
                 let sequence_no = self.next_sequence_no();
                 slot.insert(InFlightItem {
                     sequence_no,
-                    item_key: item_key.clone(),
                     meta: meta.clone(),
                     findings: Vec::new(),
                 });
@@ -595,8 +602,18 @@ impl CommitSink for ReceiptCommitSink {
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
         let item = guard
-            .get_mut(item_key.as_bytes())
+            .get_mut(item_key)
             .ok_or_else(|| anyhow::anyhow!("upsert_findings called before begin_item for item"))?;
+
+        for (i, finding) in batch.findings.iter().enumerate() {
+            if finding.end <= finding.start {
+                anyhow::bail!(
+                    "finding at index {i} has invalid span [{}, {})",
+                    finding.start,
+                    finding.end,
+                );
+            }
+        }
 
         // The CommitSink surface provides only start/end offsets.
         // Root-hint fields are unavailable through this bridge, so both
@@ -619,32 +636,29 @@ impl CommitSink for ReceiptCommitSink {
     }
 
     fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
-        let key_bytes = item_key.as_bytes();
-
         // Remove the item under a short-lived lock. Translation and
         // submission happen outside the critical section to minimize lock
         // hold duration. The interior mutex satisfies `Send + Sync` bounds
         // but the sink is driven by a single-threaded drain loop.
-        let item = {
+        let (removed_key, item) = {
             let mut guard = self.in_flight.lock().map_err(|_| {
                 anyhow::anyhow!("receipt commit sink in-flight state lock poisoned")
             })?;
             guard
-                .remove(key_bytes)
+                .remove_entry(item_key)
                 .ok_or_else(|| anyhow::anyhow!("finish_item called before begin_item for item"))?
         };
 
         let sequence_no = item.sequence_no;
-        let work = match self.translate_in_flight(&item) {
+        let work = match self.translate_in_flight(&removed_key, &item) {
             Ok(work) => work,
             Err(err) => {
-                // Rollback: re-insert so the caller can retry. Recover
-                // through a poisoned mutex rather than losing the item.
+                // Rollback: re-insert with the same owned key — zero allocations.
                 let overwritten = self
                     .in_flight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(key_bytes.to_vec(), item);
+                    .insert(removed_key, item);
                 debug_assert!(
                     overwritten.is_none(),
                     "rollback re-insert overwrote a concurrent begin_item entry; \
@@ -655,13 +669,12 @@ impl CommitSink for ReceiptCommitSink {
         };
 
         if let Err(error) = self.submitter.submit(work) {
-            // Rollback: re-insert so the caller can retry. Recover through
-            // a poisoned mutex rather than silently losing the item.
+            // Rollback: re-insert with the same owned key — zero allocations.
             let overwritten = self
                 .in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(key_bytes.to_vec(), item);
+                .insert(removed_key, item);
             debug_assert!(
                 overwritten.is_none(),
                 "rollback re-insert overwrote a concurrent begin_item entry; \
@@ -975,14 +988,20 @@ where
     // pipeline, the scan typically sees a downstream "pipeline cancelled"
     // Runtime error. Evaluating the drain result first exposes the root cause
     // instead of the cancellation symptom.
+    //
+    // Runtime errors are checked before submitted-commit accounting because a
+    // failed `finish_item` rolls the item back into the in-flight map, which
+    // makes `commit.finish()` return "items still in flight". Checking
+    // `outcome` first preserves the original translation/span error rather
+    // than surfacing its consequence.
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
     } = stage_result
         .map_err(DistributedRuntimeError::Durability)?
         .map_err(DistributedRuntimeError::Durability)?;
-    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
 
     let committed_units = committed_sequence_nos.len() as u64;
 
@@ -1072,7 +1091,7 @@ mod tests {
         CancellationToken, OwnedCoreEvent,
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
-        coordination_sink::{CommitProgressRecord, IdentityChainRecord, StoredGitEvent},
+        coordination_sink::{CommitProgressRecord, StoredGitEvent},
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1100,7 +1119,6 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         progress: Mutex<Vec<CommitProgressRecord>>,
-        identity: Mutex<Vec<IdentityChainRecord>>,
     }
 
     impl CoordinationEventRecorder for Recorder {
@@ -1118,15 +1136,6 @@ mod tests {
             event: CommitProgressRecord,
         ) -> Result<()> {
             self.progress.lock().expect("progress lock").push(event);
-            Ok(())
-        }
-
-        fn record_identity_chain(
-            &self,
-            _shard_id: &str,
-            record: crate::coordination_sink::IdentityChainRecord,
-        ) -> Result<()> {
-            self.identity.lock().expect("identity lock").push(record);
             Ok(())
         }
     }
@@ -1544,17 +1553,8 @@ mod tests {
         sink.begin_item(&second, &meta).expect("begin second item");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        assert_eq!(
-            guard.get(first.as_bytes()).expect("first item").sequence_no,
-            0
-        );
-        assert_eq!(
-            guard
-                .get(second.as_bytes())
-                .expect("second item")
-                .sequence_no,
-            1
-        );
+        assert_eq!(guard.get(&first).expect("first item").sequence_no, 0);
+        assert_eq!(guard.get(&second).expect("second item").sequence_no, 1);
         drop(guard);
 
         pipeline.shutdown().expect("worker should join");
@@ -1612,7 +1612,7 @@ mod tests {
                 size_hint,
             } => {
                 assert_eq!(*got, write_context());
-                assert_eq!(got_key, item_key.as_bytes());
+                assert_eq!(got_key, &item_key);
                 assert_eq!(*size_hint, meta.size_hint);
             }
             other => panic!("expected begin progress record, got {other:?}"),
@@ -1623,7 +1623,7 @@ mod tests {
                 item_key: got_key,
             } => {
                 assert_eq!(*got, write_context());
-                assert_eq!(got_key, item_key.as_bytes());
+                assert_eq!(got_key, &item_key);
             }
             other => panic!("expected finish progress record, got {other:?}"),
         }
@@ -1647,9 +1647,7 @@ mod tests {
         .expect("upsert findings");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        let item = guard
-            .get(item_key.as_bytes())
-            .expect("item should remain in flight");
+        let item = guard.get(&item_key).expect("item should remain in flight");
         assert_eq!(
             item.findings,
             vec![FsFindingRecord {
@@ -1690,10 +1688,7 @@ mod tests {
             .expect("begin after failed duplicate");
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert_eq!(
-            guard
-                .get(next_key.as_bytes())
-                .expect("next item")
-                .sequence_no,
+            guard.get(&next_key).expect("next item").sequence_no,
             1,
             "failed begin must not waste a sequence number"
         );
@@ -1806,7 +1801,7 @@ mod tests {
         .expect("second upsert");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        let item = guard.get(key.as_bytes()).expect("item in flight");
+        let item = guard.get(&key).expect("item in flight");
         assert_eq!(item.findings.len(), 2, "both batches should accumulate");
         assert_eq!(item.findings[0].rule_id, 7);
         assert_eq!(item.findings[1].rule_id, 8);
@@ -1919,6 +1914,146 @@ mod tests {
     }
 
     #[test]
+    fn translate_in_flight_uses_item_key_surrogate_version_when_version_is_missing() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/version-compare.txt");
+        let meta_without_version = ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x44; 32]),
+            version: None,
+            size_hint: Some(256),
+        };
+        let meta_with_explicit_version = ItemMeta {
+            stable_item_id: meta_without_version.stable_item_id,
+            version: Some(VersionId::Strong(ObjectVersionId::from_version_bytes(
+                b"explicit-v1",
+            ))),
+            size_hint: meta_without_version.size_hint,
+        };
+        let findings = vec![FsFindingRecord {
+            rule_id: 7,
+            root_hint_start: 10,
+            root_hint_end: 20,
+            span_start: 10,
+            span_end: 20,
+            norm_hash: [0x55; 32],
+            confidence_score: 6,
+        }];
+
+        let (_, _, implicit_translation) = sink
+            .translate_in_flight(
+                &key,
+                &InFlightItem {
+                    sequence_no: 0,
+                    meta: meta_without_version,
+                    findings: findings.clone(),
+                },
+            )
+            .expect("surrogate-version translation")
+            .into_parts();
+        let (_, _, explicit_translation) = sink
+            .translate_in_flight(
+                &key,
+                &InFlightItem {
+                    sequence_no: 0,
+                    meta: meta_with_explicit_version,
+                    findings,
+                },
+            )
+            .expect("explicit-version translation")
+            .into_parts();
+
+        assert_eq!(
+            implicit_translation.findings()[0].finding_id(),
+            explicit_translation.findings()[0].finding_id(),
+            "finding identity must stay version-independent",
+        );
+        assert_ne!(
+            implicit_translation.occurrences()[0].occurrence_id(),
+            explicit_translation.occurrences()[0].occurrence_id(),
+            "missing-version translation must derive occurrence identity from the item-key surrogate version",
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn upsert_findings_rejects_empty_span() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/bad-span.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![
+                        finding(),
+                        FindingRecord {
+                            rule_id: 8,
+                            start: 30,
+                            end: 30,
+                            norm_hash: [0x66; 32],
+                            confidence_score: 9,
+                        },
+                    ],
+                },
+            )
+            .expect_err("empty span must be rejected at upsert time");
+        assert!(
+            err.to_string()
+                .contains("finding at index 1 has invalid span"),
+            "unexpected error: {err}"
+        );
+
+        // The item is still in-flight — the batch was rejected before any
+        // findings were appended, so finish_item can still be called.
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(&key),
+            "rejected batch must not remove the in-flight item"
+        );
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn upsert_findings_rejects_inverted_span() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/inverted-span.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![FindingRecord {
+                        rule_id: 9,
+                        start: 40,
+                        end: 30,
+                        norm_hash: [0x77; 32],
+                        confidence_score: 7,
+                    }],
+                },
+            )
+            .expect_err("inverted span must be rejected at upsert time");
+        assert!(
+            err.to_string()
+                .contains("finding at index 0 has invalid span"),
+            "unexpected error: {err}"
+        );
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(&key),
+            "rejected batch must not remove the in-flight item"
+        );
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
     fn finish_item_preserves_in_flight_on_translation_failure() {
         let (pipeline, sink, _recorder) = make_receipt_sink();
         let key = item_key("tenant/repo/overflow.txt");
@@ -1938,7 +2073,7 @@ mod tests {
 
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
-            guard.contains_key(key.as_bytes()),
+            guard.contains_key(&key),
             "item must remain in in_flight after translation failure"
         );
         drop(guard);
@@ -1978,7 +2113,7 @@ mod tests {
 
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
-            guard.contains_key(key.as_bytes()),
+            guard.contains_key(&key),
             "item must remain in in_flight after submit failure"
         );
         drop(guard);
@@ -1987,6 +2122,32 @@ mod tests {
             sink.submitted.lock().expect("submitted lock").is_empty(),
             "submitted must be empty after submit failure"
         );
+    }
+
+    #[test]
+    fn upsert_after_finish_is_rejected() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/finished.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.finish_item(&key).expect("finish item");
+
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![finding()],
+                },
+            )
+            .expect_err("upsert after finish should fail");
+
+        assert!(
+            err.to_string()
+                .contains("upsert_findings called before begin_item"),
+            "unexpected error: {err}"
+        );
+
+        pipeline.shutdown().expect("worker should join");
     }
 
     #[test]

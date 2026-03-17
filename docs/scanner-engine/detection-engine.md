@@ -225,9 +225,10 @@ types. See [fs-persistence-pipeline.md](../scanner-scheduler/fs-persistence-pipe
 for the full pipeline documentation.
 
 Identity chain derivation (norm_hash -> secret_hash -> finding_id -> occurrence_id)
-is implemented in `crates/gossip-scanner-runtime/src/commit_sink.rs` via
-`DurableCommitSink`. See [gossip-scanner-runtime.md](../gossip-scanner-runtime.md)
-for details.
+is implemented in `crates/gossip-scanner-runtime/src/result_translation.rs`
+and invoked by `ReceiptCommitSink` in the distributed runtime when an item is
+submitted to the commit pipeline. See
+[gossip-scanner-runtime.md](../gossip-scanner-runtime.md) for details.
 
 ## SQLite Persistence Backend
 
