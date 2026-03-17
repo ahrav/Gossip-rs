@@ -287,9 +287,24 @@ where
     F: FindingsSink,
     D: DoneLedger,
 {
-    sender: CommitPipelineSender,
+    sender: Option<CommitPipelineSender>,
+    outcomes: Option<Receiver<CommitStageOutput<F::Error, D::Error>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// Outcome-drain handle returned by [`CommitPipeline::split`].
+///
+/// This handle owns the outcome receiver and worker join handle but not the
+/// submission sender. Distributed runtimes use it to drain durable receipts
+/// concurrently while scan execution continues on another thread.
+pub struct CommitPipelineDrainer<F, D>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+{
     outcomes: Receiver<CommitStageOutput<F::Error, D::Error>>,
     worker: Option<JoinHandle<()>>,
+    cancel: CancellationToken,
 }
 
 impl<F, D> CommitPipeline<F, D>
@@ -325,11 +340,11 @@ where
             })?;
 
         Ok(Self {
-            sender: CommitPipelineSender {
+            sender: Some(CommitPipelineSender {
                 inner: submit_tx,
                 cancel,
-            },
-            outcomes: outcome_rx,
+            }),
+            outcomes: Some(outcome_rx),
             worker: Some(worker),
         })
     }
@@ -338,7 +353,34 @@ where
     #[inline]
     #[must_use]
     pub fn sender(&self) -> CommitPipelineSender {
-        self.sender.clone()
+        self.sender
+            .as_ref()
+            .expect("commit pipeline sender must exist until split or shutdown")
+            .clone()
+    }
+
+    /// Split the pipeline into an execution-side sender and an outcome drainer.
+    ///
+    /// Dropping the returned sender closes the submission channel once all of
+    /// its clones are gone, allowing the commit worker to exit naturally after
+    /// draining queued work. The returned drainer can receive outcomes and join
+    /// the worker thread without retaining an extra submission handle.
+    #[must_use = "both the sender and drainer must be used or explicitly dropped"]
+    pub fn split(mut self) -> (CommitPipelineSender, CommitPipelineDrainer<F, D>) {
+        let sender = self
+            .sender
+            .take()
+            .expect("commit pipeline sender must exist before split");
+        let outcomes = self
+            .outcomes
+            .take()
+            .expect("commit pipeline outcomes must exist before split");
+        let drainer = CommitPipelineDrainer {
+            outcomes,
+            worker: self.worker.take(),
+            cancel: sender.cancel.clone(),
+        };
+        (sender, drainer)
     }
 
     /// Receive the next commit-stage outcome, blocking until one arrives or the
@@ -350,7 +392,10 @@ where
     /// outcomes have been consumed.
     #[inline]
     pub fn recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, RecvError> {
-        self.outcomes.recv()
+        self.outcomes
+            .as_ref()
+            .expect("commit pipeline outcomes must exist until split or shutdown")
+            .recv()
     }
 
     /// Receive the next commit-stage outcome, blocking for at most `timeout`.
@@ -365,7 +410,10 @@ where
         &self,
         timeout: Duration,
     ) -> Result<CommitStageOutput<F::Error, D::Error>, RecvTimeoutError> {
-        self.outcomes.recv_timeout(timeout)
+        self.outcomes
+            .as_ref()
+            .expect("commit pipeline outcomes must exist until split or shutdown")
+            .recv_timeout(timeout)
     }
 
     /// Try to receive one commit-stage outcome without blocking.
@@ -377,7 +425,10 @@ where
     /// buffered outcomes have been consumed.
     #[inline]
     pub fn try_recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, TryRecvError> {
-        self.outcomes.try_recv()
+        self.outcomes
+            .as_ref()
+            .expect("commit pipeline outcomes must exist until split or shutdown")
+            .try_recv()
     }
 
     /// Shut the pipeline down and join the worker thread.
@@ -396,7 +447,9 @@ where
     /// completes. The worker always finishes the current in-flight commit
     /// before exiting.
     pub fn shutdown(mut self) -> thread::Result<()> {
-        self.sender.cancel.cancel();
+        if let Some(sender) = self.sender.as_ref() {
+            sender.cancel.cancel();
+        }
         let handle = self.worker.take();
         // Dropping `self` closes both channels, which unblocks the worker
         // if it is waiting on `recv_timeout()` or `send()`. `Drop::drop`
@@ -415,7 +468,9 @@ where
     D: DoneLedger,
 {
     fn drop(&mut self) {
-        self.sender.cancel.cancel();
+        if let Some(sender) = self.sender.as_ref() {
+            sender.cancel.cancel();
+        }
         if self.worker.is_some() {
             tracing::warn!("CommitPipeline dropped without shutdown; worker thread detached");
         }
@@ -424,6 +479,63 @@ where
         // it is waiting on a timed receive; the JoinHandle drop detaches the
         // thread. The worker also polls cancellation between receives, so it
         // exits promptly even if cloned senders keep the channel connected.
+    }
+}
+
+impl<F, D> CommitPipelineDrainer<F, D>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+{
+    /// Request cancellation of the underlying commit worker.
+    #[inline]
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Receive the next commit-stage outcome, blocking until one arrives or the
+    /// worker exits.
+    #[inline]
+    pub fn recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, RecvError> {
+        self.outcomes.recv()
+    }
+
+    /// Receive the next commit-stage outcome, blocking for at most `timeout`.
+    #[inline]
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<CommitStageOutput<F::Error, D::Error>, RecvTimeoutError> {
+        self.outcomes.recv_timeout(timeout)
+    }
+
+    /// Try to receive one commit-stage outcome without blocking.
+    #[inline]
+    pub fn try_recv(&self) -> Result<CommitStageOutput<F::Error, D::Error>, TryRecvError> {
+        self.outcomes.try_recv()
+    }
+
+    /// Join the commit worker after outcome draining has finished.
+    pub fn join(mut self) -> thread::Result<()> {
+        match self.worker.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<F, D> Drop for CommitPipelineDrainer<F, D>
+where
+    F: FindingsSink,
+    D: DoneLedger,
+{
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if self.worker.is_some() {
+            tracing::warn!(
+                "CommitPipelineDrainer dropped without join; commit worker thread detached"
+            );
+        }
     }
 }
 

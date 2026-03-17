@@ -98,6 +98,30 @@ pub(crate) fn scan_local_filesystem(
         config.anchor_mode,
     )?;
 
+    scan_local_filesystem_with_engine(config, canonical_path, engine, out, commit, cancel)
+}
+
+/// Run a parallel filesystem scan against a local directory or single file
+/// using a caller-provided detection engine.
+///
+/// Distributed execution uses this to share one engine instance between the
+/// scan workers and the receipt commit sink's rule-fingerprint lookup.
+pub(crate) fn scan_local_filesystem_with_engine(
+    config: &FsScanConfig,
+    canonical_path: PathBuf,
+    engine: Arc<scanner_engine::Engine>,
+    out: &dyn EventOutput,
+    commit: &dyn crate::commit_sink::CommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    if cancel.is_cancelled() {
+        return Ok(AssignmentOutcome {
+            report: ScanReport::default(),
+            checkpoint_hint: None,
+            debug_output: None,
+        });
+    }
+
     let report = std::thread::scope(|scope| -> Result<ScanReport, ScanRuntimeError> {
         let (event_tx, event_rx) = sync_channel(EVENT_CHANNEL_CAP);
         let event_forwarder = scope.spawn(move || forward_core_events(out, event_rx));
