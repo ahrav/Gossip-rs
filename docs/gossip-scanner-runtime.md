@@ -409,7 +409,6 @@ finding batches, reconstructs the richer translation inputs expected by
 bounded commit pipeline. That translation path computes:
 
 - tenant-scoped secret hash (derived from the bridge batch's `norm_hash`)
-- tenant-scoped secret hash
 - finding ID (using the rule-fingerprint resolver for position-independent rule identity)
 - occurrence ID
 

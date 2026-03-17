@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Error as AnyError, Result, anyhow};
