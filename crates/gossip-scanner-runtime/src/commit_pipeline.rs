@@ -546,9 +546,12 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// bounding shutdown latency even when the submission channel is idle.
 ///
 /// Invariant: every successfully dequeued item produces exactly one outcome
-/// on `outcome_tx` — either `Committed` or `Failed`. If the outcome channel
-/// is disconnected (e.g. during shutdown), the last outcome may be silently
-/// dropped; committed data remains durable in storage.
+/// on `outcome_tx` — either `Committed` or `Failed` — in the non-cancelled
+/// path (blocking `send`). During cancellation, the worker uses `try_send`
+/// for any in-flight or post-dequeue outcomes; if the outcome queue is full
+/// or disconnected, the outcome is silently dropped. Committed data remains
+/// durable in storage and checkpoint advancement resumes from the last
+/// durable checkpoint on restart.
 fn run_commit_stage<F, D>(
     committer: ResultCommitter<F, D>,
     submit_rx: Receiver<QueuedCommit>,

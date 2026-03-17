@@ -288,10 +288,10 @@ stable across process restarts.
   `CancellationToken` before each blocking send so cancelled pipelines reject
   new work immediately.
 - `CommitPipelineDrainer` — an outcome-drain handle that owns the outcome
-  receiver and the worker `JoinHandle`. It exposes `recv()`,
-  `recv_timeout()`, and `try_recv()` for consuming `CommitStageOutput`
-  values, a `cancel()` method for stopping the worker, and `join()` for
-  waiting on the worker thread after draining completes.
+  receiver and the worker `JoinHandle`. It exposes `recv()` and
+  `recv_timeout()` for consuming `CommitStageOutput` values, a `cancel()`
+  method for stopping the worker, and `join()` for waiting on the worker
+  thread after draining completes.
 
 Dropping the sender closes the submission channel. Once the commit worker
 drains all remaining queued items, it exits, allowing the drainer to consume
