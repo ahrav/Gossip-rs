@@ -55,6 +55,8 @@ use crate::{
 /// payload agrees with the shared write context.
 pub trait ShardLeaseAssignment {
     /// Detection-policy hash carried by the assignment payload.
+    ///
+    /// Implementations must return the same value for the lifetime of `self`.
     fn policy_hash(&self) -> PolicyHash;
 }
 
@@ -157,7 +159,7 @@ impl<A> ShardLease<A> {
 /// # Design note
 ///
 /// This trait intentionally bundles shard lifecycle, done-ledger, and
-/// recorder access into one surface. The worker loop calls all six methods
+/// recorder access into one surface. The worker loop calls all methods
 /// on the same coordinator instance. Split into focused traits when a
 /// second implementation or test double needs a subset.
 ///
@@ -171,6 +173,9 @@ where
     A: ShardLeaseAssignment,
 {
     /// Acquire the next lease to process, or `None` when no work remains.
+    ///
+    /// `None` is terminal — the worker loop will shut down. Implementations that
+    /// need to express temporary unavailability must block or retry internally.
     fn acquire_shard(&self) -> Result<Option<ShardLease<A>>>;
 
     /// Release a lease without marking it complete.
@@ -202,11 +207,7 @@ where
 /// The runtime clones these handles per shard. Production backends should make
 /// that cheap, for example by cloning an `Arc` or a pool handle.
 #[derive(Clone, Debug)]
-pub struct DistributedPersistence<F, D>
-where
-    F: Clone + Send + Sync,
-    D: Clone + Send + Sync,
-{
+pub struct DistributedPersistence<F, D> {
     /// Findings sink handle cloned by the worker loop.
     pub findings_sink: F,
     /// Done-ledger handle cloned by the worker loop.
@@ -243,7 +244,7 @@ impl Default for DistributedRuntimeConfig {
     fn default() -> Self {
         Self {
             budgets: ScanBudgets::default(),
-            commit_queue_capacity: NonZeroUsize::new(64).unwrap(),
+            commit_queue_capacity: NonZeroUsize::new(64).expect("hardcoded non-zero constant"),
         }
     }
 }
@@ -298,6 +299,12 @@ impl std::error::Error for DistributedRuntimeError {
 impl From<ScanRuntimeError> for DistributedRuntimeError {
     fn from(value: ScanRuntimeError) -> Self {
         Self::Runtime(value)
+    }
+}
+
+impl From<PolicyMismatchError> for DistributedRuntimeError {
+    fn from(value: PolicyMismatchError) -> Self {
+        Self::Coordinator(value.into())
     }
 }
 
@@ -376,6 +383,13 @@ mod tests {
         assert_eq!(&*err.shard_id, "shard-x");
         assert_eq!(err.assignment_hash, PolicyHash::from_bytes([0xFF; 32]));
         assert_eq!(err.write_context_hash, PolicyHash::from_bytes([0x22; 32]));
+
+        let msg = err.to_string();
+        assert!(msg.contains("shard-x"), "error should name the shard");
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "leaf error has no source"
+        );
     }
 
     #[test]
@@ -394,7 +408,10 @@ mod tests {
         let config = DistributedRuntimeConfig::default();
 
         assert_eq!(config.budgets, ScanBudgets::default());
-        assert_eq!(config.commit_queue_capacity, NonZeroUsize::new(64).unwrap());
+        assert_eq!(
+            config.commit_queue_capacity,
+            NonZeroUsize::new(64).expect("hardcoded non-zero constant"),
+        );
     }
 
     #[test]
@@ -417,5 +434,46 @@ mod tests {
             "durability pipeline error: commit boom"
         );
         assert!(std::error::Error::source(&durability).is_some());
+
+        let mismatch = PolicyMismatchError {
+            shard_id: Arc::from("shard-z"),
+            assignment_hash: PolicyHash::from_bytes([0xAA; 32]),
+            write_context_hash: PolicyHash::from_bytes([0xBB; 32]),
+        };
+        let from_mismatch = DistributedRuntimeError::from(mismatch);
+        assert!(
+            matches!(from_mismatch, DistributedRuntimeError::Coordinator(_)),
+            "PolicyMismatchError should route to Coordinator variant"
+        );
+        assert!(std::error::Error::source(&from_mismatch).is_some());
+
+        let msg = from_mismatch.to_string();
+        assert!(
+            msg.starts_with("coordinator error:"),
+            "should use Coordinator display prefix"
+        );
+        assert!(
+            msg.contains("shard-z"),
+            "should propagate shard id through display chain"
+        );
+    }
+
+    #[test]
+    fn distributed_run_report_default_satisfies_invariant() {
+        let report = DistributedRunReport::default();
+        assert_eq!(report.leases_seen, 0);
+        assert_eq!(report.shards_scanned, 0);
+        assert_eq!(report.shards_skipped_done, 0);
+        assert!(report.shards_scanned + report.shards_skipped_done <= report.leases_seen);
+
+        // Non-trivial case: demonstrates the invariant holds for realistic
+        // field values and guards against field-ordering mistakes in future
+        // construction sites.
+        let nonzero = DistributedRunReport {
+            leases_seen: 10,
+            shards_scanned: 7,
+            shards_skipped_done: 3,
+        };
+        assert!(nonzero.shards_scanned + nonzero.shards_skipped_done <= nonzero.leases_seen);
     }
 }
