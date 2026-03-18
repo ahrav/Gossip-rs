@@ -941,6 +941,16 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
 /// workers are completing shards rapidly.
 const CLAIM_RACE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
+/// Synthetic cursor key for completing unbounded shards that produced zero
+/// items.
+///
+/// When a shard's `key_range_start` is empty (unbounded lower bound) and no
+/// items were committed, we still need a valid `last_key` to satisfy the
+/// coordination layer's completion validation. A single null byte is the
+/// smallest non-empty byte sequence and passes all bounds checks when the
+/// spec start is empty.
+const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
+
 /// Build a filesystem scan config by overlaying shard metadata onto a template.
 ///
 /// If the shard's `connector_extra` field contains a non-empty UTF-8 path,
@@ -1090,7 +1100,11 @@ where
 /// - The receipt-driven `checkpoint` cursor when items were committed.
 /// - The shard's `range_start` when the shard produced zero items but has
 ///   a non-empty range (ensures forward progress on re-scan).
-/// - An `initial()` cursor when both are absent (empty shard with empty range).
+/// - A synthetic sentinel key ([`EMPTY_RANGE_SENTINEL_KEY`]) when the shard
+///   has no range start. In practice this branch is unreachable because the
+///   coordination layer rejects unbounded shards at registration time, but
+///   the guard exists to prevent a `CursorUpdate::new` panic on empty input
+///   (and `CursorUpdate::initial()` would fail validation).
 ///
 /// Completion uses a deterministic [`OpId`] so replayed calls are idempotent.
 /// If the coordination backend reports the completion was already applied
@@ -1108,7 +1122,9 @@ where
 
     let final_cursor = match checkpoint {
         Some(cursor) => cursor.as_update(),
-        None if lease.range_start().is_empty() => gossip_coordination::CursorUpdate::initial(),
+        None if lease.range_start().is_empty() => {
+            gossip_coordination::CursorUpdate::new(EMPTY_RANGE_SENTINEL_KEY)
+        }
         None => gossip_coordination::CursorUpdate::new(lease.range_start()),
     };
     let op_id = deterministic_op_id(
@@ -1243,14 +1259,18 @@ where
         (outcome, submitted, stage_result)
     });
 
+    // Check the scan outcome first: when both the scan and the drain thread
+    // fail, the scan failure is typically the root cause (the broken pipeline
+    // cascades into the drain). Surfacing the Runtime error gives operators
+    // the most actionable diagnostic.
+    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
     } = stage_result
         .map_err(DistributedRuntimeError::Durability)?
         .map_err(DistributedRuntimeError::Durability)?;
-    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
-    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let committed_units = committed_sequence_nos.len() as u64;
 
     if committed_units == 0 {
@@ -2797,7 +2817,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 250);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 2_000);
         let _ = claim_coordination_lease(&mut coordinator, worker(99));
 
         let report = run_worker(
