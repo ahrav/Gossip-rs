@@ -1138,11 +1138,12 @@ where
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(e) => {
-                tracing::info!(
+                tracing::warn!(
+                    error = %e,
                     leases_seen = report.leases_seen,
                     shards_scanned = report.shards_scanned,
                     shards_skipped_done = report.shards_skipped_done,
-                    "worker loop terminating with partial progress",
+                    "worker loop terminating: shard acquisition failed",
                 );
                 return Err(DistributedRuntimeError::Coordinator(e));
             }
@@ -1153,11 +1154,12 @@ where
             Ok(done) => done,
             Err(e) => {
                 release_best_effort(&lease);
-                tracing::info!(
+                tracing::warn!(
+                    error = %e,
                     leases_seen = report.leases_seen,
                     shards_scanned = report.shards_scanned,
                     shards_skipped_done = report.shards_skipped_done,
-                    "worker loop terminating with partial progress",
+                    "worker loop terminating: done-ledger check failed",
                 );
                 return Err(DistributedRuntimeError::Coordinator(e));
             }
@@ -1177,11 +1179,12 @@ where
             config,
         ) {
             release_best_effort(&lease);
-            tracing::info!(
+            tracing::warn!(
+                error = %e,
                 leases_seen = report.leases_seen,
                 shards_scanned = report.shards_scanned,
                 shards_skipped_done = report.shards_skipped_done,
-                "worker loop terminating with partial progress",
+                "worker loop terminating: filesystem lease execution failed",
             );
             return Err(e);
         }
@@ -3062,7 +3065,7 @@ mod tests {
         ]);
         coordinator.mark_done("shard-done");
         // Release will fail for the done shard, but the loop should continue
-        // to process the active shard (F-02 made done-shard release best-effort).
+        // to process the active shard (done-shard release is best-effort).
         coordinator.fail_next_releases(1);
 
         let report = run_worker(

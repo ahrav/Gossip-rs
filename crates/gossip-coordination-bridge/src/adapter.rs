@@ -25,8 +25,10 @@
 //!
 //! All mutable coordination state (the backend handle, `AcquireScratch`, and
 //! the active-lease map) lives behind a single `Mutex<AdapterState>`. The lock
-//! is held only for the duration of each coordination call — never across a
-//! sleep boundary.
+//! is held for one or two coordination calls per acquisition attempt (claim
+//! plus an optional progress check on the retry path) but is always released
+//! before the inter-retry sleep. Contention is bounded by the number of
+//! concurrent worker threads.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,16 +59,13 @@ use crate::FilesystemAssignment;
 /// workers are completing shards faster than the polling interval.
 const CLAIM_RACE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
-/// Production adapter that bridges [`EtcdCoordinator`] into the distributed
-/// scanner runtime's [`DistributedCoordinator`] trait.
+/// Production adapter: the generic adapter core specialized on
+/// [`EtcdCoordinator`].
 ///
-/// This is a thin wrapper over an internal generic adapter core that fixes the
-/// backend type parameter to `EtcdCoordinator`. The generic core exists so that
-/// tests can substitute [`InMemoryCoordinator`](gossip_coordination::InMemoryCoordinator)
-/// without touching production code paths.
-pub struct EtcdRuntimeAdapter {
-    inner: RuntimeAdapterCore<EtcdCoordinator>,
-}
+/// The generic core exists so tests can substitute
+/// [`InMemoryCoordinator`](gossip_coordination::InMemoryCoordinator) without
+/// touching production code paths.
+pub type EtcdRuntimeAdapter = RuntimeAdapterCore<EtcdCoordinator>;
 
 /// Generic adapter core parameterized over any coordination backend.
 ///
@@ -75,7 +74,7 @@ pub struct EtcdRuntimeAdapter {
 /// and shared across all shard operations. Mutable state — the backend handle,
 /// claim scratch buffer, and active-lease tracking map — lives behind a single
 /// `Mutex` to keep the trait implementation `Send + Sync`.
-struct RuntimeAdapterCore<C> {
+pub struct RuntimeAdapterCore<C> {
     tenant: TenantId,
     run: RunId,
     worker: WorkerId,
@@ -90,56 +89,50 @@ struct RuntimeAdapterCore<C> {
 
 /// Mutable state guarded by a single lock.
 ///
-/// The lock is held only for individual coordination calls, never across
-/// blocking sleeps, so contention stays bounded.
+/// The lock is held for at most two coordination calls (claim + progress
+/// check in the retry branch), never across blocking sleeps, so contention
+/// stays bounded.
 struct AdapterState<C> {
     coordinator: C,
     /// Heap-allocated to avoid bloating the state struct (contains multiple
     /// fixed-capacity buffers). Reused across `claim_next_available` calls
     /// to avoid per-claim allocation.
     scratch: Box<AcquireScratch>,
-    /// Maps shard-id strings to their coordination-layer [`Lease`] tokens.
+    /// Maps shard-id strings to their coordination-layer [`Lease`] tokens
+    /// and the shard spec's inclusive range-start key.
     /// Entries are inserted on acquire and removed on complete or release.
     /// The map lets `complete_shard` and `release_shard` look up the
     /// coordination-layer lease from the runtime-layer `ShardLease`.
-    active_leases: HashMap<String, Lease>,
+    ///
+    /// The range-start key is captured at acquire time and used as a
+    /// fallback cursor position when completing shards that produced zero
+    /// findings (no receipt-derived checkpoint cursor exists).
+    active_leases: HashMap<String, TrackedLease>,
 }
 
-impl EtcdRuntimeAdapter {
-    /// Construct an etcd-backed runtime adapter.
+/// Coordination-layer lease paired with the shard spec's range-start key.
+///
+/// The range-start is captured at acquire time because the shard spec is
+/// only available during the claim call. At completion time, if the
+/// runtime provides no checkpoint cursor (zero-finding shards), the
+/// adapter uses the range-start as the `last_key` in the cursor update.
+/// This satisfies the coordination backend's key-presence requirement
+/// under `CursorSemantics::Completed` without implying false progress.
+struct TrackedLease {
+    lease: Lease,
+    /// Inclusive lower bound of the shard's key range, cloned from
+    /// `ShardSpecRef::key_range_start()` at acquisition time.
+    range_start: Vec<u8>,
+}
+
+impl<C> RuntimeAdapterCore<C> {
+    /// Construct an adapter for the given coordination backend.
     ///
     /// The `scan_template` is cloned per-shard and may be overridden when the
     /// shard spec carries a filesystem path in its `connector_extra` metadata.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        coordinator: EtcdCoordinator,
-        tenant: TenantId,
-        run: RunId,
-        worker: WorkerId,
-        policy_hash: PolicyHash,
-        tenant_secret_key: TenantSecretKey,
-        scan_template: FsScanConfig,
-        recorder: Arc<dyn CoordinationEventRecorder>,
-    ) -> Self {
-        Self {
-            inner: RuntimeAdapterCore::new(
-                coordinator,
-                tenant,
-                run,
-                worker,
-                policy_hash,
-                tenant_secret_key,
-                scan_template,
-                recorder,
-            ),
-        }
-    }
-}
-
-impl<C> RuntimeAdapterCore<C> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
         coordinator: C,
         tenant: TenantId,
         run: RunId,
@@ -166,7 +159,13 @@ impl<C> RuntimeAdapterCore<C> {
     }
 }
 
-impl<C> RuntimeAdapterCore<C>
+/// [`DistributedCoordinator`] implementation for the generic adapter core.
+///
+/// `is_shard_done` always returns `false` and `mark_shard_done` is a no-op
+/// because the done-ledger is not yet backed by persistent storage in this
+/// adapter. The worker loop will re-scan a shard if it is re-acquired
+/// after a crash.
+impl<C> DistributedCoordinator<FilesystemAssignment> for RuntimeAdapterCore<C>
 where
     C: CoordinationBackend + RunManagement + ShardClaiming + Send,
 {
@@ -184,7 +183,7 @@ where
     /// deadline, falling back to [`CLAIM_RACE_RETRY_DELAY`] when no deadline
     /// is available. The `Mutex` is released before sleeping so other
     /// threads can complete or release their shards concurrently.
-    fn acquire_shard_impl(&self) -> Result<Option<ShardLease<FilesystemAssignment>>> {
+    fn acquire_shard(&self) -> Result<Option<ShardLease<FilesystemAssignment>>> {
         loop {
             let now = wall_clock_now();
             let sleep_for = {
@@ -204,11 +203,10 @@ where
                     Ok(acquired) => {
                         let tracked_lease = acquired.lease;
                         let shard_id = tracked_lease.shard().to_string();
-                        let assignment = assignment_from_spec(
-                            acquired.snapshot.spec(),
-                            self.policy_hash,
-                            &self.scan_template,
-                        )?;
+                        let spec = acquired.snapshot.spec();
+                        let range_start = spec.key_range_start().to_vec();
+                        let assignment =
+                            assignment_from_spec(spec, self.policy_hash, &self.scan_template)?;
                         let write_context = WriteContext::new(
                             tracked_lease.tenant(),
                             self.policy_hash,
@@ -222,8 +220,14 @@ where
                             write_context,
                             self.tenant_secret_key,
                         )
-                        .map_err(|err| anyhow!("{err}"))?;
-                        active_leases.insert(shard_id, tracked_lease);
+                        .map_err(anyhow::Error::from)?;
+                        active_leases.insert(
+                            shard_id,
+                            TrackedLease {
+                                lease: tracked_lease,
+                                range_start,
+                            },
+                        );
                         return Ok(Some(runtime_lease));
                     }
                     Err(ClaimError::NoneAvailable { earliest_deadline }) => {
@@ -232,13 +236,13 @@ where
                         // progress to decide whether to retry or signal completion.
                         let progress = coordinator
                             .get_run_progress(now, self.tenant, self.run)
-                            .map_err(|err| anyhow!("{err}"))?;
+                            .map_err(anyhow::Error::from)?;
                         if progress.active() == 0 {
                             return Ok(None);
                         }
                         claim_retry_delay(now, earliest_deadline)
                     }
-                    Err(err) => return Err(anyhow!("{err}")),
+                    Err(err) => return Err(err.into()),
                 }
             };
             std::thread::sleep(sleep_for);
@@ -253,7 +257,7 @@ where
     ///
     /// Returns an error if `lease` is not tracked by this adapter (double
     /// release or wrong adapter instance).
-    fn release_shard_impl(&self, lease: &ShardLease<FilesystemAssignment>) -> Result<()> {
+    fn release_shard(&self, lease: &ShardLease<FilesystemAssignment>) -> Result<()> {
         let mut state = self.state.lock().expect("adapter state lock");
         if state.active_leases.remove(lease.shard_id()).is_none() {
             return Err(anyhow!(
@@ -273,69 +277,57 @@ where
     /// worker crashes and replays the same completion, the coordinator detects
     /// the duplicate via its per-shard op-log.
     ///
-    /// When no checkpoint cursor is provided, the shard completes at the
-    /// initial cursor position (no scan progress to record).
-    fn complete_shard_impl(
-        &self,
-        lease: &ShardLease<FilesystemAssignment>,
-        checkpoint: Option<Cursor>,
-        _report: ScanReport,
-    ) -> Result<()> {
-        let now = wall_clock_now();
-        let mut state = self.state.lock().expect("adapter state lock");
-        let tracked_lease = state
-            .active_leases
-            .get(lease.shard_id())
-            .copied()
-            .ok_or_else(|| {
-                anyhow!(
-                    "runtime lease '{}' is not active on this adapter",
-                    lease.shard_id()
-                )
-            })?;
-        let final_cursor = checkpoint
-            .as_ref()
-            .map(Cursor::as_update)
-            .unwrap_or_else(gossip_contracts::coordination::CursorUpdate::initial);
-        let op_id = deterministic_op_id(
-            tracked_lease.shard_key(),
-            tracked_lease.fence(),
-            OpKind::Complete,
-        );
-        let _ = state
-            .coordinator
-            .complete(now, self.tenant, &tracked_lease, &final_cursor, op_id)
-            .map_err(|err| anyhow!("{err}"))?;
-        state.active_leases.remove(lease.shard_id());
-        Ok(())
-    }
-}
-
-/// [`DistributedCoordinator`] implementation for the generic adapter core.
-///
-/// `is_shard_done` always returns `false` and `mark_shard_done` is a no-op
-/// because the done-ledger is not yet backed by persistent storage in this
-/// adapter. The worker loop will re-scan a shard if it is re-acquired
-/// after a crash.
-impl<C> DistributedCoordinator<FilesystemAssignment> for RuntimeAdapterCore<C>
-where
-    C: CoordinationBackend + RunManagement + ShardClaiming + Send,
-{
-    fn acquire_shard(&self) -> Result<Option<ShardLease<FilesystemAssignment>>> {
-        self.acquire_shard_impl()
-    }
-
-    fn release_shard(&self, lease: &ShardLease<FilesystemAssignment>) -> Result<()> {
-        self.release_shard_impl(lease)
-    }
-
+    /// When no checkpoint cursor is provided (zero-finding shards), the
+    /// adapter uses the shard's range-start key captured at acquisition time.
+    /// This satisfies the coordination backend's key-presence requirement
+    /// under `CursorSemantics::Completed` without implying false progress
+    /// beyond the initial position.
     fn complete_shard(
         &self,
         lease: &ShardLease<FilesystemAssignment>,
         checkpoint: Option<Cursor>,
-        report: ScanReport,
+        // The coordination backend does not consume scan-report metrics.
+        // The report is part of the trait interface so other implementations
+        // (e.g., telemetry-aware coordinators) can forward it.
+        _report: ScanReport,
     ) -> Result<()> {
-        self.complete_shard_impl(lease, checkpoint, report)
+        let now = wall_clock_now();
+        let mut state = self.state.lock().expect("adapter state lock");
+
+        // Copy the coordination lease and range-start out of the tracking map
+        // before calling into the coordinator. This avoids holding an immutable
+        // borrow on `active_leases` across the mutable `coordinator.complete`
+        // call.
+        let tracked = state.active_leases.get(lease.shard_id()).ok_or_else(|| {
+            anyhow!(
+                "runtime lease '{}' is not active on this adapter",
+                lease.shard_id()
+            )
+        })?;
+        let coordination_lease = tracked.lease;
+        let fallback_key = tracked.range_start.clone();
+
+        let final_cursor = match checkpoint.as_ref() {
+            Some(cursor) => cursor.as_update(),
+            None => {
+                // Zero-finding shards have no receipt-derived checkpoint.
+                // Use the shard's range-start key as a "no progress beyond
+                // the initial position" marker so the coordination backend
+                // accepts the completion under Completed semantics.
+                gossip_contracts::coordination::CursorUpdate::new(&fallback_key)
+            }
+        };
+        let op_id = deterministic_op_id(
+            coordination_lease.shard_key(),
+            coordination_lease.fence(),
+            OpKind::Complete,
+        );
+        let _ = state
+            .coordinator
+            .complete(now, self.tenant, &coordination_lease, &final_cursor, op_id)
+            .map_err(anyhow::Error::from)?;
+        state.active_leases.remove(lease.shard_id());
+        Ok(())
     }
 
     fn is_shard_done(&self, _lease: &ShardLease<FilesystemAssignment>) -> Result<bool> {
@@ -348,38 +340,6 @@ where
 
     fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
         Arc::clone(&self.recorder)
-    }
-}
-
-/// Delegation to the inner generic adapter core specialized on `EtcdCoordinator`.
-impl DistributedCoordinator<FilesystemAssignment> for EtcdRuntimeAdapter {
-    fn acquire_shard(&self) -> Result<Option<ShardLease<FilesystemAssignment>>> {
-        self.inner.acquire_shard()
-    }
-
-    fn release_shard(&self, lease: &ShardLease<FilesystemAssignment>) -> Result<()> {
-        self.inner.release_shard(lease)
-    }
-
-    fn complete_shard(
-        &self,
-        lease: &ShardLease<FilesystemAssignment>,
-        checkpoint: Option<Cursor>,
-        report: ScanReport,
-    ) -> Result<()> {
-        self.inner.complete_shard(lease, checkpoint, report)
-    }
-
-    fn is_shard_done(&self, lease: &ShardLease<FilesystemAssignment>) -> Result<bool> {
-        self.inner.is_shard_done(lease)
-    }
-
-    fn mark_shard_done(&self, lease: &ShardLease<FilesystemAssignment>) -> Result<()> {
-        self.inner.mark_shard_done(lease)
-    }
-
-    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
-        self.inner.event_recorder()
     }
 }
 
@@ -762,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_shard_without_checkpoint_errors_under_completed_semantics() {
+    fn complete_shard_without_checkpoint_uses_range_start_under_completed_semantics() {
         let adapter = make_adapter_with_registered_shard(&[]);
 
         let lease = adapter
@@ -770,16 +730,24 @@ mod tests {
             .expect("acquire should succeed")
             .expect("one shard should be available");
 
-        // CursorSemantics::Completed requires a last_key on complete.
-        // When the adapter receives `None`, it falls back to
-        // CursorUpdate::initial() which has no last_key, and the
-        // coordination backend rejects the operation.
-        let err = adapter
+        // Zero-finding shards complete with `checkpoint = None`. The adapter
+        // falls back to the shard's range-start key captured at acquire time,
+        // which satisfies the coordination backend's key-presence requirement
+        // under CursorSemantics::Completed.
+        adapter
             .complete_shard(&lease, None, ScanReport::default())
-            .expect_err("complete without checkpoint must error under Completed semantics");
+            .expect("zero-finding shard completion must succeed under Completed semantics");
+
+        let state = adapter.state.lock().expect("adapter state lock");
+        let progress = state
+            .coordinator
+            .get_run_progress(wall_clock_now(), tenant(), run())
+            .expect("run progress");
+        assert_eq!(progress.active(), 0);
+        assert_eq!(progress.done(), 1);
         assert!(
-            err.to_string().contains("last_key"),
-            "unexpected error: {err}"
+            state.active_leases.is_empty(),
+            "completed lease should be removed from the tracking map"
         );
     }
 
