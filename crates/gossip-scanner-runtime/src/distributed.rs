@@ -1561,6 +1561,10 @@ mod tests {
         ["password=", "xK9mP2qL7wN4vR8t"].concat()
     }
 
+    fn clean_fixture() -> &'static str {
+        "ordinary sample text for scanner tests"
+    }
+
     fn filesystem_lease(shard_id: &str, path: &std::path::Path) -> ShardLease<StubAssignment> {
         ShardLease::new(
             Arc::from(shard_id),
@@ -2758,8 +2762,7 @@ mod tests {
     #[test]
     fn run_filesystem_lease_clean_only_shard_completes_without_checkpoint() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
-            .expect("write clean fixture");
+        fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 
         let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
@@ -2779,9 +2782,9 @@ mod tests {
         let completed = coordinator.completed_shards();
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].shard_id, "shard-clean-only");
-        assert!(
-            completed[0].report.items_scanned > 0,
-            "clean-only shard should still report scanned files"
+        assert_eq!(
+            completed[0].report.items_scanned, 1,
+            "clean-only shard with a single file should report exactly one scanned item"
         );
         assert!(
             completed[0].checkpoint.is_none(),
@@ -2897,8 +2900,7 @@ mod tests {
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write secret fixture");
         // Clean file — no findings, so the scanner's emit_persistence_batch
         // early-returns and this file never enters the commit pipeline.
-        fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
-            .expect("write clean fixture");
+        fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 
         let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
