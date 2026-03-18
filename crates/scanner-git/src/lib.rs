@@ -204,6 +204,8 @@ pub mod spill_chunk;
 pub mod spill_limits;
 /// Implements k-way merge of sorted spill runs with duplicate removal.
 pub mod spill_merge;
+/// Provides shared spill-file naming helpers for sibling spill modules.
+pub(crate) mod spill_path;
 /// Implements the spill orchestrator for candidate collection and dedup.
 pub mod spiller;
 /// Defines start set configuration and deterministic identity hashing.
