@@ -9,12 +9,12 @@
 //! before reading from `as_slice`, and must ensure the spill file outlives
 //! any consumers of the returned slice.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::spill_path::{make_unique_spill_path, SpillPathKind};
+use crate::spill_path::{reserve_unique_spill_file, SpillPathKind};
 use memmap2::{Mmap, MmapMut};
 
 /// Spill-backed blob bytes.
@@ -32,8 +32,7 @@ pub struct BlobSpill {
 impl BlobSpill {
     /// Create a new spill file sized to `len` bytes.
     pub fn new(dir: &Path, len: usize) -> io::Result<Self> {
-        let path = make_unique_spill_path(dir, SpillPathKind::Blob);
-        let file = open_spill_file(&path, len as u64)?;
+        let (path, file) = reserve_unique_spill_file(dir, SpillPathKind::Blob, len as u64)?;
         // SAFETY: The file length is fixed and we only write through the mutable mapping.
         let writer = unsafe { MmapMut::map_mut(&file)? };
         // SAFETY: Read-only view of the same immutable-length file.
@@ -116,16 +115,4 @@ impl<'a> BlobSpillWriter<'a> {
         }
         Ok(())
     }
-}
-
-/// Create and pre-size a spill file for mmap-backed IO.
-fn open_spill_file(path: &Path, capacity: u64) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(path)?;
-    file.set_len(capacity)?;
-    Ok(file)
 }

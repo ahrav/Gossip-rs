@@ -23,12 +23,12 @@
 //! is responsible for removing the file or directory after the scan.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::spill_path::{make_unique_spill_path, SpillPathKind};
+use crate::spill_path::{reserve_unique_spill_file, SpillPathKind};
 use memmap2::{Mmap, MmapMut};
 
 #[cfg(target_os = "linux")]
@@ -138,11 +138,10 @@ pub struct SpillArena {
 impl SpillArena {
     /// Creates a new spill arena with a fixed size in bytes.
     ///
-    /// The backing file is created (or truncated) under `dir` and is not
+    /// The backing file is atomically reserved under `dir` and is not
     /// deleted by this type; callers should clean up the directory if needed.
     pub fn new(dir: &Path, capacity: u64) -> Result<Self, SpillArenaError> {
-        let path = make_unique_spill_path(dir, SpillPathKind::Tree);
-        let file = open_spill_file(&path, capacity)?;
+        let (path, file) = reserve_unique_spill_file(dir, SpillPathKind::Tree, capacity)?;
 
         // SAFETY: The file length is set once at creation (`set_len`) and
         // never resized. Only this arena writes to the file (through
@@ -219,19 +218,6 @@ impl SpillArena {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
-
-/// Creates (or truncates) the spill file and sets its length to `capacity`.
-fn open_spill_file(path: &Path, capacity: u64) -> Result<File, SpillArenaError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-
-    file.set_len(capacity)?;
-    Ok(file)
 }
 
 /// Hints the OS that the spill file will be accessed sequentially.
