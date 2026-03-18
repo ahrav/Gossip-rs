@@ -406,8 +406,7 @@ fn translate_findings(
 
     for (index, finding) in findings_input.iter().enumerate() {
         // confidence_score is intentionally omitted: the persistence schema does not
-        // carry confidence. It is preserved in IdentityChainRecord (commit_sink path)
-        // for coordination-level diagnostics only.
+        // carry confidence.
 
         if finding.span_end <= finding.span_start {
             return Err(ResultTranslationError::InvalidFindingSpan {
@@ -1010,6 +1009,34 @@ mod tests {
             translated_b.observations()[0].observation_id(),
             "root_hint fields must not participate in ObservationId derivation",
         );
+    }
+
+    #[test]
+    fn mixed_valid_and_invalid_batch_rejects_at_correct_index() {
+        let item = scan_item();
+        let findings = [finding(1, 10, 20, 0xAA), finding(2, 30, 30, 0xBB)];
+
+        let err = translate_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            &item,
+            64,
+            timing(),
+            ItemResult::Scanned {
+                findings: &findings,
+            },
+            &test_rule_fingerprint,
+        )
+        .expect_err("batch with invalid finding at index 1 must fail");
+
+        match err {
+            ResultTranslationError::InvalidFindingSpan { index, start, end } => {
+                assert_eq!(index, 1, "error must identify the invalid finding index");
+                assert_eq!(start, 30);
+                assert_eq!(end, 30);
+            }
+            other => panic!("expected InvalidFindingSpan, got {other:?}"),
+        }
     }
 
     #[test]

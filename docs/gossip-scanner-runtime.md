@@ -29,9 +29,9 @@ entrypoints share the same local runtime execution paths.
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
 | `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
-| `src/commit_sink.rs` | Local `CommitSink` trait, no-op sink, and durable identity-deriving sink that stamps one shared `WriteContext` onto emitted records |
-| `src/coordination_sink.rs` | Owned event records and recorder trait used by durable persistence plumbing, including write-scoped progress and identity-chain records |
-| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, layered runtime errors, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), and `run_filesystem_lease` (single-shard execution entrypoint) |
+| `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
+| `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
+| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, layered runtime errors, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), `run_worker` (lease loop), and `InMemoryCoordinator` (test-support coordinator harness) |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
@@ -116,8 +116,8 @@ old cross-crate driver seam.
 
 ### Distributed runs
 
-- `DistributedRuntimeConfig` stores the budgets that the future worker loop
-  must validate before executing a lease
+- `DistributedRuntimeConfig` stores the budgets that the worker loop threads
+  into receipt-driven shard execution
 
 ---
 
@@ -312,7 +312,7 @@ decomposition.
 
 `ReceiptCommitSink` implements the `CommitSink` trait to bridge scan-driver
 item lifecycle callbacks into the receipt-driven commit pipeline. It tracks
-in-flight items in a `BTreeMap` keyed by item-key bytes:
+in-flight items in a `BTreeMap<ItemKey, InFlightItem>`:
 
 - `begin_item` assigns a monotonically increasing sequence number and
   inserts an `InFlightItem` into the in-flight map.
@@ -374,6 +374,26 @@ the receipt-driven durability model:
 If any step fails, the shard is not marked done and will be retried on the
 next lease acquisition.
 
+#### `run_worker`
+
+`run_worker` is the top-level distributed lease loop. It acquires leases until
+the coordinator returns `None`, counts every lease in
+`DistributedRunReport`, releases already-done shards without scanning them,
+routes filesystem leases through `run_filesystem_lease`, and rejects
+assignments that do not expose a filesystem scan config instead of advancing
+them without receipt-derived durability.
+
+#### `InMemoryCoordinator`
+
+`InMemoryCoordinator<A>` is available in test builds and under the
+`test-support` feature. It keeps the lease queue, completion bookkeeping, and
+recorded coordination events behind one `Arc<Mutex<...>>` state bundle so
+tests can exercise the worker loop without a real coordination backend.
+
+The coordinator intentionally does not deduplicate `complete_shard` calls.
+Crash-retry tests can therefore observe duplicate completion records when a
+shard is re-leased after completion but before done-marking.
+
 ### ScanRuntimeError
 
 The runtime error surface has six current categories:
@@ -386,8 +406,7 @@ The runtime error surface has six current categories:
 - `Driver`
 
 `Driver(anyhow::Error)` is the catch-all for runtime execution failures such
-as scan-loop errors, event-forwarder join failures, and the still-unwired
-distributed family path.
+as scan-loop errors and event-forwarder join failures.
 
 ---
 
@@ -401,25 +420,27 @@ runtime:
 - `FindingsBatch`
 - `CommitSink`
 - `CliNoOpCommitSink`
-- `DurableCommitSink`
 
-`DurableCommitSink` is the bridge between scan-loop item lifecycle events
-and identity-chain recording for coordination diagnostics. It computes:
+Distributed receipt-driven execution implements that surface with
+`ReceiptCommitSink` in `src/distributed.rs`. The adapter accumulates compact
+finding batches, reconstructs the richer translation inputs expected by
+`translate_item_result`, and submits the resulting persistence work to the
+bounded commit pipeline. That translation path computes:
 
-- normalized secret hash input
-- tenant-scoped secret hash
+- tenant-scoped secret hash (derived from the bridge batch's `norm_hash`)
 - finding ID (using the rule-fingerprint resolver for position-independent rule identity)
 - occurrence ID
 
-The sink stores one `WriteContext` per shard-scoped runtime instance and a
-rule-fingerprint resolver (`Arc<dyn Fn(u32) -> RuleFingerprint>`). It uses
-the shared scope when deriving tenant-bound finding identity and forwards the
-same context on every `CommitProgressRecord` and `IdentityChainRecord`. The
+The distributed adapter stores one `WriteContext` per shard-scoped runtime
+instance and a rule-fingerprint resolver (`Arc<dyn Fn(u32) -> RuleFingerprint>`).
+It uses the shared scope when translating item results for durable persistence
+and forwards the same context on every `CommitProgressRecord`. The
 rule-fingerprint resolver translates positional `rule_id` values into stable
 `RuleFingerprint` values derived from the rule name.
 
-When a source does not provide an explicit version, the sink derives a
-stable surrogate object version from the item-key bytes.
+When a source does not provide an explicit version, `ReceiptCommitSink`
+derives a stable surrogate object version from the item-key bytes before
+calling `translate_item_result`.
 
 The sink's compact `FindingRecord` and `FindingsBatch` types are local bridge
 shapes. They are not the persistence-layer `FindingRecord`,
@@ -560,8 +581,12 @@ done checks, done marking, and event recording.
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones
 per shard, while `DistributedRuntimeError`
-distinguishes coordinator failures, scan-runtime failures, and local durability
-pipeline failures.
+distinguishes coordinator failures, scan-runtime failures, local durability
+pipeline failures, and unsupported assignment types.
+
+`run_worker` ties those types together into the lease loop, and
+`InMemoryCoordinator<A>` provides a harness implementation for unit tests and
+feature-gated downstream test support.
 
 ---
 
@@ -582,15 +607,19 @@ The runtime tests focus on the behavior that exists today:
 - distributed config defaults
 - distributed persistence handle cloning
 - distributed runtime error layering
+- distributed worker-loop lease accounting, done-ledger skips, and
+  receipt-derived completion
+- in-memory coordinator snapshots for completed shards and recorded events
 - CLI parsing and summary formatting
-- durable commit-sink identity derivation
+- receipt-driven identity derivation via translate_item_result
 - authoritative findings -> done-ledger commit ordering and item-level receipt
   construction
 - bounded execution -> commit backpressure and cancellation semantics
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources and verify the distributed type surface (lease construction,
-persistence cloning, config defaults, error layering).
+persistence cloning, config defaults, error layering, worker-loop accounting,
+and in-memory coordinator observations).
 
 ---
 
@@ -600,7 +629,7 @@ persistence cloning, config defaults, error layering).
 |---------|------|
 | Core runtime types and validation | `crates/gossip-scanner-runtime/src/lib.rs` |
 | CLI parsing and summary rendering | `crates/gossip-scanner-runtime/src/cli.rs` |
-| Commit sink types and durable identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Commit sink trait and bridge record types | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
 | Deterministic result-to-persistence translation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Durable findings -> done-ledger commit stage | `crates/gossip-scanner-runtime/src/result_committer.rs` |
 | Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
