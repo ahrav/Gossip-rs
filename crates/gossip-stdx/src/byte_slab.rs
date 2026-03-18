@@ -200,8 +200,9 @@ fn alloc_size(n: usize) -> Option<u32> {
     if n == 0 {
         return Some(0);
     }
-    let n = u32::try_from(n).ok()?;
-    n.max(MIN_BLOCK).checked_next_power_of_two()
+    checked_len_u32(n)?
+        .max(MIN_BLOCK)
+        .checked_next_power_of_two()
 }
 
 /// Computes startup free-list metadata capacity from slab byte capacity.
