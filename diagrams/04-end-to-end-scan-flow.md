@@ -11,8 +11,8 @@ surfaces.
 ## 1. Dual Entry Points -- CLI, Worker, and Distributed Runtime
 
 The CLI and worker binaries call the same filesystem and Git entrypoints.
-The distributed module currently exposes worker-loop foundation types instead
-of a callable placeholder entrypoint.
+The distributed module provides a receipt-driven `run_worker` loop and
+foundation types for coordinator-backed execution.
 
 ```mermaid
 %% Diagram: dual-entry-point-sequence
@@ -30,11 +30,11 @@ sequenceDiagram
     CLI->>RT: scan_fs(config) / scan_git(config)
     RT->>RT: validate path + budgets
     alt Filesystem request
-        RT->>OC: filesystem_placeholder(config, canonical_path)
-        OC-->>RT: ScanRuntimeError::Driver(...)
+        RT->>OC: scan_local_filesystem(config, canonical_path)
+        OC-->>RT: ScanReport
     else Git request
-        RT->>GR: local_repo_placeholder(config, canonical_repo)
-        GR-->>RT: ScanRuntimeError::Driver(...)
+        RT->>GR: scan_local_repo(config, canonical_repo)
+        GR-->>RT: ScanReport
     end
     RT-->>CLI: Result<ScanReport, ScanRuntimeError>
 
@@ -42,11 +42,11 @@ sequenceDiagram
     WRK->>RT: scan_fs(config) / scan_git(config)
     RT->>RT: validate path + budgets
     alt Filesystem request
-        RT->>OC: filesystem_placeholder(config, canonical_path)
-        OC-->>RT: ScanRuntimeError::Driver(...)
+        RT->>OC: scan_local_filesystem(config, canonical_path)
+        OC-->>RT: ScanReport
     else Git request
-        RT->>GR: local_repo_placeholder(config, canonical_repo)
-        GR-->>RT: ScanRuntimeError::Driver(...)
+        RT->>GR: scan_local_repo(config, canonical_repo)
+        GR-->>RT: ScanReport
     end
     RT-->>WRK: Result<ScanReport, ScanRuntimeError>
 
@@ -58,10 +58,9 @@ sequenceDiagram
 `Direct` and `Connector` modes converge on the same family modules inside the
 runtime crate.
 
-**Typed placeholders.** The filesystem and Git family modules report
-unimplemented execution through `ScanRuntimeError::Driver(...)` rather than
-panicking or relying on `todo!()`. The distributed type layer already carries a
-dedicated `DistributedRuntimeError` enum for the upcoming worker loop.
+**Family dispatch.** The filesystem and Git family modules route scan requests
+to `scan_local_filesystem` and `scan_local_repo` respectively. The distributed
+layer carries a dedicated `DistributedRuntimeError` enum for the worker loop.
 
 ---
 
@@ -83,8 +82,8 @@ graph TD
     end
 
     subgraph Runtime["gossip-scanner-runtime"]
-        OC["OrderedContentRuntime<br/>filesystem_placeholder(...)"]
-        GR["GitRepoRuntime<br/>local_repo_placeholder(...)"]
+        OC["OrderedContentRuntime<br/>scan_local_filesystem(...)"]
+        GR["GitRepoRuntime<br/>scan_local_repo(...)"]
     end
 
     subgraph Distributed["distributed.rs foundation"]
@@ -167,17 +166,16 @@ sequenceDiagram
     LOOP->>CS: begin_item(item_key, ItemMeta { stable_item_id, version })
     CS->>REC: record_commit_progress(Begin { item_key, size_hint })
 
-    loop For each finding in item
+    loop For each finding batch in item
         LOOP->>CS: upsert_findings(item_key, FindingsBatch)
-        CS->>CS: rule_fingerprint_resolver(rule_id) → RuleFingerprint
-        CS->>ID: NormHash::from_digest(...)
-        CS->>ID: key_secret_hash(...)
-        CS->>ID: derive_finding_id(...)
-        CS->>ID: derive_occurrence_id(...)
-        CS->>REC: record_identity_chain(IdentityChainRecord)
+        CS->>CS: accumulate FsFindingRecord values
     end
 
     LOOP->>CS: finish_item(item_key)
+    CS->>CS: translate_in_flight(item_key, InFlightItem)
+    CS->>CS: translate_item_result(findings, rule_fingerprint_resolver)
+    note right of CS: Batch identity derivation (NormHash, FindingId, OccurrenceId)
+    CS->>CS: submit QueuedCommit to commit pipeline
     CS->>REC: record_commit_progress(Finish { item_key })
 ```
 
@@ -185,11 +183,12 @@ sequenceDiagram
 enumerated and executed, while `EventOutput` receives a stable stream of
 runtime events.
 
-**Identity derivation stays local to the runtime.** `DurableCommitSink`
-computes the finding and occurrence identity chain without leaking identity
-logic into the family contracts. A rule-fingerprint resolver callback
-translates positional `rule_id` values into stable, name-derived
-`RuleFingerprint` values, ensuring finding identity is position-independent.
+**Identity derivation stays local to the runtime.** `ReceiptCommitSink`
+rebuilds the translation inputs for `translate_item_result`, which computes
+the finding and occurrence identity chain without leaking identity logic into
+the family contracts. A rule-fingerprint resolver callback translates
+positional `rule_id` values into stable, name-derived `RuleFingerprint`
+values, ensuring finding identity is position-independent.
 
 ---
 
@@ -204,8 +203,8 @@ graph TD
     B["scan_fs / scan_git"]
     C["Validate path + budgets"]
     D{"Source family"}
-    E["ordered_content::filesystem_placeholder"]
-    F["git_repo::local_repo_placeholder"]
+    E["ordered_content::scan_local_filesystem"]
+    F["git_repo::scan_local_repo"]
     G["Result&lt;ScanReport, ScanRuntimeError&gt;"]
     H["distributed.rs foundation types"]
     I["ShardLease&lt;A&gt;<br/>DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
@@ -261,7 +260,8 @@ assemble around coordination and durability backends.
 | Ordered-content runtime module | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Git runtime module | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Distributed runtime module | `crates/gossip-scanner-runtime/src/distributed.rs` |
-| Commit sink and identity derivation | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Commit sink trait and bridge record types | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| Deterministic identity derivation | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | Coordination event recorder types | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Filesystem execution engine | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`, `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
 | Git execution engine | `crates/scanner-git/src/runner.rs` |

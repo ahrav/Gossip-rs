@@ -8,13 +8,13 @@
 //! and error layering ([`DistributedRuntimeError`]).
 //!
 //! It also provides `ReceiptCommitSink`, the compatibility adapter that
-//! translates scan-driver `CommitSink` callbacks into receipt-driven commit
+//! translates scan-loop `CommitSink` callbacks into receipt-driven commit
 //! pipeline work.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Error as AnyError, Result, anyhow};
@@ -69,6 +69,13 @@ use crate::{
     result_translation::{ItemResult, ScanTiming, translate_item_result},
     scan_fs_with_prebuilt_engine,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::OwnedCoreEvent;
+#[cfg(any(test, feature = "test-support"))]
+use crate::coordination_sink::StoredGitEvent;
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::{HashSet, VecDeque};
 
 /// Assignment payloads expose their policy scope so leases can assert that the
 /// payload agrees with the shared write context.
@@ -147,6 +154,13 @@ impl<A> ShardLease<A> {
     #[inline]
     #[must_use]
     pub fn shard_id(&self) -> &str {
+        &self.shard_id
+    }
+
+    /// Arc-wrapped shard label for zero-allocation sharing.
+    #[inline]
+    #[must_use]
+    pub fn shard_id_arc(&self) -> &Arc<str> {
         &self.shard_id
     }
 
@@ -235,6 +249,10 @@ where
 ///
 /// The runtime clones these handles per shard. Production backends should make
 /// that cheap, for example by cloning an `Arc` or a pool handle.
+///
+/// Both backends must tolerate duplicate writes for the same
+/// `(write_context, item_key)` pair because the worker loop provides
+/// at-least-once delivery (see `run_filesystem_lease` for details).
 #[derive(Clone, Debug)]
 pub struct DistributedPersistence<F, D> {
     /// Findings sink handle cloned by the worker loop.
@@ -294,6 +312,19 @@ pub struct DistributedRunReport {
     pub shards_skipped_done: u64,
 }
 
+impl DistributedRunReport {
+    /// Assert the structural invariant in debug builds.
+    fn debug_assert_invariant(&self) {
+        debug_assert!(
+            self.shards_scanned + self.shards_skipped_done <= self.leases_seen,
+            "report invariant violated: scanned({}) + skipped({}) > seen({})",
+            self.shards_scanned,
+            self.shards_skipped_done,
+            self.leases_seen,
+        );
+    }
+}
+
 /// Distributed runtime error.
 #[derive(Debug)]
 pub enum DistributedRuntimeError {
@@ -303,6 +334,12 @@ pub enum DistributedRuntimeError {
     Runtime(ScanRuntimeError),
     /// The local durability pipeline failed.
     Durability(AnyError),
+    /// The lease assignment is not a supported type for this runtime
+    /// (e.g. non-filesystem assignment in a filesystem-only worker).
+    UnsupportedAssignment {
+        /// Shard label for the unsupported assignment.
+        shard_id: Arc<str>,
+    },
 }
 
 impl fmt::Display for DistributedRuntimeError {
@@ -311,6 +348,9 @@ impl fmt::Display for DistributedRuntimeError {
             Self::Coordinator(error) => write!(f, "coordinator error: {error}"),
             Self::Runtime(error) => write!(f, "runtime error: {error}"),
             Self::Durability(error) => write!(f, "durability pipeline error: {error}"),
+            Self::UnsupportedAssignment { shard_id } => {
+                write!(f, "unsupported assignment for shard {shard_id:?}")
+            }
         }
     }
 }
@@ -321,6 +361,7 @@ impl std::error::Error for DistributedRuntimeError {
             Self::Coordinator(error) => Some(error.as_ref()),
             Self::Runtime(error) => Some(error),
             Self::Durability(error) => Some(error.as_ref()),
+            Self::UnsupportedAssignment { .. } => None,
         }
     }
 }
@@ -342,34 +383,14 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 #[derive(Debug)]
 struct InFlightItem {
     sequence_no: u64,
-    item_key: ItemKey,
     meta: ItemMeta,
     findings: Vec<FsFindingRecord>,
-}
-
-/// Ordered record of one item successfully handed to the commit pipeline.
-///
-/// Bookkeeping only — used by [`wait_for_submitted_commits`] to verify that
-/// every submitted sequence number produced a matching durable outcome.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SubmittedCommit {
-    sequence_no: u64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl SubmittedCommit {
-    #[inline]
-    #[must_use]
-    fn sequence_no(&self) -> u64 {
-        self.sequence_no
-    }
 }
 
 /// Scan-driver commit sink that bridges begin/upsert/finish callbacks into the
 /// receipt-driven commit pipeline.
 ///
-/// The existing scan-driver seam still emits compact `ItemMeta` and
+/// The existing scan-loop seam still emits compact `ItemMeta` and
 /// `FindingRecord` batches rather than the richer runtime commit inputs.
 /// `ReceiptCommitSink` reconstructs the deterministic translation inputs
 /// expected by the shared commit pipeline so ordered-content execution can
@@ -377,8 +398,7 @@ impl SubmittedCommit {
 ///
 /// # Threading model
 ///
-/// Like [`DurableCommitSink`](crate::commit_sink::DurableCommitSink), this
-/// sink is driven by a single-threaded drain loop. The interior `Mutex`
+/// This sink is driven by a single-threaded drain loop. The interior `Mutex`
 /// fields satisfy the `Send + Sync` bound required by [`CommitSink`] without
 /// introducing real contention. Sequence numbers assigned by
 /// [`next_sequence_no`](Self::next_sequence_no) are therefore monotonically
@@ -393,8 +413,12 @@ struct ReceiptCommitSink {
     rule_fingerprint: Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>,
     submitter: CommitPipelineSender,
     next_sequence_no: AtomicU64,
-    in_flight: Mutex<BTreeMap<Vec<u8>, InFlightItem>>,
-    submitted: Mutex<Vec<SubmittedCommit>>,
+    in_flight: Mutex<BTreeMap<ItemKey, InFlightItem>>,
+    submitted: Mutex<Vec<u64>>,
+    /// First-failure-only flag for progress telemetry. Mirrors
+    /// `CoordinationEventSink`'s suppression to avoid flooding logs during
+    /// sustained recorder outages.
+    progress_error_logged: AtomicBool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -417,13 +441,16 @@ impl ReceiptCommitSink {
             next_sequence_no: AtomicU64::new(0),
             in_flight: Mutex::new(BTreeMap::new()),
             submitted: Mutex::new(Vec::new()),
+            progress_error_logged: AtomicBool::new(false),
         }
     }
 
-    /// Consume the sink and return the ordered list of successfully submitted
-    /// commits. Returns an error if any items remain in-flight (indicating a
-    /// protocol violation by the caller) or if a mutex is poisoned.
-    fn finish(self) -> Result<Vec<SubmittedCommit>> {
+    /// Consume the sink and return the sequence numbers of successfully
+    /// submitted commits. Returns an error if any items remain in-flight
+    /// (either because the caller violated the begin/upsert/finish protocol
+    /// or because an earlier translation/submission failure rolled the item
+    /// back into the in-flight map) or if a mutex is poisoned.
+    fn finish(self) -> Result<Vec<u64>> {
         let in_flight = self
             .in_flight
             .into_inner()
@@ -469,19 +496,22 @@ impl ReceiptCommitSink {
     /// Records a begin-progress event for telemetry.
     ///
     /// Recorder errors are intentionally non-fatal: durability flows through
-    /// the commit pipeline, not the recorder. This diverges from
-    /// `DurableCommitSink` where recorder errors are propagated because the
-    /// recorder IS the durability path.
+    /// the commit pipeline, not the recorder.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
-        if let Err(e) = self.recorder.record_commit_progress(
+        if let Err(error) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Begin {
                 write_context: self.write_context,
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: item_key.clone(),
                 size_hint: meta.size_hint,
             },
-        ) {
-            tracing::debug!(shard_id = %self.shard_id, %e, "record_begin telemetry failed");
+        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
         }
     }
 
@@ -493,14 +523,19 @@ impl ReceiptCommitSink {
     /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
     /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
-        if let Err(e) = self.recorder.record_commit_progress(
+        if let Err(error) = self.recorder.record_commit_progress(
             &self.shard_id,
             CommitProgressRecord::Finish {
                 write_context: self.write_context,
-                item_key: item_key.as_bytes().to_vec(),
+                item_key: item_key.clone(),
             },
-        ) {
-            tracing::debug!(shard_id = %self.shard_id, %e, "record_finish telemetry failed");
+        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
         }
     }
 
@@ -511,18 +546,16 @@ impl ReceiptCommitSink {
     /// When the item has no explicit `version`, a weak version derived from
     /// the item key bytes is used. When the item key is valid UTF-8, a
     /// display-only [`Location`] is attached for diagnostics.
-    fn translate_in_flight(&self, item: &InFlightItem) -> Result<QueuedCommit> {
+    fn translate_in_flight(&self, item_key: &ItemKey, item: &InFlightItem) -> Result<QueuedCommit> {
         let timing = Self::logical_timing_for(item.sequence_no)?;
         let bytes_scanned = item.meta.size_hint.unwrap_or(0);
         let version = item.meta.version.unwrap_or_else(|| {
-            VersionId::Weak(ObjectVersionId::from_version_bytes(
-                item.item_key.as_bytes(),
-            ))
+            VersionId::Weak(ObjectVersionId::from_version_bytes(item_key.as_bytes()))
         });
-        let checkpoint_cursor = Cursor::with_last_key(item.item_key.clone());
-        let item_ref = ItemRef::try_from_slice(item.item_key.as_bytes())?;
+        let checkpoint_cursor = Cursor::with_last_key(item_key.clone());
+        let item_ref = ItemRef::try_from_slice(item_key.as_bytes())?;
         let mut scan_item = ScanItem::new(
-            item.item_key.clone(),
+            item_key.clone(),
             item_ref,
             item.meta.stable_item_id,
             version,
@@ -556,18 +589,36 @@ impl ReceiptCommitSink {
             translation,
         ))
     }
+
+    /// Re-insert a removed item into the in-flight map on translation or
+    /// submission failure.
+    ///
+    /// Uses `unwrap_or_else` to recover through a poisoned mutex because the
+    /// rollback is not on the durability path — see the struct-level threading
+    /// model documentation.
+    fn rollback_in_flight(&self, key: ItemKey, item: InFlightItem) {
+        let overwritten = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, item);
+        debug_assert!(
+            overwritten.is_none(),
+            "rollback re-insert overwrote a concurrent begin_item entry; \
+             ReceiptCommitSink must be driven by a single-threaded drain loop"
+        );
+    }
 }
 
 impl CommitSink for ReceiptCommitSink {
     fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()> {
-        let key_bytes = item_key.as_bytes().to_vec();
         let mut guard = self
             .in_flight
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
 
         use std::collections::btree_map::Entry;
-        match guard.entry(key_bytes) {
+        match guard.entry(item_key.clone()) {
             Entry::Occupied(_) => {
                 return Err(anyhow::anyhow!(
                     "begin_item called twice without finish_item for the same item"
@@ -577,7 +628,6 @@ impl CommitSink for ReceiptCommitSink {
                 let sequence_no = self.next_sequence_no();
                 slot.insert(InFlightItem {
                     sequence_no,
-                    item_key: item_key.clone(),
                     meta: meta.clone(),
                     findings: Vec::new(),
                 });
@@ -595,8 +645,10 @@ impl CommitSink for ReceiptCommitSink {
             .lock()
             .map_err(|_| anyhow::anyhow!("receipt commit sink in-flight state lock poisoned"))?;
         let item = guard
-            .get_mut(item_key.as_bytes())
+            .get_mut(item_key)
             .ok_or_else(|| anyhow::anyhow!("upsert_findings called before begin_item for item"))?;
+
+        batch.validate()?;
 
         // The CommitSink surface provides only start/end offsets.
         // Root-hint fields are unavailable through this bridge, so both
@@ -619,54 +671,30 @@ impl CommitSink for ReceiptCommitSink {
     }
 
     fn finish_item(&self, item_key: &ItemKey) -> Result<()> {
-        let key_bytes = item_key.as_bytes();
-
         // Remove the item under a short-lived lock. Translation and
         // submission happen outside the critical section to minimize lock
         // hold duration. The interior mutex satisfies `Send + Sync` bounds
         // but the sink is driven by a single-threaded drain loop.
-        let item = {
+        let (removed_key, item) = {
             let mut guard = self.in_flight.lock().map_err(|_| {
                 anyhow::anyhow!("receipt commit sink in-flight state lock poisoned")
             })?;
             guard
-                .remove(key_bytes)
+                .remove_entry(item_key)
                 .ok_or_else(|| anyhow::anyhow!("finish_item called before begin_item for item"))?
         };
 
         let sequence_no = item.sequence_no;
-        let work = match self.translate_in_flight(&item) {
+        let work = match self.translate_in_flight(&removed_key, &item) {
             Ok(work) => work,
             Err(err) => {
-                // Rollback: re-insert so the caller can retry. Recover
-                // through a poisoned mutex rather than losing the item.
-                let overwritten = self
-                    .in_flight
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key_bytes.to_vec(), item);
-                debug_assert!(
-                    overwritten.is_none(),
-                    "rollback re-insert overwrote a concurrent begin_item entry; \
-                     ReceiptCommitSink must be driven by a single-threaded drain loop"
-                );
+                self.rollback_in_flight(removed_key, item);
                 return Err(err);
             }
         };
 
         if let Err(error) = self.submitter.submit(work) {
-            // Rollback: re-insert so the caller can retry. Recover through
-            // a poisoned mutex rather than silently losing the item.
-            let overwritten = self
-                .in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key_bytes.to_vec(), item);
-            debug_assert!(
-                overwritten.is_none(),
-                "rollback re-insert overwrote a concurrent begin_item entry; \
-                 ReceiptCommitSink must be driven by a single-threaded drain loop"
-            );
+            self.rollback_in_flight(removed_key, item);
             return Err(anyhow::anyhow!(
                 "execution to commit submission failed: {error}"
             ));
@@ -679,7 +707,7 @@ impl CommitSink for ReceiptCommitSink {
         self.submitted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(SubmittedCommit { sequence_no });
+            .push(sequence_no);
 
         self.record_finish(item_key);
         Ok(())
@@ -801,10 +829,14 @@ where
 /// against the committed sequence numbers drained from that stream.
 #[cfg_attr(not(test), allow(dead_code))]
 fn wait_for_submitted_commits(
-    mut submitted: Vec<SubmittedCommit>,
+    mut submitted: Vec<u64>,
     mut committed_sequence_nos: Vec<u64>,
 ) -> Result<()> {
-    submitted.sort_by_key(SubmittedCommit::sequence_no);
+    // Items can finish out of sequence-number order (the atomic counter
+    // assigns sequence numbers at begin_item, but finish_item order depends
+    // on scan duration per item). Sort both sides so the pairwise comparison
+    // below can detect mismatches by value, not by arrival order.
+    submitted.sort_unstable();
     committed_sequence_nos.sort_unstable();
 
     // Reject duplicate sequence numbers — structurally impossible today
@@ -812,7 +844,7 @@ fn wait_for_submitted_commits(
     // guard against future regressions.
     if let Some(dup) = submitted
         .windows(2)
-        .find_map(|w| (w[0].sequence_no() == w[1].sequence_no()).then_some(w[0].sequence_no()))
+        .find_map(|w| (w[0] == w[1]).then_some(w[0]))
     {
         return Err(anyhow!("duplicate submitted sequence number {dup}"));
     }
@@ -831,11 +863,7 @@ fn wait_for_submitted_commits(
         ));
     }
 
-    for (expected, actual) in submitted
-        .into_iter()
-        .map(|entry| entry.sequence_no())
-        .zip(committed_sequence_nos.into_iter())
-    {
+    for (expected, actual) in submitted.into_iter().zip(committed_sequence_nos) {
         if expected != actual {
             return Err(anyhow!(
                 "submitted commit sequence {} did not match durable outcome sequence {}",
@@ -885,6 +913,22 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
 /// 6. `mark_shard_done` records the shard as complete in the done-ledger.
 ///
 /// If any step fails, the shard is not marked done and will be retried.
+/// On error, the caller is responsible for releasing the lease.
+///
+/// # Completion protocol — `acknowledge_checkpoint` failure
+///
+/// If `acknowledge_checkpoint` fails after `complete_shard` succeeds, the
+/// shard is not marked done and will be re-scanned on retry. This relies on
+/// the `complete_shard` idempotency contract documented on
+/// [`DistributedCoordinator`].
+///
+/// # At-least-once delivery
+///
+/// If `complete_shard` succeeds but `mark_shard_done` fails, the shard will
+/// be re-leased on the next worker iteration. The re-execution replays the
+/// full scan-and-commit cycle, producing duplicate `FindingsSink` writes and
+/// `DoneLedger` upserts. Both persistence backends must therefore be
+/// idempotent for the same `(write_context, item_key)` pair.
 #[cfg_attr(not(test), allow(dead_code))]
 fn run_filesystem_lease<A, F, D>(
     coordinator: &dyn DistributedCoordinator<A>,
@@ -905,11 +949,8 @@ where
     let scan_config = lease
         .assignment()
         .filesystem_scan_config()
-        .ok_or_else(|| {
-            DistributedRuntimeError::Coordinator(anyhow!(
-                "shard '{}' lease assignment does not carry a filesystem scan config",
-                lease.shard_id()
-            ))
+        .ok_or_else(|| DistributedRuntimeError::UnsupportedAssignment {
+            shard_id: Arc::clone(lease.shard_id_arc()),
         })?
         .with_workers(1)
         .with_budgets(config.budgets)
@@ -936,7 +977,7 @@ where
             as Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>
     };
 
-    let sink = CoordinationEventSink::new(recorder.clone(), Arc::from(lease.shard_id()));
+    let sink = CoordinationEventSink::new(recorder.clone(), Arc::clone(lease.shard_id_arc()));
     let cancel = CancellationToken::new();
     let pipeline = CommitPipeline::start(
         persistence.findings_sink.clone(),
@@ -951,7 +992,7 @@ where
     let (submitter, drainer) = pipeline.split();
     let commit = ReceiptCommitSink::new(
         recorder,
-        Arc::from(lease.shard_id()),
+        Arc::clone(lease.shard_id_arc()),
         lease.write_context(),
         lease.tenant_secret_key(),
         rule_fingerprint,
@@ -975,14 +1016,20 @@ where
     // pipeline, the scan typically sees a downstream "pipeline cancelled"
     // Runtime error. Evaluating the drain result first exposes the root cause
     // instead of the cancellation symptom.
+    //
+    // Runtime errors are checked before submitted-commit accounting because a
+    // failed `finish_item` rolls the item back into the in-flight map, which
+    // makes `commit.finish()` return "items still in flight". Checking
+    // `outcome` first preserves the original translation/span error rather
+    // than surfacing its consequence.
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
     } = stage_result
         .map_err(DistributedRuntimeError::Durability)?
         .map_err(DistributedRuntimeError::Durability)?;
-    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
 
     let committed_units = committed_sequence_nos.len() as u64;
 
@@ -1049,9 +1096,345 @@ where
     Ok(())
 }
 
+/// Run the distributed worker loop until the coordinator has no more leases.
+///
+/// Each iteration either skips an already-complete shard, executes one
+/// filesystem lease through the receipt-driven durability path, or stops with a
+/// safe error when the assignment does not expose a filesystem scan config.
+///
+/// The loop is **fail-fast**: it terminates on the first per-shard error.
+/// Progress accumulated before the failure is not returned to the caller —
+/// the `Err` variant carries only the error. The caller is responsible for
+/// retry or requeue. Lease release on error paths is best-effort: the
+/// original error is returned even if the release itself fails (a warning is
+/// logged in that case).
+pub fn run_worker<A, F, D>(
+    coordinator: &dyn DistributedCoordinator<A>,
+    persistence: DistributedPersistence<F, D>,
+    config: DistributedRuntimeConfig,
+) -> Result<DistributedRunReport, DistributedRuntimeError>
+where
+    A: ShardLeaseAssignment,
+    F: FindingsSink + Clone + Send + Sync + 'static,
+    D: DoneLedger + Clone + Send + Sync + 'static,
+    F::Error: std::error::Error + Send + Sync + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    let recorder = coordinator.event_recorder();
+    let mut report = DistributedRunReport::default();
+
+    let release_best_effort = |lease: &ShardLease<A>| {
+        if let Err(release_err) = coordinator.release_shard(lease) {
+            tracing::warn!(
+                shard_id = %lease.shard_id(),
+                %release_err,
+                "best-effort lease release failed; may remain acquired until lease TTL expires",
+            );
+        }
+    };
+
+    loop {
+        let lease = match coordinator.acquire_shard() {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shards_skipped_done = report.shards_skipped_done,
+                    "worker loop terminating: shard acquisition failed",
+                );
+                return Err(DistributedRuntimeError::Coordinator(e));
+            }
+        };
+        report.leases_seen = report.leases_seen.saturating_add(1);
+
+        let is_done = match coordinator.is_shard_done(&lease) {
+            Ok(done) => done,
+            Err(e) => {
+                release_best_effort(&lease);
+                tracing::warn!(
+                    error = %e,
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shards_skipped_done = report.shards_skipped_done,
+                    "worker loop terminating: done-ledger check failed",
+                );
+                return Err(DistributedRuntimeError::Coordinator(e));
+            }
+        };
+
+        if is_done {
+            release_best_effort(&lease);
+            report.shards_skipped_done = report.shards_skipped_done.saturating_add(1);
+            continue;
+        }
+
+        if let Err(e) = run_filesystem_lease(
+            coordinator,
+            Arc::clone(&recorder),
+            &persistence,
+            &lease,
+            config,
+        ) {
+            release_best_effort(&lease);
+            tracing::warn!(
+                error = %e,
+                leases_seen = report.leases_seen,
+                shards_scanned = report.shards_scanned,
+                shards_skipped_done = report.shards_skipped_done,
+                "worker loop terminating: filesystem lease execution failed",
+            );
+            return Err(e);
+        }
+        report.shards_scanned = report.shards_scanned.saturating_add(1);
+    }
+
+    report.debug_assert_invariant();
+    Ok(report)
+}
+
+/// In-memory coordinator used by tests and local harnesses.
+///
+/// The coordinator stores leases, shard lifecycle transitions, and recorder
+/// output behind one mutex-protected state bundle. `complete_shard` is
+/// intentionally non-idempotent so crash-retry tests can observe duplicate
+/// completions when a shard is re-leased between completion and done-marking.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub struct InMemoryCoordinator<A> {
+    state: Arc<Mutex<InMemoryCoordinatorState<A>>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct InMemoryCoordinatorState<A> {
+    queue: VecDeque<ShardLease<A>>,
+    done: HashSet<String>,
+    done_mark_contexts: Vec<WriteContext>,
+    released: Vec<String>,
+    completed: Vec<CompletedShard>,
+    core_events: Vec<(String, OwnedCoreEvent)>,
+    git_events: Vec<(String, StoredGitEvent)>,
+    commit_progress: Vec<(String, CommitProgressRecord)>,
+    acquire_fail_count: usize,
+    release_fail_count: usize,
+    is_done_fail_count: usize,
+    complete_fail_count: usize,
+    mark_done_fail_count: usize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> Default for InMemoryCoordinatorState<A> {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            done: HashSet::new(),
+            done_mark_contexts: Vec::new(),
+            released: Vec::new(),
+            completed: Vec::new(),
+            core_events: Vec::new(),
+            git_events: Vec::new(),
+            commit_progress: Vec::new(),
+            acquire_fail_count: 0,
+            release_fail_count: 0,
+            is_done_fail_count: 0,
+            complete_fail_count: 0,
+            mark_done_fail_count: 0,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedShard {
+    pub shard_id: String,
+    pub checkpoint: Option<Cursor>,
+    pub report: ScanReport,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> InMemoryCoordinator<A> {
+    /// Create a coordinator pre-loaded with the provided lease queue.
+    #[must_use]
+    pub fn new(leases: Vec<ShardLease<A>>) -> Self {
+        let queue = VecDeque::from(leases);
+        Self {
+            state: Arc::new(Mutex::new(InMemoryCoordinatorState {
+                queue,
+                ..InMemoryCoordinatorState::default()
+            })),
+        }
+    }
+
+    /// Pre-mark a shard as done so the worker loop skips it.
+    pub fn mark_done(&self, shard_id: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .done
+            .insert(shard_id.into());
+    }
+
+    /// Snapshot of the in-memory done set.
+    #[must_use]
+    pub fn done_set(&self) -> HashSet<String> {
+        self.state.lock().expect("state lock").done.clone()
+    }
+
+    /// Snapshot of the write contexts used for `mark_shard_done`.
+    #[must_use]
+    pub fn done_mark_contexts(&self) -> Vec<WriteContext> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .done_mark_contexts
+            .clone()
+    }
+
+    /// Snapshot of shards released without completion.
+    #[must_use]
+    pub fn released_shards(&self) -> Vec<String> {
+        self.state.lock().expect("state lock").released.clone()
+    }
+
+    /// Snapshot of completed shard records.
+    #[must_use]
+    pub fn completed_shards(&self) -> Vec<CompletedShard> {
+        self.state.lock().expect("state lock").completed.clone()
+    }
+
+    /// Cause the next `count` calls to `acquire_shard` to return an error.
+    pub fn fail_next_acquires(&self, count: usize) {
+        self.state.lock().expect("state lock").acquire_fail_count = count;
+    }
+
+    /// Cause the next `count` calls to `release_shard` to return an error.
+    pub fn fail_next_releases(&self, count: usize) {
+        self.state.lock().expect("state lock").release_fail_count = count;
+    }
+
+    /// Cause the next `count` calls to `is_shard_done` to return an error.
+    pub fn fail_next_is_done_checks(&self, count: usize) {
+        self.state.lock().expect("state lock").is_done_fail_count = count;
+    }
+
+    /// Cause the next `count` calls to `complete_shard` to return an error.
+    pub fn fail_next_completes(&self, count: usize) {
+        self.state.lock().expect("state lock").complete_fail_count = count;
+    }
+
+    /// Cause the next `count` calls to `mark_shard_done` to return an error.
+    pub fn fail_next_mark_done(&self, count: usize) {
+        self.state.lock().expect("state lock").mark_done_fail_count = count;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> DistributedCoordinator<A> for InMemoryCoordinator<A>
+where
+    A: ShardLeaseAssignment + Send + Sync + 'static,
+{
+    fn acquire_shard(&self) -> Result<Option<ShardLease<A>>> {
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.acquire_fail_count > 0 {
+            guard.acquire_fail_count -= 1;
+            return Err(anyhow!("injected acquire_shard failure"));
+        }
+        Ok(guard.queue.pop_front())
+    }
+
+    fn release_shard(&self, lease: &ShardLease<A>) -> Result<()> {
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.release_fail_count > 0 {
+            guard.release_fail_count -= 1;
+            return Err(anyhow!("injected release_shard failure"));
+        }
+        guard.released.push(lease.shard_id().to_owned());
+        Ok(())
+    }
+
+    fn complete_shard(
+        &self,
+        lease: &ShardLease<A>,
+        checkpoint: Option<Cursor>,
+        report: ScanReport,
+    ) -> Result<()> {
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.complete_fail_count > 0 {
+            guard.complete_fail_count -= 1;
+            return Err(anyhow!("injected complete_shard failure"));
+        }
+        guard.completed.push(CompletedShard {
+            shard_id: lease.shard_id().to_owned(),
+            checkpoint,
+            report,
+        });
+        Ok(())
+    }
+
+    fn is_shard_done(&self, lease: &ShardLease<A>) -> Result<bool> {
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.is_done_fail_count > 0 {
+            guard.is_done_fail_count -= 1;
+            return Err(anyhow!("injected is_shard_done failure"));
+        }
+        Ok(guard.done.contains(lease.shard_id()))
+    }
+
+    fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()> {
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.mark_done_fail_count > 0 {
+            guard.mark_done_fail_count -= 1;
+            return Err(anyhow!("injected mark_shard_done failure"));
+        }
+        guard.done.insert(lease.shard_id().to_owned());
+        guard.done_mark_contexts.push(lease.write_context());
+        Ok(())
+    }
+
+    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
+        Arc::new(Self {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<A> CoordinationEventRecorder for InMemoryCoordinator<A>
+where
+    A: Send + Sync + 'static,
+{
+    fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .core_events
+            .push((shard_id.to_owned(), event));
+        Ok(())
+    }
+
+    fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .git_events
+            .push((shard_id.to_owned(), event));
+        Ok(())
+    }
+
+    fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .commit_progress
+            .push((shard_id.to_owned(), event));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::fs;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1072,7 +1455,7 @@ mod tests {
         CancellationToken, OwnedCoreEvent,
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
-        coordination_sink::{CommitProgressRecord, IdentityChainRecord, StoredGitEvent},
+        coordination_sink::{CommitProgressRecord, StoredGitEvent},
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1100,7 +1483,6 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         progress: Mutex<Vec<CommitProgressRecord>>,
-        identity: Mutex<Vec<IdentityChainRecord>>,
     }
 
     impl CoordinationEventRecorder for Recorder {
@@ -1119,107 +1501,6 @@ mod tests {
         ) -> Result<()> {
             self.progress.lock().expect("progress lock").push(event);
             Ok(())
-        }
-
-        fn record_identity_chain(
-            &self,
-            _shard_id: &str,
-            record: crate::coordination_sink::IdentityChainRecord,
-        ) -> Result<()> {
-            self.identity.lock().expect("identity lock").push(record);
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct CompletedShard {
-        shard_id: String,
-        checkpoint: Option<Cursor>,
-        report: ScanReport,
-    }
-
-    #[derive(Default)]
-    struct TestCoordinatorState {
-        completed: Vec<CompletedShard>,
-        released: Vec<String>,
-        done: HashSet<String>,
-        done_mark_contexts: Vec<WriteContext>,
-    }
-
-    #[derive(Clone, Default)]
-    struct TestCoordinator {
-        recorder: Arc<Recorder>,
-        state: Arc<Mutex<TestCoordinatorState>>,
-    }
-
-    impl TestCoordinator {
-        fn completed_shards(&self) -> Vec<CompletedShard> {
-            self.state.lock().expect("state lock").completed.clone()
-        }
-
-        fn done_set(&self) -> HashSet<String> {
-            self.state.lock().expect("state lock").done.clone()
-        }
-
-        fn done_mark_contexts(&self) -> Vec<WriteContext> {
-            self.state
-                .lock()
-                .expect("state lock")
-                .done_mark_contexts
-                .clone()
-        }
-    }
-
-    impl DistributedCoordinator<StubAssignment> for TestCoordinator {
-        fn acquire_shard(&self) -> Result<Option<ShardLease<StubAssignment>>> {
-            Ok(None)
-        }
-
-        fn release_shard(&self, lease: &ShardLease<StubAssignment>) -> Result<()> {
-            self.state
-                .lock()
-                .expect("state lock")
-                .released
-                .push(lease.shard_id().to_owned());
-            Ok(())
-        }
-
-        fn complete_shard(
-            &self,
-            lease: &ShardLease<StubAssignment>,
-            checkpoint: Option<Cursor>,
-            report: ScanReport,
-        ) -> Result<()> {
-            self.state
-                .lock()
-                .expect("state lock")
-                .completed
-                .push(CompletedShard {
-                    shard_id: lease.shard_id().to_owned(),
-                    checkpoint,
-                    report,
-                });
-            Ok(())
-        }
-
-        fn is_shard_done(&self, lease: &ShardLease<StubAssignment>) -> Result<bool> {
-            Ok(self
-                .state
-                .lock()
-                .expect("state lock")
-                .done
-                .contains(lease.shard_id()))
-        }
-
-        fn mark_shard_done(&self, lease: &ShardLease<StubAssignment>) -> Result<()> {
-            let mut guard = self.state.lock().expect("state lock");
-            guard.done.insert(lease.shard_id().to_owned());
-            guard.done_mark_contexts.push(lease.write_context());
-            Ok(())
-        }
-
-        fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
-            self.recorder.clone()
         }
     }
 
@@ -1446,6 +1727,22 @@ mod tests {
             msg.contains("shard-z"),
             "should propagate shard id through display chain"
         );
+
+        let unsupported = DistributedRuntimeError::UnsupportedAssignment {
+            shard_id: Arc::from("shard-nope"),
+        };
+        assert!(
+            unsupported.to_string().contains("unsupported assignment"),
+            "should contain variant description"
+        );
+        assert!(
+            unsupported.to_string().contains("shard-nope"),
+            "should include shard id"
+        );
+        assert!(
+            std::error::Error::source(&unsupported).is_none(),
+            "UnsupportedAssignment is a leaf error"
+        );
     }
 
     #[test]
@@ -1469,21 +1766,14 @@ mod tests {
 
     #[test]
     fn wait_for_submitted_commits_accepts_matching_sequences_out_of_order() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 2 },
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-        ];
+        let submitted = vec![2, 0, 1];
 
         wait_for_submitted_commits(submitted, vec![1, 2, 0]).expect("matching sequences");
     }
 
     #[test]
     fn wait_for_submitted_commits_rejects_mismatched_sequences() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-        ];
+        let submitted = vec![0, 1];
         let err = wait_for_submitted_commits(submitted, vec![0, 2])
             .expect_err("mismatched sequences should fail");
 
@@ -1496,11 +1786,7 @@ mod tests {
 
     #[test]
     fn wait_for_submitted_commits_rejects_duplicate_submitted_sequences() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-            SubmittedCommit { sequence_no: 1 },
-        ];
+        let submitted = vec![0, 1, 1];
         let err = wait_for_submitted_commits(submitted, vec![0, 1, 1])
             .expect_err("duplicate submitted sequences should fail");
 
@@ -1513,17 +1799,37 @@ mod tests {
 
     #[test]
     fn wait_for_submitted_commits_rejects_duplicate_committed_sequences() {
-        let submitted = vec![
-            SubmittedCommit { sequence_no: 0 },
-            SubmittedCommit { sequence_no: 1 },
-            SubmittedCommit { sequence_no: 2 },
-        ];
+        let submitted = vec![0, 1, 2];
         let err = wait_for_submitted_commits(submitted, vec![0, 2, 2])
             .expect_err("duplicate committed sequences should fail");
 
         assert!(
             err.to_string()
                 .contains("duplicate committed sequence number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_fewer_committed_than_submitted() {
+        let err = wait_for_submitted_commits(vec![0, 1], vec![0])
+            .expect_err("fewer committed than submitted should fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("submitted 2 commit(s) but commit stage produced 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_submitted_commits_rejects_more_committed_than_submitted() {
+        let err = wait_for_submitted_commits(vec![0], vec![0, 1])
+            .expect_err("more committed than submitted should fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("submitted 1 commit(s) but commit stage produced 2"),
             "unexpected error: {err}"
         );
     }
@@ -1544,17 +1850,8 @@ mod tests {
         sink.begin_item(&second, &meta).expect("begin second item");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        assert_eq!(
-            guard.get(first.as_bytes()).expect("first item").sequence_no,
-            0
-        );
-        assert_eq!(
-            guard
-                .get(second.as_bytes())
-                .expect("second item")
-                .sequence_no,
-            1
-        );
+        assert_eq!(guard.get(&first).expect("first item").sequence_no, 0);
+        assert_eq!(guard.get(&second).expect("second item").sequence_no, 1);
         drop(guard);
 
         pipeline.shutdown().expect("worker should join");
@@ -1578,7 +1875,7 @@ mod tests {
 
         let submitted = sink.finish().expect("sink finish");
         assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].sequence_no(), 0);
+        assert_eq!(submitted[0], 0);
 
         match pipeline
             .recv_timeout(Duration::from_secs(1))
@@ -1612,7 +1909,7 @@ mod tests {
                 size_hint,
             } => {
                 assert_eq!(*got, write_context());
-                assert_eq!(got_key, item_key.as_bytes());
+                assert_eq!(got_key, &item_key);
                 assert_eq!(*size_hint, meta.size_hint);
             }
             other => panic!("expected begin progress record, got {other:?}"),
@@ -1623,7 +1920,7 @@ mod tests {
                 item_key: got_key,
             } => {
                 assert_eq!(*got, write_context());
-                assert_eq!(got_key, item_key.as_bytes());
+                assert_eq!(got_key, &item_key);
             }
             other => panic!("expected finish progress record, got {other:?}"),
         }
@@ -1647,9 +1944,7 @@ mod tests {
         .expect("upsert findings");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        let item = guard
-            .get(item_key.as_bytes())
-            .expect("item should remain in flight");
+        let item = guard.get(&item_key).expect("item should remain in flight");
         assert_eq!(
             item.findings,
             vec![FsFindingRecord {
@@ -1690,10 +1985,7 @@ mod tests {
             .expect("begin after failed duplicate");
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert_eq!(
-            guard
-                .get(next_key.as_bytes())
-                .expect("next item")
-                .sequence_no,
+            guard.get(&next_key).expect("next item").sequence_no,
             1,
             "failed begin must not waste a sequence number"
         );
@@ -1806,7 +2098,7 @@ mod tests {
         .expect("second upsert");
 
         let guard = sink.in_flight.lock().expect("in flight lock");
-        let item = guard.get(key.as_bytes()).expect("item in flight");
+        let item = guard.get(&key).expect("item in flight");
         assert_eq!(item.findings.len(), 2, "both batches should accumulate");
         assert_eq!(item.findings[0].rule_id, 7);
         assert_eq!(item.findings[1].rule_id, 8);
@@ -1919,6 +2211,146 @@ mod tests {
     }
 
     #[test]
+    fn translate_in_flight_uses_item_key_surrogate_version_when_version_is_missing() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/version-compare.txt");
+        let meta_without_version = ItemMeta {
+            stable_item_id: StableItemId::from_bytes([0x44; 32]),
+            version: None,
+            size_hint: Some(256),
+        };
+        let meta_with_explicit_version = ItemMeta {
+            stable_item_id: meta_without_version.stable_item_id,
+            version: Some(VersionId::Strong(ObjectVersionId::from_version_bytes(
+                b"explicit-v1",
+            ))),
+            size_hint: meta_without_version.size_hint,
+        };
+        let findings = vec![FsFindingRecord {
+            rule_id: 7,
+            root_hint_start: 10,
+            root_hint_end: 20,
+            span_start: 10,
+            span_end: 20,
+            norm_hash: [0x55; 32],
+            confidence_score: 6,
+        }];
+
+        let (_, _, implicit_translation) = sink
+            .translate_in_flight(
+                &key,
+                &InFlightItem {
+                    sequence_no: 0,
+                    meta: meta_without_version,
+                    findings: findings.clone(),
+                },
+            )
+            .expect("surrogate-version translation")
+            .into_parts();
+        let (_, _, explicit_translation) = sink
+            .translate_in_flight(
+                &key,
+                &InFlightItem {
+                    sequence_no: 0,
+                    meta: meta_with_explicit_version,
+                    findings,
+                },
+            )
+            .expect("explicit-version translation")
+            .into_parts();
+
+        assert_eq!(
+            implicit_translation.findings()[0].finding_id(),
+            explicit_translation.findings()[0].finding_id(),
+            "finding identity must stay version-independent",
+        );
+        assert_ne!(
+            implicit_translation.occurrences()[0].occurrence_id(),
+            explicit_translation.occurrences()[0].occurrence_id(),
+            "missing-version translation must derive occurrence identity from the item-key surrogate version",
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn upsert_findings_rejects_empty_span() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/bad-span.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![
+                        finding(),
+                        FindingRecord {
+                            rule_id: 8,
+                            start: 30,
+                            end: 30,
+                            norm_hash: [0x66; 32],
+                            confidence_score: 9,
+                        },
+                    ],
+                },
+            )
+            .expect_err("empty span must be rejected at upsert time");
+        assert!(
+            err.to_string()
+                .contains("finding at index 1 has invalid span"),
+            "unexpected error: {err}"
+        );
+
+        // The item is still in-flight — the batch was rejected before any
+        // findings were appended, so finish_item can still be called.
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(&key),
+            "rejected batch must not remove the in-flight item"
+        );
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn upsert_findings_rejects_inverted_span() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/inverted-span.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![FindingRecord {
+                        rule_id: 9,
+                        start: 40,
+                        end: 30,
+                        norm_hash: [0x77; 32],
+                        confidence_score: 7,
+                    }],
+                },
+            )
+            .expect_err("inverted span must be rejected at upsert time");
+        assert!(
+            err.to_string()
+                .contains("finding at index 0 has invalid span"),
+            "unexpected error: {err}"
+        );
+
+        let guard = sink.in_flight.lock().expect("in flight lock");
+        assert!(
+            guard.contains_key(&key),
+            "rejected batch must not remove the in-flight item"
+        );
+        drop(guard);
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
     fn finish_item_preserves_in_flight_on_translation_failure() {
         let (pipeline, sink, _recorder) = make_receipt_sink();
         let key = item_key("tenant/repo/overflow.txt");
@@ -1938,7 +2370,7 @@ mod tests {
 
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
-            guard.contains_key(key.as_bytes()),
+            guard.contains_key(&key),
             "item must remain in in_flight after translation failure"
         );
         drop(guard);
@@ -1978,7 +2410,7 @@ mod tests {
 
         let guard = sink.in_flight.lock().expect("in flight lock");
         assert!(
-            guard.contains_key(key.as_bytes()),
+            guard.contains_key(&key),
             "item must remain in in_flight after submit failure"
         );
         drop(guard);
@@ -1990,11 +2422,245 @@ mod tests {
     }
 
     #[test]
+    fn upsert_after_finish_is_rejected() {
+        let (pipeline, sink, _recorder) = make_receipt_sink();
+        let key = item_key("tenant/repo/finished.txt");
+
+        sink.begin_item(&key, &item_meta()).expect("begin item");
+        sink.finish_item(&key).expect("finish item");
+
+        let err = sink
+            .upsert_findings(
+                &key,
+                &FindingsBatch {
+                    findings: vec![finding()],
+                },
+            )
+            .expect_err("upsert after finish should fail");
+
+        assert!(
+            err.to_string()
+                .contains("upsert_findings called before begin_item"),
+            "unexpected error: {err}"
+        );
+
+        pipeline.shutdown().expect("worker should join");
+    }
+
+    #[test]
+    fn run_worker_skips_done_shards_before_scan() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator =
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-done", dir.path())]);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        coordinator.mark_done("shard-done");
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("run worker");
+
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 0);
+        assert_eq!(report.shards_skipped_done, 1);
+        assert_eq!(
+            report.leases_seen,
+            report.shards_scanned + report.shards_skipped_done
+        );
+        assert_eq!(coordinator.released_shards(), vec!["shard-done".to_owned()]);
+        assert!(coordinator.completed_shards().is_empty());
+        assert!(
+            findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "skipped shard must not emit findings durability writes"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "skipped shard must not emit done-ledger writes"
+        );
+    }
+
+    #[test]
+    fn run_worker_persists_findings_done_ledger_checkpoint_and_marks_done() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator =
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-worker", dir.path())]);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("run worker");
+
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 1);
+        assert_eq!(report.shards_skipped_done, 0);
+        assert_eq!(
+            report.leases_seen,
+            report.shards_scanned + report.shards_skipped_done
+        );
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].shard_id, "shard-worker");
+        assert!(
+            completed[0].report.items_scanned >= 1,
+            "scan report should record the scanned file"
+        );
+        let checkpoint = completed[0]
+            .checkpoint
+            .as_ref()
+            .expect("non-empty shard should checkpoint");
+        assert!(
+            checkpoint.last_key().is_some(),
+            "receipt-driven checkpoint should carry a progress key"
+        );
+        assert!(
+            checkpoint.token().is_none(),
+            "receipt-driven checkpoint should be tokenless"
+        );
+
+        assert!(coordinator.done_set().contains("shard-worker"));
+        assert_eq!(coordinator.done_mark_contexts(), vec![write_context()]);
+
+        let observations = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot");
+        assert!(
+            !observations.is_empty(),
+            "durable findings observations should be present"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one scanned file should produce one done row"
+        );
+        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
+        assert_eq!(rows[0].write_context(), write_context());
+    }
+
+    #[test]
+    fn complete_shard_duplicate_call_produces_duplicate_entry() {
+        let dir = tempdir().expect("tempdir");
+        let lease = filesystem_lease("shard-dup", dir.path());
+        let coordinator = InMemoryCoordinator::new(Vec::<ShardLease<StubAssignment>>::new());
+        let report = ScanReport::default();
+
+        coordinator
+            .complete_shard(&lease, None, report)
+            .expect("first complete_shard");
+        coordinator
+            .complete_shard(&lease, None, report)
+            .expect("second complete_shard");
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].shard_id, "shard-dup");
+        assert_eq!(completed[1].shard_id, "shard-dup");
+        assert_eq!(completed[0].checkpoint, completed[1].checkpoint);
+        assert_eq!(completed[0].report, completed[1].report);
+    }
+
+    #[test]
+    fn run_worker_rejects_non_filesystem_assignment_without_receipts() {
+        let coordinator = InMemoryCoordinator::new(vec![
+            ShardLease::new(
+                Arc::from("shard-non-fs"),
+                StubAssignment {
+                    policy_hash: write_context().policy_hash(),
+                    filesystem_scan_config: None,
+                },
+                write_context(),
+                tenant_secret_key(),
+            )
+            .expect("lease"),
+        ]);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("non-filesystem lease should be rejected");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::UnsupportedAssignment { .. }),
+            "non-filesystem rejection should use UnsupportedAssignment variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("unsupported assignment"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "UnsupportedAssignment is a leaf error with no source"
+        );
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-non-fs".to_owned()],
+            "non-filesystem rejection must release the lease"
+        );
+        assert!(coordinator.completed_shards().is_empty());
+        assert!(!coordinator.done_set().contains("shard-non-fs"));
+    }
+
+    #[test]
+    fn run_worker_releases_lease_on_filesystem_scan_failure() {
+        // Point the lease at a guaranteed-unique non-existent path so the
+        // filesystem scan fails when the worker tries to enumerate it.
+        let tmp = tempdir().expect("tempdir");
+        let bogus_path = tmp.path().join("nonexistent-child");
+
+        let coordinator =
+            InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", &bogus_path)]);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("scan on non-existent path should fail");
+
+        assert!(
+            matches!(
+                error,
+                DistributedRuntimeError::Runtime(_) | DistributedRuntimeError::Durability(_)
+            ),
+            "filesystem scan failure should produce a Runtime or Durability error, got: {error:?}"
+        );
+
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-fail".to_owned()],
+            "filesystem scan failure must release the lease"
+        );
+        assert!(coordinator.completed_shards().is_empty());
+        assert!(!coordinator.done_set().contains("shard-fail"));
+    }
+
+    #[test]
     fn run_filesystem_lease_persists_checkpoint_and_marks_done() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
@@ -2053,7 +2719,7 @@ mod tests {
     #[test]
     fn run_filesystem_lease_zero_item_shard_completes_without_checkpoint() {
         let dir = tempdir().expect("tempdir");
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink, done_ledger.clone());
@@ -2143,7 +2809,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         done_ledger
@@ -2192,7 +2858,7 @@ mod tests {
 
     #[test]
     fn run_filesystem_lease_rejects_assignment_without_filesystem_config() {
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let persistence =
             DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
         let lease = ShardLease::new(
@@ -2216,8 +2882,8 @@ mod tests {
         .expect_err("missing filesystem config should be rejected");
 
         assert!(
-            matches!(error, DistributedRuntimeError::Coordinator(_)),
-            "missing filesystem config is a lease/coordinator contract error"
+            matches!(error, DistributedRuntimeError::UnsupportedAssignment { .. }),
+            "missing filesystem config should use UnsupportedAssignment variant, got: {error:?}"
         );
         assert!(coordinator.completed_shards().is_empty());
         assert!(!coordinator.done_set().contains("shard-missing-config"));
@@ -2234,7 +2900,7 @@ mod tests {
         fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
             .expect("write clean fixture");
 
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
@@ -2279,5 +2945,278 @@ mod tests {
             "only the file with findings should produce a done-ledger row"
         );
         assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
+    }
+
+    #[test]
+    fn run_worker_returns_zero_report_on_empty_queue() {
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
+
+        let report = run_worker(
+            &coordinator,
+            persistence,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("empty queue should succeed");
+
+        assert_eq!(report.leases_seen, 0);
+        assert_eq!(report.shards_scanned, 0);
+        assert_eq!(report.shards_skipped_done, 0);
+        assert!(coordinator.released_shards().is_empty());
+        assert!(coordinator.completed_shards().is_empty());
+    }
+
+    #[test]
+    fn run_worker_processes_multiple_shards_from_queue() {
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        fs::write(dir_a.path().join("secret.txt"), secret_fixture()).expect("write fixture a");
+        fs::write(dir_b.path().join("secret.txt"), secret_fixture()).expect("write fixture b");
+
+        let coordinator = InMemoryCoordinator::new(vec![
+            filesystem_lease("shard-a", dir_a.path()),
+            filesystem_lease("shard-b", dir_b.path()),
+        ]);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink, done_ledger),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("multi-shard run should succeed");
+
+        assert_eq!(report.leases_seen, 2);
+        assert_eq!(report.shards_scanned, 2);
+        assert_eq!(report.shards_skipped_done, 0);
+
+        let completed: Vec<String> = coordinator
+            .completed_shards()
+            .into_iter()
+            .map(|c| c.shard_id)
+            .collect();
+        assert!(completed.contains(&"shard-a".to_owned()));
+        assert!(completed.contains(&"shard-b".to_owned()));
+    }
+
+    #[test]
+    fn run_worker_mixed_done_and_active_shards() {
+        let dir_active = tempdir().expect("tempdir active");
+        fs::write(dir_active.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let dir_done = tempdir().expect("tempdir done");
+        fs::write(dir_done.path().join("secret.txt"), secret_fixture())
+            .expect("write done fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![
+            filesystem_lease("shard-done", dir_done.path()),
+            filesystem_lease("shard-active", dir_active.path()),
+        ]);
+        coordinator.mark_done("shard-done");
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(findings_sink, done_ledger),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("mixed done/active run should succeed");
+
+        assert_eq!(report.leases_seen, 2);
+        assert_eq!(report.shards_scanned, 1);
+        assert_eq!(report.shards_skipped_done, 1);
+
+        let completed: Vec<String> = coordinator
+            .completed_shards()
+            .into_iter()
+            .map(|c| c.shard_id)
+            .collect();
+        assert_eq!(completed, vec!["shard-active".to_owned()]);
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-done".to_owned()],
+            "only the done shard should be released without completion"
+        );
+    }
+
+    #[test]
+    fn run_worker_returns_coordinator_error_on_acquire_failure() {
+        let dir = tempdir().expect("tempdir");
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_acquires(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected acquire failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "acquire failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("injected acquire_shard failure"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn run_worker_returns_coordinator_error_on_is_done_failure() {
+        let dir = tempdir().expect("tempdir");
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_is_done_checks(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected is_done failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "is_done failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("injected is_shard_done failure"),
+            "unexpected error: {error}"
+        );
+        // The is_done error handler does a best-effort release.
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-a".to_owned()],
+            "is_done failure must attempt best-effort lease release"
+        );
+    }
+
+    #[test]
+    fn run_worker_preserves_original_error_when_release_fails_after_is_done_error() {
+        let dir = tempdir().expect("tempdir");
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        // Both is_done and release will fail; the original is_done error
+        // should be returned, not the release error.
+        coordinator.fail_next_is_done_checks(1);
+        coordinator.fail_next_releases(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected is_done failure should propagate");
+
+        assert!(
+            error.to_string().contains("injected is_shard_done failure"),
+            "original is_done error should be preserved, got: {error}"
+        );
+        // Release failed too, so no shard appears in released list.
+        assert!(
+            coordinator.released_shards().is_empty(),
+            "failed release should not record the shard"
+        );
+    }
+
+    #[test]
+    fn run_worker_continues_after_release_failure_on_done_shard() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![
+            filesystem_lease("shard-done", dir.path()),
+            filesystem_lease("shard-active", dir.path()),
+        ]);
+        coordinator.mark_done("shard-done");
+        // Release will fail for the done shard, but the loop should continue
+        // to process the active shard (done-shard release is best-effort).
+        coordinator.fail_next_releases(1);
+
+        let report = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("done-shard release failure should not abort the loop");
+
+        assert_eq!(report.leases_seen, 2);
+        assert_eq!(report.shards_skipped_done, 1);
+        assert_eq!(report.shards_scanned, 1);
+    }
+
+    #[test]
+    fn run_worker_returns_coordinator_error_on_complete_failure() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_completes(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected complete failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "complete failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected complete_shard failure"),
+            "unexpected error: {error}"
+        );
+
+        // The lease should still be released best-effort despite the error.
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-a"],
+            "lease must be released best-effort after complete failure"
+        );
+    }
+
+    #[test]
+    fn run_worker_completes_but_fails_mark_done() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_mark_done(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected mark_done failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "mark_done failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected mark_shard_done failure"),
+            "unexpected error: {error}"
+        );
+
+        // The shard was successfully completed before mark_done failed.
+        assert_eq!(
+            coordinator.completed_shards().len(),
+            1,
+            "shard must appear in completed list despite mark_done failure"
+        );
+        assert!(
+            coordinator.done_set().is_empty(),
+            "shard must not appear in done set when mark_done fails"
+        );
     }
 }
