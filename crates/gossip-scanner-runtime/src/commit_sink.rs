@@ -64,6 +64,25 @@ pub struct FindingsBatch {
     pub findings: Vec<FindingRecord>,
 }
 
+impl FindingsBatch {
+    /// Validate that every finding has a non-empty, non-inverted byte span.
+    ///
+    /// Returns `Ok(())` when all spans satisfy `end > start`, or an error
+    /// naming the first invalid finding.
+    pub fn validate(&self) -> Result<()> {
+        for (i, finding) in self.findings.iter().enumerate() {
+            if finding.end <= finding.start {
+                anyhow::bail!(
+                    "finding at index {i} has invalid span [{}, {})",
+                    finding.start,
+                    finding.end,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-item lifecycle sink for scan-result durability.
 ///
 /// The sink models a strict item lifecycle:
@@ -81,9 +100,9 @@ pub trait CommitSink: Send + Sync {
 
     /// Record one batch of findings for an in-progress item.
     ///
-    /// Durability-enabled implementations must reject findings with empty or
-    /// inverted spans (`end <= start`). No-op sinks that discard all data may
-    /// skip this check.
+    /// Callers should submit validated batches via [`FindingsBatch::validate`].
+    /// Durable sink implementations perform their own validation as
+    /// defense-in-depth; no-op sinks may skip it.
     fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()>;
 
     /// Mark the item as fully scanned.
@@ -111,6 +130,74 @@ impl CommitSink for CliNoOpCommitSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn findings_batch_validate_accepts_valid_spans() {
+        let batch = FindingsBatch {
+            findings: vec![
+                FindingRecord {
+                    rule_id: 1,
+                    start: 0,
+                    end: 10,
+                    norm_hash: [0; 32],
+                    confidence_score: 0,
+                },
+                FindingRecord {
+                    rule_id: 2,
+                    start: 100,
+                    end: 200,
+                    norm_hash: [0; 32],
+                    confidence_score: 0,
+                },
+            ],
+        };
+        batch.validate().expect("valid spans should pass");
+    }
+
+    #[test]
+    fn findings_batch_validate_rejects_empty_span() {
+        let batch = FindingsBatch {
+            findings: vec![FindingRecord {
+                rule_id: 1,
+                start: 10,
+                end: 10,
+                norm_hash: [0; 32],
+                confidence_score: 0,
+            }],
+        };
+        let err = batch.validate().expect_err("empty span should be rejected");
+        assert!(
+            err.to_string().contains("invalid span [10, 10)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn findings_batch_validate_rejects_inverted_span() {
+        let batch = FindingsBatch {
+            findings: vec![FindingRecord {
+                rule_id: 1,
+                start: 20,
+                end: 10,
+                norm_hash: [0; 32],
+                confidence_score: 0,
+            }],
+        };
+        let err = batch
+            .validate()
+            .expect_err("inverted span should be rejected");
+        assert!(
+            err.to_string().contains("invalid span [20, 10)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn findings_batch_validate_empty_batch_is_valid() {
+        FindingsBatch::default()
+            .validate()
+            .expect("empty batch should pass");
+    }
 
     #[test]
     fn finding_record_debug_redacts_norm_hash() {
