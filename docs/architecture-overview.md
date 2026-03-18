@@ -166,7 +166,10 @@ graph TB
 
 The architecture includes a full distributed coordination stack for shard-based
 scanning. These crates are layered so that shared data-model types sit at the
-leaf and runtime/binary crates depend inward.
+leaf and runtime/binary crates depend inward. The distributed worker loop in
+`gossip-scanner-runtime` now depends directly on `gossip-coordination` and
+`gossip-frontier`; there is no intermediate bridge crate between claiming a
+lease and executing a shard.
 
 ```text
 gossip-contracts  (data model leaf -- identity, shard spec, connector types)
@@ -191,7 +194,7 @@ gossip-contracts  (data model leaf -- identity, shard spec, connector types)
 | **InMemoryCoordinator**            | `crates/gossip-coordination/src/in_memory.rs`                             | Reference backend implementation (executable spec for testing and simulation)                               |
 | **gossip-connectors**              | `crates/gossip-connectors/src/`                                           | Concrete connector implementations: `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
 | **gossip-scanner-runtime**         | `crates/gossip-scanner-runtime/src/lib.rs`                                | Family-oriented runtime: `scan_fs()`, `scan_git()` entry points; `ExecutionMode` (Direct/Connector) routing |
-| **Distributed Runtime Surface**    | `crates/gossip-scanner-runtime/src/distributed.rs`                        | `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, `DistributedRuntimeConfig`, `DistributedRunReport`, `DistributedRuntimeError` |
+| **Distributed Runtime Surface**    | `crates/gossip-scanner-runtime/src/distributed.rs`                        | `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, `DistributedRuntimeConfig`, `DistributedRunReport`, `DistributedRuntimeError`, `run_worker` |
 | **gossip-worker**                  | `crates/gossip-worker/src/main.rs`                                        | Binary: CLI arg parsing, tracing init, dispatches to `scan_fs`/`scan_git` via runtime                      |
 
 

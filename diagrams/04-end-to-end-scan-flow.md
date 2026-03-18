@@ -50,8 +50,8 @@ sequenceDiagram
     end
     RT-->>WRK: Result<ScanReport, ScanRuntimeError>
 
-    note over DRT: distributed.rs foundation types
-    note over DRT: ShardLease&lt;A&gt;, DistributedCoordinator&lt;A&gt;, DistributedRuntimeConfig
+    note over DRT: distributed.rs worker-loop surface
+    note over DRT: WorkerIdentity, ShardLease, DistributedRuntimeConfig
 ```
 
 **One public boundary.** `ExecutionMode` remains caller-visible, but both
@@ -68,8 +68,10 @@ layer carries a dedicated `DistributedRuntimeError` enum for the worker loop.
 
 `gossip-scanner-runtime` expresses scan execution in terms of source families.
 The ordered-content family uses `OrderedContentRuntime`; the Git family uses
-`GitRepoRuntime`; the distributed module now provides shared worker-loop types
-such as `ShardLease<A>` and `DistributedCoordinator<A>`. The filesystem and Git
+`GitRepoRuntime`; the distributed module now provides the concrete worker-loop
+types and helpers such as `WorkerIdentity`, `ShardLease`, and `run_worker`.
+The runtime talks directly to `gossip-coordination` for claims/completion and
+to `gossip-frontier` for shard metadata decoding. The filesystem and Git
 backend crates remain the engine targets that these family modules are shaped
 around.
 
@@ -87,8 +89,8 @@ graph TD
     end
 
     subgraph Distributed["distributed.rs foundation"]
-        DIST["ShardLease&lt;A&gt;"]
-        DF["DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
+        DIST["WorkerIdentity<br/>ShardLease"]
+        DF["run_worker(...)<br/>DistributedRuntimeConfig"]
     end
 
     subgraph Contracts["gossip-contracts::connector"]
@@ -207,7 +209,7 @@ graph TD
     F["git_repo::scan_local_repo"]
     G["Result&lt;ScanReport, ScanRuntimeError&gt;"]
     H["distributed.rs foundation types"]
-    I["ShardLease&lt;A&gt;<br/>DistributedCoordinator&lt;A&gt;<br/>DistributedRuntimeConfig"]
+    I["WorkerIdentity<br/>ShardLease<br/>DistributedRuntimeConfig"]
     J["DistributedRunReport /<br/>DistributedRuntimeError"]
 
     A --> B
@@ -236,8 +238,8 @@ graph TD
 
 **Current execution surface.** Filesystem and Git entrypoints validate inputs
 first, then hand off to a family module that owns execution semantics. The
-distributed module currently contributes the types that the worker loop will
-assemble around coordination and durability backends.
+distributed module currently contributes the concrete worker-loop types and
+helpers that assemble direct coordination and durability backends.
 
 ---
 
