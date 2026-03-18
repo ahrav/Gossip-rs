@@ -2761,7 +2761,7 @@ mod tests {
         fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
             .expect("write clean fixture");
 
-        let coordinator = TestCoordinator::default();
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
