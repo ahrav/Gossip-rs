@@ -368,8 +368,9 @@ the receipt-driven durability model:
    pipeline.
 7. Prepares a checkpoint prefix from the aggregator, persists the checkpoint
    cursor via `complete_shard`, acknowledges the checkpoint to advance the
-   aggregator watermark, and marks the shard done. Zero-item shards
-   (empty directories) complete without a checkpoint cursor.
+   aggregator watermark, and marks the shard done. Shards with zero durable
+   commit units (empty directories or directories where no file produced
+   findings) complete without a checkpoint cursor.
 
 If any step fails, the shard is not marked done and will be retried on the
 next lease acquisition.
