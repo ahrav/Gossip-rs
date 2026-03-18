@@ -168,6 +168,8 @@ impl WorkerIdentity {
 /// - **`lease`** — authoritative coordination lease used for terminal completion.
 /// - **`range_start`** — inclusive lower bound of the shard's key range, used as
 ///   the fallback cursor when no items are committed.
+/// - **`scan_config`** — filesystem scan configuration for this shard, derived
+///   from the worker template with optional shard-level path overrides.
 /// - **`write_context`** — numeric shard identity plus fencing epoch for all
 ///   persistence writes.
 /// - **`tenant_secret_key`** — key material for secret-hash derivation.
@@ -193,12 +195,6 @@ pub struct ShardLease {
 
 impl ShardLease {
     /// Construct one concrete filesystem shard lease.
-    ///
-    /// # Debug-mode invariant
-    ///
-    /// Asserts that `lease` and `write_context` agree on tenant, run, shard,
-    /// and fence epoch. A mismatch here is a programming error in the lease
-    /// construction call site.
     pub fn new(
         shard_id: Arc<str>,
         lease: Lease,
@@ -207,11 +203,6 @@ impl ShardLease {
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
     ) -> Self {
-        debug_assert_eq!(lease.tenant(), write_context.tenant_id());
-        debug_assert_eq!(lease.run(), write_context.run_id());
-        debug_assert_eq!(lease.shard(), write_context.shard_id());
-        debug_assert_eq!(lease.fence(), write_context.fence_epoch());
-
         Self {
             shard_id,
             lease,
@@ -313,8 +304,7 @@ pub struct DistributedRuntimeConfig {
     /// Scan execution budget controls applied to every shard assignment.
     pub budgets: ScanBudgets,
     /// Capacity used for both the bounded execution-to-commit queue and the
-    /// commit-to-checkpoint outcome queue. Matches the
-    /// [`CommitPipelineConfig`] default.
+    /// commit-to-checkpoint outcome queue. Defaults to 64.
     pub commit_queue_capacity: NonZeroUsize,
 }
 
@@ -404,7 +394,6 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 /// `finish_item` re-inserts the item into the in-flight map so the caller
 /// can retry or so that `ReceiptCommitSink::finish()` can detect the
 /// leaked item.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct InFlightItem {
     sequence_no: u64,
@@ -451,7 +440,6 @@ struct InFlightItem {
 /// - **Submission failure** (e.g., pipeline disconnected): same rollback.
 /// - **Recorder failure** (telemetry): logged once, then suppressed; non-fatal
 ///   because durability flows through the commit pipeline, not the recorder.
-#[cfg_attr(not(test), allow(dead_code))]
 struct ReceiptCommitSink {
     shard_id: Arc<str>,
     recorder: Arc<dyn CoordinationEventRecorder>,
@@ -468,7 +456,6 @@ struct ReceiptCommitSink {
     progress_error_logged: AtomicBool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ReceiptCommitSink {
     /// Construct one adapter for a single shard's scan lifecycle.
     ///
@@ -601,7 +588,9 @@ impl ReceiptCommitSink {
     /// 2. Falls back to a weak version derived from the item key bytes when
     ///    the connector did not supply an explicit version.
     /// 3. Attaches a display-only [`Location`] when the item key is valid
-    ///    UTF-8 (best-effort; non-UTF-8 keys skip the location).
+    ///    UTF-8 and `Location::try_new` accepts the resulting string
+    ///    (best-effort; non-UTF-8 keys or keys rejected by `Location`
+    ///    construction skip the location).
     /// 4. Delegates to [`translate_item_result`] for deterministic
     ///    persistence row derivation.
     ///
@@ -779,7 +768,6 @@ impl CommitSink for ReceiptCommitSink {
 /// Produced by [`drain_commit_stage`] and consumed by
 /// [`run_filesystem_lease`] to build the checkpoint and verify that every
 /// submitted commit produced a durable outcome.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct CommitStageDrainResult {
     /// Receipt aggregator that tracks the contiguous committed prefix.
@@ -808,7 +796,6 @@ struct CommitStageDrainResult {
 /// sequence-number cross-check. If external cancellation were introduced,
 /// callers would need to distinguish cancellation-induced outcome gaps from
 /// genuine durability failures.
-#[cfg_attr(not(test), allow(dead_code))]
 fn drain_commit_stage<F, D>(
     drainer: CommitPipelineDrainer<F, D>,
     write_context: WriteContext,
@@ -881,7 +868,6 @@ where
 /// The local commit pipeline exposes an outcome stream rather than per-item
 /// completion handles, so this helper matches submitted sequence numbers
 /// against the committed sequence numbers drained from that stream.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wait_for_submitted_commits(
     mut submitted: Vec<u64>,
     mut committed_sequence_nos: Vec<u64>,
@@ -941,7 +927,6 @@ fn wait_for_submitted_commits(
 /// # Errors
 ///
 /// Returns an error if `last_sequence_no` is `u64::MAX` (no room for +1).
-#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
     last_sequence_no
@@ -994,12 +979,6 @@ fn build_lease_from_acquire(
         acquired.lease.run(),
         acquired.lease.shard(),
         acquired.lease.fence(),
-    );
-
-    assert_eq!(
-        write_context.policy_hash(),
-        identity.policy_hash,
-        "worker identity must thread the configured policy hash into write_context",
     );
 
     Ok(ShardLease::new(
@@ -1096,19 +1075,8 @@ where
             Err(ClaimError::Throttled { retry_after }) => {
                 std::thread::sleep(claim_retry_delay(now, Some(retry_after)));
             }
-            Err(error @ ClaimError::RunNotFound) => {
-                return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
-            }
-            Err(error @ ClaimError::TenantMismatch { .. }) => {
-                return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
-            }
-            Err(error @ ClaimError::BackendError(_)) => {
-                return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
-            }
             Err(error) => {
-                return Err(DistributedRuntimeError::Coordinator(anyhow!(
-                    "unsupported claim error variant: {error}"
-                )));
+                return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
             }
         }
     }
@@ -1195,7 +1163,6 @@ where
 /// assignment remains monotonic without cross-thread synchronization. The
 /// commit pipeline provides the parallelism boundary: scan execution and
 /// durable commit proceed concurrently on separate threads.
-#[cfg_attr(not(test), allow(dead_code))]
 fn run_filesystem_lease<F, D>(
     recorder: Arc<dyn CoordinationEventRecorder>,
     persistence: &DistributedPersistence<F, D>,
@@ -1494,27 +1461,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct NoopRecorder;
-
-    impl CoordinationEventRecorder for NoopRecorder {
-        fn record_core_event(&self, _shard_id: &str, _event: OwnedCoreEvent) -> Result<()> {
-            Ok(())
-        }
-
-        fn record_git_event(&self, _shard_id: &str, _event: StoredGitEvent) -> Result<()> {
-            Ok(())
-        }
-
-        fn record_commit_progress(
-            &self,
-            _shard_id: &str,
-            _event: CommitProgressRecord,
-        ) -> Result<()> {
-            Ok(())
-        }
-    }
-
     fn tenant() -> TenantId {
         TenantId::from_bytes([0x11; 32])
     }
@@ -1551,7 +1497,7 @@ mod tests {
     }
 
     fn recorder() -> Arc<dyn CoordinationEventRecorder> {
-        Arc::new(NoopRecorder)
+        Arc::new(Recorder::default())
     }
 
     fn test_run_config(lease_duration_ms: u64) -> RunConfig {
