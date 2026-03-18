@@ -1,15 +1,72 @@
-//! Foundational distributed runtime types for receipt-driven worker execution.
+//! Distributed worker runtime for receipt-driven shard execution.
 //!
-//! This module defines the shared nouns consumed by the distributed worker
-//! loop: worker identity ([`WorkerIdentity`]), lease payloads
-//! ([`ShardLease`]), cloned persistence handles ([`DistributedPersistence`]),
-//! runtime configuration ([`DistributedRuntimeConfig`]), run reports
-//! ([`DistributedRunReport`]), and error layering
-//! ([`DistributedRuntimeError`]).
+//! This module is the entry point for distributed scanning. It implements a
+//! claim-execute-complete loop: the worker claims shards from a
+//! [`CoordinationFacade`], executes each shard's filesystem scan, commits
+//! findings and done-ledger rows through a bounded commit pipeline, and then
+//! completes the shard lease with a receipt-driven checkpoint cursor.
 //!
-//! It also provides `ReceiptCommitSink`, the compatibility adapter that
-//! translates scan-loop `CommitSink` callbacks into receipt-driven commit
-//! pipeline work.
+//! # Architecture
+//!
+//! ```text
+//! ┌──────────────┐    claim     ┌────────────────────┐
+//! │ Coordinator  │ ──────────>  │  run_worker loop   │
+//! │ (CoordFacade)│ <────────── │  (claim/scan/done) │
+//! └──────────────┘   complete   └────────┬───────────┘
+//!                                        │
+//!                              ┌─────────▼──────────┐
+//!                              │ run_filesystem_lease│
+//!                              │  (per shard)        │
+//!                              └─────────┬──────────┘
+//!                     ┌──────────────────┼──────────────────┐
+//!                     ▼                  ▼                  ▼
+//!          ┌────────────────┐  ┌──────────────────┐ ┌─────────────┐
+//!          │ scan engine    │  │ ReceiptCommitSink │ │ commit      │
+//!          │ (scheduler)    │──│ (CommitSink impl) │─│ pipeline    │
+//!          └────────────────┘  └──────────────────┘ │ + drainer   │
+//!                                                   └──────┬──────┘
+//!                                                          ▼
+//!                                                 ┌────────────────┐
+//!                                                 │ Checkpoint     │
+//!                                                 │ Aggregator     │
+//!                                                 └────────────────┘
+//! ```
+//!
+//! # Key types
+//!
+//! | Type                        | Role                                             |
+//! |-----------------------------|--------------------------------------------------|
+//! | [`WorkerIdentity`]          | Immutable identity threaded through all calls     |
+//! | [`ShardLease`]              | Per-shard lease payload with scan config + fencing|
+//! | [`DistributedPersistence`]  | Cloneable persistence backend handles             |
+//! | [`DistributedRuntimeConfig`]| Budget and queue-sizing knobs                     |
+//! | [`DistributedRunReport`]    | Summary counters from one worker invocation       |
+//! | [`DistributedRuntimeError`] | Layered error: coordinator / runtime / durability |
+//!
+//! # Invariants
+//!
+//! 1. **Receipt-only checkpoint advancement.** Checkpoint progress is derived
+//!    exclusively from durable commit receipts, never from raw scan completion.
+//! 2. **Single-threaded scan execution.** Each shard runs with `workers = 1` so
+//!    the `ReceiptCommitSink` sequence counter remains monotonic without
+//!    cross-thread synchronization.
+//! 3. **At-least-once delivery.** The commit pipeline tolerates duplicate writes
+//!    for the same `(write_context, item_key)` pair. Persistence backends must
+//!    be idempotent.
+//! 4. **Fail-fast after claim.** Once a shard is claimed, any scan, commit, or
+//!    completion error terminates the worker loop. Uncompleted leases expire
+//!    via coordination-layer deadlines.
+//!
+//! # Internal adapter: `ReceiptCommitSink`
+//!
+//! The scan scheduler emits compact `CommitSink` callbacks (`begin_item`,
+//! `upsert_findings`, `finish_item`). `ReceiptCommitSink` bridges these into
+//! the richer [`CommitPipeline`] by reconstructing deterministic
+//! [`crate::result_translation::translate_item_result`]
+//! inputs and submitting owned [`QueuedCommit`] work items.
+//!
+//! [`CoordinationFacade`]: gossip_coordination::CoordinationFacade
+//! [`CommitPipeline`]: crate::commit_pipeline::CommitPipeline
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -53,9 +110,11 @@ use crate::{
 
 /// Immutable worker identity threaded through shard claiming and completion.
 ///
-/// These fields previously lived on the bridge adapter. `run_worker` now takes
-/// them directly so the runtime can claim shards and complete them against a
-/// [`CoordinationFacade`] without an intermediate compatibility layer.
+/// Bundles all tenant-scoped, run-scoped, and worker-scoped state that
+/// [`run_worker`] needs to claim shards and complete them against a
+/// [`CoordinationFacade`]. Each field is constant for the lifetime of one
+/// worker invocation; per-shard variability (scan path, fencing epoch) lives
+/// on [`ShardLease`] instead.
 #[derive(Clone)]
 pub struct WorkerIdentity {
     /// Tenant boundary for all coordination calls.
@@ -102,10 +161,19 @@ impl WorkerIdentity {
 
 /// Lease payload consumed by the distributed runtime.
 ///
-/// One lease corresponds to one shard from the coordination layer. The string
-/// shard label routes telemetry, while [`WriteContext`] carries the numeric
-/// shard identity used for fenced writes. The coordination lease and shard
-/// range start stay on the payload so completion can happen without a side-map.
+/// One lease corresponds to one shard from the coordination layer. It carries
+/// everything needed to scan and commit that shard without additional lookups:
+///
+/// - **`shard_id`** — string label for telemetry routing.
+/// - **`lease`** — authoritative coordination lease used for terminal completion.
+/// - **`range_start`** — inclusive lower bound of the shard's key range, used as
+///   the fallback cursor when no items are committed.
+/// - **`write_context`** — numeric shard identity plus fencing epoch for all
+///   persistence writes.
+/// - **`tenant_secret_key`** — key material for secret-hash derivation.
+///
+/// The coordination lease and range start are kept together so that
+/// shard completion can finalize the lease without a side-map.
 #[derive(Clone, Debug)]
 pub struct ShardLease {
     /// String shard label used for routing recorder events.
@@ -125,6 +193,12 @@ pub struct ShardLease {
 
 impl ShardLease {
     /// Construct one concrete filesystem shard lease.
+    ///
+    /// # Debug-mode invariant
+    ///
+    /// Asserts that `lease` and `write_context` agree on tenant, run, shard,
+    /// and fence epoch. A mismatch here is a programming error in the lease
+    /// construction call site.
     pub fn new(
         shard_id: Arc<str>,
         lease: Lease,
@@ -229,7 +303,11 @@ where
     }
 }
 
-/// Runtime config for distributed scans.
+/// Runtime configuration for distributed scans.
+///
+/// Controls scan budgets (item count, byte count, time limits) and the
+/// capacity of the bounded channels that connect scan execution to the
+/// commit stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DistributedRuntimeConfig {
     /// Scan execution budget controls applied to every shard assignment.
@@ -274,7 +352,12 @@ impl DistributedRunReport {
     }
 }
 
-/// Distributed runtime error.
+/// Layered error from the distributed runtime.
+///
+/// Classifies failures by origin so callers can distinguish coordinator
+/// connectivity issues from local scan crashes from durability pipeline
+/// stalls. The variant determines whether the error is retryable (e.g.,
+/// coordinator transient failures) or terminal (e.g., scan panics).
 #[derive(Debug)]
 pub enum DistributedRuntimeError {
     /// The coordinator returned an error.
@@ -315,9 +398,12 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 ///
 /// Accumulates findings through [`ReceiptCommitSink::upsert_findings`] until
 /// [`finish_item`](ReceiptCommitSink::finish_item) translates the accumulated
-/// state into a [`QueuedCommit`] and submits it to the pipeline. On
-/// translation or submission failure, the item is re-inserted into the
-/// in-flight map so the caller can retry.
+/// state into a [`QueuedCommit`] and submits it to the pipeline.
+///
+/// Rollback on failure: if translation or pipeline submission fails,
+/// `finish_item` re-inserts the item into the in-flight map so the caller
+/// can retry or so that `ReceiptCommitSink::finish()` can detect the
+/// leaked item.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct InFlightItem {
@@ -326,14 +412,28 @@ struct InFlightItem {
     findings: Vec<FsFindingRecord>,
 }
 
-/// Scan-driver commit sink that bridges begin/upsert/finish callbacks into the
+/// Compatibility adapter that bridges scan-loop `CommitSink` callbacks into the
 /// receipt-driven commit pipeline.
 ///
-/// The existing scan-loop seam still emits compact `ItemMeta` and
-/// `FindingRecord` batches rather than the richer runtime commit inputs.
-/// `ReceiptCommitSink` reconstructs the deterministic translation inputs
-/// expected by the shared commit pipeline so ordered-content execution can
-/// produce durable receipts without changing the scheduler callback surface.
+/// # Problem
+///
+/// The scan scheduler emits compact `ItemMeta` + `FindingRecord` batches via
+/// the `CommitSink` trait. The downstream commit pipeline expects richer
+/// `QueuedCommit` work items containing full persistence translations
+/// (findings, occurrences, observations, done-ledger rows). This adapter
+/// reconstructs those deterministic translations in `finish_item` so
+/// ordered-content execution can produce durable receipts without changing
+/// the scheduler callback surface.
+///
+/// # Item lifecycle
+///
+/// ```text
+/// begin_item(key, meta)          → inserts InFlightItem with sequence_no
+///   upsert_findings(key, batch)  → appends FsFindingRecord to InFlightItem
+///   upsert_findings(key, batch)  → (may be called multiple times)
+/// finish_item(key)               → removes InFlightItem, translates,
+///                                  submits QueuedCommit to pipeline
+/// ```
 ///
 /// # Threading model
 ///
@@ -343,6 +443,14 @@ struct InFlightItem {
 /// [`next_sequence_no`](Self::next_sequence_no) are therefore monotonically
 /// ordered with respect to submission; `Ordering::Relaxed` is sufficient
 /// because there is no concurrent caller to race against.
+///
+/// # Failure modes
+///
+/// - **Translation failure** (e.g., sequence-number overflow): the item is
+///   rolled back into `in_flight` and `finish()` will detect it.
+/// - **Submission failure** (e.g., pipeline disconnected): same rollback.
+/// - **Recorder failure** (telemetry): logged once, then suppressed; non-fatal
+///   because durability flows through the commit pipeline, not the recorder.
 #[cfg_attr(not(test), allow(dead_code))]
 struct ReceiptCommitSink {
     shard_id: Arc<str>,
@@ -362,6 +470,11 @@ struct ReceiptCommitSink {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ReceiptCommitSink {
+    /// Construct one adapter for a single shard's scan lifecycle.
+    ///
+    /// The `rule_fingerprint` closure maps engine rule IDs to stable
+    /// persistence-layer fingerprints. It is called during `finish_item`
+    /// translation and must be deterministic for the same rule ID.
     fn new(
         recorder: Arc<dyn CoordinationEventRecorder>,
         shard_id: Arc<str>,
@@ -482,9 +595,17 @@ impl ReceiptCommitSink {
     /// item's accumulated state and produce a [`QueuedCommit`] ready for the
     /// commit pipeline.
     ///
-    /// When the item has no explicit `version`, a weak version derived from
-    /// the item key bytes is used. When the item key is valid UTF-8, a
-    /// display-only [`Location`] is attached for diagnostics.
+    /// This is the core bridge logic. It:
+    /// 1. Derives a non-overlapping `[started, finished)` logical time pair
+    ///    from the item's sequence number.
+    /// 2. Falls back to a weak version derived from the item key bytes when
+    ///    the connector did not supply an explicit version.
+    /// 3. Attaches a display-only [`Location`] when the item key is valid
+    ///    UTF-8 (best-effort; non-UTF-8 keys skip the location).
+    /// 4. Delegates to [`translate_item_result`] for deterministic
+    ///    persistence row derivation.
+    ///
+    /// [`translate_item_result`]: crate::result_translation::translate_item_result
     fn translate_in_flight(&self, item_key: &ItemKey, item: &InFlightItem) -> Result<QueuedCommit> {
         let timing = Self::logical_timing_for(item.sequence_no)?;
         let bytes_scanned = item.meta.size_hint.unwrap_or(0);
@@ -831,11 +952,15 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
 
 /// Fallback delay when no lease deadline is available to guide retry timing.
 ///
-/// Kept short to avoid stalling the worker loop when concurrent workers are
-/// completing shards rapidly.
+/// Kept short (25 ms) to avoid stalling the worker loop when concurrent
+/// workers are completing shards rapidly.
 const CLAIM_RACE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
-/// Build a filesystem scan config from a claimed shard spec.
+/// Build a filesystem scan config by overlaying shard metadata onto a template.
+///
+/// If the shard's `connector_extra` field contains a non-empty UTF-8 path,
+/// that path overrides the template's `path` field. Otherwise the template
+/// path is used as-is.
 fn scan_config_from_spec(
     spec: gossip_coordination::ShardSpecRef<'_>,
     scan_template: &FsScanConfig,
@@ -854,6 +979,10 @@ fn scan_config_from_spec(
 }
 
 /// Convert an acquired coordination lease into the concrete runtime payload.
+///
+/// Constructs a [`WriteContext`] from the lease's fencing fields and the
+/// worker's policy hash, then decodes the shard spec's `connector_extra`
+/// to derive the filesystem scan path.
 fn build_lease_from_acquire(
     acquired: AcquireResultView<'_>,
     identity: &WorkerIdentity,
@@ -884,6 +1013,10 @@ fn build_lease_from_acquire(
 }
 
 /// Convert the wall clock to [`LogicalTime`] (milliseconds since Unix epoch).
+///
+/// Falls back to `1` if the system clock is before the epoch or if the
+/// millisecond count overflows `u64`. The minimum of `1` avoids zero-valued
+/// logical times, which some coordination backends treat as sentinel values.
 fn wall_clock_now() -> LogicalTime {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -894,6 +1027,11 @@ fn wall_clock_now() -> LogicalTime {
 }
 
 /// Compute how long to sleep before retrying a shard claim.
+///
+/// When the coordinator provides an `earliest_deadline` (the soonest
+/// existing lease expiry), the delay equals `deadline - now` (clamped to
+/// at least 1 ms). Without a deadline, the fixed [`CLAIM_RACE_RETRY_DELAY`]
+/// is used.
 fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -> Duration {
     earliest_deadline
         .map(|deadline| deadline.as_raw().saturating_sub(now.as_raw()).max(1))
@@ -902,6 +1040,10 @@ fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -
 }
 
 /// Derive a deterministic [`OpId`] from shard identity, fence epoch, and kind.
+///
+/// Idempotent: the same `(key, fence, op_kind)` triple always produces the
+/// same `OpId`. This allows the coordination backend to detect and deduplicate
+/// replayed completion calls.
 fn deterministic_op_id(key: ShardKey, fence: FenceEpoch, op_kind: OpKind) -> OpId {
     let mut hasher = domain_hasher("gossip.scanner_runtime.distributed.op_id");
     key.run().write_canonical(&mut hasher);
@@ -913,6 +1055,13 @@ fn deterministic_op_id(key: ShardKey, fence: FenceEpoch, op_kind: OpKind) -> OpI
 
 /// Claim the next available shard, retrying while the run still has active
 /// work or the coordinator is enforcing worker cooldown.
+///
+/// Returns `Ok(None)` when no shards are available **and** the run has zero
+/// active leases (i.e., the run is fully settled). Returns `Ok(Some(lease))`
+/// on successful claim. Retries internally on `NoneAvailable` (other
+/// workers hold all shards) and `Throttled` (coordinator-imposed cooldown),
+/// sleeping until the earliest deadline expires. Terminal errors like
+/// `RunNotFound` or `BackendError` propagate immediately.
 fn claim_next_lease<C>(
     coordinator: &mut C,
     identity: &WorkerIdentity,
@@ -966,6 +1115,16 @@ where
 }
 
 /// Complete a claimed shard directly against the coordination backend.
+///
+/// The final cursor is chosen as:
+/// - The receipt-driven `checkpoint` cursor when items were committed.
+/// - The shard's `range_start` when the shard produced zero items but has
+///   a non-empty range (ensures forward progress on re-scan).
+/// - An `initial()` cursor when both are absent (empty shard with empty range).
+///
+/// Completion uses a deterministic [`OpId`] so replayed calls are idempotent.
+/// If the coordination backend reports the completion was already applied
+/// (idempotent replay), the function logs an info message but succeeds.
 fn complete_shard<C>(
     coordinator: &mut C,
     identity: &WorkerIdentity,
@@ -1009,10 +1168,33 @@ where
 
 /// Execute one filesystem lease under the receipt-driven durability model.
 ///
-/// The scan path runs with finding persistence enabled and a single execution
-/// worker so `ReceiptCommitSink` sequence assignment remains deterministic.
-/// The function returns the scan report plus the receipt-driven checkpoint
-/// cursor, if any. The caller owns the coordination-layer completion step.
+/// This is the per-shard work function called by [`run_worker`]. It
+/// orchestrates the full scan-commit-checkpoint pipeline for one shard:
+///
+/// 1. **Setup**: validates budgets, builds the scan engine, creates the
+///    commit pipeline and `ReceiptCommitSink`.
+/// 2. **Concurrent execution**: spawns a scoped thread to drain the commit
+///    pipeline's outcome stream while the main thread runs the filesystem
+///    scan through `scan_fs_with_prebuilt_engine`.
+/// 3. **Post-scan verification**: checks that every submitted sequence
+///    number produced exactly one durable outcome (via
+///    [`wait_for_submitted_commits`]).
+/// 4. **Checkpoint**: prepares and acknowledges the receipt-driven
+///    checkpoint prefix through [`PrefixCheckpointAggregator`].
+///
+/// Returns `(ScanReport, None)` when the shard produced zero committed
+/// items (empty directory or all-clean scan). Returns
+/// `(ScanReport, Some(cursor))` when at least one item was committed.
+///
+/// The caller owns the coordination-layer completion step (calling
+/// [`complete_shard`] with the returned cursor).
+///
+/// # Design choice: single worker
+///
+/// The scan runs with `workers = 1` so that `ReceiptCommitSink` sequence
+/// assignment remains monotonic without cross-thread synchronization. The
+/// commit pipeline provides the parallelism boundary: scan execution and
+/// durable commit proceed concurrently on separate threads.
 #[cfg_attr(not(test), allow(dead_code))]
 fn run_filesystem_lease<F, D>(
     recorder: Arc<dyn CoordinationEventRecorder>,
@@ -1074,6 +1256,11 @@ where
         submitter,
     );
 
+    // Scan execution and commit draining run concurrently in a scoped thread.
+    // The drain thread consumes commit outcomes and feeds the checkpoint
+    // aggregator. When the scan completes, `commit.finish()` consumes the
+    // sink (verifying no items remain in-flight) and the drain thread exits
+    // once the submission channel closes.
     let (outcome, submitted, stage_result) = std::thread::scope(|scope| {
         let write_context = lease.write_context();
         let max_buffered = config.commit_queue_capacity.get();
@@ -1142,23 +1329,31 @@ where
 
 /// Run the distributed worker loop until the coordinator has no more leases.
 ///
-/// The loop claims shards directly through [`CoordinationFacade`], retries
-/// internally while the run still has active work but every candidate shard is
-/// currently leased or the worker is throttled, executes one filesystem shard
-/// at a time, and then completes the claimed lease with either the
-/// receipt-derived checkpoint cursor or the shard's range start.
+/// This is the top-level entry point for distributed scanning. The loop:
 ///
-/// The loop is fail-fast once a shard is claimed: it terminates on the first
-/// claim, scan, or completion error. Leases are not explicitly released on
-/// failure; the coordination backend reclaims them when their deadlines
-/// expire.
+/// 1. **Claims** the next available shard from the coordinator, retrying
+///    while the run still has active work but every candidate shard is
+///    currently leased or the worker is being throttled.
+/// 2. **Executes** the shard's filesystem scan through the full
+///    scan-commit-checkpoint pipeline.
+/// 3. **Completes** the shard lease against the coordinator, advancing the
+///    coordination cursor to the receipt-derived checkpoint position.
+/// 4. **Repeats** until no shards remain (returns `Ok(report)`) or an error
+///    occurs (returns `Err`).
+///
+/// # Fail-fast semantics
+///
+/// The loop terminates on the first claim, scan, or completion error.
+/// Uncompleted leases are not explicitly released; the coordination backend
+/// reclaims them when their deadlines expire.
 ///
 /// # Errors
 ///
-/// Returns [`DistributedRuntimeError::Coordinator`] when shard claiming,
-/// progress lookup, or completion fails; [`DistributedRuntimeError::Runtime`]
-/// when scan execution fails; and [`DistributedRuntimeError::Durability`] when
-/// the receipt-driven commit pipeline cannot confirm durable progress.
+/// - [`DistributedRuntimeError::Coordinator`] — shard claiming, progress
+///   lookup, or completion failed.
+/// - [`DistributedRuntimeError::Runtime`] — scan execution failed.
+/// - [`DistributedRuntimeError::Durability`] — the receipt-driven commit
+///   pipeline could not confirm durable progress.
 pub fn run_worker<C, F, D>(
     coordinator: &mut C,
     identity: WorkerIdentity,
