@@ -58,7 +58,11 @@ pub(crate) fn reserve_unique_spill_file(
             .open(&path)
         {
             Ok(file) => {
-                file.set_len(capacity)?;
+                if let Err(err) = file.set_len(capacity) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err);
+                }
                 return Ok((path, file));
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
