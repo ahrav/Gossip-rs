@@ -2,14 +2,30 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use gossip_contracts::{
+    coordination::ShardSpec,
+    identity::{
+        LogicalTime, OpId, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey, WorkerId,
+    },
+};
+use gossip_coordination::{
+    CursorSemantics, InMemoryCoordinator as CoordinationInMemoryCoordinator, InitialShardInput,
+    RunConfig, RunManagement,
+};
+use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
 use serde_json::Value;
 use tempfile::{NamedTempFile, tempdir};
 
 use super::*;
+use crate::{
+    coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent},
+    distributed::{DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity, run_worker},
+};
 
 fn run_git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -79,6 +95,176 @@ fn parse_jsonl(bytes: Vec<u8>) -> Vec<Value> {
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_str(line).expect("event line should be valid json"))
         .collect()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ComparableFinding {
+    path: String,
+    rule: String,
+    start: u64,
+    end: u64,
+}
+
+fn normalize_finding_path(path: &str, root: &Path) -> String {
+    let candidate = Path::new(path);
+    if let Ok(stripped) = candidate.strip_prefix(root) {
+        if stripped.as_os_str().is_empty() {
+            return candidate
+                .file_name()
+                .expect("finding path matching root must have file name")
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
+        return stripped.to_string_lossy().replace('\\', "/");
+    }
+    path.replace('\\', "/")
+}
+
+fn comparable_findings_from_jsonl(bytes: Vec<u8>, root: &Path) -> Vec<ComparableFinding> {
+    let mut findings: Vec<_> = parse_jsonl(bytes)
+        .into_iter()
+        .filter(|event| event.get("path").is_some() && event.get("start").is_some())
+        .map(|event| ComparableFinding {
+            path: normalize_finding_path(event["path"].as_str().expect("finding path"), root),
+            rule: event
+                .get("rule")
+                .and_then(Value::as_str)
+                .or_else(|| event.get("rule_name").and_then(Value::as_str))
+                .expect("finding rule")
+                .to_owned(),
+            start: event["start"].as_u64().expect("finding start"),
+            end: event["end"].as_u64().expect("finding end"),
+        })
+        .collect();
+    findings.sort();
+    findings
+}
+
+#[derive(Default)]
+struct DistributedCoreRecorder {
+    core_events: Mutex<Vec<OwnedCoreEvent>>,
+}
+
+impl DistributedCoreRecorder {
+    fn core_jsonl(&self) -> Vec<u8> {
+        let events = self.core_events.lock().expect("core events lock").clone();
+        let out = scanner_scheduler::events::VecEventOutput::new();
+        for event in &events {
+            event.emit_into(&out);
+        }
+        out.take()
+    }
+}
+
+impl CoordinationEventRecorder for DistributedCoreRecorder {
+    fn record_core_event(&self, _shard_id: &str, event: OwnedCoreEvent) -> anyhow::Result<()> {
+        self.core_events
+            .lock()
+            .expect("core events lock")
+            .push(event);
+        Ok(())
+    }
+
+    fn record_git_event(&self, _shard_id: &str, _event: StoredGitEvent) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_commit_progress(
+        &self,
+        _shard_id: &str,
+        _event: CommitProgressRecord,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+fn distributed_tenant() -> TenantId {
+    TenantId::from_bytes([0x11; 32])
+}
+
+fn distributed_run() -> RunId {
+    RunId::from_raw(7)
+}
+
+fn distributed_worker() -> WorkerId {
+    WorkerId::from_raw(13)
+}
+
+fn distributed_policy_hash() -> PolicyHash {
+    PolicyHash::from_bytes([0x22; 32])
+}
+
+fn distributed_tenant_secret_key() -> TenantSecretKey {
+    TenantSecretKey::from_bytes([0x33; 32])
+}
+
+fn distributed_run_config(lease_duration_ms: u64) -> RunConfig {
+    RunConfig::try_new(CursorSemantics::Completed, lease_duration_ms, None).expect("run config")
+}
+
+fn distributed_now() -> LogicalTime {
+    LogicalTime::from_raw(1)
+}
+
+fn setup_distributed_coordinator(
+    path: &Path,
+    lease_duration_ms: u64,
+) -> CoordinationInMemoryCoordinator {
+    let mut coordinator = CoordinationInMemoryCoordinator::new(lease_duration_ms);
+    let now = distributed_now();
+    coordinator
+        .create_run(
+            now,
+            distributed_tenant(),
+            distributed_run(),
+            distributed_run_config(lease_duration_ms),
+        )
+        .expect("create run");
+
+    let connector_extra = path
+        .to_str()
+        .expect("test path must be valid UTF-8")
+        .as_bytes();
+    let mut scratch = ShardSpecScratch::new();
+    let spec_ref =
+        range_shard_ref(b"\x00", b"\xFF", connector_extra, &mut scratch).expect("range shard spec");
+    let spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec");
+    let shard_id = ShardId::from_raw(1);
+    let shards = [InitialShardInput::new(
+        shard_id,
+        spec.as_ref(),
+        gossip_coordination::CursorUpdate::initial(),
+    )];
+    let _ = coordinator
+        .register_shards(
+            now,
+            distributed_tenant(),
+            distributed_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .expect("register shards");
+
+    coordinator
+}
+
+fn distributed_worker_identity(
+    path: &Path,
+    recorder: Arc<dyn CoordinationEventRecorder>,
+) -> WorkerIdentity {
+    WorkerIdentity::new(
+        distributed_tenant(),
+        distributed_run(),
+        distributed_worker(),
+        distributed_policy_hash(),
+        distributed_tenant_secret_key(),
+        FsScanConfig::new(path.to_path_buf()),
+        recorder,
+    )
+}
+
+fn fs_runtime_corpus_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/parity/corpus/fs_runtime")
 }
 
 #[derive(Default)]
@@ -482,6 +668,46 @@ fn scan_fs_with_runtime_returns_empty_report_when_pre_cancelled() {
         out.take().is_empty(),
         "no events should be emitted when pre-cancelled"
     );
+}
+
+#[test]
+fn scan_fs_local_and_distributed_paths_match_on_finding_set() {
+    let fixture_root = fs_runtime_corpus_dir();
+    let local_out = scanner_scheduler::events::VecEventOutput::new();
+    let cancel = CancellationToken::new();
+
+    let local_outcome = scan_fs_with_runtime(
+        &FsScanConfig::new(&fixture_root),
+        &local_out,
+        &commit_sink::CliNoOpCommitSink,
+        &cancel,
+    )
+    .expect("local filesystem scan should succeed");
+    assert!(
+        local_outcome.report.findings_emitted >= 1,
+        "parity fixture should emit at least one local finding",
+    );
+
+    let recorder = Arc::new(DistributedCoreRecorder::default());
+    let mut coordinator = setup_distributed_coordinator(&fixture_root, 30_000);
+    let report = run_worker(
+        &mut coordinator,
+        distributed_worker_identity(&fixture_root, recorder.clone()),
+        DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+        DistributedRuntimeConfig::default(),
+    )
+    .expect("distributed filesystem scan should succeed");
+    assert_eq!(report.leases_seen, 1);
+    assert_eq!(report.shards_scanned, 1);
+
+    let local = comparable_findings_from_jsonl(local_out.take(), &fixture_root);
+    let distributed = comparable_findings_from_jsonl(recorder.core_jsonl(), &fixture_root);
+
+    assert!(
+        !distributed.is_empty(),
+        "parity fixture should emit at least one distributed finding",
+    );
+    assert_eq!(distributed, local);
 }
 
 #[test]

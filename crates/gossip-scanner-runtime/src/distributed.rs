@@ -2587,6 +2587,40 @@ mod tests {
     }
 
     #[test]
+    fn complete_shard_with_checkpoint_uses_receipt_cursor_under_completed_semantics() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"a", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let checkpoint = Cursor::with_last_key(item_key("secret.txt"));
+
+        complete_shard(&mut coordinator, &identity, &lease, Some(&checkpoint))
+            .expect("checkpoint-backed shard completion must succeed");
+
+        let progress = run_progress(&coordinator);
+        assert_eq!(progress.active(), 0);
+        assert_eq!(progress.done(), 1);
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status(), ShardStatus::Done);
+        assert_eq!(
+            summaries[0].last_key(),
+            Some(
+                checkpoint
+                    .last_key()
+                    .expect("checkpoint key must be present")
+                    .as_bytes()
+            )
+        );
+        assert_ne!(
+            summaries[0].last_key(),
+            Some(lease.range_start()),
+            "completion must honor the receipt-derived checkpoint instead of the shard range start",
+        );
+    }
+
+    #[test]
     fn run_filesystem_lease_persists_checkpoint_cursor_for_secret_shard() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
