@@ -1024,6 +1024,8 @@ fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -
 /// same `OpId`. This allows the coordination backend to detect and deduplicate
 /// replayed completion calls.
 fn deterministic_op_id(key: ShardKey, fence: FenceEpoch, op_kind: OpKind) -> OpId {
+    // Domain string is part of the identity contract: changing it breaks OpId
+    // continuity for in-flight operations and causes deduplication mismatches.
     let mut hasher = domain_hasher("gossip.scanner_runtime.distributed.op_id");
     key.run().write_canonical(&mut hasher);
     key.shard().write_canonical(&mut hasher);
@@ -1102,7 +1104,7 @@ fn complete_shard<C>(
 where
     C: CoordinationFacade,
 {
-    debug_assert_eq!(lease.lease().tenant(), identity.tenant);
+    assert_eq!(lease.lease().tenant(), identity.tenant);
 
     let final_cursor = match checkpoint {
         Some(cursor) => cursor.as_update(),
@@ -1334,7 +1336,7 @@ where
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    let mut scratch = AcquireScratch::new();
+    let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
 
     loop {
@@ -2827,5 +2829,112 @@ mod tests {
             "missing run should produce Coordinator variant, got: {error:?}"
         );
         assert!(error.to_string().contains("run not found"));
+    }
+
+    #[test]
+    fn claim_retry_delay_with_future_deadline() {
+        let now = LogicalTime::from_raw(1000);
+        let deadline = Some(LogicalTime::from_raw(1050));
+        assert_eq!(claim_retry_delay(now, deadline), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn claim_retry_delay_clamps_stale_deadline_to_one_ms() {
+        let now = LogicalTime::from_raw(2000);
+        let stale = Some(LogicalTime::from_raw(1000));
+        assert_eq!(claim_retry_delay(now, stale), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn claim_retry_delay_falls_back_without_deadline() {
+        let now = LogicalTime::from_raw(1000);
+        assert_eq!(claim_retry_delay(now, None), CLAIM_RACE_RETRY_DELAY);
+    }
+
+    #[test]
+    fn build_lease_from_acquire_rejects_non_utf8_connector_extra() {
+        let mut coordinator = setup_coordinator_with_connector_extra(&[vec![0xFF, 0xFE]], 30_000);
+        let mut scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(wall_clock_now(), tenant(), run(), worker(1), &mut scratch)
+            .expect("claim next available");
+        let identity = worker_identity(Path::new("/fallback"));
+
+        let err = build_lease_from_acquire(acquired, &identity)
+            .expect_err("non-UTF-8 connector_extra must be rejected");
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_succeeds_with_mixed_finding_and_clean_files() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write secret fixture");
+        fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("mixed shard should succeed");
+
+        assert!(
+            report.items_scanned >= 2,
+            "both files should be scanned, got {}",
+            report.items_scanned,
+        );
+        assert!(
+            checkpoint.is_some(),
+            "shard with findings should checkpoint"
+        );
+
+        let observations = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot");
+        assert!(
+            !observations.is_empty(),
+            "secret file should produce durable findings"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the finding-bearing file produces a done-ledger row"
+        );
+    }
+
+    #[test]
+    fn complete_shard_fails_when_lease_is_fenced() {
+        let dir = tempdir().expect("tempdir");
+
+        // Use a very short TTL so our lease expires quickly.
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 50);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        // Wait for our lease to expire, then let a rival claim the same
+        // shard. This bumps the fence epoch, making our lease stale.
+        std::thread::sleep(Duration::from_millis(100));
+        let _rival_lease = claim_coordination_lease(&mut coordinator, worker(99));
+
+        let err = complete_shard(&mut coordinator, &identity, &lease, None)
+            .expect_err("completion with stale fence should fail");
+        assert!(
+            matches!(err, DistributedRuntimeError::Coordinator(_)),
+            "expected Coordinator error variant, got: {err:?}"
+        );
     }
 }
