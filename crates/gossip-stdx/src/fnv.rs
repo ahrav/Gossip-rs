@@ -44,14 +44,13 @@ pub fn fnv_mix_u64(sig: &mut u64, value: u64) {
 #[inline]
 pub fn fnv_mix_bytes(sig: &mut u64, bytes: &[u8]) {
     fnv_mix_u64(sig, bytes.len() as u64);
-    let full_chunks = bytes.len() / 8;
-    let (bulk, tail) = bytes.split_at(full_chunks * 8);
-    for chunk in bulk.chunks_exact(8) {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
         let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
         fnv_mix_u64(sig, word);
     }
-    for byte in tail {
-        fnv_mix_byte(sig, *byte);
+    for &byte in chunks.remainder() {
+        fnv_mix_byte(sig, byte);
     }
 }
 
