@@ -14,7 +14,7 @@
 //! acquire_shard ──► claim_next_available (coordination)
 //!                  ├─ OK: map spec → FilesystemAssignment, wrap in ShardLease
 //!                  ├─ NoneAvailable + active > 0: sleep, retry
-//!                  └─ NoneAvailable + active == 0: return None (run settled)
+//!                  └─ NoneAvailable + active == 0: return None (no active shards remain)
 //!
 //! complete_shard ──► complete (coordination) + deterministic OpId
 //!
@@ -56,7 +56,7 @@ use crate::FilesystemAssignment;
 
 /// Fallback delay when no shard-lease deadline is available to guide retry
 /// timing. Kept short to avoid stalling the worker loop when concurrent
-/// workers are completing shards faster than the polling interval.
+/// workers are completing shards rapidly.
 const CLAIM_RACE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 /// Production adapter: the generic adapter core specialized on
@@ -162,9 +162,10 @@ impl<C> RuntimeAdapterCore<C> {
 /// [`DistributedCoordinator`] implementation for the generic adapter core.
 ///
 /// `is_shard_done` always returns `false` and `mark_shard_done` is a no-op
-/// because the done-ledger is not yet backed by persistent storage in this
-/// adapter. The worker loop will re-scan a shard if it is re-acquired
-/// after a crash.
+/// because shard completion state is tracked by the coordination backend
+/// itself (the `complete` call transitions the shard to Done status).
+/// Re-scanning after a crash is harmless due to idempotency contracts on
+/// `FindingsSink` and `DoneLedger`.
 impl<C> DistributedCoordinator<FilesystemAssignment> for RuntimeAdapterCore<C>
 where
     C: CoordinationBackend + RunManagement + ShardClaiming + Send,
@@ -175,8 +176,9 @@ where
     /// - A shard is claimed: translates the coordination-layer lease and spec
     ///   into a runtime-layer [`ShardLease<FilesystemAssignment>`], tracks the
     ///   coordination lease in `active_leases`, and returns `Some(lease)`.
-    /// - The run is settled (`progress.active() == 0`): returns `None`,
-    ///   signaling the worker loop to shut down.
+    /// - No active shards remain (`progress.active() == 0`): returns `None`,
+    ///   signaling the worker loop to shut down. Parked or terminal shards
+    ///   are not retried.
     /// - A non-retryable error occurs: returns `Err`.
     ///
     /// Between retries the thread sleeps until the earliest known lease
@@ -286,11 +288,15 @@ where
         &self,
         lease: &ShardLease<FilesystemAssignment>,
         checkpoint: Option<Cursor>,
-        // The coordination backend does not consume scan-report metrics.
-        // The report is part of the trait interface so other implementations
-        // (e.g., telemetry-aware coordinators) can forward it.
-        _report: ScanReport,
+        report: ScanReport,
     ) -> Result<()> {
+        tracing::debug!(
+            shard_id = %lease.shard_id(),
+            items_scanned = report.items_scanned,
+            bytes_scanned = report.bytes_scanned,
+            findings_emitted = report.findings_emitted,
+            "shard scan complete",
+        );
         let now = wall_clock_now();
         let mut state = self.state.lock().expect("adapter state lock");
 
@@ -322,10 +328,16 @@ where
             coordination_lease.fence(),
             OpKind::Complete,
         );
-        let _ = state
+        let outcome = state
             .coordinator
             .complete(now, self.tenant, &coordination_lease, &final_cursor, op_id)
             .map_err(anyhow::Error::from)?;
+        if !outcome.is_executed() {
+            tracing::info!(
+                shard_id = %lease.shard_id(),
+                "completion was an idempotent replay",
+            );
+        }
         state.active_leases.remove(lease.shard_id());
         Ok(())
     }
@@ -794,5 +806,17 @@ mod tests {
     fn claim_retry_delay_falls_back_without_deadline() {
         let now = LogicalTime::from_raw(1000);
         assert_eq!(claim_retry_delay(now, None), CLAIM_RACE_RETRY_DELAY);
+    }
+
+    #[test]
+    fn acquire_shard_rejects_non_utf8_connector_extra() {
+        let adapter = make_adapter_with_registered_shard(&[0xFF, 0xFE]);
+        let err = adapter
+            .acquire_shard()
+            .expect_err("non-UTF-8 connector_extra should fail");
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -1220,6 +1220,8 @@ struct InMemoryCoordinatorState<A> {
     acquire_fail_count: usize,
     release_fail_count: usize,
     is_done_fail_count: usize,
+    complete_fail_count: usize,
+    mark_done_fail_count: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1237,6 +1239,8 @@ impl<A> Default for InMemoryCoordinatorState<A> {
             acquire_fail_count: 0,
             release_fail_count: 0,
             is_done_fail_count: 0,
+            complete_fail_count: 0,
+            mark_done_fail_count: 0,
         }
     }
 }
@@ -1314,6 +1318,16 @@ impl<A> InMemoryCoordinator<A> {
     pub fn fail_next_is_done_checks(&self, count: usize) {
         self.state.lock().expect("state lock").is_done_fail_count = count;
     }
+
+    /// Cause the next `count` calls to `complete_shard` to return an error.
+    pub fn fail_next_completes(&self, count: usize) {
+        self.state.lock().expect("state lock").complete_fail_count = count;
+    }
+
+    /// Cause the next `count` calls to `mark_shard_done` to return an error.
+    pub fn fail_next_mark_done(&self, count: usize) {
+        self.state.lock().expect("state lock").mark_done_fail_count = count;
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1346,15 +1360,16 @@ where
         checkpoint: Option<Cursor>,
         report: ScanReport,
     ) -> Result<()> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .completed
-            .push(CompletedShard {
-                shard_id: lease.shard_id().to_owned(),
-                checkpoint,
-                report,
-            });
+        let mut guard = self.state.lock().expect("state lock");
+        if guard.complete_fail_count > 0 {
+            guard.complete_fail_count -= 1;
+            return Err(anyhow!("injected complete_shard failure"));
+        }
+        guard.completed.push(CompletedShard {
+            shard_id: lease.shard_id().to_owned(),
+            checkpoint,
+            report,
+        });
         Ok(())
     }
 
@@ -1369,6 +1384,10 @@ where
 
     fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()> {
         let mut guard = self.state.lock().expect("state lock");
+        if guard.mark_done_fail_count > 0 {
+            guard.mark_done_fail_count -= 1;
+            return Err(anyhow!("injected mark_shard_done failure"));
+        }
         guard.done.insert(lease.shard_id().to_owned());
         guard.done_mark_contexts.push(lease.write_context());
         Ok(())
@@ -3078,5 +3097,77 @@ mod tests {
         assert_eq!(report.leases_seen, 2);
         assert_eq!(report.shards_skipped_done, 1);
         assert_eq!(report.shards_scanned, 1);
+    }
+
+    #[test]
+    fn run_worker_returns_coordinator_error_on_complete_failure() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_completes(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected complete failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "complete failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected complete_shard failure"),
+            "unexpected error: {error}"
+        );
+
+        // The lease should still be released best-effort despite the error.
+        assert_eq!(
+            coordinator.released_shards(),
+            vec!["shard-a"],
+            "lease must be released best-effort after complete failure"
+        );
+    }
+
+    #[test]
+    fn run_worker_completes_but_fails_mark_done() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
+        coordinator.fail_next_mark_done(1);
+
+        let error = run_worker(
+            &coordinator,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("injected mark_done failure should propagate");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "mark_done failure should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected mark_shard_done failure"),
+            "unexpected error: {error}"
+        );
+
+        // The shard was successfully completed before mark_done failed.
+        assert_eq!(
+            coordinator.completed_shards().len(),
+            1,
+            "shard must appear in completed list despite mark_done failure"
+        );
+        assert!(
+            coordinator.done_set().is_empty(),
+            "shard must not appear in done set when mark_done fails"
+        );
     }
 }

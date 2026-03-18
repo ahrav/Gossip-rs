@@ -1341,6 +1341,7 @@ dependencies = [
  "gossip-frontier",
  "gossip-scanner-runtime",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
