@@ -1561,6 +1561,10 @@ mod tests {
         ["password=", "xK9mP2qL7wN4vR8t"].concat()
     }
 
+    fn clean_fixture() -> &'static str {
+        "ordinary sample text for scanner tests"
+    }
+
     fn filesystem_lease(shard_id: &str, path: &std::path::Path) -> ShardLease<StubAssignment> {
         ShardLease::new(
             Arc::from(shard_id),
@@ -2756,6 +2760,54 @@ mod tests {
     }
 
     #[test]
+    fn run_filesystem_lease_clean_only_shard_completes_without_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
+
+        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+        let lease = filesystem_lease("shard-clean-only", dir.path());
+
+        run_filesystem_lease(
+            &coordinator,
+            coordinator.event_recorder(),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("clean-only filesystem shard should succeed");
+
+        let completed = coordinator.completed_shards();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].shard_id, "shard-clean-only");
+        assert_eq!(
+            completed[0].report.items_scanned, 1,
+            "clean-only shard with a single file should report exactly one scanned item"
+        );
+        assert!(
+            completed[0].checkpoint.is_none(),
+            "clean-only shard must complete without a checkpoint"
+        );
+        assert!(coordinator.done_set().contains("shard-clean-only"));
+        assert!(
+            findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "clean-only shard should not emit durable findings observations"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "clean-only shard should not emit done-ledger rows"
+        );
+    }
+
+    #[test]
     fn run_filesystem_lease_commit_failure_prevents_completion_and_done_mark() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
@@ -2848,8 +2900,7 @@ mod tests {
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write secret fixture");
         // Clean file — no findings, so the scanner's emit_persistence_batch
         // early-returns and this file never enters the commit pipeline.
-        fs::write(dir.path().join("readme.txt"), "This file has no secrets.")
-            .expect("write clean fixture");
+        fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 
         let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
         let findings_sink = InMemoryFindingsSink::new();
