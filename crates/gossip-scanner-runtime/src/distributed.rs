@@ -1,58 +1,96 @@
-//! Foundational distributed runtime types for receipt-driven worker execution.
+//! Distributed worker runtime for receipt-driven shard execution.
 //!
-//! This module defines the shared nouns consumed by the distributed worker
-//! loop: lease payloads ([`ShardLease`]), coordinator callbacks
-//! ([`DistributedCoordinator`]), cloned persistence handles
-//! ([`DistributedPersistence`]), runtime configuration
-//! ([`DistributedRuntimeConfig`]), run reports ([`DistributedRunReport`]),
-//! and error layering ([`DistributedRuntimeError`]).
+//! This module is the entry point for distributed scanning. It implements a
+//! claim-execute-complete loop: the worker claims shards from a
+//! [`CoordinationFacade`], executes each shard's filesystem scan, commits
+//! findings and done-ledger rows through a bounded commit pipeline, and then
+//! completes the shard lease with a receipt-driven checkpoint cursor.
 //!
-//! It also provides `ReceiptCommitSink`, the compatibility adapter that
-//! translates scan-loop `CommitSink` callbacks into receipt-driven commit
-//! pipeline work.
+//! # Architecture
+//!
+//! ```text
+//! ┌──────────────┐    claim     ┌────────────────────┐
+//! │ Coordinator  │ ──────────>  │  run_worker loop   │
+//! │ (CoordFacade)│ <────────── │  (claim/scan/done) │
+//! └──────────────┘   complete   └────────┬───────────┘
+//!                                        │
+//!                              ┌─────────▼──────────┐
+//!                              │ run_filesystem_lease│
+//!                              │  (per shard)        │
+//!                              └─────────┬──────────┘
+//!                     ┌──────────────────┼──────────────────┐
+//!                     ▼                  ▼                  ▼
+//!          ┌────────────────┐  ┌──────────────────┐ ┌─────────────┐
+//!          │ scan engine    │  │ ReceiptCommitSink │ │ commit      │
+//!          │ (scheduler)    │──│ (CommitSink impl) │─│ pipeline    │
+//!          └────────────────┘  └──────────────────┘ │ + drainer   │
+//!                                                   └──────┬──────┘
+//!                                                          ▼
+//!                                                 ┌────────────────┐
+//!                                                 │ Checkpoint     │
+//!                                                 │ Aggregator     │
+//!                                                 └────────────────┘
+//! ```
+//!
+//! # Key types
+//!
+//! | Type                        | Role                                             |
+//! |-----------------------------|--------------------------------------------------|
+//! | [`WorkerIdentity`]          | Immutable identity threaded through all calls     |
+//! | [`ShardLease`]              | Per-shard lease payload with scan config + fencing|
+//! | [`DistributedPersistence`]  | Cloneable persistence backend handles             |
+//! | [`DistributedRuntimeConfig`]| Budget and queue-sizing knobs                     |
+//! | [`DistributedRunReport`]    | Summary counters from one worker invocation       |
+//! | [`DistributedRuntimeError`] | Layered error: coordinator / runtime / durability |
+//!
+//! # Invariants
+//!
+//! 1. **Receipt-only checkpoint advancement.** Checkpoint progress is derived
+//!    exclusively from durable commit receipts, never from raw scan completion.
+//! 2. **Single-threaded scan execution.** Each shard runs with `workers = 1` so
+//!    the `ReceiptCommitSink` sequence counter remains monotonic without
+//!    cross-thread synchronization.
+//! 3. **At-least-once delivery.** The commit pipeline tolerates duplicate writes
+//!    for the same `(write_context, item_key)` pair. Persistence backends must
+//!    be idempotent.
+//! 4. **Fail-fast after claim.** Once a shard is claimed, any scan, commit, or
+//!    completion error terminates the worker loop. Uncompleted leases expire
+//!    via coordination-layer deadlines.
+//!
+//! # Internal adapter: `ReceiptCommitSink`
+//!
+//! The scan scheduler emits compact `CommitSink` callbacks (`begin_item`,
+//! `upsert_findings`, `finish_item`). `ReceiptCommitSink` bridges these into
+//! the richer [`CommitPipeline`] by reconstructing deterministic
+//! [`crate::result_translation::translate_item_result`]
+//! inputs and submitting owned [`QueuedCommit`] work items.
+//!
+//! [`CoordinationFacade`]: gossip_coordination::CoordinationFacade
+//! [`CommitPipeline`]: crate::commit_pipeline::CommitPipeline
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Error as AnyError, Result, anyhow};
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
-    identity::{LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, TenantSecretKey},
+    identity::{
+        CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
+        RuleFingerprint, RunId, ShardKey, TenantId, TenantSecretKey, WorkerId, domain_hasher,
+        finalize_64,
+    },
     persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
 };
+use gossip_coordination::{
+    AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, Lease, OpKind,
+};
+use gossip_frontier::decode_connector_extra;
 use scanner_scheduler::store::FsFindingRecord;
-
-/// Error returned when a [`ShardLease`] construction detects that the
-/// assignment's policy hash does not match the write context's policy hash.
-///
-/// This is a boundary-validation failure: the coordinator adapter produced
-/// inconsistent shard data, typically during rolling policy updates or
-/// coordinator bugs. Surfacing this as a recoverable error lets the worker
-/// loop skip the shard and continue draining the queue instead of crashing.
-#[derive(Debug, Clone)]
-pub struct PolicyMismatchError {
-    /// Shard label that triggered the mismatch.
-    pub shard_id: Arc<str>,
-    /// Policy hash carried by the assignment payload.
-    pub assignment_hash: PolicyHash,
-    /// Policy hash carried by the write context.
-    pub write_context_hash: PolicyHash,
-}
-
-impl fmt::Display for PolicyMismatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "shard {:?}: assignment policy_hash ({:?}) != write_context policy_hash ({:?})",
-            self.shard_id, self.assignment_hash, self.write_context_hash,
-        )
-    }
-}
-
-impl std::error::Error for PolicyMismatchError {}
 
 use crate::{
     CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
@@ -70,43 +108,84 @@ use crate::{
     scan_fs_with_prebuilt_engine,
 };
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::OwnedCoreEvent;
-#[cfg(any(test, feature = "test-support"))]
-use crate::coordination_sink::StoredGitEvent;
-#[cfg(any(test, feature = "test-support"))]
-use std::collections::{HashSet, VecDeque};
+/// Immutable worker identity threaded through shard claiming and completion.
+///
+/// Bundles all tenant-scoped, run-scoped, and worker-scoped state that
+/// [`run_worker`] needs to claim shards and complete them against a
+/// [`CoordinationFacade`]. Each field is constant for the lifetime of one
+/// worker invocation; per-shard variability (scan path, fencing epoch) lives
+/// on [`ShardLease`] instead.
+#[derive(Clone)]
+pub struct WorkerIdentity {
+    /// Tenant boundary for all coordination calls.
+    pub tenant: TenantId,
+    /// Run whose shards this worker claims.
+    pub run: RunId,
+    /// Worker identity recorded on claimed leases.
+    pub worker: WorkerId,
+    /// Detection policy scope for all writes emitted by this worker.
+    pub policy_hash: PolicyHash,
+    /// Tenant-scoped secret used when deriving stable persistence identity.
+    pub tenant_secret_key: TenantSecretKey,
+    /// Base filesystem scan configuration cloned per shard and optionally
+    /// overridden from shard metadata.
+    pub scan_template: FsScanConfig,
+    /// Shared recorder used by event and commit telemetry.
+    pub recorder: Arc<dyn CoordinationEventRecorder>,
+}
 
-/// Assignment payloads expose their policy scope so leases can assert that the
-/// payload agrees with the shared write context.
-pub trait ShardLeaseAssignment {
-    /// Detection-policy hash carried by the assignment payload.
-    ///
-    /// Implementations must return the same value for the lifetime of `self`.
-    fn policy_hash(&self) -> PolicyHash;
-
-    /// Filesystem scan config carried by the assignment payload, if any.
-    ///
-    /// Distributed receipt-driven execution currently supports only filesystem
-    /// leases. Assignment types that do not represent a filesystem shard should
-    /// use the default `None` implementation.
+impl WorkerIdentity {
+    /// Construct one distributed worker identity bundle.
     #[must_use]
-    fn filesystem_scan_config(&self) -> Option<FsScanConfig> {
-        None
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant: TenantId,
+        run: RunId,
+        worker: WorkerId,
+        policy_hash: PolicyHash,
+        tenant_secret_key: TenantSecretKey,
+        scan_template: FsScanConfig,
+        recorder: Arc<dyn CoordinationEventRecorder>,
+    ) -> Self {
+        Self {
+            tenant,
+            run,
+            worker,
+            policy_hash,
+            tenant_secret_key,
+            scan_template,
+            recorder,
+        }
     }
 }
 
 /// Lease payload consumed by the distributed runtime.
 ///
-/// One lease corresponds to one shard from the coordination layer. The string
-/// shard label routes telemetry, while [`WriteContext`] carries the numeric
-/// shard identity used for fenced writes.
+/// One lease corresponds to one shard from the coordination layer. It carries
+/// everything needed to scan and commit that shard without additional lookups:
+///
+/// - **`shard_id`** — string label for telemetry routing.
+/// - **`lease`** — authoritative coordination lease used for terminal completion.
+/// - **`range_start`** — inclusive lower bound of the shard's key range, used as
+///   the fallback cursor when no items are committed.
+/// - **`scan_config`** — filesystem scan configuration for this shard, derived
+///   from the worker template with optional shard-level path overrides.
+/// - **`write_context`** — numeric shard identity plus fencing epoch for all
+///   persistence writes.
+/// - **`tenant_secret_key`** — key material for secret-hash derivation.
+///
+/// The coordination lease and range start are kept together so that
+/// shard completion can finalize the lease without a side-map.
 #[derive(Clone, Debug)]
-pub struct ShardLease<A> {
+pub struct ShardLease {
     /// String shard label used for routing recorder events.
     shard_id: Arc<str>,
-    /// Scan assignment payload associated with this lease.
-    assignment: A,
+    /// Authoritative coordination-layer lease used for terminal completion.
+    lease: Lease,
+    /// Inclusive lower bound of the shard's key range.
+    range_start: Vec<u8>,
+    /// Filesystem scan configuration for this shard.
+    scan_config: FsScanConfig,
     /// Shared routing and fencing metadata for all writes emitted under the
     /// lease.
     write_context: WriteContext,
@@ -114,42 +193,26 @@ pub struct ShardLease<A> {
     tenant_secret_key: TenantSecretKey,
 }
 
-impl<A: ShardLeaseAssignment> ShardLease<A> {
-    /// Construct a lease payload, validating that the assignment and write
-    /// context agree on policy scope.
-    ///
-    /// Returns [`PolicyMismatchError`] when the hashes diverge. This is a
-    /// boundary-validation check: the coordinator adapter is responsible for
-    /// producing consistent shard data, but a mismatch must be surfaced as a
-    /// recoverable error so the worker loop can skip the shard instead of
-    /// crashing.
+impl ShardLease {
+    /// Construct one concrete filesystem shard lease.
     pub fn new(
         shard_id: Arc<str>,
-        assignment: A,
+        lease: Lease,
+        range_start: Vec<u8>,
+        scan_config: FsScanConfig,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
-    ) -> std::result::Result<Self, PolicyMismatchError> {
-        let assignment_hash = assignment.policy_hash();
-        let write_context_hash = write_context.policy_hash();
-
-        if assignment_hash != write_context_hash {
-            return Err(PolicyMismatchError {
-                shard_id,
-                assignment_hash,
-                write_context_hash,
-            });
-        }
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             shard_id,
-            assignment,
+            lease,
+            range_start,
+            scan_config,
             write_context,
             tenant_secret_key,
-        })
+        }
     }
-}
 
-impl<A> ShardLease<A> {
     /// String shard label used for routing recorder events.
     #[inline]
     #[must_use]
@@ -164,11 +227,24 @@ impl<A> ShardLease<A> {
         &self.shard_id
     }
 
-    /// Scan assignment payload associated with this lease.
+    /// Coordination-layer lease used for terminal completion.
+    #[inline]
+    pub fn lease(&self) -> Lease {
+        self.lease
+    }
+
+    /// Inclusive lower bound of the shard's key range.
     #[inline]
     #[must_use]
-    pub fn assignment(&self) -> &A {
-        &self.assignment
+    pub fn range_start(&self) -> &[u8] {
+        &self.range_start
+    }
+
+    /// Filesystem scan configuration for this shard.
+    #[inline]
+    #[must_use]
+    pub fn scan_config(&self) -> &FsScanConfig {
+        &self.scan_config
     }
 
     /// Shared routing and fencing metadata for all writes emitted under the
@@ -185,64 +261,6 @@ impl<A> ShardLease<A> {
     pub fn tenant_secret_key(&self) -> TenantSecretKey {
         self.tenant_secret_key
     }
-}
-
-/// Coordinator surface required by the distributed runtime.
-///
-/// Implementors must guarantee:
-///
-/// - `acquire_shard` returns `None` when no more work is available.
-/// - Production coordinators make `complete_shard` idempotent or
-///   at-least-once tolerant because crash recovery may replay the call.
-/// - `mark_shard_done` is called only after `complete_shard` succeeds.
-/// - `release_shard` validates lease ownership.
-/// - `event_recorder` is safe to share across event and commit telemetry for
-///   one shard.
-///
-/// # Design note
-///
-/// This trait intentionally bundles shard lifecycle, done-ledger, and
-/// recorder access into one surface. The worker loop calls all methods
-/// on the same coordinator instance. Split into focused traits when a
-/// second implementation or test double needs a subset.
-///
-/// Methods are synchronous so the trait can be used in deterministic
-/// simulation tests without an async runtime. Implementations that wrap
-/// remote I/O should run on a dedicated OS thread or use interior
-/// `block_on`; the worker loop must not call these methods from a Tokio
-/// reactor thread.
-pub trait DistributedCoordinator<A>: Send + Sync
-where
-    A: ShardLeaseAssignment,
-{
-    /// Acquire the next lease to process, or `None` when no work remains.
-    ///
-    /// `None` is terminal — the worker loop will shut down. Implementations that
-    /// need to express temporary unavailability must block or retry internally.
-    fn acquire_shard(&self) -> Result<Option<ShardLease<A>>>;
-
-    /// Release a lease without marking it complete.
-    fn release_shard(&self, lease: &ShardLease<A>) -> Result<()>;
-
-    /// Mark one lease complete with optional receipt-derived checkpoint
-    /// metadata. The [`Cursor`] is the connector-layer owned cursor; the
-    /// coordinator adapter bridges it to `CursorUpdate` for the coordination
-    /// backend.
-    fn complete_shard(
-        &self,
-        lease: &ShardLease<A>,
-        checkpoint: Option<Cursor>,
-        report: ScanReport,
-    ) -> Result<()>;
-
-    /// Query done-ledger status before scanning a shard.
-    fn is_shard_done(&self, lease: &ShardLease<A>) -> Result<bool>;
-
-    /// Persist done-ledger completion after successful scan.
-    fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()>;
-
-    /// Shared recorder used by event and progress telemetry.
-    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder>;
 }
 
 /// Shared persistence backends used by the distributed runtime.
@@ -276,14 +294,17 @@ where
     }
 }
 
-/// Runtime config for distributed scans.
+/// Runtime configuration for distributed scans.
+///
+/// Controls scan budgets (item count, byte count, time limits) and the
+/// capacity of the bounded channels that connect scan execution to the
+/// commit stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DistributedRuntimeConfig {
     /// Scan execution budget controls applied to every shard assignment.
     pub budgets: ScanBudgets,
     /// Capacity used for both the bounded execution-to-commit queue and the
-    /// commit-to-checkpoint outcome queue. Matches the
-    /// [`CommitPipelineConfig`] default.
+    /// commit-to-checkpoint outcome queue. Defaults to 64.
     pub commit_queue_capacity: NonZeroUsize,
 }
 
@@ -298,34 +319,35 @@ impl Default for DistributedRuntimeConfig {
 
 /// Summary report from one distributed runtime invocation.
 ///
-/// Invariant: `shards_scanned + shards_skipped_done <= leases_seen`.
-/// The difference (`leases_seen - shards_scanned - shards_skipped_done`)
-/// represents leases that were acquired but released without completion,
-/// for example due to a per-shard runtime error or a coordinator-level skip.
+/// Invariant: `shards_scanned <= leases_seen`.
+/// The difference (`leases_seen - shards_scanned`) represents leases that were
+/// claimed but not completed because the worker terminated on an error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DistributedRunReport {
     /// Total number of leases dequeued from the coordinator.
     pub leases_seen: u64,
     /// Number of shards that were scanned.
     pub shards_scanned: u64,
-    /// Number of shards skipped because they were already done.
-    pub shards_skipped_done: u64,
 }
 
 impl DistributedRunReport {
     /// Assert the structural invariant in debug builds.
     fn debug_assert_invariant(&self) {
         debug_assert!(
-            self.shards_scanned + self.shards_skipped_done <= self.leases_seen,
-            "report invariant violated: scanned({}) + skipped({}) > seen({})",
+            self.shards_scanned <= self.leases_seen,
+            "report invariant violated: scanned({}) > seen({})",
             self.shards_scanned,
-            self.shards_skipped_done,
             self.leases_seen,
         );
     }
 }
 
-/// Distributed runtime error.
+/// Layered error from the distributed runtime.
+///
+/// Classifies failures by origin so callers can distinguish coordinator
+/// connectivity issues from local scan crashes from durability pipeline
+/// stalls. The variant determines whether the error is retryable (e.g.,
+/// coordinator transient failures) or terminal (e.g., scan panics).
 #[derive(Debug)]
 pub enum DistributedRuntimeError {
     /// The coordinator returned an error.
@@ -334,12 +356,6 @@ pub enum DistributedRuntimeError {
     Runtime(ScanRuntimeError),
     /// The local durability pipeline failed.
     Durability(AnyError),
-    /// The lease assignment is not a supported type for this runtime
-    /// (e.g. non-filesystem assignment in a filesystem-only worker).
-    UnsupportedAssignment {
-        /// Shard label for the unsupported assignment.
-        shard_id: Arc<str>,
-    },
 }
 
 impl fmt::Display for DistributedRuntimeError {
@@ -348,9 +364,6 @@ impl fmt::Display for DistributedRuntimeError {
             Self::Coordinator(error) => write!(f, "coordinator error: {error}"),
             Self::Runtime(error) => write!(f, "runtime error: {error}"),
             Self::Durability(error) => write!(f, "durability pipeline error: {error}"),
-            Self::UnsupportedAssignment { shard_id } => {
-                write!(f, "unsupported assignment for shard {shard_id:?}")
-            }
         }
     }
 }
@@ -361,7 +374,6 @@ impl std::error::Error for DistributedRuntimeError {
             Self::Coordinator(error) => Some(error.as_ref()),
             Self::Runtime(error) => Some(error),
             Self::Durability(error) => Some(error.as_ref()),
-            Self::UnsupportedAssignment { .. } => None,
         }
     }
 }
@@ -376,10 +388,12 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 ///
 /// Accumulates findings through [`ReceiptCommitSink::upsert_findings`] until
 /// [`finish_item`](ReceiptCommitSink::finish_item) translates the accumulated
-/// state into a [`QueuedCommit`] and submits it to the pipeline. On
-/// translation or submission failure, the item is re-inserted into the
-/// in-flight map so the caller can retry.
-#[cfg_attr(not(test), allow(dead_code))]
+/// state into a [`QueuedCommit`] and submits it to the pipeline.
+///
+/// Rollback on failure: if translation or pipeline submission fails,
+/// `finish_item` re-inserts the item into the in-flight map so the caller
+/// can retry or so that `ReceiptCommitSink::finish()` can detect the
+/// leaked item.
 #[derive(Debug)]
 struct InFlightItem {
     sequence_no: u64,
@@ -387,14 +401,28 @@ struct InFlightItem {
     findings: Vec<FsFindingRecord>,
 }
 
-/// Scan-driver commit sink that bridges begin/upsert/finish callbacks into the
+/// Compatibility adapter that bridges scan-loop `CommitSink` callbacks into the
 /// receipt-driven commit pipeline.
 ///
-/// The existing scan-loop seam still emits compact `ItemMeta` and
-/// `FindingRecord` batches rather than the richer runtime commit inputs.
-/// `ReceiptCommitSink` reconstructs the deterministic translation inputs
-/// expected by the shared commit pipeline so ordered-content execution can
-/// produce durable receipts without changing the scheduler callback surface.
+/// # Problem
+///
+/// The scan scheduler emits compact `ItemMeta` + `FindingRecord` batches via
+/// the `CommitSink` trait. The downstream commit pipeline expects richer
+/// `QueuedCommit` work items containing full persistence translations
+/// (findings, occurrences, observations, done-ledger rows). This adapter
+/// reconstructs those deterministic translations in `finish_item` so
+/// ordered-content execution can produce durable receipts without changing
+/// the scheduler callback surface.
+///
+/// # Item lifecycle
+///
+/// ```text
+/// begin_item(key, meta)          → inserts InFlightItem with sequence_no
+///   upsert_findings(key, batch)  → appends FsFindingRecord to InFlightItem
+///   upsert_findings(key, batch)  → (may be called multiple times)
+/// finish_item(key)               → removes InFlightItem, translates,
+///                                  submits QueuedCommit to pipeline
+/// ```
 ///
 /// # Threading model
 ///
@@ -404,7 +432,14 @@ struct InFlightItem {
 /// [`next_sequence_no`](Self::next_sequence_no) are therefore monotonically
 /// ordered with respect to submission; `Ordering::Relaxed` is sufficient
 /// because there is no concurrent caller to race against.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// # Failure modes
+///
+/// - **Translation failure** (e.g., sequence-number overflow): the item is
+///   rolled back into `in_flight` and `finish()` will detect it.
+/// - **Submission failure** (e.g., pipeline disconnected): same rollback.
+/// - **Recorder failure** (telemetry): logged once, then suppressed; non-fatal
+///   because durability flows through the commit pipeline, not the recorder.
 struct ReceiptCommitSink {
     shard_id: Arc<str>,
     recorder: Arc<dyn CoordinationEventRecorder>,
@@ -421,8 +456,12 @@ struct ReceiptCommitSink {
     progress_error_logged: AtomicBool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ReceiptCommitSink {
+    /// Construct one adapter for a single shard's scan lifecycle.
+    ///
+    /// The `rule_fingerprint` closure maps engine rule IDs to stable
+    /// persistence-layer fingerprints. It is called during `finish_item`
+    /// translation and must be deterministic for the same rule ID.
     fn new(
         recorder: Arc<dyn CoordinationEventRecorder>,
         shard_id: Arc<str>,
@@ -543,9 +582,19 @@ impl ReceiptCommitSink {
     /// item's accumulated state and produce a [`QueuedCommit`] ready for the
     /// commit pipeline.
     ///
-    /// When the item has no explicit `version`, a weak version derived from
-    /// the item key bytes is used. When the item key is valid UTF-8, a
-    /// display-only [`Location`] is attached for diagnostics.
+    /// This is the core bridge logic. It:
+    /// 1. Derives a non-overlapping `[started, finished)` logical time pair
+    ///    from the item's sequence number.
+    /// 2. Falls back to a weak version derived from the item key bytes when
+    ///    the connector did not supply an explicit version.
+    /// 3. Attaches a display-only [`Location`] when the item key is valid
+    ///    UTF-8 and `Location::try_new` accepts the resulting string
+    ///    (best-effort; non-UTF-8 keys or keys rejected by `Location`
+    ///    construction skip the location).
+    /// 4. Delegates to [`translate_item_result`] for deterministic
+    ///    persistence row derivation.
+    ///
+    /// [`translate_item_result`]: crate::result_translation::translate_item_result
     fn translate_in_flight(&self, item_key: &ItemKey, item: &InFlightItem) -> Result<QueuedCommit> {
         let timing = Self::logical_timing_for(item.sequence_no)?;
         let bytes_scanned = item.meta.size_hint.unwrap_or(0);
@@ -714,18 +763,11 @@ impl CommitSink for ReceiptCommitSink {
     }
 }
 
-impl From<PolicyMismatchError> for DistributedRuntimeError {
-    fn from(value: PolicyMismatchError) -> Self {
-        Self::Coordinator(value.into())
-    }
-}
-
 /// Accumulated state from draining the commit-stage outcome stream.
 ///
 /// Produced by [`drain_commit_stage`] and consumed by
 /// [`run_filesystem_lease`] to build the checkpoint and verify that every
 /// submitted commit produced a durable outcome.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct CommitStageDrainResult {
     /// Receipt aggregator that tracks the contiguous committed prefix.
@@ -754,7 +796,6 @@ struct CommitStageDrainResult {
 /// sequence-number cross-check. If external cancellation were introduced,
 /// callers would need to distinguish cancellation-induced outcome gaps from
 /// genuine durability failures.
-#[cfg_attr(not(test), allow(dead_code))]
 fn drain_commit_stage<F, D>(
     drainer: CommitPipelineDrainer<F, D>,
     write_context: WriteContext,
@@ -827,7 +868,6 @@ where
 /// The local commit pipeline exposes an outcome stream rather than per-item
 /// completion handles, so this helper matches submitted sequence numbers
 /// against the committed sequence numbers drained from that stream.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wait_for_submitted_commits(
     mut submitted: Vec<u64>,
     mut committed_sequence_nos: Vec<u64>,
@@ -887,7 +927,6 @@ fn wait_for_submitted_commits(
 /// # Errors
 ///
 /// Returns an error if `last_sequence_no` is `u64::MAX` (no room for +1).
-#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
     last_sequence_no
@@ -896,49 +935,259 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
         .ok_or_else(|| anyhow!("checkpoint logical time overflow: last_sequence_no is u64::MAX"))
 }
 
-/// Execute one filesystem lease under the receipt-driven durability model.
+/// Fallback delay when no lease deadline is available to guide retry timing.
 ///
-/// The scan path runs with finding persistence enabled and a single execution
-/// worker so `ReceiptCommitSink` sequence assignment remains deterministic.
-/// The shard completes only after every submitted item has produced a durable
-/// commit outcome and the resulting committed prefix has been checkpointed.
+/// Kept short (25 ms) to avoid stalling the worker loop when concurrent
+/// workers are completing shards rapidly.
+const CLAIM_RACE_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+/// Synthetic cursor key for completing unbounded shards that produced zero
+/// items.
 ///
-/// # Completion protocol
+/// When a shard's `key_range_start` is empty (unbounded lower bound) and no
+/// items were committed, we still need a valid `last_key` to satisfy the
+/// coordination layer's completion validation. A single null byte is the
+/// smallest non-empty byte sequence and passes all bounds checks when the
+/// spec start is empty.
+const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
+
+/// Build a filesystem scan config by overlaying shard metadata onto a template.
 ///
-/// 1. Scan execution and commit-stage drain run concurrently on scoped threads.
-/// 2. After both finish, the submitted vs committed sequence lists are compared.
-/// 3. The aggregator prepares a checkpoint prefix from the committed receipts.
-/// 4. `complete_shard` persists the checkpoint cursor with the coordinator.
-/// 5. The checkpoint is acknowledged, advancing the aggregator's watermark.
-/// 6. `mark_shard_done` records the shard as complete in the done-ledger.
+/// If the shard's `connector_extra` field contains a non-empty UTF-8 path,
+/// that path overrides the template's `path` field. Otherwise the template
+/// path is used as-is.
+fn scan_config_from_spec(
+    spec: gossip_coordination::ShardSpecRef<'_>,
+    scan_template: &FsScanConfig,
+) -> Result<FsScanConfig> {
+    let mut scan_config = scan_template.clone();
+    let connector_extra = decode_connector_extra(spec)
+        .map_err(|err| anyhow!("failed to decode shard metadata envelope: {err}"))?;
+
+    if !connector_extra.is_empty() {
+        let path = std::str::from_utf8(connector_extra)
+            .map_err(|err| anyhow!("filesystem shard metadata path is not valid UTF-8: {err}"))?;
+        scan_config.path = PathBuf::from(path);
+    }
+
+    Ok(scan_config)
+}
+
+/// Convert an acquired coordination lease into the concrete runtime payload.
 ///
-/// If any step fails, the shard is not marked done and will be retried.
-/// On error, the caller is responsible for releasing the lease.
+/// Constructs a [`WriteContext`] from the lease's fencing fields and the
+/// worker's policy hash, then decodes the shard spec's `connector_extra`
+/// to derive the filesystem scan path.
+fn build_lease_from_acquire(
+    acquired: AcquireResultView<'_>,
+    identity: &WorkerIdentity,
+) -> Result<ShardLease> {
+    let spec = acquired.snapshot.spec();
+    let write_context = WriteContext::new(
+        acquired.lease.tenant(),
+        identity.policy_hash,
+        acquired.lease.run(),
+        acquired.lease.shard(),
+        acquired.lease.fence(),
+    );
+
+    Ok(ShardLease::new(
+        Arc::from(acquired.lease.shard().to_string()),
+        acquired.lease,
+        spec.key_range_start().to_vec(),
+        scan_config_from_spec(spec, &identity.scan_template)?,
+        write_context,
+        identity.tenant_secret_key,
+    ))
+}
+
+/// Convert the wall clock to [`LogicalTime`] (milliseconds since Unix epoch).
 ///
-/// # Completion protocol — `acknowledge_checkpoint` failure
+/// Falls back to `1` if the system clock is before the epoch or if the
+/// millisecond count overflows `u64`. The minimum of `1` avoids zero-valued
+/// logical times, which some coordination backends treat as sentinel values.
+fn wall_clock_now() -> LogicalTime {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(1);
+    LogicalTime::from_raw(millis.max(1))
+}
+
+/// Compute how long to sleep before retrying a shard claim.
 ///
-/// If `acknowledge_checkpoint` fails after `complete_shard` succeeds, the
-/// shard is not marked done and will be re-scanned on retry. This relies on
-/// the `complete_shard` idempotency contract documented on
-/// [`DistributedCoordinator`].
+/// When the coordinator provides an `earliest_deadline` (the soonest
+/// existing lease expiry), the delay equals `deadline - now` (clamped to
+/// at least 1 ms). Without a deadline, the fixed [`CLAIM_RACE_RETRY_DELAY`]
+/// is used.
+fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -> Duration {
+    earliest_deadline
+        .map(|deadline| deadline.as_raw().saturating_sub(now.as_raw()).max(1))
+        .map(Duration::from_millis)
+        .unwrap_or(CLAIM_RACE_RETRY_DELAY)
+}
+
+/// Derive a deterministic [`OpId`] from shard identity, fence epoch, and kind.
 ///
-/// # At-least-once delivery
+/// Idempotent: the same `(key, fence, op_kind)` triple always produces the
+/// same `OpId`. This allows the coordination backend to detect and deduplicate
+/// replayed completion calls.
+fn deterministic_op_id(key: ShardKey, fence: FenceEpoch, op_kind: OpKind) -> OpId {
+    // Domain string is part of the identity contract: changing it breaks OpId
+    // continuity for in-flight operations and causes deduplication mismatches.
+    let mut hasher = domain_hasher("gossip.scanner_runtime.distributed.op_id");
+    key.run().write_canonical(&mut hasher);
+    key.shard().write_canonical(&mut hasher);
+    fence.write_canonical(&mut hasher);
+    op_kind.as_u8().write_canonical(&mut hasher);
+    OpId::from_raw(finalize_64(&hasher))
+}
+
+/// Claim the next available shard, retrying while the run still has active
+/// work or the coordinator is enforcing worker cooldown.
 ///
-/// If `complete_shard` succeeds but `mark_shard_done` fails, the shard will
-/// be re-leased on the next worker iteration. The re-execution replays the
-/// full scan-and-commit cycle, producing duplicate `FindingsSink` writes and
-/// `DoneLedger` upserts. Both persistence backends must therefore be
-/// idempotent for the same `(write_context, item_key)` pair.
-#[cfg_attr(not(test), allow(dead_code))]
-fn run_filesystem_lease<A, F, D>(
-    coordinator: &dyn DistributedCoordinator<A>,
-    recorder: Arc<dyn CoordinationEventRecorder>,
-    persistence: &DistributedPersistence<F, D>,
-    lease: &ShardLease<A>,
-    config: DistributedRuntimeConfig,
+/// Returns `Ok(None)` when no shards are available **and** the run has zero
+/// active leases (i.e., the run is fully settled). Returns `Ok(Some(lease))`
+/// on successful claim. Retries internally on `NoneAvailable` (other
+/// workers hold all shards) and `Throttled` (coordinator-imposed cooldown),
+/// sleeping until the earliest deadline expires. Terminal errors like
+/// `RunNotFound` or `BackendError` propagate immediately.
+fn claim_next_lease<C>(
+    coordinator: &mut C,
+    identity: &WorkerIdentity,
+    scratch: &mut AcquireScratch,
+) -> Result<Option<ShardLease>, DistributedRuntimeError>
+where
+    C: CoordinationFacade,
+{
+    loop {
+        let now = wall_clock_now();
+        match coordinator.claim_next_available(
+            now,
+            identity.tenant,
+            identity.run,
+            identity.worker,
+            scratch,
+        ) {
+            Ok(acquired) => {
+                return build_lease_from_acquire(acquired, identity)
+                    .map(Some)
+                    .map_err(DistributedRuntimeError::Coordinator);
+            }
+            Err(ClaimError::NoneAvailable { earliest_deadline }) => {
+                let progress = coordinator
+                    .get_run_progress(now, identity.tenant, identity.run)
+                    .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
+                if progress.active() == 0 {
+                    return Ok(None);
+                }
+                std::thread::sleep(claim_retry_delay(now, earliest_deadline));
+            }
+            Err(ClaimError::Throttled { retry_after }) => {
+                std::thread::sleep(claim_retry_delay(now, Some(retry_after)));
+            }
+            Err(error) => {
+                return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
+            }
+        }
+    }
+}
+
+/// Complete a claimed shard directly against the coordination backend.
+///
+/// The final cursor is chosen as:
+/// - The receipt-driven `checkpoint` cursor when items were committed.
+/// - The shard's `range_start` when the shard produced zero items but has
+///   a non-empty range (ensures forward progress on re-scan).
+/// - A synthetic sentinel key ([`EMPTY_RANGE_SENTINEL_KEY`]) when the shard
+///   has no range start. In practice this branch is unreachable because the
+///   coordination layer rejects unbounded shards at registration time, but
+///   the guard exists to prevent a `CursorUpdate::new` panic on empty input
+///   (and `CursorUpdate::initial()` would fail validation).
+///
+/// Completion uses a deterministic [`OpId`] so replayed calls are idempotent.
+/// If the coordination backend reports the completion was already applied
+/// (idempotent replay), the function logs an info message but succeeds.
+fn complete_shard<C>(
+    coordinator: &mut C,
+    identity: &WorkerIdentity,
+    lease: &ShardLease,
+    checkpoint: Option<&Cursor>,
 ) -> Result<(), DistributedRuntimeError>
 where
-    A: ShardLeaseAssignment,
+    C: CoordinationFacade,
+{
+    assert_eq!(lease.lease().tenant(), identity.tenant);
+
+    let final_cursor = match checkpoint {
+        Some(cursor) => cursor.as_update(),
+        None if lease.range_start().is_empty() => {
+            gossip_coordination::CursorUpdate::new(EMPTY_RANGE_SENTINEL_KEY)
+        }
+        None => gossip_coordination::CursorUpdate::new(lease.range_start()),
+    };
+    let op_id = deterministic_op_id(
+        lease.lease().shard_key(),
+        lease.lease().fence(),
+        OpKind::Complete,
+    );
+    let outcome = coordinator
+        .complete(
+            wall_clock_now(),
+            identity.tenant,
+            &lease.lease(),
+            &final_cursor,
+            op_id,
+        )
+        .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
+
+    if !outcome.is_executed() {
+        tracing::info!(
+            shard_id = %lease.shard_id(),
+            "completion was an idempotent replay",
+        );
+    }
+
+    Ok(())
+}
+
+/// Execute one filesystem lease under the receipt-driven durability model.
+///
+/// This is the per-shard work function called by [`run_worker`]. It
+/// orchestrates the full scan-commit-checkpoint pipeline for one shard:
+///
+/// 1. **Setup**: validates budgets, builds the scan engine, creates the
+///    commit pipeline and `ReceiptCommitSink`.
+/// 2. **Concurrent execution**: spawns a scoped thread to drain the commit
+///    pipeline's outcome stream while the main thread runs the filesystem
+///    scan through `scan_fs_with_prebuilt_engine`.
+/// 3. **Post-scan verification**: checks that every submitted sequence
+///    number produced exactly one durable outcome (via
+///    [`wait_for_submitted_commits`]).
+/// 4. **Checkpoint**: prepares and acknowledges the receipt-driven
+///    checkpoint prefix through [`PrefixCheckpointAggregator`].
+///
+/// Returns `(ScanReport, None)` when the shard produced zero committed
+/// items (empty directory or all-clean scan). Returns
+/// `(ScanReport, Some(cursor))` when at least one item was committed.
+///
+/// The caller owns the coordination-layer completion step (calling
+/// [`complete_shard`] with the returned cursor).
+///
+/// # Design choice: single worker
+///
+/// The scan runs with `workers = 1` so that `ReceiptCommitSink` sequence
+/// assignment remains monotonic without cross-thread synchronization. The
+/// commit pipeline provides the parallelism boundary: scan execution and
+/// durable commit proceed concurrently on separate threads.
+fn run_filesystem_lease<F, D>(
+    recorder: Arc<dyn CoordinationEventRecorder>,
+    persistence: &DistributedPersistence<F, D>,
+    lease: &ShardLease,
+    config: DistributedRuntimeConfig,
+) -> Result<(ScanReport, Option<Cursor>), DistributedRuntimeError>
+where
     F: FindingsSink + Clone + Send + Sync + 'static,
     D: DoneLedger + Clone + Send + Sync + 'static,
     F::Error: std::error::Error + Send + Sync + 'static,
@@ -947,19 +1196,12 @@ where
     config.budgets.validate()?;
 
     let scan_config = lease
-        .assignment()
-        .filesystem_scan_config()
-        .ok_or_else(|| DistributedRuntimeError::UnsupportedAssignment {
-            shard_id: Arc::clone(lease.shard_id_arc()),
-        })?
+        .scan_config()
+        .clone()
         .with_workers(1)
         .with_budgets(config.budgets)
         .with_persist_findings(true);
 
-    // Relaxed ordering on ReceiptCommitSink::next_sequence_no is sound only
-    // when exactly one scan worker thread exists. Hard assert rather than
-    // debug_assert: this is a soundness invariant that must hold in release
-    // builds, and the cost (one integer comparison per shard) is negligible.
     assert_eq!(
         scan_config.workers, 1,
         "receipt-driven execution requires single-threaded scanning"
@@ -999,6 +1241,11 @@ where
         submitter,
     );
 
+    // Scan execution and commit draining run concurrently in a scoped thread.
+    // The drain thread consumes commit outcomes and feeds the checkpoint
+    // aggregator. When the scan completes, `commit.finish()` consumes the
+    // sink (verifying no items remain in-flight) and the drain thread exits
+    // once the submission channel closes.
     let (outcome, submitted, stage_result) = std::thread::scope(|scope| {
         let write_context = lease.write_context();
         let max_buffered = config.commit_queue_capacity.get();
@@ -1012,182 +1259,160 @@ where
         (outcome, submitted, stage_result)
     });
 
-    // Prefer durability errors: when the drain stage fails and cancels the
-    // pipeline, the scan typically sees a downstream "pipeline cancelled"
-    // Runtime error. Evaluating the drain result first exposes the root cause
-    // instead of the cancellation symptom.
-    //
-    // Runtime errors are checked before submitted-commit accounting because a
-    // failed `finish_item` rolls the item back into the in-flight map, which
-    // makes `commit.finish()` return "items still in flight". Checking
-    // `outcome` first preserves the original translation/span error rather
-    // than surfacing its consequence.
+    // Check the scan outcome first: when both the scan and the drain thread
+    // fail, the scan failure is typically the root cause (the broken pipeline
+    // cascades into the drain). Surfacing the Runtime error gives operators
+    // the most actionable diagnostic.
+    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
     } = stage_result
         .map_err(DistributedRuntimeError::Durability)?
         .map_err(DistributedRuntimeError::Durability)?;
-    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
-    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
-
     let committed_units = committed_sequence_nos.len() as u64;
 
-    // Shards with zero durable commit units (empty directories or directories
-    // where no file produced findings) complete without a checkpoint cursor
-    // because no receipt-derived cursor position exists.
-    // Guard early to avoid calling prepare_checkpoint on an empty aggregator.
     if committed_units == 0 {
-        coordinator
-            .complete_shard(lease, None, outcome.report)
-            .map_err(DistributedRuntimeError::Coordinator)?;
-        coordinator
-            .mark_shard_done(lease)
-            .map_err(DistributedRuntimeError::Coordinator)?;
-        return Ok(());
+        return Ok((outcome.report, None));
     }
 
-    // Files without findings never reach the commit pipeline (the scanner's
-    // emit_persistence_batch early-returns), so `submitted.len()` can be less
-    // than items_scanned.
     wait_for_submitted_commits(submitted, committed_sequence_nos)
         .map_err(DistributedRuntimeError::Durability)?;
 
-    let pending = aggregator
-        .prepare_checkpoint()
-        .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
+    let (checkpoint_scope, checkpoint_time, checkpoint_cursor) = {
+        let pending = aggregator
+            .prepare_checkpoint()
+            .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
-    let pending = pending.ok_or_else(|| {
-        DistributedRuntimeError::Durability(anyhow!(
-            "filesystem shard '{}' committed {} unit(s) but no receipt-driven checkpoint prefix was prepared",
-            lease.shard_id(),
-            committed_units
-        ))
-    })?;
-    if pending.committed_units() != committed_units {
-        return Err(DistributedRuntimeError::Durability(anyhow!(
-            "filesystem shard '{}' prepared checkpoint for {} unit(s), expected {}",
-            lease.shard_id(),
-            pending.committed_units(),
-            committed_units
-        )));
-    }
+        let pending = pending.ok_or_else(|| {
+            DistributedRuntimeError::Durability(anyhow!(
+                "filesystem shard '{}' committed {} unit(s) but no receipt-driven checkpoint prefix was prepared",
+                lease.shard_id(),
+                committed_units
+            ))
+        })?;
+        if pending.committed_units() != committed_units {
+            return Err(DistributedRuntimeError::Durability(anyhow!(
+                "filesystem shard '{}' prepared checkpoint for {} unit(s), expected {}",
+                lease.shard_id(),
+                pending.committed_units(),
+                committed_units
+            )));
+        }
 
-    coordinator
-        .complete_shard(
-            lease,
-            Some(pending.checkpoint_cursor().clone()),
-            outcome.report,
+        (
+            pending.scope().clone(),
+            checkpoint_logical_time(pending.last_sequence_no())
+                .map_err(DistributedRuntimeError::Durability)?,
+            pending.checkpoint_cursor().clone(),
         )
-        .map_err(DistributedRuntimeError::Coordinator)?;
-
-    let checkpoint_receipt = CheckpointCommitReceipt::new(
-        pending.scope().clone(),
-        checkpoint_logical_time(pending.last_sequence_no())
-            .map_err(DistributedRuntimeError::Durability)?,
-    );
+    };
+    let checkpoint_receipt = CheckpointCommitReceipt::new(checkpoint_scope, checkpoint_time);
     aggregator
         .acknowledge_checkpoint(checkpoint_receipt)
         .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
-    coordinator
-        .mark_shard_done(lease)
-        .map_err(DistributedRuntimeError::Coordinator)?;
-    Ok(())
+    Ok((outcome.report, Some(checkpoint_cursor)))
 }
 
 /// Run the distributed worker loop until the coordinator has no more leases.
 ///
-/// Each iteration either skips an already-complete shard, executes one
-/// filesystem lease through the receipt-driven durability path, or stops with a
-/// safe error when the assignment does not expose a filesystem scan config.
+/// This is the top-level entry point for distributed scanning. The loop:
 ///
-/// The loop is **fail-fast**: it terminates on the first per-shard error.
-/// Progress accumulated before the failure is not returned to the caller —
-/// the `Err` variant carries only the error. The caller is responsible for
-/// retry or requeue. Lease release on error paths is best-effort: the
-/// original error is returned even if the release itself fails (a warning is
-/// logged in that case).
-pub fn run_worker<A, F, D>(
-    coordinator: &dyn DistributedCoordinator<A>,
+/// 1. **Claims** the next available shard from the coordinator, retrying
+///    while the run still has active work but every candidate shard is
+///    currently leased or the worker is being throttled.
+/// 2. **Executes** the shard's filesystem scan through the full
+///    scan-commit-checkpoint pipeline.
+/// 3. **Completes** the shard lease against the coordinator, advancing the
+///    coordination cursor to the receipt-derived checkpoint position.
+/// 4. **Repeats** until no shards remain (returns `Ok(report)`) or an error
+///    occurs (returns `Err`).
+///
+/// # Fail-fast semantics
+///
+/// The loop terminates on the first claim, scan, or completion error.
+/// Uncompleted leases are not explicitly released; the coordination backend
+/// reclaims them when their deadlines expire.
+///
+/// # Errors
+///
+/// - [`DistributedRuntimeError::Coordinator`] — shard claiming, progress
+///   lookup, or completion failed.
+/// - [`DistributedRuntimeError::Runtime`] — scan execution failed.
+/// - [`DistributedRuntimeError::Durability`] — the receipt-driven commit
+///   pipeline could not confirm durable progress.
+pub fn run_worker<C, F, D>(
+    coordinator: &mut C,
+    identity: WorkerIdentity,
     persistence: DistributedPersistence<F, D>,
     config: DistributedRuntimeConfig,
 ) -> Result<DistributedRunReport, DistributedRuntimeError>
 where
-    A: ShardLeaseAssignment,
+    C: CoordinationFacade,
     F: FindingsSink + Clone + Send + Sync + 'static,
     D: DoneLedger + Clone + Send + Sync + 'static,
     F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    let recorder = coordinator.event_recorder();
+    let mut scratch = Box::new(AcquireScratch::new());
     let mut report = DistributedRunReport::default();
 
-    let release_best_effort = |lease: &ShardLease<A>| {
-        if let Err(release_err) = coordinator.release_shard(lease) {
-            tracing::warn!(
-                shard_id = %lease.shard_id(),
-                %release_err,
-                "best-effort lease release failed; may remain acquired until lease TTL expires",
-            );
-        }
-    };
-
     loop {
-        let lease = match coordinator.acquire_shard() {
-            Ok(Some(l)) => l,
+        let lease = match claim_next_lease(coordinator, &identity, &mut scratch) {
+            Ok(Some(lease)) => lease,
             Ok(None) => break,
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
-                    error = %e,
+                    error = %error,
                     leases_seen = report.leases_seen,
                     shards_scanned = report.shards_scanned,
-                    shards_skipped_done = report.shards_skipped_done,
-                    "worker loop terminating: shard acquisition failed",
+                    "worker loop terminating: shard claim failed",
                 );
-                return Err(DistributedRuntimeError::Coordinator(e));
+                return Err(error);
             }
         };
         report.leases_seen = report.leases_seen.saturating_add(1);
 
-        let is_done = match coordinator.is_shard_done(&lease) {
-            Ok(done) => done,
-            Err(e) => {
-                release_best_effort(&lease);
-                tracing::warn!(
-                    error = %e,
-                    leases_seen = report.leases_seen,
-                    shards_scanned = report.shards_scanned,
-                    shards_skipped_done = report.shards_skipped_done,
-                    "worker loop terminating: done-ledger check failed",
-                );
-                return Err(DistributedRuntimeError::Coordinator(e));
-            }
-        };
-
-        if is_done {
-            release_best_effort(&lease);
-            report.shards_skipped_done = report.shards_skipped_done.saturating_add(1);
-            continue;
-        }
-
-        if let Err(e) = run_filesystem_lease(
-            coordinator,
-            Arc::clone(&recorder),
+        let (scan_report, checkpoint) = match run_filesystem_lease(
+            Arc::clone(&identity.recorder),
             &persistence,
             &lease,
             config,
         ) {
-            release_best_effort(&lease);
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shard_id = %lease.shard_id(),
+                    "worker loop terminating: filesystem lease execution failed",
+                );
+                return Err(error);
+            }
+        };
+
+        tracing::debug!(
+            shard_id = %lease.shard_id(),
+            items_scanned = scan_report.items_scanned,
+            bytes_scanned = scan_report.bytes_scanned,
+            findings_emitted = scan_report.findings_emitted,
+            "shard scan complete",
+        );
+
+        if let Err(error) = complete_shard(coordinator, &identity, &lease, checkpoint.as_ref()) {
             tracing::warn!(
-                error = %e,
+                error = %error,
                 leases_seen = report.leases_seen,
                 shards_scanned = report.shards_scanned,
-                shards_skipped_done = report.shards_skipped_done,
-                "worker loop terminating: filesystem lease execution failed",
+                shard_id = %lease.shard_id(),
+                "worker loop terminating: shard completion failed",
             );
-            return Err(e);
+            return Err(error);
         }
+
         report.shards_scanned = report.shards_scanned.saturating_add(1);
     }
 
@@ -1195,259 +1420,29 @@ where
     Ok(report)
 }
 
-/// In-memory coordinator used by tests and local harnesses.
-///
-/// The coordinator stores leases, shard lifecycle transitions, and recorder
-/// output behind one mutex-protected state bundle. `complete_shard` is
-/// intentionally non-idempotent so crash-retry tests can observe duplicate
-/// completions when a shard is re-leased between completion and done-marking.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Default)]
-pub struct InMemoryCoordinator<A> {
-    state: Arc<Mutex<InMemoryCoordinatorState<A>>>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-struct InMemoryCoordinatorState<A> {
-    queue: VecDeque<ShardLease<A>>,
-    done: HashSet<String>,
-    done_mark_contexts: Vec<WriteContext>,
-    released: Vec<String>,
-    completed: Vec<CompletedShard>,
-    core_events: Vec<(String, OwnedCoreEvent)>,
-    git_events: Vec<(String, StoredGitEvent)>,
-    commit_progress: Vec<(String, CommitProgressRecord)>,
-    acquire_fail_count: usize,
-    release_fail_count: usize,
-    is_done_fail_count: usize,
-    complete_fail_count: usize,
-    mark_done_fail_count: usize,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl<A> Default for InMemoryCoordinatorState<A> {
-    fn default() -> Self {
-        Self {
-            queue: VecDeque::new(),
-            done: HashSet::new(),
-            done_mark_contexts: Vec::new(),
-            released: Vec::new(),
-            completed: Vec::new(),
-            core_events: Vec::new(),
-            git_events: Vec::new(),
-            commit_progress: Vec::new(),
-            acquire_fail_count: 0,
-            release_fail_count: 0,
-            is_done_fail_count: 0,
-            complete_fail_count: 0,
-            mark_done_fail_count: 0,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompletedShard {
-    pub shard_id: String,
-    pub checkpoint: Option<Cursor>,
-    pub report: ScanReport,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl<A> InMemoryCoordinator<A> {
-    /// Create a coordinator pre-loaded with the provided lease queue.
-    #[must_use]
-    pub fn new(leases: Vec<ShardLease<A>>) -> Self {
-        let queue = VecDeque::from(leases);
-        Self {
-            state: Arc::new(Mutex::new(InMemoryCoordinatorState {
-                queue,
-                ..InMemoryCoordinatorState::default()
-            })),
-        }
-    }
-
-    /// Pre-mark a shard as done so the worker loop skips it.
-    pub fn mark_done(&self, shard_id: impl Into<String>) {
-        self.state
-            .lock()
-            .expect("state lock")
-            .done
-            .insert(shard_id.into());
-    }
-
-    /// Snapshot of the in-memory done set.
-    #[must_use]
-    pub fn done_set(&self) -> HashSet<String> {
-        self.state.lock().expect("state lock").done.clone()
-    }
-
-    /// Snapshot of the write contexts used for `mark_shard_done`.
-    #[must_use]
-    pub fn done_mark_contexts(&self) -> Vec<WriteContext> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .done_mark_contexts
-            .clone()
-    }
-
-    /// Snapshot of shards released without completion.
-    #[must_use]
-    pub fn released_shards(&self) -> Vec<String> {
-        self.state.lock().expect("state lock").released.clone()
-    }
-
-    /// Snapshot of completed shard records.
-    #[must_use]
-    pub fn completed_shards(&self) -> Vec<CompletedShard> {
-        self.state.lock().expect("state lock").completed.clone()
-    }
-
-    /// Cause the next `count` calls to `acquire_shard` to return an error.
-    pub fn fail_next_acquires(&self, count: usize) {
-        self.state.lock().expect("state lock").acquire_fail_count = count;
-    }
-
-    /// Cause the next `count` calls to `release_shard` to return an error.
-    pub fn fail_next_releases(&self, count: usize) {
-        self.state.lock().expect("state lock").release_fail_count = count;
-    }
-
-    /// Cause the next `count` calls to `is_shard_done` to return an error.
-    pub fn fail_next_is_done_checks(&self, count: usize) {
-        self.state.lock().expect("state lock").is_done_fail_count = count;
-    }
-
-    /// Cause the next `count` calls to `complete_shard` to return an error.
-    pub fn fail_next_completes(&self, count: usize) {
-        self.state.lock().expect("state lock").complete_fail_count = count;
-    }
-
-    /// Cause the next `count` calls to `mark_shard_done` to return an error.
-    pub fn fail_next_mark_done(&self, count: usize) {
-        self.state.lock().expect("state lock").mark_done_fail_count = count;
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl<A> DistributedCoordinator<A> for InMemoryCoordinator<A>
-where
-    A: ShardLeaseAssignment + Send + Sync + 'static,
-{
-    fn acquire_shard(&self) -> Result<Option<ShardLease<A>>> {
-        let mut guard = self.state.lock().expect("state lock");
-        if guard.acquire_fail_count > 0 {
-            guard.acquire_fail_count -= 1;
-            return Err(anyhow!("injected acquire_shard failure"));
-        }
-        Ok(guard.queue.pop_front())
-    }
-
-    fn release_shard(&self, lease: &ShardLease<A>) -> Result<()> {
-        let mut guard = self.state.lock().expect("state lock");
-        if guard.release_fail_count > 0 {
-            guard.release_fail_count -= 1;
-            return Err(anyhow!("injected release_shard failure"));
-        }
-        guard.released.push(lease.shard_id().to_owned());
-        Ok(())
-    }
-
-    fn complete_shard(
-        &self,
-        lease: &ShardLease<A>,
-        checkpoint: Option<Cursor>,
-        report: ScanReport,
-    ) -> Result<()> {
-        let mut guard = self.state.lock().expect("state lock");
-        if guard.complete_fail_count > 0 {
-            guard.complete_fail_count -= 1;
-            return Err(anyhow!("injected complete_shard failure"));
-        }
-        guard.completed.push(CompletedShard {
-            shard_id: lease.shard_id().to_owned(),
-            checkpoint,
-            report,
-        });
-        Ok(())
-    }
-
-    fn is_shard_done(&self, lease: &ShardLease<A>) -> Result<bool> {
-        let mut guard = self.state.lock().expect("state lock");
-        if guard.is_done_fail_count > 0 {
-            guard.is_done_fail_count -= 1;
-            return Err(anyhow!("injected is_shard_done failure"));
-        }
-        Ok(guard.done.contains(lease.shard_id()))
-    }
-
-    fn mark_shard_done(&self, lease: &ShardLease<A>) -> Result<()> {
-        let mut guard = self.state.lock().expect("state lock");
-        if guard.mark_done_fail_count > 0 {
-            guard.mark_done_fail_count -= 1;
-            return Err(anyhow!("injected mark_shard_done failure"));
-        }
-        guard.done.insert(lease.shard_id().to_owned());
-        guard.done_mark_contexts.push(lease.write_context());
-        Ok(())
-    }
-
-    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder> {
-        Arc::new(Self {
-            state: Arc::clone(&self.state),
-        })
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl<A> CoordinationEventRecorder for InMemoryCoordinator<A>
-where
-    A: Send + Sync + 'static,
-{
-    fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .core_events
-            .push((shard_id.to_owned(), event));
-        Ok(())
-    }
-
-    fn record_git_event(&self, shard_id: &str, event: StoredGitEvent) -> Result<()> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .git_events
-            .push((shard_id.to_owned(), event));
-        Ok(())
-    }
-
-    fn record_commit_progress(&self, shard_id: &str, event: CommitProgressRecord) -> Result<()> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .commit_progress
-            .push((shard_id.to_owned(), event));
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
     use gossip_contracts::{
         connector::{Cursor, ItemKey},
+        coordination::ShardSpec,
         identity::{
-            FenceEpoch, PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId,
-            TenantSecretKey, derive_rule_fingerprint,
+            FenceEpoch, OpId, PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId,
+            TenantSecretKey, WorkerId, derive_rule_fingerprint,
         },
         persistence::{DoneLedgerStatus, WriteContext},
     };
+    use gossip_coordination::{
+        AcquireScratch, CoordinationBackend, CursorSemantics, CursorUpdate as CoordCursorUpdate,
+        InMemoryCoordinator as CoordinationInMemoryCoordinator, InitialShardInput, RunConfig,
+        RunManagement, ShardClaiming, ShardFilter, ShardStatus,
+    };
+    use gossip_frontier::{ShardSpecScratch, range_shard_ref};
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
     use tempfile::tempdir;
 
@@ -1457,22 +1452,6 @@ mod tests {
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
         coordination_sink::{CommitProgressRecord, StoredGitEvent},
     };
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct StubAssignment {
-        policy_hash: PolicyHash,
-        filesystem_scan_config: Option<FsScanConfig>,
-    }
-
-    impl ShardLeaseAssignment for StubAssignment {
-        fn policy_hash(&self) -> PolicyHash {
-            self.policy_hash
-        }
-
-        fn filesystem_scan_config(&self) -> Option<FsScanConfig> {
-            self.filesystem_scan_config.clone()
-        }
-    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct StubFindings(u8);
@@ -1504,6 +1483,22 @@ mod tests {
         }
     }
 
+    fn tenant() -> TenantId {
+        TenantId::from_bytes([0x11; 32])
+    }
+
+    fn run() -> RunId {
+        RunId::from_raw(7)
+    }
+
+    fn worker(id: u64) -> WorkerId {
+        WorkerId::from_raw(id)
+    }
+
+    fn policy_hash() -> PolicyHash {
+        PolicyHash::from_bytes([0x22; 32])
+    }
+
     fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
         let name = format!("test-rule-{rule_id}");
         derive_rule_fingerprint(&name)
@@ -1521,6 +1516,30 @@ mod tests {
 
     fn tenant_secret_key() -> TenantSecretKey {
         TenantSecretKey::from_bytes([0x33; 32])
+    }
+
+    fn recorder() -> Arc<dyn CoordinationEventRecorder> {
+        Arc::new(Recorder::default())
+    }
+
+    fn test_run_config(lease_duration_ms: u64) -> RunConfig {
+        RunConfig::try_new(CursorSemantics::Completed, lease_duration_ms, None).expect("run config")
+    }
+
+    fn base_scan_config(path: impl AsRef<Path>) -> FsScanConfig {
+        FsScanConfig::new(path.as_ref().to_path_buf())
+    }
+
+    fn worker_identity(path: &Path) -> WorkerIdentity {
+        WorkerIdentity::new(
+            tenant(),
+            run(),
+            worker(13),
+            policy_hash(),
+            tenant_secret_key(),
+            base_scan_config(path),
+            recorder(),
+        )
     }
 
     fn item_key(path: &str) -> ItemKey {
@@ -1545,13 +1564,6 @@ mod tests {
         }
     }
 
-    fn filesystem_assignment(path: &std::path::Path) -> StubAssignment {
-        StubAssignment {
-            policy_hash: write_context().policy_hash(),
-            filesystem_scan_config: Some(FsScanConfig::new(path)),
-        }
-    }
-
     /// Build a secret-shaped test fixture from non-secret fragments.
     ///
     /// The assembled string matches gitleaks' generic-api-key rule at scan
@@ -1565,14 +1577,150 @@ mod tests {
         "ordinary sample text for scanner tests"
     }
 
-    fn filesystem_lease(shard_id: &str, path: &std::path::Path) -> ShardLease<StubAssignment> {
-        ShardLease::new(
-            Arc::from(shard_id),
-            filesystem_assignment(path),
-            write_context(),
-            tenant_secret_key(),
-        )
-        .expect("filesystem lease")
+    fn setup_coordinator_with_connector_extra(
+        connector_extra: &[Vec<u8>],
+        lease_duration_ms: u64,
+    ) -> CoordinationInMemoryCoordinator {
+        let mut coordinator = CoordinationInMemoryCoordinator::new(lease_duration_ms);
+        let now = wall_clock_now();
+        coordinator
+            .create_run(now, tenant(), run(), test_run_config(lease_duration_ms))
+            .expect("create run");
+
+        let mut scratch = ShardSpecScratch::new();
+        let shard_entries: Vec<(ShardId, ShardSpec)> = connector_extra
+            .iter()
+            .enumerate()
+            .map(|(idx, extra)| {
+                let start = [idx as u8];
+                let end = [(idx + 1) as u8];
+                let spec_ref = range_shard_ref(&start, &end, extra.as_slice(), &mut scratch)
+                    .expect("range shard spec");
+                (
+                    ShardId::from_raw(idx as u64 + 1),
+                    ShardSpec::try_from_ref(spec_ref).expect("owned shard spec"),
+                )
+            })
+            .collect();
+        let shards: Vec<InitialShardInput<'_>> = shard_entries
+            .iter()
+            .map(|(shard_id, spec)| {
+                InitialShardInput::new(*shard_id, spec.as_ref(), CoordCursorUpdate::initial())
+            })
+            .collect();
+        let _ = coordinator
+            .register_shards(now, tenant(), run(), &shards, OpId::from_raw(1))
+            .expect("register shards");
+
+        coordinator
+    }
+
+    fn setup_coordinator(
+        paths: &[&Path],
+        lease_duration_ms: u64,
+    ) -> CoordinationInMemoryCoordinator {
+        let connector_extra: Vec<Vec<u8>> = paths
+            .iter()
+            .map(|path| {
+                path.to_str()
+                    .expect("test paths must be valid UTF-8")
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect();
+        setup_coordinator_with_connector_extra(&connector_extra, lease_duration_ms)
+    }
+
+    fn setup_coordinator_with_ranges(
+        entries: &[(&Path, &[u8], &[u8])],
+        lease_duration_ms: u64,
+    ) -> CoordinationInMemoryCoordinator {
+        let mut coordinator = CoordinationInMemoryCoordinator::new(lease_duration_ms);
+        let now = wall_clock_now();
+        coordinator
+            .create_run(now, tenant(), run(), test_run_config(lease_duration_ms))
+            .expect("create run");
+
+        let mut scratch = ShardSpecScratch::new();
+        let shard_entries: Vec<(ShardId, ShardSpec)> = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, start, end))| {
+                let connector_extra = path
+                    .to_str()
+                    .expect("test paths must be valid UTF-8")
+                    .as_bytes();
+                let spec_ref = range_shard_ref(start, end, connector_extra, &mut scratch)
+                    .expect("range shard spec");
+                (
+                    ShardId::from_raw(idx as u64 + 1),
+                    ShardSpec::try_from_ref(spec_ref).expect("owned shard spec"),
+                )
+            })
+            .collect();
+        let shards: Vec<InitialShardInput<'_>> = shard_entries
+            .iter()
+            .map(|(shard_id, spec)| {
+                InitialShardInput::new(*shard_id, spec.as_ref(), CoordCursorUpdate::initial())
+            })
+            .collect();
+        let _ = coordinator
+            .register_shards(now, tenant(), run(), &shards, OpId::from_raw(1))
+            .expect("register shards");
+
+        coordinator
+    }
+
+    fn claim_lease(
+        coordinator: &mut CoordinationInMemoryCoordinator,
+        identity: &WorkerIdentity,
+    ) -> ShardLease {
+        let mut scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(
+                wall_clock_now(),
+                identity.tenant,
+                identity.run,
+                identity.worker,
+                &mut scratch,
+            )
+            .expect("claim next available");
+        build_lease_from_acquire(acquired, identity).expect("runtime lease")
+    }
+
+    fn claim_coordination_lease(
+        coordinator: &mut CoordinationInMemoryCoordinator,
+        worker_id: WorkerId,
+    ) -> gossip_coordination::Lease {
+        let mut scratch = AcquireScratch::new();
+        coordinator
+            .claim_next_available(wall_clock_now(), tenant(), run(), worker_id, &mut scratch)
+            .expect("claim next available")
+            .lease
+    }
+
+    fn shard_summaries(
+        coordinator: &CoordinationInMemoryCoordinator,
+    ) -> Vec<gossip_coordination::ShardSummary> {
+        let mut summaries = Vec::new();
+        coordinator
+            .list_shards_into(
+                wall_clock_now(),
+                tenant(),
+                run(),
+                ShardFilter::all(),
+                &mut summaries,
+            )
+            .expect("list shards");
+        summaries
+    }
+
+    fn run_progress(
+        coordinator: &CoordinationInMemoryCoordinator,
+    ) -> gossip_coordination::RunProgress {
+        coordinator
+            .get_run_progress(wall_clock_now(), tenant(), run())
+            .expect("run progress")
     }
 
     fn make_receipt_sink() -> (
@@ -1604,67 +1752,20 @@ mod tests {
     }
 
     #[test]
-    fn shard_lease_preserves_assignment_and_write_context() {
-        let write_context = WriteContext::new(
-            TenantId::from_bytes([0x11; 32]),
-            PolicyHash::from_bytes([0x22; 32]),
-            RunId::from_raw(3),
-            ShardId::from_raw(4),
-            FenceEpoch::from_raw(5),
-        );
-        let assignment = StubAssignment {
-            policy_hash: write_context.policy_hash(),
-            filesystem_scan_config: None,
-        };
-        let lease = ShardLease::new(
-            Arc::from("shard-a"),
-            assignment.clone(),
-            write_context,
-            TenantSecretKey::from_bytes([0x33; 32]),
-        )
-        .expect("matching hashes should succeed");
+    fn shard_lease_preserves_claimed_coordination_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
 
-        assert_eq!(lease.shard_id(), "shard-a");
-        assert_eq!(lease.assignment(), &assignment);
-        assert_eq!(lease.write_context(), write_context);
-        assert_eq!(
-            lease.tenant_secret_key(),
-            TenantSecretKey::from_bytes([0x33; 32])
-        );
-    }
-
-    #[test]
-    fn shard_lease_rejects_mismatched_policy_hash() {
-        let write_context = WriteContext::new(
-            TenantId::from_bytes([0x11; 32]),
-            PolicyHash::from_bytes([0x22; 32]),
-            RunId::from_raw(3),
-            ShardId::from_raw(4),
-            FenceEpoch::from_raw(5),
-        );
-        let assignment = StubAssignment {
-            policy_hash: PolicyHash::from_bytes([0xFF; 32]),
-            filesystem_scan_config: None,
-        };
-
-        let err = ShardLease::new(
-            Arc::from("shard-x"),
-            assignment,
-            write_context,
-            TenantSecretKey::from_bytes([0x33; 32]),
-        )
-        .expect_err("mismatched hashes should fail");
-
-        assert_eq!(&*err.shard_id, "shard-x");
-        assert_eq!(err.assignment_hash, PolicyHash::from_bytes([0xFF; 32]));
-        assert_eq!(err.write_context_hash, PolicyHash::from_bytes([0x22; 32]));
-
-        let msg = err.to_string();
-        assert!(msg.contains("shard-x"), "error should name the shard");
-        assert!(
-            std::error::Error::source(&err).is_none(),
-            "leaf error has no source"
-        );
+        assert_eq!(lease.shard_id(), "ShardId(1)");
+        assert_eq!(lease.lease().tenant(), tenant());
+        assert_eq!(lease.lease().run(), run());
+        assert_eq!(lease.lease().shard(), ShardId::from_raw(1));
+        assert_eq!(lease.lease().fence(), FenceEpoch::from_raw(2));
+        assert_eq!(lease.write_context().tenant_id(), tenant());
+        assert_eq!(lease.write_context().policy_hash(), policy_hash());
+        assert_eq!(lease.tenant_secret_key(), tenant_secret_key());
     }
 
     #[test]
@@ -1709,44 +1810,6 @@ mod tests {
             "durability pipeline error: commit boom"
         );
         assert!(std::error::Error::source(&durability).is_some());
-
-        let mismatch = PolicyMismatchError {
-            shard_id: Arc::from("shard-z"),
-            assignment_hash: PolicyHash::from_bytes([0xAA; 32]),
-            write_context_hash: PolicyHash::from_bytes([0xBB; 32]),
-        };
-        let from_mismatch = DistributedRuntimeError::from(mismatch);
-        assert!(
-            matches!(from_mismatch, DistributedRuntimeError::Coordinator(_)),
-            "PolicyMismatchError should route to Coordinator variant"
-        );
-        assert!(std::error::Error::source(&from_mismatch).is_some());
-
-        let msg = from_mismatch.to_string();
-        assert!(
-            msg.starts_with("coordinator error:"),
-            "should use Coordinator display prefix"
-        );
-        assert!(
-            msg.contains("shard-z"),
-            "should propagate shard id through display chain"
-        );
-
-        let unsupported = DistributedRuntimeError::UnsupportedAssignment {
-            shard_id: Arc::from("shard-nope"),
-        };
-        assert!(
-            unsupported.to_string().contains("unsupported assignment"),
-            "should contain variant description"
-        );
-        assert!(
-            unsupported.to_string().contains("shard-nope"),
-            "should include shard id"
-        );
-        assert!(
-            std::error::Error::source(&unsupported).is_none(),
-            "UnsupportedAssignment is a leaf error"
-        );
     }
 
     #[test]
@@ -1754,8 +1817,7 @@ mod tests {
         let report = DistributedRunReport::default();
         assert_eq!(report.leases_seen, 0);
         assert_eq!(report.shards_scanned, 0);
-        assert_eq!(report.shards_skipped_done, 0);
-        assert!(report.shards_scanned + report.shards_skipped_done <= report.leases_seen);
+        assert!(report.shards_scanned <= report.leases_seen);
 
         // Non-trivial case: demonstrates the invariant holds for realistic
         // field values and guards against field-ordering mistakes in future
@@ -1763,9 +1825,8 @@ mod tests {
         let nonzero = DistributedRunReport {
             leases_seen: 10,
             shards_scanned: 7,
-            shards_skipped_done: 3,
         };
-        assert!(nonzero.shards_scanned + nonzero.shards_skipped_done <= nonzero.leases_seen);
+        assert!(nonzero.shards_scanned <= nonzero.leases_seen);
     }
 
     #[test]
@@ -2452,244 +2513,104 @@ mod tests {
     }
 
     #[test]
-    fn run_worker_skips_done_shards_before_scan() {
+    fn build_lease_from_acquire_uses_metadata_path_override() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
 
-        let coordinator =
-            InMemoryCoordinator::new(vec![filesystem_lease("shard-done", dir.path())]);
-        let findings_sink = InMemoryFindingsSink::new();
-        let done_ledger = InMemoryDoneLedger::new();
-        coordinator.mark_done("shard-done");
-
-        let report = run_worker(
-            &coordinator,
-            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect("run worker");
-
-        assert_eq!(report.leases_seen, 1);
-        assert_eq!(report.shards_scanned, 0);
-        assert_eq!(report.shards_skipped_done, 1);
-        assert_eq!(
-            report.leases_seen,
-            report.shards_scanned + report.shards_skipped_done
-        );
-        assert_eq!(coordinator.released_shards(), vec!["shard-done".to_owned()]);
-        assert!(coordinator.completed_shards().is_empty());
-        assert!(
-            findings_sink
-                .observations_snapshot()
-                .expect("observations snapshot")
-                .is_empty(),
-            "skipped shard must not emit findings durability writes"
-        );
-        assert!(
-            done_ledger
-                .snapshot()
-                .expect("done-ledger snapshot")
-                .is_empty(),
-            "skipped shard must not emit done-ledger writes"
-        );
+        assert_eq!(lease.shard_id(), "ShardId(1)");
+        assert_eq!(lease.scan_config().path, dir.path());
+        assert_eq!(lease.write_context().tenant_id(), tenant());
+        assert_eq!(lease.write_context().run_id(), run());
+        assert_eq!(lease.write_context().shard_id(), ShardId::from_raw(1));
+        assert_eq!(lease.write_context().policy_hash(), policy_hash());
+        assert_eq!(lease.write_context().fence_epoch(), FenceEpoch::from_raw(2));
+        assert_eq!(lease.range_start(), &[0u8]);
     }
 
     #[test]
-    fn run_worker_persists_findings_done_ledger_checkpoint_and_marks_done() {
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+    fn build_lease_from_acquire_falls_back_to_template_path_when_metadata_empty() {
+        let mut coordinator = setup_coordinator_with_connector_extra(&[Vec::new()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
 
-        let coordinator =
-            InMemoryCoordinator::new(vec![filesystem_lease("shard-worker", dir.path())]);
-        let findings_sink = InMemoryFindingsSink::new();
-        let done_ledger = InMemoryDoneLedger::new();
-
-        let report = run_worker(
-            &coordinator,
-            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect("run worker");
-
-        assert_eq!(report.leases_seen, 1);
-        assert_eq!(report.shards_scanned, 1);
-        assert_eq!(report.shards_skipped_done, 0);
-        assert_eq!(
-            report.leases_seen,
-            report.shards_scanned + report.shards_skipped_done
-        );
-
-        let completed = coordinator.completed_shards();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-worker");
-        assert!(
-            completed[0].report.items_scanned >= 1,
-            "scan report should record the scanned file"
-        );
-        let checkpoint = completed[0]
-            .checkpoint
-            .as_ref()
-            .expect("non-empty shard should checkpoint");
-        assert!(
-            checkpoint.last_key().is_some(),
-            "receipt-driven checkpoint should carry a progress key"
-        );
-        assert!(
-            checkpoint.token().is_none(),
-            "receipt-driven checkpoint should be tokenless"
-        );
-
-        assert!(coordinator.done_set().contains("shard-worker"));
-        assert_eq!(coordinator.done_mark_contexts(), vec![write_context()]);
-
-        let observations = findings_sink
-            .observations_snapshot()
-            .expect("observations snapshot");
-        assert!(
-            !observations.is_empty(),
-            "durable findings observations should be present"
-        );
-
-        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
-        assert_eq!(
-            rows.len(),
-            1,
-            "one scanned file should produce one done row"
-        );
-        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
-        assert_eq!(rows[0].write_context(), write_context());
+        assert_eq!(lease.scan_config().path, Path::new("/fallback"));
     }
 
     #[test]
-    fn complete_shard_duplicate_call_produces_duplicate_entry() {
-        let dir = tempdir().expect("tempdir");
-        let lease = filesystem_lease("shard-dup", dir.path());
-        let coordinator = InMemoryCoordinator::new(Vec::<ShardLease<StubAssignment>>::new());
-        let report = ScanReport::default();
+    fn deterministic_op_id_is_stable_and_input_sensitive() {
+        let key = ShardKey::new(run(), ShardId::from_raw(9));
+        let fence = FenceEpoch::from_raw(4);
 
-        coordinator
-            .complete_shard(&lease, None, report)
-            .expect("first complete_shard");
-        coordinator
-            .complete_shard(&lease, None, report)
-            .expect("second complete_shard");
-
-        let completed = coordinator.completed_shards();
-        assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].shard_id, "shard-dup");
-        assert_eq!(completed[1].shard_id, "shard-dup");
-        assert_eq!(completed[0].checkpoint, completed[1].checkpoint);
-        assert_eq!(completed[0].report, completed[1].report);
-    }
-
-    #[test]
-    fn run_worker_rejects_non_filesystem_assignment_without_receipts() {
-        let coordinator = InMemoryCoordinator::new(vec![
-            ShardLease::new(
-                Arc::from("shard-non-fs"),
-                StubAssignment {
-                    policy_hash: write_context().policy_hash(),
-                    filesystem_scan_config: None,
-                },
-                write_context(),
-                tenant_secret_key(),
-            )
-            .expect("lease"),
-        ]);
-
-        let error = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("non-filesystem lease should be rejected");
-
-        assert!(
-            matches!(error, DistributedRuntimeError::UnsupportedAssignment { .. }),
-            "non-filesystem rejection should use UnsupportedAssignment variant, got: {error:?}"
+        let baseline = deterministic_op_id(key, fence, OpKind::Complete);
+        assert_eq!(baseline, deterministic_op_id(key, fence, OpKind::Complete));
+        assert_ne!(
+            baseline,
+            deterministic_op_id(key, fence, OpKind::Checkpoint),
+            "op-kind must influence the hash",
         );
-        assert!(
-            error.to_string().contains("unsupported assignment"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            std::error::Error::source(&error).is_none(),
-            "UnsupportedAssignment is a leaf error with no source"
-        );
-        assert_eq!(
-            coordinator.released_shards(),
-            vec!["shard-non-fs".to_owned()],
-            "non-filesystem rejection must release the lease"
-        );
-        assert!(coordinator.completed_shards().is_empty());
-        assert!(!coordinator.done_set().contains("shard-non-fs"));
-    }
-
-    #[test]
-    fn run_worker_releases_lease_on_filesystem_scan_failure() {
-        // Point the lease at a guaranteed-unique non-existent path so the
-        // filesystem scan fails when the worker tries to enumerate it.
-        let tmp = tempdir().expect("tempdir");
-        let bogus_path = tmp.path().join("nonexistent-child");
-
-        let coordinator =
-            InMemoryCoordinator::new(vec![filesystem_lease("shard-fail", &bogus_path)]);
-
-        let error = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("scan on non-existent path should fail");
-
-        assert!(
-            matches!(
-                error,
-                DistributedRuntimeError::Runtime(_) | DistributedRuntimeError::Durability(_)
+        assert_ne!(
+            baseline,
+            deterministic_op_id(
+                ShardKey::new(run(), ShardId::from_raw(10)),
+                fence,
+                OpKind::Complete
             ),
-            "filesystem scan failure should produce a Runtime or Durability error, got: {error:?}"
+            "shard identity must influence the hash",
         );
-
-        assert_eq!(
-            coordinator.released_shards(),
-            vec!["shard-fail".to_owned()],
-            "filesystem scan failure must release the lease"
+        assert_ne!(
+            baseline,
+            deterministic_op_id(key, FenceEpoch::from_raw(5), OpKind::Complete),
+            "fence epoch must influence the hash",
         );
-        assert!(coordinator.completed_shards().is_empty());
-        assert!(!coordinator.done_set().contains("shard-fail"));
     }
 
     #[test]
-    fn run_filesystem_lease_persists_checkpoint_and_marks_done() {
+    fn complete_shard_without_checkpoint_uses_range_start_under_completed_semantics() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        complete_shard(&mut coordinator, &identity, &lease, None)
+            .expect("zero-finding shard completion must succeed under Completed semantics");
+
+        let progress = run_progress(&coordinator);
+        assert_eq!(progress.active(), 0);
+        assert_eq!(progress.done(), 1);
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status(), ShardStatus::Done);
+        assert_eq!(summaries[0].last_key(), Some(&[0u8][..]));
+    }
+
+    #[test]
+    fn run_filesystem_lease_persists_checkpoint_cursor_for_secret_shard() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
-        let lease = filesystem_lease("shard-fs", dir.path());
-
-        run_filesystem_lease(
-            &coordinator,
-            coordinator.event_recorder(),
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
             &persistence,
             &lease,
             DistributedRuntimeConfig::default(),
         )
         .expect("filesystem lease should succeed");
 
-        let completed = coordinator.completed_shards();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-fs");
         assert!(
-            completed[0].report.items_scanned >= 1,
+            report.items_scanned >= 1,
             "scan report should record the scanned file"
         );
-        let checkpoint = completed[0]
-            .checkpoint
-            .as_ref()
-            .expect("non-empty shard should checkpoint");
+        let checkpoint = checkpoint.expect("non-empty shard should checkpoint");
         assert!(
             checkpoint.last_key().is_some(),
             "receipt-driven checkpoint should carry a progress key"
@@ -2698,9 +2619,6 @@ mod tests {
             checkpoint.token().is_none(),
             "receipt-driven checkpoint should be tokenless"
         );
-
-        assert!(coordinator.done_set().contains("shard-fs"));
-        assert_eq!(coordinator.done_mark_contexts(), vec![write_context()]);
 
         let observations = findings_sink
             .observations_snapshot()
@@ -2711,119 +2629,101 @@ mod tests {
         );
 
         let rows = done_ledger.snapshot().expect("done-ledger snapshot");
-        assert_eq!(
-            rows.len(),
-            1,
-            "one scanned file should produce one done row"
-        );
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
-        assert_eq!(rows[0].write_context(), write_context());
+        assert_eq!(rows[0].write_context(), lease.write_context());
+
+        complete_shard(&mut coordinator, &identity, &lease, Some(&checkpoint))
+            .expect("complete shard");
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries[0].status(), ShardStatus::Done);
+        assert_eq!(
+            summaries[0].last_key(),
+            checkpoint.last_key().map(|key| key.as_bytes())
+        );
     }
 
     #[test]
-    fn run_filesystem_lease_zero_item_shard_completes_without_checkpoint() {
+    fn run_filesystem_lease_zero_item_shard_returns_no_checkpoint() {
         let dir = tempdir().expect("tempdir");
-        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
-        let findings_sink = InMemoryFindingsSink::new();
+        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
         let done_ledger = InMemoryDoneLedger::new();
-        let persistence = DistributedPersistence::new(findings_sink, done_ledger.clone());
-        let lease = filesystem_lease("shard-empty", dir.path());
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
 
-        run_filesystem_lease(
-            &coordinator,
-            coordinator.event_recorder(),
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
             &persistence,
             &lease,
             DistributedRuntimeConfig::default(),
         )
         .expect("empty filesystem shard should succeed");
 
-        let completed = coordinator.completed_shards();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-empty");
-        assert_eq!(
-            completed[0].report.items_scanned, 0,
-            "empty directory should scan zero items"
-        );
-        assert!(
-            completed[0].checkpoint.is_none(),
-            "zero-item shard must complete without a checkpoint"
-        );
-        assert!(coordinator.done_set().contains("shard-empty"));
+        assert_eq!(report.items_scanned, 0);
+        assert!(checkpoint.is_none());
         assert!(
             done_ledger
                 .snapshot()
                 .expect("done-ledger snapshot")
-                .is_empty(),
-            "zero-item shard should not emit done-ledger rows"
+                .is_empty()
         );
     }
 
     #[test]
-    fn run_filesystem_lease_clean_only_shard_completes_without_checkpoint() {
+    fn run_filesystem_lease_clean_only_shard_returns_no_checkpoint() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 
-        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
+        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
-        let lease = filesystem_lease("shard-clean-only", dir.path());
 
-        run_filesystem_lease(
-            &coordinator,
-            coordinator.event_recorder(),
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
             &persistence,
             &lease,
             DistributedRuntimeConfig::default(),
         )
         .expect("clean-only filesystem shard should succeed");
 
-        let completed = coordinator.completed_shards();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-clean-only");
-        assert_eq!(
-            completed[0].report.items_scanned, 1,
-            "clean-only shard with a single file should report exactly one scanned item"
-        );
-        assert!(
-            completed[0].checkpoint.is_none(),
-            "clean-only shard must complete without a checkpoint"
-        );
-        assert!(coordinator.done_set().contains("shard-clean-only"));
+        assert_eq!(report.items_scanned, 1);
+        assert!(checkpoint.is_none());
         assert!(
             findings_sink
                 .observations_snapshot()
                 .expect("observations snapshot")
-                .is_empty(),
-            "clean-only shard should not emit durable findings observations"
+                .is_empty()
         );
         assert!(
             done_ledger
                 .snapshot()
                 .expect("done-ledger snapshot")
-                .is_empty(),
-            "clean-only shard should not emit done-ledger rows"
+                .is_empty()
         );
     }
 
     #[test]
-    fn run_filesystem_lease_commit_failure_prevents_completion_and_done_mark() {
+    fn run_filesystem_lease_commit_failure_prevents_completion() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
+        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         done_ledger
             .fail_next_commits(1)
             .expect("inject done-ledger commit failure");
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
-        let lease = filesystem_lease("shard-fail", dir.path());
 
         let error = run_filesystem_lease(
-            &coordinator,
-            coordinator.event_recorder(),
+            Arc::clone(&identity.recorder),
             &persistence,
             &lease,
             DistributedRuntimeConfig::default(),
@@ -2836,19 +2736,10 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            coordinator.completed_shards().is_empty(),
-            "checkpoint must not be recorded without a durable receipt"
-        );
-        assert!(
-            !coordinator.done_set().contains("shard-fail"),
-            "shard must not be marked done after durability failure"
-        );
-        assert!(
             done_ledger
                 .snapshot()
                 .expect("done-ledger snapshot")
-                .is_empty(),
-            "done-ledger rows must remain absent after commit failure"
+                .is_empty()
         );
         assert!(
             !findings_sink
@@ -2857,368 +2748,214 @@ mod tests {
                 .is_empty(),
             "findings may still be durable before the done-ledger failure"
         );
+        assert_eq!(run_progress(&coordinator).active(), 1);
     }
 
     #[test]
-    fn run_filesystem_lease_rejects_assignment_without_filesystem_config() {
-        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
-        let persistence =
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
-        let lease = ShardLease::new(
-            Arc::from("shard-missing-config"),
-            StubAssignment {
-                policy_hash: write_context().policy_hash(),
-                filesystem_scan_config: None,
-            },
-            write_context(),
-            tenant_secret_key(),
-        )
-        .expect("lease");
-
-        let error = run_filesystem_lease(
-            &coordinator,
-            coordinator.event_recorder(),
-            &persistence,
-            &lease,
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("missing filesystem config should be rejected");
-
-        assert!(
-            matches!(error, DistributedRuntimeError::UnsupportedAssignment { .. }),
-            "missing filesystem config should use UnsupportedAssignment variant, got: {error:?}"
-        );
-        assert!(coordinator.completed_shards().is_empty());
-        assert!(!coordinator.done_set().contains("shard-missing-config"));
-    }
-
-    #[test]
-    fn run_filesystem_lease_succeeds_with_mixed_finding_and_clean_files() {
+    fn run_worker_returns_zero_report_when_all_shards_are_terminal() {
         let dir = tempdir().expect("tempdir");
-        // File with a detectable secret — will produce findings and enter the
-        // commit pipeline.
-        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write secret fixture");
-        // Clean file — no findings, so the scanner's emit_persistence_batch
-        // early-returns and this file never enters the commit pipeline.
-        fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
-
-        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
-        let findings_sink = InMemoryFindingsSink::new();
-        let done_ledger = InMemoryDoneLedger::new();
-        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
-        let lease = filesystem_lease("shard-mixed", dir.path());
-
-        run_filesystem_lease(
-            &coordinator,
-            coordinator.event_recorder(),
-            &persistence,
-            &lease,
-            DistributedRuntimeConfig::default(),
-        )
-        .expect("mixed shard with clean files should succeed");
-
-        let completed = coordinator.completed_shards();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].shard_id, "shard-mixed");
-
-        let checkpoint = completed[0]
-            .checkpoint
-            .as_ref()
-            .expect("non-empty shard should checkpoint");
-        assert!(
-            checkpoint.last_key().is_some(),
-            "receipt-driven checkpoint should carry a progress key"
-        );
-
-        assert!(coordinator.done_set().contains("shard-mixed"));
-
-        let observations = findings_sink
-            .observations_snapshot()
-            .expect("observations snapshot");
-        assert!(
-            !observations.is_empty(),
-            "durable findings observations should be present for the secret file"
-        );
-
-        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
-        assert_eq!(
-            rows.len(),
-            1,
-            "only the file with findings should produce a done-ledger row"
-        );
-        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
-    }
-
-    #[test]
-    fn run_worker_returns_zero_report_on_empty_queue() {
-        let coordinator = InMemoryCoordinator::<StubAssignment>::new(vec![]);
-        let persistence =
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let raw_lease = claim_coordination_lease(&mut coordinator, worker(1));
+        let final_cursor = CoordCursorUpdate::with_last_key(b"done");
+        let _ = coordinator
+            .complete(
+                wall_clock_now(),
+                tenant(),
+                &raw_lease,
+                &final_cursor,
+                OpId::from_raw(99),
+            )
+            .expect("complete shard");
 
         let report = run_worker(
-            &coordinator,
-            persistence,
+            &mut coordinator,
+            worker_identity(Path::new("/fallback")),
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
             DistributedRuntimeConfig::default(),
         )
-        .expect("empty queue should succeed");
+        .expect("settled run should succeed");
 
         assert_eq!(report.leases_seen, 0);
         assert_eq!(report.shards_scanned, 0);
-        assert_eq!(report.shards_skipped_done, 0);
-        assert!(coordinator.released_shards().is_empty());
-        assert!(coordinator.completed_shards().is_empty());
     }
 
     #[test]
     fn run_worker_processes_multiple_shards_from_queue() {
         let dir_a = tempdir().expect("tempdir a");
         let dir_b = tempdir().expect("tempdir b");
-        fs::write(dir_a.path().join("secret.txt"), secret_fixture()).expect("write fixture a");
-        fs::write(dir_b.path().join("secret.txt"), secret_fixture()).expect("write fixture b");
+        fs::write(dir_a.path().join("alpha-secret.txt"), secret_fixture())
+            .expect("write fixture a");
+        fs::write(dir_b.path().join("omega-secret.txt"), secret_fixture())
+            .expect("write fixture b");
 
-        let coordinator = InMemoryCoordinator::new(vec![
-            filesystem_lease("shard-a", dir_a.path()),
-            filesystem_lease("shard-b", dir_b.path()),
-        ]);
-        let findings_sink = InMemoryFindingsSink::new();
-        let done_ledger = InMemoryDoneLedger::new();
-
+        let mut coordinator = setup_coordinator_with_ranges(
+            &[(dir_a.path(), b"a", b"n"), (dir_b.path(), b"n", b"\xFF")],
+            30_000,
+        );
         let report = run_worker(
-            &coordinator,
-            DistributedPersistence::new(findings_sink, done_ledger),
+            &mut coordinator,
+            worker_identity(Path::new("/fallback")),
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
             DistributedRuntimeConfig::default(),
         )
         .expect("multi-shard run should succeed");
 
         assert_eq!(report.leases_seen, 2);
         assert_eq!(report.shards_scanned, 2);
-        assert_eq!(report.shards_skipped_done, 0);
-
-        let completed: Vec<String> = coordinator
-            .completed_shards()
-            .into_iter()
-            .map(|c| c.shard_id)
-            .collect();
-        assert!(completed.contains(&"shard-a".to_owned()));
-        assert!(completed.contains(&"shard-b".to_owned()));
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 2);
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.status() == ShardStatus::Done)
+        );
     }
 
     #[test]
-    fn run_worker_mixed_done_and_active_shards() {
-        let dir_active = tempdir().expect("tempdir active");
-        fs::write(dir_active.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+    fn run_worker_retries_until_live_lease_expires() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let dir_done = tempdir().expect("tempdir done");
-        fs::write(dir_done.path().join("secret.txt"), secret_fixture())
-            .expect("write done fixture");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 2_000);
+        let _ = claim_coordination_lease(&mut coordinator, worker(99));
 
-        let coordinator = InMemoryCoordinator::new(vec![
-            filesystem_lease("shard-done", dir_done.path()),
-            filesystem_lease("shard-active", dir_active.path()),
-        ]);
-        coordinator.mark_done("shard-done");
+        let report = run_worker(
+            &mut coordinator,
+            worker_identity(Path::new("/fallback")),
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("lease expiry retry should eventually claim the shard");
 
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 1);
+        assert_eq!(run_progress(&coordinator).done(), 1);
+    }
+
+    #[test]
+    fn run_worker_returns_missing_run_as_coordinator_error() {
+        let mut coordinator = CoordinationInMemoryCoordinator::new(30_000);
+        let error = run_worker(
+            &mut coordinator,
+            worker_identity(Path::new("/fallback")),
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("missing run should surface a coordinator error");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Coordinator(_)),
+            "missing run should produce Coordinator variant, got: {error:?}"
+        );
+        assert!(error.to_string().contains("run not found"));
+    }
+
+    #[test]
+    fn claim_retry_delay_with_future_deadline() {
+        let now = LogicalTime::from_raw(1000);
+        let deadline = Some(LogicalTime::from_raw(1050));
+        assert_eq!(claim_retry_delay(now, deadline), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn claim_retry_delay_clamps_stale_deadline_to_one_ms() {
+        let now = LogicalTime::from_raw(2000);
+        let stale = Some(LogicalTime::from_raw(1000));
+        assert_eq!(claim_retry_delay(now, stale), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn claim_retry_delay_falls_back_without_deadline() {
+        let now = LogicalTime::from_raw(1000);
+        assert_eq!(claim_retry_delay(now, None), CLAIM_RACE_RETRY_DELAY);
+    }
+
+    #[test]
+    fn build_lease_from_acquire_rejects_non_utf8_connector_extra() {
+        let mut coordinator = setup_coordinator_with_connector_extra(&[vec![0xFF, 0xFE]], 30_000);
+        let mut scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(wall_clock_now(), tenant(), run(), worker(1), &mut scratch)
+            .expect("claim next available");
+        let identity = worker_identity(Path::new("/fallback"));
+
+        let err = build_lease_from_acquire(acquired, &identity)
+            .expect_err("non-UTF-8 connector_extra must be rejected");
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_succeeds_with_mixed_finding_and_clean_files() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write secret fixture");
+        fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
 
-        let report = run_worker(
-            &coordinator,
-            DistributedPersistence::new(findings_sink, done_ledger),
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
             DistributedRuntimeConfig::default(),
         )
-        .expect("mixed done/active run should succeed");
+        .expect("mixed shard should succeed");
 
-        assert_eq!(report.leases_seen, 2);
-        assert_eq!(report.shards_scanned, 1);
-        assert_eq!(report.shards_skipped_done, 1);
+        assert!(
+            report.items_scanned >= 2,
+            "both files should be scanned, got {}",
+            report.items_scanned,
+        );
+        assert!(
+            checkpoint.is_some(),
+            "shard with findings should checkpoint"
+        );
 
-        let completed: Vec<String> = coordinator
-            .completed_shards()
-            .into_iter()
-            .map(|c| c.shard_id)
-            .collect();
-        assert_eq!(completed, vec!["shard-active".to_owned()]);
+        let observations = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot");
+        assert!(
+            !observations.is_empty(),
+            "secret file should produce durable findings"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
         assert_eq!(
-            coordinator.released_shards(),
-            vec!["shard-done".to_owned()],
-            "only the done shard should be released without completion"
-        );
-    }
-
-    #[test]
-    fn run_worker_returns_coordinator_error_on_acquire_failure() {
-        let dir = tempdir().expect("tempdir");
-        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
-        coordinator.fail_next_acquires(1);
-
-        let error = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("injected acquire failure should propagate");
-
-        assert!(
-            matches!(error, DistributedRuntimeError::Coordinator(_)),
-            "acquire failure should produce Coordinator variant, got: {error:?}"
-        );
-        assert!(
-            error.to_string().contains("injected acquire_shard failure"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn run_worker_returns_coordinator_error_on_is_done_failure() {
-        let dir = tempdir().expect("tempdir");
-        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
-        coordinator.fail_next_is_done_checks(1);
-
-        let error = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("injected is_done failure should propagate");
-
-        assert!(
-            matches!(error, DistributedRuntimeError::Coordinator(_)),
-            "is_done failure should produce Coordinator variant, got: {error:?}"
-        );
-        assert!(
-            error.to_string().contains("injected is_shard_done failure"),
-            "unexpected error: {error}"
-        );
-        // The is_done error handler does a best-effort release.
-        assert_eq!(
-            coordinator.released_shards(),
-            vec!["shard-a".to_owned()],
-            "is_done failure must attempt best-effort lease release"
-        );
-    }
-
-    #[test]
-    fn run_worker_preserves_original_error_when_release_fails_after_is_done_error() {
-        let dir = tempdir().expect("tempdir");
-        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
-        // Both is_done and release will fail; the original is_done error
-        // should be returned, not the release error.
-        coordinator.fail_next_is_done_checks(1);
-        coordinator.fail_next_releases(1);
-
-        let error = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("injected is_done failure should propagate");
-
-        assert!(
-            error.to_string().contains("injected is_shard_done failure"),
-            "original is_done error should be preserved, got: {error}"
-        );
-        // Release failed too, so no shard appears in released list.
-        assert!(
-            coordinator.released_shards().is_empty(),
-            "failed release should not record the shard"
-        );
-    }
-
-    #[test]
-    fn run_worker_continues_after_release_failure_on_done_shard() {
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
-
-        let coordinator = InMemoryCoordinator::new(vec![
-            filesystem_lease("shard-done", dir.path()),
-            filesystem_lease("shard-active", dir.path()),
-        ]);
-        coordinator.mark_done("shard-done");
-        // Release will fail for the done shard, but the loop should continue
-        // to process the active shard (done-shard release is best-effort).
-        coordinator.fail_next_releases(1);
-
-        let report = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect("done-shard release failure should not abort the loop");
-
-        assert_eq!(report.leases_seen, 2);
-        assert_eq!(report.shards_skipped_done, 1);
-        assert_eq!(report.shards_scanned, 1);
-    }
-
-    #[test]
-    fn run_worker_returns_coordinator_error_on_complete_failure() {
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
-
-        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
-        coordinator.fail_next_completes(1);
-
-        let error = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("injected complete failure should propagate");
-
-        assert!(
-            matches!(error, DistributedRuntimeError::Coordinator(_)),
-            "complete failure should produce Coordinator variant, got: {error:?}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("injected complete_shard failure"),
-            "unexpected error: {error}"
-        );
-
-        // The lease should still be released best-effort despite the error.
-        assert_eq!(
-            coordinator.released_shards(),
-            vec!["shard-a"],
-            "lease must be released best-effort after complete failure"
-        );
-    }
-
-    #[test]
-    fn run_worker_completes_but_fails_mark_done() {
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
-
-        let coordinator = InMemoryCoordinator::new(vec![filesystem_lease("shard-a", dir.path())]);
-        coordinator.fail_next_mark_done(1);
-
-        let error = run_worker(
-            &coordinator,
-            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
-            DistributedRuntimeConfig::default(),
-        )
-        .expect_err("injected mark_done failure should propagate");
-
-        assert!(
-            matches!(error, DistributedRuntimeError::Coordinator(_)),
-            "mark_done failure should produce Coordinator variant, got: {error:?}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("injected mark_shard_done failure"),
-            "unexpected error: {error}"
-        );
-
-        // The shard was successfully completed before mark_done failed.
-        assert_eq!(
-            coordinator.completed_shards().len(),
+            rows.len(),
             1,
-            "shard must appear in completed list despite mark_done failure"
+            "only the finding-bearing file produces a done-ledger row"
         );
+    }
+
+    #[test]
+    fn complete_shard_fails_when_lease_is_fenced() {
+        let dir = tempdir().expect("tempdir");
+
+        // Use a very short TTL so our lease expires quickly.
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 50);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        // Wait for our lease to expire, then let a rival claim the same
+        // shard. This bumps the fence epoch, making our lease stale.
+        std::thread::sleep(Duration::from_millis(100));
+        let _rival_lease = claim_coordination_lease(&mut coordinator, worker(99));
+
+        let err = complete_shard(&mut coordinator, &identity, &lease, None)
+            .expect_err("completion with stale fence should fail");
         assert!(
-            coordinator.done_set().is_empty(),
-            "shard must not appear in done set when mark_done fails"
+            matches!(err, DistributedRuntimeError::Coordinator(_)),
+            "expected Coordinator error variant, got: {err:?}"
         );
     }
 }

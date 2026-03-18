@@ -12,7 +12,9 @@
   result-translation, result-committer, checkpoint-aggregator, commit-sink,
   and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
-- distributed runtime types: lease payloads, coordinator callbacks, persistence handles, runtime configuration, run reports, and error layering
+- distributed runtime worker-loop support: `WorkerIdentity`, concrete shard
+  leases, direct coordination claim/complete helpers, persistence handles,
+  runtime configuration, run reports, and error layering
 
 The crate no longer depends on a separate scan-driver abstraction. Its
 public surface stays stable for callers while direct and connector-mode
@@ -31,7 +33,7 @@ entrypoints share the same local runtime execution paths.
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
-| `src/distributed.rs` | Foundational distributed worker-loop types: `ShardLease<A>`, `DistributedCoordinator<A>`, `DistributedPersistence<F, D>`, config/report types, layered runtime errors, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), `run_worker` (lease loop), and `InMemoryCoordinator` (test-support coordinator harness) |
+| `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), direct `CoordinationFacade` claim/complete helpers, and `run_worker` (lease loop) |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
@@ -83,9 +85,12 @@ Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
 
-The distributed module exports foundational types consumed by the worker loop:
-`ShardLease`, `DistributedCoordinator`, `DistributedPersistence`,
-`DistributedRuntimeConfig`, `DistributedRunReport`, and `DistributedRuntimeError`.
+The distributed module exports the concrete worker-loop types and helpers:
+`WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
+`DistributedRuntimeConfig`, `DistributedRunReport`, and
+`DistributedRuntimeError`. The runtime depends directly on
+`gossip-coordination` for claim and completion operations and on
+`gossip-frontier` for shard metadata decoding.
 
 ### Family split
 
@@ -352,7 +357,7 @@ failure aborts the shard.
 the receipt-driven durability model:
 
 1. Validates budgets and extracts the filesystem scan config from the lease
-   assignment. Forces single-worker execution so `ReceiptCommitSink` sequence
+   payload. Forces single-worker execution so `ReceiptCommitSink` sequence
    assignment remains deterministic.
 2. Builds the runtime engine and a rule-fingerprint resolver closure from the
    same engine instance (shared via `Arc`).
@@ -366,34 +371,27 @@ the receipt-driven durability model:
    sequence numbers via `wait_for_submitted_commits` and verifies that the
    durable receipt count matches the number of items submitted to the commit
    pipeline.
-7. Prepares a checkpoint prefix from the aggregator, persists the checkpoint
-   cursor via `complete_shard`, acknowledges the checkpoint to advance the
-   aggregator watermark, and marks the shard done. Shards with zero durable
-   commit units (empty directories or directories where no file produced
-   findings) complete without a checkpoint cursor.
+7. Prepares a checkpoint prefix from the aggregator, acknowledges the
+   checkpoint to advance the aggregator watermark, and returns the checkpoint
+   cursor to the caller. Shards with zero durable commit units (empty
+   directories or directories where no file produced durable rows) return no
+   checkpoint cursor.
 
-If any step fails, the shard is not marked done and will be retried on the
-next lease acquisition.
+If any step fails, the shard is not completed in coordination and will be
+retried when the lease expires.
 
 #### `run_worker`
 
 `run_worker` is the top-level distributed lease loop. It acquires leases until
-the coordinator returns `None`, counts every lease in
-`DistributedRunReport`, releases already-done shards without scanning them,
-routes filesystem leases through `run_filesystem_lease`, and rejects
-assignments that do not expose a filesystem scan config instead of advancing
-them without receipt-derived durability.
+the coordinator returns no more active work, counts every claimed lease in
+`DistributedRunReport`, routes each lease through `run_filesystem_lease`, and
+then completes it directly against the coordination backend. Completion uses
+the receipt-derived checkpoint cursor when one exists; otherwise it falls back
+to the shard's range start so `CursorSemantics::Completed` runs still advance
+terminal state for clean or empty shards.
 
-#### `InMemoryCoordinator`
-
-`InMemoryCoordinator<A>` is available in test builds and under the
-`test-support` feature. It keeps the lease queue, completion bookkeeping, and
-recorded coordination events behind one `Arc<Mutex<...>>` state bundle so
-tests can exercise the worker loop without a real coordination backend.
-
-The coordinator intentionally does not deduplicate `complete_shard` calls.
-Crash-retry tests can therefore observe duplicate completion records when a
-shard is re-leased after completion but before done-marking.
+Unit tests exercise this loop through `gossip_coordination::InMemoryCoordinator`,
+which is the same reference backend used elsewhere in the coordination layer.
 
 ### ScanRuntimeError
 
@@ -534,30 +532,41 @@ imported from another crate.
 builds on.
 
 ```rust
-pub struct ShardLease<A> {
+pub struct WorkerIdentity {
+    pub tenant: TenantId,
+    pub run: RunId,
+    pub worker: WorkerId,
+    pub policy_hash: PolicyHash,
+    pub tenant_secret_key: TenantSecretKey,
+    pub scan_template: FsScanConfig,
+    pub recorder: Arc<dyn CoordinationEventRecorder>,
+}
+```
+
+```rust
+pub struct ShardLease {
     shard_id: Arc<str>,
-    assignment: A,
+    lease: Lease,
+    range_start: Vec<u8>,
+    scan_config: FsScanConfig,
     write_context: WriteContext,
     tenant_secret_key: TenantSecretKey,
 }
 ```
 
 ```rust
-pub trait DistributedCoordinator<A>: Send + Sync
+pub fn run_worker<C, F, D>(
+    coordinator: &mut C,
+    identity: WorkerIdentity,
+    persistence: DistributedPersistence<F, D>,
+    config: DistributedRuntimeConfig,
+) -> Result<DistributedRunReport, DistributedRuntimeError>
 where
-    A: ShardLeaseAssignment,
+    C: CoordinationFacade,
+    F: FindingsSink + Clone + Send + Sync + 'static,
+    D: DoneLedger + Clone + Send + Sync + 'static,
 {
-    fn acquire_shard(&self) -> anyhow::Result<Option<ShardLease<A>>>;
-    fn release_shard(&self, lease: &ShardLease<A>) -> anyhow::Result<()>;
-    fn complete_shard(
-        &self,
-        lease: &ShardLease<A>,
-        checkpoint: Option<Cursor>,
-        report: ScanReport,
-    ) -> anyhow::Result<()>;
-    fn is_shard_done(&self, lease: &ShardLease<A>) -> anyhow::Result<bool>;
-    fn mark_shard_done(&self, lease: &ShardLease<A>) -> anyhow::Result<()>;
-    fn event_recorder(&self) -> Arc<dyn CoordinationEventRecorder>;
+    ...
 }
 ```
 
@@ -568,26 +577,30 @@ pub struct DistributedRuntimeConfig {
 }
 ```
 
-`ShardLease<A>` is the hand-off object from coordination into the worker loop.
-It keeps the string shard label used for recorder routing separate from the
-numeric shard identity carried inside `WriteContext`. Construction via
-`ShardLease::new` validates that the assignment and write context agree on
-policy scope, returning `PolicyMismatchError` on divergence so the worker
-loop can skip the shard instead of crashing.
+`WorkerIdentity` bundles the stable coordination and durability scope for one
+worker invocation. It threads tenant/run/worker identity, the policy hash used
+for `WriteContext`, the tenant secret key used during translation, a template
+filesystem config, and the shared coordination recorder into the claim and
+completion helpers.
 
-`DistributedCoordinator<A>` defines the coordination callbacks the runtime
-needs around a single lease: acquire, release, receipt-derived completion,
-done checks, done marking, and event recording.
+`ShardLease` is the hand-off object from `gossip-coordination` into the worker
+loop. It keeps the string shard label used for recorder routing separate from
+the numeric shard identity carried inside `Lease` and `WriteContext`, stores
+the shard's key-range start for completion fallback, and carries the
+filesystem scan config derived from the claimed shard spec plus connector
+metadata.
 
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones
 per shard, while `DistributedRuntimeError`
-distinguishes coordinator failures, scan-runtime failures, local durability
-pipeline failures, and unsupported assignment types.
+distinguishes coordinator failures, scan-runtime failures, and local
+durability pipeline failures.
 
-`run_worker` ties those types together into the lease loop, and
-`InMemoryCoordinator<A>` provides a harness implementation for unit tests and
-feature-gated downstream test support.
+`run_worker` ties those types together into the lease loop. It claims shards
+directly through `CoordinationFacade::claim_next_available`, retries on
+throttling or live-lease contention, executes one filesystem shard at a time,
+and completes successful shards through `CoordinationFacade::complete` with a
+deterministic `OpId`.
 
 ---
 
@@ -604,13 +617,13 @@ The runtime tests focus on the behavior that exists today:
 - event forwarding for filesystem and git runtime entrypoints
 - commit forwarding for filesystem scans with persistence enabled
 - deterministic result translation into findings and done-ledger persistence rows
-- lease policy-scope assertions
 - distributed config defaults
 - distributed persistence handle cloning
 - distributed runtime error layering
-- distributed worker-loop lease accounting, done-ledger skips, and
-  receipt-derived completion
-- in-memory coordinator snapshots for completed shards and recorded events
+- distributed worker-loop lease accounting, claim retry, and receipt-derived
+  completion
+- `gossip_coordination::InMemoryCoordinator` snapshots for completed shards
+  and run progress
 - CLI parsing and summary formatting
 - receipt-driven identity derivation via translate_item_result
 - authoritative findings -> done-ledger commit ordering and item-level receipt
@@ -618,9 +631,9 @@ The runtime tests focus on the behavior that exists today:
 - bounded execution -> commit backpressure and cancellation semantics
 
 These tests exercise the live local runtime paths for valid filesystem and
-git sources and verify the distributed type surface (lease construction,
-persistence cloning, config defaults, error layering, worker-loop accounting,
-and in-memory coordinator observations).
+git sources and verify the distributed worker loop (lease construction,
+persistence cloning, config defaults, error layering, claim/completion flow,
+and coordination-backend observations).
 
 ---
 
