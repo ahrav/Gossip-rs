@@ -35,7 +35,7 @@ pub struct BlobSpill {
 impl BlobSpill {
     /// Create a new spill file sized to `len` bytes.
     pub fn new(dir: &Path, len: usize) -> io::Result<Self> {
-        let path = make_spill_path(dir);
+        let path = make_unique_spill_path(dir, "blob_spill");
         let file = open_spill_file(&path, len as u64)?;
         // SAFETY: The file length is fixed and we only write through the mutable mapping.
         let writer = unsafe { MmapMut::map_mut(&file)? };
@@ -123,15 +123,18 @@ impl<'a> BlobSpillWriter<'a> {
 
 /// Construct a unique spill file path within `dir`.
 ///
-/// Includes PID, timestamp, and a monotonic counter to avoid collisions.
-fn make_spill_path(dir: &Path) -> PathBuf {
+/// Includes the caller's `prefix`, the process id, a timestamp, and a
+/// monotonic counter to avoid collisions across spill-backed helpers.
+/// Distinct prefixes keep blob and tree spill files easy to distinguish
+/// while still sharing one collision-resistant naming scheme.
+pub(crate) fn make_unique_spill_path(dir: &Path, prefix: &str) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let counter = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut path = dir.to_path_buf();
     path.push(format!(
-        "blob_spill_{}_{}_{}",
+        "{prefix}_{}_{}_{}",
         std::process::id(),
         now.as_nanos(),
         counter

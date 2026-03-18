@@ -26,9 +26,9 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::blob_spill::make_unique_spill_path;
 use memmap2::{Mmap, MmapMut};
 
 #[cfg(target_os = "linux")]
@@ -141,7 +141,7 @@ impl SpillArena {
     /// The backing file is created (or truncated) under `dir` and is not
     /// deleted by this type; callers should clean up the directory if needed.
     pub fn new(dir: &Path, capacity: u64) -> Result<Self, SpillArenaError> {
-        let path = make_spill_path(dir);
+        let path = make_unique_spill_path(dir, "tree_spill");
         let file = open_spill_file(&path, capacity)?;
 
         // SAFETY: The file length is set once at creation (`set_len`) and
@@ -219,30 +219,6 @@ impl SpillArena {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
-
-/// Monotonic counter to prevent path collisions when multiple
-/// `ObjectStore` instances are constructed concurrently (parallel blob
-/// intro). The PID + timestamp alone can collide within the same
-/// nanosecond on fast thread spawns.
-static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Construct a unique spill file path within `dir`.
-///
-/// Includes PID, timestamp, and a monotonic counter to avoid collisions.
-fn make_spill_path(dir: &Path) -> PathBuf {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let counter = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut path = dir.to_path_buf();
-    path.push(format!(
-        "tree_spill_{}_{}_{}",
-        std::process::id(),
-        now.as_nanos(),
-        counter
-    ));
-    path
 }
 
 /// Creates (or truncates) the spill file and sets its length to `capacity`.
