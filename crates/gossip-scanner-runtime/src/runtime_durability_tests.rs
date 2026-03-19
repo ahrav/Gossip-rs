@@ -10,6 +10,8 @@ use gossip_persistence_inmemory::{
     InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError, InMemoryStoreKind,
 };
 
+use scanner_scheduler::store::FsFindingRecord;
+
 use crate::{
     checkpoint_aggregator::{
         PrefixCheckpointAggregator, PrefixCheckpointError, ReceiptRecordOutcome,
@@ -59,29 +61,39 @@ fn assert_sink_counts(sink: &InMemoryFindingsSink, expected: usize) {
     );
 }
 
-fn scanned_translation(
+fn scanned_translation_with(
     write_context: WriteContext,
     item_suffix: u8,
     timing_offset: u64,
+    findings: &[FsFindingRecord],
 ) -> PersistenceTranslation {
     let item = scan_item(item_suffix);
-    let findings = [
-        finding(7, 10, 20, item_suffix),
-        finding(9, 30, 45, item_suffix.wrapping_add(10)),
-    ];
-
     translate_item_result(
         write_context,
         &tenant_secret_key(),
         &item,
         128,
         timing_with_offset(timing_offset),
-        ItemResult::Scanned {
-            findings: &findings,
-        },
+        ItemResult::Scanned { findings },
         &test_rule_fingerprint,
     )
-    .expect("translation of scanned item with two findings should succeed")
+    .expect("translation should succeed")
+}
+
+fn scanned_translation(
+    write_context: WriteContext,
+    item_suffix: u8,
+    timing_offset: u64,
+) -> PersistenceTranslation {
+    scanned_translation_with(
+        write_context,
+        item_suffix,
+        timing_offset,
+        &[
+            finding(7, 10, 20, item_suffix),
+            finding(9, 30, 45, item_suffix.wrapping_add(10)),
+        ],
+    )
 }
 
 fn clean_scanned_translation(
@@ -89,17 +101,7 @@ fn clean_scanned_translation(
     item_suffix: u8,
     timing_offset: u64,
 ) -> PersistenceTranslation {
-    let item = scan_item(item_suffix);
-    translate_item_result(
-        write_context,
-        &tenant_secret_key(),
-        &item,
-        128,
-        timing_with_offset(timing_offset),
-        ItemResult::Scanned { findings: &[] },
-        &test_rule_fingerprint,
-    )
-    .expect("translation of clean scan item should succeed")
+    scanned_translation_with(write_context, item_suffix, timing_offset, &[])
 }
 
 #[test]
@@ -212,8 +214,18 @@ fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
     assert_eq!(receipt.durable().done_ledger().record_count(), 1);
     assert_eq!(receipt.durable().done_ledger().findings_count(), 0);
 
-    // Aggregator accepts the receipt and produces a checkpoint.
+    // Verify receipt-gating invariant holds for zero-findings commits.
     let mut aggregator = PrefixCheckpointAggregator::new(context, unit.sequence_no(), 4);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "zero-findings commit must still require an explicit receipt for checkpoint progress"
+    );
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+
+    // Aggregator accepts the receipt and produces a checkpoint.
     let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
         .expect("receipt boundary kind should match the shard stream");
     assert_eq!(
@@ -230,10 +242,106 @@ fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
     assert_eq!(pending.first_sequence_no(), 0);
     assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(pending.committed_units(), 1);
+    assert_eq!(pending.first_sequence_no(), 0);
+    assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(
         pending.checkpoint_cursor(),
         &Cursor::with_last_key(item_key(0x81)),
         "checkpoint cursor must point to the clean-scan item key"
+    );
+}
+
+#[test]
+fn real_receipts_only_advance_the_contiguous_prefix() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
+
+    let context = write_context_with_epoch(300);
+    let unit_zero = completed_unit(0, 0x61);
+    let unit_one = completed_unit(1, 0x62);
+    let translation_zero = scanned_translation(context, 0x61, 1);
+    let translation_one = scanned_translation(context, 0x62, 2);
+
+    let receipt_one = committer
+        .commit_translation(context, &unit_one, &translation_one)
+        .expect("sequence 1 should commit");
+    let receipt_zero = committer
+        .commit_translation(context, &unit_zero, &translation_zero)
+        .expect("sequence 0 should commit");
+
+    // Both commits wrote durable data: 2 findings per item, 1 done-ledger row per item.
+    assert_sink_counts(&findings_sink, 4);
+    assert_eq!(
+        done_ledger.snapshot().expect("done-ledger snapshot").len(),
+        2,
+        "each committed item should produce one done-ledger row"
+    );
+
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
+    let receipt_one_input =
+        CheckpointAggregatorInput::new(unit_one.checkpoint_boundary_kind(), receipt_one)
+            .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(receipt_one_input)
+            .expect("out-of-order receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "sequence 1 alone must not advance the committed prefix"
+    );
+    assert_eq!(aggregator.next_sequence_no(), 0);
+    assert_eq!(aggregator.checkpointed_units(), 0);
+
+    let receipt_zero_input =
+        CheckpointAggregatorInput::new(unit_zero.checkpoint_boundary_kind(), receipt_zero)
+            .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(receipt_zero_input)
+            .expect("gap-closing receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("contiguous prefix should now exist");
+    assert_eq!(pending.first_sequence_no(), 0);
+    assert_eq!(pending.last_sequence_no(), 1);
+    assert_eq!(pending.committed_units(), 2);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x62)),
+        "checkpoint cursor must reflect the last item in the contiguous prefix"
+    );
+
+    let checkpoint_scope = pending.scope().clone();
+
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            checkpoint_scope,
+            LogicalTime::from_raw(9_101),
+        ))
+        .expect("durable checkpoint receipt should advance the full prefix");
+
+    assert_eq!(aggregator.next_sequence_no(), 2);
+    assert_eq!(aggregator.checkpointed_units(), 2);
+    assert_eq!(
+        aggregator.buffered_receipt_count(),
+        0,
+        "buffer must drain after acknowledging the full prefix"
+    );
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed after acknowledgement")
+            .is_none(),
+        "no pending receipts should remain after acknowledging the full prefix"
     );
 }
 
