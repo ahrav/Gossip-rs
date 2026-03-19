@@ -8,9 +8,9 @@ use std::{
 };
 
 use gossip_contracts::{
-    connector::{Cursor, ItemKey},
+    connector::Cursor,
     identity::LogicalTime,
-    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus},
+    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus, WriteContext},
 };
 use gossip_persistence_inmemory::{
     CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
@@ -365,10 +365,10 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
         match rx.recv_timeout(timeout) {
             Ok(val) => assert_eq!(val, expected, "ack value mismatch"),
             Err(RecvTimeoutError::Disconnected) => {
-                if let Some(h) = producer.take() {
-                    if let Err(payload) = h.join() {
-                        std::panic::resume_unwind(payload);
-                    }
+                if let Some(h) = producer.take()
+                    && let Err(payload) = h.join()
+                {
+                    std::panic::resume_unwind(payload);
                 }
                 panic!(
                     "ack channel disconnected — producer completed without sending ack {expected}"
