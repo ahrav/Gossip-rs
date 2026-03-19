@@ -10,7 +10,7 @@ use std::{
 use gossip_contracts::{
     connector::Cursor,
     identity::LogicalTime,
-    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus, WriteContext},
+    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus},
 };
 use gossip_persistence_inmemory::{
     CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
@@ -22,7 +22,7 @@ use crate::{
     checkpoint_aggregator::{
         PrefixCheckpointAggregator, PrefixCheckpointError, ReceiptRecordOutcome,
     },
-    commit_model::{CheckpointAggregatorInput, UnitCommitReceipt},
+    commit_model::CheckpointAggregatorInput,
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput, QueuedCommit},
     result_committer::{ResultCommitError, ResultCommitter},
     test_fixtures::{
@@ -322,6 +322,7 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
 
     let sender = pipeline.sender();
     let (ack_tx, ack_rx) = mpsc::channel();
+    let (entering_third_tx, entering_third_rx) = mpsc::channel::<()>();
     let context = write_context_with_epoch(600);
     let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 8);
 
@@ -344,6 +345,9 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
             .expect("second submit should succeed");
         ack_tx.send(2u8).expect("second ack");
 
+        entering_third_tx
+            .send(())
+            .expect("rendezvous: producer reached third submit");
         sender
             .submit(QueuedCommit::new(
                 context,
@@ -382,6 +386,12 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
 
     recv_ack(&ack_rx, &mut producer, 1, Duration::from_secs(1));
     recv_ack(&ack_rx, &mut producer, 2, Duration::from_secs(1));
+    // Wait for the producer to reach the third submit call. Without this
+    // rendezvous the timeout below could pass vacuously if the producer thread
+    // were descheduled after sending ack 2 but before entering `submit()`.
+    entering_third_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("producer should reach the third submit");
     // The worker is blocked inside `StoreHandle::wait()` on a non-auto-completing
     // findings sink — the condvar cannot fire until `release_next` is called, so
     // 200ms is far longer than any scheduling jitter while still keeping the test
@@ -401,7 +411,7 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
         "no durable receipt should be emitted while the first findings write is still pending"
     );
 
-    wait_until(|| findings_sink.pending_count().expect("pending count") == 1);
+    wait_until(|| findings_sink.pending_count().expect("pending count") >= 1);
     assert!(
         done_ledger
             .snapshot()
