@@ -29,6 +29,7 @@ focused on the surfaces with pinned fixtures and canonicalized outputs:
 - CLI parsing and summary rendering
 - event-sink formatting
 - JSONL canonicalization in `parity.rs`
+- local-vs-distributed filesystem finding-set parity after path normalization
 - deterministic identity derivation via `translate_item_result`
 
 As additional receipt-driven distributed paths land, the same public runtime
