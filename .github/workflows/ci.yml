@@ -381,7 +381,21 @@ jobs:
           shared-key: stable-linux-doc
           save-cache: "true"
 
-      - run: cargo doc --no-deps --all-features
+      # Explicit feature list instead of --all-features: avoids compiling
+      # librocksdb-sys (C++ from source, ~4 min on CI) which adds no public
+      # API surface. Only test-support features are needed to resolve
+      # doc-links to cfg-gated modules.
+      - run: >-
+          cargo doc --no-deps --features
+          gossip-contracts/test-support,
+          gossip-coordination/test-support,
+          gossip-coordination-etcd/test-support,
+          gossip-pg-common/test-support,
+          gossip-done-ledger-postgres/test-utils,
+          gossip-findings-postgres/test-utils,
+          gossip-persistence-inmemory/test-support,
+          gossip-scanner-runtime/test-support,
+          scanner-engine/test-support
 
   # ── Dependency Lint (licenses, advisories, bans) ───────────────────
   deny:
