@@ -35,8 +35,8 @@ fill_page(shard, cursor, budgets)
      Ok(None)          => terminal completion (shard fully enumerated)
      Ok(Some(PageBuf)) => { items, state: HasMore{cursor} | Complete }
      for each item:
-       open(item_ref, budgets) -> dyn Read
-       (optionally) read_range(item_ref, offset, dst, budgets) -> usize
+        open(item_ref, budgets) -> Result<Box<dyn Read + Send>, ReadError>
+        (optionally) read_range(item_ref, offset, dst, budgets) -> Result<usize, ReadError>
      checkpoint cursor
 ```
 
@@ -67,9 +67,9 @@ operates on entire repositories rather than individual items.
    -> Result<Option<PageBuf<GitRepoTarget>>, EnumerateError>
       Ok(None) => terminal completion (shard fully enumerated)
 2. GitMirrorManager::sync_mirror(locator)
-   -> LocalMirror
+   -> Result<LocalMirror, GitRunError>
 3. GitRepoExecutor::run_repo(mirror, selection, limits)
-   -> GitRunOutcome
+   -> Result<GitRunOutcome, GitRunError>
 ```
 
 ---
@@ -101,6 +101,7 @@ and `types.rs`.
 | `crates/gossip-contracts/src/connector/common.rs` | Shared paging vocabulary |
 | `crates/gossip-contracts/src/connector/types.rs` | Toxic-byte wrappers, cursor, budgets |
 | `crates/gossip-contracts/src/connector/api.rs` | Error taxonomy, capabilities |
+| `crates/gossip-contracts/src/connector/mod.rs` | Re-export hub, canonical connector tags |
 | `crates/gossip-connectors/src/filesystem.rs` | Filesystem ordered-content connector |
 | `crates/gossip-connectors/src/git.rs` | Git `ls-files` ordered-content connector |
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
@@ -108,6 +109,13 @@ and `types.rs`.
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
+| `crates/gossip-scanner-runtime/src/commit_sink.rs` | Commit-sink trait and bridge record types for scan-loop lifecycle |
+| `crates/gossip-scanner-runtime/src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt` |
+| `crates/gossip-scanner-runtime/src/result_translation.rs` | Deterministic scan-result -> persistence-row translation |
+| `crates/gossip-scanner-runtime/src/result_committer.rs` | Authoritative findings -> done-ledger durable commit stage |
+| `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregation |
+| `crates/gossip-scanner-runtime/src/coordination_sink.rs` | Coordination event recorder payloads for distributed scans |
+| `crates/gossip-scanner-runtime/src/distributed.rs` | Distributed worker-loop runtime and receipt-backed commit plumbing |
 
 ---
 

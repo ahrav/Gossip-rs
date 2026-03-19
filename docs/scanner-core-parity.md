@@ -16,7 +16,9 @@ summary, and parity plumbing local to `gossip-scanner-runtime`:
 - `crates/gossip-worker` exercises the same runtime surface with a minimal
   worker-specific CLI.
 - `crates/gossip-scanner-runtime` owns local `ScanReport`,
-  `ScanCheckpoint`, `CancellationToken`, commit-pipeline, and commit-sink
+  `ScanCheckpoint`, `CancellationToken`, commit-pipeline, commit-sink,
+  commit-model, result-translation, result-committer,
+  checkpoint-aggregator, coordination-sink, and distributed worker-loop
   types.
 - `crates/scanner-engine` owns the detection pipeline: vectorscan prefilter,
   regex, transform decode, offline validation, and finding emission.
