@@ -16,15 +16,15 @@ use gossip_coordination::{
     CursorSemantics, InMemoryCoordinator as CoordinationInMemoryCoordinator, InitialShardInput,
     RunConfig, RunManagement,
 };
-use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+use gossip_frontier::{range_shard_ref, ShardSpecScratch};
 use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
 use serde_json::Value;
-use tempfile::{NamedTempFile, tempdir};
+use tempfile::{tempdir, NamedTempFile};
 
 use super::*;
 use crate::{
     coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent},
-    distributed::{DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity, run_worker},
+    distributed::{run_worker, DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity},
 };
 
 fn run_git(repo: &Path, args: &[&str]) {
@@ -105,27 +105,16 @@ struct ComparableFinding {
     end: u64,
 }
 
-fn normalize_finding_path(path: &str, root: &Path) -> String {
-    let candidate = Path::new(path);
-    if let Ok(stripped) = candidate.strip_prefix(root) {
-        if stripped.as_os_str().is_empty() {
-            return candidate
-                .file_name()
-                .expect("finding path matching root must have file name")
-                .to_string_lossy()
-                .replace('\\', "/");
-        }
-        return stripped.to_string_lossy().replace('\\', "/");
-    }
-    path.replace('\\', "/")
-}
-
 fn comparable_findings_from_jsonl(bytes: Vec<u8>, root: &Path) -> Vec<ComparableFinding> {
+    let roots: &[&Path] = &[root];
     let mut findings: Vec<_> = parse_jsonl(bytes)
         .into_iter()
-        .filter(|event| event.get("path").is_some() && event.get("start").is_some())
+        .filter(crate::parity::is_finding_event)
         .map(|event| ComparableFinding {
-            path: normalize_finding_path(event["path"].as_str().expect("finding path"), root),
+            path: crate::parity::normalize_path(
+                event["path"].as_str().expect("finding path").to_owned(),
+                roots,
+            ),
             rule: event
                 .get("rule")
                 .and_then(Value::as_str)
@@ -703,6 +692,10 @@ fn scan_fs_local_and_distributed_paths_match_on_finding_set() {
     let local = comparable_findings_from_jsonl(local_out.take(), &fixture_root);
     let distributed = comparable_findings_from_jsonl(recorder.core_jsonl(), &fixture_root);
 
+    assert!(
+        !local.is_empty(),
+        "parsed local JSONL must contain at least one finding",
+    );
     assert!(
         !distributed.is_empty(),
         "parity fixture should emit at least one distributed finding",

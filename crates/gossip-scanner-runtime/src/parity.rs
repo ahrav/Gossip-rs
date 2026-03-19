@@ -197,7 +197,7 @@ fn rule_field(value: &serde_json::Value, line: usize) -> Result<String, Canonica
     required_str(value, line, "rule")
 }
 
-fn is_finding_event(value: &serde_json::Value) -> bool {
+pub(crate) fn is_finding_event(value: &serde_json::Value) -> bool {
     let type_field = value.get("type").and_then(serde_json::Value::as_str);
     if matches!(type_field, Some("finding")) {
         return true;
@@ -209,7 +209,7 @@ fn is_finding_event(value: &serde_json::Value) -> bool {
         && value.get("end").is_some()
 }
 
-fn normalize_path(path: String, roots: &[&Path]) -> String {
+pub(crate) fn normalize_path(path: String, roots: &[&Path]) -> String {
     let candidate = Path::new(&path);
     for root in roots {
         if let Ok(stripped) = candidate.strip_prefix(root) {
