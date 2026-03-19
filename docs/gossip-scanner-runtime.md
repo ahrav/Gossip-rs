@@ -630,6 +630,9 @@ The runtime tests focus on the behavior that exists today:
 - authoritative findings -> done-ledger commit ordering and item-level receipt
   construction
 - bounded execution -> commit backpressure and cancellation semantics
+- crash-before-ledger fault injection with idempotent retry and checkpoint blocking
+- crash-before-findings-durability with empty-store verification
+- multi-item partial-prefix recovery under mid-stream fault
 
 These tests exercise the live local runtime paths for valid filesystem and
 git sources and verify the distributed worker loop (lease construction,
@@ -656,3 +659,5 @@ and coordination-backend observations).
 | Frozen runtime commit vocabulary | `crates/gossip-scanner-runtime/src/commit_model.rs` |
 | Receipt-driven prefix checkpoint aggregation | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` |
 | JSONL parity helpers | `crates/gossip-scanner-runtime/src/parity.rs` |
+| Shared test fixtures | `crates/gossip-scanner-runtime/src/test_fixtures.rs` |
+| Runtime durability integration tests | `crates/gossip-scanner-runtime/src/runtime_durability_tests.rs` |

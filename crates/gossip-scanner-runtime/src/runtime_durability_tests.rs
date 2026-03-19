@@ -3,49 +3,30 @@
 
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
-    identity::{
-        FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
-        StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
-    },
+    identity::{LogicalTime, ObjectVersionId, StableItemId},
     persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus, WriteContext},
 };
 use gossip_persistence_inmemory::{
     InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError, InMemoryStoreKind,
 };
-use scanner_scheduler::store::FsFindingRecord;
 
 use crate::{
     checkpoint_aggregator::{PrefixCheckpointAggregator, ReceiptRecordOutcome},
     commit_model::{CheckpointAggregatorInput, CompletedUnit},
     result_committer::{ResultCommitError, ResultCommitter},
-    result_translation::{ItemResult, PersistenceTranslation, ScanTiming, translate_item_result},
+    result_translation::{ItemResult, PersistenceTranslation, translate_item_result},
+    test_fixtures::{
+        finding, tenant_secret_key, test_rule_fingerprint, timing_with_offset,
+        write_context_with_epoch,
+    },
 };
 
-fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
-    let name = format!("test-rule-{rule_id}");
-    derive_rule_fingerprint(&name)
-}
-
-fn write_context(fence_epoch_raw: u64) -> WriteContext {
-    WriteContext::new(
-        TenantId::from_bytes([0x11; 32]),
-        PolicyHash::from_bytes([0x22; 32]),
-        RunId::from_raw(33),
-        ShardId::from_raw(44),
-        FenceEpoch::from_raw(fence_epoch_raw),
-    )
-}
-
-fn tenant_secret_key() -> TenantSecretKey {
-    TenantSecretKey::from_bytes([0x99; 32])
-}
-
 fn item_key(item_suffix: u8) -> ItemKey {
-    ItemKey::try_from_slice(&[b't', b'/', item_suffix]).expect("item key")
+    ItemKey::try_from_slice(&[b't', b'/', item_suffix]).unwrap()
 }
 
 fn scan_item(item_suffix: u8) -> ScanItem {
-    let item_ref = ItemRef::try_from_vec(vec![b'r', item_suffix]).expect("item ref");
+    let item_ref = ItemRef::try_from_vec(vec![b'r', item_suffix]).unwrap();
     let path = format!("tenant/repo/file-{item_suffix}.txt");
     let url = format!("https://example.invalid/{item_suffix}");
 
@@ -57,30 +38,23 @@ fn scan_item(item_suffix: u8) -> ScanItem {
             [item_suffix.wrapping_add(1); 32],
         )),
     )
-    .with_location(Location::try_new(path, Some(url)).expect("location"))
+    .with_location(Location::try_new(path, Some(url)).unwrap())
 }
 
 fn completed_unit(sequence_no: u64, item_suffix: u8) -> CompletedUnit {
     CompletedUnit::ordered_content(sequence_no, Cursor::with_last_key(item_key(item_suffix)))
 }
 
-fn timing(offset: u64) -> ScanTiming {
-    ScanTiming::new(
-        LogicalTime::from_raw(1_000 + offset),
-        LogicalTime::from_raw(2_000 + offset),
-    )
-}
-
-fn finding(rule_id: u32, span_start: u64, span_end: u64, hash_seed: u8) -> FsFindingRecord {
-    FsFindingRecord {
-        rule_id,
-        root_hint_start: span_start,
-        root_hint_end: span_end,
-        span_start,
-        span_end,
-        norm_hash: [hash_seed; 32],
-        confidence_score: 7,
-    }
+fn assert_sink_counts(sink: &InMemoryFindingsSink, expected: usize) {
+    assert_eq!(sink.findings_snapshot().expect("snapshot").len(), expected);
+    assert_eq!(
+        sink.occurrences_snapshot().expect("snapshot").len(),
+        expected
+    );
+    assert_eq!(
+        sink.observations_snapshot().expect("snapshot").len(),
+        expected
+    );
 }
 
 fn scanned_translation(
@@ -99,13 +73,13 @@ fn scanned_translation(
         &tenant_secret_key(),
         &item,
         128,
-        timing(timing_offset),
+        timing_with_offset(timing_offset),
         ItemResult::Scanned {
             findings: &findings,
         },
         &test_rule_fingerprint,
     )
-    .expect("translation")
+    .expect("translation of scanned item with two findings should succeed")
 }
 
 #[test]
@@ -117,13 +91,13 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
         .expect("fault injection should succeed");
     let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
 
-    let context = write_context(200);
+    let context = write_context_with_epoch(200);
     let unit = completed_unit(0, 0x51);
     let translation = scanned_translation(context, 0x51, 1);
 
     let error = committer
         .commit_translation(context, &unit, &translation)
-        .expect_err("the first attempt should fail after findings durability");
+        .expect_err("done-ledger commit should fail on first attempt (findings already durable)");
 
     match error {
         ResultCommitError::DoneLedgerAdvance(CommitAdvanceError::Wait(
@@ -131,24 +105,7 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
         )) => assert_eq!(store, InMemoryStoreKind::DoneLedger),
         other => panic!("expected injected done-ledger commit failure, got {other:?}"),
     }
-    assert_eq!(
-        findings_sink.findings_snapshot().expect("snapshot").len(),
-        2
-    );
-    assert_eq!(
-        findings_sink
-            .occurrences_snapshot()
-            .expect("snapshot")
-            .len(),
-        2
-    );
-    assert_eq!(
-        findings_sink
-            .observations_snapshot()
-            .expect("snapshot")
-            .len(),
-        2
-    );
+    assert_sink_counts(&findings_sink, 2);
     assert!(
         done_ledger
             .snapshot()
@@ -176,24 +133,16 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
         .commit_translation(context, &unit, &retry_translation)
         .expect("retry with re-derived translation should succeed idempotently");
 
-    assert_eq!(
-        findings_sink.findings_snapshot().expect("snapshot").len(),
-        2
-    );
-    assert_eq!(
-        findings_sink
-            .occurrences_snapshot()
-            .expect("snapshot")
-            .len(),
-        2
-    );
-    assert_eq!(
-        findings_sink
-            .observations_snapshot()
-            .expect("snapshot")
-            .len(),
-        2
-    );
+    // Receipt validates the full commit pipeline executed on retry.
+    assert_eq!(receipt.completed_unit().sequence_no(), 0);
+    assert_eq!(receipt.durable().scope().committed_units().get(), 1);
+    assert_eq!(receipt.durable().findings().finding_count(), 2);
+    assert_eq!(receipt.durable().findings().occurrence_count(), 2);
+    assert_eq!(receipt.durable().findings().observation_count(), 2);
+    assert_eq!(receipt.durable().done_ledger().record_count(), 1);
+    assert_eq!(receipt.durable().done_ledger().findings_count(), 2);
+
+    assert_sink_counts(&findings_sink, 2);
     assert_eq!(
         done_ledger.snapshot().expect("done-ledger snapshot").len(),
         1
@@ -266,5 +215,179 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
             .expect("checkpoint preparation should succeed")
             .is_none(),
         "no pending receipts remain after acknowledgement"
+    );
+}
+
+#[test]
+fn crash_before_findings_durability_leaves_both_stores_empty_and_retry_recovers() {
+    let findings_sink = InMemoryFindingsSink::new();
+    findings_sink
+        .fail_next_commits(1)
+        .expect("fault injection should succeed");
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
+
+    let context = write_context_with_epoch(300);
+    let unit = completed_unit(0, 0x61);
+    let translation = scanned_translation(context, 0x61, 2);
+
+    let error = committer
+        .commit_translation(context, &unit, &translation)
+        .expect_err("findings commit should fail on first attempt (injected fault)");
+
+    match error {
+        ResultCommitError::FindingsWait(InMemoryPersistenceError::InjectedCommitFailure {
+            store,
+        }) => assert_eq!(store, InMemoryStoreKind::Findings),
+        other => panic!("expected injected findings commit failure, got {other:?}"),
+    }
+
+    // Both stores must be empty after a findings-stage crash.
+    assert_sink_counts(&findings_sink, 0);
+    assert!(
+        done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot")
+            .is_empty(),
+        "done-ledger must remain empty when findings never became durable"
+    );
+
+    let mut aggregator = PrefixCheckpointAggregator::new(context, unit.sequence_no(), 4);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "no receipt means no checkpoint progress"
+    );
+
+    // Retry succeeds after the transient fault clears.
+    let retry_translation = scanned_translation(context, 0x61, 2);
+    let receipt = committer
+        .commit_translation(context, &unit, &retry_translation)
+        .expect("retry should succeed after transient findings fault clears");
+
+    assert_eq!(receipt.completed_unit().sequence_no(), 0);
+    assert_eq!(receipt.durable().scope().committed_units().get(), 1);
+    assert_eq!(receipt.durable().findings().finding_count(), 2);
+    assert_eq!(receipt.durable().findings().occurrence_count(), 2);
+    assert_eq!(receipt.durable().findings().observation_count(), 2);
+    assert_eq!(receipt.durable().done_ledger().record_count(), 1);
+    assert_eq!(receipt.durable().done_ledger().findings_count(), 2);
+
+    assert_sink_counts(&findings_sink, 2);
+    assert_eq!(
+        done_ledger.snapshot().expect("done-ledger snapshot").len(),
+        1
+    );
+
+    let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
+        .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(input)
+            .expect("retry receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("one committed receipt should yield one checkpointable prefix");
+    assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x61)),
+    );
+}
+
+#[test]
+fn multi_item_crash_on_second_item_yields_partial_prefix_after_retry() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
+
+    let context = write_context_with_epoch(400);
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 8);
+
+    // Item 1 commits successfully.
+    let unit1 = completed_unit(0, 0x71);
+    let translation1 = scanned_translation(context, 0x71, 3);
+    let receipt1 = committer
+        .commit_translation(context, &unit1, &translation1)
+        .expect("item 1 commit should succeed");
+
+    // Inject done-ledger fault before item 2.
+    done_ledger
+        .fail_next_commits(1)
+        .expect("fault injection should succeed");
+
+    let unit2 = completed_unit(1, 0x72);
+    let translation2 = scanned_translation(context, 0x72, 4);
+    let _error = committer
+        .commit_translation(context, &unit2, &translation2)
+        .expect_err("item 2 done-ledger commit should fail (injected fault)");
+
+    // Feed receipt 1 to the aggregator — partial prefix of 1 item.
+    let input1 = CheckpointAggregatorInput::new(unit1.checkpoint_boundary_kind(), receipt1)
+        .expect("receipt boundary kind should match");
+    assert_eq!(
+        aggregator
+            .record_receipt(input1)
+            .expect("receipt 1 should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let partial = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("one committed receipt should yield a checkpointable prefix");
+    assert_eq!(partial.first_sequence_no(), 0);
+    assert_eq!(partial.last_sequence_no(), 0);
+    assert_eq!(partial.committed_units(), 1);
+    assert_eq!(
+        partial.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x71)),
+    );
+
+    // Acknowledge the partial checkpoint so the aggregator advances.
+    let partial_scope = partial.scope().clone();
+    let _page = aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            partial_scope,
+            LogicalTime::from_raw(10_001),
+        ))
+        .expect("partial acknowledge should succeed");
+    assert_eq!(aggregator.next_sequence_no(), 1);
+
+    // Retry item 2 after the transient fault clears.
+    let retry_translation2 = scanned_translation(context, 0x72, 4);
+    let receipt2 = committer
+        .commit_translation(context, &unit2, &retry_translation2)
+        .expect("item 2 retry should succeed");
+
+    assert_eq!(receipt2.completed_unit().sequence_no(), 1);
+    assert_eq!(receipt2.durable().findings().finding_count(), 2);
+    assert_eq!(receipt2.durable().done_ledger().record_count(), 1);
+
+    let input2 = CheckpointAggregatorInput::new(unit2.checkpoint_boundary_kind(), receipt2)
+        .expect("receipt boundary kind should match");
+    assert_eq!(
+        aggregator
+            .record_receipt(input2)
+            .expect("receipt 2 should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let full = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("second receipt should extend the prefix");
+    assert_eq!(full.first_sequence_no(), 1);
+    assert_eq!(full.last_sequence_no(), 1);
+    assert_eq!(full.committed_units(), 1);
+    assert_eq!(
+        full.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x72)),
     );
 }

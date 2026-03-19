@@ -530,14 +530,10 @@ mod tests {
 
     use gossip_contracts::{
         connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
-        identity::{
-            FenceEpoch, LogicalTime, NormHash, ObjectVersionId, PolicyHash, RuleFingerprint, RunId,
-            ShardId, StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
-            key_secret_hash,
-        },
+        identity::{LogicalTime, NormHash, ObjectVersionId, RunId, StableItemId, key_secret_hash},
         persistence::{
             DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-            DoneLedgerStatus, FindingRecord, ObservationRecord, OccurrenceRecord, WriteContext,
+            FindingRecord, ObservationRecord, OccurrenceRecord,
         },
     };
     use gossip_persistence_inmemory::{
@@ -549,27 +545,9 @@ mod tests {
     use super::*;
     use crate::{
         commit_model::CompletedUnit,
-        result_translation::{ItemResult, ScanTiming, translate_item_result},
+        result_translation::{ItemResult, translate_item_result},
+        test_fixtures::{finding, tenant_secret_key, test_rule_fingerprint, timing, write_context},
     };
-
-    fn write_context() -> WriteContext {
-        WriteContext::new(
-            TenantId::from_bytes([0x11; 32]),
-            PolicyHash::from_bytes([0x22; 32]),
-            RunId::from_raw(33),
-            ShardId::from_raw(44),
-            FenceEpoch::from_raw(55),
-        )
-    }
-
-    fn tenant_secret_key() -> TenantSecretKey {
-        TenantSecretKey::from_bytes([0x99; 32])
-    }
-
-    fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
-        let name = format!("test-rule-{rule_id}");
-        derive_rule_fingerprint(&name)
-    }
 
     fn scan_item() -> ScanItem {
         ScanItem::new(
@@ -585,22 +563,6 @@ mod tests {
             )
             .expect("location"),
         )
-    }
-
-    fn timing() -> ScanTiming {
-        ScanTiming::new(LogicalTime::from_raw(1_000), LogicalTime::from_raw(2_000))
-    }
-
-    fn finding(rule_id: u32, span_start: u64, span_end: u64, hash_seed: u8) -> FsFindingRecord {
-        FsFindingRecord {
-            rule_id,
-            root_hint_start: span_start,
-            root_hint_end: span_end,
-            span_start,
-            span_end,
-            norm_hash: [hash_seed; 32],
-            confidence_score: 7,
-        }
     }
 
     fn completed_unit(sequence_no: u64) -> CompletedUnit {

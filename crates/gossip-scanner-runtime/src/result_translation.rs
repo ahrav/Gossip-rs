@@ -460,11 +460,8 @@ fn translate_findings(
 mod tests {
     use gossip_contracts::{
         connector::{ItemKey, ItemRef, Location, ScanItem, VersionId},
-        identity::{
-            FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
-            StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
-        },
-        persistence::{DoneLedgerErrorCode, DoneLedgerStatus, WriteContext},
+        identity::{LogicalTime, ObjectVersionId, StableItemId},
+        persistence::{DoneLedgerErrorCode, DoneLedgerStatus},
     };
     use scanner_scheduler::store::FsFindingRecord;
 
@@ -472,29 +469,9 @@ mod tests {
         ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
         translate_item_result,
     };
-
-    /// Test-only rule fingerprint lookup that derives from a synthetic name.
-    ///
-    /// Uses `"test-rule-{rule_id}"` so that different rule IDs produce
-    /// different stable fingerprints within tests.
-    fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
-        let name = format!("test-rule-{rule_id}");
-        derive_rule_fingerprint(&name)
-    }
-
-    fn write_context() -> WriteContext {
-        WriteContext::new(
-            TenantId::from_bytes([0x11; 32]),
-            PolicyHash::from_bytes([0x22; 32]),
-            RunId::from_raw(33),
-            ShardId::from_raw(44),
-            FenceEpoch::from_raw(55),
-        )
-    }
-
-    fn tenant_secret_key() -> TenantSecretKey {
-        TenantSecretKey::from_bytes([0x99; 32])
-    }
+    use crate::test_fixtures::{
+        finding, tenant_secret_key, test_rule_fingerprint, timing, write_context,
+    };
 
     fn scan_item_with_version(version: VersionId) -> ScanItem {
         ScanItem::new(
@@ -523,22 +500,6 @@ mod tests {
             StableItemId::from_bytes([0x33; 32]),
             VersionId::Strong(ObjectVersionId::from_bytes([0x44; 32])),
         )
-    }
-
-    fn timing() -> ScanTiming {
-        ScanTiming::new(LogicalTime::from_raw(1_000), LogicalTime::from_raw(2_000))
-    }
-
-    fn finding(rule_id: u32, span_start: u64, span_end: u64, hash_seed: u8) -> FsFindingRecord {
-        FsFindingRecord {
-            rule_id,
-            root_hint_start: span_start,
-            root_hint_end: span_end,
-            span_start,
-            span_end,
-            norm_hash: [hash_seed; 32],
-            confidence_score: 7,
-        }
     }
 
     fn translate_scanned(findings: &[FsFindingRecord]) -> PersistenceTranslation {

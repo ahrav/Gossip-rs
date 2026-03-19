@@ -687,43 +687,23 @@ mod tests {
 
     use gossip_contracts::{
         connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
-        identity::{
-            FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
-            StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
-        },
-        persistence::{CommitAdvanceError, DoneLedgerErrorCode, WriteContext},
+        identity::{ObjectVersionId, StableItemId},
+        persistence::{CommitAdvanceError, DoneLedgerErrorCode},
     };
     use gossip_persistence_inmemory::{
         CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
         InMemoryStoreKind,
     };
-    use scanner_scheduler::store::FsFindingRecord;
 
     use super::*;
     use crate::{
         commit_model::CompletedUnit,
         result_committer::ResultCommitError,
-        result_translation::{ItemResult, ScanTiming, translate_item_result},
+        result_translation::{ItemResult, translate_item_result},
+        test_fixtures::{
+            finding, tenant_secret_key, test_rule_fingerprint, timing_with_offset, write_context,
+        },
     };
-
-    fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
-        let name = format!("test-rule-{rule_id}");
-        derive_rule_fingerprint(&name)
-    }
-
-    fn write_context() -> WriteContext {
-        WriteContext::new(
-            TenantId::from_bytes([0x11; 32]),
-            PolicyHash::from_bytes([0x22; 32]),
-            RunId::from_raw(33),
-            ShardId::from_raw(44),
-            FenceEpoch::from_raw(55),
-        )
-    }
-
-    fn tenant_secret_key() -> TenantSecretKey {
-        TenantSecretKey::from_bytes([0x99; 32])
-    }
 
     fn scan_item(item_suffix: u8) -> ScanItem {
         let item_key =
@@ -742,25 +722,6 @@ mod tests {
             )),
         )
         .with_location(Location::try_new(path, Some(url)).expect("location"))
-    }
-
-    fn timing(offset: u64) -> ScanTiming {
-        ScanTiming::new(
-            LogicalTime::from_raw(1_000 + offset),
-            LogicalTime::from_raw(2_000 + offset),
-        )
-    }
-
-    fn finding(rule_id: u32, span_start: u64, span_end: u64, hash_seed: u8) -> FsFindingRecord {
-        FsFindingRecord {
-            rule_id,
-            root_hint_start: span_start,
-            root_hint_end: span_end,
-            span_start,
-            span_end,
-            norm_hash: [hash_seed; 32],
-            confidence_score: 7,
-        }
     }
 
     fn completed_unit(sequence_no: u64, item_suffix: u8) -> CompletedUnit {
@@ -784,7 +745,7 @@ mod tests {
             &tenant_secret_key(),
             &item,
             128,
-            timing(u64::from(item_suffix)),
+            timing_with_offset(u64::from(item_suffix)),
             ItemResult::Scanned {
                 findings: &findings,
             },
@@ -800,7 +761,7 @@ mod tests {
             &tenant_secret_key(),
             &item,
             64,
-            timing(u64::from(item_suffix)),
+            timing_with_offset(u64::from(item_suffix)),
             ItemResult::FailedRetryable {
                 error_code: DoneLedgerErrorCode::try_new("OPEN_FAILED").expect("error code"),
             },
