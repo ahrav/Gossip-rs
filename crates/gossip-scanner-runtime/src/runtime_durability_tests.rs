@@ -445,6 +445,13 @@ fn pending_prefix_does_not_widen_until_the_previous_checkpoint_is_acked() {
     assert_eq!(aggregator.next_sequence_no(), 3);
     assert_eq!(aggregator.checkpointed_units(), 3);
     assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "no receipts remain; the aggregator should be fully drained"
+    );
 }
 
 #[test]
