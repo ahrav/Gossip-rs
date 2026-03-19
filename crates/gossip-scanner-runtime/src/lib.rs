@@ -1676,5 +1676,11 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
 }
 
 #[cfg(test)]
+mod test_fixtures;
+
+#[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod runtime_durability_tests;
