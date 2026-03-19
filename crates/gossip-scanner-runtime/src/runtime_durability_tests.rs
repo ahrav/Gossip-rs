@@ -70,6 +70,21 @@ fn assert_sink_counts(sink: &InMemoryFindingsSink, expected: usize) {
     );
 }
 
+fn assert_single_done_row(
+    done_ledger: &InMemoryDoneLedger,
+    expected_status: DoneLedgerStatus,
+    expected_findings_count: u32,
+) {
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(rows.len(), 1, "done-ledger should contain exactly one row");
+    let row = rows
+        .into_iter()
+        .next()
+        .expect("exactly one done-ledger record");
+    assert_eq!(row.status(), expected_status);
+    assert_eq!(row.findings_count(), expected_findings_count);
+}
+
 fn scanned_translation_with(
     write_context: WriteContext,
     item_suffix: u8,
@@ -129,22 +144,7 @@ fn no_checkpoint_without_receipt_even_when_done_ledger_is_durable() {
 
     // Preconditions: both stores are durable.
     assert_sink_counts(&findings_sink, 2);
-    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
-    assert_eq!(rows.len(), 1, "done-ledger row should already be durable");
-    let done_record = rows
-        .into_iter()
-        .next()
-        .expect("exactly one done-ledger record");
-    assert_eq!(
-        done_record.status(),
-        DoneLedgerStatus::ScannedWithFindings,
-        "done-ledger status must reflect the two committed findings"
-    );
-    assert_eq!(
-        done_record.findings_count(),
-        2,
-        "done-ledger findings_count must match committed findings"
-    );
+    assert_single_done_row(&done_ledger, DoneLedgerStatus::ScannedWithFindings, 2);
 
     // Negative path: without recording the receipt, no checkpoint.
     let mut aggregator = PrefixCheckpointAggregator::new(context, unit.sequence_no(), 4);
@@ -200,7 +200,7 @@ fn no_checkpoint_without_receipt_even_when_done_ledger_is_durable() {
 }
 
 #[test]
-fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
+fn clean_scan_with_zero_findings_is_receipt_gated_normally() {
     let findings_sink = InMemoryFindingsSink::new();
     let done_ledger = InMemoryDoneLedger::new();
     let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
@@ -215,22 +215,7 @@ fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
 
     // Preconditions: findings sink is empty, done-ledger has one clean row.
     assert_sink_counts(&findings_sink, 0);
-    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
-    assert_eq!(rows.len(), 1, "done-ledger should contain exactly one row");
-    let done_record = rows
-        .into_iter()
-        .next()
-        .expect("exactly one done-ledger record");
-    assert_eq!(
-        done_record.status(),
-        DoneLedgerStatus::ScannedClean,
-        "done-ledger status must be ScannedClean for zero findings"
-    );
-    assert_eq!(
-        done_record.findings_count(),
-        0,
-        "done-ledger findings_count must be zero for a clean scan"
-    );
+    assert_single_done_row(&done_ledger, DoneLedgerStatus::ScannedClean, 0);
 
     // Receipt reflects the zero-findings commit.
     assert_eq!(receipt.durable().findings().finding_count(), 0);
@@ -625,26 +610,7 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
     assert_eq!(receipt.durable().done_ledger().findings_count(), 2);
 
     assert_sink_counts(&findings_sink, 2);
-    assert_eq!(
-        done_ledger.snapshot().expect("done-ledger snapshot").len(),
-        1
-    );
-    let done_record = done_ledger
-        .snapshot()
-        .expect("done-ledger snapshot")
-        .into_iter()
-        .next()
-        .expect("exactly one done-ledger record");
-    assert_eq!(
-        done_record.status(),
-        DoneLedgerStatus::ScannedWithFindings,
-        "done-ledger status must reflect the two committed findings"
-    );
-    assert_eq!(
-        done_record.findings_count(),
-        2,
-        "done-ledger findings_count must match committed findings"
-    );
+    assert_single_done_row(&done_ledger, DoneLedgerStatus::ScannedWithFindings, 2);
 
     let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
         .expect("receipt boundary kind should match the shard stream");
