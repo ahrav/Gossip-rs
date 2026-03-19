@@ -839,16 +839,28 @@ fn stale_fence_receipts_are_rejected_and_leave_no_side_effect() {
     );
 
     let pending_scope = pending.scope().clone();
-    let _page_receipt = aggregator
+    let page_receipt = aggregator
         .acknowledge_checkpoint(CheckpointCommitReceipt::new(
             pending_scope,
             LogicalTime::from_raw(9_301),
         ))
         .expect("acknowledging the current-epoch checkpoint should succeed");
+    assert_eq!(
+        page_receipt.checkpoint().checkpointed_at(),
+        LogicalTime::from_raw(9_301),
+        "page receipt must echo the committed logical time"
+    );
 
     assert_eq!(aggregator.next_sequence_no(), 8);
     assert_eq!(aggregator.checkpointed_units(), 1);
     assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed after acknowledgement")
+            .is_none(),
+        "no pending receipts should remain after acknowledging the stale-fence checkpoint"
+    );
 }
 
 #[test]
@@ -859,6 +871,9 @@ fn stale_fence_with_same_run_id_but_different_epoch_is_rejected() {
 
     let stale_context = write_context_with_epoch(300);
     let current_context = write_context_with_epoch(301);
+    // Precondition: both contexts share tenant/policy/run/shard — only the
+    // epoch differs. These guards document that intent so the test remains
+    // valid if the fixture is ever parameterized further.
     assert_eq!(stale_context.tenant_id(), current_context.tenant_id());
     assert_eq!(stale_context.policy_hash(), current_context.policy_hash());
     assert_eq!(stale_context.run_id(), current_context.run_id());
@@ -891,6 +906,11 @@ fn stale_fence_with_same_run_id_but_different_epoch_is_rejected() {
     );
     assert_eq!(aggregator.buffered_receipt_count(), 0);
     assert_eq!(aggregator.checkpointed_units(), 0);
+    assert_eq!(
+        aggregator.next_sequence_no(),
+        11,
+        "stale rejection must not advance the sequence counter"
+    );
     assert!(
         aggregator
             .prepare_checkpoint()
@@ -898,6 +918,27 @@ fn stale_fence_with_same_run_id_but_different_epoch_is_rejected() {
             .is_none(),
         "rejecting the stale receipt must not create checkpointable progress"
     );
+
+    // Verify the aggregator is still healthy: a current-epoch receipt buffers
+    // normally after rejecting the stale one.
+    let current_receipt = committer
+        .commit_translation(
+            current_context,
+            &unit,
+            &scanned_translation(current_context, 0x74, 41),
+        )
+        .expect("current-epoch commit should succeed");
+    let current_input =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), current_receipt)
+            .expect("current receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(current_input)
+            .expect("current-epoch receipt should buffer after stale rejection"),
+        ReceiptRecordOutcome::Buffered,
+    );
+    assert_eq!(aggregator.next_sequence_no(), 11);
+    assert_eq!(aggregator.buffered_receipt_count(), 1);
 }
 
 #[test]
