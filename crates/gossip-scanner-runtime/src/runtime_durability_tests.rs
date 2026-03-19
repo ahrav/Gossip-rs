@@ -7,7 +7,7 @@ use gossip_contracts::{
         FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
         StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
     },
-    persistence::{CommitAdvanceError, WriteContext},
+    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus, WriteContext},
 };
 use gossip_persistence_inmemory::{
     InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError, InMemoryStoreKind,
@@ -167,9 +167,14 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
     );
     assert_eq!(aggregator.buffered_receipt_count(), 0);
 
+    // Re-derive translation from identical inputs rather than reusing the same
+    // object. This implicitly asserts that `translate_item_result` is
+    // deterministic: same scan outputs produce byte-identical persistence
+    // batches, so the retry succeeds via upsert idempotency.
+    let retry_translation = scanned_translation(context, 0x51, 1);
     let receipt = committer
-        .commit_translation(context, &unit, &translation)
-        .expect("retry should succeed idempotently");
+        .commit_translation(context, &unit, &retry_translation)
+        .expect("retry with re-derived translation should succeed idempotently");
 
     assert_eq!(
         findings_sink.findings_snapshot().expect("snapshot").len(),
@@ -193,6 +198,22 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
         done_ledger.snapshot().expect("done-ledger snapshot").len(),
         1
     );
+    let done_record = done_ledger
+        .snapshot()
+        .expect("done-ledger snapshot")
+        .into_iter()
+        .next()
+        .expect("exactly one done-ledger record");
+    assert_eq!(
+        done_record.status(),
+        DoneLedgerStatus::ScannedWithFindings,
+        "done-ledger status must reflect the two committed findings"
+    );
+    assert_eq!(
+        done_record.findings_count(),
+        2,
+        "done-ledger findings_count must match committed findings"
+    );
 
     let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
         .expect("receipt boundary kind should match the shard stream");
@@ -210,4 +231,40 @@ fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_saf
     assert_eq!(pending.first_sequence_no(), 0);
     assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x51)),
+        "checkpoint cursor must point to the committed item key"
+    );
+
+    // Extract scope before mutable borrow for acknowledge_checkpoint.
+    let checkpoint_scope = pending.scope().clone();
+
+    // Acknowledge the prepared checkpoint, completing the recovery cycle.
+    // After acknowledgement the aggregator advances past the committed unit
+    // and is ready for the next shard assignment.
+    let _page_receipt = aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            checkpoint_scope,
+            LogicalTime::from_raw(9999),
+        ))
+        .expect("acknowledge should finalize the prepared prefix");
+
+    assert_eq!(
+        aggregator.next_sequence_no(),
+        1,
+        "next_sequence_no must advance from 0 to 1 after acknowledgement"
+    );
+    assert_eq!(
+        aggregator.buffered_receipt_count(),
+        0,
+        "all buffered receipts must drain after acknowledgement"
+    );
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "no pending receipts remain after acknowledgement"
+    );
 }
