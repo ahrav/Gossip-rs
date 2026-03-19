@@ -28,7 +28,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::spill_path::{reserve_unique_spill_file, SpillPathKind};
+use crate::spill_path::{map_spill_file, reserve_unique_spill_file, SpillPathKind};
 use memmap2::{Mmap, MmapMut};
 
 #[cfg(target_os = "linux")]
@@ -142,17 +142,7 @@ impl SpillArena {
     /// deleted by this type; callers should clean up the directory if needed.
     pub fn new(dir: &Path, capacity: u64) -> Result<Self, SpillArenaError> {
         let (path, file) = reserve_unique_spill_file(dir, SpillPathKind::Tree, capacity)?;
-
-        // SAFETY: The file length is set once at creation (`set_len`) and
-        // never resized. Only this arena writes to the file (through
-        // `writer`), and the write cursor advances monotonically without
-        // re-visiting earlier regions. No external process modifies the
-        // file during the scan lifetime.
-        let writer = unsafe { MmapMut::map_mut(&file)? };
-        // SAFETY: Same fixed-length file. The read mapping is immutable
-        // and only observes bytes previously written through `writer`.
-        // Kernel page-cache coherence ensures visibility of prior writes.
-        let reader = Arc::new(unsafe { Mmap::map(&file)? });
+        let (writer, reader) = map_spill_file(&file)?;
 
         advise_sequential(&file, &reader);
 

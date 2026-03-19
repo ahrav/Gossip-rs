@@ -202,7 +202,7 @@ for tree payloads that exceed the in-memory cache. Key properties:
 - **Sequential access hints**: on Linux, `posix_fadvise(SEQUENTIAL)` and
    `madvise(SEQUENTIAL)` are issued (`spill_arena.rs`).
 - **Unique file naming**: PID + timestamp + monotonic counter
-   (`SPILL_COUNTER`, `spill_arena.rs`) prevent collisions during parallel
+   (`GLOBAL_SPILL_COUNTER`, `spill_path.rs`) prevent collisions during parallel
   blob introduction.
 
 ### SpillIndex

@@ -9,7 +9,10 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use memmap2::{Mmap, MmapMut};
 
 /// Spill-file families supported by the scanner-git spill helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,20 +79,34 @@ pub(crate) fn reserve_unique_spill_file(
     ))
 }
 
+/// Creates paired writable and shared read-only mappings for a spill file.
+///
+/// Spill helpers reserve files at their final length before calling this
+/// helper, so the returned mappings never observe a resize. Callers keep the
+/// mutable mapping private to the owning writer while cloning the read-only
+/// `Arc<Mmap>` into handles that borrow spill bytes.
+pub(crate) fn map_spill_file(file: &File) -> io::Result<(MmapMut, Arc<Mmap>)> {
+    // SAFETY: Spill helpers reserve the file at its final length before
+    // mapping it, and only the owning helper writes through the mutable map.
+    let writer = unsafe { MmapMut::map_mut(file)? };
+    // SAFETY: The read-only mapping targets the same fixed-length file and
+    // observes bytes written through the paired mutable mapping.
+    let reader = Arc::new(unsafe { Mmap::map(file)? });
+    Ok((writer, reader))
+}
+
 fn next_spill_path_candidate(dir: &Path, kind: SpillPathKind) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let counter = GLOBAL_SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut path = dir.to_path_buf();
-    path.push(format!(
+    dir.join(format!(
         "{}_{}_{}_{}",
         kind.prefix(),
         std::process::id(),
         now.as_nanos(),
         counter
-    ));
-    path
+    ))
 }
 
 #[cfg(test)]
