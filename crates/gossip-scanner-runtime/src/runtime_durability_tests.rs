@@ -170,6 +170,24 @@ fn no_checkpoint_without_receipt_even_when_done_ledger_is_durable() {
         &Cursor::with_last_key(item_key(0x41)),
         "checkpoint cursor must point to the committed item key"
     );
+
+    let checkpoint_scope = pending.scope().clone();
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            checkpoint_scope,
+            LogicalTime::from_raw(9_001),
+        ))
+        .expect("acknowledging the receipt-gated checkpoint should succeed");
+    assert_eq!(aggregator.next_sequence_no(), 1);
+    assert_eq!(aggregator.checkpointed_units(), 1);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "no pending receipts should remain after acknowledging the single-unit checkpoint"
+    );
 }
 
 #[test]
@@ -249,6 +267,24 @@ fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
         &Cursor::with_last_key(item_key(0x81)),
         "checkpoint cursor must point to the clean-scan item key"
     );
+
+    let checkpoint_scope = pending.scope().clone();
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            checkpoint_scope,
+            LogicalTime::from_raw(9_501),
+        ))
+        .expect("acknowledging the clean-scan checkpoint should succeed");
+    assert_eq!(aggregator.next_sequence_no(), 1);
+    assert_eq!(aggregator.checkpointed_units(), 1);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "no pending receipts should remain after acknowledging the clean-scan checkpoint"
+    );
 }
 
 #[test]
@@ -278,7 +314,7 @@ fn real_receipts_only_advance_the_contiguous_prefix() {
         "each committed item should produce one done-ledger row"
     );
 
-    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
+    let mut aggregator = PrefixCheckpointAggregator::new(context, unit_zero.sequence_no(), 4);
     let receipt_one_input =
         CheckpointAggregatorInput::new(unit_one.checkpoint_boundary_kind(), receipt_one)
             .expect("receipt boundary kind should match the shard stream");
@@ -297,6 +333,11 @@ fn real_receipts_only_advance_the_contiguous_prefix() {
     );
     assert_eq!(aggregator.next_sequence_no(), 0);
     assert_eq!(aggregator.checkpointed_units(), 0);
+    assert_eq!(
+        aggregator.buffered_receipt_count(),
+        1,
+        "out-of-order receipt must be buffered, not silently dropped"
+    );
 
     let receipt_zero_input =
         CheckpointAggregatorInput::new(unit_zero.checkpoint_boundary_kind(), receipt_zero)
@@ -695,6 +736,204 @@ fn crash_after_ledger_before_checkpoint_allows_reassignment_retry_and_rejects_st
             .is_none(),
         "no pending receipts should remain after acknowledging the recovered checkpoint"
     );
+}
+
+#[test]
+fn stale_fence_receipts_are_rejected_and_leave_no_side_effect() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink, done_ledger);
+
+    let stale_context_100 = write_context_with_epoch(100);
+    let stale_context_200 = write_context_with_epoch(200);
+    let current_context_300 = write_context_with_epoch(300);
+    let unit = completed_unit(7, 0x73);
+
+    let stale_receipt_100 = committer
+        .commit_translation(
+            stale_context_100,
+            &unit,
+            &scanned_translation(stale_context_100, 0x73, 10),
+        )
+        .expect("epoch-100 commit should succeed");
+    let stale_receipt_200 = committer
+        .commit_translation(
+            stale_context_200,
+            &unit,
+            &scanned_translation(stale_context_200, 0x73, 20),
+        )
+        .expect("epoch-200 commit should succeed");
+    let current_receipt_300 = committer
+        .commit_translation(
+            current_context_300,
+            &unit,
+            &scanned_translation(current_context_300, 0x73, 30),
+        )
+        .expect("epoch-300 commit should succeed");
+
+    let mut aggregator = PrefixCheckpointAggregator::new(current_context_300, 7, 4);
+
+    for (label, stale_context, stale_receipt) in [
+        ("epoch-100", stale_context_100, stale_receipt_100),
+        ("epoch-200", stale_context_200, stale_receipt_200),
+    ] {
+        let stale_input =
+            CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt)
+                .expect("stale receipt boundary kind should match the shard stream");
+        let stale_error = aggregator
+            .record_receipt(stale_input)
+            .expect_err("stale receipt must be rejected");
+        assert_eq!(
+            stale_error,
+            PrefixCheckpointError::OwnershipMismatch {
+                sequence_no: 7,
+                expected: Box::new(current_context_300),
+                actual: Box::new(stale_context),
+            }
+        );
+        assert_eq!(
+            aggregator.buffered_receipt_count(),
+            0,
+            "{label}: buffer side effect"
+        );
+        assert_eq!(
+            aggregator.checkpointed_units(),
+            0,
+            "{label}: checkpointed side effect"
+        );
+        assert!(
+            aggregator
+                .prepare_checkpoint()
+                .expect("checkpoint preparation should succeed after stale rejection")
+                .is_none(),
+            "{label}: rejection must not leave behind a checkpointable prefix"
+        );
+    }
+
+    let current_input_300 =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), current_receipt_300)
+            .expect("epoch-300 receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(current_input_300)
+            .expect("current receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+    assert_eq!(aggregator.buffered_receipt_count(), 1);
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("current receipt should establish a checkpointable prefix");
+    assert_eq!(pending.first_sequence_no(), 7);
+    assert_eq!(pending.last_sequence_no(), 7);
+    assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x73)),
+    );
+
+    let pending_scope = pending.scope().clone();
+    let page_receipt = aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            pending_scope,
+            LogicalTime::from_raw(9_301),
+        ))
+        .expect("acknowledging the current-epoch checkpoint should succeed");
+    assert_eq!(
+        page_receipt.checkpoint().checkpointed_at(),
+        LogicalTime::from_raw(9_301),
+        "page receipt must echo the committed logical time"
+    );
+
+    assert_eq!(aggregator.next_sequence_no(), 8);
+    assert_eq!(aggregator.checkpointed_units(), 1);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed after acknowledgement")
+            .is_none(),
+        "no pending receipts should remain after acknowledging the stale-fence checkpoint"
+    );
+}
+
+#[test]
+fn stale_fence_with_same_run_id_but_different_epoch_is_rejected() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink, done_ledger);
+
+    let stale_context = write_context_with_epoch(300);
+    let current_context = write_context_with_epoch(301);
+    // Precondition: both contexts share tenant/policy/run/shard — only the
+    // epoch differs. These guards document that intent so the test remains
+    // valid if the fixture is ever parameterized further.
+    assert_eq!(stale_context.tenant_id(), current_context.tenant_id());
+    assert_eq!(stale_context.policy_hash(), current_context.policy_hash());
+    assert_eq!(stale_context.run_id(), current_context.run_id());
+    assert_eq!(stale_context.shard_id(), current_context.shard_id());
+    assert_ne!(stale_context.fence_epoch(), current_context.fence_epoch());
+
+    let unit = completed_unit(11, 0x74);
+    let stale_receipt = committer
+        .commit_translation(
+            stale_context,
+            &unit,
+            &scanned_translation(stale_context, 0x74, 40),
+        )
+        .expect("stale commit should succeed");
+
+    let mut aggregator = PrefixCheckpointAggregator::new(current_context, 11, 4);
+    let stale_input =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt)
+            .expect("stale receipt boundary kind should match the shard stream");
+    let stale_error = aggregator
+        .record_receipt(stale_input)
+        .expect_err("different fence epoch must be rejected even when run and shard match");
+    assert_eq!(
+        stale_error,
+        PrefixCheckpointError::OwnershipMismatch {
+            sequence_no: 11,
+            expected: Box::new(current_context),
+            actual: Box::new(stale_context),
+        }
+    );
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert_eq!(aggregator.checkpointed_units(), 0);
+    assert_eq!(
+        aggregator.next_sequence_no(),
+        11,
+        "stale rejection must not advance the sequence counter"
+    );
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed after epoch mismatch")
+            .is_none(),
+        "rejecting the stale receipt must not create checkpointable progress"
+    );
+
+    // Verify the aggregator is still healthy: a current-epoch receipt buffers
+    // normally after rejecting the stale one.
+    let current_receipt = committer
+        .commit_translation(
+            current_context,
+            &unit,
+            &scanned_translation(current_context, 0x74, 41),
+        )
+        .expect("current-epoch commit should succeed");
+    let current_input =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), current_receipt)
+            .expect("current receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(current_input)
+            .expect("current-epoch receipt should buffer after stale rejection"),
+        ReceiptRecordOutcome::Buffered,
+    );
+    assert_eq!(aggregator.next_sequence_no(), 11);
+    assert_eq!(aggregator.buffered_receipt_count(), 1);
 }
 
 #[test]
