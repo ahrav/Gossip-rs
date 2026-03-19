@@ -877,46 +877,42 @@ fn stale_fence_receipts_are_rejected_and_leave_no_side_effect() {
 
     let mut aggregator = PrefixCheckpointAggregator::new(current_context_300, 7, 4);
 
-    let assert_stale_rejected = |aggregator: &mut PrefixCheckpointAggregator,
-                                 stale_ctx: WriteContext,
-                                 receipt: UnitCommitReceipt,
-                                 label: &str| {
-        let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
-            .unwrap_or_else(|_| panic!("{label} receipt boundary kind should match"));
-        let err = aggregator
-            .record_receipt(input)
-            .expect_err(&format!("{label} stale receipt must be rejected"));
+    for (label, stale_context, stale_receipt) in [
+        ("epoch-100", stale_context_100, stale_receipt_100),
+        ("epoch-200", stale_context_200, stale_receipt_200),
+    ] {
+        let stale_input =
+            CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt)
+                .expect("stale receipt boundary kind should match the shard stream");
+        let stale_error = aggregator
+            .record_receipt(stale_input)
+            .expect_err("stale receipt must be rejected");
         assert_eq!(
-            err,
+            stale_error,
             PrefixCheckpointError::OwnershipMismatch {
                 sequence_no: 7,
                 expected: Box::new(current_context_300),
-                actual: Box::new(stale_ctx),
+                actual: Box::new(stale_context),
             }
         );
-        assert_eq!(aggregator.buffered_receipt_count(), 0);
-        assert_eq!(aggregator.checkpointed_units(), 0);
+        assert_eq!(
+            aggregator.buffered_receipt_count(),
+            0,
+            "{label}: buffer side effect"
+        );
+        assert_eq!(
+            aggregator.checkpointed_units(),
+            0,
+            "{label}: checkpointed side effect"
+        );
         assert!(
             aggregator
                 .prepare_checkpoint()
-                .expect("checkpoint preparation should succeed after rejection")
+                .expect("checkpoint preparation should succeed after stale rejection")
                 .is_none(),
-            "{label} rejection must not leave behind a checkpointable prefix"
+            "{label}: rejection must not leave behind a checkpointable prefix"
         );
-    };
-
-    assert_stale_rejected(
-        &mut aggregator,
-        stale_context_100,
-        stale_receipt_100,
-        "epoch-100",
-    );
-    assert_stale_rejected(
-        &mut aggregator,
-        stale_context_200,
-        stale_receipt_200,
-        "epoch-200",
-    );
+    }
 
     let current_input_300 =
         CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), current_receipt_300)
@@ -942,16 +938,28 @@ fn stale_fence_receipts_are_rejected_and_leave_no_side_effect() {
     );
 
     let pending_scope = pending.scope().clone();
-    let _page_receipt = aggregator
+    let page_receipt = aggregator
         .acknowledge_checkpoint(CheckpointCommitReceipt::new(
             pending_scope,
             LogicalTime::from_raw(9_301),
         ))
         .expect("acknowledging the current-epoch checkpoint should succeed");
+    assert_eq!(
+        page_receipt.checkpoint().checkpointed_at(),
+        LogicalTime::from_raw(9_301),
+        "page receipt must echo the committed logical time"
+    );
 
     assert_eq!(aggregator.next_sequence_no(), 8);
     assert_eq!(aggregator.checkpointed_units(), 1);
     assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed after acknowledgement")
+            .is_none(),
+        "no pending receipts should remain after acknowledging the stale-fence checkpoint"
+    );
 }
 
 #[test]
@@ -962,6 +970,9 @@ fn stale_fence_with_same_run_id_but_different_epoch_is_rejected() {
 
     let stale_context = write_context_with_epoch(300);
     let current_context = write_context_with_epoch(301);
+    // Precondition: both contexts share tenant/policy/run/shard — only the
+    // epoch differs. These guards document that intent so the test remains
+    // valid if the fixture is ever parameterized further.
     assert_eq!(stale_context.tenant_id(), current_context.tenant_id());
     assert_eq!(stale_context.policy_hash(), current_context.policy_hash());
     assert_eq!(stale_context.run_id(), current_context.run_id());
@@ -994,6 +1005,11 @@ fn stale_fence_with_same_run_id_but_different_epoch_is_rejected() {
     );
     assert_eq!(aggregator.buffered_receipt_count(), 0);
     assert_eq!(aggregator.checkpointed_units(), 0);
+    assert_eq!(
+        aggregator.next_sequence_no(),
+        11,
+        "stale rejection must not advance the sequence counter"
+    );
     assert!(
         aggregator
             .prepare_checkpoint()
