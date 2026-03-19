@@ -285,7 +285,7 @@ fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
 fn real_receipts_only_advance_the_contiguous_prefix() {
     let findings_sink = InMemoryFindingsSink::new();
     let done_ledger = InMemoryDoneLedger::new();
-    let committer = ResultCommitter::new(findings_sink, done_ledger);
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
 
     let context = write_context_with_epoch(300);
     let unit_zero = completed_unit(0, 0x61);
@@ -299,6 +299,14 @@ fn real_receipts_only_advance_the_contiguous_prefix() {
     let receipt_zero = committer
         .commit_translation(context, &unit_zero, &translation_zero)
         .expect("sequence 0 should commit");
+
+    // Both commits wrote durable data: 2 findings per item, 1 done-ledger row per item.
+    assert_sink_counts(&findings_sink, 4);
+    assert_eq!(
+        done_ledger.snapshot().expect("done-ledger snapshot").len(),
+        2,
+        "each committed item should produce one done-ledger row"
+    );
 
     let mut aggregator = PrefixCheckpointAggregator::new(context, unit_zero.sequence_no(), 4);
     let receipt_one_input =
@@ -344,7 +352,7 @@ fn real_receipts_only_advance_the_contiguous_prefix() {
     assert_eq!(
         pending.checkpoint_cursor(),
         &Cursor::with_last_key(item_key(0x62)),
-        "checkpoint cursor must point to the last item in the contiguous prefix"
+        "checkpoint cursor must reflect the last item in the contiguous prefix"
     );
 
     let checkpoint_scope = pending.scope().clone();
@@ -358,13 +366,17 @@ fn real_receipts_only_advance_the_contiguous_prefix() {
 
     assert_eq!(aggregator.next_sequence_no(), 2);
     assert_eq!(aggregator.checkpointed_units(), 2);
-    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert_eq!(
+        aggregator.buffered_receipt_count(),
+        0,
+        "buffer must drain after acknowledging the full prefix"
+    );
     assert!(
         aggregator
             .prepare_checkpoint()
-            .expect("checkpoint preparation should succeed")
+            .expect("checkpoint preparation should succeed after acknowledgement")
             .is_none(),
-        "no pending receipts should remain after acknowledging the two-unit prefix"
+        "no pending receipts should remain after acknowledging the full prefix"
     );
 }
 
