@@ -11,7 +11,9 @@ use gossip_persistence_inmemory::{
 };
 
 use crate::{
-    checkpoint_aggregator::{PrefixCheckpointAggregator, ReceiptRecordOutcome},
+    checkpoint_aggregator::{
+        PrefixCheckpointAggregator, PrefixCheckpointError, ReceiptRecordOutcome,
+    },
     commit_model::{CheckpointAggregatorInput, CompletedUnit},
     result_committer::{ResultCommitError, ResultCommitter},
     result_translation::{ItemResult, PersistenceTranslation, translate_item_result},
@@ -298,6 +300,139 @@ fn crash_before_findings_durability_leaves_both_stores_empty_and_retry_recovers(
     assert_eq!(
         pending.checkpoint_cursor(),
         &Cursor::with_last_key(item_key(0x61)),
+    );
+}
+
+#[test]
+fn crash_after_ledger_before_checkpoint_allows_reassignment_retry_and_rejects_stale_fence() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
+
+    let stale_context = write_context_with_epoch(400);
+    let current_context = write_context_with_epoch(401);
+    let unit = completed_unit(7, 0x71);
+
+    let stale_translation = scanned_translation(stale_context, 0x71, 5);
+    let stale_receipt = committer
+        .commit_translation(stale_context, &unit, &stale_translation)
+        .expect("first worker should durably write findings and done-ledger");
+
+    assert_eq!(
+        done_ledger.snapshot().expect("done-ledger snapshot").len(),
+        1,
+        "durable done-ledger state should contain exactly one row before checkpoint recovery"
+    );
+
+    let mut aggregator = PrefixCheckpointAggregator::new(current_context, unit.sequence_no(), 4);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "durable done-ledger state alone must not move the checkpoint without a recorded receipt"
+    );
+
+    let stale_input =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt)
+            .expect("stale receipt boundary kind should still match the shard stream");
+    let stale_error = aggregator
+        .record_receipt(stale_input)
+        .expect_err("stale-fence receipt must be rejected after reassignment");
+    assert_eq!(
+        stale_error,
+        PrefixCheckpointError::OwnershipMismatch {
+            sequence_no: 7,
+            expected: Box::new(current_context),
+            actual: Box::new(stale_context),
+        }
+    );
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert_eq!(aggregator.checkpointed_units(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should still succeed after stale rejection")
+            .is_none(),
+        "rejecting the stale receipt must not leave behind a checkpointable prefix"
+    );
+
+    let retry_translation = scanned_translation(current_context, 0x71, 100);
+    let retry_receipt = committer
+        .commit_translation(current_context, &unit, &retry_translation)
+        .expect("reassignment retry should be idempotent and succeed");
+
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(
+        rows.len(),
+        1,
+        "retry must not create duplicate done-ledger rows"
+    );
+    let row = rows
+        .into_iter()
+        .next()
+        .expect("exactly one done-ledger row should remain");
+    assert_eq!(
+        row.write_context(),
+        current_context,
+        "the higher-fence retry should win done-ledger provenance"
+    );
+
+    let observations = findings_sink
+        .observations_snapshot()
+        .expect("observations snapshot");
+    assert_eq!(
+        observations.len(),
+        2,
+        "reassignment retry must upsert observations rather than duplicating them"
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.write_context() == current_context),
+        "later retry should win observation provenance as well"
+    );
+
+    let retry_input =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), retry_receipt)
+            .expect("retry receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(retry_input)
+            .expect("current-fence receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("current-fence retry should re-establish a checkpointable prefix");
+    assert_eq!(pending.first_sequence_no(), 7);
+    assert_eq!(pending.last_sequence_no(), 7);
+    assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x71)),
+        "checkpoint cursor must point at the retried unit"
+    );
+
+    let pending_scope = pending.scope().clone();
+    let _page_receipt = aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            pending_scope,
+            LogicalTime::from_raw(9_201),
+        ))
+        .expect("acknowledging the recovered checkpoint should succeed");
+
+    assert_eq!(aggregator.next_sequence_no(), 8);
+    assert_eq!(aggregator.checkpointed_units(), 1);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed after acknowledgement")
+            .is_none(),
+        "no pending receipts should remain after acknowledging the recovered checkpoint"
     );
 }
 
