@@ -16,15 +16,15 @@ use gossip_coordination::{
     CursorSemantics, InMemoryCoordinator as CoordinationInMemoryCoordinator, InitialShardInput,
     RunConfig, RunManagement,
 };
-use gossip_frontier::{range_shard_ref, ShardSpecScratch};
+use gossip_frontier::{ShardSpecScratch, range_shard_ref};
 use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
 use serde_json::Value;
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::{NamedTempFile, tempdir};
 
 use super::*;
 use crate::{
     coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent},
-    distributed::{run_worker, DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity},
+    distributed::{DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity, run_worker},
 };
 
 fn run_git(repo: &Path, args: &[&str]) {
