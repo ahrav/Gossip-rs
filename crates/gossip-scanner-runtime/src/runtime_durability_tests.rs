@@ -204,7 +204,11 @@ fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
     );
 
     // Receipt reflects the zero-findings commit.
+    assert_eq!(receipt.completed_unit().sequence_no(), 0);
+    assert_eq!(receipt.durable().scope().committed_units().get(), 1);
     assert_eq!(receipt.durable().findings().finding_count(), 0);
+    assert_eq!(receipt.durable().findings().occurrence_count(), 0);
+    assert_eq!(receipt.durable().findings().observation_count(), 0);
     assert_eq!(receipt.durable().done_ledger().record_count(), 1);
     assert_eq!(receipt.durable().done_ledger().findings_count(), 0);
 
@@ -223,6 +227,8 @@ fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
         .prepare_checkpoint()
         .expect("checkpoint preparation should succeed")
         .expect("one committed receipt should yield one checkpointable prefix");
+    assert_eq!(pending.first_sequence_no(), 0);
+    assert_eq!(pending.last_sequence_no(), 0);
     assert_eq!(pending.committed_units(), 1);
     assert_eq!(
         pending.checkpoint_cursor(),
