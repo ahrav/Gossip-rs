@@ -45,6 +45,18 @@ pub(crate) fn timing_with_offset(offset: u64) -> ScanTiming {
     )
 }
 
+/// Spin-polls `predicate` at 5ms intervals for up to 10s (2 000 iterations).
+/// Panics if the condition is never satisfied.
+pub(crate) fn wait_until(mut predicate: impl FnMut() -> bool) {
+    for _ in 0..2_000 {
+        if predicate() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("condition was not satisfied before timeout");
+}
+
 pub(crate) fn finding(
     rule_id: u32,
     span_start: u64,

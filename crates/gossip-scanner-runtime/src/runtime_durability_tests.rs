@@ -24,12 +24,12 @@ use crate::{
     checkpoint_aggregator::{
         PrefixCheckpointAggregator, PrefixCheckpointError, ReceiptRecordOutcome,
     },
-    commit_model::{CheckpointAggregatorInput, CompletedUnit},
+    commit_model::{CheckpointAggregatorInput, CompletedUnit, UnitCommitReceipt},
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput, QueuedCommit},
     result_committer::{ResultCommitError, ResultCommitter},
     result_translation::{ItemResult, PersistenceTranslation, translate_item_result},
     test_fixtures::{
-        finding, tenant_secret_key, test_rule_fingerprint, timing_with_offset,
+        finding, tenant_secret_key, test_rule_fingerprint, timing_with_offset, wait_until,
         write_context_with_epoch,
     },
 };
@@ -441,6 +441,10 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
 
     assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
     assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+    // The worker is blocked inside `handle.wait()` on a non-auto-completing findings
+    // sink — no amount of scheduling delay can complete that condvar wait until
+    // `release_next` is called. The 50ms timeout therefore proves the producer is
+    // structurally blocked, not merely slow.
     assert!(
         matches!(
             ack_rx.recv_timeout(Duration::from_millis(50)),
@@ -456,17 +460,7 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
         "no durable receipt should be emitted while the first findings write is still pending"
     );
 
-    for _ in 0..200 {
-        if findings_sink.pending_count().expect("pending count") == 1 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(
-        findings_sink.pending_count().expect("pending count"),
-        1,
-        "exactly one findings write should be in-flight while the worker is stalled"
-    );
+    wait_until(|| findings_sink.pending_count().expect("pending count") == 1);
     assert!(
         done_ledger
             .snapshot()
@@ -482,12 +476,7 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
     assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
 
     for _ in 0..2 {
-        for _ in 0..200 {
-            if findings_sink.pending_count().expect("pending count") >= 1 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_until(|| findings_sink.pending_count().expect("pending count") >= 1);
         findings_sink
             .release_next(CompletionOrder::OldestFirst)
             .expect("release remaining findings writes")
@@ -962,52 +951,45 @@ fn stale_fence_receipts_are_rejected_and_leave_no_side_effect() {
 
     let mut aggregator = PrefixCheckpointAggregator::new(current_context_300, 7, 4);
 
-    let stale_input_100 =
-        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt_100)
-            .expect("epoch-100 receipt boundary kind should match the shard stream");
-    let stale_error_100 = aggregator
-        .record_receipt(stale_input_100)
-        .expect_err("epoch-100 stale receipt must be rejected");
-    assert_eq!(
-        stale_error_100,
-        PrefixCheckpointError::OwnershipMismatch {
-            sequence_no: 7,
-            expected: Box::new(current_context_300),
-            actual: Box::new(stale_context_100),
-        }
-    );
-    assert_eq!(aggregator.buffered_receipt_count(), 0);
-    assert_eq!(aggregator.checkpointed_units(), 0);
-    assert!(
-        aggregator
-            .prepare_checkpoint()
-            .expect("checkpoint preparation should succeed after epoch-100 rejection")
-            .is_none(),
-        "epoch-100 rejection must not leave behind a checkpointable prefix"
-    );
+    let assert_stale_rejected = |aggregator: &mut PrefixCheckpointAggregator,
+                                 stale_ctx: WriteContext,
+                                 receipt: UnitCommitReceipt,
+                                 label: &str| {
+        let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
+            .unwrap_or_else(|_| panic!("{label} receipt boundary kind should match"));
+        let err = aggregator
+            .record_receipt(input)
+            .expect_err(&format!("{label} stale receipt must be rejected"));
+        assert_eq!(
+            err,
+            PrefixCheckpointError::OwnershipMismatch {
+                sequence_no: 7,
+                expected: Box::new(current_context_300),
+                actual: Box::new(stale_ctx),
+            }
+        );
+        assert_eq!(aggregator.buffered_receipt_count(), 0);
+        assert_eq!(aggregator.checkpointed_units(), 0);
+        assert!(
+            aggregator
+                .prepare_checkpoint()
+                .expect("checkpoint preparation should succeed after rejection")
+                .is_none(),
+            "{label} rejection must not leave behind a checkpointable prefix"
+        );
+    };
 
-    let stale_input_200 =
-        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt_200)
-            .expect("epoch-200 receipt boundary kind should match the shard stream");
-    let stale_error_200 = aggregator
-        .record_receipt(stale_input_200)
-        .expect_err("epoch-200 stale receipt must be rejected");
-    assert_eq!(
-        stale_error_200,
-        PrefixCheckpointError::OwnershipMismatch {
-            sequence_no: 7,
-            expected: Box::new(current_context_300),
-            actual: Box::new(stale_context_200),
-        }
+    assert_stale_rejected(
+        &mut aggregator,
+        stale_context_100,
+        stale_receipt_100,
+        "epoch-100",
     );
-    assert_eq!(aggregator.buffered_receipt_count(), 0);
-    assert_eq!(aggregator.checkpointed_units(), 0);
-    assert!(
-        aggregator
-            .prepare_checkpoint()
-            .expect("checkpoint preparation should succeed after epoch-200 rejection")
-            .is_none(),
-        "epoch-200 rejection must not leave behind a checkpointable prefix"
+    assert_stale_rejected(
+        &mut aggregator,
+        stale_context_200,
+        stale_receipt_200,
+        "epoch-200",
     );
 
     let current_input_300 =
