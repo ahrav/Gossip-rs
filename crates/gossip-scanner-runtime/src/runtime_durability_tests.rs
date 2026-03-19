@@ -84,6 +84,159 @@ fn scanned_translation(
     .expect("translation of scanned item with two findings should succeed")
 }
 
+fn clean_scanned_translation(
+    write_context: WriteContext,
+    item_suffix: u8,
+    timing_offset: u64,
+) -> PersistenceTranslation {
+    let item = scan_item(item_suffix);
+    translate_item_result(
+        write_context,
+        &tenant_secret_key(),
+        &item,
+        128,
+        timing_with_offset(timing_offset),
+        ItemResult::Scanned { findings: &[] },
+        &test_rule_fingerprint,
+    )
+    .expect("translation of clean scan item should succeed")
+}
+
+#[test]
+fn no_checkpoint_without_receipt_even_when_done_ledger_is_durable() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
+
+    let context = write_context_with_epoch(100);
+    let unit = completed_unit(0, 0x41);
+    let translation = scanned_translation(context, 0x41, 1);
+
+    let receipt = committer
+        .commit_translation(context, &unit, &translation)
+        .expect("durable commit should succeed");
+
+    // Preconditions: both stores are durable.
+    assert_sink_counts(&findings_sink, 2);
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(rows.len(), 1, "done-ledger row should already be durable");
+    let done_record = rows
+        .into_iter()
+        .next()
+        .expect("exactly one done-ledger record");
+    assert_eq!(
+        done_record.status(),
+        DoneLedgerStatus::ScannedWithFindings,
+        "done-ledger status must reflect the two committed findings"
+    );
+    assert_eq!(
+        done_record.findings_count(),
+        2,
+        "done-ledger findings_count must match committed findings"
+    );
+
+    // Negative path: without recording the receipt, no checkpoint.
+    let mut aggregator = PrefixCheckpointAggregator::new(context, unit.sequence_no(), 4);
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "no checkpoint can be prepared until a durable receipt is explicitly recorded"
+    );
+    assert_eq!(aggregator.checkpointed_units(), 0);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
+
+    // Positive control: recording the receipt enables checkpoint progress.
+    let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
+        .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(input)
+            .expect("receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("one recorded receipt should yield one checkpointable prefix");
+    assert_eq!(pending.first_sequence_no(), 0);
+    assert_eq!(pending.last_sequence_no(), 0);
+    assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x41)),
+        "checkpoint cursor must point to the committed item key"
+    );
+}
+
+#[test]
+fn clean_scan_with_zero_findings_commits_and_checkpoints_normally() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
+
+    let context = write_context_with_epoch(500);
+    let unit = completed_unit(0, 0x81);
+    let translation = clean_scanned_translation(context, 0x81, 1);
+
+    let receipt = committer
+        .commit_translation(context, &unit, &translation)
+        .expect("clean-scan durable commit should succeed");
+
+    // Preconditions: findings sink is empty, done-ledger has one clean row.
+    assert_sink_counts(&findings_sink, 0);
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(rows.len(), 1, "done-ledger should contain exactly one row");
+    let done_record = rows
+        .into_iter()
+        .next()
+        .expect("exactly one done-ledger record");
+    assert_eq!(
+        done_record.status(),
+        DoneLedgerStatus::ScannedClean,
+        "done-ledger status must be ScannedClean for zero findings"
+    );
+    assert_eq!(
+        done_record.findings_count(),
+        0,
+        "done-ledger findings_count must be zero for a clean scan"
+    );
+
+    // Receipt reflects the zero-findings commit.
+    assert_eq!(receipt.completed_unit().sequence_no(), 0);
+    assert_eq!(receipt.durable().scope().committed_units().get(), 1);
+    assert_eq!(receipt.durable().findings().finding_count(), 0);
+    assert_eq!(receipt.durable().findings().occurrence_count(), 0);
+    assert_eq!(receipt.durable().findings().observation_count(), 0);
+    assert_eq!(receipt.durable().done_ledger().record_count(), 1);
+    assert_eq!(receipt.durable().done_ledger().findings_count(), 0);
+
+    // Aggregator accepts the receipt and produces a checkpoint.
+    let mut aggregator = PrefixCheckpointAggregator::new(context, unit.sequence_no(), 4);
+    let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
+        .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(input)
+            .expect("clean-scan receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("one committed receipt should yield one checkpointable prefix");
+    assert_eq!(pending.first_sequence_no(), 0);
+    assert_eq!(pending.last_sequence_no(), 0);
+    assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x81)),
+        "checkpoint cursor must point to the clean-scan item key"
+    );
+}
+
 #[test]
 fn crash_after_findings_before_ledger_write_does_not_checkpoint_and_retry_is_safe() {
     let findings_sink = InMemoryFindingsSink::new();
