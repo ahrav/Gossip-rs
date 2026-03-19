@@ -556,13 +556,13 @@ jobs:
 
       - name: Run tests (${{ matrix.profile }})
         run: >-
-          cargo nextest run --all-features ${{ matrix.release-flag }}
+          cargo nextest run --workspace --all-features ${{ matrix.release-flag }}
           --profile nightly
           --exclude gossip-coordination-etcd
 
       - name: Run ignored slow tests (${{ matrix.profile }})
         run: >-
-          cargo nextest run --all-features ${{ matrix.release-flag }}
+          cargo nextest run --workspace --all-features ${{ matrix.release-flag }}
           --profile nightly
           --exclude gossip-coordination-etcd
           --run-ignored ignored-only
