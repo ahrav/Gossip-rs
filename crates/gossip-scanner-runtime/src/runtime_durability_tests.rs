@@ -10,7 +10,7 @@ use std::{
 use gossip_contracts::{
     connector::Cursor,
     identity::LogicalTime,
-    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus, WriteContext},
+    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus},
 };
 use gossip_persistence_inmemory::{
     CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
@@ -22,7 +22,7 @@ use crate::{
     checkpoint_aggregator::{
         PrefixCheckpointAggregator, PrefixCheckpointError, ReceiptRecordOutcome,
     },
-    commit_model::{CheckpointAggregatorInput, UnitCommitReceipt},
+    commit_model::CheckpointAggregatorInput,
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput, QueuedCommit},
     result_committer::{ResultCommitError, ResultCommitter},
     test_fixtures::{
@@ -302,6 +302,134 @@ fn real_receipts_only_advance_the_contiguous_prefix() {
             .is_none(),
         "no pending receipts should remain after acknowledging the full prefix"
     );
+}
+
+#[test]
+fn pending_prefix_does_not_widen_until_the_previous_checkpoint_is_acked() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink.clone(), done_ledger.clone());
+
+    let context = write_context_with_epoch(550);
+    let unit_zero = completed_unit(0, 0x81);
+    let unit_one = completed_unit(1, 0x82);
+    let unit_two = completed_unit(2, 0x83);
+    let translation_zero = scanned_translation(context, 0x81, 1);
+    let translation_one = scanned_translation(context, 0x82, 2);
+    let translation_two = scanned_translation(context, 0x83, 3);
+
+    let receipt_one = committer
+        .commit_translation(context, &unit_one, &translation_one)
+        .expect("sequence 1 should commit");
+    let receipt_zero = committer
+        .commit_translation(context, &unit_zero, &translation_zero)
+        .expect("sequence 0 should commit");
+    let receipt_two = committer
+        .commit_translation(context, &unit_two, &translation_two)
+        .expect("sequence 2 should commit");
+
+    assert_sink_counts(&findings_sink, 6);
+    assert_eq!(
+        done_ledger.snapshot().expect("done-ledger snapshot").len(),
+        3,
+        "each committed item should produce one done-ledger row"
+    );
+
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
+    let receipt_one_input =
+        CheckpointAggregatorInput::new(unit_one.checkpoint_boundary_kind(), receipt_one)
+            .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(receipt_one_input)
+            .expect("out-of-order receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let receipt_zero_input =
+        CheckpointAggregatorInput::new(unit_zero.checkpoint_boundary_kind(), receipt_zero)
+            .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(receipt_zero_input)
+            .expect("gap-closing receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let first_scope = {
+        let first_pending = aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .expect("contiguous prefix should exist");
+        assert_eq!(first_pending.first_sequence_no(), 0);
+        assert_eq!(first_pending.last_sequence_no(), 1);
+        assert_eq!(first_pending.committed_units(), 2);
+        assert_eq!(
+            first_pending.checkpoint_cursor(),
+            &Cursor::with_last_key(item_key(0x82)),
+            "checkpoint cursor must reflect the end of the prepared prefix"
+        );
+        first_pending.scope().clone()
+    };
+
+    let receipt_two_input =
+        CheckpointAggregatorInput::new(unit_two.checkpoint_boundary_kind(), receipt_two)
+            .expect("receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(receipt_two_input)
+            .expect("later receipt should buffer behind the pending prefix"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let still_pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("pending prefix should remain prepared");
+    assert_eq!(still_pending.first_sequence_no(), 0);
+    assert_eq!(still_pending.last_sequence_no(), 1);
+    assert_eq!(still_pending.committed_units(), 2);
+    assert_eq!(
+        still_pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x82)),
+        "pending prefix must stay frozen until acknowledgement"
+    );
+    assert_eq!(aggregator.checkpointed_units(), 0);
+    assert_eq!(aggregator.buffered_receipt_count(), 3);
+
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            first_scope,
+            LogicalTime::from_raw(9_301),
+        ))
+        .expect("durable checkpoint receipt should advance the first prefix");
+
+    let second_scope = {
+        let second_pending = aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .expect("the buffered tail receipt should now become checkpointable");
+        assert_eq!(second_pending.first_sequence_no(), 2);
+        assert_eq!(second_pending.last_sequence_no(), 2);
+        assert_eq!(second_pending.committed_units(), 1);
+        assert_eq!(
+            second_pending.checkpoint_cursor(),
+            &Cursor::with_last_key(item_key(0x83)),
+            "checkpoint cursor must advance to the buffered tail receipt after acknowledgement"
+        );
+        second_pending.scope().clone()
+    };
+
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            second_scope,
+            LogicalTime::from_raw(9_302),
+        ))
+        .expect("durable checkpoint receipt should advance the remaining tail receipt");
+
+    assert_eq!(aggregator.next_sequence_no(), 3);
+    assert_eq!(aggregator.checkpointed_units(), 3);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
 }
 
 #[test]
