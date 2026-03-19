@@ -93,7 +93,7 @@ use gossip_frontier::decode_connector_extra;
 use scanner_scheduler::store::FsFindingRecord;
 
 use crate::{
-    CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
+    AssignmentOutcome, CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
     build_runtime_engine,
     checkpoint_aggregator::PrefixCheckpointAggregator,
     commit_model::CompletedUnit,
@@ -778,6 +778,25 @@ struct CommitStageDrainResult {
     committed_sequence_nos: Vec<u64>,
 }
 
+/// Resolve the concurrent scan, submission, and drain results from one
+/// filesystem lease.
+///
+/// Scan failures are surfaced before durability failures because a broken scan
+/// often cascades into downstream drain errors. Returning the runtime error
+/// first gives operators the closest cause.
+fn resolve_filesystem_lease_results(
+    outcome: Result<AssignmentOutcome, ScanRuntimeError>,
+    submitted: Result<Vec<u64>>,
+    stage_result: anyhow::Result<anyhow::Result<CommitStageDrainResult>>,
+) -> Result<(AssignmentOutcome, Vec<u64>, CommitStageDrainResult), DistributedRuntimeError> {
+    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
+    let stage_result = stage_result
+        .map_err(DistributedRuntimeError::Durability)?
+        .map_err(DistributedRuntimeError::Durability)?;
+    Ok((outcome, submitted, stage_result))
+}
+
 /// Drain commit-stage outcomes to completion while building the receipt-driven
 /// checkpoint prefix.
 ///
@@ -1259,18 +1278,12 @@ where
         (outcome, submitted, stage_result)
     });
 
-    // Check the scan outcome first: when both the scan and the drain thread
-    // fail, the scan failure is typically the root cause (the broken pipeline
-    // cascades into the drain). Surfacing the Runtime error gives operators
-    // the most actionable diagnostic.
-    let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
-    let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
+    let (outcome, submitted, stage_result) =
+        resolve_filesystem_lease_results(outcome, submitted, stage_result)?;
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
-    } = stage_result
-        .map_err(DistributedRuntimeError::Durability)?
-        .map_err(DistributedRuntimeError::Durability)?;
+    } = stage_result;
     let committed_units = committed_sequence_nos.len() as u64;
 
     if committed_units == 0 {
@@ -1827,6 +1840,50 @@ mod tests {
             shards_scanned: 7,
         };
         assert!(nonzero.shards_scanned <= nonzero.leases_seen);
+    }
+
+    #[test]
+    fn resolve_filesystem_lease_results_prefers_scan_failure_over_drain_failure() {
+        let scan_error = ScanRuntimeError::Driver(AnyError::msg("scan boom"));
+        let stage_error = anyhow!("drain boom");
+
+        let error =
+            resolve_filesystem_lease_results(Err(scan_error), Ok(Vec::new()), Ok(Err(stage_error)))
+                .expect_err("scan failure should win when both scan and drain fail");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Runtime(_)),
+            "expected Runtime variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("scan boom"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_filesystem_lease_results_returns_drain_failure_after_successful_scan() {
+        let stage_error = anyhow!("drain boom");
+
+        let error = resolve_filesystem_lease_results(
+            Ok(AssignmentOutcome {
+                report: ScanReport::default(),
+                checkpoint_hint: None,
+                debug_output: None,
+            }),
+            Ok(Vec::new()),
+            Ok(Err(stage_error)),
+        )
+        .expect_err("drain failure should surface after a successful scan");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Durability(_)),
+            "expected Durability variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("drain boom"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
