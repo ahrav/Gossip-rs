@@ -345,6 +345,16 @@ fn pending_prefix_does_not_widen_until_the_previous_checkpoint_is_acked() {
             .expect("out-of-order receipt should buffer"),
         ReceiptRecordOutcome::Buffered
     );
+    // Seq 1 is buffered but seq 0 is still missing — no contiguous prefix yet.
+    assert!(
+        aggregator
+            .prepare_checkpoint()
+            .expect("checkpoint preparation should succeed")
+            .is_none(),
+        "seq 1 alone must not produce a checkpointable prefix"
+    );
+    assert_eq!(aggregator.next_sequence_no(), 0);
+    assert_eq!(aggregator.buffered_receipt_count(), 1);
 
     let receipt_zero_input =
         CheckpointAggregatorInput::new(unit_zero.checkpoint_boundary_kind(), receipt_zero)
@@ -393,6 +403,11 @@ fn pending_prefix_does_not_widen_until_the_previous_checkpoint_is_acked() {
         still_pending.checkpoint_cursor(),
         &Cursor::with_last_key(item_key(0x82)),
         "pending prefix must stay frozen until acknowledgement"
+    );
+    assert_eq!(
+        aggregator.next_sequence_no(),
+        0,
+        "prepare_checkpoint must not advance the committed position"
     );
     assert_eq!(aggregator.checkpointed_units(), 0);
     assert_eq!(aggregator.buffered_receipt_count(), 3);
