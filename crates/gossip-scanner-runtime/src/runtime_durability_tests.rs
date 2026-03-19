@@ -8,55 +8,28 @@ use std::{
 };
 
 use gossip_contracts::{
-    connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
-    identity::{LogicalTime, ObjectVersionId, StableItemId},
-    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus, WriteContext},
+    connector::{Cursor, ItemKey},
+    identity::LogicalTime,
+    persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus},
 };
 use gossip_persistence_inmemory::{
     CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
     InMemoryStoreKind,
 };
 
-use scanner_scheduler::store::FsFindingRecord;
-
 use crate::{
     CancellationToken,
     checkpoint_aggregator::{
         PrefixCheckpointAggregator, PrefixCheckpointError, ReceiptRecordOutcome,
     },
-    commit_model::{CheckpointAggregatorInput, CompletedUnit, UnitCommitReceipt},
+    commit_model::{CheckpointAggregatorInput, UnitCommitReceipt},
     commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput, QueuedCommit},
     result_committer::{ResultCommitError, ResultCommitter},
-    result_translation::{ItemResult, PersistenceTranslation, translate_item_result},
     test_fixtures::{
-        finding, tenant_secret_key, test_rule_fingerprint, timing_with_offset, wait_until,
+        clean_scanned_translation, completed_unit, item_key, scanned_translation, wait_until,
         write_context_with_epoch,
     },
 };
-
-fn item_key(item_suffix: u8) -> ItemKey {
-    ItemKey::try_from_slice(&[b't', b'/', item_suffix]).unwrap()
-}
-
-fn scan_item(item_suffix: u8) -> ScanItem {
-    let item_ref = ItemRef::try_from_vec(vec![b'r', item_suffix]).unwrap();
-    let path = format!("tenant/repo/file-{item_suffix}.txt");
-    let url = format!("https://example.invalid/{item_suffix}");
-
-    ScanItem::new(
-        item_key(item_suffix),
-        item_ref,
-        StableItemId::from_bytes([item_suffix; 32]),
-        VersionId::Strong(ObjectVersionId::from_bytes(
-            [item_suffix.wrapping_add(1); 32],
-        )),
-    )
-    .with_location(Location::try_new(path, Some(url)).unwrap())
-}
-
-fn completed_unit(sequence_no: u64, item_suffix: u8) -> CompletedUnit {
-    CompletedUnit::ordered_content(sequence_no, Cursor::with_last_key(item_key(item_suffix)))
-}
 
 fn assert_sink_counts(sink: &InMemoryFindingsSink, expected: usize) {
     assert_eq!(sink.findings_snapshot().expect("snapshot").len(), expected);
@@ -83,49 +56,6 @@ fn assert_single_done_row(
         .expect("exactly one done-ledger record");
     assert_eq!(row.status(), expected_status);
     assert_eq!(row.findings_count(), expected_findings_count);
-}
-
-fn scanned_translation_with(
-    write_context: WriteContext,
-    item_suffix: u8,
-    timing_offset: u64,
-    findings: &[FsFindingRecord],
-) -> PersistenceTranslation {
-    let item = scan_item(item_suffix);
-    translate_item_result(
-        write_context,
-        &tenant_secret_key(),
-        &item,
-        128,
-        timing_with_offset(timing_offset),
-        ItemResult::Scanned { findings },
-        &test_rule_fingerprint,
-    )
-    .expect("translation should succeed")
-}
-
-fn scanned_translation(
-    write_context: WriteContext,
-    item_suffix: u8,
-    timing_offset: u64,
-) -> PersistenceTranslation {
-    scanned_translation_with(
-        write_context,
-        item_suffix,
-        timing_offset,
-        &[
-            finding(7, 10, 20, item_suffix),
-            finding(9, 30, 45, item_suffix.wrapping_add(10)),
-        ],
-    )
-}
-
-fn clean_scanned_translation(
-    write_context: WriteContext,
-    item_suffix: u8,
-    timing_offset: u64,
-) -> PersistenceTranslation {
-    scanned_translation_with(write_context, item_suffix, timing_offset, &[])
 }
 
 #[test]
@@ -395,7 +325,7 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
     let context = write_context_with_epoch(600);
     let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 8);
 
-    let producer = thread::spawn(move || {
+    let mut producer = Some(thread::spawn(move || {
         sender
             .submit(QueuedCommit::new(
                 context,
@@ -422,24 +352,50 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
             ))
             .expect("third submit should succeed once backpressure clears");
         ack_tx.send(3u8).expect("third ack");
-    });
+    }));
 
-    assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-    assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
-    // The worker is blocked inside `handle.wait()` on a non-auto-completing findings
-    // sink — no amount of scheduling delay can complete that condvar wait until
-    // `release_next` is called. The 50ms timeout therefore proves the producer is
-    // structurally blocked, not merely slow.
+    /// Receives an ack from the producer, surfacing the producer's panic on
+    /// channel disconnect instead of reporting a confusing `Disconnected` error.
+    fn recv_ack(
+        rx: &mpsc::Receiver<u8>,
+        producer: &mut Option<thread::JoinHandle<()>>,
+        expected: u8,
+        timeout: Duration,
+    ) {
+        match rx.recv_timeout(timeout) {
+            Ok(val) => assert_eq!(val, expected, "ack value mismatch"),
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(h) = producer.take() {
+                    if let Err(payload) = h.join() {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+                panic!(
+                    "ack channel disconnected — producer completed without sending ack {expected}"
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("timed out waiting for producer ack {expected}")
+            }
+        }
+    }
+
+    recv_ack(&ack_rx, &mut producer, 1, Duration::from_secs(1));
+    recv_ack(&ack_rx, &mut producer, 2, Duration::from_secs(1));
+    // The worker is blocked inside `StoreHandle::wait()` on a non-auto-completing
+    // findings sink — the condvar cannot fire until `release_next` is called, so
+    // 200ms is far longer than any scheduling jitter while still keeping the test
+    // fast. This proves the producer is structurally blocked, not merely slow.
     assert!(
         matches!(
-            ack_rx.recv_timeout(Duration::from_millis(50)),
+            ack_rx.recv_timeout(Duration::from_millis(200)),
             Err(RecvTimeoutError::Timeout)
         ),
         "third submit should remain blocked while the slow sink stalls the worker and the bounded execution queue is full"
     );
     assert!(
         matches!(
-            pipeline.recv_timeout(Duration::from_millis(50)),
+            pipeline.recv_timeout(Duration::from_millis(200)),
             Err(RecvTimeoutError::Timeout)
         ),
         "no durable receipt should be emitted while the first findings write is still pending"
@@ -458,7 +414,7 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
         .release_next(CompletionOrder::OldestFirst)
         .expect("release first findings write")
         .expect("first pending findings write");
-    assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+    recv_ack(&ack_rx, &mut producer, 3, Duration::from_secs(1));
 
     for _ in 0..2 {
         wait_until(|| findings_sink.pending_count().expect("pending count") >= 1);
@@ -494,7 +450,11 @@ fn slow_sink_causes_backpressure_in_bounded_pipeline() {
         }
     }
 
-    producer.join().expect("producer should join");
+    producer
+        .take()
+        .expect("producer handle should still exist")
+        .join()
+        .expect("producer should join");
     pipeline.shutdown().expect("worker should join");
 
     assert_eq!(
@@ -1041,6 +1001,50 @@ fn stale_fence_with_same_run_id_but_different_epoch_is_rejected() {
             .is_none(),
         "rejecting the stale receipt must not create checkpointable progress"
     );
+
+    // Positive control: a receipt from the current epoch for the same unit must
+    // succeed, proving that the aggregator rejects only the epoch mismatch and
+    // not the unit or sequence number itself.
+    let current_receipt = committer
+        .commit_translation(
+            current_context,
+            &unit,
+            &scanned_translation(current_context, 0x74, 41),
+        )
+        .expect("current-epoch commit should succeed");
+
+    let current_input =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), current_receipt)
+            .expect("current receipt boundary kind should match the shard stream");
+    assert_eq!(
+        aggregator
+            .record_receipt(current_input)
+            .expect("current-epoch receipt should buffer"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("current-epoch receipt should yield a checkpointable prefix");
+    assert_eq!(pending.first_sequence_no(), 11);
+    assert_eq!(pending.last_sequence_no(), 11);
+    assert_eq!(pending.committed_units(), 1);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x74)),
+    );
+
+    let pending_scope = pending.scope().clone();
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            pending_scope,
+            LogicalTime::from_raw(9_401),
+        ))
+        .expect("acknowledging the current-epoch checkpoint should succeed");
+    assert_eq!(aggregator.next_sequence_no(), 12);
+    assert_eq!(aggregator.checkpointed_units(), 1);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
 }
 
 #[test]
@@ -1131,5 +1135,113 @@ fn multi_item_crash_on_second_item_yields_partial_prefix_after_retry() {
     assert_eq!(
         full.checkpoint_cursor(),
         &Cursor::with_last_key(item_key(0x72)),
+    );
+}
+
+#[test]
+fn duplicate_receipt_returns_duplicate_buffered_without_side_effect() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink, done_ledger);
+
+    let context = write_context_with_epoch(500);
+    let unit = completed_unit(0, 0x90);
+    let receipt = committer
+        .commit_translation(context, &unit, &scanned_translation(context, 0x90, 1))
+        .expect("commit should succeed");
+
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
+
+    let input_first =
+        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt.clone())
+            .expect("boundary kind should match");
+    assert_eq!(
+        aggregator
+            .record_receipt(input_first)
+            .expect("first record should succeed"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let input_dup = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
+        .expect("boundary kind should match");
+    assert_eq!(
+        aggregator
+            .record_receipt(input_dup)
+            .expect("duplicate record should succeed without error"),
+        ReceiptRecordOutcome::DuplicateBuffered
+    );
+    assert_eq!(
+        aggregator.buffered_receipt_count(),
+        1,
+        "duplicate must not inflate the buffer"
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("single receipt should yield a prefix");
+    assert_eq!(pending.committed_units(), 1);
+}
+
+#[test]
+fn receipt_for_already_checkpointed_sequence_returns_already_checkpointed() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let committer = ResultCommitter::new(findings_sink, done_ledger);
+
+    let context = write_context_with_epoch(501);
+    let unit = completed_unit(0, 0x91);
+    let receipt = committer
+        .commit_translation(context, &unit, &scanned_translation(context, 0x91, 2))
+        .expect("commit should succeed");
+
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 4);
+
+    let input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt.clone())
+        .expect("boundary kind should match");
+    assert_eq!(
+        aggregator
+            .record_receipt(input)
+            .expect("record should succeed"),
+        ReceiptRecordOutcome::Buffered
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("receipt should yield a prefix");
+    let scope = pending.scope().clone();
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            scope,
+            LogicalTime::from_raw(10_501),
+        ))
+        .expect("acknowledge should succeed");
+    assert_eq!(aggregator.next_sequence_no(), 1);
+    assert_eq!(aggregator.checkpointed_units(), 1);
+
+    // Re-record the same receipt after it has been checkpointed.
+    let replayed_input = CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), receipt)
+        .expect("boundary kind should match");
+    assert_eq!(
+        aggregator
+            .record_receipt(replayed_input)
+            .expect("replayed record should succeed without error"),
+        ReceiptRecordOutcome::AlreadyCheckpointed
+    );
+    assert_eq!(
+        aggregator.buffered_receipt_count(),
+        0,
+        "already-checkpointed receipt must not re-enter the buffer"
+    );
+    assert_eq!(
+        aggregator.checkpointed_units(),
+        1,
+        "checkpointed count must not change"
+    );
+    assert_eq!(
+        aggregator.next_sequence_no(),
+        1,
+        "sequence watermark must not regress"
     );
 }

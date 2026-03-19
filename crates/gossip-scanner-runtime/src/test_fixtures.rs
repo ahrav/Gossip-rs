@@ -1,15 +1,19 @@
 //! Shared test fixtures for the gossip-scanner-runtime crate.
 
 use gossip_contracts::{
+    connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     identity::{
-        FenceEpoch, LogicalTime, PolicyHash, RuleFingerprint, RunId, ShardId, TenantId,
-        TenantSecretKey, derive_rule_fingerprint,
+        FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
+        StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
     },
     persistence::WriteContext,
 };
 use scanner_scheduler::store::FsFindingRecord;
 
-use crate::result_translation::ScanTiming;
+use crate::{
+    commit_model::CompletedUnit,
+    result_translation::{ItemResult, PersistenceTranslation, ScanTiming, translate_item_result},
+};
 
 pub(crate) fn test_rule_fingerprint(rule_id: u32) -> RuleFingerprint {
     let name = format!("test-rule-{rule_id}");
@@ -72,4 +76,71 @@ pub(crate) fn finding(
         norm_hash: [hash_seed; 32],
         confidence_score: 7,
     }
+}
+
+pub(crate) fn item_key(item_suffix: u8) -> ItemKey {
+    ItemKey::try_from_slice(&[b't', b'/', item_suffix]).unwrap()
+}
+
+pub(crate) fn scan_item(item_suffix: u8) -> ScanItem {
+    let item_ref = ItemRef::try_from_vec(vec![b'r', item_suffix]).unwrap();
+    let path = format!("tenant/repo/file-{item_suffix}.txt");
+    let url = format!("https://example.invalid/{item_suffix}");
+
+    ScanItem::new(
+        item_key(item_suffix),
+        item_ref,
+        StableItemId::from_bytes([item_suffix; 32]),
+        VersionId::Strong(ObjectVersionId::from_bytes(
+            [item_suffix.wrapping_add(1); 32],
+        )),
+    )
+    .with_location(Location::try_new(path, Some(url)).unwrap())
+}
+
+pub(crate) fn completed_unit(sequence_no: u64, item_suffix: u8) -> CompletedUnit {
+    CompletedUnit::ordered_content(sequence_no, Cursor::with_last_key(item_key(item_suffix)))
+}
+
+pub(crate) fn scanned_translation_with(
+    write_context: WriteContext,
+    item_suffix: u8,
+    timing_offset: u64,
+    findings: &[FsFindingRecord],
+) -> PersistenceTranslation {
+    let item = scan_item(item_suffix);
+    translate_item_result(
+        write_context,
+        &tenant_secret_key(),
+        &item,
+        128,
+        timing_with_offset(timing_offset),
+        ItemResult::Scanned { findings },
+        &test_rule_fingerprint,
+    )
+    .expect("translation should succeed")
+}
+
+pub(crate) fn scanned_translation(
+    write_context: WriteContext,
+    item_suffix: u8,
+    timing_offset: u64,
+) -> PersistenceTranslation {
+    scanned_translation_with(
+        write_context,
+        item_suffix,
+        timing_offset,
+        &[
+            finding(7, 10, 20, item_suffix),
+            finding(9, 30, 45, item_suffix.wrapping_add(10)),
+        ],
+    )
+}
+
+pub(crate) fn clean_scanned_translation(
+    write_context: WriteContext,
+    item_suffix: u8,
+    timing_offset: u64,
+) -> PersistenceTranslation {
+    scanned_translation_with(write_context, item_suffix, timing_offset, &[])
 }
