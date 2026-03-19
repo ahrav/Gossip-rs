@@ -767,53 +767,42 @@ fn stale_fence_receipts_are_rejected_and_leave_no_side_effect() {
 
     let mut aggregator = PrefixCheckpointAggregator::new(current_context_300, 7, 4);
 
-    let stale_input_100 =
-        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt_100)
-            .expect("epoch-100 receipt boundary kind should match the shard stream");
-    let stale_error_100 = aggregator
-        .record_receipt(stale_input_100)
-        .expect_err("epoch-100 stale receipt must be rejected");
-    assert_eq!(
-        stale_error_100,
-        PrefixCheckpointError::OwnershipMismatch {
-            sequence_no: 7,
-            expected: Box::new(current_context_300),
-            actual: Box::new(stale_context_100),
-        }
-    );
-    assert_eq!(aggregator.buffered_receipt_count(), 0);
-    assert_eq!(aggregator.checkpointed_units(), 0);
-    assert!(
-        aggregator
-            .prepare_checkpoint()
-            .expect("checkpoint preparation should succeed after epoch-100 rejection")
-            .is_none(),
-        "epoch-100 rejection must not leave behind a checkpointable prefix"
-    );
-
-    let stale_input_200 =
-        CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt_200)
-            .expect("epoch-200 receipt boundary kind should match the shard stream");
-    let stale_error_200 = aggregator
-        .record_receipt(stale_input_200)
-        .expect_err("epoch-200 stale receipt must be rejected");
-    assert_eq!(
-        stale_error_200,
-        PrefixCheckpointError::OwnershipMismatch {
-            sequence_no: 7,
-            expected: Box::new(current_context_300),
-            actual: Box::new(stale_context_200),
-        }
-    );
-    assert_eq!(aggregator.buffered_receipt_count(), 0);
-    assert_eq!(aggregator.checkpointed_units(), 0);
-    assert!(
-        aggregator
-            .prepare_checkpoint()
-            .expect("checkpoint preparation should succeed after epoch-200 rejection")
-            .is_none(),
-        "epoch-200 rejection must not leave behind a checkpointable prefix"
-    );
+    for (label, stale_context, stale_receipt) in [
+        ("epoch-100", stale_context_100, stale_receipt_100),
+        ("epoch-200", stale_context_200, stale_receipt_200),
+    ] {
+        let stale_input =
+            CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), stale_receipt)
+                .expect("stale receipt boundary kind should match the shard stream");
+        let stale_error = aggregator
+            .record_receipt(stale_input)
+            .expect_err("stale receipt must be rejected");
+        assert_eq!(
+            stale_error,
+            PrefixCheckpointError::OwnershipMismatch {
+                sequence_no: 7,
+                expected: Box::new(current_context_300),
+                actual: Box::new(stale_context),
+            }
+        );
+        assert_eq!(
+            aggregator.buffered_receipt_count(),
+            0,
+            "{label}: buffer side effect"
+        );
+        assert_eq!(
+            aggregator.checkpointed_units(),
+            0,
+            "{label}: checkpointed side effect"
+        );
+        assert!(
+            aggregator
+                .prepare_checkpoint()
+                .expect("checkpoint preparation should succeed after stale rejection")
+                .is_none(),
+            "{label}: rejection must not leave behind a checkpointable prefix"
+        );
+    }
 
     let current_input_300 =
         CheckpointAggregatorInput::new(unit.checkpoint_boundary_kind(), current_receipt_300)
