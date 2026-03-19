@@ -1,22 +1,31 @@
 //! Runtime durability integration tests for translation, commit, and
 //! receipt-driven checkpoint aggregation.
 
+use std::{
+    sync::mpsc::{self, RecvTimeoutError},
+    thread,
+    time::Duration,
+};
+
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     identity::{LogicalTime, ObjectVersionId, StableItemId},
     persistence::{CheckpointCommitReceipt, CommitAdvanceError, DoneLedgerStatus, WriteContext},
 };
 use gossip_persistence_inmemory::{
-    InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError, InMemoryStoreKind,
+    CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink, InMemoryPersistenceError,
+    InMemoryStoreKind,
 };
 
 use scanner_scheduler::store::FsFindingRecord;
 
 use crate::{
+    CancellationToken,
     checkpoint_aggregator::{
         PrefixCheckpointAggregator, PrefixCheckpointError, ReceiptRecordOutcome,
     },
     commit_model::{CheckpointAggregatorInput, CompletedUnit},
+    commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput, QueuedCommit},
     result_committer::{ResultCommitError, ResultCommitter},
     result_translation::{ItemResult, PersistenceTranslation, translate_item_result},
     test_fixtures::{
@@ -378,6 +387,192 @@ fn real_receipts_only_advance_the_contiguous_prefix() {
             .is_none(),
         "no pending receipts should remain after acknowledging the full prefix"
     );
+}
+
+#[test]
+fn slow_sink_causes_backpressure_in_bounded_pipeline() {
+    let findings_sink = InMemoryFindingsSink::with_auto_complete(false);
+    let done_ledger = InMemoryDoneLedger::new();
+    let cancel = CancellationToken::new();
+    let pipeline = CommitPipeline::start(
+        findings_sink.clone(),
+        done_ledger.clone(),
+        CommitPipelineConfig {
+            execution_queue_capacity: 1,
+            outcome_queue_capacity: 4,
+        },
+        cancel,
+    )
+    .expect("pipeline should start");
+
+    let sender = pipeline.sender();
+    let (ack_tx, ack_rx) = mpsc::channel();
+    let context = write_context_with_epoch(600);
+    let mut aggregator = PrefixCheckpointAggregator::new(context, 0, 8);
+
+    let producer = thread::spawn(move || {
+        sender
+            .submit(QueuedCommit::new(
+                context,
+                completed_unit(0, 0x81),
+                scanned_translation(context, 0x81, 11),
+            ))
+            .expect("first submit should succeed");
+        ack_tx.send(1u8).expect("first ack");
+
+        sender
+            .submit(QueuedCommit::new(
+                context,
+                completed_unit(1, 0x82),
+                scanned_translation(context, 0x82, 12),
+            ))
+            .expect("second submit should succeed");
+        ack_tx.send(2u8).expect("second ack");
+
+        sender
+            .submit(QueuedCommit::new(
+                context,
+                completed_unit(2, 0x83),
+                scanned_translation(context, 0x83, 13),
+            ))
+            .expect("third submit should succeed once backpressure clears");
+        ack_tx.send(3u8).expect("third ack");
+    });
+
+    assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+    assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+    assert!(
+        matches!(
+            ack_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ),
+        "third submit should remain blocked while the slow sink stalls the worker and the bounded execution queue is full"
+    );
+    assert!(
+        matches!(
+            pipeline.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ),
+        "no durable receipt should be emitted while the first findings write is still pending"
+    );
+
+    for _ in 0..200 {
+        if findings_sink.pending_count().expect("pending count") == 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        findings_sink.pending_count().expect("pending count"),
+        1,
+        "exactly one findings write should be in-flight while the worker is stalled"
+    );
+    assert!(
+        done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot")
+            .is_empty(),
+        "done-ledger must remain empty until the blocked findings write is released"
+    );
+
+    findings_sink
+        .release_next(CompletionOrder::OldestFirst)
+        .expect("release first findings write")
+        .expect("first pending findings write");
+    assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+
+    for _ in 0..2 {
+        for _ in 0..200 {
+            if findings_sink.pending_count().expect("pending count") >= 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        findings_sink
+            .release_next(CompletionOrder::OldestFirst)
+            .expect("release remaining findings writes")
+            .expect("pending findings write should exist");
+    }
+
+    for _ in 0..3 {
+        match pipeline
+            .recv_timeout(Duration::from_secs(1))
+            .expect("committed outcome should arrive")
+        {
+            CommitStageOutput::Committed {
+                write_context,
+                checkpoint_input,
+            } => {
+                assert_eq!(
+                    write_context, context,
+                    "every committed outcome must preserve the originating write context"
+                );
+                assert_eq!(
+                    aggregator
+                        .record_receipt(checkpoint_input)
+                        .expect("receipt should buffer"),
+                    ReceiptRecordOutcome::Buffered
+                );
+            }
+            CommitStageOutput::Failed { error, .. } => {
+                panic!("expected durable commit success, got failure: {error}")
+            }
+        }
+    }
+
+    producer.join().expect("producer should join");
+    pipeline.shutdown().expect("worker should join");
+
+    assert_eq!(
+        findings_sink.pending_count().expect("pending count"),
+        0,
+        "all delayed findings writes must drain after the releases"
+    );
+    assert_sink_counts(&findings_sink, 6);
+
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(
+        rows.len(),
+        3,
+        "each committed item should produce one durable done-ledger row"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.status() == DoneLedgerStatus::ScannedWithFindings),
+        "all rows should reflect scanned items with findings"
+    );
+    assert!(
+        rows.iter().all(|row| row.findings_count() == 2),
+        "each durable done-ledger row should account for the two committed findings"
+    );
+    assert!(
+        rows.iter().all(|row| row.write_context() == context),
+        "every durable row must preserve the shared write context"
+    );
+
+    let pending = aggregator
+        .prepare_checkpoint()
+        .expect("checkpoint preparation should succeed")
+        .expect("three committed receipts should yield one contiguous checkpoint prefix");
+    assert_eq!(pending.first_sequence_no(), 0);
+    assert_eq!(pending.last_sequence_no(), 2);
+    assert_eq!(pending.committed_units(), 3);
+    assert_eq!(
+        pending.checkpoint_cursor(),
+        &Cursor::with_last_key(item_key(0x83)),
+        "the checkpoint cursor must advance to the final durably committed item"
+    );
+
+    let checkpoint_scope = pending.scope().clone();
+    aggregator
+        .acknowledge_checkpoint(CheckpointCommitReceipt::new(
+            checkpoint_scope,
+            LogicalTime::from_raw(9_601),
+        ))
+        .expect("acknowledging the fully drained prefix should succeed");
+    assert_eq!(aggregator.next_sequence_no(), 3);
+    assert_eq!(aggregator.checkpointed_units(), 3);
+    assert_eq!(aggregator.buffered_receipt_count(), 0);
 }
 
 #[test]
