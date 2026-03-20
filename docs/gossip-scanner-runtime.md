@@ -43,7 +43,7 @@ entrypoints share the same local runtime execution paths.
 | `src/lib_tests.rs` | Validation and local scan execution tests for the runtime core |
 | `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
 | `src/test_fixtures.rs` | Shared test fixtures (write contexts, timings, findings builders, rule fingerprints) used by runtime test modules |
-| `src/runtime_durability_tests.rs` | Integration tests that stitch together translation, findings -> done-ledger durability, and receipt-driven checkpoint aggregation to prove runtime durability invariants |
+| `src/runtime_durability_tests.rs` | Integration tests that stitch together translation, findings -> done-ledger durability, and receipt-driven checkpoint aggregation to prove explicit-receipt gating, contiguous-prefix advancement, and reassignment-safe retry invariants |
 | `Cargo.toml` | Runtime crate dependencies and feature flags |
 
 ---
@@ -632,9 +632,15 @@ The runtime tests focus on the behavior that exists today:
 - `gossip_coordination::InMemoryCoordinator` snapshots for completed shards
   and run progress
 - CLI parsing and summary formatting
+- local-vs-distributed filesystem finding-set parity after JSONL path
+  normalization
 - receipt-driven identity derivation via translate_item_result
 - authoritative findings -> done-ledger commit ordering and item-level receipt
   construction
+- explicit receipt gating before checkpoint advancement, including clean scans
+  that emit zero findings
+- contiguous-prefix checkpoint advancement from out-of-order durable receipts
+- stale-fence receipt rejection followed by reassignment-safe idempotent retry
 - bounded execution -> commit backpressure and cancellation semantics
 - crash-before-ledger fault injection with idempotent retry and checkpoint blocking
 - crash-before-findings-durability with empty-store verification
