@@ -1845,11 +1845,18 @@ mod tests {
     #[test]
     fn resolve_filesystem_lease_results_prefers_scan_failure_over_drain_failure() {
         let scan_error = ScanRuntimeError::Driver(AnyError::msg("scan boom"));
+        let submitted_error = anyhow!("submitted boom");
         let stage_error = anyhow!("drain boom");
 
-        let error =
-            resolve_filesystem_lease_results(Err(scan_error), Ok(Vec::new()), Ok(Err(stage_error)))
-                .expect_err("scan failure should win when both scan and drain fail");
+        // All three inputs fail so the test discriminates ordering: if the
+        // function ever checked `submitted` before `outcome`, the returned
+        // variant would be `Durability` instead of `Runtime`.
+        let error = resolve_filesystem_lease_results(
+            Err(scan_error),
+            Err(submitted_error),
+            Ok(Err(stage_error)),
+        )
+        .expect_err("scan failure should win when all three paths fail");
 
         assert!(
             matches!(error, DistributedRuntimeError::Runtime(_)),
@@ -1882,6 +1889,57 @@ mod tests {
         );
         assert!(
             error.to_string().contains("drain boom"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_filesystem_lease_results_maps_submitted_failure_to_durability() {
+        let submitted_error = anyhow!("submitted boom");
+
+        let error = resolve_filesystem_lease_results(
+            Ok(AssignmentOutcome {
+                report: ScanReport::default(),
+                checkpoint_hint: None,
+                debug_output: None,
+            }),
+            Err(submitted_error),
+            // stage_result is never reached because submitted fails first.
+            Err(anyhow!("unused")),
+        )
+        .expect_err("submitted failure should surface as Durability");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Durability(_)),
+            "expected Durability variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("submitted boom"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_filesystem_lease_results_maps_drain_thread_panic_to_durability() {
+        let panic_error = anyhow!("drain thread panicked");
+
+        let error = resolve_filesystem_lease_results(
+            Ok(AssignmentOutcome {
+                report: ScanReport::default(),
+                checkpoint_hint: None,
+                debug_output: None,
+            }),
+            Ok(Vec::new()),
+            Err(panic_error),
+        )
+        .expect_err("thread panic should be a durability error");
+
+        assert!(
+            matches!(error, DistributedRuntimeError::Durability(_)),
+            "expected Durability variant, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("drain thread panicked"),
             "unexpected error: {error}"
         );
     }
