@@ -1439,7 +1439,12 @@ dependencies = [
 name = "gossip-worker"
 version = "0.1.0"
 dependencies = [
+ "gossip-coordination-etcd",
+ "gossip-done-ledger-postgres",
+ "gossip-findings-postgres",
+ "gossip-pg-common",
  "gossip-scanner-runtime",
+ "postgres",
  "tempfile",
  "tracing",
  "tracing-subscriber",

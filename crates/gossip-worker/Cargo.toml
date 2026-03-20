@@ -12,9 +12,15 @@ default = []
 aegis-pure-rust = ["gossip-scanner-runtime/aegis-pure-rust"]
 
 [dependencies]
+gossip-coordination-etcd.workspace = true
+gossip-done-ledger-postgres.workspace = true
+gossip-findings-postgres.workspace = true
 gossip-scanner-runtime.workspace = true
+postgres.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+gossip-coordination-etcd = { workspace = true, features = ["test-support"] }
+gossip-pg-common = { workspace = true, features = ["test-support"] }
 tempfile = "3"
