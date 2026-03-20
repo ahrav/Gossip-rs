@@ -1,0 +1,28 @@
+[package]
+name = "gossip-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Binary: unified scan-driver worker entrypoint"
+
+[features]
+default = []
+aegis-pure-rust = ["gossip-scanner-runtime/aegis-pure-rust"]
+
+[dependencies]
+anyhow.workspace = true
+gossip-contracts.workspace = true
+gossip-coordination-etcd.workspace = true
+gossip-done-ledger-postgres.workspace = true
+gossip-findings-postgres.workspace = true
+gossip-scanner-runtime.workspace = true
+postgres.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+gossip-coordination-etcd = { workspace = true, features = ["test-support"] }
+gossip-pg-common = { workspace = true, features = ["test-support"] }
+tempfile = "3"
