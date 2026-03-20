@@ -381,7 +381,13 @@ jobs:
           shared-key: stable-linux-doc
           save-cache: "true"
 
-      - run: cargo doc --no-deps --all-features
+      # Explicit feature list instead of --all-features: avoids compiling
+      # librocksdb-sys (C++ from source, ~4 min on CI) which adds no public
+      # API surface. Only test-support features are needed to resolve
+      # doc-links to cfg-gated modules.
+      - run: >-
+          cargo doc --no-deps
+          --features gossip-contracts/test-support,gossip-coordination/test-support,gossip-coordination-etcd/test-support,gossip-pg-common/test-support,gossip-done-ledger-postgres/test-utils,gossip-findings-postgres/test-utils,gossip-persistence-inmemory/test-support,gossip-scanner-runtime/test-support,scanner-engine/test-support
 
   # ── Dependency Lint (licenses, advisories, bans) ───────────────────
   deny:
@@ -550,13 +556,13 @@ jobs:
 
       - name: Run tests (${{ matrix.profile }})
         run: >-
-          cargo nextest run --all-features ${{ matrix.release-flag }}
+          cargo nextest run --workspace --all-features ${{ matrix.release-flag }}
           --profile nightly
           --exclude gossip-coordination-etcd
 
       - name: Run ignored slow tests (${{ matrix.profile }})
         run: >-
-          cargo nextest run --all-features ${{ matrix.release-flag }}
+          cargo nextest run --workspace --all-features ${{ matrix.release-flag }}
           --profile nightly
           --exclude gossip-coordination-etcd
           --run-ignored ignored-only

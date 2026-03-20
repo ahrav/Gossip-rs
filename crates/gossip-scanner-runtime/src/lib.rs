@@ -1,5 +1,6 @@
-//! Scanner runtime: configuration, path validation, engine construction,
-//! and local scan dispatch for filesystem and Git source families.
+//! Unified scanner runtime: configuration, path validation, engine
+//! construction, scan dispatch, and receipt-driven durability plumbing for
+//! filesystem and Git source families.
 //!
 //! # Architecture
 //!
@@ -9,10 +10,14 @@
 //!
 //! 1. **Validate** user-supplied paths and budget parameters.
 //! 2. **Build** a detection engine from rules, transforms, and tuning knobs.
-//! 3. **Dispatch** scans through the appropriate source-family module:
+//! 3. **Dispatch** local scans through the appropriate source-family module:
 //!    - [`ordered_content`] for filesystem trees and single files.
 //!    - [`git_repo`] for local Git repositories.
-//! 4. **Bridge** scan-internal events into caller-owned sinks via bounded
+//! 4. **Drive** distributed durability through the shared receipt vocabulary
+//!    and stages: [`commit_model`], [`result_translation`],
+//!    [`result_committer`], [`commit_pipeline`], and
+//!    [`checkpoint_aggregator`].
+//! 5. **Bridge** scan-internal events into caller-owned sinks via bounded
 //!    channels and scoped forwarding threads.
 //!
 //! # Source families
@@ -28,6 +33,16 @@
 //! the same scan logic today. The distinction exists so that worker and CLI
 //! entry points exercise the same runtime boundary, and so the connector path
 //! can diverge when remote source enumeration is added.
+//!
+//! # Durability model
+//!
+//! Local CLI entry points can use no-op commit sinks, but distributed
+//! completion is locked to durable per-unit receipts. Scan completion and
+//! driver-local checkpoint hints are never authoritative progress signals;
+//! [`distributed`] advances shard completion only after
+//! [`result_committer::ResultCommitter`] returns receipts that
+//! [`checkpoint_aggregator::PrefixCheckpointAggregator`] can fold into the
+//! committed prefix.
 //!
 //! # Event forwarding
 //!
@@ -66,18 +81,31 @@ use scanner_scheduler::store::{
     FsFindingBatch, FsFindingRecord, FsRunLoss, FsStoreError, StoreProducer,
 };
 
+// Receipt-driven committed-prefix checkpoint aggregation.
 pub mod checkpoint_aggregator;
+// CLI entrypoint wiring, argument parsing, and runtime dispatch.
 pub mod cli;
+// Shared runtime commit vocabulary for family-neutral durability stages.
 pub mod commit_model;
+// Bounded execution -> commit pipeline for the receipt-driven durability model.
 pub mod commit_pipeline;
+// Commit-sink compatibility shims for non-durable runtime entry points.
 pub mod commit_sink;
+// Coordination-backed event sink for distributed scans.
 pub mod coordination_sink;
+// Distributed worker runtime and receipt-backed commit plumbing.
 pub mod distributed;
+// Event sink implementations for CLI and runtime output.
 pub mod event_sink;
+// Git-repository runtime boundary for local scans.
 pub mod git_repo;
+// Ordered-content (filesystem) runtime boundary.
 pub mod ordered_content;
+// Cross-scanner parity helpers.
 pub mod parity;
+// Authoritative findings -> done-ledger durable commit stage.
 pub mod result_committer;
+// Deterministic translation from scan results into persistence-layer rows.
 pub mod result_translation;
 
 /// How the runtime acquires source items.
@@ -209,8 +237,8 @@ impl CancellationToken {
 /// Both fields must be non-zero; validation enforces this constraint
 /// before distributed scan dispatch. Local scan paths (`scan_fs_with_runtime`,
 /// `scan_git_with_runtime`) do not validate or consume budgets — they are
-/// relevant only to the distributed runtime, which enforces them during
-/// checkpoint-bounded item processing.
+/// relevant only to the distributed runtime. Both fields are validated
+/// (non-zero) before dispatch but are not yet enforced at execution time.
 ///
 /// Defaults are intentionally conservative (256 items, 1 MB) to bound
 /// memory pressure in distributed workers.
@@ -680,12 +708,18 @@ impl From<ConnectorInputError> for ScanRuntimeError {
     }
 }
 
-/// Execution outcome for one runtime invocation.
+/// Execution outcome for one runtime assignment.
+///
+/// Local entry points consume this for summary reporting, while the
+/// distributed worker uses it to hand scan-side information back into
+/// coordinator flow control. The authoritative distributed progress signal is
+/// the receipt-driven committed prefix, not any driver-local checkpoint hint.
 #[derive(Clone, Debug)]
 pub struct AssignmentOutcome {
     /// Aggregate counters for the invocation.
     pub report: ScanReport,
-    /// Optional checkpoint hint for distributed coordinators.
+    /// Optional driver-local checkpoint hint retained for runtime-local
+    /// bookkeeping, never as the authoritative distributed progress signal.
     pub checkpoint_hint: Option<ScanCheckpoint>,
     /// Optional debug diagnostics for stderr output.
     pub debug_output: Option<String>,

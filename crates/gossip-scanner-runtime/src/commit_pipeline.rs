@@ -701,7 +701,8 @@ mod tests {
         result_committer::ResultCommitError,
         result_translation::{ItemResult, translate_item_result},
         test_fixtures::{
-            finding, tenant_secret_key, test_rule_fingerprint, timing_with_offset, write_context,
+            finding, tenant_secret_key, test_rule_fingerprint, timing_with_offset, wait_until,
+            write_context,
         },
     };
 
@@ -776,16 +777,6 @@ mod tests {
             completed_unit(sequence_no, item_suffix),
             translated_scan(item_suffix),
         )
-    }
-
-    fn wait_until(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..2_000 {
-            if predicate() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        panic!("condition was not satisfied before timeout");
     }
 
     #[test]

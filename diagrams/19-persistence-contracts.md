@@ -39,12 +39,13 @@ every runtime call site.
 
 ## 1. Persistence Trait Hierarchy
 
-The persistence surface is split into two durable sinks (findings and
-done-ledger) unified by a shared two-phase durability protocol. Submission and
-durability are intentionally separate: `Ok(handle)` means the backend accepted
-the write; `handle.wait()` blocks until the write is durable and returns a typed
-receipt. This separation lets backends coalesce writes (group-commit fsync) or
-pipeline I/O without weakening the caller-visible contract.
+The persistence surface is split into two receipt-emitting write traits
+(findings and done-ledger) unified by a shared two-phase durability protocol.
+Submission and durability are intentionally separate: `Ok(handle)` means the
+backend accepted the write; `handle.wait()` blocks until the write is durable
+and returns a typed receipt. This separation lets backends coalesce writes
+(group-commit fsync) or pipeline I/O without weakening the caller-visible
+contract.
 
 The `CommitHandle` trait consumes `self` on `wait()`, preventing double-waits.
 `ReadyCommitHandle` provides a zero-cost adapter for synchronous backends and

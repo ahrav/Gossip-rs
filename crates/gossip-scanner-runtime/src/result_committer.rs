@@ -526,7 +526,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::thread;
 
     use gossip_contracts::{
         connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
@@ -546,7 +546,9 @@ mod tests {
     use crate::{
         commit_model::CompletedUnit,
         result_translation::{ItemResult, translate_item_result},
-        test_fixtures::{finding, tenant_secret_key, test_rule_fingerprint, timing, write_context},
+        test_fixtures::{
+            finding, tenant_secret_key, test_rule_fingerprint, timing, wait_until, write_context,
+        },
     };
 
     fn scan_item() -> ScanItem {
@@ -620,16 +622,6 @@ mod tests {
             &test_rule_fingerprint,
         )
         .expect("translation")
-    }
-
-    fn wait_until(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..2_000 {
-            if predicate() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        panic!("condition was not satisfied before timeout");
     }
 
     #[test]

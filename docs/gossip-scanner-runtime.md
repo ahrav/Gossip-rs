@@ -26,7 +26,7 @@ entrypoints share the same local runtime execution paths.
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, `scan_fs_with_runtime`, `scan_git_with_runtime`, and `scan_fs_with_prebuilt_engine` (crate-internal entrypoint that reuses a caller-provided engine for distributed scans) |
+| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, mode-specific dispatchers (`scan_fs_direct`, `scan_fs_connector`, `scan_git_direct`, `scan_git_connector`), and crate-internal `scan_fs_with_runtime`, `scan_git_with_runtime`, `scan_fs_with_prebuilt_engine` |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
 | `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
@@ -207,7 +207,8 @@ pub struct ScanCheckpoint {
 
 Incremental progress hint for future resumable runtime loops. The type is
 local to this crate and avoids name collisions with other cursor-related
-types.
+types. Distributed workers derive shard advancement from receipt-backed
+contiguous-prefix aggregation before surfacing any checkpoint cursor.
 
 ### AssignmentOutcome
 
@@ -221,8 +222,10 @@ pub struct AssignmentOutcome {
 
 Return shape for the sink-aware runtime entrypoints. Callers receive the
 main report plus optional checkpoint and debug payloads. The `checkpoint_hint`
-field remains a non-authoritative hint; the durable commit pipeline is modeled
-separately in `src/commit_model.rs`.
+field remains an advisory runtime-local cursor for direct callers; it does not
+prove durable distributed progress. Coordinator-backed execution advances shard
+state only from receipt-backed commit outcomes that flow through
+`src/commit_model.rs`, `src/commit_pipeline.rs`, and `src/distributed.rs`.
 
 ### Runtime commit model
 
@@ -567,6 +570,8 @@ where
     C: CoordinationFacade,
     F: FindingsSink + Clone + Send + Sync + 'static,
     D: DoneLedger + Clone + Send + Sync + 'static,
+    F::Error: std::error::Error + Send + Sync + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
 {
     ...
 }
