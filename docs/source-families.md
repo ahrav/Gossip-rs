@@ -35,7 +35,7 @@ fill_page(shard, cursor, budgets)
      Ok(None)          => terminal completion (shard fully enumerated)
      Ok(Some(PageBuf)) => { items, state: HasMore{cursor} | Complete }
      for each item:
-        open(item_ref, budgets) -> Result<Box<dyn Read + Send>, ReadError>
+        open(item_ref, budgets) -> Result<Box<dyn io::Read + Send>, ReadError>
         (optionally) read_range(item_ref, offset, dst, budgets) -> Result<usize, ReadError>
      checkpoint cursor
 ```

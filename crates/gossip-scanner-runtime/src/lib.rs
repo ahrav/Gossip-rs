@@ -237,8 +237,8 @@ impl CancellationToken {
 /// Both fields must be non-zero; validation enforces this constraint
 /// before distributed scan dispatch. Local scan paths (`scan_fs_with_runtime`,
 /// `scan_git_with_runtime`) do not validate or consume budgets — they are
-/// relevant only to the distributed runtime, which enforces them during
-/// budget-bounded item processing.
+/// relevant only to the distributed runtime. Both fields are validated
+/// (non-zero) before dispatch but are not yet enforced at execution time.
 ///
 /// Defaults are intentionally conservative (256 items, 1 MB) to bound
 /// memory pressure in distributed workers.
