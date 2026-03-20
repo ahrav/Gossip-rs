@@ -9,7 +9,10 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use memmap2::{Mmap, MmapMut};
 
 /// Spill-file families supported by the scanner-git spill helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,25 +79,53 @@ pub(crate) fn reserve_unique_spill_file(
     ))
 }
 
+/// Creates paired writable and shared read-only mappings for a spill file.
+///
+/// # Safety contract for callers
+///
+/// To avoid undefined behaviour both of the following invariants MUST hold
+/// for the lifetime of the returned mappings:
+///
+/// 1. **Monotonic writes only** — the owning writer must advance its cursor
+///    strictly forward and must never overwrite a byte range that has already
+///    been exposed via a cloned `Arc<Mmap>` handle.  Violating this creates
+///    aliased `&mut [u8]` / `&[u8]` references to the same memory, which is
+///    UB in Rust regardless of synchronisation.
+/// 2. **No external modification** — no other process (or thread) must write
+///    to the underlying file while either mapping is live.  The `memmap2`
+///    safety contract requires this for read-only maps.
+///
+/// Spill helpers in this crate satisfy both invariants: the file is sized
+/// once in [`reserve_unique_spill_file`] and never resized, and the write
+/// cursor is monotonically advancing.
+pub(crate) fn map_spill_file(file: &File) -> io::Result<(MmapMut, Arc<Mmap>)> {
+    // SAFETY: Callers size the file to its final length before mapping and
+    // write through the mutable mapping with a monotonically advancing
+    // cursor, so no byte range is mutated while a reader observes it.
+    let writer = unsafe { MmapMut::map_mut(file)? };
+    // SAFETY: Read-only mapping of the same fixed-length file.  No external
+    // process modifies the file during the mapping's lifetime.
+    let reader = Arc::new(unsafe { Mmap::map(file)? });
+    Ok((writer, reader))
+}
+
 fn next_spill_path_candidate(dir: &Path, kind: SpillPathKind) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let counter = GLOBAL_SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut path = dir.to_path_buf();
-    path.push(format!(
+    dir.join(format!(
         "{}_{}_{}_{}",
         kind.prefix(),
         std::process::id(),
         now.as_nanos(),
         counter
-    ));
-    path
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reserve_unique_spill_file, SpillPathKind};
+    use super::{map_spill_file, reserve_unique_spill_file, SpillPathKind};
 
     #[test]
     fn spill_path_kind_controls_filename_prefix() {
@@ -116,5 +147,29 @@ mod tests {
             .is_some_and(|name| name.starts_with("tree_spill_")));
         assert_eq!(blob_file.metadata().expect("blob metadata").len(), 8);
         assert_eq!(tree_file.metadata().expect("tree metadata").len(), 16);
+    }
+
+    #[test]
+    fn map_spill_file_writes_visible_through_reader() {
+        let dir = tempfile::tempdir().expect("create test dir");
+        let (_path, file) =
+            reserve_unique_spill_file(dir.path(), SpillPathKind::Blob, 64).expect("reserve");
+
+        let (mut writer, reader) = map_spill_file(&file).expect("map");
+
+        writer[..5].copy_from_slice(b"hello");
+        assert_eq!(&reader[..5], b"hello");
+    }
+
+    #[test]
+    fn map_spill_file_zero_length_returns_empty_mappings() {
+        let dir = tempfile::tempdir().expect("create test dir");
+        let (_path, file) =
+            reserve_unique_spill_file(dir.path(), SpillPathKind::Tree, 0).expect("reserve");
+
+        let (writer, reader) = map_spill_file(&file).expect("map");
+
+        assert!(writer.is_empty());
+        assert!(reader.is_empty());
     }
 }

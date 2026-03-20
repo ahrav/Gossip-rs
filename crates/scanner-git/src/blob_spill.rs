@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::spill_path::{reserve_unique_spill_file, SpillPathKind};
+use crate::spill_path::{map_spill_file, reserve_unique_spill_file, SpillPathKind};
 use memmap2::{Mmap, MmapMut};
 
 /// Spill-backed blob bytes.
@@ -33,10 +33,7 @@ impl BlobSpill {
     /// Create a new spill file sized to `len` bytes.
     pub fn new(dir: &Path, len: usize) -> io::Result<Self> {
         let (path, file) = reserve_unique_spill_file(dir, SpillPathKind::Blob, len as u64)?;
-        // SAFETY: The file length is fixed and we only write through the mutable mapping.
-        let writer = unsafe { MmapMut::map_mut(&file)? };
-        // SAFETY: Read-only view of the same immutable-length file.
-        let reader = Arc::new(unsafe { Mmap::map(&file)? });
+        let (writer, reader) = map_spill_file(&file)?;
 
         Ok(Self {
             path,
