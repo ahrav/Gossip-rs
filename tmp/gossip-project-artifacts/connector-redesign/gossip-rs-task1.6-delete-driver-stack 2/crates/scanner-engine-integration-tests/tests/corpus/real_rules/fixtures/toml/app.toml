@@ -1,4 +1,0 @@
-# Fixture: TOML config with password field
-[auth]
-username = "demo"
-password = "abc12345"
