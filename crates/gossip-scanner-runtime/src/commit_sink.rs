@@ -1,7 +1,10 @@
-//! Shared commit-sink traits and lightweight record types for runtime entry points.
+//! Commit-sink compatibility shims for non-durable runtime entry points.
 //!
-//! Distributed receipt-driven execution provides its adapter in
-//! `distributed.rs`, while CLI and direct-mode scans use [`CliNoOpCommitSink`].
+//! The authoritative durability path is the receipt-driven execution ->
+//! commit pipeline (`ReceiptCommitSink` in `distributed.rs` feeding
+//! `ResultCommitter`). This module keeps the family-neutral `CommitSink`
+//! bridge, lightweight record types, and the CLI no-op implementation used by
+//! local scans.
 
 use std::fmt;
 
@@ -101,7 +104,7 @@ pub trait CommitSink: Send + Sync {
     /// Record one batch of findings for an in-progress item.
     ///
     /// Callers should submit validated batches via [`FindingsBatch::validate`].
-    /// Durable sink implementations perform their own validation as
+    /// Persisting sink implementations perform their own validation as
     /// defense-in-depth; no-op sinks may skip it.
     fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()>;
 

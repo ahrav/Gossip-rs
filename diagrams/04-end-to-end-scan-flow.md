@@ -58,6 +58,12 @@ sequenceDiagram
 `Direct` and `Connector` modes converge on the same family modules inside the
 runtime crate.
 
+**Receipt-gated distributed progress.** The worker loop does not treat raw
+item completion or returned checkpoint hints as authoritative durability
+signals. Coordinator-backed execution advances shard progress only after the
+commit pipeline emits receipt-backed outcomes that the runtime folds into a
+contiguous committed prefix.
+
 **Family dispatch.** The filesystem and Git family modules route scan requests
 to `scan_local_filesystem` and `scan_local_repo` respectively. The distributed
 layer carries a dedicated `DistributedRuntimeError` enum for the worker loop.

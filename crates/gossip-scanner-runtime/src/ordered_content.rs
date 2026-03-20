@@ -14,7 +14,8 @@
 //!    diagnostics) from the scan workers into the caller's [`EventOutput`] sink.
 //! 2. **Commit forwarder** — drains persistence batches into the caller's
 //!    [`CommitSink`](crate::commit_sink::CommitSink) (a no-op sink for CLI
-//!    scans, a durable sink for distributed scans).
+//!    scans; distributed mode routes the same lifecycle into the
+//!    receipt-driven commit pipeline).
 //!
 //! Both channels are bounded (`EVENT_CHANNEL_CAP` and `COMMIT_CHANNEL_CAP`)
 //! and are explicitly dropped after the scan completes so the forwarder
@@ -69,8 +70,9 @@ impl OrderedContentRuntime {
 ///
 /// When `config.persist_findings` is true, a [`ChannelStoreProducer`] is
 /// wired into the parallel scanner. Finding batches flow through the commit
-/// channel to the `commit` sink, which may be a no-op (CLI) or a durable
-/// recorder (distributed mode).
+/// channel to the `commit` sink, which is a no-op for CLI scans; distributed
+/// mode routes the same lifecycle into the receipt-driven commit pipeline via
+/// its commit-sink adapter.
 ///
 /// # Errors
 ///
