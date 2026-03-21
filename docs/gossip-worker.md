@@ -39,6 +39,10 @@ Specifically:
   backend settings
 - `backend=production` never falls back to local or in-memory doubles
 - the default launch path fails closed on missing production backend settings
+- production startup validates etcd and both PostgreSQL schemas before any
+  shard work begins
+- development-only startup policy can auto-apply embedded migrations before
+  readiness validation
 - successful local runs log `(items_scanned, bytes_scanned, findings_emitted)`
 - successful distributed runs log `(leases_seen, shards_scanned)`
 
@@ -96,20 +100,23 @@ connector mode; use `--mode=direct` for local scans.
 
 ### Production composition flow
 
-`run_production_worker` handles connection, migration, and execution in one
-call:
+`run_production_worker` handles connection, startup readiness, and execution
+in one call:
 
 ```text
 caller
   -> ProductionBackendConfig::new(...)
+  -> ProductionStartupSettings::{validate_only, dev_auto_migrate}()
   -> DistributedWorkerConfig::worker_identity() | worker_identity_with_recorder()
   -> DistributedWorkerConfig::runtime_config()
-  -> run_production_worker(config, identity, runtime)
-     -> build_production_backends(config)
-        -> EtcdCoordinator::connect(...)
+  -> run_production_worker(config, startup, identity, runtime)
+     -> build_production_backends(config, startup)
         -> connect_postgres_client(...) [done-ledger]
         -> connect_postgres_client(...) [findings]
-     -> apply_migrations() on done_ledger and findings_sink
+        -> build_production_backends_from_clients(..., startup)
+           -> EtcdCoordinator::connect(...) [includes cluster health check]
+           -> prepare_done_ledger_backend(...)
+           -> prepare_findings_backend(...)
      -> distributed::run_worker(...)
   -> DistributedRunReport
 ```
@@ -179,6 +186,7 @@ override environment values when both are present.
 | `GOSSIP_ETCD_NAMESPACE` | string | *(none)* | Yes (production) | etcd namespace prefix for key isolation. |
 | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the done-ledger database. |
 | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the findings database. |
+| `GOSSIP_STARTUP_SCHEMA_MODE` | `validate` or `dev-auto-migrate` | `validate` | No | Startup schema policy. `validate` fails closed when schemas are missing or drifted; `dev-auto-migrate` applies embedded migrations first, then validates readiness. |
 | `GOSSIP_TENANT_ID` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant identity. Accepts optional `0x` prefix. |
 | `GOSSIP_RUN_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Run identity. Zero is the unassigned sentinel and is rejected. |
 | `GOSSIP_WORKER_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Worker identity. Zero is the unassigned sentinel and is rejected. |
@@ -210,6 +218,7 @@ All flags use `--name=value` syntax (equals-sign required; space-separated
 | `--etcd-namespace` | `GOSSIP_ETCD_NAMESPACE` | string |
 | `--done-ledger-postgres-dsn` | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN |
 | `--findings-postgres-dsn` | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN |
+| `--startup-schema-mode` | `GOSSIP_STARTUP_SCHEMA_MODE` | `validate`, `dev-auto-migrate` |
 | `--tenant-id` | `GOSSIP_TENANT_ID` | 64 hex chars |
 | `--run-id` | `GOSSIP_RUN_ID` | u64, >= 1 |
 | `--worker-id` | `GOSSIP_WORKER_ID` | u64, >= 1 |
@@ -298,6 +307,7 @@ loop.
 ```rust
 struct DistributedWorkerConfig {
     backends: ProductionBackendConfig,
+    startup: ProductionStartupSettings,
     identity: WorkerIdentityConfig,
     source: FsSourceSettings,
     runtime: DistributedWorkerRuntimeSettings,
@@ -307,7 +317,37 @@ struct DistributedWorkerConfig {
 Resolved real-backend launch configuration. Identity fields (tenant, run,
 worker, policy hash, secret key) are grouped in `WorkerIdentityConfig` and
 accessible through the `identity()` accessor or individual delegation methods
-(`tenant()`, `run()`, etc.). Backend is always `Production` by construction.
+(`tenant()`, `run()`, etc.). The `startup()` accessor exposes the schema
+readiness policy for the production bootstrap path. Backend is always
+`Production` by construction.
+
+### StartupSchemaMode
+
+```rust
+enum StartupSchemaMode {
+    Validate,
+    DevAutoMigrate,
+}
+```
+
+Startup policy for the production composition root. `Validate` is the
+fail-closed default: both PostgreSQL schemas and their migration history
+tables must already exist and match the embedded checksums.
+`DevAutoMigrate` is reserved for local development and integration
+workflows where applying embedded migrations at startup is acceptable.
+The etcd cluster health check runs unconditionally regardless of schema
+mode.
+
+### ProductionStartupSettings
+
+```rust
+struct ProductionStartupSettings {
+    schema_mode: StartupSchemaMode,
+}
+```
+
+Small typed wrapper that carries the selected startup policy through config
+resolution and into the production composition root.
 
 ### ResolvedWorkerConfig
 
@@ -346,7 +386,8 @@ redacts both DSNs so credentials do not leak into logs.
 ### ProductionRuntimeBackends
 
 Concrete bundle of the live etcd coordinator and persistence handles passed to
-the generic distributed runtime.
+the generic distributed runtime. Construction succeeds only after etcd passes a
+status check and both PostgreSQL schemas satisfy the selected startup policy.
 
 ### ProductionCoordinationEventRecorder
 
@@ -429,7 +470,7 @@ output for diagnostics).
 | `main()` | Wire together tracing, config resolution, execution, logging, and exit codes |
 | `build_production_backends()` | Connect the real etcd and PostgreSQL backends from DSNs |
 | `build_production_backends_from_clients()` | Wrap caller-supplied PostgreSQL clients with the real runtime backends |
-| `run_production_worker()` | Build backends, apply migrations, and run the distributed runtime |
+| `run_production_worker()` | Build backends, enforce the startup schema policy, and run the distributed runtime |
 
 ---
 
@@ -439,6 +480,8 @@ The config module checks:
 
 - resolution of a full production config from environment variables alone
 - CLI override precedence over environment values
+- defaulting of startup schema mode to `validate`
+- parsing of `startup-schema-mode` from environment variables and CLI flags
 - connector-mode defaulting to the production backend path
 - fail-closed startup when production backend settings are absent
 - rejection of `--backend=local` in connector mode
@@ -462,8 +505,17 @@ The production module includes:
 - DSN whitespace trimming validation
 - debug redaction coverage for secret-bearing DSNs
 - error-chain preservation for bootstrap and worker error conversions
-- ignored live-backend bootstrap tests that require configured etcd and
-  PostgreSQL endpoints
+- validate-only failures when done-ledger or findings schemas are missing
+- checksum-mismatch detection for persisted done-ledger migration history
+- truncated-checksum detection for corrupted migration history rows
+- development auto-migrate bootstrap and idempotency coverage
+- development auto-migrate followed by validate-only on the same database
+- live-backend construction from explicit PostgreSQL clients
+- proof that schema-readiness failures stop before the distributed runtime
+  claims shards
+- proof that the real backend path reaches the coordinator runtime without
+  falling back to local or in-memory doubles
+- DSN host extraction with literal `@` in password
 
 The recorder module checks:
 

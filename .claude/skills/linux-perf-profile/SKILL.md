@@ -351,4 +351,6 @@ PMU data to source-level patterns. Reference specific lines/functions.]
 
 - `/bench-compare` — Criterion before/after measurement (use first to detect regressions)
 - `/perf-regression` — Full regression workflow with acceptance criteria
+- `/perf-topdown` — Cross-arch TMA + branch trace entry point; escalates to this skill for ARM-specific deep dives
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns
+- `/pgo-bolt` — Branch sampling data from perf can feed BOLT for post-link binary optimization

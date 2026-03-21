@@ -121,5 +121,7 @@ Report results as:
 
 - `/bench-compare` — Quick before/after benchmark comparison
 - `/asm-forge` — Assembly-guided optimization for hot functions
-- `/linux-perf-profile` — Hardware counter analysis for deeper investigation
+- `/linux-perf-profile` — ARM-focused deep drill-down (cache, TLB, lock contention)
+- `/perf-topdown` — Cross-arch TMA classification and branch trace analysis
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns
+- `/pgo-bolt` — Apply PGO+BOLT to production builds before regression testing
