@@ -294,14 +294,19 @@ fn worker_binary_path() -> PathBuf {
 }
 
 fn migrate_database_pair(done_ledger_dsn: &str, findings_dsn: &str) {
-    let mut done_ledger_client =
-        Client::connect(done_ledger_dsn, NoTls).expect("done-ledger test DB should connect");
-    apply_done_ledger_migrations(&mut done_ledger_client)
-        .expect("done-ledger migrations should succeed");
-
-    let mut findings_client =
-        Client::connect(findings_dsn, NoTls).expect("findings test DB should connect");
-    apply_findings_migrations(&mut findings_client).expect("findings migrations should succeed");
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut client = Client::connect(done_ledger_dsn, NoTls)
+                .expect("done-ledger test DB should connect");
+            apply_done_ledger_migrations(&mut client)
+                .expect("done-ledger migrations should succeed");
+        });
+        s.spawn(|| {
+            let mut client =
+                Client::connect(findings_dsn, NoTls).expect("findings test DB should connect");
+            apply_findings_migrations(&mut client).expect("findings migrations should succeed");
+        });
+    });
 }
 
 fn run_worker_process(
@@ -374,6 +379,10 @@ fn assert_worker_success(output: &Output, context: &str) {
 }
 
 fn table_row_count(dsn: &str, table: &str) -> i64 {
+    assert!(
+        table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "table_row_count requires a plain SQL identifier, got: {table}"
+    );
     let mut client = Client::connect(dsn, NoTls).expect("test database should connect");
     client
         .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
@@ -409,19 +418,22 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
 
     let done_ledger_rows = proof.done_ledger_row_count();
     let observation_rows = proof.observation_row_count();
+    // The scan fixture contains exactly 2 files (evidence.txt, readme.txt),
+    // producing one done-ledger entry per scanned object-version.
     assert!(
-        done_ledger_rows > 0,
-        "happy path must durably persist done-ledger rows"
+        done_ledger_rows >= 2,
+        "expected at least 2 done-ledger rows (one per scanned file), got {done_ledger_rows}"
     );
+    // The safe-test-token rule matches exactly once in evidence.txt.
     assert!(
-        observation_rows > 0,
-        "happy path must durably persist findings observations for the safe test rule '{}'",
+        observation_rows >= 1,
+        "expected at least 1 observation for rule '{}', got {observation_rows}",
         SAFE_RULE_NAME,
     );
     let targeted_observations = proof.observations_for_run();
     assert!(
-        targeted_observations > 0,
-        "observations must belong to the seeded run_id={} and shard_id={}",
+        targeted_observations >= 1,
+        "expected at least 1 observation for run_id={}, shard_id={}, got {targeted_observations}",
         RUN_ID_RAW,
         SHARD_ID_RAW,
     );
@@ -451,12 +463,14 @@ fn worker_binary_restart_is_idempotent_after_completed_shard() {
     let done_rows_after_first = proof.done_ledger_row_count();
     let observation_rows_after_first = proof.observation_row_count();
     assert!(
-        done_rows_after_first > 0,
-        "first launch must write done-ledger rows"
+        done_rows_after_first >= 2,
+        "first launch must write at least 2 done-ledger rows (one per scanned file), \
+         got {done_rows_after_first}"
     );
     assert!(
-        observation_rows_after_first > 0,
-        "first launch must write findings observations"
+        observation_rows_after_first >= 1,
+        "first launch must write at least 1 findings observation, \
+         got {observation_rows_after_first}"
     );
 
     let second = proof.run_worker_binary();
@@ -567,9 +581,37 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
         "replacement lease must advance the fencing epoch"
     );
 
-    let _ = backend_b
+    // After the replacement worker advances the fence, zombie operations
+    // must be rejected with current > presented (the stronger invariant
+    // that the pre-replacement assertions above cannot exercise).
+    let superseded_checkpoint = backend_a
         .checkpoint(
             now(7),
+            tenant_id(),
+            &lease_a,
+            &CursorUpdate::new(b"q"),
+            OpId::from_raw(400),
+        )
+        .expect_err("zombie checkpoint must be rejected after replacement acquisition");
+    match superseded_checkpoint {
+        CheckpointError::StaleFence { presented, current } => {
+            assert_eq!(presented, lease_a.fence());
+            assert_eq!(
+                current,
+                lease_b.fence(),
+                "current fence must reflect the replacement worker's epoch"
+            );
+            assert!(
+                current > presented,
+                "replacement acquisition must advance fence beyond the zombie's epoch"
+            );
+        }
+        other => panic!("expected StaleFence after replacement, got {other:?}"),
+    }
+
+    let _ = backend_b
+        .checkpoint(
+            now(8),
             tenant_id(),
             &lease_b,
             &CursorUpdate::new(b"p"),
