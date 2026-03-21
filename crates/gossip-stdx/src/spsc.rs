@@ -994,6 +994,130 @@ mod loom_tests {
             assert_eq!(received, vec![0, 1, 2, 3]);
         });
     }
+
+    /// Verify `try_pop_batch` preserves FIFO ordering across all interleavings.
+    ///
+    /// Producer pushes K items, consumer drains with `try_pop_batch` into a
+    /// buffer larger than K. Loom explores all scheduling points between the
+    /// producer's Release-store of tail and the consumer's Acquire-load + batch
+    /// read + Release-store of head.
+    #[test]
+    fn loom_spsc_try_pop_batch() {
+        const K: u32 = 3;
+
+        loom::model(|| {
+            let ring = loom::sync::Arc::new(SpscRing::<u32, 4>::new());
+
+            let ring_p = ring.clone();
+            let ring_c = ring.clone();
+
+            let producer = thread::spawn(move || {
+                let mut prod = SpscProducer {
+                    ring: &*ring_p,
+                    cached_head: 0,
+                };
+                for i in 0..K {
+                    loop {
+                        match prod.try_push(i) {
+                            Ok(()) => break,
+                            Err(_) => loom::thread::yield_now(),
+                        }
+                    }
+                }
+            });
+
+            let consumer = thread::spawn(move || {
+                let mut cons = SpscConsumer {
+                    ring: &*ring_c,
+                    cached_tail: 0,
+                };
+                let mut received = Vec::new();
+                let mut buf = [MaybeUninit::uninit(); 4];
+
+                while received.len() < K as usize {
+                    let n = cons.try_pop_batch(&mut buf);
+                    for slot in &buf[..n] {
+                        // SAFETY: `try_pop_batch` guarantees `buf[0..n]` are initialized.
+                        received.push(unsafe { slot.assume_init_read() });
+                    }
+                    if n == 0 {
+                        loom::thread::yield_now();
+                    }
+                }
+                received
+            });
+
+            producer.join().unwrap();
+            let received = consumer.join().unwrap();
+
+            assert_eq!(received.len(), K as usize, "all items must be received");
+            for (i, &v) in received.iter().enumerate() {
+                assert_eq!(v, i as u32, "FIFO violated at index {i}");
+            }
+        });
+    }
+
+    /// Verify `try_pop_batch` under backpressure: producer pushes more items
+    /// than capacity, requiring the consumer to batch-drain mid-way.
+    ///
+    /// Mirrors `loom_spsc_full_retry` but uses `try_pop_batch` instead of
+    /// `try_pop`. Verifies no data loss and strict FIFO ordering when the
+    /// ring wraps under concurrent push/batch-pop.
+    #[test]
+    fn loom_spsc_batch_backpressure() {
+        loom::model(|| {
+            let ring = loom::sync::Arc::new(SpscRing::<u32, 2>::new());
+
+            let ring_p = ring.clone();
+            let ring_c = ring.clone();
+
+            // Push 4 items into a capacity-2 ring — requires consumer drain.
+            let producer = thread::spawn(move || {
+                let mut prod = SpscProducer {
+                    ring: &*ring_p,
+                    cached_head: 0,
+                };
+                for i in 0..4u32 {
+                    loop {
+                        match prod.try_push(i) {
+                            Ok(()) => break,
+                            Err(_) => loom::thread::yield_now(),
+                        }
+                    }
+                }
+            });
+
+            let consumer = thread::spawn(move || {
+                let mut cons = SpscConsumer {
+                    ring: &*ring_c,
+                    cached_tail: 0,
+                };
+                let mut received = Vec::new();
+                let mut buf = [MaybeUninit::uninit(); 2];
+
+                while received.len() < 4 {
+                    let n = cons.try_pop_batch(&mut buf);
+                    for slot in &buf[..n] {
+                        // SAFETY: `try_pop_batch` guarantees `buf[0..n]` are initialized.
+                        received.push(unsafe { slot.assume_init_read() });
+                    }
+                    if n == 0 {
+                        loom::thread::yield_now();
+                    }
+                }
+                received
+            });
+
+            producer.join().unwrap();
+            let received = consumer.join().unwrap();
+
+            assert_eq!(
+                received,
+                vec![0, 1, 2, 3],
+                "FIFO with no data loss under backpressure"
+            );
+        });
+    }
 }
 
 // ============================================================================

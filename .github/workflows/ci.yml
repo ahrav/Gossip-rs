@@ -678,8 +678,8 @@ jobs:
           save-cache: "false"
 
       # Loom exhaustively explores thread interleavings.
-      # 12 loom::model tests across 2 crates (gossip-stdx, scanner-scheduler).
-      - name: Loom — gossip-stdx (8 tests)
+      # 15 loom::model tests across 2 crates (gossip-stdx, scanner-scheduler).
+      - name: Loom — gossip-stdx (11 tests)
         run: >-
           RUSTFLAGS="--cfg loom" cargo test --lib
           -p gossip-stdx --features loom -- loom_tests
