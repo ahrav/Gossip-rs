@@ -350,8 +350,8 @@ impl<T, const N: usize> SpscConsumer<T, N> {
 /// tx.try_push(42).unwrap();
 /// assert_eq!(rx.try_pop(), Some(42));
 /// ```
-pub fn spsc_channel<T: Send + 'static, const N: usize>()
--> (OwnedSpscProducer<T, N>, OwnedSpscConsumer<T, N>) {
+pub fn spsc_channel<T: Send + 'static, const N: usize>(
+) -> (OwnedSpscProducer<T, N>, OwnedSpscConsumer<T, N>) {
     // Force compile-time capacity check.
     let _ = SpscRing::<T, N>::CAPACITY;
 
@@ -590,8 +590,8 @@ mod tests {
 
     #[test]
     fn drop_remaining_items() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         let drop_count = Arc::new(AtomicUsize::new(0));
 
@@ -656,8 +656,8 @@ mod tests {
     /// are dropped — verifying no leak or double-drop.
     #[test]
     fn cross_thread_drop_tracking() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         struct Dt(Arc<AtomicUsize>);
         impl Drop for Dt {
@@ -889,6 +889,15 @@ mod prop_tests {
 
 #[cfg(all(test, loom))]
 mod loom_tests {
+    //! Loom exhaustively explores thread interleavings for the atomic
+    //! head/tail index operations. `SpscRing::buf` still uses
+    //! `std::cell::UnsafeCell` (not `loom::cell::UnsafeCell`), so loom
+    //! cannot detect data races *within the slot buffer itself*. Slot-level
+    //! safety depends on the Release/Acquire ordering of `tail` and `head`,
+    //! which loom does verify. Substituting `loom::cell::UnsafeCell` would
+    //! require restructuring all buffer access paths (the loom API returns
+    //! tracked `ConstPtr`/`MutPtr` wrappers rather than raw `*mut T`).
+
     use super::*;
     use loom::thread;
 
@@ -1065,19 +1074,21 @@ mod loom_tests {
     /// ring wraps under concurrent push/batch-pop.
     #[test]
     fn loom_spsc_batch_backpressure() {
+        const TOTAL: u32 = 4;
+
         loom::model(|| {
             let ring = loom::sync::Arc::new(SpscRing::<u32, 2>::new());
 
             let ring_p = ring.clone();
             let ring_c = ring.clone();
 
-            // Push 4 items into a capacity-2 ring — requires consumer drain.
+            // Push TOTAL items into a capacity-2 ring — requires consumer drain.
             let producer = thread::spawn(move || {
                 let mut prod = SpscProducer {
                     ring: &*ring_p,
                     cached_head: 0,
                 };
-                for i in 0..4u32 {
+                for i in 0..TOTAL {
                     loop {
                         match prod.try_push(i) {
                             Ok(()) => break,
@@ -1095,7 +1106,7 @@ mod loom_tests {
                 let mut received = Vec::new();
                 let mut buf = [MaybeUninit::uninit(); 2];
 
-                while received.len() < 4 {
+                while received.len() < TOTAL as usize {
                     let n = cons.try_pop_batch(&mut buf);
                     for slot in &buf[..n] {
                         // SAFETY: `try_pop_batch` guarantees `buf[0..n]` are initialized.
@@ -1111,9 +1122,9 @@ mod loom_tests {
             producer.join().unwrap();
             let received = consumer.join().unwrap();
 
+            let expected: Vec<u32> = (0..TOTAL).collect();
             assert_eq!(
-                received,
-                vec![0, 1, 2, 3],
+                received, expected,
                 "FIFO with no data loss under backpressure"
             );
         });

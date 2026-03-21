@@ -253,6 +253,8 @@ mod loom_tests {
 
             // Sequential clear — per the documented usage contract.
             bs.clear();
+            assert!(!bs.is_set(0), "bit 0 should be zero after clear");
+            assert!(!bs.is_set(1), "bit 1 should be zero after clear");
 
             // After clear, spawn threads that race on the same bits.
             // `thread::spawn` provides happens-before, so both threads
