@@ -113,7 +113,7 @@ impl fmt::Display for BackendSelection {
 /// Source family selected by the worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerSource {
-    /// Ordered-content filesystem scan.
+    /// Filesystem scan.
     Fs,
     /// Local Git repository scan.
     Git,
@@ -135,15 +135,71 @@ impl FromStr for WorkerSource {
     }
 }
 
+/// Scan tuning shared by both filesystem and git source types.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommonScanSettings {
+    decode_depth: Option<usize>,
+    scan_binary: bool,
+    rules_file: Option<PathBuf>,
+    anchor_mode: AnchorMode,
+}
+
+impl CommonScanSettings {
+    #[inline]
+    #[must_use]
+    pub fn decode_depth(&self) -> Option<usize> {
+        self.decode_depth
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn scan_binary(&self) -> bool {
+        self.scan_binary
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn rules_file(&self) -> Option<&Path> {
+        self.rules_file.as_deref()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn anchor_mode(&self) -> AnchorMode {
+        self.anchor_mode
+    }
+
+    #[must_use]
+    pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
+        self.decode_depth = decode_depth;
+        self
+    }
+
+    #[must_use]
+    pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
+        self.scan_binary = scan_binary;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
+        self.rules_file = rules_file;
+        self
+    }
+
+    #[must_use]
+    pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
+        self.anchor_mode = anchor_mode;
+        self
+    }
+}
+
 /// Filesystem-specific source settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsSourceSettings {
     path: PathBuf,
-    decode_depth: Option<usize>,
     skip_archives: bool,
-    scan_binary: bool,
-    rules_file: Option<PathBuf>,
-    anchor_mode: AnchorMode,
+    common: CommonScanSettings,
 }
 
 impl FsSourceSettings {
@@ -157,11 +213,8 @@ impl FsSourceSettings {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            decode_depth: None,
             skip_archives: false,
-            scan_binary: false,
-            rules_file: None,
-            anchor_mode: AnchorMode::Manual,
+            common: CommonScanSettings::default(),
         }
     }
 
@@ -174,7 +227,7 @@ impl FsSourceSettings {
     #[inline]
     #[must_use]
     pub fn decode_depth(&self) -> Option<usize> {
-        self.decode_depth
+        self.common.decode_depth()
     }
 
     #[inline]
@@ -186,24 +239,24 @@ impl FsSourceSettings {
     #[inline]
     #[must_use]
     pub fn scan_binary(&self) -> bool {
-        self.scan_binary
+        self.common.scan_binary()
     }
 
     #[inline]
     #[must_use]
     pub fn rules_file(&self) -> Option<&Path> {
-        self.rules_file.as_deref()
+        self.common.rules_file()
     }
 
     #[inline]
     #[must_use]
     pub fn anchor_mode(&self) -> AnchorMode {
-        self.anchor_mode
+        self.common.anchor_mode()
     }
 
     #[must_use]
     pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
-        self.decode_depth = decode_depth;
+        self.common = self.common.with_decode_depth(decode_depth);
         self
     }
 
@@ -215,19 +268,19 @@ impl FsSourceSettings {
 
     #[must_use]
     pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
-        self.scan_binary = scan_binary;
+        self.common = self.common.with_scan_binary(scan_binary);
         self
     }
 
     #[must_use]
     pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
-        self.rules_file = rules_file;
+        self.common = self.common.with_rules_file(rules_file);
         self
     }
 
     #[must_use]
     pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
-        self.anchor_mode = anchor_mode;
+        self.common = self.common.with_anchor_mode(anchor_mode);
         self
     }
 
@@ -239,11 +292,11 @@ impl FsSourceSettings {
         budgets: ScanBudgets,
     ) -> FsScanConfig {
         FsScanConfig::new(self.path.clone())
-            .with_decode_depth(self.decode_depth)
+            .with_decode_depth(self.common.decode_depth)
             .with_skip_archives(self.skip_archives)
-            .with_scan_binary(self.scan_binary)
-            .with_rules_file(self.rules_file.clone())
-            .with_anchor_mode(self.anchor_mode)
+            .with_scan_binary(self.common.scan_binary)
+            .with_rules_file(self.common.rules_file.clone())
+            .with_anchor_mode(self.common.anchor_mode)
             .with_execution_mode(execution_mode)
             .with_budgets(budgets)
     }
@@ -253,10 +306,7 @@ impl FsSourceSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitSourceSettings {
     repo: PathBuf,
-    decode_depth: Option<usize>,
-    scan_binary: bool,
-    rules_file: Option<PathBuf>,
-    anchor_mode: AnchorMode,
+    common: CommonScanSettings,
 }
 
 impl GitSourceSettings {
@@ -270,10 +320,7 @@ impl GitSourceSettings {
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         Self {
             repo: repo.into(),
-            decode_depth: None,
-            scan_binary: false,
-            rules_file: None,
-            anchor_mode: AnchorMode::Manual,
+            common: CommonScanSettings::default(),
         }
     }
 
@@ -286,48 +333,48 @@ impl GitSourceSettings {
     #[inline]
     #[must_use]
     pub fn decode_depth(&self) -> Option<usize> {
-        self.decode_depth
+        self.common.decode_depth()
     }
 
     #[inline]
     #[must_use]
     pub fn scan_binary(&self) -> bool {
-        self.scan_binary
+        self.common.scan_binary()
     }
 
     #[inline]
     #[must_use]
     pub fn rules_file(&self) -> Option<&Path> {
-        self.rules_file.as_deref()
+        self.common.rules_file()
     }
 
     #[inline]
     #[must_use]
     pub fn anchor_mode(&self) -> AnchorMode {
-        self.anchor_mode
+        self.common.anchor_mode()
     }
 
     #[must_use]
     pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
-        self.decode_depth = decode_depth;
+        self.common = self.common.with_decode_depth(decode_depth);
         self
     }
 
     #[must_use]
     pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
-        self.scan_binary = scan_binary;
+        self.common = self.common.with_scan_binary(scan_binary);
         self
     }
 
     #[must_use]
     pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
-        self.rules_file = rules_file;
+        self.common = self.common.with_rules_file(rules_file);
         self
     }
 
     #[must_use]
     pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
-        self.anchor_mode = anchor_mode;
+        self.common = self.common.with_anchor_mode(anchor_mode);
         self
     }
 
@@ -339,10 +386,10 @@ impl GitSourceSettings {
         budgets: ScanBudgets,
     ) -> GitScanConfig {
         GitScanConfig::new(self.repo.clone())
-            .with_decode_depth(self.decode_depth)
-            .with_scan_binary(self.scan_binary)
-            .with_rules_file(self.rules_file.clone())
-            .with_anchor_mode(self.anchor_mode)
+            .with_decode_depth(self.common.decode_depth)
+            .with_scan_binary(self.common.scan_binary)
+            .with_rules_file(self.common.rules_file.clone())
+            .with_anchor_mode(self.common.anchor_mode)
             .with_execution_mode(execution_mode)
             .with_budgets(budgets)
     }
@@ -355,17 +402,6 @@ pub enum WorkerSourceSettings {
     Fs(FsSourceSettings),
     /// Git settings.
     Git(GitSourceSettings),
-}
-
-impl WorkerSourceSettings {
-    #[inline]
-    #[must_use]
-    pub fn source(&self) -> WorkerSource {
-        match self {
-            Self::Fs(_) => WorkerSource::Fs,
-            Self::Git(_) => WorkerSource::Git,
-        }
-    }
 }
 
 /// Typed local worker launch configuration.
@@ -570,15 +606,79 @@ impl DistributedWorkerRuntimeSettings {
 
 /// Grouped identity fields for a distributed worker.
 ///
-/// These five fields travel together and map directly to
-/// [`WorkerIdentity`] at runtime.
+/// These five fields map to the identity-bearing fields of [`WorkerIdentity`]
+/// at runtime. The remaining `WorkerIdentity` fields (scan template and
+/// recorder) are supplied separately.
+///
+/// # Invariants
+///
+/// `tenant_secret_key` must not be all zeros (validated at construction).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WorkerIdentityConfig {
-    pub tenant: TenantId,
-    pub run: RunId,
-    pub worker: WorkerId,
-    pub policy_hash: PolicyHash,
-    pub tenant_secret_key: TenantSecretKey,
+    tenant: TenantId,
+    run: RunId,
+    worker: WorkerId,
+    policy_hash: PolicyHash,
+    tenant_secret_key: TenantSecretKey,
+}
+
+impl WorkerIdentityConfig {
+    /// Construct a validated identity config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerConfigError`] when `tenant_secret_key` is all zeros.
+    pub fn new(
+        tenant: TenantId,
+        run: RunId,
+        worker: WorkerId,
+        policy_hash: PolicyHash,
+        tenant_secret_key: TenantSecretKey,
+    ) -> Result<Self, WorkerConfigError> {
+        if !tenant_secret_key.is_valid() {
+            return Err(WorkerConfigError::invalid_redacted_value(
+                "tenant_secret_key",
+                "must not be all zeros",
+            ));
+        }
+        Ok(Self {
+            tenant,
+            run,
+            worker,
+            policy_hash,
+            tenant_secret_key,
+        })
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn tenant(&self) -> TenantId {
+        self.tenant
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn run(&self) -> RunId {
+        self.run
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn worker(&self) -> WorkerId {
+        self.worker
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn policy_hash(&self) -> PolicyHash {
+        self.policy_hash
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn tenant_secret_key(&self) -> TenantSecretKey {
+        self.tenant_secret_key
+    }
 }
 
 impl fmt::Debug for WorkerIdentityConfig {
@@ -605,9 +705,8 @@ pub struct DistributedWorkerConfig {
 impl DistributedWorkerConfig {
     /// Construct one validated distributed worker configuration bundle.
     ///
-    /// Enforces business rules as defense-in-depth: non-zero budgets and a
-    /// valid (non-all-zeros) tenant secret key. The resolution pipeline
-    /// validates format; this constructor validates semantics.
+    /// Enforces non-zero budget invariants as defense-in-depth. The secret-key
+    /// invariant is enforced by [`WorkerIdentityConfig::new`].
     pub fn new(
         backends: ProductionBackendConfig,
         identity: WorkerIdentityConfig,
@@ -615,13 +714,6 @@ impl DistributedWorkerConfig {
         runtime: DistributedWorkerRuntimeSettings,
     ) -> Result<Self, WorkerConfigError> {
         validate_budgets(&runtime.budgets)?;
-        if !identity.tenant_secret_key.is_valid() {
-            return Err(WorkerConfigError::invalid_redacted_value(
-                "tenant_secret_key",
-                "must not be all zeros",
-            ));
-        }
-
         Ok(Self {
             backends,
             identity,
@@ -652,31 +744,31 @@ impl DistributedWorkerConfig {
     #[inline]
     #[must_use]
     pub fn tenant(&self) -> TenantId {
-        self.identity.tenant
+        self.identity.tenant()
     }
 
     #[inline]
     #[must_use]
     pub fn run(&self) -> RunId {
-        self.identity.run
+        self.identity.run()
     }
 
     #[inline]
     #[must_use]
     pub fn worker(&self) -> WorkerId {
-        self.identity.worker
+        self.identity.worker()
     }
 
     #[inline]
     #[must_use]
     pub fn policy_hash(&self) -> PolicyHash {
-        self.identity.policy_hash
+        self.identity.policy_hash()
     }
 
     #[inline]
     #[must_use]
     pub fn tenant_secret_key(&self) -> TenantSecretKey {
-        self.identity.tenant_secret_key
+        self.identity.tenant_secret_key()
     }
 
     #[inline]
@@ -707,11 +799,11 @@ impl DistributedWorkerConfig {
         recorder: Arc<dyn CoordinationEventRecorder>,
     ) -> WorkerIdentity {
         WorkerIdentity::new(
-            self.identity.tenant,
-            self.identity.run,
-            self.identity.worker,
-            self.identity.policy_hash,
-            self.identity.tenant_secret_key,
+            self.identity.tenant(),
+            self.identity.run(),
+            self.identity.worker(),
+            self.identity.policy_hash(),
+            self.identity.tenant_secret_key(),
             self.source
                 .to_scan_config(ExecutionMode::Connector, self.runtime.budgets()),
             recorder,
@@ -840,7 +932,17 @@ pub struct ProcessEnv;
 
 impl EnvProvider for ProcessEnv {
     fn get(&self, key: &'static str) -> Option<String> {
-        std::env::var(key).ok()
+        match std::env::var(key) {
+            Ok(val) => Some(val),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::error!(
+                    env_var = key,
+                    "environment variable contains invalid UTF-8; treating as absent"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -1028,9 +1130,17 @@ impl RawWorkerConfig {
     fn resolve(self) -> Result<ResolvedWorkerConfig, WorkerConfigError> {
         let execution_mode = parse_optional(self.execution_mode.as_deref(), "mode", parse_mode)?
             .unwrap_or(ExecutionMode::Connector);
-        let backend = parse_optional(self.backend.as_deref(), "backend", parse_backend)?;
-        let source = parse_optional(self.source.as_deref(), "source", parse_source)?
-            .unwrap_or(WorkerSource::Fs);
+        let backend = parse_optional(
+            self.backend.as_deref(),
+            "backend",
+            parse_from_str::<BackendSelection>,
+        )?;
+        let source = parse_optional(
+            self.source.as_deref(),
+            "source",
+            parse_from_str::<WorkerSource>,
+        )?
+        .unwrap_or(WorkerSource::Fs);
         let path = parse_optional(self.path.as_deref(), "path", parse_path)?
             .unwrap_or_else(|| PathBuf::from("."));
         let rules_file = parse_optional(self.rules_file.as_deref(), "rules_file", parse_path)?;
@@ -1074,6 +1184,24 @@ impl RawWorkerConfig {
             ));
         }
 
+        // Helper: build a local config for the given execution mode.
+        let make_local = |mode| {
+            LocalWorkerConfig::new(
+                mode,
+                build_local_source_settings(
+                    source,
+                    path.clone(),
+                    rules_file.clone(),
+                    decode_depth,
+                    scan_binary,
+                    skip_archives,
+                    anchor_mode,
+                ),
+                budgets,
+            )
+            .map(ResolvedWorkerConfig::Local)
+        };
+
         match execution_mode {
             ExecutionMode::Direct => {
                 if matches!(backend, Some(BackendSelection::Production)) {
@@ -1081,19 +1209,7 @@ impl RawWorkerConfig {
                         message: "backend=production requires connector mode; direct mode cannot use real distributed backends".to_owned(),
                     });
                 }
-                Ok(ResolvedWorkerConfig::Local(LocalWorkerConfig::new(
-                    ExecutionMode::Direct,
-                    build_local_source_settings(
-                        source,
-                        path,
-                        rules_file,
-                        decode_depth,
-                        scan_binary,
-                        skip_archives,
-                        anchor_mode,
-                    ),
-                    budgets,
-                )?))
+                make_local(ExecutionMode::Direct)
             }
             ExecutionMode::Connector => {
                 let backend = backend.ok_or(WorkerConfigError::MissingRequiredValue {
@@ -1102,21 +1218,7 @@ impl RawWorkerConfig {
                     env: ENV_WORKER_BACKEND,
                 })?;
                 match backend {
-                    BackendSelection::Local => {
-                        Ok(ResolvedWorkerConfig::Local(LocalWorkerConfig::new(
-                            ExecutionMode::Connector,
-                            build_local_source_settings(
-                                source,
-                                path,
-                                rules_file,
-                                decode_depth,
-                                scan_binary,
-                                skip_archives,
-                                anchor_mode,
-                            ),
-                            budgets,
-                        )?))
-                    }
+                    BackendSelection::Local => make_local(ExecutionMode::Connector),
                     BackendSelection::Production => {
                         if source != WorkerSource::Fs {
                             return Err(WorkerConfigError::UnsupportedCombination {
@@ -1198,6 +1300,13 @@ impl RawWorkerConfig {
                             done_ledger_postgres_dsn,
                             findings_postgres_dsn,
                         )?;
+                        if !path.exists() {
+                            return Err(WorkerConfigError::invalid_value(
+                                "path",
+                                path.display().to_string(),
+                                "path does not exist on this host",
+                            ));
+                        }
                         let source = FsSourceSettings::new(path)
                             .with_rules_file(rules_file)
                             .with_decode_depth(decode_depth)
@@ -1219,13 +1328,13 @@ impl RawWorkerConfig {
                         }
                         let runtime =
                             DistributedWorkerRuntimeSettings::new(budgets, commit_queue_capacity);
-                        let identity = WorkerIdentityConfig {
+                        let identity = WorkerIdentityConfig::new(
                             tenant,
                             run,
                             worker,
                             policy_hash,
                             tenant_secret_key,
-                        };
+                        )?;
                         Ok(ResolvedWorkerConfig::Distributed(Box::new(
                             DistributedWorkerConfig::new(backends, identity, source, runtime)?,
                         )))
@@ -1284,11 +1393,25 @@ fn validate_budgets(budgets: &ScanBudgets) -> Result<(), WorkerConfigError> {
             "must be > 0",
         ));
     }
+    if budgets.max_items > MAX_ITEMS_CEILING {
+        return Err(WorkerConfigError::invalid_value(
+            "max_items",
+            budgets.max_items.to_string(),
+            format!("exceeds maximum of {MAX_ITEMS_CEILING}"),
+        ));
+    }
     if budgets.max_bytes == 0 {
         return Err(WorkerConfigError::invalid_value(
             "max_bytes",
             "0",
             "must be > 0",
+        ));
+    }
+    if budgets.max_bytes > MAX_BYTES_CEILING {
+        return Err(WorkerConfigError::invalid_value(
+            "max_bytes",
+            budgets.max_bytes.to_string(),
+            format!("exceeds maximum of {MAX_BYTES_CEILING}"),
         ));
     }
     Ok(())
@@ -1348,18 +1471,13 @@ fn parse_mode(field: &'static str, raw: &str) -> Result<ExecutionMode, WorkerCon
         .map_err(|error| WorkerConfigError::invalid_value(field, raw, error.to_string()))
 }
 
-fn parse_backend(field: &'static str, raw: &str) -> Result<BackendSelection, WorkerConfigError> {
-    raw.parse::<BackendSelection>()
-        .map_err(|error| match error {
-            WorkerConfigError::InvalidValue { reason, .. } => {
-                WorkerConfigError::invalid_value(field, raw, reason)
-            }
-            other => other,
-        })
-}
-
-fn parse_source(field: &'static str, raw: &str) -> Result<WorkerSource, WorkerConfigError> {
-    raw.parse::<WorkerSource>().map_err(|error| match error {
+/// Parse a `FromStr` type whose `Err` is `WorkerConfigError`, remapping the
+/// field name so the error identifies the correct config key.
+fn parse_from_str<T: std::str::FromStr<Err = WorkerConfigError>>(
+    field: &'static str,
+    raw: &str,
+) -> Result<T, WorkerConfigError> {
+    raw.parse::<T>().map_err(|error| match error {
         WorkerConfigError::InvalidValue { reason, .. } => {
             WorkerConfigError::invalid_value(field, raw, reason)
         }
@@ -1561,7 +1679,7 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
 
 /// Recorder that discards coordination events while still satisfying the runtime interface.
 #[derive(Default)]
-pub struct NoopCoordinationEventRecorder;
+pub(crate) struct NoopCoordinationEventRecorder;
 
 impl CoordinationEventRecorder for NoopCoordinationEventRecorder {
     fn record_core_event(&self, _shard_id: &str, _event: OwnedCoreEvent) -> AnyhowResult<()> {
@@ -1635,7 +1753,7 @@ mod tests {
                 ENV_TENANT_SECRET_KEY,
                 "3333333333333333333333333333333333333333333333333333333333333333",
             )
-            .with(ENV_WORKER_PATH, "/srv/scans/root")
+            .with(ENV_WORKER_PATH, "/tmp")
             .with(ENV_WORKER_SCAN_BINARY, "true")
             .with(ENV_FS_SKIP_ARCHIVES, "false")
             .with(ENV_WORKER_ANCHOR_MODE, "derived")
@@ -1664,7 +1782,7 @@ mod tests {
                 assert_eq!(cfg.runtime().budgets().max_items, 1024);
                 assert_eq!(cfg.runtime().budgets().max_bytes, 2_097_152);
                 assert_eq!(cfg.runtime().commit_queue_capacity().get(), 128);
-                assert_eq!(cfg.source().path(), Path::new("/srv/scans/root"));
+                assert_eq!(cfg.source().path(), Path::new("/tmp"));
                 assert!(cfg.source().scan_binary());
                 assert_eq!(cfg.source().anchor_mode(), AnchorMode::Derived);
                 assert_eq!(
@@ -1679,13 +1797,13 @@ mod tests {
     #[test]
     fn cli_overrides_env_for_run_id_and_path() {
         let env = production_env();
-        let resolved = resolve_worker_config_from(["--run-id=99", "fs", "/tmp/cli-root"], &env)
+        let resolved = resolve_worker_config_from(["--run-id=99", "fs", "/tmp"], &env)
             .expect("CLI overrides should resolve");
 
         match resolved {
             ResolvedWorkerConfig::Distributed(cfg) => {
                 assert_eq!(cfg.run(), RunId::from_raw(99));
-                assert_eq!(cfg.source().path(), Path::new("/tmp/cli-root"));
+                assert_eq!(cfg.source().path(), Path::new("/tmp"));
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
@@ -1866,10 +1984,7 @@ mod tests {
         assert_eq!(identity.worker, cfg.worker());
         assert_eq!(identity.policy_hash, cfg.policy_hash());
         assert_eq!(identity.tenant_secret_key, cfg.tenant_secret_key());
-        assert_eq!(
-            identity.scan_template.path,
-            PathBuf::from("/srv/scans/root")
-        );
+        assert_eq!(identity.scan_template.path, PathBuf::from("/tmp"));
         assert_eq!(
             identity.scan_template.execution_mode,
             ExecutionMode::Connector
@@ -2076,13 +2191,19 @@ mod tests {
 
     #[test]
     fn parse_source_accepts_both_variants() {
-        assert_eq!(parse_source("source", "fs").unwrap(), WorkerSource::Fs);
-        assert_eq!(parse_source("source", "GIT").unwrap(), WorkerSource::Git);
+        assert_eq!(
+            parse_from_str::<WorkerSource>("source", "fs").unwrap(),
+            WorkerSource::Fs
+        );
+        assert_eq!(
+            parse_from_str::<WorkerSource>("source", "GIT").unwrap(),
+            WorkerSource::Git
+        );
     }
 
     #[test]
     fn parse_source_rejects_unknown() {
-        parse_source("source", "svn").expect_err("unknown source must fail");
+        parse_from_str::<WorkerSource>("source", "svn").expect_err("unknown source must fail");
     }
 
     #[test]
@@ -2267,6 +2388,35 @@ mod tests {
     }
 
     #[test]
+    fn max_bytes_at_ceiling_is_accepted() {
+        let at_ceiling = MAX_BYTES_CEILING.to_string();
+        let env = production_env().with(ENV_MAX_BYTES, &at_ceiling);
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("max_bytes at exactly the ceiling must be accepted");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        assert_eq!(cfg.runtime().budgets().max_bytes, MAX_BYTES_CEILING);
+    }
+
+    #[test]
+    fn commit_queue_capacity_at_ceiling_is_accepted() {
+        let at_ceiling = MAX_COMMIT_QUEUE_CEILING.to_string();
+        let env = production_env().with(ENV_COMMIT_QUEUE_CAPACITY, &at_ceiling);
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("commit_queue_capacity at exactly the ceiling must be accepted");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        assert_eq!(
+            cfg.runtime().commit_queue_capacity().get(),
+            MAX_COMMIT_QUEUE_CEILING
+        );
+    }
+
+    #[test]
     fn dsn_error_messages_are_redacted() {
         let env = production_env().with(ENV_DONE_LEDGER_POSTGRES_DSN, "   ");
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
@@ -2300,6 +2450,49 @@ mod tests {
         assert!(
             result.is_err(),
             "worker_id=0 is the ZERO sentinel and must be rejected, but got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn production_rejects_nonexistent_path() {
+        let bogus = "/this/path/does/not/exist/gossip_f7_test";
+        let env = production_env().with(ENV_WORKER_PATH, bogus);
+        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
+        assert!(
+            result.is_err(),
+            "non-existent path must be rejected in production mode, but got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WorkerConfigError::InvalidValue {
+                    field: "path",
+                    ref reason,
+                    ..
+                } if reason.contains("does not exist")
+            ),
+            "expected InvalidValue for non-existent path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_cli_flag_returns_usage_error() {
+        let env = TestEnv::default();
+        let result = resolve_worker_config_from(["--bogus=42"], &env);
+        assert!(
+            matches!(result, Err(WorkerConfigError::Usage(_))),
+            "unknown flag must produce a Usage error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_positional_args_returns_usage_error() {
+        let env = TestEnv::default();
+        let result = resolve_worker_config_from(["fs", "/path", "extra"], &env);
+        assert!(
+            matches!(result, Err(WorkerConfigError::Usage(_))),
+            "three positional args must produce a Usage error, got: {result:?}"
         );
     }
 }

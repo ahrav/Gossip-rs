@@ -85,9 +85,9 @@ main()
         -> log_distributed_report(...)
 ```
 
-The default configuration remains `connector fs .`, but connector mode now
-fails closed unless the caller selects `--backend=local` or
-`--backend=production`.
+The default mode and source are `connector fs .`, but connector mode requires
+explicit backend selection (`--backend=local` or `--backend=production`).
+Omitting the backend fails closed with a configuration error.
 
 ### Production composition flow
 
@@ -246,20 +246,17 @@ loop.
 
 ```rust
 struct DistributedWorkerConfig {
-    backend: BackendSelection,
     backends: ProductionBackendConfig,
-    tenant: TenantId,
-    run: RunId,
-    worker: WorkerId,
-    policy_hash: PolicyHash,
-    tenant_secret_key: TenantSecretKey,
+    identity: WorkerIdentityConfig,
     source: FsSourceSettings,
     runtime: DistributedWorkerRuntimeSettings,
 }
 ```
 
-Resolved real-backend launch configuration. This type owns all identity and
-backend settings required to boot one worker without code changes.
+Resolved real-backend launch configuration. Identity fields (tenant, run,
+worker, policy hash, secret key) are grouped in `WorkerIdentityConfig` and
+accessible through the `identity()` accessor or individual delegation methods
+(`tenant()`, `run()`, etc.). Backend is always `Production` by construction.
 
 ### ResolvedWorkerConfig
 

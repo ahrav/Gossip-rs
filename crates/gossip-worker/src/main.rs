@@ -63,17 +63,32 @@ impl From<gossip_worker::production::ProductionWorkerError> for WorkerError {
     }
 }
 
+/// Resolve the tracing `EnvFilter` from `RUST_LOG`, returning a fallback
+/// filter and a flag when the user-supplied value is invalid.
+fn resolve_log_filter() -> (EnvFilter, bool) {
+    match EnvFilter::try_from_default_env() {
+        Ok(filter) => (filter, false),
+        Err(error) => {
+            eprintln!("warning: invalid RUST_LOG filter ({error}), falling back to 'info'");
+            (EnvFilter::new("info"), true)
+        }
+    }
+}
+
 /// Initialize the global tracing subscriber.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|error| {
-        eprintln!("warning: invalid RUST_LOG filter ({error}), falling back to 'info'");
-        EnvFilter::new("info")
-    });
+    let (filter, used_fallback) = resolve_log_filter();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .compact()
         .init();
+    if used_fallback {
+        tracing::warn!(
+            "RUST_LOG contained an invalid filter directive; \
+             active filter is 'info' — check RUST_LOG for typos"
+        );
+    }
 }
 
 /// Execute one local scan using the resolved local worker config.
@@ -95,32 +110,20 @@ fn run_local_worker(cfg: &LocalWorkerConfig) -> Result<(u64, u64, u64), WorkerEr
 
 fn log_local_report(cfg: &LocalWorkerConfig, report: (u64, u64, u64)) {
     let (items_scanned, bytes_scanned, findings_emitted) = report;
-    match cfg.source() {
-        WorkerSourceSettings::Fs(source) => {
-            tracing::info!(
-                backend = "local",
-                source = "fs",
-                mode = ?cfg.execution_mode(),
-                path = %source.path().display(),
-                items_scanned,
-                bytes_scanned,
-                findings_emitted,
-                "scan completed",
-            );
-        }
-        WorkerSourceSettings::Git(source) => {
-            tracing::info!(
-                backend = "local",
-                source = "git",
-                mode = ?cfg.execution_mode(),
-                path = %source.repo().display(),
-                items_scanned,
-                bytes_scanned,
-                findings_emitted,
-                "scan completed",
-            );
-        }
-    }
+    let (source_label, path) = match cfg.source() {
+        WorkerSourceSettings::Fs(s) => ("fs", s.path().display().to_string()),
+        WorkerSourceSettings::Git(s) => ("git", s.repo().display().to_string()),
+    };
+    tracing::info!(
+        backend = "local",
+        source = source_label,
+        mode = ?cfg.execution_mode(),
+        %path,
+        items_scanned,
+        bytes_scanned,
+        findings_emitted,
+        "scan completed",
+    );
 }
 
 fn log_distributed_report(

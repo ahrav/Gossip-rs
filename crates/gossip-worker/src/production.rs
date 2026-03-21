@@ -763,4 +763,95 @@ mod tests {
         assert!(is_local_host("127.0.0.1"));
         assert!(is_local_host("localhost"));
     }
+
+    // ---- has_connect_timeout tests ----
+
+    #[test]
+    fn has_connect_timeout_uri_with_param_in_query_string() {
+        let dsn = "postgresql://user:pass@host:5432/db?connect_timeout=5&sslmode=require";
+        assert!(has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_uri_without_param() {
+        let dsn = "postgresql://user:pass@host:5432/db?sslmode=require";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_uri_as_only_query_param() {
+        let dsn = "postgres://user@host/db?connect_timeout=10";
+        assert!(has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_keyword_value_with_param() {
+        let dsn = "host=db.example.com port=5432 connect_timeout=5 dbname=mydb";
+        assert!(has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_keyword_value_without_param() {
+        let dsn = "host=db.example.com port=5432 dbname=mydb";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_uri_embedded_in_password_is_not_detected() {
+        // The substring appears in the password, not as a query-string parameter.
+        let dsn = "postgresql://user:connect_timeout=secret@host:5432/db?sslmode=require";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_keyword_value_in_value_position_is_not_detected() {
+        // "connect_timeout=3" appears as the *value* of password, not as its own key.
+        let dsn = "host=db.example.com password=connect_timeout=3 dbname=mydb";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    // ---- extract_pg_host edge-case tests ----
+
+    #[test]
+    fn extract_pg_host_uri_without_userinfo() {
+        let dsn = "postgresql://myhost:5432/db";
+        assert_eq!(extract_pg_host(dsn), Some("myhost"));
+    }
+
+    #[test]
+    fn extract_pg_host_uri_without_port() {
+        let dsn = "postgresql://user@myhost/db";
+        assert_eq!(extract_pg_host(dsn), Some("myhost"));
+    }
+
+    #[test]
+    fn extract_pg_host_keyword_value_with_hostname() {
+        let dsn = "host=db.example.com port=5432";
+        assert_eq!(extract_pg_host(dsn), Some("db.example.com"));
+    }
+
+    #[test]
+    fn extract_pg_host_empty_brackets_returns_none() {
+        let dsn = "postgresql://user@[]:5432/db";
+        assert_eq!(extract_pg_host(dsn), None);
+    }
+
+    #[test]
+    fn extract_pg_host_missing_host_in_uri_returns_none() {
+        // Triple-slash means no authority component — host is empty.
+        let dsn = "postgresql:///mydb";
+        assert_eq!(extract_pg_host(dsn), None);
+    }
+
+    // ---- is_local_host edge-case tests ----
+
+    #[test]
+    fn is_local_host_unix_socket_path() {
+        assert!(is_local_host("/var/run/postgresql"));
+    }
+
+    #[test]
+    fn is_local_host_non_local_hostname() {
+        assert!(!is_local_host("db.example.com"));
+    }
 }
