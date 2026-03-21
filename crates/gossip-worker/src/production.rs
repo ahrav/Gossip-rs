@@ -360,7 +360,12 @@ pub fn run_production_worker(
 /// does not include an explicit `connect_timeout` parameter. Without this
 /// fallback the `postgres` crate defaults to *no timeout*, which can block
 /// the calling thread for minutes on an unreachable host.
-const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 30;
+///
+/// Kept low (5 s) so that worst-case startup failure (etcd + two PostgreSQL
+/// connections) stays under 20 s — well within typical container liveness
+/// probe windows. Callers that need a longer timeout should set
+/// `connect_timeout=N` in their DSN explicitly.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 5;
 
 /// Check whether a DSN already contains an explicit `connect_timeout` parameter.
 ///

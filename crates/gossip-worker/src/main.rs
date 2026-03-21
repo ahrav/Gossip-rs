@@ -162,6 +162,8 @@ fn main() {
         },
         ResolvedWorkerConfig::Distributed(cfg) => match run_production_worker(
             cfg.production_backends(),
+            // No-op recorder — wire a real CoordinationEventRecorder via
+            // worker_identity_with_recorder once the telemetry sink is built.
             cfg.worker_identity(),
             cfg.runtime_config(),
         ) {
@@ -220,7 +222,8 @@ mod tests {
                 dir.path().to_path_buf(),
             )),
             gossip_scanner_runtime::ScanBudgets::default(),
-        );
+        )
+        .expect("default budgets should be valid");
 
         let (items_scanned, bytes_scanned, _findings_emitted) =
             run_local_worker(&cfg).expect("filesystem worker should succeed");
@@ -242,7 +245,8 @@ mod tests {
                 dir.path().to_path_buf(),
             )),
             gossip_scanner_runtime::ScanBudgets::default(),
-        );
+        )
+        .expect("default budgets should be valid");
 
         let (items_scanned, bytes_scanned, _findings_emitted) =
             run_local_worker(&cfg).expect("git worker should succeed");

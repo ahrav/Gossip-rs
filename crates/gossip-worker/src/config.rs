@@ -371,17 +371,21 @@ pub struct LocalWorkerConfig {
 
 impl LocalWorkerConfig {
     /// Construct one local worker launch configuration.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerConfigError`] when `max_items` or `max_bytes` is zero.
     pub fn new(
         execution_mode: ExecutionMode,
         source: WorkerSourceSettings,
         budgets: ScanBudgets,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, WorkerConfigError> {
+        validate_budgets(&budgets)?;
+        Ok(Self {
             execution_mode,
             source,
             budgets,
-        }
+        })
     }
 
     #[inline]
@@ -603,20 +607,7 @@ impl DistributedWorkerConfig {
         source: FsSourceSettings,
         runtime: DistributedWorkerRuntimeSettings,
     ) -> Result<Self, WorkerConfigError> {
-        if runtime.budgets.max_items == 0 {
-            return Err(WorkerConfigError::invalid_value(
-                "max_items",
-                "0",
-                "must be > 0",
-            ));
-        }
-        if runtime.budgets.max_bytes == 0 {
-            return Err(WorkerConfigError::invalid_value(
-                "max_bytes",
-                "0",
-                "must be > 0",
-            ));
-        }
+        validate_budgets(&runtime.budgets)?;
         if !identity.tenant_secret_key.is_valid() {
             return Err(WorkerConfigError::invalid_redacted_value(
                 "tenant_secret_key",
@@ -693,7 +684,10 @@ impl DistributedWorkerConfig {
         self.runtime
     }
 
-    /// Build the runtime `WorkerIdentity` using the default no-op recorder.
+    /// Build the runtime `WorkerIdentity` with a no-op recorder that discards
+    /// all coordination events. Use [`Self::worker_identity_with_recorder`] to
+    /// inject a production telemetry recorder once the coordination event sink
+    /// is built.
     #[must_use]
     pub fn worker_identity(&self) -> WorkerIdentity {
         self.worker_identity_with_recorder(Arc::new(NoopCoordinationEventRecorder))
@@ -943,10 +937,28 @@ impl RawWorkerConfig {
         match positionals.len() {
             0 => Ok(()),
             1 => {
+                if self.path.is_some() {
+                    return Err(WorkerConfigError::Usage(format!(
+                        "path specified both as --path flag and as positional argument\n{}",
+                        usage()
+                    )));
+                }
                 self.path = Some(positionals[0].clone());
                 Ok(())
             }
             2 => {
+                if self.source.is_some() {
+                    return Err(WorkerConfigError::Usage(format!(
+                        "source specified both as --source flag and as positional argument\n{}",
+                        usage()
+                    )));
+                }
+                if self.path.is_some() {
+                    return Err(WorkerConfigError::Usage(format!(
+                        "path specified both as --path flag and as positional argument\n{}",
+                        usage()
+                    )));
+                }
                 self.source = Some(positionals[0].clone());
                 self.path = Some(positionals[1].clone());
                 Ok(())
@@ -1066,7 +1078,7 @@ impl RawWorkerConfig {
                                 anchor_mode,
                             ),
                             budgets,
-                        )))
+                        )?))
                     }
                     BackendSelection::Production => {
                         if source != WorkerSource::Fs {
@@ -1219,6 +1231,24 @@ fn usage() -> &'static str {
      [fs|git] [path]\n\
      defaults: --mode=connector fs .\n\
      note: connector mode requires explicit backend selection; backend=production currently supports only fs"
+}
+
+fn validate_budgets(budgets: &ScanBudgets) -> Result<(), WorkerConfigError> {
+    if budgets.max_items == 0 {
+        return Err(WorkerConfigError::invalid_value(
+            "max_items",
+            "0",
+            "must be > 0",
+        ));
+    }
+    if budgets.max_bytes == 0 {
+        return Err(WorkerConfigError::invalid_value(
+            "max_bytes",
+            "0",
+            "must be > 0",
+        ));
+    }
+    Ok(())
 }
 
 fn build_local_source_settings(
@@ -1855,6 +1885,229 @@ mod tests {
                 ref value,
                 ..
             } if value == "[redacted]"
+        ));
+    }
+
+    #[test]
+    fn direct_mode_rejects_production_backend() {
+        let err = resolve_worker_config_from(
+            [
+                "--mode=direct",
+                "--backend=production",
+                "fs",
+                "/tmp/project",
+            ],
+            &TestEnv::default(),
+        )
+        .expect_err("direct mode must reject production backend");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::UnsupportedCombination { ref message }
+                if message.contains("direct mode")
+        ));
+    }
+
+    #[test]
+    fn production_rejects_zero_max_items() {
+        let env = production_env().with(ENV_MAX_ITEMS, "0");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("max_items=0 must be rejected");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_items",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn production_rejects_zero_max_bytes() {
+        let env = production_env().with(ENV_MAX_BYTES, "0");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("max_bytes=0 must be rejected");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_bool_accepts_all_truthy_tokens() {
+        for token in ["true", "1", "yes", "on", "TRUE", " True ", " ON "] {
+            assert!(
+                parse_bool("test_field", token).unwrap(),
+                "expected true for {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bool_accepts_all_falsy_tokens() {
+        for token in ["false", "0", "no", "off", "FALSE", " No ", " OFF "] {
+            assert!(
+                !parse_bool("test_field", token).unwrap(),
+                "expected false for {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bool_rejects_invalid_tokens() {
+        for token in ["2", "maybe", ""] {
+            parse_bool("test_field", token).expect_err(&format!("should reject {token:?}"));
+        }
+    }
+
+    #[test]
+    fn parse_anchor_mode_accepts_both_variants() {
+        assert_eq!(
+            parse_anchor_mode("anchor", "manual").unwrap(),
+            AnchorMode::Manual
+        );
+        assert_eq!(
+            parse_anchor_mode("anchor", "DERIVED").unwrap(),
+            AnchorMode::Derived
+        );
+    }
+
+    #[test]
+    fn parse_anchor_mode_rejects_unknown() {
+        parse_anchor_mode("anchor", "auto").expect_err("unknown anchor mode must fail");
+    }
+
+    #[test]
+    fn parse_source_accepts_both_variants() {
+        assert_eq!(parse_source("source", "fs").unwrap(), WorkerSource::Fs);
+        assert_eq!(parse_source("source", "GIT").unwrap(), WorkerSource::Git);
+    }
+
+    #[test]
+    fn parse_source_rejects_unknown() {
+        parse_source("source", "svn").expect_err("unknown source must fail");
+    }
+
+    #[test]
+    fn flag_without_equals_produces_usage_error() {
+        let err = resolve_worker_config_from(
+            ["--backend", "production", "fs", "/tmp"],
+            &TestEnv::default(),
+        )
+        .expect_err("space-separated flag must produce usage error");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::Usage(ref msg) if msg.contains("invalid flag")
+        ));
+    }
+
+    #[test]
+    fn empty_flag_value_produces_usage_error() {
+        let err = resolve_worker_config_from(
+            ["--scan-binary=", "--backend=local", "fs", "/tmp"],
+            &TestEnv::default(),
+        )
+        .expect_err("empty flag value must produce usage error");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::Usage(ref msg)
+                if msg.contains("non-empty value")
+        ));
+    }
+
+    #[test]
+    fn cli_flag_preserves_value_containing_equals() {
+        let env = production_env();
+        let resolved = resolve_worker_config_from(
+            ["--done-ledger-postgres-dsn=host=db.example.com password=s3cret dbname=done"],
+            &env,
+        )
+        .expect("DSN with embedded equals should resolve");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        assert_eq!(
+            cfg.production_backends().done_ledger_postgres_dsn(),
+            "host=db.example.com password=s3cret dbname=done"
+        );
+    }
+
+    #[test]
+    fn backend_selection_display_roundtrips() {
+        for expected in [BackendSelection::Local, BackendSelection::Production] {
+            let text = expected.to_string();
+            let parsed: BackendSelection = text.parse().unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn distributed_runtime_defaults_mirror_upstream() {
+        let defaults = DistributedWorkerRuntimeSettings::default();
+        let upstream = DistributedRuntimeConfig::default();
+        assert_eq!(defaults.budgets(), upstream.budgets);
+        assert_eq!(
+            defaults.commit_queue_capacity(),
+            upstream.commit_queue_capacity
+        );
+    }
+
+    #[test]
+    fn positional_path_conflicts_with_flag_path() {
+        let err = resolve_worker_config_from(
+            ["--path=/srv/prod", "/tmp/test"],
+            &TestEnv::default().with(ENV_WORKER_BACKEND, "local"),
+        )
+        .expect_err("positional path must conflict with --path flag");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::Usage(ref msg)
+                if msg.contains("path specified both")
+        ));
+    }
+
+    #[test]
+    fn positional_source_conflicts_with_flag_source() {
+        let err = resolve_worker_config_from(
+            ["--source=git", "fs", "/tmp/test"],
+            &TestEnv::default().with(ENV_WORKER_BACKEND, "local"),
+        )
+        .expect_err("positional source must conflict with --source flag");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::Usage(ref msg)
+                if msg.contains("source specified both")
+        ));
+    }
+
+    #[test]
+    fn local_config_rejects_zero_budgets() {
+        let err = LocalWorkerConfig::new(
+            ExecutionMode::Direct,
+            WorkerSourceSettings::Fs(FsSourceSettings::new("/tmp")),
+            ScanBudgets {
+                max_items: 0,
+                max_bytes: 1024,
+            },
+        )
+        .expect_err("zero max_items must be rejected");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_items",
+                ..
+            }
         ));
     }
 }
