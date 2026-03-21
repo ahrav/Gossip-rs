@@ -141,6 +141,11 @@ pub struct FsSourceSettings {
 
 impl FsSourceSettings {
     /// Construct one filesystem source settings bundle.
+    ///
+    /// This constructor does not validate the path. When used through the
+    /// resolution pipeline ([`resolve_worker_config_from`]), path validation
+    /// (non-empty, trimmed) is handled by the parser layer. Direct callers
+    /// are responsible for supplying a meaningful path.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -249,6 +254,11 @@ pub struct GitSourceSettings {
 
 impl GitSourceSettings {
     /// Construct one git source settings bundle.
+    ///
+    /// This constructor does not validate the repo path. When used through
+    /// the resolution pipeline ([`resolve_worker_config_from`]), path
+    /// validation (non-empty, trimmed) is handled by the parser layer.
+    /// Direct callers are responsible for supplying a meaningful path.
     #[must_use]
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         Self {

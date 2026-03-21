@@ -362,8 +362,29 @@ pub fn run_production_worker(
 /// the calling thread for minutes on an unreachable host.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 30;
 
+/// Check whether a DSN already contains an explicit `connect_timeout` parameter.
+///
+/// For URI-format DSNs (`postgresql://` / `postgres://`), the parameter must
+/// appear in the query string (after `?`, delimited by `&`). For keyword-value
+/// DSNs, parameters are whitespace-delimited, so `connect_timeout=` must appear
+/// at the start of the string or immediately after whitespace. This avoids
+/// false positives when the substring appears inside a password, database name,
+/// or other opaque field.
+fn has_connect_timeout(dsn: &str) -> bool {
+    if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+        dsn.split_once('?').is_some_and(|(_, query)| {
+            query
+                .split('&')
+                .any(|param| param.starts_with("connect_timeout="))
+        })
+    } else {
+        dsn.split_whitespace()
+            .any(|param| param.starts_with("connect_timeout="))
+    }
+}
+
 fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
-    if dsn.contains("connect_timeout=") {
+    if has_connect_timeout(dsn) {
         return Client::connect(dsn, NoTls);
     }
 
@@ -376,6 +397,10 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     } else {
         format!("{dsn} connect_timeout={DEFAULT_CONNECT_TIMEOUT_SECS}")
     };
+    tracing::debug!(
+        timeout_secs = DEFAULT_CONNECT_TIMEOUT_SECS,
+        "DSN omitted connect_timeout; injecting default"
+    );
     Client::connect(&timed, NoTls)
 }
 
