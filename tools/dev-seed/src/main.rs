@@ -179,7 +179,7 @@ fn cmd_seed(
     match coordinator.register_shards(next_now, tenant, run_id, &manifest, OpId::from_raw(1)) {
         Ok(_) => {}
         Err(RegisterShardsError::OpIdConflict(_)) => {
-            eprintln!("shard {shard_id_raw} already registered — skipping");
+            eprintln!("shard {shard_id_raw} already registered with different payload — skipping");
         }
         Err(err) => {
             return Err(anyhow::Error::msg(err.to_string()).context("failed to register shards"));

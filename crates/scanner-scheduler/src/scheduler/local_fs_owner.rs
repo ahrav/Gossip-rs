@@ -547,11 +547,13 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
     }
 }
 
-/// Build and emit a persistence batch for one chunk's post-dedupe findings.
+/// Build and emit a persistence batch for post-dedupe findings.
 ///
-/// No-ops when `store_producer` is `None`. Emits even when `findings` is
-/// empty so the downstream pipeline can record a "scanned clean" done-ledger
-/// entry for objects with zero matches.
+/// No-ops when `store_producer` is `None`. Accepts empty findings slices
+/// so the downstream pipeline can record a "scanned clean" done-ledger
+/// entry for objects with zero matches. Callers control the emission
+/// frequency: per-chunk for finding-bearing chunks, once per file for
+/// clean files.
 ///
 /// # Fail-soft design
 ///
@@ -859,6 +861,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     let mut carry: usize = 0; // Bytes of overlap prefix for next scan
     let mut have: usize = 0; // Total bytes in buffer from last iteration
     let mut preloaded: usize = first_n; // First chunk already in buf[0..first_n]
+    let mut file_had_findings = false;
 
     loop {
         // Move tail overlap bytes to front as next prefix
@@ -935,15 +938,19 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &mut ctx.metrics,
         );
 
-        emit_persistence_batch(
-            scratch.store_producer.as_deref(),
-            &*scratch.event_sink,
-            path_bytes,
-            &scratch.pending,
-            &mut scratch.persist_batch,
-            &mut ctx.metrics,
-        );
-        // Emit findings
+        // Emit persistence batches only for chunks that produced findings.
+        // Clean-file done-ledger entries are emitted once after the loop.
+        if !scratch.pending.is_empty() {
+            file_had_findings = true;
+            emit_persistence_batch(
+                scratch.store_producer.as_deref(),
+                &*scratch.event_sink,
+                path_bytes,
+                &scratch.pending,
+                &mut scratch.persist_batch,
+                &mut ctx.metrics,
+            );
+        }
         emit_findings(
             engine.as_ref(),
             &*scratch.event_sink,
@@ -960,6 +967,21 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         if offset >= file_size {
             break;
         }
+    }
+
+    // Clean files emit a single empty batch so the done-ledger records
+    // "scanned, nothing found." Finding-bearing files already emitted
+    // per-chunk batches inside the loop.
+    if !file_had_findings {
+        scratch.pending.clear();
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+        );
     }
 
     // Buffer returned to pool on drop

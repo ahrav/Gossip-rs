@@ -134,10 +134,9 @@ impl std::error::Error for FsStoreError {}
 ///
 /// # Contract
 ///
-/// - `emit_fs_batch` is called once per scanned object per chunk. Batches
-///   may arrive out of file order when workers run in parallel. The
-///   findings slice may be empty for objects (or chunks) with no matches;
-///   callers use these empty batches to record "scanned clean" status.
+/// - `emit_fs_batch` is called once per scanned object for each chunk that
+///   produced findings, plus once for clean objects (empty findings slice).
+///   Batches may arrive out of file order when workers run in parallel.
 /// - `record_fs_run_loss` is called exactly once at the end of a scan run.
 ///   Implementations should persist or log the loss data before returning.
 /// - `end_run` is called once after `record_fs_run_loss` to finalize the run

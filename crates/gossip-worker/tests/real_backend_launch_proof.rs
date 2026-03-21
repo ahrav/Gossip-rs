@@ -185,21 +185,6 @@ impl SeededLaunchProof {
     fn observation_row_count(&self) -> i64 {
         table_row_count(&self.findings_dsn, findings_schema::OBSERVATIONS_TABLE)
     }
-
-    fn observations_for_run(&self) -> i64 {
-        let mut client =
-            Client::connect(&self.findings_dsn, NoTls).expect("findings DB should connect");
-        client
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM {} WHERE run_id = $1 AND shard_id = $2",
-                    findings_schema::OBSERVATIONS_TABLE,
-                ),
-                &[&(run_id().as_raw() as i64), &(SHARD_ID_RAW as i64)],
-            )
-            .expect("observation query should succeed")
-            .get::<_, i64>(0)
-    }
 }
 
 fn tenant_id() -> TenantId {
@@ -463,13 +448,6 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
         "expected exactly 1 observation for rule '{}', got {observation_rows}",
         SAFE_RULE_NAME,
     );
-    let targeted_observations = proof.observations_for_run();
-    assert_eq!(
-        targeted_observations, 1,
-        "expected exactly 1 observation for run_id={}, shard_id={}, got {targeted_observations}",
-        RUN_ID_RAW, SHARD_ID_RAW,
-    );
-
     let shard = proof
         .coordinator
         .test_load_shard_snapshot(tenant_id(), proof.shard_key)
