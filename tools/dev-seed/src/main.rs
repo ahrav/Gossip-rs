@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, TenantId};
 use gossip_coordination::{
-    CursorSemantics, CursorUpdate, InitialShardInput, RunConfig, RunManagement,
+    CursorSemantics, CursorUpdate, InitialShardInput, RegisterShardsError, RunConfig, RunManagement,
 };
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig};
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
@@ -178,13 +178,11 @@ fn cmd_seed(
     let next_now = LogicalTime::from_raw(2);
     match coordinator.register_shards(next_now, tenant, run_id, &manifest, OpId::from_raw(1)) {
         Ok(_) => {}
+        Err(RegisterShardsError::OpIdConflict(_)) => {
+            eprintln!("shard {shard_id_raw} already registered — skipping");
+        }
         Err(err) => {
-            let msg = err.to_string();
-            if msg.contains("already registered") || msg.contains("OpIdConflict") {
-                eprintln!("shard {shard_id_raw} already registered — skipping");
-            } else {
-                return Err(anyhow::Error::msg(msg).context("failed to register shards"));
-            }
+            return Err(anyhow::Error::msg(err.to_string()).context("failed to register shards"));
         }
     }
 
@@ -223,6 +221,10 @@ fn cmd_inspect(done_ledger_dsn: &str, findings_dsn: &str) -> Result<()> {
 }
 
 fn table_count(dsn: &str, table: &str) -> Result<i64, String> {
+    assert!(
+        !table.is_empty() && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "table_count requires a plain SQL identifier, got: {table:?}"
+    );
     let mut client = Client::connect(dsn, NoTls).map_err(|e| e.to_string())?;
     client
         .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])

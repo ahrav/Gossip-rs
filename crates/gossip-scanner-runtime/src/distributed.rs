@@ -2814,7 +2814,7 @@ mod tests {
     }
 
     #[test]
-    fn run_filesystem_lease_clean_only_shard_returns_no_checkpoint() {
+    fn run_filesystem_lease_clean_only_shard_produces_checkpoint_and_done_ledger_entry() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 

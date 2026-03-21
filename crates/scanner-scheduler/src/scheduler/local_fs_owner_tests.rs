@@ -1472,3 +1472,43 @@ fn account_effective_dropped_saturates_when_pruned_exceeds_dropped() {
     account_effective_dropped_findings(&mut m, 3, 3);
     assert_eq!(m.findings_dropped, 0);
 }
+
+// ---------------------------------------------------------------------------
+// emit_persistence_batch — empty findings (done-ledger entry for clean files)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emit_persistence_batch_emits_for_empty_findings() {
+    let producer = InMemoryStoreProducer::default();
+    let sink = VecEventOutput::new();
+    let mut metrics = WorkerMetricsLocal::new();
+    let mut persist_batch = Vec::new();
+
+    let path = b"/clean/file.txt";
+    let empty_findings: &[FindingWithHash<FindingRec>] = &[];
+
+    emit_persistence_batch(
+        Some(&producer as &dyn StoreProducer),
+        &sink,
+        path,
+        empty_findings,
+        &mut persist_batch,
+        &mut metrics,
+    );
+
+    let batches = producer.batches();
+    assert_eq!(
+        batches.len(),
+        1,
+        "expected exactly one batch for clean file"
+    );
+    assert_eq!(batches[0].object_path, path);
+    assert!(
+        batches[0].findings.is_empty(),
+        "findings should be empty for a clean file"
+    );
+    assert_eq!(
+        metrics.persistence_emit_failures, 0,
+        "successful emit should not increment failure counter"
+    );
+}
