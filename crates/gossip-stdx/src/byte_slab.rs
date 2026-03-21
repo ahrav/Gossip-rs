@@ -1014,6 +1014,388 @@ impl Drop for ByteSlab {
     }
 }
 
+// ============================================================================
+// Kani formal verification proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod kani_proofs {
+    //! Kani proofs for `ByteSlab`'s structural invariants.
+    //!
+    //! The proofs use a 64-byte slab to keep the state space tractable while
+    //! still exercising bump allocation, free-list insertion, coalescing, and
+    //! bump reclamation.
+
+    use super::*;
+
+    const SMALL_SLAB_CAPACITY: usize = 64;
+
+    fn assert_structural_invariants(slab: &ByteSlab) {
+        assert!(slab.bump <= slab.capacity);
+
+        let len = slab.free_list.len();
+        // free_list_metadata_capacity(64) = ceil((64/16)/2) = 2, so the
+        // pre-allocated free-list can hold at most 2 entries for this slab size.
+        let max_free_entries = free_list_metadata_capacity(SMALL_SLAB_CAPACITY);
+        assert!(
+            len <= max_free_entries,
+            "free list length {len} exceeds metadata capacity {max_free_entries} \
+             for a {SMALL_SLAB_CAPACITY}-byte slab"
+        );
+
+        let free_sum = match len {
+            0 => 0,
+            1 => {
+                let (offset, size) = slab.free_list[0];
+                assert!(size > 0);
+                let end = offset.checked_add(size).expect("free block end overflow");
+                assert!(end <= slab.bump);
+                size
+            }
+            2 => {
+                let (left_offset, left_size) = slab.free_list[0];
+                let (right_offset, right_size) = slab.free_list[1];
+                assert!(left_size > 0);
+                assert!(right_size > 0);
+
+                let left_end = left_offset
+                    .checked_add(left_size)
+                    .expect("left free block end overflow");
+                let right_end = right_offset
+                    .checked_add(right_size)
+                    .expect("right free block end overflow");
+
+                // Implied transitively by left_end < right_offset and
+                // right_end <= bump, but asserted explicitly for symmetry
+                // with the 1-entry case.
+                assert!(left_end <= slab.bump);
+                assert!(
+                    left_end < right_offset,
+                    "free-list blocks must stay sorted, non-overlapping, and coalesced"
+                );
+                assert!(right_end <= slab.bump);
+
+                left_size
+                    .checked_add(right_size)
+                    .expect("free-list byte total overflow")
+            }
+            _ => panic!(
+                "unexpected free list length {len}; \
+                 max for {SMALL_SLAB_CAPACITY}-byte slab is {max_free_entries}"
+            ),
+        };
+
+        assert_eq!(free_sum, slab.free_bytes);
+
+        let virgin = slab.capacity - slab.bump;
+        assert_eq!(slab.live_bytes + slab.free_bytes + virgin, slab.capacity);
+    }
+
+    // Verifies zero stays zero, small inputs round up to MIN_BLOCK, larger
+    // inputs round to the next power of two, and oversized requests fail.
+    #[kani::proof]
+    fn alloc_size_rounds_correctly() {
+        let n: usize = kani::any();
+        let rounded = alloc_size(n);
+
+        if n == 0 {
+            assert_eq!(rounded, Some(0));
+            return;
+        }
+
+        if n > u32::MAX as usize {
+            assert_eq!(rounded, None);
+            return;
+        }
+
+        let n32 = n as u32;
+        if n32 > (1u32 << 31) {
+            assert_eq!(rounded, None);
+            return;
+        }
+
+        let rounded = rounded.expect("bounded inputs up to 2^31 must round");
+        assert!(rounded.is_power_of_two());
+        assert!(rounded >= MIN_BLOCK);
+        assert!(rounded >= n32);
+
+        if n32 <= MIN_BLOCK {
+            assert_eq!(rounded, MIN_BLOCK);
+        } else {
+            assert!(rounded / 2 < n32);
+            if n32.is_power_of_two() {
+                assert_eq!(rounded, n32);
+            }
+        }
+    }
+
+    // Verifies invariant 1 (`bump <= capacity`) and invariant 4 (byte
+    // conservation) after allocation from either virgin space or a recycled
+    // free-list block.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn allocate_preserves_byte_conservation() {
+        let len: usize = kani::any();
+        kani::assume(len > 0 && len <= 16);
+        let reuse_free_block: bool = kani::any();
+
+        let payload = [0xAB; 16];
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+
+        let slot = if reuse_free_block {
+            let freed = slab.allocate(&payload).unwrap();
+            let _pin = slab.allocate(&[0xCD; 16]).unwrap();
+            slab.deallocate(freed);
+
+            let slot = slab.allocate(&payload[..len]).unwrap();
+            assert_eq!(slot.offset, 0);
+            assert_eq!(slot.alloc_size, MIN_BLOCK);
+            assert_eq!(slab.free_list_bytes(), 0);
+            assert_eq!(slab.live_count(), 2);
+            slot
+        } else {
+            let slot = slab.allocate(&payload[..len]).unwrap();
+            assert_eq!(slot.offset, 0);
+            assert_eq!(slot.alloc_size, MIN_BLOCK);
+            assert_eq!(slab.live_count(), 1);
+            slot
+        };
+
+        let stored = slab.get(slot);
+        assert_eq!(slot.len(), len);
+        assert_eq!(stored.len(), len);
+        let idx: usize = kani::any();
+        kani::assume(idx < len);
+        assert_eq!(stored[idx], payload[idx]);
+        assert_structural_invariants(&slab);
+        slab.clear();
+    }
+
+    // Verifies invariant 1, invariant 3 (`free_bytes` equals the tracked
+    // free-list total), and invariant 4 after a non-trailing deallocation.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn deallocate_preserves_byte_conservation() {
+        let len: usize = kani::any();
+        kani::assume(len > 0 && len <= 32);
+
+        let payload = [0x11; 32];
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+        let slot = slab.allocate(&payload[..len]).unwrap();
+        let _pin = slab.allocate(&[0x22; 16]).unwrap();
+        let freed_size = slot.alloc_size;
+
+        slab.deallocate(slot);
+
+        assert_eq!(slab.free_list.len(), 1);
+        assert_eq!(slab.free_list[0], (0, freed_size));
+        assert_eq!(slab.free_bytes, freed_size);
+        assert_eq!(slab.free_list_bytes(), freed_size as usize);
+        assert_eq!(slab.live_count(), 1);
+        assert_structural_invariants(&slab);
+        slab.clear();
+    }
+
+    // Verifies a single allocate/deallocate cycle conserves bytes and fully
+    // reclaims the slab state.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn allocate_deallocate_roundtrip() {
+        let len: usize = kani::any();
+        kani::assume(len > 0 && len <= SMALL_SLAB_CAPACITY);
+
+        let payload = [0x5A; SMALL_SLAB_CAPACITY];
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+        let slot = slab.allocate(&payload[..len]).unwrap();
+
+        let stored = slab.get(slot);
+        assert_eq!(stored.len(), len);
+        let idx: usize = kani::any();
+        kani::assume(idx < len);
+        assert_eq!(stored[idx], payload[idx]);
+        slab.deallocate(slot);
+
+        assert_eq!(slab.bump, 0);
+        assert!(slab.free_list.is_empty());
+        assert_eq!(slab.live_bytes, 0);
+        assert_eq!(slab.live_count, 0);
+        assert_eq!(slab.available_bytes(), slab.capacity());
+        assert_structural_invariants(&slab);
+    }
+
+    // Verifies invariant 2 by exploring right-only, left-only, and
+    // three-way coalescing scenarios with a symbolic branch.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn coalescing_produces_no_adjacent_blocks() {
+        let scenario: u8 = kani::any();
+        kani::assume(scenario < 3);
+
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+        let a = slab.allocate(&[0xA1; 16]).unwrap();
+        let b = slab.allocate(&[0xB2; 16]).unwrap();
+        let c = slab.allocate(&[0xC3; 16]).unwrap();
+        let _pin = slab.allocate(&[0xD4; 16]).unwrap();
+
+        match scenario {
+            0 => {
+                slab.deallocate(c);
+                slab.deallocate(b);
+                assert_eq!(slab.free_list.len(), 1);
+                assert_eq!(slab.free_list[0], (16, 32));
+            }
+            1 => {
+                slab.deallocate(a);
+                slab.deallocate(b);
+                assert_eq!(slab.free_list.len(), 1);
+                assert_eq!(slab.free_list[0], (0, 32));
+            }
+            2 => {
+                slab.deallocate(a);
+                slab.deallocate(c);
+                slab.deallocate(b);
+                assert_eq!(slab.free_list.len(), 1);
+                assert_eq!(slab.free_list[0], (0, 48));
+            }
+            _ => unreachable!(),
+        }
+
+        assert_structural_invariants(&slab);
+        slab.clear();
+    }
+
+    // Verifies `clear` resets all bookkeeping and restores the empty-slab
+    // invariants even when live and free-list state are both present.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn clear_resets_all_bookkeeping() {
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+        let owner_before = slab.owner_id;
+        let slot = slab.allocate(&[0x31; 16]).unwrap();
+        let _pin = slab.allocate(&[0x32; 16]).unwrap();
+        slab.deallocate(slot);
+
+        assert!(slab.bump > 0);
+        assert!(!slab.free_list.is_empty());
+        assert!(slab.live_bytes > 0);
+        assert!(slab.live_count > 0);
+
+        slab.clear();
+
+        assert_eq!(slab.bump, 0);
+        assert!(slab.free_list.is_empty());
+        assert_eq!(slab.free_bytes, 0);
+        assert_eq!(slab.live_bytes, 0);
+        assert_eq!(slab.live_count, 0);
+        assert_eq!(slab.available_bytes(), slab.capacity());
+        assert_ne!(slab.owner_id, owner_before);
+        assert_structural_invariants(&slab);
+    }
+
+    // Verifies the distinct reclaim path where deallocating the trailing block
+    // merges with a left free-list neighbor and retracts the bump pointer.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn bump_reclaim_retracts_pointer() {
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+        let a = slab.allocate(&[0x41; 16]).unwrap();
+        let b = slab.allocate(&[0x42; 16]).unwrap();
+        let c = slab.allocate(&[0x43; 16]).unwrap();
+        let bump_before = slab.bump;
+
+        slab.deallocate(b);
+        assert_eq!(slab.free_list.len(), 1);
+        assert_eq!(slab.free_list[0], (16, 16));
+
+        slab.deallocate(c);
+
+        assert_eq!(slab.bump, 16);
+        assert!(slab.bump < bump_before);
+        assert!(slab.free_list.is_empty());
+        assert_eq!(slab.live_count, 1);
+        assert_eq!(slab.live_bytes, 16);
+        assert_structural_invariants(&slab);
+
+        slab.deallocate(a);
+        assert_eq!(slab.bump, 0);
+        assert!(slab.free_list.is_empty());
+        assert_eq!(slab.live_count, 0);
+        assert_eq!(slab.live_bytes, 0);
+    }
+
+    // Exercises the free-list *split* path: a 32-byte free block is reused
+    // for a 16-byte request, producing a 16-byte remainder that is pushed
+    // back onto the free list. Verifies byte conservation holds through the
+    // split and that the remainder is correctly tracked.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn split_reuse_preserves_byte_conservation() {
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+
+        // Allocate a 32-byte block (payload 17..=32 rounds to 32).
+        let big = slab.allocate(&[0xAA; 17]).unwrap();
+        assert_eq!(big.alloc_size, 32);
+        // Pin the tail so the big block doesn't retract the bump on dealloc.
+        let _pin = slab.allocate(&[0xBB; 16]).unwrap();
+        assert_eq!(slab.bump, 48);
+
+        // Free the 32-byte block → free list: [(0, 32)].
+        slab.deallocate(big);
+        assert_eq!(slab.free_list.len(), 1);
+        assert_eq!(slab.free_list[0], (0, 32));
+        assert_structural_invariants(&slab);
+
+        // Re-allocate 16 bytes from the free list. The 32-byte block is
+        // split: 16 bytes for the allocation, 16-byte remainder returned
+        // to the free list.
+        let small = slab.allocate(&[0xCC; 16]).unwrap();
+        assert_eq!(small.offset, 0);
+        assert_eq!(small.alloc_size, MIN_BLOCK);
+        // The 16-byte remainder at offset 16 should be in the free list.
+        assert_eq!(slab.free_list.len(), 1);
+        assert_eq!(slab.free_list[0], (16, 16));
+        assert_eq!(slab.free_bytes, 16);
+        assert_eq!(slab.live_count(), 2);
+        assert_structural_invariants(&slab);
+        slab.clear();
+    }
+
+    // Verifies `allocate` returns `SlabFull` when the slab is exhausted.
+    // Four 16-byte allocations fill a 64-byte slab; a fifth must fail.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn exhausted_slab_returns_slab_full() {
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+        let _a = slab.allocate(&[0x01; 16]).unwrap();
+        let _b = slab.allocate(&[0x02; 16]).unwrap();
+        let _c = slab.allocate(&[0x03; 16]).unwrap();
+        let _d = slab.allocate(&[0x04; 16]).unwrap();
+        assert_eq!(slab.bump, 64);
+        assert_eq!(slab.available_bytes(), 0);
+
+        let result = slab.allocate(&[0x05; 1]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.requested, MIN_BLOCK);
+        assert_eq!(err.available, 0);
+        assert_structural_invariants(&slab);
+        slab.clear();
+    }
+
+    // Verifies the owner-id provenance mechanism: slots obtained before
+    // `clear` are rejected by `get` after `clear` rotates the owner id.
+    #[kani::proof]
+    #[kani::should_panic]
+    #[kani::unwind(32)]
+    fn stale_slot_panics_after_clear() {
+        let mut slab = ByteSlab::with_capacity(SMALL_SLAB_CAPACITY);
+        let slot = slab.allocate(&[0xFF; 16]).unwrap();
+        slab.clear();
+        // This must panic: slot.owner_id != slab.owner_id after clear.
+        let _ = slab.get(slot);
+    }
+}
+
 #[cfg(test)]
 #[path = "byte_slab_tests.rs"]
 mod tests;
