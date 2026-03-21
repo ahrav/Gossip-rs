@@ -1439,6 +1439,8 @@ dependencies = [
 name = "gossip-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "gossip-contracts",
  "gossip-coordination-etcd",
  "gossip-done-ledger-postgres",
  "gossip-findings-postgres",

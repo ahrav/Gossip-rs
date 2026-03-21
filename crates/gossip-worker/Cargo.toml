@@ -12,6 +12,8 @@ default = []
 aegis-pure-rust = ["gossip-scanner-runtime/aegis-pure-rust"]
 
 [dependencies]
+anyhow.workspace = true
+gossip-contracts.workspace = true
 gossip-coordination-etcd.workspace = true
 gossip-done-ledger-postgres.workspace = true
 gossip-findings-postgres.workspace = true
