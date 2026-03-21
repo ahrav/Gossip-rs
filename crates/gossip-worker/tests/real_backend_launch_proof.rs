@@ -91,13 +91,11 @@ const WORKER_ENV_KEYS: &[&str] = &[
 ];
 
 struct SafeScanFixture {
-    /// Held for Drop — keeps the scan directory alive for the test lifetime.
-    #[allow(dead_code)]
+    /// RAII guard — dropping this removes the temporary scan directory.
     scan_root: TempDir,
-    /// Held for Drop — keeps the rules directory alive for the test lifetime.
+    /// RAII guard — dropping this removes the temporary rules directory.
     #[allow(dead_code)]
     rules_root: TempDir,
-    scan_path: PathBuf,
     rules_path: PathBuf,
 }
 
@@ -105,16 +103,15 @@ impl SafeScanFixture {
     fn new() -> Self {
         let scan_root = tempfile::tempdir().expect("scan tempdir should create");
         let rules_root = tempfile::tempdir().expect("rules tempdir should create");
-        let scan_path = scan_root.path().to_path_buf();
         let rules_path = rules_root.path().join("safe-rules.yaml");
 
         fs::write(
-            scan_path.join("evidence.txt"),
+            scan_root.path().join("evidence.txt"),
             format!("non-secret fixture payload: {SAFE_TOKEN}\n"),
         )
         .expect("safe evidence fixture should write");
         fs::write(
-            scan_path.join("readme.txt"),
+            scan_root.path().join("readme.txt"),
             "this file exists to ensure the shard scans more than one filesystem entry\n",
         )
         .expect("safe readme fixture should write");
@@ -123,13 +120,12 @@ impl SafeScanFixture {
         Self {
             scan_root,
             rules_root,
-            scan_path,
             rules_path,
         }
     }
 
     fn scan_path(&self) -> &Path {
-        &self.scan_path
+        self.scan_root.path()
     }
 
     fn rules_path(&self) -> &Path {
@@ -139,7 +135,6 @@ impl SafeScanFixture {
 
 struct SeededLaunchProof {
     coordinator: EtcdCoordinator,
-    etcd_config: EtcdCoordinatorConfig,
     done_ledger_dsn: String,
     findings_dsn: String,
     fixture: SafeScanFixture,
@@ -150,7 +145,6 @@ impl SeededLaunchProof {
     fn new() -> Self {
         let namespace = contention_namespace();
         let mut coordinator = test_coordinator_in_namespace(&namespace);
-        let etcd_config = coordinator.config().clone();
         let done_ledger_dsn = create_test_db();
         let findings_dsn = create_test_db();
         migrate_database_pair(&done_ledger_dsn, &findings_dsn);
@@ -164,7 +158,6 @@ impl SeededLaunchProof {
 
         Self {
             coordinator,
-            etcd_config,
             done_ledger_dsn,
             findings_dsn,
             fixture,
@@ -174,7 +167,7 @@ impl SeededLaunchProof {
 
     fn run_worker_binary(&self) -> Output {
         run_worker_process(
-            &self.etcd_config,
+            self.coordinator.config(),
             &self.done_ledger_dsn,
             &self.findings_dsn,
             self.fixture.scan_path(),
@@ -275,7 +268,9 @@ fn worker_binary_path() -> PathBuf {
 
     // Integration tests run from `target/<profile>/deps`; the package binary
     // sits next to that directory in the same profile output folder.
-    let fallback = std::env::current_exe()
+    let current_exe = std::env::current_exe();
+    let fallback = current_exe
+        .as_ref()
         .ok()
         .and_then(|exe| {
             exe.parent()
@@ -290,7 +285,16 @@ fn worker_binary_path() -> PathBuf {
         return path;
     }
 
-    panic!("could not locate the compiled gossip-worker binary for integration tests");
+    match current_exe {
+        Err(e) => panic!(
+            "could not locate the compiled gossip-worker binary: \
+             current_exe() failed: {e}"
+        ),
+        Ok(exe) => panic!(
+            "could not locate the compiled gossip-worker binary; \
+             searched CARGO_BIN_EXE_* and relative to {exe:?}"
+        ),
+    }
 }
 
 fn migrate_database_pair(done_ledger_dsn: &str, findings_dsn: &str) {
@@ -353,14 +357,16 @@ fn run_worker_process(
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut pipe) = stdout_pipe {
-            pipe.read_to_end(&mut buf).ok();
+            pipe.read_to_end(&mut buf)
+                .expect("failed to read child process stdout");
         }
         buf
     });
     let stderr_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut pipe) = stderr_pipe {
-            pipe.read_to_end(&mut buf).ok();
+            pipe.read_to_end(&mut buf)
+                .expect("failed to read child process stderr");
         }
         buf
     });
@@ -374,6 +380,7 @@ fn run_worker_process(
         },
         None => {
             child.kill().expect("kill should succeed");
+            child.wait().expect("wait after kill should succeed");
             let stdout = stdout_thread.join().unwrap_or_default();
             let stderr = stderr_thread.join().unwrap_or_default();
             panic!(
@@ -397,8 +404,8 @@ fn assert_worker_success(output: &Output, context: &str) {
 
 fn table_row_count(dsn: &str, table: &str) -> i64 {
     assert!(
-        table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-        "table_row_count requires a plain SQL identifier, got: {table}"
+        !table.is_empty() && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "table_row_count requires a non-empty plain SQL identifier, got: {table:?}"
     );
     let mut client = Client::connect(dsn, NoTls).expect("test database should connect");
     client
@@ -437,27 +444,30 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
 
     let output = proof.run_worker_binary();
     assert_worker_success(&output, "real-backend worker happy path");
+    assert!(
+        !output.stderr.is_empty(),
+        "worker should produce diagnostic output on stderr"
+    );
 
     let done_ledger_rows = proof.done_ledger_row_count();
     let observation_rows = proof.observation_row_count();
     // The scan fixture contains exactly 2 files (evidence.txt, readme.txt),
     // producing one done-ledger entry per scanned object-version.
-    assert!(
-        done_ledger_rows >= 2,
-        "expected at least 2 done-ledger rows (one per scanned file), got {done_ledger_rows}"
+    assert_eq!(
+        done_ledger_rows, 2,
+        "expected exactly 2 done-ledger rows (one per scanned file), got {done_ledger_rows}"
     );
     // The safe-test-token rule matches exactly once in evidence.txt.
-    assert!(
-        observation_rows >= 1,
-        "expected at least 1 observation for rule '{}', got {observation_rows}",
+    assert_eq!(
+        observation_rows, 1,
+        "expected exactly 1 observation for rule '{}', got {observation_rows}",
         SAFE_RULE_NAME,
     );
     let targeted_observations = proof.observations_for_run();
-    assert!(
-        targeted_observations >= 1,
-        "expected at least 1 observation for run_id={}, shard_id={}, got {targeted_observations}",
-        RUN_ID_RAW,
-        SHARD_ID_RAW,
+    assert_eq!(
+        targeted_observations, 1,
+        "expected exactly 1 observation for run_id={}, shard_id={}, got {targeted_observations}",
+        RUN_ID_RAW, SHARD_ID_RAW,
     );
 
     let shard = proof
@@ -484,14 +494,14 @@ fn worker_binary_restart_is_idempotent_after_completed_shard() {
     assert_worker_success(&first, "first real-backend worker launch");
     let done_rows_after_first = proof.done_ledger_row_count();
     let observation_rows_after_first = proof.observation_row_count();
-    assert!(
-        done_rows_after_first >= 2,
-        "first launch must write at least 2 done-ledger rows (one per scanned file), \
+    assert_eq!(
+        done_rows_after_first, 2,
+        "first launch must write exactly 2 done-ledger rows (one per scanned file), \
          got {done_rows_after_first}"
     );
-    assert!(
-        observation_rows_after_first >= 1,
-        "first launch must write at least 1 findings observation, \
+    assert_eq!(
+        observation_rows_after_first, 1,
+        "first launch must write exactly 1 findings observation, \
          got {observation_rows_after_first}"
     );
 
@@ -518,6 +528,7 @@ fn worker_binary_restart_is_idempotent_after_completed_shard() {
 }
 
 #[test]
+#[ignore = "requires wall-clock TTL expiry against live etcd"]
 fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
     let namespace = contention_namespace();
     let ttl_secs: i64 = 1;

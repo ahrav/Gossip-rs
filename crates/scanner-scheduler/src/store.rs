@@ -134,9 +134,10 @@ impl std::error::Error for FsStoreError {}
 ///
 /// # Contract
 ///
-/// - `emit_fs_batch` is called zero or more times during a scan, once per
-///   scanned object that produced findings. Batches may arrive out of file
-///   order when workers run in parallel.
+/// - `emit_fs_batch` is called once per scanned object per chunk. Batches
+///   may arrive out of file order when workers run in parallel. The
+///   findings slice may be empty for objects (or chunks) with no matches;
+///   callers use these empty batches to record "scanned clean" status.
 /// - `record_fs_run_loss` is called exactly once at the end of a scan run.
 ///   Implementations should persist or log the loss data before returning.
 /// - `end_run` is called once after `record_fs_run_loss` to finalize the run
@@ -147,6 +148,8 @@ impl std::error::Error for FsStoreError {}
 pub trait StoreProducer: Send + Sync + 'static {
     /// Emit one post-dedupe finding batch for a single scanned object.
     ///
+    /// The findings slice may be empty for objects with no matches;
+    /// implementations must handle this to record "scanned clean" status.
     /// Called from a worker thread. The batch borrows data from scratch
     /// buffers, so implementations must copy or serialize before returning.
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError>;

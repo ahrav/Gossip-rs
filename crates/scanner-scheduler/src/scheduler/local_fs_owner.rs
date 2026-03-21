@@ -62,16 +62,16 @@
 use super::count_budget::CountBudget;
 use super::engine_trait::{EngineScratch, FindingWithHashRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, WorkerCtx};
-use super::local_fs_archive_ctx::{ArchiveEnd, dispatch_archive_scan};
+use super::local_fs_archive_ctx::{dispatch_archive_scan, ArchiveEnd};
 use super::local_fs_extract::extract_and_scan_file;
 use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
 use super::shared_core::{carry_overlap_prefix, scan_chunk_postprocess};
 use super::ts_buffer_pool::{TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
-use crate::archive::formats::{TarCursor, ZipCursor, tar::TAR_BLOCK_LEN};
+use crate::archive::formats::{tar::TAR_BLOCK_LEN, TarCursor, ZipCursor};
 use crate::archive::{
-    ArchiveBudgets, ArchiveConfig, DEFAULT_MAX_COMPONENTS, EntryPathCanonicalizer,
-    VirtualPathBuilder, detect_kind_from_path, sniff_kind_from_header,
+    detect_kind_from_path, sniff_kind_from_header, ArchiveBudgets, ArchiveConfig,
+    EntryPathCanonicalizer, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
 };
 use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
 use crate::store::{FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer};
@@ -79,8 +79,8 @@ use crate::store::{FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ============================================================================
 // Configuration
@@ -549,7 +549,9 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
 
 /// Build and emit a persistence batch for one chunk's post-dedupe findings.
 ///
-/// No-ops when `store_producer` is `None` or `findings` is empty.
+/// No-ops when `store_producer` is `None`. Emits even when `findings` is
+/// empty so the downstream pipeline can record a "scanned clean" done-ledger
+/// entry for objects with zero matches.
 ///
 /// # Fail-soft design
 ///
@@ -571,10 +573,10 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     let Some(producer) = store_producer else {
         return;
     };
-    if findings.is_empty() {
-        return;
-    }
 
+    // Emit even when findings is empty: the downstream pipeline uses each
+    // batch to create a done-ledger entry, so clean files (zero findings)
+    // still need a batch to record "scanned, nothing found."
     build_persistence_batch(findings, persist_batch);
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]
