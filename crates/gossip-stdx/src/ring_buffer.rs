@@ -540,27 +540,28 @@ mod kani_proofs {
     //! Each proof targets one or more `unsafe` operations, verifying that
     //! wrapping index arithmetic and `MaybeUninit` access are sound for all
     //! valid inputs (symbolic, not sampled). Together the 10 proofs cover
-    //! all 9 `unsafe` blocks in `RingBuffer`.
+    //! all 8 `unsafe {}` blocks and the one `unsafe fn` declaration in
+    //! `RingBuffer`.
     //!
     //! Key difference from `InlineVec` proofs: RingBuffer uses wrapping
-    //! index arithmetic `(head + offset) & MASK`. Proofs #2-#10 construct
+    //! index arithmetic `(head + offset) & MASK`. Most proofs construct
     //! non-zero `head` positions via push/pop warmup so that elements span
     //! the wrap boundary, exercising the `& MASK` logic that a `head = 0`
     //! test would miss.
     //!
     //! Proofs use `CAP = 4` and `u32` elements for tractable SAT solving.
     //!
-    //! Coverage:
-    //! - Proof 1: `uninit_array` (trivially sound for MaybeUninit)
-    //! - Proof 2: `push_back_assume_capacity` (write at wrapped tail)
-    //! - Proof 3: `get` (read at wrapped physical index)
-    //! - Proof 4: `pop_front` (read at wrapped head)
-    //! - Proof 5: `clone` (read across wrap boundary)
-    //! - Proof 6: `drop` via `clear` -> `pop_front` (correct element count)
-    //! - Proof 7: `Iter::next` (forward traversal across wrap)
-    //! - Proof 8: `DoubleEndedIterator::next_back` (reverse across wrap)
-    //! - Proof 9: push/pop rotation preserves elements (combined L217+L264)
-    //! - Proof 10: `push_back_overwrite` sequence (transitive: pop_front + push_back_assume_capacity)
+    //! Coverage by unsafe operation:
+    //! - `uninit_array`: MaybeUninit array construction is trivially sound
+    //! - `push_back_assume_capacity`: write lands at correct wrapped tail index
+    //! - `get`: read at wrapped physical index returns initialized data only
+    //! - `pop_front`: read at wrapped head returns initialized data, FIFO order
+    //! - `clone`: read across wrap boundary produces element-wise equal ring
+    //! - `clear`/`drop`: memory-safe traversal of all initialized slots
+    //! - `Iter::next`: forward traversal across wrap boundary in FIFO order
+    //! - `DoubleEndedIterator::next_back`: reverse traversal across wrap boundary
+    //! - push/pop rotation: interleaved operations preserve element values
+    //! - `push_back_overwrite`: evict-then-write sequence is sound at all head positions
 
     use super::*;
 
@@ -576,21 +577,27 @@ mod kani_proofs {
             ring.push_back(0).unwrap();
         }
         for _ in 0..offset {
-            ring.pop_front();
+            assert_eq!(ring.pop_front(), Some(0));
         }
+        // Postcondition: ring is empty with head advanced to `offset`.
+        // Guards against future changes that might normalize head to 0
+        // on empty, which would silently defeat wrap-boundary coverage.
+        assert!(ring.is_empty());
+        assert_eq!(ring.head, offset);
     }
 
-    // Proof 1: `uninit_array` produces a valid `[MaybeUninit<T>; N]` for
-    // both sized types and ZSTs.
+    // `uninit_array` produces a valid `[MaybeUninit<T>; N]` for both sized
+    // types and ZSTs.
     #[kani::proof]
     fn uninit_array_is_valid() {
         let _arr = uninit_array::<u32, CAP>();
         let _arr_zst = uninit_array::<(), CAP>();
     }
 
-    // Proof 2: `push_back_assume_capacity` writes within bounds for all
-    // head positions and fill levels.
-    // Covers unsafe at L217: `get_unchecked_mut(index(tail)).write(value)`.
+    // `push_back_assume_capacity` writes within bounds for all head
+    // positions and fill levels.
+    // Covers the `get_unchecked_mut(tail).write(value)` unsafe in
+    // `push_back_assume_capacity`.
     #[kani::proof]
     #[kani::unwind(7)]
     fn push_back_within_capacity_is_safe() {
@@ -607,9 +614,9 @@ mod kani_proofs {
         assert_eq!(ring.len(), n);
     }
 
-    // Proof 3: `get` returns initialized references only, for all head
-    // positions and logical indices. Out-of-bounds returns None.
-    // Covers unsafe at L167: `get_unchecked(physical).assume_init_ref()`.
+    // `get` returns initialized references only, for all head positions
+    // and logical indices. Out-of-bounds returns None.
+    // Covers the `get_unchecked(physical).assume_init_ref()` unsafe in `get`.
     #[kani::proof]
     #[kani::unwind(7)]
     fn get_returns_initialized_only() {
@@ -637,9 +644,9 @@ mod kani_proofs {
         assert!(ring.get(n).is_none());
     }
 
-    // Proof 4: `pop_front` reads only initialized memory, for all head
-    // positions. After popping all elements, the ring is empty.
-    // Covers unsafe at L264: `get_unchecked(index(idx)).as_ptr().read()`.
+    // `pop_front` reads only initialized memory, for all head positions.
+    // After popping all elements, the ring is empty.
+    // Covers the `get_unchecked(idx).as_ptr().read()` unsafe in `pop_front`.
     #[kani::proof]
     #[kani::unwind(7)]
     fn pop_front_reads_initialized() {
@@ -663,9 +670,9 @@ mod kani_proofs {
         assert!(ring.pop_front().is_none());
     }
 
-    // Proof 5: `clone` reads only initialized slots across the wrap
-    // boundary and produces an equal ring buffer.
-    // Covers unsafe at L351: `get_unchecked(index(physical)).assume_init_ref()`.
+    // `clone` reads only initialized slots across the wrap boundary and
+    // produces an equal ring buffer.
+    // Covers the `get_unchecked(physical).assume_init_ref()` unsafe in `clone`.
     #[kani::proof]
     #[kani::unwind(7)]
     fn clone_is_sound() {
@@ -689,12 +696,14 @@ mod kani_proofs {
         }
     }
 
-    // Proof 6: `Drop` (via `clear` -> `pop_front`) visits exactly `len`
-    // elements for all head positions, including wrapped layouts.
-    // Covers unsafe at L264 transitively via `pop_front` in `clear`.
+    // `Drop` (via `clear` -> `pop_front`) accesses only initialized memory
+    // for all head positions, including wrapped layouts. Uses `u32` elements
+    // (trivial Drop), so this verifies memory safety of the traversal, not
+    // that exactly `n` destructors ran.
+    // Covers `pop_front` unsafe transitively through `clear`.
     #[kani::proof]
     #[kani::unwind(7)]
-    fn drop_visits_correct_count() {
+    fn drop_clear_is_memory_safe() {
         let mut ring = RingBuffer::<u32, CAP>::new();
         let offset: u32 = kani::any();
         kani::assume(offset < CAP as u32);
@@ -709,9 +718,10 @@ mod kani_proofs {
         drop(ring); // Kani verifies all pop_front reads are in-bounds.
     }
 
-    // Proof 7: forward iteration via `Iter::next` traverses exactly the
-    // initialized elements across the wrap boundary in FIFO order.
-    // Covers unsafe at L441 and L459: `get_unchecked` -> `assume_init_ref`.
+    // Forward iteration via `Iter::next` traverses exactly the initialized
+    // elements across the wrap boundary in FIFO order.
+    // Covers the `get_unchecked` -> `assume_init_ref` unsafe in
+    // `Iter::get_unchecked` and `Iter::next`.
     #[kani::proof]
     #[kani::unwind(7)]
     fn iter_forward_is_sound() {
@@ -736,9 +746,10 @@ mod kani_proofs {
         assert_eq!(count, n);
     }
 
-    // Proof 8: reverse iteration via `DoubleEndedIterator::next_back`
-    // traverses elements in reverse FIFO order across the wrap boundary.
-    // Covers unsafe at L441 and L479: `get_unchecked` -> `assume_init_ref`.
+    // Reverse iteration via `DoubleEndedIterator::next_back` traverses
+    // elements in reverse FIFO order across the wrap boundary.
+    // Covers the `get_unchecked` -> `assume_init_ref` unsafe in
+    // `Iter::get_unchecked` and `Iter::next_back`.
     #[kani::proof]
     #[kani::unwind(7)]
     fn iter_reverse_is_sound() {
@@ -763,9 +774,10 @@ mod kani_proofs {
         assert_eq!(count, n);
     }
 
-    // Proof 9: interleaved push/pop rotation preserves element values.
-    // Exercises both L217 (push write) and L264 (pop read) with head
-    // advancing through all positions modulo CAPACITY.
+    // Interleaved push/pop rotation preserves element values. Exercises
+    // both the write unsafe in `push_back_assume_capacity` and the read
+    // unsafe in `pop_front` with head advancing through all positions
+    // modulo CAPACITY.
     #[kani::proof]
     #[kani::unwind(7)]
     fn push_pop_rotate_preserves_elements() {
@@ -793,10 +805,10 @@ mod kani_proofs {
         }
     }
 
-    // Proof 10: repeated `push_back_overwrite` exercises the most
-    // wrapping-intensive single operation. It delegates to `pop_front`
-    // (L264) + `push_back_assume_capacity` (L217), covering both unsafe
-    // blocks transitively with head AND tail wrapping simultaneously.
+    // Repeated `push_back_overwrite` exercises the most wrapping-intensive
+    // single operation. It delegates to `pop_front` + `push_back_assume_capacity`,
+    // covering both unsafe blocks transitively with head AND tail wrapping
+    // simultaneously.
     #[kani::proof]
     #[kani::unwind(7)]
     fn push_back_overwrite_sequence_is_sound() {
