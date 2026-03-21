@@ -140,6 +140,30 @@ mod tests {
         spill.writer().finish().expect("finish empty spill");
 
         assert!(spill.is_empty());
+        assert_eq!(spill.len(), 0);
         assert!(spill.as_slice().is_empty());
+    }
+
+    #[test]
+    fn blob_spill_writer_rejects_overflow() {
+        let dir = tempfile::tempdir().expect("create spill dir");
+        let mut spill = BlobSpill::new(dir.path(), 3).expect("create spill");
+        let mut writer = spill.writer();
+        assert!(
+            writer.write(b"toolong").is_err(),
+            "write must fail when bytes exceed capacity"
+        );
+    }
+
+    #[test]
+    fn blob_spill_finish_errors_when_write_is_incomplete() {
+        let dir = tempfile::tempdir().expect("create spill dir");
+        let mut spill = BlobSpill::new(dir.path(), 5).expect("create spill");
+        let mut writer = spill.writer();
+        writer.write(b"hi").expect("partial write");
+        assert!(
+            writer.finish().is_err(),
+            "finish must fail when fewer than len bytes were written"
+        );
     }
 }
