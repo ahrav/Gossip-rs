@@ -923,21 +923,30 @@ impl RawWorkerConfig {
         S: Into<String>,
     {
         let mut positionals = Vec::new();
+        let mut flag_set_source = false;
+        let mut flag_set_path = false;
         for raw_arg in args.into_iter().map(Into::into) {
             if let Some(flag) = raw_arg.strip_prefix("--") {
                 let (name, value) = flag.split_once('=').ok_or_else(|| {
                     WorkerConfigError::Usage(format!("invalid flag '{raw_arg}'\n{}", usage()))
                 })?;
+                match name {
+                    "source" => flag_set_source = true,
+                    "path" => flag_set_path = true,
+                    _ => {}
+                }
                 self.apply_cli_override(name, value)?;
             } else {
                 positionals.push(raw_arg);
             }
         }
 
+        // Positional args override environment variables (expected), but
+        // conflict with explicit --source / --path flags (ambiguous intent).
         match positionals.len() {
             0 => Ok(()),
             1 => {
-                if self.path.is_some() {
+                if flag_set_path {
                     return Err(WorkerConfigError::Usage(format!(
                         "path specified both as --path flag and as positional argument\n{}",
                         usage()
@@ -947,13 +956,13 @@ impl RawWorkerConfig {
                 Ok(())
             }
             2 => {
-                if self.source.is_some() {
+                if flag_set_source {
                     return Err(WorkerConfigError::Usage(format!(
                         "source specified both as --source flag and as positional argument\n{}",
                         usage()
                     )));
                 }
-                if self.path.is_some() {
+                if flag_set_path {
                     return Err(WorkerConfigError::Usage(format!(
                         "path specified both as --path flag and as positional argument\n{}",
                         usage()
