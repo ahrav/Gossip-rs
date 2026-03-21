@@ -445,8 +445,10 @@ impl IterWalker {
     /// Build a single-threaded directory walker rooted at `root`.
     ///
     /// Configures the `ignore` crate's `WalkBuilder` with gitignore,
-    /// symlink, and hidden-file settings from `config`. The resulting
-    /// iterator is consumed lazily by `next_file()`.
+    /// symlink, and hidden-file settings from `config`. Entries within
+    /// each directory are sorted by path so the emission order is
+    /// deterministic and monotonically increasing by key — a requirement
+    /// for the distributed checkpoint aggregator's resume semantics.
     fn new(root: &Path, config: &ParallelScanConfig) -> Self {
         let mut builder = ignore::WalkBuilder::new(root);
         builder
@@ -454,7 +456,8 @@ impl IterWalker {
             .hidden(config.skip_hidden)
             .git_ignore(config.respect_gitignore)
             .git_global(config.respect_gitignore)
-            .git_exclude(config.respect_gitignore);
+            .git_exclude(config.respect_gitignore)
+            .sort_by_file_path(|a, b| a.cmp(b));
         Self {
             walk: builder.build(),
         }

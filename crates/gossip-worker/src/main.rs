@@ -95,6 +95,7 @@ fn init_tracing() {
         }
     };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .compact()

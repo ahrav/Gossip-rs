@@ -549,7 +549,9 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
 
 /// Build and emit a persistence batch for one chunk's post-dedupe findings.
 ///
-/// No-ops when `store_producer` is `None` or `findings` is empty.
+/// No-ops when `store_producer` is `None`. Emits even when `findings` is
+/// empty so the downstream pipeline can record a "scanned clean" done-ledger
+/// entry for objects with zero matches.
 ///
 /// # Fail-soft design
 ///
@@ -571,10 +573,10 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     let Some(producer) = store_producer else {
         return;
     };
-    if findings.is_empty() {
-        return;
-    }
 
+    // Emit even when findings is empty: the downstream pipeline uses each
+    // batch to create a done-ledger entry, so clean files (zero findings)
+    // still need a batch to record "scanned, nothing found."
     build_persistence_batch(findings, persist_batch);
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]

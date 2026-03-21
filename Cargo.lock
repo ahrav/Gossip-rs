@@ -1449,11 +1449,13 @@ dependencies = [
  "gossip-persistence-inmemory",
  "gossip-pg-common",
  "gossip-scanner-runtime",
+ "gossip-stdx",
  "postgres",
  "scanner-scheduler",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "wait-timeout",
 ]
 
 [[package]]
