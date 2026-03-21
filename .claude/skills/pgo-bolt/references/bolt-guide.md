@@ -258,8 +258,10 @@ Source → PGO Build → BOLT → Final Binary
 BOLT-ERROR: cannot process binaries with relocations in non-allocated sections
 ```
 
-**Fix:** Build with `-C relocation-model=pic` or ensure relocations are in allocated
-sections. Stripping debug info before BOLT may also help:
+**Fix:** Build with both `-C relocation-model=pic` **and** `-C link-arg=-Wl,--emit-relocs`
+(see the Prerequisites section above). The relocation model alone is insufficient;
+`--emit-relocs` ensures relocations land in allocated sections where BOLT can process them.
+Stripping debug info before BOLT may also help:
 ```bash
 objcopy --only-keep-debug binary binary.debug
 strip binary

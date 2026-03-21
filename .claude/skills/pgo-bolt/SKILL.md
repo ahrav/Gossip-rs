@@ -72,6 +72,8 @@ RUSTFLAGS="-C opt-level=3 -C target-cpu=native -C force-frame-pointers=yes -C de
   cargo build --release
 ```
 
+**Note:** `-C flag=value` and `-Cflag=value` are equivalent; both forms appear in this guide.
+
 **For BOLT compatibility**, add to `.cargo/config.toml` (target-specific to avoid overriding PGO flags):
 
 ```toml
@@ -239,18 +241,20 @@ cargo pgo bolt optimize --with-pgo -- --bin <target>
 
 ```bash
 # Step 1: Instrumented build
+# Detect host target triple (works on Linux x86-64, AArch64, and macOS)
+TARGET=$(rustc -vV | grep host | cut -d' ' -f2)
 # Use --target flag to prevent build scripts from generating .profraw files
 # Use ABSOLUTE paths for -Cprofile-generate (Cargo varies working directories)
 RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" \
-  cargo build --release --target=x86_64-unknown-linux-gnu --bin <target>
+  cargo build --release --target="$TARGET" --bin <target>
 
 # Step 2: Run representative workload(s)
 # Each run creates .profraw files in /tmp/pgo-data/
 # %p=PID, %m=binary hash — guarantees unique filenames for parallel/repeated runs
 LLVM_PROFILE_FILE="/tmp/pgo-data/run-%m_%p.profraw" \
-  ./target/x86_64-unknown-linux-gnu/release/<target> <input_1>
+  ./target/$TARGET/release/<target> <input_1>
 LLVM_PROFILE_FILE="/tmp/pgo-data/run-%m_%p.profraw" \
-  ./target/x86_64-unknown-linux-gnu/release/<target> <input_2>
+  ./target/$TARGET/release/<target> <input_2>
 
 # Step 3: Merge profiles
 # Find llvm-profdata in the Rust toolchain
