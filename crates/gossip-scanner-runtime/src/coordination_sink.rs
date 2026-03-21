@@ -6,6 +6,7 @@
 //! enforced by the receipt-driven commit pipeline (`ReceiptCommitSink` ->
 //! `ResultCommitter`), while event recording remains best-effort telemetry.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -55,7 +56,7 @@ pub enum CommitProgressRecord {
 }
 
 /// Coordinator-facing recorder for distributed scan output.
-pub trait CoordinationEventRecorder: Send + Sync {
+pub trait CoordinationEventRecorder: Send + Sync + fmt::Debug {
     /// Persists a scanner core event (finding, progress, summary, diagnostic).
     fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()>;
     /// Persists a git-specific event (commit metadata or identity dictionary entry).
@@ -92,17 +93,30 @@ impl CoordinationEventSink {
             git_error_logged: AtomicBool::new(false),
         }
     }
+
+    fn warn_recorder_failure(
+        &self,
+        error_flag: &AtomicBool,
+        error: anyhow::Error,
+        message: &'static str,
+    ) {
+        if !error_flag.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "{message}",
+            );
+        }
+    }
 }
 
 impl EventOutput for CoordinationEventSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
         let owned = OwnedCoreEvent::from_core(event);
-        if let Err(error) = self.recorder.record_core_event(&self.shard_id, owned)
-            && !self.core_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
+        if let Err(error) = self.recorder.record_core_event(&self.shard_id, owned) {
+            self.warn_recorder_failure(
+                &self.core_error_logged,
+                error,
                 "recorder failed to persist core event; subsequent failures suppressed",
             );
         }
@@ -137,12 +151,10 @@ impl GitEventOutput for CoordinationEventSink {
             },
         };
 
-        if let Err(error) = self.recorder.record_git_event(&self.shard_id, owned)
-            && !self.git_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
+        if let Err(error) = self.recorder.record_git_event(&self.shard_id, owned) {
+            self.warn_recorder_failure(
+                &self.git_error_logged,
+                error,
                 "recorder failed to persist git event; subsequent failures suppressed",
             );
         }

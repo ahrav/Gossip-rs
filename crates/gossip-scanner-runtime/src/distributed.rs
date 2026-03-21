@@ -510,6 +510,18 @@ impl ReceiptCommitSink {
         self.next_sequence_no.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn record_progress(&self, event: CommitProgressRecord) {
+        if let Err(error) = self.recorder.record_commit_progress(&self.shard_id, event)
+            && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
+        }
+    }
+
     /// Derive a pair of non-overlapping logical timestamps from a sequence number.
     ///
     /// Maps sequence `n` to `(2n, 2n+1)`, giving each item a unique
@@ -537,21 +549,11 @@ impl ReceiptCommitSink {
     /// Recorder errors are intentionally non-fatal: durability flows through
     /// the commit pipeline, not the recorder.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
-        if let Err(error) = self.recorder.record_commit_progress(
-            &self.shard_id,
-            CommitProgressRecord::Begin {
-                write_context: self.write_context,
-                item_key: item_key.clone(),
-                size_hint: meta.size_hint,
-            },
-        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
-                "recorder failed to persist progress event; subsequent failures suppressed",
-            );
-        }
+        self.record_progress(CommitProgressRecord::Begin {
+            write_context: self.write_context,
+            item_key: item_key.clone(),
+            size_hint: meta.size_hint,
+        });
     }
 
     /// Records a finish-progress event for telemetry.
@@ -562,20 +564,10 @@ impl ReceiptCommitSink {
     /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
     /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
-        if let Err(error) = self.recorder.record_commit_progress(
-            &self.shard_id,
-            CommitProgressRecord::Finish {
-                write_context: self.write_context,
-                item_key: item_key.clone(),
-            },
-        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
-                "recorder failed to persist progress event; subsequent failures suppressed",
-            );
-        }
+        self.record_progress(CommitProgressRecord::Finish {
+            write_context: self.write_context,
+            item_key: item_key.clone(),
+        });
     }
 
     /// Reconstruct the deterministic translation inputs from an in-flight
@@ -1433,6 +1425,16 @@ where
     Ok(report)
 }
 
+/// Build a secret-shaped test fixture from non-secret fragments.
+///
+/// The assembled string matches gitleaks' generic-api-key rule at scan
+/// time, but keeping the fragments separate avoids committing a literal
+/// that trips secret-detection CI on the source file itself.
+#[cfg(any(test, feature = "test-support"))]
+pub fn secret_fixture() -> String {
+    ["password=", "xK9mP2qL7wN4vR8t"].concat()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1472,7 +1474,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct StubDoneLedger(u8);
 
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct Recorder {
         progress: Mutex<Vec<CommitProgressRecord>>,
     }
@@ -1575,15 +1577,6 @@ mod tests {
             norm_hash: [0x55; 32],
             confidence_score: 6,
         }
-    }
-
-    /// Build a secret-shaped test fixture from non-secret fragments.
-    ///
-    /// The assembled string matches gitleaks' generic-api-key rule at scan
-    /// time, but keeping the fragments separate avoids committing a literal
-    /// that trips secret-detection CI on the source file itself.
-    fn secret_fixture() -> String {
-        ["password=", "xK9mP2qL7wN4vR8t"].concat()
     }
 
     fn clean_fixture() -> &'static str {

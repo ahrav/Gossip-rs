@@ -33,11 +33,12 @@ Specifically:
 
 - invalid configuration fails with exit code `2`
 - `ExecutionMode::Direct` always resolves to a local scan path
-- `ExecutionMode::Connector` requires explicit backend selection
-- `backend=local` resolves to the existing local runtime path
+- `ExecutionMode::Connector` defaults to the real production backend path
+- `backend=local` is only valid for direct local scans
 - `backend=production` requires all identity fields plus etcd and PostgreSQL
   backend settings
 - `backend=production` never falls back to local or in-memory doubles
+- the default launch path fails closed on missing production backend settings
 - successful local runs log `(items_scanned, bytes_scanned, findings_emitted)`
 - successful distributed runs log `(leases_seen, shards_scanned)`
 
@@ -88,9 +89,10 @@ main()
         -> log_distributed_report(...)
 ```
 
-The default mode and source are `connector fs .`, but connector mode requires
-explicit backend selection (`--backend=local` or `--backend=production`).
-Omitting the backend fails closed with a configuration error.
+The default mode and source are `connector fs .`. Connector mode defaults to
+the production backend path, so omitting backend settings fails closed on the
+first missing production field. Explicit `--backend=local` is rejected in
+connector mode; use `--mode=direct` for local scans.
 
 ### Production composition flow
 
@@ -100,8 +102,7 @@ call:
 ```text
 caller
   -> ProductionBackendConfig::new(...)
-  -> DistributedWorkerConfig::worker_identity_noop()
-     (worker_identity_with_recorder() is available for callers that opt into production telemetry recording)
+  -> DistributedWorkerConfig::worker_identity() | worker_identity_with_recorder()
   -> DistributedWorkerConfig::runtime_config()
   -> run_production_worker(config, identity, runtime)
      -> build_production_backends(config)
@@ -171,8 +172,8 @@ override environment values when both are present.
 | Variable | Format | Default | Required | Description |
 |----------|--------|---------|----------|-------------|
 | `GOSSIP_WORKER_MODE` | `direct` or `connector` | `connector` | No | Selects the execution mode family. |
-| `GOSSIP_WORKER_BACKEND` | `local` or `production` | *(none)* | Yes (connector mode) | Selects the backend for connector mode. Connector mode fails closed without an explicit backend. |
-| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Production backend supports only `fs`. |
+| `GOSSIP_WORKER_BACKEND` | `local` or `production` | `production` in connector mode | No | Optional backend override. Connector mode defaults to `production`; `local` is only valid with `--mode=direct`. |
+| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Connector mode supports only `fs`; use direct mode for local git scans. |
 | `GOSSIP_WORKER_PATH` | filesystem path | `.` | No | Filesystem or git repository path to scan. |
 | `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs | *(none)* | Yes (production) | etcd endpoint CSV for the coordination backend. |
 | `GOSSIP_ETCD_NAMESPACE` | string | *(none)* | Yes (production) | etcd namespace prefix for key isolation. |
@@ -253,8 +254,9 @@ enum BackendSelection {
 }
 ```
 
-Selects whether connector mode routes to the local runtime path or to the real
-distributed worker path.
+Selects the backend family from the config surface. Direct mode accepts the
+local backend path, while connector mode defaults to and enforces the
+production backend path.
 
 ### WorkerSourceSettings
 
@@ -271,13 +273,13 @@ Typed source-family settings used by local launches.
 
 ```rust
 struct LocalWorkerConfig {
-    execution_mode: ExecutionMode,
     source: WorkerSourceSettings,
     budgets: ScanBudgets,
 }
 ```
 
-Resolved local launch configuration for filesystem or git scans.
+Resolved local direct launch configuration for filesystem or git scans. Local
+configs are structurally always `ExecutionMode::Direct`.
 
 ### DistributedWorkerRuntimeSettings
 
@@ -334,11 +336,6 @@ enum WorkerConfigError {
 
 Typed configuration errors used for argument mistakes, missing required
 production fields, validation failures, and unsupported launch combinations.
-
-### NoopCoordinationEventRecorder
-
-No-op implementation of `CoordinationEventRecorder` used when building a
-default `WorkerIdentity` from a resolved distributed config.
 
 ### ProductionBackendConfig
 
@@ -399,7 +396,7 @@ different field positions produce distinct digests. Display format:
 ### CoordinationTelemetrySink
 
 ```rust
-pub(crate) trait CoordinationTelemetrySink: Send + Sync {
+pub(crate) trait CoordinationTelemetrySink: Send + Sync + fmt::Debug {
     fn emit(&self, record: SanitizedCoordinationRecord) -> Result<()>;
 }
 ```
@@ -442,7 +439,9 @@ The config module checks:
 
 - resolution of a full production config from environment variables alone
 - CLI override precedence over environment values
-- backend selection failure in connector mode when no backend is configured
+- connector-mode defaulting to the production backend path
+- fail-closed startup when production backend settings are absent
+- rejection of `--backend=local` in connector mode
 - direct-mode fallback to local execution without backend selection
 - missing required production identity fields
 - rejection of `source=git` for real distributed launches
@@ -454,6 +453,8 @@ The binary test module checks:
 
 - successful filesystem scans for a valid local path
 - successful git scans for a valid repository root
+- execution of the distributed worker loop through the resolved distributed path
+- fail-closed production bootstrap when real backends are unreachable
 
 The production module includes:
 
