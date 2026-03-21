@@ -578,6 +578,48 @@ mod tests {
         assert!(bootstrap.to_string().contains("etcd coordination backend"));
     }
 
+    fn unreachable_postgres_connect_error() -> postgres::Error {
+        match Client::connect(
+            "host=127.0.0.1 port=1 user=postgres password=postgres dbname=postgres connect_timeout=1",
+            NoTls,
+        ) {
+            Ok(_) => panic!("port 1 should refuse PostgreSQL connections during tests"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn bootstrap_error_from_done_ledger_connect_redacts_source_chain() {
+        let bootstrap =
+            ProductionBootstrapError::DoneLedgerConnect(unreachable_postgres_connect_error());
+
+        assert!(matches!(
+            bootstrap,
+            ProductionBootstrapError::DoneLedgerConnect(_)
+        ));
+        assert!(bootstrap.source().is_none());
+        let message = bootstrap.to_string();
+        assert!(message.contains("done-ledger PostgreSQL backend"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("postgres"));
+    }
+
+    #[test]
+    fn bootstrap_error_from_findings_connect_redacts_source_chain() {
+        let bootstrap =
+            ProductionBootstrapError::FindingsConnect(unreachable_postgres_connect_error());
+
+        assert!(matches!(
+            bootstrap,
+            ProductionBootstrapError::FindingsConnect(_)
+        ));
+        assert!(bootstrap.source().is_none());
+        let message = bootstrap.to_string();
+        assert!(message.contains("findings PostgreSQL backend"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("postgres"));
+    }
+
     #[test]
     fn worker_error_from_bootstrap_preserves_source_chain() {
         let inner = EtcdCoordinatorError::RuntimeBuild(std::io::Error::new(
