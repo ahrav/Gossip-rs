@@ -12,7 +12,7 @@
 use std::fmt;
 
 use gossip_scanner_runtime::{
-    ScanRuntimeError, distributed::DistributedRunReport, scan_fs, scan_git,
+    ScanReport, ScanRuntimeError, distributed::DistributedRunReport, scan_fs, scan_git,
 };
 use gossip_worker::config::{
     DistributedWorkerConfig, LocalWorkerConfig, ResolvedWorkerConfig, WorkerSourceSettings,
@@ -71,7 +71,7 @@ impl From<ProductionWorkerError> for WorkerError {
 /// Execution report returned by one resolved worker launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WorkerRunReport {
-    Local((u64, u64, u64)),
+    Local(ScanReport),
     Distributed(DistributedRunReport),
 }
 
@@ -91,7 +91,7 @@ fn init_tracing() {
 }
 
 /// Execute one local scan using the resolved local worker config.
-fn run_local_worker(cfg: &LocalWorkerConfig) -> Result<(u64, u64, u64), WorkerError> {
+fn run_local_worker(cfg: &LocalWorkerConfig) -> Result<ScanReport, WorkerError> {
     let report = match cfg.source() {
         WorkerSourceSettings::Fs(source) => {
             scan_fs(&source.to_scan_config(cfg.execution_mode(), cfg.budgets()))?
@@ -100,18 +100,17 @@ fn run_local_worker(cfg: &LocalWorkerConfig) -> Result<(u64, u64, u64), WorkerEr
             scan_git(&source.to_scan_config(cfg.execution_mode(), cfg.budgets()))?
         }
     };
-    Ok((
-        report.items_scanned,
-        report.bytes_scanned,
-        report.findings_emitted,
-    ))
+    Ok(report)
 }
 
 /// Execute one real distributed worker launch against the production backends.
 fn run_distributed_worker(
     cfg: &DistributedWorkerConfig,
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
-    tracing::warn!(
+    tracing::error!(
+        tenant = %cfg.tenant(),
+        run = %cfg.run(),
+        worker = %cfg.worker(),
         "coordination event recorder is a no-op — \
          all coordination telemetry will be silently discarded"
     );
@@ -142,8 +141,7 @@ where
     }
 }
 
-fn log_local_report(cfg: &LocalWorkerConfig, report: (u64, u64, u64)) {
-    let (items_scanned, bytes_scanned, findings_emitted) = report;
+fn log_local_report(cfg: &LocalWorkerConfig, report: ScanReport) {
     let (source_label, path) = match cfg.source() {
         WorkerSourceSettings::Fs(s) => ("fs", s.path().display().to_string()),
         WorkerSourceSettings::Git(s) => ("git", s.repo().display().to_string()),
@@ -153,9 +151,9 @@ fn log_local_report(cfg: &LocalWorkerConfig, report: (u64, u64, u64)) {
         source = source_label,
         mode = ?cfg.execution_mode(),
         %path,
-        items_scanned,
-        bytes_scanned,
-        findings_emitted,
+        items_scanned = report.items_scanned,
+        bytes_scanned = report.bytes_scanned,
+        findings_emitted = report.findings_emitted,
         "scan completed",
     );
 }
@@ -367,10 +365,9 @@ mod tests {
         )
         .expect("default budgets should be valid");
 
-        let (items_scanned, bytes_scanned, _findings_emitted) =
-            run_local_worker(&cfg).expect("filesystem worker should succeed");
-        assert!(items_scanned > 0);
-        assert!(bytes_scanned > 0);
+        let report = run_local_worker(&cfg).expect("filesystem worker should succeed");
+        assert!(report.items_scanned > 0);
+        assert!(report.bytes_scanned > 0);
     }
 
     #[test]
@@ -389,10 +386,9 @@ mod tests {
         )
         .expect("default budgets should be valid");
 
-        let (items_scanned, bytes_scanned, _findings_emitted) =
-            run_local_worker(&cfg).expect("git worker should succeed");
-        assert!(items_scanned > 0);
-        assert!(bytes_scanned > 0);
+        let report = run_local_worker(&cfg).expect("git worker should succeed");
+        assert!(report.items_scanned > 0);
+        assert!(report.bytes_scanned > 0);
     }
 
     #[test]

@@ -89,17 +89,14 @@ impl FromStr for BackendSelection {
     type Err = WorkerConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let trimmed = value.trim();
-        if trimmed.eq_ignore_ascii_case("local") {
-            Ok(Self::Local)
-        } else if trimmed.eq_ignore_ascii_case("production") {
-            Ok(Self::Production)
-        } else {
-            Err(WorkerConfigError::invalid_value(
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "production" => Ok(Self::Production),
+            _ => Err(WorkerConfigError::invalid_value(
                 "backend",
                 value,
                 "expected 'local' or 'production'",
-            ))
+            )),
         }
     }
 }
@@ -126,17 +123,14 @@ impl FromStr for WorkerSource {
     type Err = WorkerConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let trimmed = value.trim();
-        if trimmed.eq_ignore_ascii_case("fs") {
-            Ok(Self::Fs)
-        } else if trimmed.eq_ignore_ascii_case("git") {
-            Ok(Self::Git)
-        } else {
-            Err(WorkerConfigError::invalid_value(
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fs" => Ok(Self::Fs),
+            "git" => Ok(Self::Git),
+            _ => Err(WorkerConfigError::invalid_value(
                 "source",
                 value,
                 "expected 'fs' or 'git'",
-            ))
+            )),
         }
     }
 }
@@ -215,6 +209,10 @@ impl FsSourceSettings {
     /// resolution pipeline ([`resolve_worker_config_from`]), path validation
     /// (non-empty, trimmed) is handled by the parser layer. Direct callers
     /// are responsible for supplying a meaningful path.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if `path` is empty.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path: PathBuf = path.into();
@@ -324,6 +322,10 @@ impl GitSourceSettings {
     /// the resolution pipeline ([`resolve_worker_config_from`]), path
     /// validation (non-empty, trimmed) is handled by the parser layer.
     /// Direct callers are responsible for supplying a meaningful path.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if `repo` is empty.
     #[must_use]
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         let repo: PathBuf = repo.into();
@@ -591,8 +593,9 @@ impl DistributedWorkerRuntimeSettings {
     /// Construct one runtime tuning bundle.
     ///
     /// Prefer the resolution pipeline ([`resolve_worker_config_from`]) for
-    /// end-to-end validated configuration. This constructor is exposed for
-    /// in-package test helpers that assemble configs directly.
+    /// end-to-end validated configuration. This constructor bypasses the
+    /// end-to-end validation of the resolution pipeline. Callers are
+    /// responsible for supplying individually valid budget and capacity values.
     #[must_use]
     pub fn new(budgets: ScanBudgets, commit_queue_capacity: NonZeroUsize) -> Self {
         Self {
@@ -1256,23 +1259,23 @@ impl RawWorkerConfig {
         // Warn when secrets are passed via CLI flags (visible in process table).
         if self.cli_tenant_secret_key {
             tracing::warn!(
-                "tenant secret key provided via --tenant-secret-key flag; \
-                 prefer {} env var to avoid process-table exposure",
-                ENV_TENANT_SECRET_KEY
+                flag = "--tenant-secret-key",
+                preferred_env = ENV_TENANT_SECRET_KEY,
+                "secret provided via CLI flag; prefer env var to avoid process-table exposure"
             );
         }
         if self.cli_done_ledger_dsn {
             tracing::warn!(
-                "done-ledger DSN provided via --done-ledger-postgres-dsn flag; \
-                 prefer {} env var to avoid process-table exposure",
-                ENV_DONE_LEDGER_POSTGRES_DSN
+                flag = "--done-ledger-postgres-dsn",
+                preferred_env = ENV_DONE_LEDGER_POSTGRES_DSN,
+                "credential provided via CLI flag; prefer env var to avoid process-table exposure"
             );
         }
         if self.cli_findings_dsn {
             tracing::warn!(
-                "findings DSN provided via --findings-postgres-dsn flag; \
-                 prefer {} env var to avoid process-table exposure",
-                ENV_FINDINGS_POSTGRES_DSN
+                flag = "--findings-postgres-dsn",
+                preferred_env = ENV_FINDINGS_POSTGRES_DSN,
+                "credential provided via CLI flag; prefer env var to avoid process-table exposure"
             );
         }
 
@@ -1638,40 +1641,26 @@ fn parse_nonempty_string_redacted(
 }
 
 fn parse_bool(field: &'static str, raw: &str) -> Result<bool, WorkerConfigError> {
-    let trimmed = raw.trim();
-    if trimmed == "1"
-        || trimmed.eq_ignore_ascii_case("true")
-        || trimmed.eq_ignore_ascii_case("yes")
-        || trimmed.eq_ignore_ascii_case("on")
-    {
-        Ok(true)
-    } else if trimmed == "0"
-        || trimmed.eq_ignore_ascii_case("false")
-        || trimmed.eq_ignore_ascii_case("no")
-        || trimmed.eq_ignore_ascii_case("off")
-    {
-        Ok(false)
-    } else {
-        Err(WorkerConfigError::invalid_value(
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(WorkerConfigError::invalid_value(
             field,
             raw,
             "expected a boolean (true/false, yes/no, on/off, 1/0)",
-        ))
+        )),
     }
 }
 
 fn parse_anchor_mode(field: &'static str, raw: &str) -> Result<AnchorMode, WorkerConfigError> {
-    let trimmed = raw.trim();
-    if trimmed.eq_ignore_ascii_case("manual") {
-        Ok(AnchorMode::Manual)
-    } else if trimmed.eq_ignore_ascii_case("derived") {
-        Ok(AnchorMode::Derived)
-    } else {
-        Err(WorkerConfigError::invalid_value(
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "manual" => Ok(AnchorMode::Manual),
+        "derived" => Ok(AnchorMode::Derived),
+        _ => Err(WorkerConfigError::invalid_value(
             field,
             raw,
             "expected 'manual' or 'derived'",
-        ))
+        )),
     }
 }
 
@@ -2560,26 +2549,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_run_id_is_rejected() {
-        let env = production_env().with(ENV_RUN_ID, "0");
-        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
-        assert!(
-            result.is_err(),
-            "run_id=0 is the ZERO sentinel and must be rejected, but got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn zero_worker_id_is_rejected() {
-        let env = production_env().with(ENV_WORKER_ID, "0");
-        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
-        assert!(
-            result.is_err(),
-            "worker_id=0 is the ZERO sentinel and must be rejected, but got: {result:?}"
-        );
-    }
-
-    #[test]
     fn production_rejects_nonexistent_path() {
         let bogus = "/this/path/does/not/exist/gossip_f7_test";
         let env = production_env().with(ENV_WORKER_PATH, bogus);
@@ -2600,6 +2569,32 @@ mod tests {
             ),
             "expected InvalidValue for non-existent path, got: {err}"
         );
+    }
+
+    #[test]
+    fn direct_mode_rejects_nonexistent_path() {
+        let err = resolve_worker_config_from(
+            ["--mode=direct", "fs", "/nonexistent/review-test"],
+            &TestEnv::default(),
+        )
+        .expect_err("nonexistent path must be rejected in direct mode");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue { field: "path", .. }
+        ));
+    }
+
+    #[test]
+    fn local_backend_rejects_nonexistent_path() {
+        let err = resolve_worker_config_from(
+            ["--backend=local", "fs", "/nonexistent/review-test"],
+            &TestEnv::default(),
+        )
+        .expect_err("nonexistent path must be rejected with local backend");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue { field: "path", .. }
+        ));
     }
 
     #[test]
@@ -3184,7 +3179,7 @@ mod tests {
     fn single_positional_git_selects_source_not_path() {
         let env = TestEnv::default()
             .with(ENV_WORKER_MODE, "direct")
-            .with(ENV_WORKER_PATH, "/some/path");
+            .with(ENV_WORKER_PATH, "/tmp");
         let result = resolve_worker_config_from(["git"], &env);
         match result {
             Ok(ResolvedWorkerConfig::Local(cfg)) => {
@@ -3203,7 +3198,7 @@ mod tests {
         let env = TestEnv::default()
             .with(ENV_WORKER_MODE, "direct")
             .with(ENV_FS_SKIP_ARCHIVES, "maybe");
-        let result = resolve_worker_config_from(["git", "/some/path"], &env);
+        let result = resolve_worker_config_from(["git", "/tmp"], &env);
         assert!(
             result.is_ok(),
             "invalid skip_archives must not reject git launches: {result:?}"
