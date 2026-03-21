@@ -388,7 +388,57 @@ fn has_connect_timeout(dsn: &str) -> bool {
     }
 }
 
+/// Extract the host component from a PostgreSQL DSN, if parseable.
+///
+/// Handles both URI format (`postgresql://user:pass@HOST:port/db`) and
+/// keyword-value format (`host=HOST user=... dbname=...`). Returns `None`
+/// when the host cannot be determined — callers should assume local in
+/// that case.
+fn extract_pg_host(dsn: &str) -> Option<&str> {
+    if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+        // URI format: scheme://[userinfo@]host[:port][/dbname][?params]
+        let after_scheme = dsn.split_once("://").map(|(_, rest)| rest)?;
+        // Strip optional userinfo (everything before the last `@`).
+        let host_and_rest = after_scheme
+            .rfind('@')
+            .map_or(after_scheme, |idx| &after_scheme[idx + 1..]);
+        // Trim port, path, and query string.
+        let host = host_and_rest
+            .split_once(':')
+            .or_else(|| host_and_rest.split_once('/'))
+            .or_else(|| host_and_rest.split_once('?'))
+            .map_or(host_and_rest, |(h, _)| h);
+        if host.is_empty() { None } else { Some(host) }
+    } else {
+        // Keyword-value format: `host=HOST port=... dbname=...`
+        dsn.split_whitespace()
+            .find_map(|param| param.strip_prefix("host="))
+            .filter(|h| !h.is_empty())
+    }
+}
+
+/// Returns `true` when the host refers to the local machine or a Unix socket.
+///
+/// Recognized local patterns: `localhost`, `127.0.0.1`, `::1`, Unix socket
+/// paths (starting with `/`), and the empty/absent case (PostgreSQL defaults
+/// to a local Unix socket when no host is specified).
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.starts_with('/')
+}
+
 fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
+    // Best-effort warning when connecting without TLS to a non-local host.
+    // If host extraction fails, assume local and stay silent.
+    if let Some(host) = extract_pg_host(dsn)
+        && !is_local_host(host)
+    {
+        tracing::warn!(
+            host = %host,
+            "connecting to PostgreSQL without TLS \
+             — use build_production_backends_from_clients for TLS-capable connections"
+        );
+    }
+
     if has_connect_timeout(dsn) {
         return Client::connect(dsn, NoTls);
     }

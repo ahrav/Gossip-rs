@@ -69,6 +69,13 @@ pub const ENV_FS_SKIP_ARCHIVES: &str = "GOSSIP_FS_SKIP_ARCHIVES";
 /// Environment variable selecting the anchor extraction mode.
 pub const ENV_WORKER_ANCHOR_MODE: &str = "GOSSIP_WORKER_ANCHOR_MODE";
 
+/// Ceiling for max_items to prevent resource exhaustion from misconfiguration.
+const MAX_ITEMS_CEILING: usize = 10_000_000;
+/// Ceiling for max_bytes to prevent resource exhaustion from misconfiguration.
+const MAX_BYTES_CEILING: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
+/// Ceiling for commit_queue_capacity to prevent resource exhaustion from misconfiguration.
+const MAX_COMMIT_QUEUE_CEILING: usize = 65_536;
+
 /// Backend selection for connector-mode launches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -1630,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_override_wins_even_when_env_value_is_invalid() {
+    fn cli_override_replaces_invalid_env_value_for_same_field() {
         let env = production_env().with(ENV_RUN_ID, "not-a-number");
         let resolved =
             resolve_worker_config_from(["--run-id=99"], &env).expect("CLI override should win");
@@ -1641,6 +1648,21 @@ mod tests {
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_env_for_non_overridden_field_still_fails() {
+        let env = production_env().with(ENV_MAX_ITEMS, "not-a-number");
+        let err = resolve_worker_config_from(["--run-id=99"], &env)
+            .expect_err("invalid env for a non-overridden field must still produce an error");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_items",
+                ..
+            }
+        ));
     }
 
     #[test]
