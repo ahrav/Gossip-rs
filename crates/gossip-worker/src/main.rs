@@ -107,7 +107,7 @@ fn run_local_worker(cfg: &LocalWorkerConfig) -> Result<ScanReport, WorkerError> 
 fn run_distributed_worker(
     cfg: &DistributedWorkerConfig,
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
-    tracing::error!(
+    tracing::warn!(
         tenant = %cfg.tenant(),
         run = %cfg.run(),
         worker = %cfg.worker(),
