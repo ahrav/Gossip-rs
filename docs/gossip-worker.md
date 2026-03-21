@@ -178,7 +178,7 @@ All flags use `--name=value` syntax (equals-sign required; space-separated
 
 Two optional positional arguments follow the flags:
 
-```
+```text
 gossip-worker [flags...] [source] [path]
 ```
 

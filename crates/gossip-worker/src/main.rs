@@ -63,32 +63,19 @@ impl From<gossip_worker::production::ProductionWorkerError> for WorkerError {
     }
 }
 
-/// Resolve the tracing `EnvFilter` from `RUST_LOG`, returning a fallback
-/// filter and a flag when the user-supplied value is invalid.
-fn resolve_log_filter() -> (EnvFilter, bool) {
-    match EnvFilter::try_from_default_env() {
-        Ok(filter) => (filter, false),
-        Err(error) => {
-            eprintln!("warning: invalid RUST_LOG filter ({error}), falling back to 'info'");
-            (EnvFilter::new("info"), true)
-        }
-    }
-}
-
 /// Initialize the global tracing subscriber.
+///
+/// Reads `RUST_LOG` if present, silently falls back to `info` when absent,
+/// and accepts partial/lossy directives without warning.
 fn init_tracing() {
-    let (filter, used_fallback) = resolve_log_filter();
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .compact()
         .init();
-    if used_fallback {
-        tracing::warn!(
-            "RUST_LOG contained an invalid filter directive; \
-             active filter is 'info' — check RUST_LOG for typos"
-        );
-    }
 }
 
 /// Execute one local scan using the resolved local worker config.
