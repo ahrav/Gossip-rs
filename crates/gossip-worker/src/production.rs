@@ -35,7 +35,6 @@ use postgres::{Client, NoTls};
 ///
 /// Each variant identifies which backend connection or migration step
 /// failed during construction.
-#[derive(Debug)]
 pub enum ProductionBootstrapError {
     /// Establishing the done-ledger PostgreSQL connection failed.
     DoneLedgerConnect(postgres::Error),
@@ -90,6 +89,26 @@ impl Error for ProductionBootstrapError {
     }
 }
 
+impl fmt::Debug for ProductionBootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Connection variants redact the inner error to prevent DSN fragment
+            // leakage through `{:?}` formatting (logs, anyhow, panic output).
+            Self::DoneLedgerConnect(_) => f
+                .debug_tuple("DoneLedgerConnect")
+                .field(&"[redacted]")
+                .finish(),
+            Self::FindingsConnect(_) => f
+                .debug_tuple("FindingsConnect")
+                .field(&"[redacted]")
+                .finish(),
+            Self::EtcdConnect(_) => f.debug_tuple("EtcdConnect").field(&"[redacted]").finish(),
+            Self::DoneLedgerMigration(e) => f.debug_tuple("DoneLedgerMigration").field(e).finish(),
+            Self::FindingsMigration(e) => f.debug_tuple("FindingsMigration").field(e).finish(),
+        }
+    }
+}
+
 impl From<EtcdCoordinatorError> for ProductionBootstrapError {
     fn from(value: EtcdCoordinatorError) -> Self {
         Self::EtcdConnect(value)
@@ -97,7 +116,6 @@ impl From<EtcdCoordinatorError> for ProductionBootstrapError {
 }
 
 /// Error returned by the real worker entrypoint.
-#[derive(Debug)]
 pub enum ProductionWorkerError {
     /// Backend construction failed before any shard work started.
     Startup(ProductionBootstrapError),
@@ -119,6 +137,15 @@ impl Error for ProductionWorkerError {
         match self {
             Self::Startup(source) => Some(source),
             Self::Runtime(source) => Some(source),
+        }
+    }
+}
+
+impl fmt::Debug for ProductionWorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Startup(e) => f.debug_tuple("Startup").field(e).finish(),
+            Self::Runtime(e) => f.debug_tuple("Runtime").field(e).finish(),
         }
     }
 }
@@ -233,8 +260,10 @@ pub fn build_production_backends(
     // Connect etcd first — it is the most likely to fail in misconfigured
     // environments, and this avoids opening Postgres connections that would
     // be immediately discarded on etcd failure.
-    let coordinator = EtcdCoordinator::connect(config.etcd().clone())
-        .map_err(ProductionBootstrapError::EtcdConnect)?;
+    let coordinator = EtcdCoordinator::connect(config.etcd().clone()).map_err(|err| {
+        tracing::warn!(error = %err, "etcd coordinator connection failed");
+        ProductionBootstrapError::EtcdConnect(err)
+    })?;
 
     let done_ledger_client = connect_postgres_client(config.done_ledger_postgres_dsn())
         .map_err(ProductionBootstrapError::DoneLedgerConnect)?;
@@ -290,8 +319,10 @@ pub fn build_production_backends_from_clients(
     done_ledger_client: Client,
     findings_client: Client,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
-    let coordinator =
-        EtcdCoordinator::connect(etcd).map_err(ProductionBootstrapError::EtcdConnect)?;
+    let coordinator = EtcdCoordinator::connect(etcd).map_err(|err| {
+        tracing::warn!(error = %err, "etcd coordinator connection failed");
+        ProductionBootstrapError::EtcdConnect(err)
+    })?;
     let persistence = DistributedPersistence::new(
         FindingsSinkPg::from_client(findings_client),
         DoneLedgerPg::from_client(done_ledger_client),
@@ -457,7 +488,10 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     }
 
     if has_connect_timeout(dsn) {
-        return Client::connect(dsn, NoTls);
+        return Client::connect(dsn, NoTls).map_err(|err| {
+            tracing::warn!(error = %err, "PostgreSQL connection failed");
+            err
+        });
     }
 
     // Append the timeout using the correct separator for the DSN format.
@@ -473,7 +507,10 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
         timeout_secs = DEFAULT_CONNECT_TIMEOUT_SECS,
         "DSN omitted connect_timeout; injecting default"
     );
-    Client::connect(&timed, NoTls)
+    Client::connect(&timed, NoTls).map_err(|err| {
+        tracing::warn!(error = %err, "PostgreSQL connection failed");
+        err
+    })
 }
 
 #[cfg(test)]
@@ -576,6 +613,95 @@ mod tests {
         // through error chain formatters.
         assert!(bootstrap.source().is_none());
         assert!(bootstrap.to_string().contains("etcd coordination backend"));
+    }
+
+    fn unreachable_postgres_connect_error() -> postgres::Error {
+        match Client::connect(
+            "host=127.0.0.1 port=1 user=postgres password=postgres dbname=postgres connect_timeout=1",
+            NoTls,
+        ) {
+            Ok(_) => panic!("port 1 should refuse PostgreSQL connections during tests"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn bootstrap_error_from_done_ledger_connect_redacts_source_chain() {
+        let bootstrap =
+            ProductionBootstrapError::DoneLedgerConnect(unreachable_postgres_connect_error());
+
+        assert!(matches!(
+            bootstrap,
+            ProductionBootstrapError::DoneLedgerConnect(_)
+        ));
+        assert!(bootstrap.source().is_none());
+        let message = bootstrap.to_string();
+        assert!(message.contains("done-ledger PostgreSQL backend"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("postgres"));
+    }
+
+    #[test]
+    fn bootstrap_error_from_findings_connect_redacts_source_chain() {
+        let bootstrap =
+            ProductionBootstrapError::FindingsConnect(unreachable_postgres_connect_error());
+
+        assert!(matches!(
+            bootstrap,
+            ProductionBootstrapError::FindingsConnect(_)
+        ));
+        assert!(bootstrap.source().is_none());
+        let message = bootstrap.to_string();
+        assert!(message.contains("findings PostgreSQL backend"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("postgres"));
+    }
+
+    #[test]
+    fn bootstrap_error_debug_redacts_connection_variants() {
+        let pg_err = unreachable_postgres_connect_error();
+        let done = ProductionBootstrapError::DoneLedgerConnect(pg_err);
+        let debug = format!("{done:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug must show [redacted] for connection variants: {debug}"
+        );
+        // The inner postgres::Error must not appear in the Debug output.
+        assert!(
+            !debug.contains("127.0.0.1"),
+            "Debug must not leak host: {debug}"
+        );
+
+        let etcd_err = EtcdCoordinatorError::RuntimeBuild(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "synthetic etcd failure",
+        ));
+        let etcd = ProductionBootstrapError::EtcdConnect(etcd_err);
+        let debug = format!("{etcd:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug must show [redacted] for etcd connection variant: {debug}"
+        );
+        assert!(
+            !debug.contains("synthetic etcd failure"),
+            "Debug must not leak inner error details: {debug}"
+        );
+    }
+
+    #[test]
+    fn worker_error_debug_redacts_bootstrap_connection_variants() {
+        let pg_err = unreachable_postgres_connect_error();
+        let bootstrap = ProductionBootstrapError::FindingsConnect(pg_err);
+        let worker: ProductionWorkerError = bootstrap.into();
+        let debug = format!("{worker:?}");
+        assert!(
+            debug.contains("[redacted]"),
+            "Worker error Debug must propagate redaction from bootstrap: {debug}"
+        );
+        assert!(
+            !debug.contains("127.0.0.1"),
+            "Worker error Debug must not leak host: {debug}"
+        );
     }
 
     #[test]

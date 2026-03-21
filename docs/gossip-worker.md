@@ -396,7 +396,7 @@ different field positions produce distinct digests. Display format:
 ### CoordinationTelemetrySink
 
 ```rust
-pub(crate) trait CoordinationTelemetrySink: Send + Sync {
+pub(crate) trait CoordinationTelemetrySink: Send + Sync + fmt::Debug {
     fn emit(&self, record: SanitizedCoordinationRecord) -> Result<()>;
 }
 ```

@@ -1314,7 +1314,11 @@ impl RawWorkerConfig {
                 make_local()
             }
             ExecutionMode::Connector => {
-                let backend = backend.expect("connector mode always defaults a backend");
+                let backend = backend.ok_or(WorkerConfigError::MissingRequiredValue {
+                    field: "backend",
+                    flag: "--backend",
+                    env: ENV_WORKER_BACKEND,
+                })?;
                 match backend {
                     BackendSelection::Local => Err(WorkerConfigError::UnsupportedCombination {
                         message: "connector mode runs the distributed worker loop against the real production backends; switch to --mode=direct for local scans".to_owned(),
@@ -2093,6 +2097,22 @@ mod tests {
     }
 
     #[test]
+    fn distributed_worker_identity_uses_production_recorder() {
+        let env = production_env();
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("production env should resolve");
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        let identity = cfg.worker_identity();
+        let debug = format!("{:?}", identity.recorder);
+        assert!(
+            debug.contains("ProductionCoordinationEventRecorder"),
+            "default worker_identity() must wire the production recorder: {debug}"
+        );
+    }
+
+    #[test]
     fn parse_hex_32_accepts_plain_hex() {
         let parsed = parse_hex_32(
             "tenant_id",
@@ -2435,6 +2455,16 @@ mod tests {
             WorkerConfigError::Usage(ref msg)
                 if msg.contains("source specified both")
         ));
+    }
+
+    #[test]
+    fn local_worker_config_execution_mode_is_always_direct() {
+        let cfg = LocalWorkerConfig::new(
+            WorkerSourceSettings::Fs(FsSourceSettings::new(PathBuf::from("/tmp"))),
+            ScanBudgets::default(),
+        )
+        .expect("default local config should be valid");
+        assert_eq!(cfg.execution_mode(), ExecutionMode::Direct);
     }
 
     #[test]

@@ -129,7 +129,7 @@ fn comparable_findings_from_jsonl(bytes: Vec<u8>, root: &Path) -> Vec<Comparable
     findings
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct DistributedCoreRecorder {
     core_events: Mutex<Vec<OwnedCoreEvent>>,
 }

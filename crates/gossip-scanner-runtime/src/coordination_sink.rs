@@ -6,6 +6,7 @@
 //! enforced by the receipt-driven commit pipeline (`ReceiptCommitSink` ->
 //! `ResultCommitter`), while event recording remains best-effort telemetry.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -55,7 +56,7 @@ pub enum CommitProgressRecord {
 }
 
 /// Coordinator-facing recorder for distributed scan output.
-pub trait CoordinationEventRecorder: Send + Sync {
+pub trait CoordinationEventRecorder: Send + Sync + fmt::Debug {
     /// Persists a scanner core event (finding, progress, summary, diagnostic).
     fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()>;
     /// Persists a git-specific event (commit metadata or identity dictionary entry).

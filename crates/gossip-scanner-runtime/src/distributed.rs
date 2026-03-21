@@ -1474,7 +1474,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct StubDoneLedger(u8);
 
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct Recorder {
         progress: Mutex<Vec<CommitProgressRecord>>,
     }
