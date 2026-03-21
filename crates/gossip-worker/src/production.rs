@@ -452,12 +452,20 @@ pub fn run_production_worker(
 const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 30;
 
 fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
-    if dsn.contains("connect_timeout") {
-        Client::connect(dsn, NoTls)
-    } else {
-        let timed = format!("{dsn} connect_timeout={DEFAULT_CONNECT_TIMEOUT_SECS}");
-        Client::connect(&timed, NoTls)
+    if dsn.contains("connect_timeout=") {
+        return Client::connect(dsn, NoTls);
     }
+
+    // Append the timeout using the correct separator for the DSN format.
+    // URI format (`postgresql://...`) requires `?` / `&` query parameters;
+    // keyword-value format (`host=... port=...`) uses whitespace.
+    let timed = if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+        let sep = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{sep}connect_timeout={DEFAULT_CONNECT_TIMEOUT_SECS}")
+    } else {
+        format!("{dsn} connect_timeout={DEFAULT_CONNECT_TIMEOUT_SECS}")
+    };
+    Client::connect(&timed, NoTls)
 }
 
 #[cfg(test)]
