@@ -8,10 +8,10 @@
 
 use std::fmt;
 
-use gossip_scanner_runtime::{ScanRuntimeError, scan_fs, scan_git};
+use gossip_scanner_runtime::{scan_fs, scan_git, ScanRuntimeError};
 use gossip_worker::config::{
-    DistributedWorkerConfig, LocalWorkerConfig, ResolvedWorkerConfig, WorkerSourceSettings,
-    resolve_worker_config_from_env_and_args,
+    resolve_worker_config_from_env_and_args, DistributedWorkerConfig, LocalWorkerConfig,
+    ResolvedWorkerConfig, WorkerSourceSettings,
 };
 use gossip_worker::production::run_production_worker;
 use tracing_subscriber::EnvFilter;
@@ -160,19 +160,25 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        ResolvedWorkerConfig::Distributed(cfg) => match run_production_worker(
-            cfg.production_backends(),
-            // No-op recorder — wire a real CoordinationEventRecorder via
-            // worker_identity_with_recorder once the telemetry sink is built.
-            cfg.worker_identity(),
-            cfg.runtime_config(),
-        ) {
-            Ok(report) => log_distributed_report(&cfg, report),
-            Err(error) => {
-                tracing::error!(error = %error, "worker scan failed");
-                std::process::exit(1);
+        ResolvedWorkerConfig::Distributed(cfg) => {
+            tracing::warn!(
+                "coordination event recorder is a no-op — \
+                 all coordination telemetry will be silently discarded"
+            );
+            match run_production_worker(
+                cfg.production_backends(),
+                // No-op recorder — wire a real CoordinationEventRecorder via
+                // worker_identity_with_recorder once the telemetry sink is built.
+                cfg.worker_identity(),
+                cfg.runtime_config(),
+            ) {
+                Ok(report) => log_distributed_report(&cfg, report),
+                Err(error) => {
+                    tracing::error!(error = %error, "worker scan failed");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
     }
 }
 

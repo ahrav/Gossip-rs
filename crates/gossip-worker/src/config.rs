@@ -1479,15 +1479,33 @@ fn parse_tenant_secret_key(
 }
 
 fn parse_run_id(field: &'static str, raw: &str) -> Result<RunId, WorkerConfigError> {
-    Ok(RunId::from_raw(raw.trim().parse::<u64>().map_err(
-        |error| WorkerConfigError::invalid_value(field, raw, error.to_string()),
-    )?))
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| WorkerConfigError::invalid_value(field, raw, error.to_string()))?;
+    if value == 0 {
+        return Err(WorkerConfigError::invalid_value(
+            field,
+            raw,
+            "must be > 0 (0 is the unassigned sentinel)",
+        ));
+    }
+    Ok(RunId::from_raw(value))
 }
 
 fn parse_worker_id(field: &'static str, raw: &str) -> Result<WorkerId, WorkerConfigError> {
-    Ok(WorkerId::from_raw(raw.trim().parse::<u64>().map_err(
-        |error| WorkerConfigError::invalid_value(field, raw, error.to_string()),
-    )?))
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| WorkerConfigError::invalid_value(field, raw, error.to_string()))?;
+    if value == 0 {
+        return Err(WorkerConfigError::invalid_value(
+            field,
+            raw,
+            "must be > 0 (0 is the unassigned sentinel)",
+        ));
+    }
+    Ok(WorkerId::from_raw(value))
 }
 
 fn parse_hex_32(field: &'static str, raw: &str) -> Result<[u8; 32], WorkerConfigError> {
@@ -1827,9 +1845,7 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("ultra-secret"));
-        assert!(
-            !debug.contains("3333333333333333333333333333333333333333333333333333333333333333")
-        );
+        assert!(!debug.contains("3333333333333333333333333333333333333333333333333333333333333333"));
         assert!(debug.contains("[redacted]"));
     }
 
@@ -2262,6 +2278,26 @@ mod tests {
         assert!(
             !message.contains("postgresql://"),
             "error message must not contain actual DSN content"
+        );
+    }
+
+    #[test]
+    fn zero_run_id_is_rejected() {
+        let env = production_env().with(ENV_RUN_ID, "0");
+        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
+        assert!(
+            result.is_err(),
+            "run_id=0 is the ZERO sentinel and must be rejected, but got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn zero_worker_id_is_rejected() {
+        let env = production_env().with(ENV_WORKER_ID, "0");
+        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
+        assert!(
+            result.is_err(),
+            "worker_id=0 is the ZERO sentinel and must be rejected, but got: {result:?}"
         );
     }
 }

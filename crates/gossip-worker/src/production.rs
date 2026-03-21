@@ -402,13 +402,27 @@ fn extract_pg_host(dsn: &str) -> Option<&str> {
         let host_and_rest = after_scheme
             .rfind('@')
             .map_or(after_scheme, |idx| &after_scheme[idx + 1..]);
-        // Trim port, path, and query string.
-        let host = host_and_rest
-            .split_once(':')
-            .or_else(|| host_and_rest.split_once('/'))
-            .or_else(|| host_and_rest.split_once('?'))
-            .map_or(host_and_rest, |(h, _)| h);
-        if host.is_empty() { None } else { Some(host) }
+
+        // Bracketed IPv6 addresses (e.g. `[::1]:5432/db`) must be handled
+        // before the `:` split, because `:` appears inside the brackets.
+        if host_and_rest.starts_with('[') {
+            let close = host_and_rest.find(']')?;
+            let host = &host_and_rest[..=close]; // e.g. "[::1]"
+            if host.len() <= 2 {
+                // Just "[]" — no actual address.
+                None
+            } else {
+                Some(host)
+            }
+        } else {
+            // Plain hostname or IPv4 — trim port, path, and query string.
+            let host = host_and_rest
+                .split_once(':')
+                .or_else(|| host_and_rest.split_once('/'))
+                .or_else(|| host_and_rest.split_once('?'))
+                .map_or(host_and_rest, |(h, _)| h);
+            if host.is_empty() { None } else { Some(host) }
+        }
     } else {
         // Keyword-value format: `host=HOST port=... dbname=...`
         dsn.split_whitespace()
@@ -707,9 +721,46 @@ mod tests {
         let error = build_production_backends(&config)
             .expect_err("unreachable etcd endpoint should fail startup");
 
-        assert!(
+         assert!(
             matches!(error, ProductionBootstrapError::EtcdConnect(_)),
             "expected typed etcd startup error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn extract_pg_host_parses_bracketed_ipv6_uri() {
+        let dsn = "postgresql://scanner:secret@[::1]:5432/done";
+        let host = extract_pg_host(dsn);
+        assert_eq!(
+            host,
+            Some("[::1]"),
+            "bracketed IPv6 in URI format must extract as '[::1]', not '['",
+        );
+    }
+
+    #[test]
+    fn extract_pg_host_parses_ipv4_uri() {
+        let dsn = "postgresql://scanner:pass@127.0.0.1:5432/done";
+        assert_eq!(extract_pg_host(dsn), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn extract_pg_host_parses_hostname_uri() {
+        let dsn = "postgres://user@db.example.com:5432/mydb";
+        assert_eq!(extract_pg_host(dsn), Some("db.example.com"));
+    }
+
+    #[test]
+    fn extract_pg_host_parses_keyword_value_ipv6() {
+        let dsn = "host=::1 port=5432 dbname=done";
+        assert_eq!(extract_pg_host(dsn), Some("::1"));
+    }
+
+    #[test]
+    fn is_local_host_recognizes_bracketed_ipv6_loopback() {
+        assert!(is_local_host("[::1]"));
+        assert!(is_local_host("::1"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("localhost"));
     }
 }
