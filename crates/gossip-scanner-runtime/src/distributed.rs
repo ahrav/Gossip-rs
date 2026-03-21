@@ -510,6 +510,18 @@ impl ReceiptCommitSink {
         self.next_sequence_no.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn record_progress(&self, event: CommitProgressRecord) {
+        if let Err(error) = self.recorder.record_commit_progress(&self.shard_id, event)
+            && !self.progress_error_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "recorder failed to persist progress event; subsequent failures suppressed",
+            );
+        }
+    }
+
     /// Derive a pair of non-overlapping logical timestamps from a sequence number.
     ///
     /// Maps sequence `n` to `(2n, 2n+1)`, giving each item a unique
@@ -537,21 +549,11 @@ impl ReceiptCommitSink {
     /// Recorder errors are intentionally non-fatal: durability flows through
     /// the commit pipeline, not the recorder.
     fn record_begin(&self, item_key: &ItemKey, meta: &ItemMeta) {
-        if let Err(error) = self.recorder.record_commit_progress(
-            &self.shard_id,
-            CommitProgressRecord::Begin {
-                write_context: self.write_context,
-                item_key: item_key.clone(),
-                size_hint: meta.size_hint,
-            },
-        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
-                "recorder failed to persist progress event; subsequent failures suppressed",
-            );
-        }
+        self.record_progress(CommitProgressRecord::Begin {
+            write_context: self.write_context,
+            item_key: item_key.clone(),
+            size_hint: meta.size_hint,
+        });
     }
 
     /// Records a finish-progress event for telemetry.
@@ -562,20 +564,10 @@ impl ReceiptCommitSink {
     /// telemetry. See [`record_begin`](Self::record_begin) for the non-fatal
     /// error rationale.
     fn record_finish(&self, item_key: &ItemKey) {
-        if let Err(error) = self.recorder.record_commit_progress(
-            &self.shard_id,
-            CommitProgressRecord::Finish {
-                write_context: self.write_context,
-                item_key: item_key.clone(),
-            },
-        ) && !self.progress_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
-                "recorder failed to persist progress event; subsequent failures suppressed",
-            );
-        }
+        self.record_progress(CommitProgressRecord::Finish {
+            write_context: self.write_context,
+            item_key: item_key.clone(),
+        });
     }
 
     /// Reconstruct the deterministic translation inputs from an in-flight

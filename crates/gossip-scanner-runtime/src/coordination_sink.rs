@@ -92,17 +92,30 @@ impl CoordinationEventSink {
             git_error_logged: AtomicBool::new(false),
         }
     }
+
+    fn warn_recorder_failure(
+        &self,
+        error_flag: &AtomicBool,
+        error: anyhow::Error,
+        message: &'static str,
+    ) {
+        if !error_flag.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                %error,
+                "{message}",
+            );
+        }
+    }
 }
 
 impl EventOutput for CoordinationEventSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
         let owned = OwnedCoreEvent::from_core(event);
-        if let Err(error) = self.recorder.record_core_event(&self.shard_id, owned)
-            && !self.core_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
+        if let Err(error) = self.recorder.record_core_event(&self.shard_id, owned) {
+            self.warn_recorder_failure(
+                &self.core_error_logged,
+                error,
                 "recorder failed to persist core event; subsequent failures suppressed",
             );
         }
@@ -137,12 +150,10 @@ impl GitEventOutput for CoordinationEventSink {
             },
         };
 
-        if let Err(error) = self.recorder.record_git_event(&self.shard_id, owned)
-            && !self.git_error_logged.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                %error,
+        if let Err(error) = self.recorder.record_git_event(&self.shard_id, owned) {
+            self.warn_recorder_failure(
+                &self.git_error_logged,
+                error,
                 "recorder failed to persist git event; subsequent failures suppressed",
             );
         }
