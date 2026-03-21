@@ -124,3 +124,4 @@ Report results as:
 - `/linux-perf-profile` — Hardware counter analysis for deeper investigation
 - `/perf-topdown` — Hardware counter analysis for deeper root cause investigation
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns
+- `/pgo-bolt` — Apply PGO+BOLT to production builds before regression testing

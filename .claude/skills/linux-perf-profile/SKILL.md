@@ -353,3 +353,4 @@ PMU data to source-level patterns. Reference specific lines/functions.]
 - `/perf-regression` — Full regression workflow with acceptance criteria
 - `/perf-topdown` — Structured TMA + branch trace workflow (start here for classify→trace→fix on any architecture)
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns
+- `/pgo-bolt` — Branch sampling data from perf can feed BOLT for post-link binary optimization

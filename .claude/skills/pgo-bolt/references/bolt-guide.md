@@ -97,7 +97,30 @@ perf2bolt -p perf.data -o perf.fdata ./binary
 
 Requires perf.data recorded with branch sampling (`-b` flag).
 
-### Path B: llvm-profgen
+### Path B: BOLT Instrumentation (no perf needed)
+
+BOLT can instrument the binary itself to collect branch profiles — useful when perf
+LBR/IBS/SPE is unavailable (VMs, cloud instances without bare metal):
+
+```bash
+# Instrument binary
+llvm-bolt ./binary -instrument -o ./binary.inst \
+    --instrumentation-file=/tmp/prof.fdata \
+    --instrumentation-file-append-pid
+
+# Run instrumented binary (collects branch data on exit)
+./binary.inst <workload>
+
+# Merge profiles from multiple runs
+merge-fdata /tmp/prof.fdata.* > merged.fdata
+
+# Optimize
+llvm-bolt ./binary -o ./binary.bolt -data=merged.fdata ...
+```
+
+cargo-pgo uses this path by default (`cargo pgo bolt build` / `cargo pgo bolt optimize`).
+
+### Path C: llvm-profgen
 
 Via perf script intermediate:
 
@@ -108,7 +131,7 @@ llvm-profgen --perfscript=perf.script --binary=./binary --output=perf.fdata
 
 Useful when perf2bolt is not available but llvm-profgen is.
 
-### Path C: Merge multiple profiles
+### Path D: Merge multiple profiles
 
 ```bash
 perf2bolt -p run1.perf.data -o run1.fdata ./binary
@@ -119,6 +142,28 @@ llvm-bolt ./binary -o ./binary.bolt -data=merged.fdata ...
 ```
 
 ## BOLT with Rust Binaries
+
+### Critical: --emit-relocs Linker Flag
+
+BOLT **requires** relocations in the binary to rearrange functions. Without this flag,
+BOLT will fail with: `BOLT-ERROR: ... requires relocations`.
+
+```toml
+# .cargo/config.toml (target-specific to avoid overriding PGO flags)
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-Wl,--emit-relocs"]
+```
+
+Or via environment:
+```bash
+RUSTFLAGS="-Clink-arg=-Wl,--emit-relocs" cargo build --release
+```
+
+Also keep `strip = false` in Cargo.toml — BOLT needs the symbol table:
+```toml
+[profile.release]
+strip = false
+```
 
 ### Symbol Mangling
 

@@ -445,3 +445,4 @@ Stop forging when:
 - `/bench-compare` — Quick before/after benchmark comparison
 - `/perf-topdown` — TMA + branch trace profiling to identify hot functions before ASM analysis
 - `/perf-regression` — Full regression testing workflow before merging
+- `/pgo-bolt` — After exhausting source-level ASM improvements, apply PGO+BOLT for binary-level layout optimization

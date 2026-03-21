@@ -65,11 +65,30 @@ apt install linux-tools-$(uname -r)  # or linux-perf on some distros
 
 ### Build Configuration
 
-Always build with frame pointers and debug info for profile collection:
+Always build with frame pointers, debug info, and emit relocations (required for BOLT):
 
 ```bash
-RUSTFLAGS="-C opt-level=3 -C target-cpu=native -C force-frame-pointers=yes -C debuginfo=2" \
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native -C force-frame-pointers=yes -C debuginfo=2 -C link-arg=-Wl,--emit-relocs" \
   cargo build --release
+```
+
+**For BOLT compatibility**, add to `.cargo/config.toml` (target-specific to avoid overriding PGO flags):
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-Wl,--emit-relocs"]
+```
+
+Also ensure `strip = false` in `Cargo.toml` release profile — BOLT needs the symbol table.
+
+For best PGO results, also set:
+
+```toml
+[profile.release]
+opt-level = 3
+lto = "fat"          # or "thin" — both work with PGO; fat gives best results
+codegen-units = 1    # maximizes cross-function PGO effectiveness
+strip = false        # required for BOLT
 ```
 
 ## Workflow Overview
@@ -189,6 +208,7 @@ functions, hyperfine captures whole-binary effects (startup, I-cache, branch pre
 cargo pgo build -- --bin <target>
 
 # Step 2: Run representative workload(s)
+# The instrumented binary is at target/<triple>/release/<target>
 # Run multiple times with different inputs for profile diversity
 ./target/x86_64-unknown-linux-gnu/release/<target> <input_1>
 ./target/x86_64-unknown-linux-gnu/release/<target> <input_2>
@@ -198,19 +218,39 @@ cargo pgo build -- --bin <target>
 cargo pgo optimize -- --bin <target>
 ```
 
+**Combined PGO + BOLT via cargo-pgo:**
+
+```bash
+# PGO instrumentation + collection (same as above)
+cargo pgo build -- --bin <target>
+./target/x86_64-unknown-linux-gnu/release/<target> <input>
+
+# PGO-optimize + BOLT-instrument in one step
+cargo pgo bolt build --with-pgo -- --bin <target>
+
+# Collect BOLT profile (run the BOLT-instrumented binary)
+./target/x86_64-unknown-linux-gnu/release/<target>-bolt-instrumented <input>
+
+# Final PGO + BOLT optimized binary
+cargo pgo bolt optimize --with-pgo -- --bin <target>
+```
+
 ### Via manual LLVM flags (fine-grained control)
 
 ```bash
 # Step 1: Instrumented build
+# Use --target flag to prevent build scripts from generating .profraw files
+# Use ABSOLUTE paths for -Cprofile-generate (Cargo varies working directories)
 RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" \
-  cargo build --release --bin <target>
+  cargo build --release --target=x86_64-unknown-linux-gnu --bin <target>
 
 # Step 2: Run representative workload(s)
 # Each run creates .profraw files in /tmp/pgo-data/
-LLVM_PROFILE_FILE="/tmp/pgo-data/run-%p-%m.profraw" \
-  ./target/release/<target> <input_1>
-LLVM_PROFILE_FILE="/tmp/pgo-data/run-%p-%m.profraw" \
-  ./target/release/<target> <input_2>
+# %p=PID, %m=binary hash — guarantees unique filenames for parallel/repeated runs
+LLVM_PROFILE_FILE="/tmp/pgo-data/run-%m_%p.profraw" \
+  ./target/x86_64-unknown-linux-gnu/release/<target> <input_1>
+LLVM_PROFILE_FILE="/tmp/pgo-data/run-%m_%p.profraw" \
+  ./target/x86_64-unknown-linux-gnu/release/<target> <input_2>
 
 # Step 3: Merge profiles
 # Find llvm-profdata in the Rust toolchain
