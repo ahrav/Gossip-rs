@@ -1,0 +1,1813 @@
+//! Unified scanner runtime: configuration, path validation, engine
+//! construction, scan dispatch, and receipt-driven durability plumbing for
+//! filesystem and Git source families.
+//!
+//! # Architecture
+//!
+//! The runtime sits between CLI / worker entry points and the lower-level
+//! `scanner_engine`, `scanner_scheduler`, and `scanner_git` crates. Its job is
+//! to:
+//!
+//! 1. **Validate** user-supplied paths and budget parameters.
+//! 2. **Build** a detection engine from rules, transforms, and tuning knobs.
+//! 3. **Dispatch** local scans through the appropriate source-family module:
+//!    - [`ordered_content`] for filesystem trees and single files.
+//!    - [`git_repo`] for local Git repositories.
+//! 4. **Drive** distributed durability through the shared receipt vocabulary
+//!    and stages: [`commit_model`], [`result_translation`],
+//!    [`result_committer`], [`commit_pipeline`], and
+//!    [`checkpoint_aggregator`].
+//! 5. **Bridge** scan-internal events into caller-owned sinks via bounded
+//!    channels and scoped forwarding threads.
+//!
+//! # Source families
+//!
+//! | Family | Module | Config type | Dispatcher |
+//! |--------|--------|-------------|------------|
+//! | Ordered content (fs) | [`ordered_content`] | [`FsScanConfig`] | [`scan_fs`] |
+//! | Git repository | [`git_repo`] | [`GitScanConfig`] | [`scan_git`] |
+//!
+//! # Execution modes
+//!
+//! [`ExecutionMode::Direct`] and [`ExecutionMode::Connector`] both resolve to
+//! the same scan logic today. The distinction exists so that worker and CLI
+//! entry points exercise the same runtime boundary, and so the connector path
+//! can diverge when remote source enumeration is added.
+//!
+//! # Durability model
+//!
+//! Local CLI entry points can use no-op commit sinks, but distributed
+//! completion is locked to durable per-unit receipts. Scan completion and
+//! driver-local checkpoint hints are never authoritative progress signals;
+//! [`distributed`] advances shard completion only after
+//! [`result_committer::ResultCommitter`] returns receipts that
+//! [`checkpoint_aggregator::PrefixCheckpointAggregator`] can fold into the
+//! committed prefix.
+//!
+//! # Event forwarding
+//!
+//! Scan loops emit events through trait-object sinks (`EventOutput`,
+//! `GitEventOutput`). Because the scheduler and git crates own those
+//! callbacks on scanner-internal threads, the runtime interposes a
+//! bounded `sync_channel` and a scoped forwarding thread so that
+//! caller-owned sinks are never called from scan-internal threads.
+//! Owned event types (`OwnedCoreEvent`, `OwnedGitEvent`) carry the
+//! channel payloads without borrowing into the scan's lifetime.
+
+use std::fmt;
+use std::fs;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
+
+pub use gossip_contracts::connector::git::GitDebugLevel;
+use gossip_contracts::connector::{
+    ConnectorInputError, Cursor, ItemKey, derive_filesystem_stable_item_id,
+};
+use gossip_contracts::identity::{ConnectorInstanceIdHash, StableItemId};
+use scanner_engine::TransformId;
+use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformMode, Tuning};
+use scanner_git::{
+    CommitIdentityIds, CommitMetaEvent, GitEvent, GitEventOutput, GitScanMode,
+    IdentityDictionaryEvent, MergeDiffMode, OidBytes,
+};
+use scanner_scheduler::events::{
+    CoreEvent, DiagnosticEvent, EventOutput, FindingEvent, NullEventOutput, ProgressEvent,
+    SummaryEvent,
+};
+use scanner_scheduler::source_kind::SourceKind;
+use scanner_scheduler::store::{
+    FsFindingBatch, FsFindingRecord, FsRunLoss, FsStoreError, StoreProducer,
+};
+
+// Receipt-driven committed-prefix checkpoint aggregation.
+pub mod checkpoint_aggregator;
+// CLI entrypoint wiring, argument parsing, and runtime dispatch.
+pub mod cli;
+// Shared runtime commit vocabulary for family-neutral durability stages.
+pub mod commit_model;
+// Bounded execution -> commit pipeline for the receipt-driven durability model.
+pub mod commit_pipeline;
+// Commit-sink compatibility shims for non-durable runtime entry points.
+pub mod commit_sink;
+// Coordination-backed event sink for distributed scans.
+pub mod coordination_sink;
+// Distributed worker runtime and receipt-backed commit plumbing.
+pub mod distributed;
+// Event sink implementations for CLI and runtime output.
+pub mod event_sink;
+// Git-repository runtime boundary for local scans.
+pub mod git_repo;
+// Ordered-content (filesystem) runtime boundary.
+pub mod ordered_content;
+// Cross-scanner parity helpers.
+pub mod parity;
+// Authoritative findings -> done-ledger durable commit stage.
+pub mod result_committer;
+// Deterministic translation from scan results into persistence-layer rows.
+pub mod result_translation;
+
+/// How the runtime acquires source items.
+///
+/// Both modes currently route through the same scan implementation.
+/// The distinction exists so worker and CLI entry points converge on a
+/// single runtime boundary, and so the `Connector` path can later add
+/// remote source enumeration without changing callers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Scan source items directly from local state.
+    #[default]
+    Direct,
+    /// Scan through the connector/runtime family path.
+    Connector,
+}
+
+impl std::str::FromStr for ExecutionMode {
+    type Err = ParseExecutionModeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(Self::Direct),
+            "connector" => Ok(Self::Connector),
+            _ => Err(ParseExecutionModeError {
+                raw: value.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Error returned when parsing [`ExecutionMode`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseExecutionModeError {
+    raw: String,
+}
+
+impl fmt::Display for ParseExecutionModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid execution mode '{}' (expected 'direct' or 'connector')",
+            self.raw
+        )
+    }
+}
+
+impl std::error::Error for ParseExecutionModeError {}
+
+/// Anchor extraction mode for rule planning.
+///
+/// Anchors are short literal strings extracted from rule patterns to drive a
+/// fast Vectorscan pre-filter before full regex evaluation. The mode
+/// determines whether anchors come from explicit rule annotations or are
+/// inferred automatically.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnchorMode {
+    /// Use manually specified anchors from rule definitions.
+    #[default]
+    Manual,
+    /// Derive anchors automatically from rule patterns.
+    Derived,
+}
+
+/// CLI-selectable event output format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventFormat {
+    /// Newline-delimited JSON (one object per line).
+    #[default]
+    Jsonl,
+    /// Human-readable plain text.
+    Text,
+    /// Streaming JSON array.
+    Json,
+    /// SARIF 2.1.0 document.
+    Sarif,
+}
+
+/// Controls which transform decoders are enabled in the runtime engine.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TransformFilter {
+    /// Enable all built-in transform decoders.
+    #[default]
+    All,
+    /// Disable all transform decoders.
+    None,
+    /// Enable only the specified transform decoders.
+    Only(Vec<TransformId>),
+}
+
+/// Cooperative cancellation token for runtime entry points.
+///
+/// Cloneable handle backed by a shared `AtomicBool`. Runtime scan functions
+/// check `is_cancelled()` before starting work and return a default
+/// [`ScanReport`] without doing any I/O when the token is set.
+///
+/// Memory ordering: `cancel()` uses `Release` and `is_cancelled()` uses
+/// `Acquire` so that any state written before cancellation is visible to the
+/// thread that observes it.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Create a new token in the non-cancelled state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cooperative cancellation.
+    ///
+    /// All clones of this token will observe `is_cancelled() == true` after
+    /// this call returns.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns true when cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// Runtime budgets for source scans.
+///
+/// Both fields must be non-zero; validation enforces this constraint
+/// before distributed scan dispatch. Local scan paths (`scan_fs_with_runtime`,
+/// `scan_git_with_runtime`) do not validate or consume budgets — they are
+/// relevant only to the distributed runtime. Both fields are validated
+/// (non-zero) before dispatch but are not yet enforced at execution time.
+///
+/// Defaults are intentionally conservative (256 items, 1 MB) to bound
+/// memory pressure in distributed workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanBudgets {
+    /// Maximum items processed between checkpoints.
+    pub max_items: usize,
+    /// Runtime-level byte budget knob.
+    pub max_bytes: u64,
+}
+
+impl Default for ScanBudgets {
+    fn default() -> Self {
+        Self {
+            max_items: 256,
+            max_bytes: 1_000_000,
+        }
+    }
+}
+
+impl ScanBudgets {
+    pub fn validate(self) -> Result<(), ScanRuntimeError> {
+        if self.max_items == 0 {
+            return Err(ScanRuntimeError::ConnectorInput(
+                ConnectorInputError::ZeroBudget { field: "max_items" },
+            ));
+        }
+        if self.max_bytes == 0 {
+            return Err(ScanRuntimeError::ConnectorInput(
+                ConnectorInputError::ZeroBudget { field: "max_bytes" },
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for a filesystem (ordered-content) scan.
+///
+/// Builder methods follow a `with_*` convention and clamp worker counts to a
+/// minimum of 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsScanConfig {
+    /// Filesystem root or file path to scan.
+    pub path: PathBuf,
+    /// Number of worker threads to use.
+    pub workers: usize,
+    /// Optional transform decode depth override.
+    pub decode_depth: Option<usize>,
+    /// When true, archive expansion is disabled.
+    pub skip_archives: bool,
+    /// When true, binary files are scanned.
+    pub scan_binary: bool,
+    /// When true, findings are persisted via the commit sink bridge.
+    pub persist_findings: bool,
+    /// Optional connector-instance scope for filesystem stable IDs.
+    ///
+    /// When unset, the runtime hashes the canonical scan root and uses that as
+    /// the connector-instance namespace. Distributed execution can override
+    /// this so the same logical connector instance stays stable even if it is
+    /// mounted at different local paths on different workers.
+    pub connector_instance: Option<ConnectorInstanceIdHash>,
+    /// Anchor extraction policy for rule matching.
+    pub anchor_mode: AnchorMode,
+    /// Optional external rules file path.
+    pub rules_file: Option<PathBuf>,
+    /// Transform decoder filter.
+    pub transform_filter: TransformFilter,
+    /// Execution mode selector.
+    pub execution_mode: ExecutionMode,
+    /// Scan execution budget controls.
+    pub budgets: ScanBudgets,
+}
+
+impl FsScanConfig {
+    /// Creates a filesystem scan config for `path` with default settings.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            workers: available_workers(),
+            decode_depth: None,
+            skip_archives: false,
+            scan_binary: false,
+            persist_findings: false,
+            connector_instance: None,
+            anchor_mode: AnchorMode::Manual,
+            rules_file: None,
+            transform_filter: TransformFilter::All,
+            execution_mode: ExecutionMode::Direct,
+            budgets: ScanBudgets::default(),
+        }
+    }
+
+    /// Sets the number of worker threads. Clamped to a minimum of 1.
+    #[must_use]
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers.max(1);
+        self
+    }
+
+    /// Sets the maximum transform decode depth.
+    #[must_use]
+    pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
+        self.decode_depth = decode_depth;
+        self
+    }
+
+    /// Enables or disables archive expansion during scanning.
+    #[must_use]
+    pub fn with_skip_archives(mut self, skip_archives: bool) -> Self {
+        self.skip_archives = skip_archives;
+        self
+    }
+
+    /// Enables or disables scanning of binary files.
+    #[must_use]
+    pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
+        self.scan_binary = scan_binary;
+        self
+    }
+
+    /// Enables or disables finding persistence via the commit sink bridge.
+    #[must_use]
+    pub fn with_persist_findings(mut self, persist_findings: bool) -> Self {
+        self.persist_findings = persist_findings;
+        self
+    }
+
+    /// Override the connector-instance scope used for filesystem stable IDs.
+    #[must_use]
+    pub fn with_connector_instance_hash(
+        mut self,
+        connector_instance: ConnectorInstanceIdHash,
+    ) -> Self {
+        self.connector_instance = Some(connector_instance);
+        self
+    }
+
+    /// Hash and store an explicit connector-instance identifier.
+    #[must_use]
+    pub fn with_connector_instance_id(mut self, connector_instance_id: impl AsRef<[u8]>) -> Self {
+        self.connector_instance = Some(ConnectorInstanceIdHash::from_instance_id_bytes(
+            connector_instance_id.as_ref(),
+        ));
+        self
+    }
+
+    /// Resolve the filesystem identity scope for one canonical scan root.
+    #[inline]
+    #[must_use]
+    pub(crate) fn resolved_identity_scope(
+        &self,
+        canonical_root: &Path,
+    ) -> FilesystemIdentityScope {
+        self.connector_instance.map_or_else(
+            || FilesystemIdentityScope::from_canonical_root(canonical_root),
+            FilesystemIdentityScope::from_connector_instance,
+        )
+    }
+
+    /// Sets the anchor extraction policy for rule matching.
+    #[must_use]
+    pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
+        self.anchor_mode = anchor_mode;
+        self
+    }
+
+    /// Sets an external rules file path.
+    #[must_use]
+    pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
+        self.rules_file = rules_file;
+        self
+    }
+
+    /// Sets the transform decoder filter.
+    #[must_use]
+    pub fn with_transform_filter(mut self, transform_filter: TransformFilter) -> Self {
+        self.transform_filter = transform_filter;
+        self
+    }
+
+    /// Sets the execution mode.
+    #[must_use]
+    pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
+    }
+
+    /// Sets the scan execution budgets.
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
+
+/// Configuration for a Git repository scan.
+///
+/// Builder methods follow a `with_*` convention and clamp worker counts to a
+/// minimum of 1. Size overrides (`tree_delta_cache_mb`, `engine_chunk_mb`) are
+/// specified in MiB and converted to byte counts at dispatch time with
+/// overflow checking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitScanConfig {
+    /// Repository root path to scan.
+    pub repo: PathBuf,
+    /// Number of pack-exec worker threads.
+    pub workers: usize,
+    /// Optional transform decode depth override.
+    pub decode_depth: Option<usize>,
+    /// When true, binary blobs are scanned.
+    pub scan_binary: bool,
+    /// Git debug output level.
+    pub debug_level: GitDebugLevel,
+    /// When true, enrich commit metadata with identity dictionary IDs.
+    pub enrich_identities: bool,
+    /// Anchor extraction policy for rule matching.
+    pub anchor_mode: AnchorMode,
+    /// Optional external rules file path.
+    pub rules_file: Option<PathBuf>,
+    /// Transform decoder filter.
+    pub transform_filter: TransformFilter,
+    /// Stable repository identifier used in persistence keys.
+    pub repo_id: u64,
+    /// Git scan mode.
+    pub scan_mode: GitScanMode,
+    /// Merge-diff strategy for merge commits.
+    pub merge_mode: MergeDiffMode,
+    /// Optional tree delta cache size override in MiB.
+    pub tree_delta_cache_mb: Option<u32>,
+    /// Optional engine chunk size override in MiB.
+    pub engine_chunk_mb: Option<u32>,
+    /// Execution mode selector.
+    pub execution_mode: ExecutionMode,
+    /// Scan execution budget controls.
+    pub budgets: ScanBudgets,
+}
+
+impl GitScanConfig {
+    /// Creates a git scan config for `repo` with default settings.
+    #[must_use]
+    pub fn new(repo: impl Into<PathBuf>) -> Self {
+        Self {
+            repo: repo.into(),
+            workers: available_workers(),
+            decode_depth: None,
+            scan_binary: false,
+            debug_level: GitDebugLevel::Off,
+            enrich_identities: false,
+            anchor_mode: AnchorMode::Manual,
+            rules_file: None,
+            transform_filter: TransformFilter::All,
+            repo_id: 1,
+            scan_mode: GitScanMode::OdbBlobFast,
+            merge_mode: MergeDiffMode::AllParents,
+            tree_delta_cache_mb: None,
+            engine_chunk_mb: None,
+            execution_mode: ExecutionMode::Direct,
+            budgets: ScanBudgets::default(),
+        }
+    }
+
+    /// Sets the number of pack-exec worker threads. Clamped to a minimum of 1.
+    #[must_use]
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers.max(1);
+        self
+    }
+
+    /// Sets the maximum transform decode depth.
+    #[must_use]
+    pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
+        self.decode_depth = decode_depth;
+        self
+    }
+
+    /// Enables or disables scanning of binary blobs.
+    #[must_use]
+    pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
+        self.scan_binary = scan_binary;
+        self
+    }
+
+    /// Sets the git debug output level.
+    #[must_use]
+    pub fn with_debug_level(mut self, debug_level: GitDebugLevel) -> Self {
+        self.debug_level = debug_level;
+        self
+    }
+
+    /// Enables or disables commit metadata enrichment.
+    #[must_use]
+    pub fn with_enrich_identities(mut self, enrich_identities: bool) -> Self {
+        self.enrich_identities = enrich_identities;
+        self
+    }
+
+    /// Sets the anchor extraction policy for rule matching.
+    #[must_use]
+    pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
+        self.anchor_mode = anchor_mode;
+        self
+    }
+
+    /// Sets an external rules file path.
+    #[must_use]
+    pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
+        self.rules_file = rules_file;
+        self
+    }
+
+    /// Sets the transform decoder filter.
+    #[must_use]
+    pub fn with_transform_filter(mut self, transform_filter: TransformFilter) -> Self {
+        self.transform_filter = transform_filter;
+        self
+    }
+
+    /// Sets the stable repository identifier used in persistence keys.
+    #[must_use]
+    pub fn with_repo_id(mut self, repo_id: u64) -> Self {
+        self.repo_id = repo_id;
+        self
+    }
+
+    /// Sets the git scan strategy.
+    #[must_use]
+    pub fn with_scan_mode(mut self, scan_mode: GitScanMode) -> Self {
+        self.scan_mode = scan_mode;
+        self
+    }
+
+    /// Sets the merge-diff strategy for merge commits.
+    #[must_use]
+    pub fn with_merge_mode(mut self, merge_mode: MergeDiffMode) -> Self {
+        self.merge_mode = merge_mode;
+        self
+    }
+
+    /// Sets the tree delta cache size in MiB.
+    #[must_use]
+    pub fn with_tree_delta_cache_mb(mut self, tree_delta_cache_mb: Option<u32>) -> Self {
+        self.tree_delta_cache_mb = tree_delta_cache_mb;
+        self
+    }
+
+    /// Sets the engine chunk size in MiB.
+    #[must_use]
+    pub fn with_engine_chunk_mb(mut self, engine_chunk_mb: Option<u32>) -> Self {
+        self.engine_chunk_mb = engine_chunk_mb;
+        self
+    }
+
+    /// Sets the execution mode.
+    #[must_use]
+    pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
+    }
+
+    /// Sets the scan execution budgets.
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
+
+/// Aggregate counters returned by one runtime execution.
+///
+/// Fields are intentionally flat so callers can log or serialize
+/// the report without traversing nested structures. All counter fields
+/// are monotonically accumulated during the scan; none are reset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Total items (files / blobs) processed.
+    pub items_scanned: u64,
+    /// Total payload bytes scanned.
+    pub bytes_scanned: u64,
+    /// Total chunk windows scanned across all items.
+    pub chunks_scanned: u64,
+    /// Findings emitted to the event stream.
+    pub findings_emitted: u64,
+    /// Non-fatal errors encountered during scanning.
+    pub errors: u64,
+    /// Items skipped because they were classified as binary by content probe.
+    pub binary_skipped: u64,
+    /// Items skipped pre-open because extension matched the binary skip table.
+    pub ext_skipped: u64,
+    /// Items skipped pre-open because filename matched the lock-file table.
+    pub lock_skipped: u64,
+    /// Items scanned via extracted text from known binary container formats.
+    pub binary_extracted: u64,
+    /// Findings dropped by engine caps during scan.
+    pub dropped_findings: u64,
+    /// Persistence batch emission failures observed by the runtime.
+    pub persist_emit_failures: u64,
+    /// Whether persistence loss counters indicate an incomplete run.
+    pub persist_incomplete: bool,
+    /// Aggregate scan-loop time in nanoseconds.
+    pub scan_ns: u64,
+    /// Aggregate persistence emission time in nanoseconds.
+    pub persist_ns: u64,
+}
+
+/// Incremental progress checkpoint produced by the runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanCheckpoint {
+    /// Cursor pointing just past the last fully committed item.
+    pub cursor: Cursor,
+    /// Running count of units committed up to this cursor position.
+    pub committed_units: u64,
+}
+
+/// Runtime wiring errors for scan execution.
+///
+/// Covers the full lifecycle from path validation through engine construction
+/// and scan dispatch. Each variant carries enough context for a human-readable
+/// error message without requiring access to the original inputs.
+#[derive(Debug)]
+pub enum ScanRuntimeError {
+    /// A scan target path failed validation.
+    InvalidPath {
+        /// Which subsystem originated the path.
+        source: &'static str,
+        /// The path that failed validation.
+        path: PathBuf,
+        /// Human-readable reason for the failure.
+        message: String,
+    },
+    /// A `git` subprocess exited with a non-zero status.
+    GitCommandFailed {
+        /// Repository path the command was invoked against.
+        repo: PathBuf,
+        /// Process exit code, if available.
+        status_code: Option<i32>,
+        /// Captured stderr output from the git process.
+        stderr: String,
+    },
+    /// An I/O operation failed during runtime setup.
+    Io {
+        /// Short description of the operation.
+        op: &'static str,
+        /// Associated file path, when applicable.
+        path: Option<PathBuf>,
+        /// Underlying I/O error.
+        error: std::io::Error,
+    },
+    /// The external rules configuration file could not be loaded or parsed.
+    RulesConfig {
+        /// Path to the rules file, if one was specified.
+        path: Option<PathBuf>,
+        /// Human-readable parse or load error.
+        message: String,
+    },
+    /// A connector input parameter was invalid.
+    ConnectorInput(ConnectorInputError),
+    /// The family runtime returned an execution error.
+    Driver(anyhow::Error),
+}
+
+impl fmt::Display for ScanRuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPath {
+                source,
+                path,
+                message,
+            } => write!(f, "{source} path '{}' invalid: {message}", path.display()),
+            Self::GitCommandFailed {
+                repo,
+                status_code,
+                stderr,
+            } => write!(
+                f,
+                "git command failed for '{}' (status={status_code:?}): {stderr}",
+                repo.display()
+            ),
+            Self::Io { op, path, error } => match path {
+                Some(path) => write!(f, "{op} failed for '{}': {error}", path.display()),
+                None => write!(f, "{op} failed: {error}"),
+            },
+            Self::RulesConfig { path, message } => match path {
+                Some(path) => write!(f, "rules config error for '{}': {message}", path.display()),
+                None => write!(f, "rules config error: {message}"),
+            },
+            Self::ConnectorInput(error) => write!(f, "{error}"),
+            Self::Driver(error) => write!(f, "runtime execution failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ScanRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { error, .. } => Some(error),
+            Self::ConnectorInput(error) => Some(error),
+            Self::Driver(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<ConnectorInputError> for ScanRuntimeError {
+    fn from(value: ConnectorInputError) -> Self {
+        Self::ConnectorInput(value)
+    }
+}
+
+/// Execution outcome for one runtime assignment.
+///
+/// Local entry points consume this for summary reporting, while the
+/// distributed worker uses it to hand scan-side information back into
+/// coordinator flow control. The authoritative distributed progress signal is
+/// the receipt-driven committed prefix, not any driver-local checkpoint hint.
+#[derive(Clone, Debug)]
+pub struct AssignmentOutcome {
+    /// Aggregate counters for the invocation.
+    pub report: ScanReport,
+    /// Optional driver-local checkpoint hint retained for runtime-local
+    /// bookkeeping, never as the authoritative distributed progress signal.
+    pub checkpoint_hint: Option<ScanCheckpoint>,
+    /// Optional debug diagnostics for stderr output.
+    pub debug_output: Option<String>,
+}
+
+/// Top-level filesystem scan dispatcher.
+///
+/// Routes to `scan_fs_direct` or `scan_fs_connector` based on
+/// [`FsScanConfig::execution_mode`]. Both currently resolve to the same
+/// implementation.
+pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    match config.execution_mode {
+        ExecutionMode::Direct => scan_fs_direct(config),
+        ExecutionMode::Connector => scan_fs_connector(config),
+    }
+}
+
+/// Top-level Git scan dispatcher.
+///
+/// Routes to `scan_git_direct` or `scan_git_connector` based on
+/// [`GitScanConfig::execution_mode`]. Both currently resolve to the same
+/// implementation.
+pub fn scan_git(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    match config.execution_mode {
+        ExecutionMode::Direct => scan_git_direct(config),
+        ExecutionMode::Connector => scan_git_connector(config),
+    }
+}
+
+/// Filesystem scan using null sinks (no event or commit output).
+///
+/// Suitable for headless / batch scans where only the aggregate report matters.
+pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    let out = NullEventOutput;
+    let commit = commit_sink::CliNoOpCommitSink;
+    let cancel = CancellationToken::new();
+    scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
+}
+
+/// Connector-mode filesystem scan. Currently delegates to [`scan_fs_direct`].
+pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    scan_fs_direct(config)
+}
+
+/// Git scan using a null event sink (no event output).
+///
+/// Suitable for headless / batch scans where only the aggregate report matters.
+pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    let out = scanner_git::NullEventSink;
+    let cancel = CancellationToken::new();
+    scan_git_with_runtime(config, &out, &cancel).map(|outcome| outcome.report)
+}
+
+/// Connector-mode Git scan. Currently delegates to [`scan_git_direct`].
+pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    scan_git_direct(config)
+}
+
+/// Internal filesystem entrypoint that accepts caller-provided sinks.
+///
+/// Validates the path (must exist and be a file or directory), then delegates
+/// to [`ordered_content::scan_local_filesystem`]. Budget validation is not
+/// performed here — budgets are consumed by the distributed runtime path only.
+pub(crate) fn scan_fs_with_runtime(
+    config: &FsScanConfig,
+    out: &dyn EventOutput,
+    commit: &dyn commit_sink::CommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    let canonical_path = validate_fs_path(&config.path)?;
+    ordered_content::scan_local_filesystem(config, canonical_path, out, commit, cancel)
+}
+
+/// Internal filesystem entrypoint that reuses a caller-provided detection
+/// engine.
+///
+/// Distributed scans use this to share one engine instance between file
+/// scanning and rule-fingerprint lookup for receipt-driven commit translation.
+pub(crate) fn scan_fs_with_prebuilt_engine(
+    config: &FsScanConfig,
+    engine: Arc<scanner_engine::Engine>,
+    out: &dyn EventOutput,
+    commit: &dyn commit_sink::CommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    let canonical_path = validate_fs_path(&config.path)?;
+    ordered_content::scan_local_filesystem_with_engine(
+        config,
+        canonical_path,
+        engine,
+        out,
+        commit,
+        cancel,
+    )
+}
+
+/// Internal Git entrypoint that accepts a caller-provided event sink.
+///
+/// Validates the path (must be a directory at the repository root), then
+/// delegates to [`git_repo::scan_local_repo`]. Budget validation is not
+/// performed here — budgets are consumed by the distributed runtime path only.
+pub(crate) fn scan_git_with_runtime(
+    config: &GitScanConfig,
+    out: &dyn GitEventOutput,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    let canonical_repo = validate_git_repo_path(&config.repo)?;
+    git_repo::scan_local_repo(config, canonical_repo, out, cancel)
+}
+
+/// Query available hardware parallelism, falling back to 1 on failure.
+///
+/// Used as the default worker count for [`FsScanConfig`] and [`GitScanConfig`].
+pub(crate) fn available_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to query available parallelism, defaulting to 1");
+            1
+        })
+}
+
+/// Bounded channel capacity for scan event forwarding.
+///
+/// Large enough to buffer a burst of findings without blocking the scan thread,
+/// small enough to bound memory when the consumer is slow.
+pub(crate) const EVENT_CHANNEL_CAP: usize = 8_192;
+
+/// Bounded channel capacity for commit (persistence) message forwarding.
+pub(crate) const COMMIT_CHANNEL_CAP: usize = 1_024;
+
+/// Build a shared detection engine from runtime configuration.
+///
+/// Loads rules (from file or built-in), filters transforms, applies tuning
+/// overrides, and constructs the engine inside `catch_unwind` to convert
+/// panics in rule compilation into recoverable [`ScanRuntimeError::RulesConfig`]
+/// errors.
+pub(crate) fn build_runtime_engine(
+    rules_file: Option<&Path>,
+    transform_filter: &TransformFilter,
+    decode_depth: Option<usize>,
+    anchor_mode: AnchorMode,
+) -> Result<Arc<scanner_engine::Engine>, ScanRuntimeError> {
+    let rules_path = rules_file.map(Path::to_path_buf);
+    let rules = load_runtime_rules(rules_file)?;
+    let transforms = filtered_runtime_transforms(transform_filter);
+    let mut tuning = default_runtime_tuning();
+    if let Some(depth) = decode_depth {
+        tuning.max_transform_depth = depth;
+    }
+
+    let engine = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        scanner_engine::Engine::new_with_anchor_policy(
+            rules,
+            transforms,
+            tuning,
+            anchor_policy(anchor_mode),
+        )
+    }))
+    .map_err(|payload| ScanRuntimeError::RulesConfig {
+        path: rules_path,
+        message: panic_payload_message(payload),
+    })?;
+
+    Ok(Arc::new(engine))
+}
+
+fn load_runtime_rules(
+    rules_file: Option<&Path>,
+) -> Result<Vec<scanner_engine::RuleSpec>, ScanRuntimeError> {
+    match rules_file {
+        Some(path) => {
+            let content = scanner_engine::read_rules_text(path).map_err(|error| {
+                ScanRuntimeError::RulesConfig {
+                    path: Some(path.to_path_buf()),
+                    message: error.to_string(),
+                }
+            })?;
+            scanner_engine::load_rules_from_content(&content).map_err(|error| {
+                ScanRuntimeError::RulesConfig {
+                    path: Some(path.to_path_buf()),
+                    message: error.to_string(),
+                }
+            })
+        }
+        None => Ok(scanner_engine::builtin_rules()),
+    }
+}
+
+fn filtered_runtime_transforms(filter: &TransformFilter) -> Vec<TransformConfig> {
+    let mut transforms = default_runtime_transforms();
+    match filter {
+        TransformFilter::All => transforms,
+        TransformFilter::None => Vec::new(),
+        TransformFilter::Only(ids) => {
+            transforms.retain(|transform| ids.contains(&transform.id));
+            transforms
+        }
+    }
+}
+
+fn default_runtime_transforms() -> Vec<TransformConfig> {
+    vec![
+        TransformConfig {
+            id: TransformId::UrlPercent,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 16,
+            max_spans_per_buffer: 8,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+        TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 32,
+            max_spans_per_buffer: 8,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+    ]
+}
+
+fn default_runtime_tuning() -> Tuning {
+    Tuning {
+        merge_gap: 64,
+        max_windows_per_rule_variant: 16,
+        pressure_gap_start: 128,
+        max_anchor_hits_per_rule_variant: 2048,
+        max_utf16_decoded_bytes_per_window: 64 * 1024,
+        max_transform_depth: 3,
+        max_total_decode_output_bytes: 512 * 1024,
+        max_work_items: 256,
+        max_findings_per_chunk: 8192,
+        scan_utf16_variants: true,
+    }
+}
+
+fn anchor_policy(mode: AnchorMode) -> AnchorPolicy {
+    match mode {
+        AnchorMode::Manual => AnchorPolicy::ManualOnly,
+        AnchorMode::Derived => AnchorPolicy::DerivedOnly,
+    }
+}
+
+/// Extract a human-readable message from a panic payload.
+///
+/// Handles `&str` and `String` payloads; falls back to a generic message
+/// for other payload types.
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "engine construction panicked".to_owned()
+    }
+}
+
+/// Owned event payload sent through the bounded forwarding channel.
+///
+/// The `Core` variant carries scheduler events (findings, progress, summary,
+/// diagnostics). The `Git` variant carries git-specific events (commit
+/// metadata, identity dictionary entries). Owning the data decouples the
+/// event's lifetime from the scan thread that produced it.
+#[derive(Debug)]
+pub(crate) enum OwnedDriverEvent {
+    Core(OwnedCoreEvent),
+    Git(OwnedGitEvent),
+}
+
+/// [`EventOutput`] adapter that serializes core events into an owned
+/// representation and sends them through a bounded `SyncSender`.
+///
+/// Send failures are silently dropped — a closed channel means the forwarder
+/// thread has exited, and there is no useful recovery action.
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelEventOutput {
+    tx: SyncSender<OwnedDriverEvent>,
+}
+
+impl ChannelEventOutput {
+    pub(crate) fn new(tx: SyncSender<OwnedDriverEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+impl EventOutput for ChannelEventOutput {
+    fn emit_core(&self, event: CoreEvent<'_>) {
+        let _ = self
+            .tx
+            .send(OwnedDriverEvent::Core(OwnedCoreEvent::from_core(event)));
+    }
+
+    fn flush(&self) {}
+}
+
+impl GitEventOutput for ChannelEventOutput {
+    fn emit_git(&self, event: GitEvent<'_>) {
+        let _ = self
+            .tx
+            .send(OwnedDriverEvent::Git(OwnedGitEvent::from_git(event)));
+    }
+}
+
+/// Drain the event channel and replay each event into `out`.
+///
+/// Runs on a scoped forwarder thread spawned by the git scan path. Exits
+/// when the channel is closed (all senders dropped), then flushes the output
+/// sink. Both core and git event variants are replayed so a single channel
+/// can carry the full event stream.
+pub(crate) fn forward_git_events(out: &dyn GitEventOutput, rx: Receiver<OwnedDriverEvent>) {
+    while let Ok(event) = rx.recv() {
+        match event {
+            OwnedDriverEvent::Core(core) => core.emit_into(out),
+            OwnedDriverEvent::Git(git) => git.emit_into(out),
+        }
+    }
+    out.flush();
+}
+
+/// Drain the event channel and replay core events into `out`, discarding
+/// any git-specific events. Used by the filesystem scan path.
+pub(crate) fn forward_core_events(out: &dyn EventOutput, rx: Receiver<OwnedDriverEvent>) {
+    while let Ok(event) = rx.recv() {
+        if let OwnedDriverEvent::Core(core) = event {
+            core.emit_into(out);
+        }
+    }
+    out.flush();
+}
+
+/// Filesystem-scoped identity derivation for one canonical scan root.
+///
+/// Captures the hashed connector-instance identity once so every normalized
+/// item key under that root derives stable item IDs in the same namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FilesystemIdentityScope {
+    connector_instance: ConnectorInstanceIdHash,
+}
+
+impl FilesystemIdentityScope {
+    /// Build the filesystem identity scope from an already-hashed connector
+    /// instance identifier.
+    fn from_connector_instance(connector_instance: ConnectorInstanceIdHash) -> Self {
+        Self { connector_instance }
+    }
+
+    /// Build the filesystem identity scope for one canonical scan root.
+    ///
+    /// The caller is responsible for passing the canonical path returned by
+    /// [`validate_fs_path`]. Using the canonical root keeps logically-identical
+    /// scan targets in the same connector-instance namespace while preserving
+    /// separation between distinct filesystem roots.
+    fn from_canonical_root(root: &Path) -> Self {
+        Self::from_connector_instance(ConnectorInstanceIdHash::from_instance_id_bytes(
+            root.as_os_str().as_encoded_bytes(),
+        ))
+    }
+
+    /// Derive the stable identity for one filesystem item key.
+    ///
+    /// Filesystem stable IDs are scoped by the canonical filesystem connector
+    /// tag plus the hashed connector-instance root, so the same relative path
+    /// under two different roots cannot collide.
+    fn stable_item_id(&self, item_key: &ItemKey) -> StableItemId {
+        derive_filesystem_stable_item_id(self.connector_instance, item_key)
+    }
+}
+
+/// [`StoreProducer`] adapter that normalizes paths and derives stable item
+/// identities before forwarding finding batches through a commit channel.
+///
+/// Path normalization strips the scan root prefix and converts to
+/// forward-slash-separated bytes, producing a deterministic item key
+/// regardless of platform path separators.
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelStoreProducer {
+    tx: SyncSender<CommitMessage>,
+    root: PathBuf,
+    identity: FilesystemIdentityScope,
+}
+
+impl ChannelStoreProducer {
+    /// Build a commit bridge for one filesystem root using the canonical-root
+    /// identity scope.
+    pub(crate) fn try_new(tx: SyncSender<CommitMessage>, root: PathBuf) -> anyhow::Result<Self> {
+        let root = canonicalize_store_root(root)?;
+        let identity = FilesystemIdentityScope::from_canonical_root(&root);
+        Ok(Self { tx, root, identity })
+    }
+
+    /// Build a commit bridge for one filesystem root using an explicit
+    /// connector-instance scope.
+    ///
+    /// Distributed execution uses this path so the same logical connector
+    /// instance keeps stable item identity even if workers see different local
+    /// mount points.
+    pub(crate) fn try_new_with_identity(
+        tx: SyncSender<CommitMessage>,
+        root: PathBuf,
+        identity: FilesystemIdentityScope,
+    ) -> anyhow::Result<Self> {
+        let root = canonicalize_store_root(root)?;
+        Ok(Self { tx, root, identity })
+    }
+}
+
+fn canonicalize_store_root(root: PathBuf) -> anyhow::Result<PathBuf> {
+    fs::canonicalize(&root)
+        .map_err(|error| anyhow::anyhow!("failed to canonicalize scan root '{}': {error}", root.display()))
+}
+
+impl StoreProducer for ChannelStoreProducer {
+    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+        let normalized_path =
+            normalize_scheduler_path(&self.root, batch.object_path).map_err(|error| {
+                FsStoreError::backend(format!("path normalization failed: {error}"))
+            })?;
+        let item_key = gossip_contracts::connector::ItemKey::try_from_slice(&normalized_path)
+            .map_err(|error| {
+                FsStoreError::backend(format!("normalized item key invalid: {error}"))
+            })?;
+        let stable_item_id = self.identity.stable_item_id(&item_key);
+
+        self.tx
+            .send(CommitMessage::Batch(OwnedCommitBatch {
+                object_path: normalized_path,
+                stable_item_id,
+                findings: batch.findings.to_vec(),
+            }))
+            .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
+    }
+
+    fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError> {
+        self.tx
+            .send(CommitMessage::RunLoss(loss))
+            .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
+    }
+
+    fn end_run(&self, had_coverage_limits: bool) -> Result<(), FsStoreError> {
+        self.tx
+            .send(CommitMessage::EndRun(had_coverage_limits))
+            .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
+    }
+}
+
+/// Messages sent through the commit forwarding channel.
+#[derive(Debug)]
+pub(crate) enum CommitMessage {
+    /// A batch of findings for one scanned item.
+    Batch(OwnedCommitBatch),
+    /// Run-level loss record. Not forwarded to the commit sink because
+    /// `ScanReport` already captures `dropped_findings` and
+    /// `persist_emit_failures` from the executor metrics. Present in the
+    /// channel because `ChannelStoreProducer` implements `StoreProducer`,
+    /// which requires `record_fs_run_loss`.
+    RunLoss(FsRunLoss),
+    /// End-of-run signal. Not forwarded to the commit sink because
+    /// run completion is handled by the caller after the scan function
+    /// returns. Present for the same `StoreProducer` trait obligation.
+    EndRun(bool),
+}
+
+/// Owned finding batch ready for commit-sink forwarding.
+#[derive(Debug)]
+pub(crate) struct OwnedCommitBatch {
+    object_path: Vec<u8>,
+    stable_item_id: StableItemId,
+    findings: Vec<FsFindingRecord>,
+}
+
+/// Drain commit messages from the channel and forward finding batches to
+/// the commit sink.
+///
+/// `RunLoss` and `EndRun` messages are acknowledged but not forwarded:
+/// run-level loss counters are already captured in [`ScanReport`] via the
+/// executor metrics, and run completion is signaled by the scan function's
+/// return. These variants exist in the channel only because
+/// [`ChannelStoreProducer`] must satisfy the [`StoreProducer`] trait.
+///
+/// Captures only the *first* error and continues draining the channel so
+/// the sender side does not block. Returns the first error (if any) after
+/// the channel is fully drained.
+pub(crate) fn forward_commits(
+    commit: &dyn commit_sink::CommitSink,
+    rx: Receiver<CommitMessage>,
+) -> anyhow::Result<()> {
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut error_count: u64 = 0;
+
+    while let Ok(message) = rx.recv() {
+        let result = match message {
+            CommitMessage::Batch(batch) => forward_commit_batch(commit, batch),
+            CommitMessage::RunLoss(loss) => {
+                tracing::debug!(
+                    dropped_findings = loss.dropped_findings,
+                    persistence_emit_failures = loss.persistence_emit_failures,
+                    "received run-loss record",
+                );
+                Ok(())
+            }
+            CommitMessage::EndRun(had_coverage_limits) => {
+                tracing::debug!(had_coverage_limits, "received end-run signal");
+                Ok(())
+            }
+        };
+
+        if let Err(error) = result {
+            error_count += 1;
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    if error_count > 1 {
+        tracing::warn!(
+            total_errors = error_count,
+            "commit forwarding encountered multiple errors; only the first is propagated",
+        );
+    }
+
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+/// Replay one finding batch through the commit sink's begin/upsert/finish
+/// lifecycle. Skips the `upsert_findings` call when the batch is empty.
+fn forward_commit_batch(
+    commit: &dyn commit_sink::CommitSink,
+    batch: OwnedCommitBatch,
+) -> anyhow::Result<()> {
+    let item_key = gossip_contracts::connector::ItemKey::try_from_slice(&batch.object_path)
+        .map_err(|error| anyhow::anyhow!("invalid item key from scheduler batch: {error}"))?;
+    let meta = commit_sink::ItemMeta {
+        stable_item_id: batch.stable_item_id,
+        version: None,
+        size_hint: None,
+    };
+    commit.begin_item(&item_key, &meta)?;
+
+    if !batch.findings.is_empty() {
+        let findings = batch
+            .findings
+            .iter()
+            .map(|finding| commit_sink::FindingRecord {
+                rule_id: finding.rule_id,
+                start: finding.span_start,
+                end: finding.span_end,
+                norm_hash: finding.norm_hash,
+                confidence_score: finding.confidence_score,
+            })
+            .collect();
+        commit.upsert_findings(&item_key, &commit_sink::FindingsBatch { findings })?;
+    }
+
+    commit.finish_item(&item_key)?;
+    Ok(())
+}
+
+/// Convert an absolute object path emitted by the scheduler into a
+/// root-relative, forward-slash-separated byte key suitable for persistence.
+///
+/// # Special case: single-file scan
+///
+/// When the scan root *is* the file itself, `strip_prefix` produces an empty
+/// relative path. In that case the function returns the file name component
+/// of the root as the item key.
+///
+/// # Platform
+///
+/// This function relies on `OsStr::from_encoded_bytes_unchecked`, which is
+/// sound on Unix (arbitrary bytes are valid OS strings) but requires WTF-8
+/// on Windows. The scanner runtime is Unix-only; a compile-time assertion
+/// below rejects Windows targets.
+///
+/// # Internal unsafe
+///
+/// Uses `OsStr::from_encoded_bytes_unchecked` because `raw_bytes` originates
+/// from the scheduler, which always provides valid OS-string-encoded paths.
+fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    #[cfg(windows)]
+    compile_error!("normalize_scheduler_path relies on Unix byte-string semantics for OsStr");
+
+    // SAFETY: raw_bytes are OS-string-encoded paths from the scheduler.
+    // On Unix, any &[u8] is a valid OsStr encoding.
+    let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(raw_bytes) };
+    let path = Path::new(os_str);
+    let rel = path.strip_prefix(root).map_err(|_| {
+        anyhow::anyhow!(
+            "batch path '{}' is not under scan root '{}'",
+            path.display(),
+            root.display()
+        )
+    })?;
+
+    if rel.as_os_str().is_empty() {
+        let file_name = root
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("single-file scan root has no file name"))?;
+        let encoded = file_name.as_encoded_bytes().to_vec();
+        if encoded.is_empty() {
+            anyhow::bail!("single-file scan root encoded to an empty key");
+        }
+        return Ok(encoded);
+    }
+
+    let mut out = Vec::new();
+    for component in rel.components() {
+        let segment = match component {
+            std::path::Component::Normal(segment) => segment,
+            _ => anyhow::bail!("path contains non-normal component: {}", rel.display()),
+        };
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(segment.as_encoded_bytes());
+    }
+    if out.is_empty() {
+        anyhow::bail!("relative path encoded to empty key: {}", rel.display());
+    }
+    Ok(out)
+}
+
+/// Owned representation of [`CoreEvent`] for cross-thread forwarding and
+/// coordination-level persistence.
+///
+/// Mirrors the borrowed `CoreEvent<'_>` variants but owns all heap data
+/// (paths, rule names, messages). Created by `from_core` and replayed by
+/// `emit_into`.
+#[derive(Clone, Debug)]
+pub enum OwnedCoreEvent {
+    Finding {
+        source: SourceKind,
+        object_path: Vec<u8>,
+        start: u64,
+        end: u64,
+        rule_id: u32,
+        /// Heap-allocated because `FindingEvent.rule_name` is `&'a str`
+        /// (lifetime-bound to the engine), not `&'static str`. Changing the
+        /// engine's `rule_name()` return type would require a cross-crate
+        /// signature change across `scanner_engine` and `scanner_scheduler`.
+        rule_name: String,
+        commit_id: Option<u32>,
+        change_kind: Option<String>,
+        confidence_score: i8,
+    },
+    Progress {
+        source: SourceKind,
+        stage: &'static str,
+        objects_scanned: u64,
+        bytes_scanned: u64,
+        findings_emitted: u64,
+    },
+    Summary {
+        source: SourceKind,
+        status: &'static str,
+        elapsed_ms: u64,
+        bytes_scanned: u64,
+        findings_emitted: u64,
+        errors: u64,
+        throughput_mib_s: f64,
+    },
+    Diagnostic {
+        level: &'static str,
+        message: String,
+    },
+}
+
+impl OwnedCoreEvent {
+    pub(crate) fn from_core(event: CoreEvent<'_>) -> Self {
+        match event {
+            CoreEvent::Finding(finding) => Self::Finding {
+                source: finding.source,
+                object_path: finding.object_path.to_vec(),
+                start: finding.start,
+                end: finding.end,
+                rule_id: finding.rule_id,
+                rule_name: finding.rule_name.to_owned(),
+                commit_id: finding.commit_id,
+                change_kind: finding.change_kind.map(ToOwned::to_owned),
+                confidence_score: finding.confidence_score,
+            },
+            CoreEvent::Progress(progress) => Self::Progress {
+                source: progress.source,
+                stage: progress.stage,
+                objects_scanned: progress.objects_scanned,
+                bytes_scanned: progress.bytes_scanned,
+                findings_emitted: progress.findings_emitted,
+            },
+            CoreEvent::Summary(summary) => Self::Summary {
+                source: summary.source,
+                status: summary.status,
+                elapsed_ms: summary.elapsed_ms,
+                bytes_scanned: summary.bytes_scanned,
+                findings_emitted: summary.findings_emitted,
+                errors: summary.errors,
+                throughput_mib_s: summary.throughput_mib_s,
+            },
+            CoreEvent::Diagnostic(diagnostic) => Self::Diagnostic {
+                level: diagnostic.level,
+                message: diagnostic.message.to_owned(),
+            },
+        }
+    }
+
+    /// Replay this owned event into a borrowed [`EventOutput`] sink.
+    ///
+    /// Reconstructs the original borrowed `CoreEvent<'_>` from owned fields
+    /// and emits it. This is the second half of the channel-based forwarding
+    /// pattern: `from_core` on the producer side, `emit_into` on the consumer.
+    fn emit_into(&self, out: &dyn EventOutput) {
+        match self {
+            Self::Finding {
+                source,
+                object_path,
+                start,
+                end,
+                rule_id,
+                rule_name,
+                commit_id,
+                change_kind,
+                confidence_score,
+            } => out.emit_core(CoreEvent::Finding(FindingEvent {
+                source: *source,
+                object_path,
+                start: *start,
+                end: *end,
+                rule_id: *rule_id,
+                rule_name,
+                commit_id: *commit_id,
+                change_kind: change_kind.as_deref(),
+                confidence_score: *confidence_score,
+            })),
+            Self::Progress {
+                source,
+                stage,
+                objects_scanned,
+                bytes_scanned,
+                findings_emitted,
+            } => out.emit_core(CoreEvent::Progress(ProgressEvent {
+                source: *source,
+                stage,
+                objects_scanned: *objects_scanned,
+                bytes_scanned: *bytes_scanned,
+                findings_emitted: *findings_emitted,
+            })),
+            Self::Summary {
+                source,
+                status,
+                elapsed_ms,
+                bytes_scanned,
+                findings_emitted,
+                errors,
+                throughput_mib_s,
+            } => out.emit_core(CoreEvent::Summary(SummaryEvent {
+                source: *source,
+                status,
+                elapsed_ms: *elapsed_ms,
+                bytes_scanned: *bytes_scanned,
+                findings_emitted: *findings_emitted,
+                errors: *errors,
+                throughput_mib_s: *throughput_mib_s,
+            })),
+            Self::Diagnostic { level, message } => {
+                out.emit_core(CoreEvent::Diagnostic(DiagnosticEvent { level, message }))
+            }
+        }
+    }
+}
+
+impl PartialEq for OwnedCoreEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Finding {
+                    source: s1,
+                    object_path: p1,
+                    start: st1,
+                    end: e1,
+                    rule_id: r1,
+                    rule_name: rn1,
+                    commit_id: c1,
+                    change_kind: ck1,
+                    confidence_score: cs1,
+                },
+                Self::Finding {
+                    source: s2,
+                    object_path: p2,
+                    start: st2,
+                    end: e2,
+                    rule_id: r2,
+                    rule_name: rn2,
+                    commit_id: c2,
+                    change_kind: ck2,
+                    confidence_score: cs2,
+                },
+            ) => {
+                s1 == s2
+                    && p1 == p2
+                    && st1 == st2
+                    && e1 == e2
+                    && r1 == r2
+                    && rn1 == rn2
+                    && c1 == c2
+                    && ck1 == ck2
+                    && cs1 == cs2
+            }
+            (
+                Self::Progress {
+                    source: s1,
+                    stage: st1,
+                    objects_scanned: os1,
+                    bytes_scanned: bs1,
+                    findings_emitted: fe1,
+                },
+                Self::Progress {
+                    source: s2,
+                    stage: st2,
+                    objects_scanned: os2,
+                    bytes_scanned: bs2,
+                    findings_emitted: fe2,
+                },
+            ) => s1 == s2 && st1 == st2 && os1 == os2 && bs1 == bs2 && fe1 == fe2,
+            (
+                Self::Summary {
+                    source: s1,
+                    status: st1,
+                    elapsed_ms: em1,
+                    bytes_scanned: bs1,
+                    findings_emitted: fe1,
+                    errors: er1,
+                    throughput_mib_s: t1,
+                },
+                Self::Summary {
+                    source: s2,
+                    status: st2,
+                    elapsed_ms: em2,
+                    bytes_scanned: bs2,
+                    findings_emitted: fe2,
+                    errors: er2,
+                    throughput_mib_s: t2,
+                },
+            ) => {
+                s1 == s2
+                    && st1 == st2
+                    && em1 == em2
+                    && bs1 == bs2
+                    && fe1 == fe2
+                    && er1 == er2
+                    && t1.to_bits() == t2.to_bits()
+            }
+            (
+                Self::Diagnostic {
+                    level: l1,
+                    message: m1,
+                },
+                Self::Diagnostic {
+                    level: l2,
+                    message: m2,
+                },
+            ) => l1 == l2 && m1 == m2,
+            _ => false,
+        }
+    }
+}
+
+/// Owned representation of [`GitEvent`] for cross-thread forwarding.
+///
+/// Mirrors the borrowed `GitEvent<'_>` variants. Identity dictionary values
+/// (arbitrary byte strings) are cloned into owned `Vec<u8>`.
+#[derive(Debug)]
+pub(crate) enum OwnedGitEvent {
+    CommitMeta {
+        commit_id: u32,
+        commit_oid: OidBytes,
+        timestamp: u64,
+        identity: Option<CommitIdentityIds>,
+    },
+    IdentityDictionary {
+        id: u32,
+        value: Vec<u8>,
+    },
+}
+
+impl OwnedGitEvent {
+    fn from_git(event: GitEvent<'_>) -> Self {
+        match event {
+            GitEvent::CommitMeta(meta) => Self::CommitMeta {
+                commit_id: meta.commit_id,
+                commit_oid: meta.commit_oid,
+                timestamp: meta.timestamp,
+                identity: meta.identity,
+            },
+            GitEvent::IdentityDictionary(entry) => Self::IdentityDictionary {
+                id: entry.id,
+                value: entry.value.to_vec(),
+            },
+        }
+    }
+
+    /// Replay this owned git event into a borrowed [`GitEventOutput`] sink.
+    fn emit_into(&self, out: &dyn GitEventOutput) {
+        match self {
+            Self::CommitMeta {
+                commit_id,
+                commit_oid,
+                timestamp,
+                identity,
+            } => out.emit_git(GitEvent::CommitMeta(CommitMetaEvent {
+                commit_id: *commit_id,
+                commit_oid: *commit_oid,
+                timestamp: *timestamp,
+                identity: *identity,
+            })),
+            Self::IdentityDictionary { id, value } => {
+                out.emit_git(GitEvent::IdentityDictionary(IdentityDictionaryEvent {
+                    id: *id,
+                    value,
+                }))
+            }
+        }
+    }
+}
+
+/// Join a scoped thread handle, converting a panic into an `anyhow::Error`
+/// that names the thread for diagnostics.
+pub(crate) fn join_scoped<T>(
+    handle: std::thread::ScopedJoinHandle<'_, T>,
+    thread_name: &str,
+) -> anyhow::Result<T> {
+    handle.join().map_err(|payload| {
+        anyhow::anyhow!("{thread_name} panicked: {}", panic_payload_message(payload))
+    })
+}
+
+/// Validate a filesystem scan target path.
+///
+/// Returns the canonicalized path on success. Rejects paths that do not exist
+/// or are neither a regular file nor a directory (e.g. symlinks to special
+/// files, device nodes).
+fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
+    if !path.exists() {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "filesystem",
+            path: path.to_path_buf(),
+            message: "path does not exist".to_owned(),
+        });
+    }
+    if !path.is_file() && !path.is_dir() {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "filesystem",
+            path: path.to_path_buf(),
+            message: "path must be a regular file or directory".to_owned(),
+        });
+    }
+    fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
+        op: "canonicalize",
+        path: Some(path.to_path_buf()),
+        error,
+    })
+}
+
+/// Validate a Git scan target path.
+///
+/// Checks that `path` exists, is a directory, is a valid Git repository
+/// (via `git rev-parse --show-toplevel`), and that the canonicalized path
+/// matches the repository root. Subdirectories of a repository are rejected
+/// to prevent accidental partial scans.
+fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
+    if !path.exists() {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "git",
+            path: path.to_path_buf(),
+            message: "path does not exist".to_owned(),
+        });
+    }
+    if !path.is_dir() {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "git",
+            path: path.to_path_buf(),
+            message: "path must be a directory".to_owned(),
+        });
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .map_err(|error| ScanRuntimeError::Io {
+            op: "spawn git rev-parse",
+            path: Some(path.to_path_buf()),
+            error,
+        })?;
+
+    if !output.status.success() {
+        return Err(ScanRuntimeError::GitCommandFailed {
+            repo: path.to_path_buf(),
+            status_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let canonical_input = fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
+        op: "canonicalize",
+        path: Some(path.to_path_buf()),
+        error,
+    })?;
+    let canonical_toplevel = fs::canonicalize(&toplevel).map_err(|error| ScanRuntimeError::Io {
+        op: "canonicalize",
+        path: Some(PathBuf::from(&toplevel)),
+        error,
+    })?;
+
+    if canonical_input != canonical_toplevel {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "git",
+            path: path.to_path_buf(),
+            message: format!(
+                "path is inside a git repository but is not the repository root (root is '{}')",
+                canonical_toplevel.display()
+            ),
+        });
+    }
+
+    Ok(canonical_input)
+}
+
+#[cfg(test)]
+mod test_fixtures;
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+mod runtime_durability_tests;
