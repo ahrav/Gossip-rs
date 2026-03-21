@@ -506,12 +506,15 @@ The production module includes:
 - error-chain preservation for bootstrap and worker error conversions
 - validate-only failures when done-ledger or findings schemas are missing
 - checksum-mismatch detection for persisted done-ledger migration history
+- truncated-checksum detection for corrupted migration history rows
 - development auto-migrate bootstrap and idempotency coverage
+- development auto-migrate followed by validate-only on the same database
 - live-backend construction from explicit PostgreSQL clients
 - proof that schema-readiness failures stop before the distributed runtime
   claims shards
 - proof that the real backend path reaches the coordinator runtime without
   falling back to local or in-memory doubles
+- DSN host extraction with literal `@` in password
 
 The recorder module checks:
 

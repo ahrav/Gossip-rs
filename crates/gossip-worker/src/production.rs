@@ -24,8 +24,9 @@ use std::fmt;
 use crate::config::ProductionBackendConfig;
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
 use gossip_done_ledger_postgres::{
-    DoneLedgerPg, DoneLedgerPgMigrationError, MIGRATIONS as DONE_LEDGER_MIGRATIONS,
-    apply_all_migrations as apply_done_ledger_migrations, schema as done_ledger_schema,
+    DoneLedgerPg, DoneLedgerPgMigrationError, EmbeddedMigration,
+    MIGRATIONS as DONE_LEDGER_MIGRATIONS, apply_all_migrations as apply_done_ledger_migrations,
+    schema as done_ledger_schema,
 };
 use gossip_findings_postgres::{
     FindingsPgMigrationError, FindingsSinkPg, MIGRATIONS as FINDINGS_MIGRATIONS,
@@ -431,10 +432,24 @@ pub fn build_production_backends(
     config: &ProductionBackendConfig,
     startup: ProductionStartupSettings,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
-    let done_ledger_client = connect_postgres_client(config.done_ledger_postgres_dsn())
+    // Connect both PostgreSQL databases in parallel. Each connection carries
+    // a 5-second default timeout, so overlapping them cuts worst-case
+    // connection time from 10s to 5s.
+    let dl_dsn = config.done_ledger_postgres_dsn().to_owned();
+    let f_dsn = config.findings_postgres_dsn().to_owned();
+
+    let dl_handle = std::thread::spawn(move || connect_postgres_client(&dl_dsn));
+    let f_handle = std::thread::spawn(move || connect_postgres_client(&f_dsn));
+
+    let done_ledger_client = dl_handle
+        .join()
+        .expect("done-ledger connection thread should not panic")
         .map_err(ProductionBootstrapError::DoneLedgerConnect)?;
-    let findings_client = connect_postgres_client(config.findings_postgres_dsn())
+    let findings_client = f_handle
+        .join()
+        .expect("findings connection thread should not panic")
         .map_err(ProductionBootstrapError::FindingsConnect)?;
+
     build_production_backends_from_clients(
         config.etcd().clone(),
         done_ledger_client,
@@ -468,6 +483,8 @@ pub fn build_production_backends_from_clients(
     mut findings_client: Client,
     startup: ProductionStartupSettings,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
+    tracing::info!(schema_mode = %startup.schema_mode(), "applying startup schema policy");
+
     let coordinator = EtcdCoordinator::connect(etcd).map_err(|err| {
         tracing::warn!(error = %err, "etcd coordinator connection failed");
         ProductionBootstrapError::EtcdConnect(err)
@@ -617,7 +634,11 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
 
     if has_connect_timeout(dsn) {
         return Client::connect(dsn, NoTls).map_err(|err| {
-            tracing::warn!(error = %err, "PostgreSQL connection failed");
+            // Log a generic message at warn; the raw driver error may echo
+            // DSN fragments (hostname, port, username). Diagnostics are
+            // available at debug level only.
+            tracing::warn!("PostgreSQL connection failed");
+            tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
             err
         });
     }
@@ -636,7 +657,8 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
         "DSN omitted connect_timeout; injecting default"
     );
     Client::connect(&timed, NoTls).map_err(|err| {
-        tracing::warn!(error = %err, "PostgreSQL connection failed");
+        tracing::warn!("PostgreSQL connection failed");
+        tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
         err
     })
 }
@@ -656,16 +678,20 @@ fn prepare_done_ledger_backend(
     client: &mut Client,
     startup: ProductionStartupSettings,
 ) -> Result<(), ProductionBootstrapError> {
-    match startup.schema_mode() {
-        StartupSchemaMode::Validate => validate_done_ledger_schema_readiness(client)
-            .map_err(ProductionBootstrapError::DoneLedgerSchemaReadiness),
-        StartupSchemaMode::DevAutoMigrate => {
-            apply_done_ledger_migrations(client)
-                .map_err(ProductionBootstrapError::DoneLedgerAutoMigrate)?;
-            validate_done_ledger_schema_readiness(client)
-                .map_err(ProductionBootstrapError::DoneLedgerSchemaReadiness)
-        }
+    if startup.schema_mode() == StartupSchemaMode::DevAutoMigrate {
+        apply_done_ledger_migrations(client)
+            .map_err(ProductionBootstrapError::DoneLedgerAutoMigrate)?;
     }
+    validate_schema_readiness(
+        client,
+        &[
+            done_ledger_schema::DONE_LEDGER_ENTRIES_TABLE,
+            done_ledger_schema::SCHEMA_MIGRATIONS_TABLE,
+        ],
+        DONE_LEDGER_MIGRATIONS,
+        done_ledger_schema::SCHEMA_MIGRATIONS_TABLE,
+    )
+    .map_err(ProductionBootstrapError::DoneLedgerSchemaReadiness)
 }
 
 /// Apply the startup policy to the findings database: auto-migrate first
@@ -675,48 +701,10 @@ fn prepare_findings_backend(
     client: &mut Client,
     startup: ProductionStartupSettings,
 ) -> Result<(), ProductionBootstrapError> {
-    match startup.schema_mode() {
-        StartupSchemaMode::Validate => validate_findings_schema_readiness(client)
-            .map_err(ProductionBootstrapError::FindingsSchemaReadiness),
-        StartupSchemaMode::DevAutoMigrate => {
-            apply_findings_migrations(client)
-                .map_err(ProductionBootstrapError::FindingsAutoMigrate)?;
-            validate_findings_schema_readiness(client)
-                .map_err(ProductionBootstrapError::FindingsSchemaReadiness)
-        }
+    if startup.schema_mode() == StartupSchemaMode::DevAutoMigrate {
+        apply_findings_migrations(client).map_err(ProductionBootstrapError::FindingsAutoMigrate)?;
     }
-}
-
-/// Verify the done-ledger schema has all required tables and that every
-/// embedded migration version is recorded with a matching checksum.
-fn validate_done_ledger_schema_readiness(
-    client: &mut Client,
-) -> Result<(), ProductionSchemaReadinessError> {
-    ensure_expected_tables_exist(
-        client,
-        &[
-            done_ledger_schema::DONE_LEDGER_ENTRIES_TABLE,
-            done_ledger_schema::SCHEMA_MIGRATIONS_TABLE,
-        ],
-    )?;
-
-    let required_migrations = DONE_LEDGER_MIGRATIONS
-        .iter()
-        .map(|migration| (migration.version(), *migration.checksum().as_bytes()))
-        .collect::<Vec<_>>();
-    ensure_migration_history_ready(
-        client,
-        done_ledger_schema::SCHEMA_MIGRATIONS_TABLE,
-        &required_migrations,
-    )
-}
-
-/// Verify the findings schema has all required tables and that every
-/// embedded migration version is recorded with a matching checksum.
-fn validate_findings_schema_readiness(
-    client: &mut Client,
-) -> Result<(), ProductionSchemaReadinessError> {
-    ensure_expected_tables_exist(
+    validate_schema_readiness(
         client,
         &[
             findings_schema::FINDINGS_TABLE,
@@ -724,75 +712,94 @@ fn validate_findings_schema_readiness(
             findings_schema::OBSERVATIONS_TABLE,
             findings_schema::SCHEMA_MIGRATIONS_TABLE,
         ],
-    )?;
-
-    let required_migrations = FINDINGS_MIGRATIONS
-        .iter()
-        .map(|migration| (migration.version(), *migration.checksum().as_bytes()))
-        .collect::<Vec<_>>();
-    ensure_migration_history_ready(
-        client,
+        FINDINGS_MIGRATIONS,
         findings_schema::SCHEMA_MIGRATIONS_TABLE,
-        &required_migrations,
     )
+    .map_err(ProductionBootstrapError::FindingsSchemaReadiness)
 }
 
+/// Verify that all expected tables exist and every embedded migration version
+/// is recorded with a matching checksum.
+fn validate_schema_readiness(
+    client: &mut Client,
+    expected_tables: &[&'static str],
+    migrations: &[EmbeddedMigration],
+    history_table: &'static str,
+) -> Result<(), ProductionSchemaReadinessError> {
+    ensure_expected_tables_exist(client, expected_tables)?;
+    let required = migrations
+        .iter()
+        .map(|m| (m.version(), *m.checksum().as_bytes()))
+        .collect::<Vec<_>>();
+    ensure_migration_history_ready(client, history_table, &required)
+}
+
+/// Check that every table in `expected_tables` exists in the current schema.
+///
+/// Uses a single `ANY($1)` query to batch the existence check, reducing
+/// round trips from N to 1.
 fn ensure_expected_tables_exist(
     client: &mut Client,
     expected_tables: &[&'static str],
 ) -> Result<(), ProductionSchemaReadinessError> {
+    if expected_tables.is_empty() {
+        return Ok(());
+    }
+    let rows = client.query(
+        "SELECT tablename::text
+           FROM pg_catalog.pg_tables
+          WHERE schemaname = current_schema()
+            AND tablename = ANY($1)",
+        &[&expected_tables],
+    )?;
+    let found: std::collections::HashSet<&str> =
+        rows.iter().map(|row| row.get::<_, &str>(0)).collect();
     for &table in expected_tables {
-        ensure_table_exists(client, table)?;
+        if !found.contains(table) {
+            return Err(ProductionSchemaReadinessError::MissingTable { table });
+        }
     }
     Ok(())
 }
 
-fn ensure_table_exists(
-    client: &mut Client,
-    table: &'static str,
-) -> Result<(), ProductionSchemaReadinessError> {
-    let exists = client
-        .query_one(
-            "SELECT EXISTS (
-                 SELECT 1
-                   FROM pg_catalog.pg_tables
-                  WHERE schemaname = current_schema()
-                    AND tablename = $1
-             )",
-            &[&table],
-        )?
-        .get::<_, bool>(0);
-
-    if exists {
-        Ok(())
-    } else {
-        Err(ProductionSchemaReadinessError::MissingTable { table })
-    }
-}
-
-/// For every `(version, sha256)` pair in `required_migrations`, verify the
-/// migration history table contains a row whose stored checksum matches the
-/// compiled-in digest. Detects missing migrations, truncated checksums, and
-/// checksum drift from out-of-band schema edits.
+/// Verify that every required migration version is present in the history
+/// table with a matching checksum.
+///
+/// Uses a single `ANY($1)` query to fetch all matching rows at once,
+/// reducing round trips from N to 1. Detects missing migrations, truncated
+/// checksums, and checksum drift from out-of-band schema edits.
+///
+/// **Precondition:** the history table must already exist. Callers should
+/// run [`ensure_expected_tables_exist`] first; calling this function against
+/// a missing table produces a [`ProductionSchemaReadinessError::Query`]
+/// error rather than a [`ProductionSchemaReadinessError::MissingTable`].
 fn ensure_migration_history_ready(
     client: &mut Client,
     history_table: &'static str,
     required_migrations: &[(&'static str, [u8; 32])],
 ) -> Result<(), ProductionSchemaReadinessError> {
-    let statement = client.prepare(&format!(
-        "SELECT checksum FROM {history_table} WHERE version = $1"
-    ))?;
+    if required_migrations.is_empty() {
+        return Ok(());
+    }
+
+    let versions: Vec<&str> = required_migrations.iter().map(|(v, _)| *v).collect();
+    let rows = client.query(
+        &format!("SELECT version, checksum FROM {history_table} WHERE version = ANY($1)"),
+        &[&versions],
+    )?;
+
+    let stored: std::collections::HashMap<String, Vec<u8>> = rows
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, Vec<u8>>(1)))
+        .collect();
 
     for &(version, expected_checksum) in required_migrations {
-        let maybe_row = client.query_opt(&statement, &[&version])?;
-        let Some(row) = maybe_row else {
+        let Some(stored_checksum) = stored.get(version) else {
             return Err(ProductionSchemaReadinessError::MissingAppliedMigration {
                 history_table,
                 version,
             });
         };
-
-        let stored_checksum: Vec<u8> = row.get(0);
         if stored_checksum.len() != expected_checksum.len() {
             return Err(ProductionSchemaReadinessError::CorruptedAppliedMigration {
                 history_table,
@@ -1463,5 +1470,78 @@ mod tests {
     #[test]
     fn is_local_host_non_local_hostname() {
         assert!(!is_local_host("db.example.com"));
+    }
+
+    #[test]
+    fn extract_pg_host_uri_with_at_in_password() {
+        // `rfind('@')` correctly finds the userinfo delimiter even when the
+        // password contains a literal unencoded `@`.
+        let dsn = "postgresql://user:p@ss@db.example.com:5432/mydb";
+        assert_eq!(extract_pg_host(dsn), Some("db.example.com"));
+    }
+
+    #[test]
+    fn dev_auto_migrate_then_validate_only_succeeds() {
+        let config = fresh_backend_config();
+        let first =
+            build_production_backends(&config, ProductionStartupSettings::dev_auto_migrate())
+                .expect("auto-migrate should bootstrap fresh databases");
+        drop(first);
+
+        let _second =
+            build_production_backends(&config, ProductionStartupSettings::validate_only())
+                .expect("validate-only should succeed after auto-migrate populated the schema");
+    }
+
+    #[test]
+    fn validate_only_fails_when_done_ledger_checksum_is_truncated() {
+        let done_ledger_dsn = create_test_db();
+        let findings_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        migrate_findings_database(&findings_dsn);
+
+        let version = DONE_LEDGER_MIGRATIONS[0].version();
+        let mut client = Client::connect(&done_ledger_dsn, NoTls)
+            .expect("done-ledger test database should accept connections");
+
+        // Drop the inline CHECK constraint so we can insert a truncated
+        // checksum that would normally be rejected by the schema.
+        client
+            .batch_execute(
+                "DO $$ DECLARE r RECORD; BEGIN \
+                   FOR r IN SELECT conname FROM pg_constraint \
+                     WHERE conrelid = 'done_ledger_schema_migrations'::regclass \
+                       AND contype = 'c' LOOP \
+                     EXECUTE 'ALTER TABLE done_ledger_schema_migrations DROP CONSTRAINT ' || r.conname; \
+                   END LOOP; \
+                 END $$",
+            )
+            .expect("dropping CHECK constraints should succeed");
+        client
+            .execute(
+                "UPDATE done_ledger_schema_migrations SET checksum = $1 WHERE version = $2",
+                &[&vec![0_u8; 16], &version],
+            )
+            .expect("truncated checksum update should succeed");
+
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must reject a truncated done-ledger checksum");
+
+        assert!(
+            matches!(
+                error,
+                ProductionBootstrapError::DoneLedgerSchemaReadiness(
+                    ProductionSchemaReadinessError::CorruptedAppliedMigration { found_len: 16, .. }
+                )
+            ),
+            "expected CorruptedAppliedMigration with 16 bytes, got {error:?}"
+        );
     }
 }
