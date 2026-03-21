@@ -89,14 +89,17 @@ impl FromStr for BackendSelection {
     type Err = WorkerConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "local" => Ok(Self::Local),
-            "production" => Ok(Self::Production),
-            _ => Err(WorkerConfigError::invalid_value(
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("local") {
+            Ok(Self::Local)
+        } else if trimmed.eq_ignore_ascii_case("production") {
+            Ok(Self::Production)
+        } else {
+            Err(WorkerConfigError::invalid_value(
                 "backend",
                 value,
                 "expected 'local' or 'production'",
-            )),
+            ))
         }
     }
 }
@@ -123,14 +126,17 @@ impl FromStr for WorkerSource {
     type Err = WorkerConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "fs" => Ok(Self::Fs),
-            "git" => Ok(Self::Git),
-            _ => Err(WorkerConfigError::invalid_value(
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("fs") {
+            Ok(Self::Fs)
+        } else if trimmed.eq_ignore_ascii_case("git") {
+            Ok(Self::Git)
+        } else {
+            Err(WorkerConfigError::invalid_value(
                 "source",
                 value,
                 "expected 'fs' or 'git'",
-            )),
+            ))
         }
     }
 }
@@ -211,8 +217,10 @@ impl FsSourceSettings {
     /// are responsible for supplying a meaningful path.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path: PathBuf = path.into();
+        debug_assert!(!path.as_os_str().is_empty(), "scan path must not be empty");
         Self {
-            path: path.into(),
+            path,
             skip_archives: false,
             common: CommonScanSettings::default(),
         }
@@ -318,8 +326,13 @@ impl GitSourceSettings {
     /// Direct callers are responsible for supplying a meaningful path.
     #[must_use]
     pub fn new(repo: impl Into<PathBuf>) -> Self {
+        let repo: PathBuf = repo.into();
+        debug_assert!(
+            !repo.as_os_str().is_empty(),
+            "repository path must not be empty"
+        );
         Self {
-            repo: repo.into(),
+            repo,
             common: CommonScanSettings::default(),
         }
     }
@@ -574,6 +587,10 @@ impl Default for DistributedWorkerRuntimeSettings {
 
 impl DistributedWorkerRuntimeSettings {
     /// Construct one runtime tuning bundle.
+    ///
+    /// Prefer the resolution pipeline ([`resolve_worker_config_from`]) for
+    /// end-to-end validated configuration. This constructor is exposed for
+    /// in-package test helpers that assemble configs directly.
     #[must_use]
     pub fn new(budgets: ScanBudgets, commit_queue_capacity: NonZeroUsize) -> Self {
         Self {
@@ -969,6 +986,12 @@ struct RawWorkerConfig {
     worker: Option<String>,
     policy_hash: Option<String>,
     tenant_secret_key: Option<String>,
+    /// Tracks whether the tenant secret key was supplied via a CLI flag.
+    cli_tenant_secret_key: bool,
+    /// Tracks whether the done-ledger DSN was supplied via a CLI flag.
+    cli_done_ledger_dsn: bool,
+    /// Tracks whether the findings DSN was supplied via a CLI flag.
+    cli_findings_dsn: bool,
 }
 
 impl fmt::Debug for RawWorkerConfig {
@@ -995,6 +1018,9 @@ impl fmt::Debug for RawWorkerConfig {
             .field("worker", &self.worker)
             .field("policy_hash", &self.policy_hash)
             .field("tenant_secret_key", &"[redacted]")
+            .field("cli_tenant_secret_key", &self.cli_tenant_secret_key)
+            .field("cli_done_ledger_dsn", &self.cli_done_ledger_dsn)
+            .field("cli_findings_dsn", &self.cli_findings_dsn)
             .finish()
     }
 }
@@ -1023,6 +1049,9 @@ impl RawWorkerConfig {
             worker: env.get(ENV_WORKER_ID),
             policy_hash: env.get(ENV_POLICY_HASH),
             tenant_secret_key: env.get(ENV_TENANT_SECRET_KEY),
+            cli_tenant_secret_key: false,
+            cli_done_ledger_dsn: false,
+            cli_findings_dsn: false,
         }
     }
 
@@ -1110,13 +1139,22 @@ impl RawWorkerConfig {
             "commit-queue-capacity" => self.commit_queue_capacity = Some(value.to_owned()),
             "etcd-endpoints" => self.etcd_endpoints_csv = Some(value.to_owned()),
             "etcd-namespace" => self.etcd_namespace = Some(value.to_owned()),
-            "done-ledger-postgres-dsn" => self.done_ledger_postgres_dsn = Some(value.to_owned()),
-            "findings-postgres-dsn" => self.findings_postgres_dsn = Some(value.to_owned()),
+            "done-ledger-postgres-dsn" => {
+                self.done_ledger_postgres_dsn = Some(value.to_owned());
+                self.cli_done_ledger_dsn = true;
+            }
+            "findings-postgres-dsn" => {
+                self.findings_postgres_dsn = Some(value.to_owned());
+                self.cli_findings_dsn = true;
+            }
             "tenant-id" => self.tenant = Some(value.to_owned()),
             "run-id" => self.run = Some(value.to_owned()),
             "worker-id" => self.worker = Some(value.to_owned()),
             "policy-hash" => self.policy_hash = Some(value.to_owned()),
-            "tenant-secret-key" => self.tenant_secret_key = Some(value.to_owned()),
+            "tenant-secret-key" => {
+                self.tenant_secret_key = Some(value.to_owned());
+                self.cli_tenant_secret_key = true;
+            }
             _ => {
                 return Err(WorkerConfigError::Usage(format!(
                     "unknown flag '--{name}'\n{}",
@@ -1169,23 +1207,38 @@ impl RawWorkerConfig {
                 .unwrap_or(defaults.budgets.max_bytes),
         };
 
-        if budgets.max_items > MAX_ITEMS_CEILING {
-            return Err(WorkerConfigError::invalid_value(
-                "max_items",
-                budgets.max_items.to_string(),
-                format!("exceeds maximum of {MAX_ITEMS_CEILING}"),
-            ));
+        // Warn when secrets are passed via CLI flags (visible in process table).
+        if self.cli_tenant_secret_key {
+            tracing::warn!(
+                "tenant secret key provided via --tenant-secret-key flag; \
+                 prefer {} env var to avoid process-table exposure",
+                ENV_TENANT_SECRET_KEY
+            );
         }
-        if budgets.max_bytes > MAX_BYTES_CEILING {
-            return Err(WorkerConfigError::invalid_value(
-                "max_bytes",
-                budgets.max_bytes.to_string(),
-                format!("exceeds maximum of {MAX_BYTES_CEILING}"),
-            ));
+        if self.cli_done_ledger_dsn {
+            tracing::warn!(
+                "done-ledger DSN provided via --done-ledger-postgres-dsn flag; \
+                 prefer {} env var to avoid process-table exposure",
+                ENV_DONE_LEDGER_POSTGRES_DSN
+            );
+        }
+        if self.cli_findings_dsn {
+            tracing::warn!(
+                "findings DSN provided via --findings-postgres-dsn flag; \
+                 prefer {} env var to avoid process-table exposure",
+                ENV_FINDINGS_POSTGRES_DSN
+            );
         }
 
         // Helper: build a local config for the given execution mode.
         let make_local = |mode| {
+            if !path.exists() {
+                return Err(WorkerConfigError::invalid_value(
+                    "path",
+                    path.display().to_string(),
+                    "path does not exist",
+                ));
+            }
             LocalWorkerConfig::new(
                 mode,
                 build_local_source_settings(
@@ -1526,26 +1579,40 @@ fn parse_nonempty_string_redacted(
 }
 
 fn parse_bool(field: &'static str, raw: &str) -> Result<bool, WorkerConfigError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(WorkerConfigError::invalid_value(
+    let trimmed = raw.trim();
+    if trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+    {
+        Ok(true)
+    } else if trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off")
+    {
+        Ok(false)
+    } else {
+        Err(WorkerConfigError::invalid_value(
             field,
             raw,
             "expected a boolean (true/false, yes/no, on/off, 1/0)",
-        )),
+        ))
     }
 }
 
 fn parse_anchor_mode(field: &'static str, raw: &str) -> Result<AnchorMode, WorkerConfigError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "manual" => Ok(AnchorMode::Manual),
-        "derived" => Ok(AnchorMode::Derived),
-        _ => Err(WorkerConfigError::invalid_value(
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("manual") {
+        Ok(AnchorMode::Manual)
+    } else if trimmed.eq_ignore_ascii_case("derived") {
+        Ok(AnchorMode::Derived)
+    } else {
+        Err(WorkerConfigError::invalid_value(
             field,
             raw,
             "expected 'manual' or 'derived'",
-        )),
+        ))
     }
 }
 
@@ -1855,18 +1922,18 @@ mod tests {
 
     #[test]
     fn direct_mode_defaults_to_local_without_backend() {
-        let resolved = resolve_worker_config_from(
-            ["--mode=direct", "fs", "/tmp/project"],
-            &TestEnv::default(),
-        )
-        .expect("direct mode should resolve without backend selection");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_str().expect("utf-8 path");
+        let resolved =
+            resolve_worker_config_from(["--mode=direct", "fs", dir_str], &TestEnv::default())
+                .expect("direct mode should resolve without backend selection");
 
         match resolved {
             ResolvedWorkerConfig::Local(cfg) => {
                 assert_eq!(cfg.execution_mode(), ExecutionMode::Direct);
                 match cfg.source() {
                     WorkerSourceSettings::Fs(settings) => {
-                        assert_eq!(settings.path(), Path::new("/tmp/project"));
+                        assert_eq!(settings.path(), dir.path());
                     }
                     other => panic!("expected fs local settings, got {other:?}"),
                 }
@@ -1963,9 +2030,7 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("ultra-secret"));
-        assert!(
-            !debug.contains("3333333333333333333333333333333333333333333333333333333333333333")
-        );
+        assert!(!debug.contains("3333333333333333333333333333333333333333333333333333333333333333"));
         assert!(debug.contains("[redacted]"));
     }
 
@@ -2494,5 +2559,499 @@ mod tests {
             matches!(result, Err(WorkerConfigError::Usage(_))),
             "three positional args must produce a Usage error, got: {result:?}"
         );
+    }
+
+    // --- Connector + local backend resolution ---
+
+    #[test]
+    fn connector_local_backend_resolves_to_local_config_with_connector_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_str().expect("utf-8 path");
+        let resolved =
+            resolve_worker_config_from(["--backend=local", "fs", dir_str], &TestEnv::default())
+                .expect("connector + local should resolve");
+
+        match resolved {
+            ResolvedWorkerConfig::Local(cfg) => {
+                assert_eq!(cfg.execution_mode(), ExecutionMode::Connector);
+            }
+            other => panic!("expected local config, got {other:?}"),
+        }
+    }
+
+    // --- InvalidEtcdConfig error variant coverage ---
+
+    #[test]
+    fn production_rejects_endpoints_csv_containing_only_delimiters() {
+        // ",," passes parse_nonempty_string (non-empty after trim), but
+        // EtcdCoordinatorConfig::from_endpoints_csv filters all empty
+        // segments, yielding NoEndpoints.
+        let env = production_env().with(ENV_ETCD_ENDPOINTS, ",,");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("all-delimiter endpoints must be rejected");
+        assert!(
+            matches!(err, WorkerConfigError::InvalidEtcdConfig(_)),
+            "expected InvalidEtcdConfig, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn production_rejects_invalid_etcd_namespace_prefix() {
+        // A namespace without a leading slash fails etcd config validation.
+        let env = production_env().with(ENV_ETCD_NAMESPACE, "no-leading-slash");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("namespace without leading '/' must be rejected");
+        assert!(
+            matches!(err, WorkerConfigError::InvalidEtcdConfig(_)),
+            "expected InvalidEtcdConfig, got {err:?}"
+        );
+    }
+
+    // --- Parser unit tests ---
+
+    #[test]
+    fn zero_run_id_is_rejected_with_descriptive_reason() {
+        let env = production_env().with(ENV_RUN_ID, "0");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("run_id=0 must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "run_id",
+                ref reason,
+                ..
+            } if reason.contains("must be > 0")
+        ));
+    }
+
+    #[test]
+    fn u64_max_run_id_is_accepted() {
+        let env = production_env().with(ENV_RUN_ID, "18446744073709551615");
+        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
+        assert!(result.is_ok(), "u64::MAX should be valid run_id");
+    }
+
+    #[test]
+    fn overflowing_run_id_is_rejected() {
+        let env = production_env().with(ENV_RUN_ID, "18446744073709551616");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("overflow must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "run_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn whitespace_padded_run_id_is_accepted() {
+        let env = production_env().with(ENV_RUN_ID, "  42  ");
+        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
+        assert!(result.is_ok(), "whitespace-padded run_id should be trimmed");
+    }
+
+    #[test]
+    fn zero_worker_id_is_rejected_with_descriptive_reason() {
+        let env = production_env().with(ENV_WORKER_ID, "0");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("worker_id=0 must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "worker_id",
+                ref reason,
+                ..
+            } if reason.contains("must be > 0")
+        ));
+    }
+
+    #[test]
+    fn u64_max_worker_id_is_accepted() {
+        let env = production_env().with(ENV_WORKER_ID, "18446744073709551615");
+        let result = resolve_worker_config_from(Vec::<String>::new(), &env);
+        assert!(result.is_ok(), "u64::MAX should be valid worker_id");
+    }
+
+    #[test]
+    fn overflowing_worker_id_is_rejected() {
+        let env = production_env().with(ENV_WORKER_ID, "18446744073709551616");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("overflow must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "worker_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_path_is_rejected() {
+        let err = resolve_worker_config_from(["--mode=direct", "fs", "   "], &TestEnv::default())
+            .expect_err("whitespace-only path must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue { field: "path", .. }
+        ));
+    }
+
+    #[test]
+    fn non_numeric_max_items_is_rejected() {
+        let env = production_env().with(ENV_MAX_ITEMS, "abc");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("non-numeric max_items must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_items",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_numeric_max_bytes_is_rejected() {
+        let env = production_env().with(ENV_MAX_BYTES, "xyz");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("non-numeric max_bytes must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn negative_run_id_is_rejected() {
+        let env = production_env().with(ENV_RUN_ID, "-1");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("negative run_id must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "run_id",
+                ..
+            }
+        ));
+    }
+
+    // --- Missing required field tests ---
+
+    #[test]
+    fn production_missing_etcd_endpoints_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_ETCD_ENDPOINTS);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing etcd_endpoints must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "etcd_endpoints",
+                flag: "--etcd-endpoints",
+                env: ENV_ETCD_ENDPOINTS,
+            }
+        ));
+    }
+
+    #[test]
+    fn production_missing_etcd_namespace_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_ETCD_NAMESPACE);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing etcd_namespace must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "etcd_namespace",
+                flag: "--etcd-namespace",
+                env: ENV_ETCD_NAMESPACE,
+            }
+        ));
+    }
+
+    #[test]
+    fn production_missing_done_ledger_postgres_dsn_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_DONE_LEDGER_POSTGRES_DSN);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing done_ledger_postgres_dsn must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "done_ledger_postgres_dsn",
+                flag: "--done-ledger-postgres-dsn",
+                env: ENV_DONE_LEDGER_POSTGRES_DSN,
+            }
+        ));
+    }
+
+    #[test]
+    fn production_missing_findings_postgres_dsn_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_FINDINGS_POSTGRES_DSN);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing findings_postgres_dsn must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "findings_postgres_dsn",
+                flag: "--findings-postgres-dsn",
+                env: ENV_FINDINGS_POSTGRES_DSN,
+            }
+        ));
+    }
+
+    #[test]
+    fn production_missing_run_id_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_RUN_ID);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing run_id must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "run_id",
+                flag: "--run-id",
+                env: ENV_RUN_ID,
+            }
+        ));
+    }
+
+    #[test]
+    fn production_missing_worker_id_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_WORKER_ID);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing worker_id must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "worker_id",
+                flag: "--worker-id",
+                env: ENV_WORKER_ID,
+            }
+        ));
+    }
+
+    #[test]
+    fn production_missing_policy_hash_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_POLICY_HASH);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing policy_hash must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "policy_hash",
+                flag: "--policy-hash",
+                env: ENV_POLICY_HASH,
+            }
+        ));
+    }
+
+    #[test]
+    fn production_missing_tenant_secret_key_is_rejected() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_TENANT_SECRET_KEY);
+            TestEnv { vars }
+        };
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("missing tenant_secret_key must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::MissingRequiredValue {
+                field: "tenant_secret_key",
+                flag: "--tenant-secret-key",
+                env: ENV_TENANT_SECRET_KEY,
+            }
+        ));
+    }
+
+    // --- Direct construction validation tests ---
+
+    #[test]
+    fn local_config_rejects_zero_max_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = LocalWorkerConfig::new(
+            ExecutionMode::Direct,
+            WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path())),
+            ScanBudgets {
+                max_items: 100,
+                max_bytes: 0,
+            },
+        )
+        .expect_err("zero max_bytes must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn local_config_rejects_max_items_above_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = LocalWorkerConfig::new(
+            ExecutionMode::Direct,
+            WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path())),
+            ScanBudgets {
+                max_items: MAX_ITEMS_CEILING + 1,
+                max_bytes: 1024,
+            },
+        )
+        .expect_err("above-ceiling max_items must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_items",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn local_config_rejects_max_bytes_above_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = LocalWorkerConfig::new(
+            ExecutionMode::Direct,
+            WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path())),
+            ScanBudgets {
+                max_items: 100,
+                max_bytes: MAX_BYTES_CEILING + 1,
+            },
+        )
+        .expect_err("above-ceiling max_bytes must be rejected");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_bytes",
+                ..
+            }
+        ));
+    }
+
+    // --- Display formatting tests ---
+
+    #[test]
+    fn missing_required_value_display_includes_field_flag_and_env() {
+        let err = WorkerConfigError::MissingRequiredValue {
+            field: "tenant_id",
+            flag: "--tenant-id",
+            env: "GOSSIP_TENANT_ID",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("tenant_id"), "display must include field name");
+        assert!(msg.contains("--tenant-id"), "display must include flag");
+        assert!(
+            msg.contains("GOSSIP_TENANT_ID"),
+            "display must include env var"
+        );
+    }
+
+    #[test]
+    fn invalid_value_display_includes_field_value_and_reason() {
+        let err = WorkerConfigError::invalid_value(
+            "backend",
+            "banana",
+            "expected 'local' or 'production'",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("backend"), "display must include field name");
+        assert!(
+            msg.contains("banana"),
+            "display must include rejected value"
+        );
+        assert!(msg.contains("expected"), "display must include reason");
+    }
+
+    #[test]
+    fn usage_error_display_includes_message() {
+        let err = WorkerConfigError::Usage("unknown flag --foo".into());
+        let msg = err.to_string();
+        assert!(msg.contains("--foo"), "display must include usage message");
+    }
+
+    #[test]
+    fn unsupported_combination_display_includes_message() {
+        let err = WorkerConfigError::UnsupportedCombination {
+            message: "git source not supported".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("git source"),
+            "display must include combination detail"
+        );
+    }
+
+    #[test]
+    fn invalid_etcd_config_display_includes_source_message() {
+        let err = WorkerConfigError::InvalidEtcdConfig(EtcdCoordinatorConfigError::NoEndpoints);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("etcd"),
+            "display must reference etcd configuration"
+        );
+        assert!(
+            msg.contains("endpoint"),
+            "display must propagate the inner error message"
+        );
+    }
+
+    #[test]
+    fn invalid_backend_config_display_includes_source_message() {
+        let err = WorkerConfigError::InvalidBackendConfig(
+            ProductionBackendConfigError::EmptyDoneLedgerPostgresDsn,
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("production backend"),
+            "display must reference backend configuration"
+        );
+        assert!(
+            msg.contains("done-ledger"),
+            "display must propagate the inner error message"
+        );
+    }
+
+    // --- Git source rejection via CLI positional arg ---
+
+    #[test]
+    fn production_rejects_git_source_via_cli_positional() {
+        let env = production_env();
+        let err = resolve_worker_config_from(["git", "/tmp"], &env)
+            .expect_err("production backend must reject git via positional arg");
+        assert!(matches!(
+            err,
+            WorkerConfigError::UnsupportedCombination { .. }
+        ));
     }
 }
