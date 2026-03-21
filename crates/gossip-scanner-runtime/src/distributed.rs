@@ -1433,6 +1433,16 @@ where
     Ok(report)
 }
 
+/// Build a secret-shaped test fixture from non-secret fragments.
+///
+/// The assembled string matches gitleaks' generic-api-key rule at scan
+/// time, but keeping the fragments separate avoids committing a literal
+/// that trips secret-detection CI on the source file itself.
+#[cfg(any(test, feature = "test-support"))]
+pub fn secret_fixture() -> String {
+    ["password=", "xK9mP2qL7wN4vR8t"].concat()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1575,15 +1585,6 @@ mod tests {
             norm_hash: [0x55; 32],
             confidence_score: 6,
         }
-    }
-
-    /// Build a secret-shaped test fixture from non-secret fragments.
-    ///
-    /// The assembled string matches gitleaks' generic-api-key rule at scan
-    /// time, but keeping the fragments separate avoids committing a literal
-    /// that trips secret-detection CI on the source file itself.
-    fn secret_fixture() -> String {
-        ["password=", "xK9mP2qL7wN4vR8t"].concat()
     }
 
     fn clean_fixture() -> &'static str {

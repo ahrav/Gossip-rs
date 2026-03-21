@@ -13,6 +13,7 @@
 //! The sink boundary stays private to this crate so future sink backends can be
 //! added without changing the runtime-facing recorder contract.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -30,11 +31,18 @@ use gossip_scanner_runtime::coordination_sink::{
 /// on this target to isolate coordination output from other worker logs.
 const TELEMETRY_TARGET: &str = "gossip_worker::coordination";
 
-/// Cached BLAKE3 derive-key hasher for [`RedactedDigest`]. Cloning the
-/// post-setup state avoids repeating the key-schedule compression on every
-/// hash call.
+/// Cached BLAKE3 derive-key hasher for [`RedactedDigest`]. Seeds the
+/// per-thread [`LOCAL_HASHER`] so the expensive key-schedule compression
+/// runs only once per process.
 static TELEMETRY_HASHER: LazyLock<gossip_contracts::blake3::Hasher> =
     LazyLock::new(|| gossip_contracts::blake3::Hasher::new_derive_key(COORDINATION_TELEMETRY_V1));
+
+thread_local! {
+    /// Per-thread hasher seeded from [`TELEMETRY_HASHER`]. Using `reset()` between
+    /// calls avoids the ~1.9 KiB memcpy of cloning the full hasher state.
+    static LOCAL_HASHER: RefCell<gossip_contracts::blake3::Hasher> =
+        RefCell::new(TELEMETRY_HASHER.clone());
+}
 
 /// Production recorder for distributed coordination telemetry.
 ///
@@ -334,6 +342,22 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
     }
 }
 
+/// Emits a coordination diagnostic event at a compile-time tracing level.
+/// Factored into a macro because `tracing::event!` requires a const level.
+macro_rules! emit_diagnostic_at_level {
+    ($level_macro:ident, $shard_id:expr, $diagnostic_level:expr, $diagnostic_message:expr) => {
+        tracing::$level_macro!(
+            target: TELEMETRY_TARGET,
+            event_name = "coordination_core_diagnostic",
+            category = "core",
+            shard_id = %$shard_id,
+            diagnostic_level = $diagnostic_level,
+            diagnostic_message = %$diagnostic_message,
+            "coordination core diagnostic",
+        )
+    };
+}
+
 /// Routes a diagnostic record to the tracing level matching `diagnostic_level`.
 /// Unrecognized levels (including `"info"` itself) fall through to `info!`.
 fn emit_diagnostic(
@@ -343,60 +367,14 @@ fn emit_diagnostic(
 ) {
     match diagnostic_level {
         "error" | "fatal" => {
-            tracing::error!(
-                target: TELEMETRY_TARGET,
-                event_name = "coordination_core_diagnostic",
-                category = "core",
-                shard_id = %shard_id,
-                diagnostic_level,
-                diagnostic_message = %diagnostic_message,
-                "coordination core diagnostic",
-            );
+            emit_diagnostic_at_level!(error, shard_id, diagnostic_level, diagnostic_message)
         }
         "warn" | "warning" => {
-            tracing::warn!(
-                target: TELEMETRY_TARGET,
-                event_name = "coordination_core_diagnostic",
-                category = "core",
-                shard_id = %shard_id,
-                diagnostic_level,
-                diagnostic_message = %diagnostic_message,
-                "coordination core diagnostic",
-            );
+            emit_diagnostic_at_level!(warn, shard_id, diagnostic_level, diagnostic_message)
         }
-        "debug" => {
-            tracing::debug!(
-                target: TELEMETRY_TARGET,
-                event_name = "coordination_core_diagnostic",
-                category = "core",
-                shard_id = %shard_id,
-                diagnostic_level,
-                diagnostic_message = %diagnostic_message,
-                "coordination core diagnostic",
-            );
-        }
-        "trace" => {
-            tracing::trace!(
-                target: TELEMETRY_TARGET,
-                event_name = "coordination_core_diagnostic",
-                category = "core",
-                shard_id = %shard_id,
-                diagnostic_level,
-                diagnostic_message = %diagnostic_message,
-                "coordination core diagnostic",
-            );
-        }
-        _ => {
-            tracing::info!(
-                target: TELEMETRY_TARGET,
-                event_name = "coordination_core_diagnostic",
-                category = "core",
-                shard_id = %shard_id,
-                diagnostic_level,
-                diagnostic_message = %diagnostic_message,
-                "coordination core diagnostic",
-            );
-        }
+        "debug" => emit_diagnostic_at_level!(debug, shard_id, diagnostic_level, diagnostic_message),
+        "trace" => emit_diagnostic_at_level!(trace, shard_id, diagnostic_level, diagnostic_message),
+        _ => emit_diagnostic_at_level!(info, shard_id, diagnostic_level, diagnostic_message),
     }
 }
 
@@ -456,15 +434,17 @@ impl RedactedDigest {
     /// length prefix prevent label/payload ambiguity.
     #[inline]
     fn bytes(label: &'static str, bytes: &[u8]) -> Self {
-        let mut hasher = TELEMETRY_HASHER.clone();
-        hasher.update(label.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-        Self {
-            len: bytes.len(),
-            hash64: finalize_64(&hasher),
-        }
+        LOCAL_HASHER.with_borrow_mut(|hasher| {
+            hasher.reset();
+            hasher.update(label.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+            Self {
+                len: bytes.len(),
+                hash64: finalize_64(hasher),
+            }
+        })
     }
 
     #[inline]

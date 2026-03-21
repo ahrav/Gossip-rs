@@ -223,7 +223,9 @@ mod tests {
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
     use gossip_scanner_runtime::{
         ScanBudgets,
-        distributed::{DistributedPersistence, DistributedRuntimeError, run_worker},
+        distributed::{
+            DistributedPersistence, DistributedRuntimeError, run_worker, secret_fixture,
+        },
     };
     use gossip_worker::config::{
         DistributedWorkerRuntimeSettings, FsSourceSettings, GitSourceSettings,
@@ -283,7 +285,10 @@ mod tests {
             .expect("test run config should be valid")
     }
 
-    fn test_distributed_config(path: &Path) -> DistributedWorkerConfig {
+    fn make_distributed_config(
+        path: &Path,
+        backends: ProductionBackendConfig,
+    ) -> DistributedWorkerConfig {
         let defaults = gossip_scanner_runtime::distributed::DistributedRuntimeConfig::default();
         let identity = WorkerIdentityConfig::new(
             tenant(),
@@ -293,41 +298,6 @@ mod tests {
             tenant_secret_key(),
         )
         .expect("test worker identity config should be valid");
-        DistributedWorkerConfig::new(
-            ProductionBackendConfig::new(
-                EtcdCoordinatorConfig::localhost(),
-                "postgresql://scanner@localhost/done_ledger",
-                "postgresql://scanner@localhost/findings",
-            )
-            .expect("test production backend config should be valid"),
-            identity,
-            FsSourceSettings::new(path.to_path_buf()),
-            DistributedWorkerRuntimeSettings::new(
-                ScanBudgets::default(),
-                defaults.commit_queue_capacity,
-            ),
-        )
-        .expect("distributed worker config should be valid")
-    }
-
-    fn unreachable_production_config(path: &Path) -> DistributedWorkerConfig {
-        let defaults = gossip_scanner_runtime::distributed::DistributedRuntimeConfig::default();
-        let identity = WorkerIdentityConfig::new(
-            tenant(),
-            run_id(),
-            worker_id(),
-            policy_hash(),
-            tenant_secret_key(),
-        )
-        .expect("test worker identity config should be valid");
-        let backends = ProductionBackendConfig::new(
-            EtcdCoordinatorConfig::new(["http://127.0.0.1:1"], "/gossip/v1")
-                .expect("unreachable etcd config should still validate"),
-            "postgresql://scanner@127.0.0.1:1/done_ledger?connect_timeout=1",
-            "postgresql://scanner@127.0.0.1:1/findings?connect_timeout=1",
-        )
-        .expect("unreachable production backend config should be valid");
-
         DistributedWorkerConfig::new(
             backends,
             identity,
@@ -338,6 +308,27 @@ mod tests {
             ),
         )
         .expect("distributed worker config should be valid")
+    }
+
+    fn test_distributed_config(path: &Path) -> DistributedWorkerConfig {
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "postgresql://scanner@localhost/done_ledger",
+            "postgresql://scanner@localhost/findings",
+        )
+        .expect("test production backend config should be valid");
+        make_distributed_config(path, backends)
+    }
+
+    fn unreachable_production_config(path: &Path) -> DistributedWorkerConfig {
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::new(["http://127.0.0.1:1"], "/gossip/v1")
+                .expect("test etcd config should be valid"),
+            "postgresql://scanner@127.0.0.1:1/done_ledger?connect_timeout=1",
+            "postgresql://scanner@127.0.0.1:1/findings?connect_timeout=1",
+        )
+        .expect("unreachable production backend config should be valid");
+        make_distributed_config(path, backends)
     }
 
     fn setup_coordinator_with_fs_shard(
@@ -370,10 +361,6 @@ mod tests {
             .register_shards(now, tenant(), run_id(), &shards, OpId::from_raw(1))
             .expect("test shard registration should succeed");
         coordinator
-    }
-
-    fn secret_fixture() -> String {
-        ["password=", "xK9mP2qL7wN4vR8t"].concat()
     }
 
     #[test]

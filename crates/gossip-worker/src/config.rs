@@ -1288,23 +1288,7 @@ impl RawWorkerConfig {
 
         // Helper: build a direct local config.
         let make_local = || {
-            match path.try_exists() {
-                Ok(false) => {
-                    return Err(WorkerConfigError::invalid_value(
-                        "path",
-                        path.display().to_string(),
-                        "path does not exist",
-                    ));
-                }
-                Err(io_err) => {
-                    return Err(WorkerConfigError::invalid_value(
-                        "path",
-                        path.display().to_string(),
-                        format!("cannot verify path existence: {io_err}"),
-                    ));
-                }
-                Ok(true) => {}
-            }
+            validate_path_exists(&path)?;
             LocalWorkerConfig::new(
                 build_local_source_settings(
                     source,
@@ -1345,7 +1329,7 @@ impl RawWorkerConfig {
 
                         let etcd_endpoints = parse_required(
                             self.etcd_endpoints_csv.as_deref(),
-                            parse_nonempty_string,
+                            parse_nonempty_string_redacted,
                             "etcd_endpoints",
                             "--etcd-endpoints",
                             ENV_ETCD_ENDPOINTS,
@@ -1416,23 +1400,7 @@ impl RawWorkerConfig {
                             done_ledger_postgres_dsn,
                             findings_postgres_dsn,
                         )?;
-                        match path.try_exists() {
-                            Ok(false) => {
-                                return Err(WorkerConfigError::invalid_value(
-                                    "path",
-                                    path.display().to_string(),
-                                    "path does not exist on this host",
-                                ));
-                            }
-                            Err(io_err) => {
-                                return Err(WorkerConfigError::invalid_value(
-                                    "path",
-                                    path.display().to_string(),
-                                    format!("cannot verify path existence: {io_err}"),
-                                ));
-                            }
-                            Ok(true) => {}
-                        }
+                        validate_path_exists(&path)?;
                         let source = FsSourceSettings::new(path)
                             .with_rules_file(rules_file)
                             .with_decode_depth(decode_depth)
@@ -1508,6 +1476,25 @@ fn default_backend_for_mode(execution_mode: ExecutionMode) -> Option<BackendSele
     match execution_mode {
         ExecutionMode::Direct => None,
         ExecutionMode::Connector => Some(BackendSelection::Production),
+    }
+}
+
+/// Fail-fast check that a scan path exists on the local host. Called during
+/// config resolution so the worker surfaces a clear error at startup rather
+/// than deep inside the scan loop.
+fn validate_path_exists(path: &Path) -> Result<(), WorkerConfigError> {
+    match path.try_exists() {
+        Ok(false) => Err(WorkerConfigError::invalid_value(
+            "path",
+            path.display().to_string(),
+            "path does not exist",
+        )),
+        Err(io_err) => Err(WorkerConfigError::invalid_value(
+            "path",
+            path.display().to_string(),
+            format!("cannot verify path existence: {io_err}"),
+        )),
+        Ok(true) => Ok(()),
     }
 }
 
@@ -1706,11 +1693,11 @@ fn parse_nonzero_usize(field: &'static str, raw: &str) -> Result<NonZeroUsize, W
 }
 
 fn parse_tenant_id(field: &'static str, raw: &str) -> Result<TenantId, WorkerConfigError> {
-    Ok(TenantId::from_bytes(parse_hex_32(field, raw)?))
+    Ok(TenantId::from_bytes(parse_hex_32_redacted(field, raw)?))
 }
 
 fn parse_policy_hash(field: &'static str, raw: &str) -> Result<PolicyHash, WorkerConfigError> {
-    Ok(PolicyHash::from_bytes(parse_hex_32(field, raw)?))
+    Ok(PolicyHash::from_bytes(parse_hex_32_redacted(field, raw)?))
 }
 
 fn parse_tenant_secret_key(
@@ -1752,6 +1739,7 @@ fn parse_worker_id(field: &'static str, raw: &str) -> Result<WorkerId, WorkerCon
     Ok(WorkerId::from_raw(value))
 }
 
+#[cfg(test)]
 fn parse_hex_32(field: &'static str, raw: &str) -> Result<[u8; 32], WorkerConfigError> {
     parse_hex_32_inner(field, raw, false)
 }
@@ -1999,23 +1987,12 @@ mod tests {
 
     #[test]
     fn production_requires_explicit_tenant_id() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_TENANT_ID);
-            TestEnv { vars }
-        };
-
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing tenant id must be rejected");
-
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "tenant_id",
-                flag: "--tenant-id",
-                env: ENV_TENANT_ID,
-            }
-        ));
+        assert_production_rejects_missing_field(
+            ENV_TENANT_ID,
+            "tenant_id",
+            "--tenant-id",
+            ENV_TENANT_ID,
+        );
     }
 
     #[test]
@@ -2216,6 +2193,40 @@ mod tests {
                 ..
             } if value == "[redacted]"
         ));
+    }
+
+    #[test]
+    fn parse_tenant_id_redacts_invalid_input() {
+        let raw_input = "not-valid-hex-at-all";
+        let err = parse_tenant_id("tenant_id", raw_input)
+            .expect_err("invalid tenant_id hex should be rejected");
+
+        let display = err.to_string();
+        assert!(
+            display.contains("[redacted]"),
+            "tenant_id parse error must redact the raw input, got: {display}"
+        );
+        assert!(
+            !display.contains(raw_input),
+            "tenant_id parse error must not contain the raw input, got: {display}"
+        );
+    }
+
+    #[test]
+    fn parse_policy_hash_redacts_invalid_input() {
+        let raw_input = "short-policy-hash";
+        let err = parse_policy_hash("policy_hash", raw_input)
+            .expect_err("invalid policy_hash hex should be rejected");
+
+        let display = err.to_string();
+        assert!(
+            display.contains("[redacted]"),
+            "policy_hash parse error must redact the raw input, got: {display}"
+        );
+        assert!(
+            !display.contains(raw_input),
+            "policy_hash parse error must not contain the raw input, got: {display}"
+        );
     }
 
     #[test]
@@ -2810,156 +2821,78 @@ mod tests {
 
     // --- Missing required field tests ---
 
-    #[test]
-    fn production_missing_etcd_endpoints_is_rejected() {
+    /// Removes `remove_env` from a full production env and asserts that
+    /// resolution fails with `MissingRequiredValue` carrying the expected
+    /// field name, CLI flag, and env var.
+    fn assert_production_rejects_missing_field(
+        remove_env: &'static str,
+        expected_field: &'static str,
+        expected_flag: &'static str,
+        expected_env: &'static str,
+    ) {
         let env = {
             let mut vars = production_env().vars;
-            vars.remove(ENV_ETCD_ENDPOINTS);
+            vars.remove(remove_env);
             TestEnv { vars }
         };
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing etcd_endpoints must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "etcd_endpoints",
-                flag: "--etcd-endpoints",
-                env: ENV_ETCD_ENDPOINTS,
-            }
-        ));
+            .expect_err(&format!("missing {expected_field} must be rejected"));
+        assert!(
+            matches!(
+                err,
+                WorkerConfigError::MissingRequiredValue { field, flag, env }
+                    if field == expected_field && flag == expected_flag && env == expected_env
+            ),
+            "expected MissingRequiredValue for {expected_field}, got: {err:?}"
+        );
     }
 
     #[test]
-    fn production_missing_etcd_namespace_is_rejected() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_ETCD_NAMESPACE);
-            TestEnv { vars }
-        };
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing etcd_namespace must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "etcd_namespace",
-                flag: "--etcd-namespace",
-                env: ENV_ETCD_NAMESPACE,
-            }
-        ));
-    }
+    fn production_missing_required_fields_are_rejected() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            (
+                ENV_ETCD_ENDPOINTS,
+                "etcd_endpoints",
+                "--etcd-endpoints",
+                ENV_ETCD_ENDPOINTS,
+            ),
+            (
+                ENV_ETCD_NAMESPACE,
+                "etcd_namespace",
+                "--etcd-namespace",
+                ENV_ETCD_NAMESPACE,
+            ),
+            (
+                ENV_DONE_LEDGER_POSTGRES_DSN,
+                "done_ledger_postgres_dsn",
+                "--done-ledger-postgres-dsn",
+                ENV_DONE_LEDGER_POSTGRES_DSN,
+            ),
+            (
+                ENV_FINDINGS_POSTGRES_DSN,
+                "findings_postgres_dsn",
+                "--findings-postgres-dsn",
+                ENV_FINDINGS_POSTGRES_DSN,
+            ),
+            (ENV_RUN_ID, "run_id", "--run-id", ENV_RUN_ID),
+            (ENV_WORKER_ID, "worker_id", "--worker-id", ENV_WORKER_ID),
+            (
+                ENV_POLICY_HASH,
+                "policy_hash",
+                "--policy-hash",
+                ENV_POLICY_HASH,
+            ),
+            (
+                ENV_TENANT_SECRET_KEY,
+                "tenant_secret_key",
+                "--tenant-secret-key",
+                ENV_TENANT_SECRET_KEY,
+            ),
+        ];
 
-    #[test]
-    fn production_missing_done_ledger_postgres_dsn_is_rejected() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_DONE_LEDGER_POSTGRES_DSN);
-            TestEnv { vars }
-        };
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing done_ledger_postgres_dsn must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "done_ledger_postgres_dsn",
-                flag: "--done-ledger-postgres-dsn",
-                env: ENV_DONE_LEDGER_POSTGRES_DSN,
-            }
-        ));
-    }
-
-    #[test]
-    fn production_missing_findings_postgres_dsn_is_rejected() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_FINDINGS_POSTGRES_DSN);
-            TestEnv { vars }
-        };
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing findings_postgres_dsn must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "findings_postgres_dsn",
-                flag: "--findings-postgres-dsn",
-                env: ENV_FINDINGS_POSTGRES_DSN,
-            }
-        ));
-    }
-
-    #[test]
-    fn production_missing_run_id_is_rejected() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_RUN_ID);
-            TestEnv { vars }
-        };
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing run_id must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "run_id",
-                flag: "--run-id",
-                env: ENV_RUN_ID,
-            }
-        ));
-    }
-
-    #[test]
-    fn production_missing_worker_id_is_rejected() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_WORKER_ID);
-            TestEnv { vars }
-        };
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing worker_id must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "worker_id",
-                flag: "--worker-id",
-                env: ENV_WORKER_ID,
-            }
-        ));
-    }
-
-    #[test]
-    fn production_missing_policy_hash_is_rejected() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_POLICY_HASH);
-            TestEnv { vars }
-        };
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing policy_hash must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "policy_hash",
-                flag: "--policy-hash",
-                env: ENV_POLICY_HASH,
-            }
-        ));
-    }
-
-    #[test]
-    fn production_missing_tenant_secret_key_is_rejected() {
-        let env = {
-            let mut vars = production_env().vars;
-            vars.remove(ENV_TENANT_SECRET_KEY);
-            TestEnv { vars }
-        };
-        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("missing tenant_secret_key must be rejected");
-        assert!(matches!(
-            err,
-            WorkerConfigError::MissingRequiredValue {
-                field: "tenant_secret_key",
-                flag: "--tenant-secret-key",
-                env: ENV_TENANT_SECRET_KEY,
-            }
-        ));
+        for &(remove_env, field, flag, env) in cases {
+            assert_production_rejects_missing_field(remove_env, field, flag, env);
+        }
     }
 
     // --- Direct construction validation tests ---
@@ -3213,6 +3146,76 @@ mod tests {
         assert!(
             result.is_ok(),
             "invalid skip_archives must not reject git launches: {result:?}"
+        );
+    }
+
+    // ---- CLI secret-exposure warning tests ----
+
+    #[test]
+    fn cli_tenant_secret_key_warns_about_process_table_exposure() {
+        use crate::recorder::test_support::capture_logs;
+        use tracing::Level;
+
+        let env = production_env();
+        let logs = capture_logs(Level::WARN, || {
+            let _ = resolve_worker_config_from(
+                [
+                    "--tenant-secret-key=3333333333333333333333333333333333333333333333333333333333333333",
+                ],
+                &env,
+            );
+        });
+        assert!(
+            logs.contains("process-table exposure"),
+            "must warn when secret key supplied via CLI flag, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn cli_done_ledger_dsn_warns_about_process_table_exposure() {
+        use crate::recorder::test_support::capture_logs;
+        use tracing::Level;
+
+        let env = production_env();
+        let logs = capture_logs(Level::WARN, || {
+            let _ = resolve_worker_config_from(
+                ["--done-ledger-postgres-dsn=postgresql://u:p@h/d"],
+                &env,
+            );
+        });
+        assert!(
+            logs.contains("process-table exposure"),
+            "must warn when done-ledger DSN supplied via CLI flag, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn cli_findings_dsn_warns_about_process_table_exposure() {
+        use crate::recorder::test_support::capture_logs;
+        use tracing::Level;
+
+        let env = production_env();
+        let logs = capture_logs(Level::WARN, || {
+            let _ = resolve_worker_config_from(["--findings-postgres-dsn=host=h dbname=d"], &env);
+        });
+        assert!(
+            logs.contains("process-table exposure"),
+            "must warn when findings DSN supplied via CLI flag, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn cli_etcd_endpoints_warns_about_process_table_exposure() {
+        use crate::recorder::test_support::capture_logs;
+        use tracing::Level;
+
+        let env = production_env();
+        let logs = capture_logs(Level::WARN, || {
+            let _ = resolve_worker_config_from(["--etcd-endpoints=http://127.0.0.1:2379"], &env);
+        });
+        assert!(
+            logs.contains("process-table exposure"),
+            "must warn when etcd endpoints supplied via CLI flag, got: {logs}"
         );
     }
 }

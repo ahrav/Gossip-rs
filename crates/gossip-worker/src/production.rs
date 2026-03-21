@@ -52,11 +52,11 @@ pub enum ProductionBootstrapError {
 impl fmt::Display for ProductionBootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            // Connection-error arms intentionally omit the inner source from
-            // the Display output. Driver error messages may echo DSN fragments
-            // (hostname, port, username) that the config layer redacts
-            // elsewhere. Callers that need the driver-level detail can inspect
-            // `Error::source()`.
+            // Connection-error arms intentionally omit the inner source.
+            // Driver error messages may echo DSN fragments (hostname, port,
+            // username) that the config layer redacts elsewhere. Both Display
+            // and Error::source() suppress the inner value so that error chain
+            // formatters (anyhow, eyre, tracing-error) cannot bypass redaction.
             Self::DoneLedgerConnect(_) => {
                 f.write_str("failed to connect done-ledger PostgreSQL backend")
             }
@@ -77,9 +77,13 @@ impl fmt::Display for ProductionBootstrapError {
 impl Error for ProductionBootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::DoneLedgerConnect(source) => Some(source),
-            Self::FindingsConnect(source) => Some(source),
-            Self::EtcdConnect(source) => Some(source),
+            // Connection variants return `None` to prevent DSN fragment leakage
+            // through error chain formatters (anyhow, eyre, tracing-error).
+            // Display already redacts the inner source for these variants;
+            // returning it here would let `.source()` walkers bypass that.
+            Self::DoneLedgerConnect(_) => None,
+            Self::FindingsConnect(_) => None,
+            Self::EtcdConnect(_) => None,
             Self::DoneLedgerMigration(source) => Some(source),
             Self::FindingsMigration(source) => Some(source),
         }
@@ -447,7 +451,6 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
         && !is_local_host(host)
     {
         tracing::warn!(
-            host = %host,
             "connecting to PostgreSQL without TLS \
              — use build_production_backends_from_clients for TLS-capable connections"
         );
@@ -558,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_error_from_etcd_preserves_source_chain() {
+    fn bootstrap_error_from_etcd_redacts_source_chain() {
         let inner = EtcdCoordinatorError::RuntimeBuild(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "synthetic etcd failure",
@@ -569,7 +572,9 @@ mod tests {
             bootstrap,
             ProductionBootstrapError::EtcdConnect(_)
         ));
-        assert!(bootstrap.source().is_some());
+        // Connection variants suppress source() to prevent DSN leakage
+        // through error chain formatters.
+        assert!(bootstrap.source().is_none());
         assert!(bootstrap.to_string().contains("etcd coordination backend"));
     }
 
