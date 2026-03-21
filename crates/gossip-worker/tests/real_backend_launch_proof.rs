@@ -375,14 +375,22 @@ fn run_worker_process(
     match child.wait_timeout(timeout).expect("wait should not fail") {
         Some(status) => Output {
             status,
-            stdout: stdout_thread.join().unwrap_or_default(),
-            stderr: stderr_thread.join().unwrap_or_default(),
+            stdout: stdout_thread
+                .join()
+                .expect("stdout drain thread should not panic"),
+            stderr: stderr_thread
+                .join()
+                .expect("stderr drain thread should not panic"),
         },
         None => {
             child.kill().expect("kill should succeed");
             child.wait().expect("wait after kill should succeed");
-            let stdout = stdout_thread.join().unwrap_or_default();
-            let stderr = stderr_thread.join().unwrap_or_default();
+            let stdout = stdout_thread
+                .join()
+                .expect("stdout drain thread should not panic");
+            let stderr = stderr_thread
+                .join()
+                .expect("stderr drain thread should not panic");
             panic!(
                 "gossip-worker did not exit within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&stdout),
