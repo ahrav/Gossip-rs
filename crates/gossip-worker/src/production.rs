@@ -229,6 +229,10 @@ impl fmt::Display for ProductionBootstrapError {
                 f,
                 "findings PostgreSQL schema is not ready for worker startup: {source}"
             ),
+            // Auto-migrate variants expose the inner error without redaction:
+            // DevAutoMigrate runs only in local development environments where
+            // DSN exposure is acceptable, and the full migration error context
+            // is essential for diagnosing schema application failures.
             Self::DoneLedgerAutoMigrate(source) => {
                 write!(f, "done-ledger PostgreSQL auto-migrate failed: {source}")
             }
@@ -526,10 +530,11 @@ pub fn run_production_worker(
 /// fallback the `postgres` crate defaults to *no timeout*, which can block
 /// the calling thread for minutes on an unreachable host.
 ///
-/// Kept low (5 s) so that worst-case startup failure (etcd + two PostgreSQL
-/// connections) stays under 20 s — well within typical container liveness
-/// probe windows. Callers that need a longer timeout should set
-/// `connect_timeout=N` in their DSN explicitly.
+/// Kept low (5 s) so that worst-case startup stays under 15 s: both
+/// PostgreSQL connections open in parallel (~5 s), then etcd connects
+/// (~5 s), then schema validation queries run. This fits well within
+/// typical container liveness probe windows. Callers that need a longer
+/// timeout should set `connect_timeout=N` in their DSN explicitly.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 5;
 
 /// Check whether a DSN already contains an explicit `connect_timeout` parameter.
@@ -1093,7 +1098,6 @@ mod tests {
             error,
             ProductionBootstrapError::DoneLedgerSchemaReadiness(
                 ProductionSchemaReadinessError::MissingTable { .. }
-                    | ProductionSchemaReadinessError::MissingAppliedMigration { .. }
             )
         ));
     }
@@ -1116,7 +1120,6 @@ mod tests {
             error,
             ProductionBootstrapError::FindingsSchemaReadiness(
                 ProductionSchemaReadinessError::MissingTable { .. }
-                    | ProductionSchemaReadinessError::MissingAppliedMigration { .. }
             )
         ));
     }
@@ -1155,6 +1158,91 @@ mod tests {
                 }
             ) if history_table == done_ledger_schema::SCHEMA_MIGRATIONS_TABLE
                 && found_version == version
+        ));
+    }
+
+    #[test]
+    fn validate_only_fails_when_findings_checksum_mismatches() {
+        let done_ledger_dsn = create_test_db();
+        let findings_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        migrate_findings_database(&findings_dsn);
+        let version = FINDINGS_MIGRATIONS[0].version();
+        let mut client = Client::connect(&findings_dsn, NoTls)
+            .expect("findings test database should accept connections");
+        client
+            .execute(
+                "UPDATE findings_schema_migrations SET checksum = $1 WHERE version = $2",
+                &[&vec![0_u8; 32], &version],
+            )
+            .expect("checksum corruption update should succeed");
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must reject mismatched findings checksums");
+
+        assert!(matches!(
+            error,
+            ProductionBootstrapError::FindingsSchemaReadiness(
+                ProductionSchemaReadinessError::MigrationChecksumMismatch {
+                    history_table,
+                    version: found_version,
+                }
+            ) if history_table == findings_schema::SCHEMA_MIGRATIONS_TABLE
+                && found_version == version
+        ));
+    }
+
+    #[test]
+    fn validate_only_fails_when_done_ledger_checksum_is_corrupted() {
+        let done_ledger_dsn = create_test_db();
+        let findings_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        migrate_findings_database(&findings_dsn);
+
+        let version = DONE_LEDGER_MIGRATIONS[0].version();
+        let mut client = Client::connect(&done_ledger_dsn, NoTls)
+            .expect("done-ledger test database should accept connections");
+
+        // Drop inline CHECK constraints so a wrong-length checksum can be stored.
+        client
+            .batch_execute(
+                "DO $$ DECLARE r RECORD; BEGIN \
+                   FOR r IN SELECT conname FROM pg_constraint \
+                     WHERE conrelid = 'done_ledger_schema_migrations'::regclass \
+                       AND contype = 'c' LOOP \
+                     EXECUTE 'ALTER TABLE done_ledger_schema_migrations DROP CONSTRAINT ' || r.conname; \
+                   END LOOP; \
+                 END $$",
+            )
+            .expect("dropping CHECK constraints should succeed");
+        client
+            .execute(
+                "UPDATE done_ledger_schema_migrations SET checksum = $1 WHERE version = $2",
+                &[&vec![0_u8; 16], &version],
+            )
+            .expect("corrupted checksum update should succeed");
+
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must reject a wrong-length done-ledger checksum");
+
+        assert!(matches!(
+            error,
+            ProductionBootstrapError::DoneLedgerSchemaReadiness(
+                ProductionSchemaReadinessError::CorruptedAppliedMigration { found_len: 16, .. }
+            )
         ));
     }
 
