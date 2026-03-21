@@ -344,26 +344,43 @@ fn run_worker_process(
         .spawn()
         .expect("gossip-worker process should launch for the real-backend tests");
 
+    // Drain stdout and stderr on background threads to prevent pipe-buffer
+    // deadlock: the OS pipe buffer is bounded (~64 KB on Linux), so if the
+    // child fills it before exiting the parent would block on `wait_timeout`
+    // while the child blocks on its write — a classic deadlock.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            pipe.read_to_end(&mut buf).ok();
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            pipe.read_to_end(&mut buf).ok();
+        }
+        buf
+    });
+
     let timeout = Duration::from_secs(30);
     match child.wait_timeout(timeout).expect("wait should not fail") {
-        Some(status) => {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(ref mut out) = child.stdout {
-                out.read_to_end(&mut stdout).ok();
-            }
-            if let Some(ref mut err) = child.stderr {
-                err.read_to_end(&mut stderr).ok();
-            }
-            Output {
-                status,
-                stdout,
-                stderr,
-            }
-        }
+        Some(status) => Output {
+            status,
+            stdout: stdout_thread.join().unwrap_or_default(),
+            stderr: stderr_thread.join().unwrap_or_default(),
+        },
         None => {
             child.kill().expect("kill should succeed");
-            panic!("gossip-worker did not exit within {timeout:?}");
+            let stdout = stdout_thread.join().unwrap_or_default();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            panic!(
+                "gossip-worker did not exit within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
         }
     }
 }
@@ -390,8 +407,14 @@ fn table_row_count(dsn: &str, table: &str) -> i64 {
         .get::<_, i64>(0)
 }
 
-fn wait_for_owner_binding_expiry(coordinator: &EtcdCoordinator, key: ShardKey, timeout: Duration) {
-    let start = Instant::now();
+/// Poll until the owner binding for `key` disappears, or panic if
+/// `ttl_secs + 10s` elapses without cleanup.  The generous fixed margin
+/// absorbs CI-host scheduling jitter, matching the canonical pattern in
+/// `gossip-coordination-etcd::tests::wait_for_owner_binding_expiry`.
+fn wait_for_owner_binding_expiry(coordinator: &EtcdCoordinator, key: ShardKey, ttl_secs: i64) {
+    let deadline = Instant::now()
+        + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
+    let interval = Duration::from_millis(250);
     loop {
         if coordinator
             .test_load_owner_binding(tenant_id(), key)
@@ -401,11 +424,10 @@ fn wait_for_owner_binding_expiry(coordinator: &EtcdCoordinator, key: ShardKey, t
             return;
         }
         assert!(
-            start.elapsed() < timeout,
-            "owner binding did not expire within {:?}",
-            timeout
+            Instant::now() < deadline,
+            "owner binding did not expire within {ttl_secs}s + 10s margin"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(interval);
     }
 }
 
@@ -498,8 +520,9 @@ fn worker_binary_restart_is_idempotent_after_completed_shard() {
 #[test]
 fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
     let namespace = contention_namespace();
-    let mut backend_a = test_coordinator_in_namespace_with_tuning(&namespace, 1, 8, 8);
-    let mut backend_b = test_coordinator_in_namespace_with_tuning(&namespace, 1, 8, 8);
+    let ttl_secs: i64 = 1;
+    let mut backend_a = test_coordinator_in_namespace_with_tuning(&namespace, ttl_secs, 8, 8);
+    let mut backend_b = test_coordinator_in_namespace_with_tuning(&namespace, ttl_secs, 8, 8);
     let fixture = SafeScanFixture::new();
     let key = seed_filesystem_run(
         &mut backend_a,
@@ -523,8 +546,21 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
         )
         .expect("worker A checkpoint should succeed before owner-lease expiry");
 
-    wait_for_owner_binding_expiry(&backend_a, key, Duration::from_secs(5));
+    wait_for_owner_binding_expiry(&backend_a, key, ttl_secs);
 
+    // Zombie-worker assertions: the owner binding is gone (etcd lease
+    // expired) but no replacement worker has reacquired. Worker A's
+    // checkpoint and renew must both be rejected with StaleFence.
+    //
+    // The fence epoch has not advanced (no reacquire), so both `presented`
+    // and `current` carry the same value. This is the expected etcd-backend
+    // behavior: the owner binding is absent, but the shard record's fence
+    // is unchanged. The `StaleFence` contract ("re-acquire") is correct
+    // for this case — callers must not interpret `presented == current` as
+    // "still valid."
+    //
+    // After the replacement worker acquires below, the stronger invariant
+    // `current > presented` is exercised separately.
     let zombie_checkpoint = backend_a
         .checkpoint(
             now(5),
@@ -537,7 +573,10 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
     match zombie_checkpoint {
         CheckpointError::StaleFence { presented, current } => {
             assert_eq!(presented, lease_a.fence());
-            assert_eq!(presented, current);
+            assert_eq!(
+                presented, current,
+                "in the owner-absent window (no reacquire), presented == current"
+            );
         }
         other => panic!("expected StaleFence after owner-lease loss, got {other:?}"),
     }
@@ -548,7 +587,10 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
     match zombie_renew {
         RenewError::StaleFence { presented, current } => {
             assert_eq!(presented, lease_a.fence());
-            assert_eq!(presented, current);
+            assert_eq!(
+                presented, current,
+                "in the owner-absent window (no reacquire), presented == current"
+            );
         }
         other => panic!("expected StaleFence on renew after owner-lease loss, got {other:?}"),
     }
