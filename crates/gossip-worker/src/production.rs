@@ -21,6 +21,7 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::config::ProductionBackendConfig;
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
 use gossip_done_ledger_postgres::{DoneLedgerPg, DoneLedgerPgError};
 use gossip_findings_postgres::{FindingsPgError, FindingsSinkPg};
@@ -29,111 +30,6 @@ use gossip_scanner_runtime::distributed::{
     DistributedRuntimeError, WorkerIdentity, run_worker,
 };
 use postgres::{Client, NoTls};
-
-/// Configuration for the real backend composition root.
-///
-/// The etcd config already performs its own validation when it is created.
-/// This type adds only the PostgreSQL routing inputs needed to build the real
-/// persistence backends.
-#[derive(Clone)]
-pub struct ProductionBackendConfig {
-    etcd: EtcdCoordinatorConfig,
-    done_ledger_postgres_dsn: String,
-    findings_postgres_dsn: String,
-}
-
-impl ProductionBackendConfig {
-    /// Construct one validated production-backend configuration bundle.
-    ///
-    /// DSNs are trimmed before storage so accidental surrounding whitespace in
-    /// environment variables or config files does not survive into the startup
-    /// path.
-    ///
-    /// See [`EtcdCoordinatorConfig::new`] for endpoint and namespace
-    /// configuration, and [`EtcdCoordinatorConfig::with_auth`] for
-    /// authentication setup.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProductionBackendConfigError`] when either PostgreSQL DSN is
-    /// empty after trimming whitespace.
-    pub fn new(
-        etcd: EtcdCoordinatorConfig,
-        done_ledger_postgres_dsn: impl Into<String>,
-        findings_postgres_dsn: impl Into<String>,
-    ) -> Result<Self, ProductionBackendConfigError> {
-        let done_ledger_postgres_dsn = done_ledger_postgres_dsn.into().trim().to_owned();
-        if done_ledger_postgres_dsn.is_empty() {
-            return Err(ProductionBackendConfigError::EmptyDoneLedgerPostgresDsn);
-        }
-
-        let findings_postgres_dsn = findings_postgres_dsn.into().trim().to_owned();
-        if findings_postgres_dsn.is_empty() {
-            return Err(ProductionBackendConfigError::EmptyFindingsPostgresDsn);
-        }
-
-        Ok(Self {
-            etcd,
-            done_ledger_postgres_dsn,
-            findings_postgres_dsn,
-        })
-    }
-
-    /// Validated etcd coordination config.
-    #[inline]
-    #[must_use]
-    pub fn etcd(&self) -> &EtcdCoordinatorConfig {
-        &self.etcd
-    }
-
-    /// PostgreSQL connection string for the done-ledger backend.
-    #[inline]
-    #[must_use]
-    pub(crate) fn done_ledger_postgres_dsn(&self) -> &str {
-        &self.done_ledger_postgres_dsn
-    }
-
-    /// PostgreSQL connection string for the findings backend.
-    #[inline]
-    #[must_use]
-    pub(crate) fn findings_postgres_dsn(&self) -> &str {
-        &self.findings_postgres_dsn
-    }
-}
-
-impl fmt::Debug for ProductionBackendConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProductionBackendConfig")
-            .field("etcd", &self.etcd)
-            .field("done_ledger_postgres_dsn", &"[redacted]")
-            .field("findings_postgres_dsn", &"[redacted]")
-            .finish()
-    }
-}
-
-/// Validation errors for [`ProductionBackendConfig`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProductionBackendConfigError {
-    /// The done-ledger PostgreSQL DSN was empty after trimming whitespace.
-    EmptyDoneLedgerPostgresDsn,
-    /// The findings PostgreSQL DSN was empty after trimming whitespace.
-    EmptyFindingsPostgresDsn,
-}
-
-impl fmt::Display for ProductionBackendConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyDoneLedgerPostgresDsn => {
-                f.write_str("done-ledger PostgreSQL DSN must not be empty")
-            }
-            Self::EmptyFindingsPostgresDsn => {
-                f.write_str("findings PostgreSQL DSN must not be empty")
-            }
-        }
-    }
-}
-
-impl Error for ProductionBackendConfigError {}
 
 /// Typed startup failures for the production composition root.
 ///
@@ -310,10 +206,17 @@ impl ProductionRuntimeBackends {
 ///
 /// # Caller Obligations
 ///
-/// Schema migrations must be applied on both persistence backends before
-/// the first call to [`ProductionRuntimeBackends::run`]. Access the
-/// backends via [`ProductionRuntimeBackends::persistence`] and call
+/// **Schema migrations are required before calling
+/// [`ProductionRuntimeBackends::run`].** Access the backends via
+/// [`ProductionRuntimeBackends::persistence`] and call
 /// `apply_migrations()` on both `done_ledger` and `findings_sink`.
+/// Calling `run()` on un-migrated backends is a hard runtime error
+/// (missing tables / columns), not a silent degradation.
+///
+/// [`run_production_worker`] is the convenience entrypoint that handles
+/// migrations automatically. Use `build_production_backends` only when
+/// you need to separate the migration step from execution (e.g.,
+/// dedicated migration tooling or staged rollouts).
 ///
 /// # Panics
 ///
@@ -360,10 +263,18 @@ pub fn build_production_backends(
 ///
 /// # Caller Obligations
 ///
-/// Schema migrations must be applied on both persistence backends before
-/// the first call to [`ProductionRuntimeBackends::run`]. Access the
-/// backends via [`ProductionRuntimeBackends::persistence`] and call
+/// **Schema migrations are required before calling
+/// [`ProductionRuntimeBackends::run`].** Access the backends via
+/// [`ProductionRuntimeBackends::persistence`] and call
 /// `apply_migrations()` on both `done_ledger` and `findings_sink`.
+/// Calling `run()` on un-migrated backends is a hard runtime error
+/// (missing tables / columns), not a silent degradation.
+///
+/// [`run_production_worker`] is the convenience entrypoint that handles
+/// migrations automatically. Use `build_production_backends_from_clients`
+/// only when you need to separate the migration step from execution
+/// (e.g., dedicated migration tooling or staged rollouts) and also need
+/// TLS or custom connection handling.
 ///
 /// # Panics
 ///
@@ -449,10 +360,100 @@ pub fn run_production_worker(
 /// does not include an explicit `connect_timeout` parameter. Without this
 /// fallback the `postgres` crate defaults to *no timeout*, which can block
 /// the calling thread for minutes on an unreachable host.
-const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 30;
+///
+/// Kept low (5 s) so that worst-case startup failure (etcd + two PostgreSQL
+/// connections) stays under 20 s — well within typical container liveness
+/// probe windows. Callers that need a longer timeout should set
+/// `connect_timeout=N` in their DSN explicitly.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 5;
+
+/// Check whether a DSN already contains an explicit `connect_timeout` parameter.
+///
+/// For URI-format DSNs (`postgresql://` / `postgres://`), the parameter must
+/// appear in the query string (after `?`, delimited by `&`). For keyword-value
+/// DSNs, parameters are whitespace-delimited, so `connect_timeout=` must appear
+/// at the start of the string or immediately after whitespace. This avoids
+/// false positives when the substring appears inside a password, database name,
+/// or other opaque field.
+fn has_connect_timeout(dsn: &str) -> bool {
+    if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+        dsn.split_once('?').is_some_and(|(_, query)| {
+            query
+                .split('&')
+                .any(|param| param.starts_with("connect_timeout="))
+        })
+    } else {
+        dsn.split_whitespace()
+            .any(|param| param.starts_with("connect_timeout="))
+    }
+}
+
+/// Extract the host component from a PostgreSQL DSN, if parseable.
+///
+/// Handles both URI format (`postgresql://user:pass@HOST:port/db`) and
+/// keyword-value format (`host=HOST user=... dbname=...`). Returns `None`
+/// when the host cannot be determined — callers should assume local in
+/// that case.
+fn extract_pg_host(dsn: &str) -> Option<&str> {
+    if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+        // URI format: scheme://[userinfo@]host[:port][/dbname][?params]
+        let after_scheme = dsn.split_once("://").map(|(_, rest)| rest)?;
+        // Strip optional userinfo (everything before the last `@`).
+        let host_and_rest = after_scheme
+            .rfind('@')
+            .map_or(after_scheme, |idx| &after_scheme[idx + 1..]);
+
+        // Bracketed IPv6 addresses (e.g. `[::1]:5432/db`) must be handled
+        // before the `:` split, because `:` appears inside the brackets.
+        if host_and_rest.starts_with('[') {
+            let close = host_and_rest.find(']')?;
+            let host = &host_and_rest[..=close]; // e.g. "[::1]"
+            if host.len() <= 2 {
+                // Just "[]" — no actual address.
+                None
+            } else {
+                Some(host)
+            }
+        } else {
+            // Plain hostname or IPv4 — trim port, path, and query string.
+            let host = host_and_rest
+                .split_once(':')
+                .or_else(|| host_and_rest.split_once('/'))
+                .or_else(|| host_and_rest.split_once('?'))
+                .map_or(host_and_rest, |(h, _)| h);
+            if host.is_empty() { None } else { Some(host) }
+        }
+    } else {
+        // Keyword-value format: `host=HOST port=... dbname=...`
+        dsn.split_whitespace()
+            .find_map(|param| param.strip_prefix("host="))
+            .filter(|h| !h.is_empty())
+    }
+}
+
+/// Returns `true` when the host refers to the local machine or a Unix socket.
+///
+/// Recognized local patterns: `localhost`, `127.0.0.1`, `::1`, Unix socket
+/// paths (starting with `/`), and the empty/absent case (PostgreSQL defaults
+/// to a local Unix socket when no host is specified).
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.starts_with('/')
+}
 
 fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
-    if dsn.contains("connect_timeout=") {
+    // Best-effort warning when connecting without TLS to a non-local host.
+    // If host extraction fails, assume local and stay silent.
+    if let Some(host) = extract_pg_host(dsn)
+        && !is_local_host(host)
+    {
+        tracing::warn!(
+            host = %host,
+            "connecting to PostgreSQL without TLS \
+             — use build_production_backends_from_clients for TLS-capable connections"
+        );
+    }
+
+    if has_connect_timeout(dsn) {
         return Client::connect(dsn, NoTls);
     }
 
@@ -465,6 +466,10 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     } else {
         format!("{dsn} connect_timeout={DEFAULT_CONNECT_TIMEOUT_SECS}")
     };
+    tracing::debug!(
+        timeout_secs = DEFAULT_CONNECT_TIMEOUT_SECS,
+        "DSN omitted connect_timeout; injecting default"
+    );
     Client::connect(&timed, NoTls)
 }
 
@@ -475,6 +480,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use crate::config::ProductionBackendConfigError;
     use gossip_coordination_etcd::test_support::test_async_coordinator_config;
     use gossip_pg_common::test_support::create_test_db;
     use gossip_scanner_runtime::ScanRuntimeError;
@@ -719,5 +725,133 @@ mod tests {
             matches!(error, ProductionBootstrapError::EtcdConnect(_)),
             "expected typed etcd startup error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn extract_pg_host_parses_bracketed_ipv6_uri() {
+        let dsn = "postgresql://scanner:secret@[::1]:5432/done";
+        let host = extract_pg_host(dsn);
+        assert_eq!(
+            host,
+            Some("[::1]"),
+            "bracketed IPv6 in URI format must extract as '[::1]', not '['",
+        );
+    }
+
+    #[test]
+    fn extract_pg_host_parses_ipv4_uri() {
+        let dsn = "postgresql://scanner:pass@127.0.0.1:5432/done";
+        assert_eq!(extract_pg_host(dsn), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn extract_pg_host_parses_hostname_uri() {
+        let dsn = "postgres://user@db.example.com:5432/mydb";
+        assert_eq!(extract_pg_host(dsn), Some("db.example.com"));
+    }
+
+    #[test]
+    fn extract_pg_host_parses_keyword_value_ipv6() {
+        let dsn = "host=::1 port=5432 dbname=done";
+        assert_eq!(extract_pg_host(dsn), Some("::1"));
+    }
+
+    #[test]
+    fn is_local_host_recognizes_bracketed_ipv6_loopback() {
+        assert!(is_local_host("[::1]"));
+        assert!(is_local_host("::1"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("localhost"));
+    }
+
+    // ---- has_connect_timeout tests ----
+
+    #[test]
+    fn has_connect_timeout_uri_with_param_in_query_string() {
+        let dsn = "postgresql://user:pass@host:5432/db?connect_timeout=5&sslmode=require";
+        assert!(has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_uri_without_param() {
+        let dsn = "postgresql://user:pass@host:5432/db?sslmode=require";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_uri_as_only_query_param() {
+        let dsn = "postgres://user@host/db?connect_timeout=10";
+        assert!(has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_keyword_value_with_param() {
+        let dsn = "host=db.example.com port=5432 connect_timeout=5 dbname=mydb";
+        assert!(has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_keyword_value_without_param() {
+        let dsn = "host=db.example.com port=5432 dbname=mydb";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_uri_embedded_in_password_is_not_detected() {
+        // The substring appears in the password, not as a query-string parameter.
+        let dsn = "postgresql://user:connect_timeout=secret@host:5432/db?sslmode=require";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    #[test]
+    fn has_connect_timeout_keyword_value_in_value_position_is_not_detected() {
+        // "connect_timeout=3" appears as the *value* of password, not as its own key.
+        let dsn = "host=db.example.com password=connect_timeout=3 dbname=mydb";
+        assert!(!has_connect_timeout(dsn));
+    }
+
+    // ---- extract_pg_host edge-case tests ----
+
+    #[test]
+    fn extract_pg_host_uri_without_userinfo() {
+        let dsn = "postgresql://myhost:5432/db";
+        assert_eq!(extract_pg_host(dsn), Some("myhost"));
+    }
+
+    #[test]
+    fn extract_pg_host_uri_without_port() {
+        let dsn = "postgresql://user@myhost/db";
+        assert_eq!(extract_pg_host(dsn), Some("myhost"));
+    }
+
+    #[test]
+    fn extract_pg_host_keyword_value_with_hostname() {
+        let dsn = "host=db.example.com port=5432";
+        assert_eq!(extract_pg_host(dsn), Some("db.example.com"));
+    }
+
+    #[test]
+    fn extract_pg_host_empty_brackets_returns_none() {
+        let dsn = "postgresql://user@[]:5432/db";
+        assert_eq!(extract_pg_host(dsn), None);
+    }
+
+    #[test]
+    fn extract_pg_host_missing_host_in_uri_returns_none() {
+        // Triple-slash means no authority component — host is empty.
+        let dsn = "postgresql:///mydb";
+        assert_eq!(extract_pg_host(dsn), None);
+    }
+
+    // ---- is_local_host edge-case tests ----
+
+    #[test]
+    fn is_local_host_unix_socket_path() {
+        assert!(is_local_host("/var/run/postgresql"));
+    }
+
+    #[test]
+    fn is_local_host_non_local_hostname() {
+        assert!(!is_local_host("db.example.com"));
     }
 }

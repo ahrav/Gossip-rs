@@ -13,8 +13,9 @@ summary, and parity plumbing local to `gossip-scanner-runtime`:
   `scan_git_with_runtime` helpers.
 - `crates/scanner-rs-cli` exposes the workspace `scanner-rs` binary with
   `scan fs|git` shape and `--execution-mode` defaulting to `direct`.
-- `crates/gossip-worker` exercises the same runtime surface with a minimal
-  worker-specific CLI.
+- `crates/gossip-worker` exercises the same runtime surface through a
+  config-resolved worker entrypoint that can dispatch either to local scans
+  or to the distributed worker path.
 - `crates/gossip-scanner-runtime` owns local `ScanReport`,
   `ScanCheckpoint`, `CancellationToken`, commit-pipeline, commit-sink,
   commit-model, result-translation, result-committer,

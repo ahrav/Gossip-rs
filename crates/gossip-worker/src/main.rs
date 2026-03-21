@@ -1,73 +1,36 @@
-//! Unified gossip-worker binary entrypoint.
+//! Unified `gossip-worker` binary entrypoint.
 //!
-//! The worker is a thin CLI shell around `gossip-scanner-runtime`. It parses
-//! a minimal argument grammar, delegates to [`scan_fs`] or [`scan_git`], and
-//! logs the resulting report via `tracing`.
+//! The worker resolves a typed configuration surface from environment
+//! variables plus CLI overrides. Depending on that resolved config it either:
 //!
-//! # Argument grammar
-//!
-//! ```text
-//! gossip-worker [--mode=direct|connector] [fs|git] [path]
-//! ```
-//!
-//! All arguments are optional. Defaults: `--mode=connector fs .`
-//!
-//! # Exit codes
-//!
-//! - `0` — scan completed successfully.
-//! - `1` — scan failed at runtime.
-//! - `2` — invalid CLI arguments.
+//! - runs a local filesystem or git scan, or
+//! - launches the real distributed worker path against etcd and PostgreSQL.
 
 use std::fmt;
-use std::path::PathBuf;
 
-use gossip_scanner_runtime::{
-    ExecutionMode, FsScanConfig, GitScanConfig, ScanRuntimeError, scan_fs, scan_git,
+use gossip_scanner_runtime::{ScanRuntimeError, scan_fs, scan_git};
+use gossip_worker::config::{
+    DistributedWorkerConfig, LocalWorkerConfig, ResolvedWorkerConfig, WorkerSourceSettings,
+    resolve_worker_config_from_env_and_args,
 };
+use gossip_worker::production::run_production_worker;
 use tracing_subscriber::EnvFilter;
 
-/// Scan source family selected by the first positional argument.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkerSource {
-    Fs,
-    Git,
-}
-
-/// Worker launch configuration.
-///
-/// The worker intentionally defaults to connector mode so both worker and CLI
-/// entrypoints exercise the same runtime-family boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkerConfig {
-    source: WorkerSource,
-    path: PathBuf,
-    execution_mode: ExecutionMode,
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            source: WorkerSource::Fs,
-            path: PathBuf::from("."),
-            execution_mode: ExecutionMode::Connector,
-        }
-    }
-}
-
-/// Worker-level error distinguishing argument errors from runtime failures.
-///
-/// `Usage` errors cause exit code 2; `Runtime` errors cause exit code 1.
+/// Worker-level error distinguishing configuration errors from runtime
+/// failures.
 #[derive(Debug)]
 enum WorkerError {
-    Usage(String),
-    Runtime(ScanRuntimeError),
+    Config(gossip_worker::config::WorkerConfigError),
+    LocalRuntime(ScanRuntimeError),
+    ProductionRuntime(gossip_worker::production::ProductionWorkerError),
 }
 
 impl fmt::Display for WorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage(msg) => write!(f, "{msg}"),
-            Self::Runtime(error) => write!(f, "scan failed: {error}"),
+            Self::Config(error) => write!(f, "{error}"),
+            Self::LocalRuntime(error) => write!(f, "scan failed: {error}"),
+            Self::ProductionRuntime(error) => write!(f, "scan failed: {error}"),
         }
     }
 }
@@ -75,26 +38,39 @@ impl fmt::Display for WorkerError {
 impl std::error::Error for WorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Usage(_) => None,
-            Self::Runtime(error) => Some(error),
+            Self::Config(error) => Some(error),
+            Self::LocalRuntime(error) => Some(error),
+            Self::ProductionRuntime(error) => Some(error),
         }
+    }
+}
+
+impl From<gossip_worker::config::WorkerConfigError> for WorkerError {
+    fn from(value: gossip_worker::config::WorkerConfigError) -> Self {
+        Self::Config(value)
     }
 }
 
 impl From<ScanRuntimeError> for WorkerError {
     fn from(value: ScanRuntimeError) -> Self {
-        Self::Runtime(value)
+        Self::LocalRuntime(value)
+    }
+}
+
+impl From<gossip_worker::production::ProductionWorkerError> for WorkerError {
+    fn from(value: gossip_worker::production::ProductionWorkerError) -> Self {
+        Self::ProductionRuntime(value)
     }
 }
 
 /// Initialize the global tracing subscriber.
 ///
-/// Reads the `RUST_LOG` env var for filter directives, defaulting to `info`.
+/// Reads `RUST_LOG` if present, silently falls back to `info` when absent,
+/// and accepts partial/lossy directives without warning.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|e| {
-        eprintln!("warning: invalid RUST_LOG filter ({e}), falling back to 'info'");
-        EnvFilter::new("info")
-    });
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -102,84 +78,15 @@ fn init_tracing() {
         .init();
 }
 
-fn usage() -> &'static str {
-    "usage: gossip-worker [--mode=direct|connector] [fs|git] [path]\n\
-     defaults: --mode=connector fs ."
-}
-
-fn parse_mode_flag(flag: &str) -> Result<ExecutionMode, WorkerError> {
-    let Some(value) = flag.strip_prefix("--mode=") else {
-        return Err(WorkerError::Usage(usage().to_owned()));
-    };
-    value
-        .parse::<ExecutionMode>()
-        .map_err(|error| WorkerError::Usage(error.to_string()))
-}
-
-fn parse_source(value: &str) -> Result<WorkerSource, WorkerError> {
-    match value {
-        "fs" => Ok(WorkerSource::Fs),
-        "git" => Ok(WorkerSource::Git),
-        _ => Err(WorkerError::Usage(format!(
-            "unknown source '{value}'\n{}",
-            usage()
-        ))),
-    }
-}
-
-/// Parse worker CLI args using a stable, minimal grammar.
-///
-/// Supported forms:
-/// - `[]` -> defaults (`connector`, `fs`, `.`)
-/// - `[path]` -> filesystem scan at `path`
-/// - `[fs|git, path]` -> explicit source and path
-/// - optional `--mode=...` prefix on all forms
-fn parse_args<I>(args: I) -> Result<WorkerConfig, WorkerError>
-where
-    I: IntoIterator,
-    I::Item: Into<String>,
-{
-    let mut cfg = WorkerConfig::default();
-    let mut positional: Vec<String> = args.into_iter().map(Into::into).collect();
-
-    if positional
-        .first()
-        .is_some_and(|first| first.starts_with("--mode="))
-    {
-        cfg.execution_mode = parse_mode_flag(&positional.remove(0))?;
-    }
-
-    match positional.len() {
-        0 => Ok(cfg),
-        1 => {
-            cfg.path = PathBuf::from(&positional[0]);
-            Ok(cfg)
+/// Execute one local scan using the resolved local worker config.
+fn run_local_worker(cfg: &LocalWorkerConfig) -> Result<(u64, u64, u64), WorkerError> {
+    let report = match cfg.source() {
+        WorkerSourceSettings::Fs(source) => {
+            scan_fs(&source.to_scan_config(cfg.execution_mode(), cfg.budgets()))?
         }
-        2 => {
-            cfg.source = parse_source(&positional[0])?;
-            cfg.path = PathBuf::from(&positional[1]);
-            Ok(cfg)
+        WorkerSourceSettings::Git(source) => {
+            scan_git(&source.to_scan_config(cfg.execution_mode(), cfg.budgets()))?
         }
-        _ => Err(WorkerError::Usage(usage().to_owned())),
-    }
-}
-
-/// Execute one scan using the scanner runtime boundary.
-///
-/// Returns `(items_scanned, bytes_scanned, findings_emitted)` for logging and
-/// smoke-test assertions.
-fn run_worker(cfg: &WorkerConfig) -> Result<(u64, u64, u64), WorkerError> {
-    let report = match cfg.source {
-        WorkerSource::Fs => scan_fs(
-            &FsScanConfig::new(&cfg.path)
-                .with_execution_mode(cfg.execution_mode)
-                .with_budgets(gossip_scanner_runtime::ScanBudgets::default()),
-        )?,
-        WorkerSource::Git => scan_git(
-            &GitScanConfig::new(&cfg.path)
-                .with_execution_mode(cfg.execution_mode)
-                .with_budgets(gossip_scanner_runtime::ScanBudgets::default()),
-        )?,
     };
     Ok((
         report.items_scanned,
@@ -188,17 +95,17 @@ fn run_worker(cfg: &WorkerConfig) -> Result<(u64, u64, u64), WorkerError> {
     ))
 }
 
-fn log_report(cfg: &WorkerConfig, report: (u64, u64, u64)) {
+fn log_local_report(cfg: &LocalWorkerConfig, report: (u64, u64, u64)) {
     let (items_scanned, bytes_scanned, findings_emitted) = report;
-    let source = match cfg.source {
-        WorkerSource::Fs => "fs",
-        WorkerSource::Git => "git",
+    let (source_label, path) = match cfg.source() {
+        WorkerSourceSettings::Fs(s) => ("fs", s.path().display().to_string()),
+        WorkerSourceSettings::Git(s) => ("git", s.repo().display().to_string()),
     };
-
     tracing::info!(
-        source,
-        mode = ?cfg.execution_mode,
-        path = %cfg.path.display(),
+        backend = "local",
+        source = source_label,
+        mode = ?cfg.execution_mode(),
+        %path,
         items_scanned,
         bytes_scanned,
         findings_emitted,
@@ -206,23 +113,61 @@ fn log_report(cfg: &WorkerConfig, report: (u64, u64, u64)) {
     );
 }
 
+fn log_distributed_report(
+    cfg: &DistributedWorkerConfig,
+    report: gossip_scanner_runtime::distributed::DistributedRunReport,
+) {
+    // `DistributedWorkerConfig` is type-constrained to `FsSourceSettings`,
+    // so source is always "fs" and mode is always `Connector`.
+    tracing::info!(
+        backend = "production",
+        source = "fs",
+        mode = ?gossip_scanner_runtime::ExecutionMode::Connector,
+        tenant = %cfg.tenant(),
+        run = %cfg.run(),
+        worker = %cfg.worker(),
+        path = %cfg.source().path().display(),
+        leases_seen = report.leases_seen,
+        shards_scanned = report.shards_scanned,
+        "distributed scan completed",
+    );
+}
+
 fn main() {
     init_tracing();
 
-    let args = std::env::args().skip(1);
-    let cfg = match parse_args(args) {
+    let resolved = match resolve_worker_config_from_env_and_args(std::env::args().skip(1)) {
         Ok(cfg) => cfg,
         Err(error) => {
-            tracing::error!(error = %error, "invalid worker arguments");
+            tracing::error!(error = %error, "invalid worker configuration");
             std::process::exit(2);
         }
     };
 
-    match run_worker(&cfg) {
-        Ok(report) => log_report(&cfg, report),
-        Err(error) => {
-            tracing::error!(error = %error, "worker scan failed");
-            std::process::exit(1);
+    match resolved {
+        ResolvedWorkerConfig::Local(cfg) => match run_local_worker(&cfg) {
+            Ok(report) => log_local_report(&cfg, report),
+            Err(error) => {
+                tracing::error!(error = %error, "worker scan failed");
+                std::process::exit(1);
+            }
+        },
+        ResolvedWorkerConfig::Distributed(cfg) => {
+            tracing::warn!(
+                "coordination event recorder is a no-op — \
+                 all coordination telemetry will be silently discarded"
+            );
+            match run_production_worker(
+                cfg.production_backends(),
+                cfg.worker_identity_noop(),
+                cfg.runtime_config(),
+            ) {
+                Ok(report) => log_distributed_report(&cfg, report),
+                Err(error) => {
+                    tracing::error!(error = %error, "worker scan failed");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -230,9 +175,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::fs;
     use std::path::Path;
     use std::process::Command;
+
+    use gossip_scanner_runtime::ExecutionMode;
     use tempfile::tempdir;
 
     fn create_git_repo(path: &Path) {
@@ -259,61 +207,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_defaults_to_connector_fs_current_dir() {
-        let cfg = parse_args(Vec::<String>::new()).expect("parse defaults");
-        assert_eq!(cfg.source, WorkerSource::Fs);
-        assert_eq!(cfg.path, PathBuf::from("."));
-        assert_eq!(cfg.execution_mode, ExecutionMode::Connector);
-    }
-
-    #[test]
-    fn parse_args_supports_explicit_git_path_and_mode() {
-        let cfg = parse_args(["--mode=direct", "git", "/tmp/repo"]).expect("parse args");
-        assert_eq!(cfg.source, WorkerSource::Git);
-        assert_eq!(cfg.path, PathBuf::from("/tmp/repo"));
-        assert_eq!(cfg.execution_mode, ExecutionMode::Direct);
-    }
-
-    #[test]
-    fn parse_args_rejects_unknown_source() {
-        let err = parse_args(["unknown", "/tmp/path"]).expect_err("unknown source");
-        assert!(err.to_string().contains("unknown source"));
-    }
-
-    #[test]
-    fn run_worker_scans_filesystem_path() {
+    fn local_worker_scans_filesystem_path() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), "password=xK9mP2qL7wN4vR8t")
-            .expect("write fixture");
+        fs::write(
+            dir.path().join("sample.txt"),
+            "fixture-local-worker-content",
+        )
+        .expect("write fixture");
 
-        let cfg = WorkerConfig {
-            source: WorkerSource::Fs,
-            path: dir.path().to_path_buf(),
-            execution_mode: ExecutionMode::Connector,
-        };
+        let cfg = LocalWorkerConfig::new(
+            ExecutionMode::Connector,
+            WorkerSourceSettings::Fs(gossip_worker::config::FsSourceSettings::new(
+                dir.path().to_path_buf(),
+            )),
+            gossip_scanner_runtime::ScanBudgets::default(),
+        )
+        .expect("default budgets should be valid");
 
         let (items_scanned, bytes_scanned, _findings_emitted) =
-            run_worker(&cfg).expect("filesystem worker should succeed");
+            run_local_worker(&cfg).expect("filesystem worker should succeed");
         assert!(items_scanned > 0);
         assert!(bytes_scanned > 0);
     }
 
     #[test]
-    fn run_worker_scans_git_repo_path() {
+    fn local_worker_scans_git_repo_path() {
         let dir = tempdir().expect("tempdir");
         create_git_repo(dir.path());
-        fs::write(dir.path().join("secret.txt"), "token=aB3dE5fG7hJ9kL1m").expect("write fixture");
+        fs::write(dir.path().join("sample.txt"), "fixture-git-worker-content")
+            .expect("write fixture");
         run_git(dir.path(), &["add", "."]);
         run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
 
-        let cfg = WorkerConfig {
-            source: WorkerSource::Git,
-            path: dir.path().to_path_buf(),
-            execution_mode: ExecutionMode::Connector,
-        };
+        let cfg = LocalWorkerConfig::new(
+            ExecutionMode::Connector,
+            WorkerSourceSettings::Git(gossip_worker::config::GitSourceSettings::new(
+                dir.path().to_path_buf(),
+            )),
+            gossip_scanner_runtime::ScanBudgets::default(),
+        )
+        .expect("default budgets should be valid");
 
         let (items_scanned, bytes_scanned, _findings_emitted) =
-            run_worker(&cfg).expect("git worker should succeed");
+            run_local_worker(&cfg).expect("git worker should succeed");
         assert!(items_scanned > 0);
         assert!(bytes_scanned > 0);
     }

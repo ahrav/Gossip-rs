@@ -4,44 +4,46 @@
 
 `gossip-worker` is the worker package that contains:
 
-- a lightweight binary entrypoint for local filesystem and git scans
-- a library surface that exposes the production composition root for real
-  etcd and PostgreSQL backends
+- a binary entrypoint that resolves environment variables plus CLI overrides
+  into an explicit local or distributed launch path
+- a library surface that exposes the worker config module and the production
+  composition root for real etcd and PostgreSQL backends
 
 The package owns only:
 
-- a minimal positional CLI grammar
+- worker launch configuration resolution
 - tracing initialization
 - exit-code policy
 - mapping runtime results into structured logs
 - construction of concrete real backends for the generic distributed runtime
 
-Neither the binary nor the library implements a scan loop. The binary
-delegates local filesystem and git requests directly to the runtime crate,
-and the library delegates distributed execution to
-`gossip-scanner-runtime::distributed::run_worker`.
+Neither the binary nor the library implements a scan loop. Local scans
+delegate to `gossip-scanner-runtime::{scan_fs, scan_git}`, and distributed
+execution delegates to `gossip-scanner-runtime::distributed::run_worker`
+through the production composition root.
 
 ---
 
 ## Behavior
 
-The local binary accepts valid filesystem and git scan requests, forwards
-them to the runtime, and surfaces runtime errors unchanged through
-`WorkerError`.
+The worker resolves one typed launch configuration from the current process
+environment plus CLI overrides.
 
 Specifically:
 
-- invalid CLI arguments fail with exit code `2`
-- valid filesystem and git scan requests execute through the runtime's
-  local scan loops
-- successful runs log `(items_scanned, bytes_scanned, findings_emitted)`
-  through `tracing`
-- the package also exposes a production-only composition module that
-  constructs `EtcdCoordinator`, `DoneLedgerPg`, and `FindingsSinkPg`
-  without coupling those concrete types into the runtime crate
+- invalid configuration fails with exit code `2`
+- `ExecutionMode::Direct` always resolves to a local scan path
+- `ExecutionMode::Connector` requires explicit backend selection
+- `backend=local` resolves to the existing local runtime path
+- `backend=production` requires all identity fields plus etcd and PostgreSQL
+  backend settings
+- `backend=production` never falls back to local or in-memory doubles
+- successful local runs log `(items_scanned, bytes_scanned, findings_emitted)`
+- successful distributed runs log `(leases_seen, shards_scanned)`
 
-The binary remains a thin local CLI shell, and the library holds the
-real-backend bootstrap layer for distributed execution.
+The worker remains a thin shell around the runtime boundary. It parses and
+validates launch intent, then dispatches either to local `scan_fs` / `scan_git`
+or to `run_production_worker`.
 
 ---
 
@@ -50,8 +52,14 @@ real-backend bootstrap layer for distributed execution.
 ```text
 gossip-worker
   --> src/main.rs
-       --> gossip-scanner-runtime local scan entrypoints
+       --> gossip-worker::config
+            --> resolve_worker_config_from_env_and_args(...)
+       --> local path:
+            --> gossip-scanner-runtime::{scan_fs, scan_git}
+       --> distributed path:
+            --> gossip-worker::production::run_production_worker(...)
   --> src/lib.rs
+       --> src/config.rs
        --> src/production.rs
             --> gossip-coordination-etcd
             --> gossip-done-ledger-postgres
@@ -62,123 +70,237 @@ gossip-worker
 ### Execution flow
 
 ```text
-gossip-worker [--mode=direct|connector] [fs|git] [path]
+gossip-worker [--mode=direct|connector] [--backend=local|production] [fs|git] [path]
 
 main()
   -> init_tracing()
-  -> parse_args(...)
-  -> run_worker(&cfg)
-     -> scan_fs(...) or scan_git(...)
-  -> log_report(...) on success
+  -> resolve_worker_config_from_env_and_args(...)
+  -> match resolved config
+     -> Local(cfg)
+        -> run_local_worker(&cfg)
+           -> scan_fs(...) or scan_git(...)
+        -> log_local_report(...)
+     -> Distributed(cfg)
+        -> run_production_worker(...)
+        -> log_distributed_report(...)
 ```
 
-The default configuration is `connector fs .`, which keeps the worker
-and CLI entrypoints aligned on the same runtime-family surface.
+The default mode and source are `connector fs .`, but connector mode requires
+explicit backend selection (`--backend=local` or `--backend=production`).
+Omitting the backend fails closed with a configuration error.
 
 ### Production composition flow
 
-Two entry points serve different levels of control:
-
-**Convenience path** — `run_production_worker` handles connection,
-migration, and execution in one call:
+`run_production_worker` handles connection, migration, and execution in one
+call:
 
 ```text
 caller
   -> ProductionBackendConfig::new(...)
+  -> DistributedWorkerConfig::worker_identity()
+  -> DistributedWorkerConfig::runtime_config()
   -> run_production_worker(config, identity, runtime)
      -> build_production_backends(config)
         -> EtcdCoordinator::connect(...)
-        -> connect_postgres_client(...) [done-ledger, 30 s timeout fallback]
-        -> connect_postgres_client(...) [findings, 30 s timeout fallback]
+        -> connect_postgres_client(...) [done-ledger]
+        -> connect_postgres_client(...) [findings]
      -> apply_migrations() on done_ledger and findings_sink
      -> distributed::run_worker(...)
   -> DistributedRunReport
 ```
 
-**Manual path** — callers that need TLS, custom clients, or separate
-migration tooling compose the steps themselves:
+Callers that need more control can build the backends manually with
+`build_production_backends` or `build_production_backends_from_clients`.
+
+---
+
+## Environment Variables
+
+All variables are read from the process environment at startup. CLI flags
+override environment values when both are present.
+
+| Variable | Format | Default | Required | Description |
+|----------|--------|---------|----------|-------------|
+| `GOSSIP_WORKER_MODE` | `direct` or `connector` | `connector` | No | Selects the execution mode family. |
+| `GOSSIP_WORKER_BACKEND` | `local` or `production` | *(none)* | Yes (connector mode) | Selects the backend for connector mode. Connector mode fails closed without an explicit backend. |
+| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Production backend supports only `fs`. |
+| `GOSSIP_WORKER_PATH` | filesystem path | `.` | No | Filesystem or git repository path to scan. |
+| `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs | *(none)* | Yes (production) | etcd endpoint CSV for the coordination backend. |
+| `GOSSIP_ETCD_NAMESPACE` | string | *(none)* | Yes (production) | etcd namespace prefix for key isolation. |
+| `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the done-ledger database. |
+| `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the findings database. |
+| `GOSSIP_TENANT_ID` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant identity. Accepts optional `0x` prefix. |
+| `GOSSIP_RUN_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Run identity. Zero is the unassigned sentinel and is rejected. |
+| `GOSSIP_WORKER_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Worker identity. Zero is the unassigned sentinel and is rejected. |
+| `GOSSIP_POLICY_HASH` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Policy hash for the scan ruleset. Accepts optional `0x` prefix. |
+| `GOSSIP_TENANT_SECRET_KEY` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant secret key. Must not be all zeros. Accepts optional `0x` prefix. |
+| `GOSSIP_MAX_ITEMS` | 1..10,000,000 | `256` | No | Maximum items processed between checkpoints. |
+| `GOSSIP_MAX_BYTES` | 1..64 GiB | `1000000` | No | Maximum bytes processed between checkpoints (1 MB default). |
+| `GOSSIP_COMMIT_QUEUE_CAPACITY` | 1..65,536 | `64` | No | Bounded commit queue capacity for the distributed runtime. |
+| `GOSSIP_WORKER_RULES_FILE` | filesystem path | *(none)* | No | Path to an optional rules file. |
+| `GOSSIP_WORKER_DECODE_DEPTH` | non-negative integer | *(none)* | No | Maximum decode depth for nested content extraction. |
+| `GOSSIP_WORKER_SCAN_BINARY` | boolean | `false` | No | Enable binary file scanning. Accepts `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`. |
+| `GOSSIP_FS_SKIP_ARCHIVES` | boolean | `false` | No | Skip archive expansion during filesystem scans. Same boolean tokens as above. |
+| `GOSSIP_WORKER_ANCHOR_MODE` | `manual` or `derived` | `manual` | No | Anchor extraction mode for rule planning. |
+
+---
+
+## CLI Flags
+
+All flags use `--name=value` syntax (equals-sign required; space-separated
+`--name value` is rejected). CLI flags override environment variables.
+
+| Flag | Env Variable | Accepted Values |
+|------|-------------|-----------------|
+| `--mode` | `GOSSIP_WORKER_MODE` | `direct`, `connector` |
+| `--backend` | `GOSSIP_WORKER_BACKEND` | `local`, `production` |
+| `--source` | `GOSSIP_WORKER_SOURCE` | `fs`, `git` |
+| `--path` | `GOSSIP_WORKER_PATH` | filesystem path |
+| `--etcd-endpoints` | `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs |
+| `--etcd-namespace` | `GOSSIP_ETCD_NAMESPACE` | string |
+| `--done-ledger-postgres-dsn` | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN |
+| `--findings-postgres-dsn` | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN |
+| `--tenant-id` | `GOSSIP_TENANT_ID` | 64 hex chars |
+| `--run-id` | `GOSSIP_RUN_ID` | u64, >= 1 |
+| `--worker-id` | `GOSSIP_WORKER_ID` | u64, >= 1 |
+| `--policy-hash` | `GOSSIP_POLICY_HASH` | 64 hex chars |
+| `--tenant-secret-key` | `GOSSIP_TENANT_SECRET_KEY` | 64 hex chars |
+| `--max-items` | `GOSSIP_MAX_ITEMS` | 1..10,000,000 |
+| `--max-bytes` | `GOSSIP_MAX_BYTES` | 1..64 GiB |
+| `--commit-queue-capacity` | `GOSSIP_COMMIT_QUEUE_CAPACITY` | 1..65,536 |
+| `--rules-file` | `GOSSIP_WORKER_RULES_FILE` | filesystem path |
+| `--decode-depth` | `GOSSIP_WORKER_DECODE_DEPTH` | non-negative integer |
+| `--scan-binary` | `GOSSIP_WORKER_SCAN_BINARY` | boolean |
+| `--skip-archives` | `GOSSIP_FS_SKIP_ARCHIVES` | boolean |
+| `--anchor-mode` | `GOSSIP_WORKER_ANCHOR_MODE` | `manual`, `derived` |
+
+### Positional arguments
+
+Two optional positional arguments follow the flags:
 
 ```text
-caller
-  -> build_production_backends(config)
-     or build_production_backends_from_clients(etcd_config, done_ledger_client, findings_client)
-  -> backends.persistence().done_ledger.apply_migrations()
-  -> backends.persistence().findings_sink.apply_migrations()
-  -> backends.run(identity, runtime)
-     -> distributed::run_worker(...)
-  -> DistributedRunReport
+gossip-worker [flags...] [source] [path]
 ```
 
-The production module is additive only. The binary uses the local scan
-path; the composition root is available for callers that build the
-distributed worker externally.
+- **`[source]`** -- `fs` or `git`. Conflicts with `--source` if both are given.
+- **`[path]`** -- Scan target path. Conflicts with `--path` if both are given.
+
+### Precedence
+
+CLI flags override environment variables unconditionally. When a CLI flag
+supplies a valid value, the corresponding environment variable is ignored even
+if the environment value is malformed.
 
 ---
 
 ## Key Types
 
-### WorkerSource
+### BackendSelection
 
 ```rust
-enum WorkerSource {
-    Fs,
-    Git,
+enum BackendSelection {
+    Local,
+    Production,
 }
 ```
 
-Selects which runtime entrypoint the worker will call.
+Selects whether connector mode routes to the local runtime path or to the real
+distributed worker path.
 
-### WorkerConfig
+### WorkerSourceSettings
 
 ```rust
-struct WorkerConfig {
-    source: WorkerSource,
-    path: PathBuf,
+enum WorkerSourceSettings {
+    Fs(FsSourceSettings),
+    Git(GitSourceSettings),
+}
+```
+
+Typed source-family settings used by local launches.
+
+### LocalWorkerConfig
+
+```rust
+struct LocalWorkerConfig {
     execution_mode: ExecutionMode,
+    source: WorkerSourceSettings,
+    budgets: ScanBudgets,
 }
 ```
 
-Small, crate-private config assembled from worker CLI arguments.
+Resolved local launch configuration for filesystem or git scans.
 
-### WorkerError
+### DistributedWorkerRuntimeSettings
 
 ```rust
-enum WorkerError {
-    Usage(String),
-    Runtime(ScanRuntimeError),
+struct DistributedWorkerRuntimeSettings {
+    budgets: ScanBudgets,
+    commit_queue_capacity: NonZeroUsize,
 }
 ```
 
-Encodes the two failure classes the worker cares about: local argument
-errors and delegated runtime failures.
+Runtime tuning extracted from worker configuration for the distributed worker
+loop.
+
+### DistributedWorkerConfig
+
+```rust
+struct DistributedWorkerConfig {
+    backends: ProductionBackendConfig,
+    identity: WorkerIdentityConfig,
+    source: FsSourceSettings,
+    runtime: DistributedWorkerRuntimeSettings,
+}
+```
+
+Resolved real-backend launch configuration. Identity fields (tenant, run,
+worker, policy hash, secret key) are grouped in `WorkerIdentityConfig` and
+accessible through the `identity()` accessor or individual delegation methods
+(`tenant()`, `run()`, etc.). Backend is always `Production` by construction.
+
+### ResolvedWorkerConfig
+
+```rust
+enum ResolvedWorkerConfig {
+    Local(LocalWorkerConfig),
+    Distributed(Box<DistributedWorkerConfig>),
+}
+```
+
+Final output of configuration resolution. The binary must handle both cases
+explicitly.
+
+### WorkerConfigError
+
+```rust
+enum WorkerConfigError {
+    Usage(String),
+    MissingRequiredValue { .. },
+    InvalidValue { .. },
+    InvalidEtcdConfig(..),
+    InvalidBackendConfig(..),
+    UnsupportedCombination { .. },
+}
+```
+
+Typed configuration errors used for argument mistakes, missing required
+production fields, validation failures, and unsupported launch combinations.
+
+### NoopCoordinationEventRecorder
+
+No-op implementation of `CoordinationEventRecorder` used when building a
+default `WorkerIdentity` from a resolved distributed config.
 
 ### ProductionBackendConfig
 
-Validated startup bundle containing the etcd coordination config plus the
-two PostgreSQL DSNs used to build the real persistence backends. Debug
-output redacts both DSNs so credentials do not leak into logs.
-
-### ProductionBootstrapError
-
-Typed startup failure classification for the production composition root.
-Each variant identifies which backend failed during construction or
-migration (`done-ledger`, `findings`, or `etcd`).
-
-### ProductionWorkerError
-
-Top-level error returned by `run_production_worker`. Distinguishes startup
-failures (before any shard work) from runtime failures (after backends
-connected successfully).
-
-### ProductionBackendConfigError
-
-Validation error returned by `ProductionBackendConfig::new` when either
-PostgreSQL DSN is empty after trimming whitespace.
+Validated startup bundle containing the etcd coordination config plus the two
+PostgreSQL DSNs used to build the real persistence backends. Debug output
+redacts both DSNs so credentials do not leak into logs.
 
 ### ProductionRuntimeBackends
 
-Concrete bundle of the live etcd coordinator and persistence handles
-passed to the generic distributed runtime.
+Concrete bundle of the live etcd coordinator and persistence handles passed to
+the generic distributed runtime.
 
 ---
 
@@ -186,14 +308,12 @@ passed to the generic distributed runtime.
 
 | Function | Purpose |
 |----------|---------|
-| `init_tracing()` | Initialize compact tracing output with `RUST_LOG` support |
-| `usage()` | Return the stable worker help text |
-| `parse_mode_flag()` | Parse `--mode=direct` or `--mode=connector` |
-| `parse_source()` | Parse `fs` or `git` into `WorkerSource` |
-| `parse_args()` | Build `WorkerConfig` from positional worker arguments |
-| `run_worker()` | Call `scan_fs` or `scan_git` and map the result into `(items, bytes, findings)` |
-| `log_report()` | Emit success metrics through `tracing::info!` |
-| `main()` | Wire together tracing, parsing, execution, logging, and exit codes |
+| `resolve_worker_config_from_env_and_args()` | Resolve the current environment plus CLI args into one typed launch config |
+| `resolve_worker_config_from()` | Resolve a caller-supplied environment provider plus CLI args |
+| `run_local_worker()` | Call `scan_fs` or `scan_git` from a resolved local config |
+| `log_local_report()` | Emit local success metrics through `tracing::info!` |
+| `log_distributed_report()` | Emit distributed success metrics through `tracing::info!` |
+| `main()` | Wire together tracing, config resolution, execution, logging, and exit codes |
 | `build_production_backends()` | Connect the real etcd and PostgreSQL backends from DSNs |
 | `build_production_backends_from_clients()` | Wrap caller-supplied PostgreSQL clients with the real runtime backends |
 | `run_production_worker()` | Build backends, apply migrations, and run the distributed runtime |
@@ -202,26 +322,57 @@ passed to the generic distributed runtime.
 
 ## Tests
 
-The worker binary test module checks:
+The config module checks:
 
-- default parsing
-- explicit `git` path parsing with mode override
-- rejection of unknown sources
+- resolution of a full production config from environment variables alone
+- CLI override precedence over environment values
+- backend selection failure in connector mode when no backend is configured
+- direct-mode fallback to local execution without backend selection
+- missing required production identity fields
+- rejection of `source=git` for real distributed launches
+- secret-key redaction in error and debug output
+- hex parsing, prefix handling, length checks, and non-hex rejection
+- construction of a valid runtime `WorkerIdentity`
+
+The binary test module checks:
+
 - successful filesystem scans for a valid local path
 - successful git scans for a valid repository root
 
-These assertions confirm that the worker stays wired to the runtime's live
-filesystem and git execution paths rather than to a removed driver-backed
-scan path.
-
-The production module adds:
+The production module includes:
 
 - config validation for empty PostgreSQL DSNs
 - DSN whitespace trimming validation
 - debug redaction coverage for secret-bearing DSNs
 - error-chain preservation for bootstrap and worker error conversions
-- ignored live-backend bootstrap tests that require either Docker-backed
-  testcontainers or externally configured etcd/PostgreSQL endpoints
+- ignored live-backend bootstrap tests that require configured etcd and
+  PostgreSQL endpoints
+
+---
+
+## Security Notes
+
+### Secret delivery
+
+Pass secrets exclusively through environment variables. CLI flags like
+`--tenant-secret-key`, `--done-ledger-postgres-dsn`, and
+`--findings-postgres-dsn` are visible in process listings (`ps aux`,
+`/proc/<pid>/cmdline`). Environment variables avoid this exposure.
+
+### TLS for PostgreSQL
+
+The default `connect_postgres_client` connects with `NoTls` and performs a
+best-effort warning when the parsed target host appears non-local. For
+TLS-capable connections, use
+`build_production_backends_from_clients`, which accepts pre-configured
+`postgres::Client` instances where the caller controls the TLS configuration.
+
+### Debug output
+
+Config types redact sensitive fields (DSNs, tenant secret key) in their
+`Debug` implementations. The `TenantSecretKey` type uses constant-time
+equality comparison (`subtle::ConstantTimeEq`) to prevent timing
+side-channel leakage of key material.
 
 ---
 
@@ -229,7 +380,8 @@ The production module adds:
 
 | Concern | Path |
 |---------|------|
-| Worker binary entrypoint, parsing, and tests | `crates/gossip-worker/src/main.rs` |
+| Worker binary entrypoint | `crates/gossip-worker/src/main.rs` |
+| Worker config surface | `crates/gossip-worker/src/config.rs` |
 | Worker library surface | `crates/gossip-worker/src/lib.rs` |
 | Production composition root | `crates/gossip-worker/src/production.rs` |
 | Runtime scan entrypoints | `crates/gossip-scanner-runtime/src/lib.rs` |
