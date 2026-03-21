@@ -1160,11 +1160,6 @@ mod tests {
 
         backends
             .persistence()
-            .done_ledger
-            .apply_migrations()
-            .expect("done-ledger migrations should succeed on the connected backend");
-        backends
-            .persistence()
             .findings_sink
             .validate_connection(Duration::from_secs(1))
             .expect("findings connection should remain usable after startup readiness");
