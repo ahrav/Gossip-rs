@@ -1194,4 +1194,106 @@ mod tests {
         assert!(logs.contains("hash="));
         assert!(!logs.contains(&canary));
     }
+
+    #[test]
+    fn tracing_sink_renders_none_optional_fields() {
+        let recorder = ProductionCoordinationEventRecorder::default();
+        let canary = secret_canary();
+        let logs = capture_logs(Level::TRACE, || {
+            // CoreFinding with commit_id: None, change_kind: None
+            recorder
+                .record_core_event(
+                    "none-finding-shard",
+                    OwnedCoreEvent::Finding {
+                        source: SourceKind::Fs,
+                        object_path: b"path".to_vec(),
+                        start: 0,
+                        end: 10,
+                        rule_id: 1,
+                        rule_name: "rule".to_owned(),
+                        commit_id: None,
+                        change_kind: None,
+                        confidence_score: 5,
+                    },
+                )
+                .expect("finding with None fields should succeed");
+
+            // GitCommitMeta with all four identity IDs as None
+            recorder
+                .record_git_event(
+                    "none-git-shard",
+                    StoredGitEvent::CommitMeta {
+                        commit_id: 1,
+                        oid_hex: "abc123".to_owned(),
+                        timestamp: 100,
+                        author_name_id: None,
+                        author_email_id: None,
+                        committer_name_id: None,
+                        committer_email_id: None,
+                    },
+                )
+                .expect("git commit meta with None identity IDs should succeed");
+
+            // CommitBegin with size_hint: None
+            recorder
+                .record_commit_progress(
+                    "none-progress-shard",
+                    CommitProgressRecord::Begin {
+                        write_context: write_context(),
+                        item_key: ItemKey::try_from_slice(b"item-key")
+                            .expect("item key should be valid"),
+                        size_hint: None,
+                    },
+                )
+                .expect("commit begin with None size_hint should succeed");
+        });
+
+        assert!(
+            logs.contains("none"),
+            "OptionalField::None should render as \"none\" in tracing output",
+        );
+        assert!(
+            !logs.contains(&canary),
+            "canary must not leak into tracing output",
+        );
+    }
+
+    #[test]
+    fn emit_diagnostic_routes_each_level_to_correct_tracing_level() {
+        let cases: &[(&str, &str)] = &[
+            ("error", "ERROR"),
+            ("fatal", "ERROR"),
+            ("warn", "WARN"),
+            ("warning", "WARN"),
+            ("debug", "DEBUG"),
+            ("trace", "TRACE"),
+            ("info", "INFO"),
+            ("unknown_level", "INFO"),
+        ];
+
+        for &(input_level, expected_output) in cases {
+            let recorder = ProductionCoordinationEventRecorder::default();
+            let logs = capture_logs(Level::TRACE, || {
+                recorder
+                    .record_core_event(
+                        "diag-level-shard",
+                        OwnedCoreEvent::Diagnostic {
+                            level: input_level,
+                            message: format!("msg-for-{input_level}"),
+                        },
+                    )
+                    .expect("diagnostic telemetry should be best-effort");
+            });
+
+            assert!(
+                logs.contains(expected_output),
+                "input level {input_level:?} should route to tracing level {expected_output}, \
+                 but captured logs were: {logs}",
+            );
+            assert!(
+                logs.contains("coordination_core_diagnostic"),
+                "diagnostic event name missing for input level {input_level:?}",
+            );
+        }
+    }
 }
