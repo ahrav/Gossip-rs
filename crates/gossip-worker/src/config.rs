@@ -971,6 +971,12 @@ impl RawWorkerConfig {
     }
 
     fn apply_cli_override(&mut self, name: &str, value: &str) -> Result<(), WorkerConfigError> {
+        if value.trim().is_empty() {
+            return Err(WorkerConfigError::Usage(format!(
+                "flag '--{name}' requires a non-empty value\n{}",
+                usage()
+            )));
+        }
         match name {
             "mode" => self.execution_mode = Some(value.to_owned()),
             "backend" => self.backend = Some(value.to_owned()),
@@ -1056,7 +1062,7 @@ impl RawWorkerConfig {
                         anchor_mode,
                     ),
                     budgets,
-                )))
+                )?))
             }
             ExecutionMode::Connector => {
                 let backend = backend.ok_or(WorkerConfigError::MissingRequiredValue {
