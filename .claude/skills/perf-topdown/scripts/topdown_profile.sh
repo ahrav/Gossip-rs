@@ -96,6 +96,7 @@ case "$ARCH" in
                 fi
                 echo "Recording branches with LBR..."
                 sudo perf record -o /tmp/perf-lbr.data -c 100000 -b -e cycles:u -- "$@"
+                sudo chmod a+r /tmp/perf-lbr.data
                 echo
                 echo "=== Top misprediction sites ==="
                 perf report -i /tmp/perf-lbr.data --sort symbol_from,symbol_to,mispredict --stdio --percent-limit=1.0 2>&1 | head -40
@@ -162,11 +163,13 @@ case "$ARCH" in
                 if [ ! -d /sys/bus/event_source/devices/arm_spe_0 ]; then
                     echo "SPE not available. Falling back to br_mis_pred_retired sampling..."
                     sudo perf record -e br_mis_pred_retired -c 1000 -g --call-graph dwarf -o /tmp/perf-branch.data -- "$@"
+                    sudo chmod a+r /tmp/perf-branch.data
                     echo
                     perf report -i /tmp/perf-branch.data --stdio --percent-limit=1.0 2>&1 | head -40
                 else
                     echo "Recording branch mispredictions with SPE..."
                     sudo perf record -e arm_spe/branch_filter=1,event_filter=0x80/ -o /tmp/perf-spe.data -- "$@"
+                    sudo chmod a+r /tmp/perf-spe.data
                     echo
                     echo "=== Branch misprediction hotspots ==="
                     perf report -i /tmp/perf-spe.data --stdio --percent-limit=1.0 2>&1 | head -40

@@ -91,7 +91,7 @@ simple_mode() {
     else
         warn "PGO output differs from baseline — verify this is expected"
         echo "  First difference:"
-        diff <(echo "$baseline_out") <(echo "$pgo_out") | head -5
+        diff <(echo "$baseline_out") <(echo "$pgo_out") | head -5 || true
     fi
 
     if $have_bolt; then
@@ -126,17 +126,24 @@ simple_mode() {
         escaped_args=" $(printf '%q ' "${args[@]}")"
     fi
 
+    # Escape binary paths for the same reason — paths with spaces or special
+    # characters would break hyperfine's internal shell invocation.
+    local escaped_baseline escaped_pgo escaped_bolt
+    escaped_baseline=$(printf '%q' "$baseline")
+    escaped_pgo=$(printf '%q' "$pgo_bin")
+    escaped_bolt=$(printf '%q' "$bolt_bin")
+
     if $have_bolt; then
         # 3-way comparison
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline'  "${baseline}${escaped_args}" \
-            -n 'pgo-only'  "${pgo_bin}${escaped_args}" \
-            -n 'pgo+bolt'  "${bolt_bin}${escaped_args}"
+            -n 'baseline'  "${escaped_baseline}${escaped_args}" \
+            -n 'pgo-only'  "${escaped_pgo}${escaped_args}" \
+            -n 'pgo+bolt'  "${escaped_bolt}${escaped_args}"
     else
         # 2-way comparison
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline' "${baseline}${escaped_args}" \
-            -n 'pgo-only' "${pgo_bin}${escaped_args}"
+            -n 'baseline' "${escaped_baseline}${escaped_args}" \
+            -n 'pgo-only' "${escaped_pgo}${escaped_args}"
     fi
 
     echo ""
@@ -187,15 +194,20 @@ explicit_mode() {
         escaped_args=" $(printf '%q ' "${args[@]}")"
     fi
 
+    local escaped_baseline escaped_pgo escaped_bolt
+    escaped_baseline=$(printf '%q' "$baseline")
+    escaped_pgo=$(printf '%q' "$pgo")
+    [[ -n "$bolt" ]] && escaped_bolt=$(printf '%q' "$bolt")
+
     if [[ -n "$bolt" ]]; then
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline' "${baseline}${escaped_args}" \
-            -n 'pgo-only' "${pgo}${escaped_args}" \
-            -n 'pgo+bolt' "${bolt}${escaped_args}"
+            -n 'baseline' "${escaped_baseline}${escaped_args}" \
+            -n 'pgo-only' "${escaped_pgo}${escaped_args}" \
+            -n 'pgo+bolt' "${escaped_bolt}${escaped_args}"
     else
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline' "${baseline}${escaped_args}" \
-            -n 'pgo-only' "${pgo}${escaped_args}"
+            -n 'baseline' "${escaped_baseline}${escaped_args}" \
+            -n 'pgo-only' "${escaped_pgo}${escaped_args}"
     fi
 
     echo ""

@@ -130,21 +130,20 @@ jobs:
             shared-key: stable-linux
             timeout: 15
             label: x86_64
+            extra-excludes: ""
           - os: macos-15
             shared-key: stable-macos
             timeout: 30
             label: aarch64
+            # gossip-worker tests need Docker (testcontainers) which is
+            # unavailable on macOS runners. Those tests run on x86_64/ubuntu
+            # and in the dedicated postgres/etcd CI jobs.
+            extra-excludes: "--exclude gossip-worker"
     env:
       PROPTEST_CASES: "4"
       STRESS_ITERATIONS: "20"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      # macOS runners lack Docker; install it so testcontainers can
-      # start etcd / PostgreSQL containers for gossip-worker tests.
-      - name: Set up Docker (macOS)
-        if: runner.os == 'macOS'
-        uses: docker/setup-docker-action@1a6edb0ba9ac496f6850236981f15d8f9a82254d # v5.0.0
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -165,6 +164,7 @@ jobs:
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
           --exclude gossip-coordination-etcd
+          ${{ matrix.extra-excludes }}
           --no-run
           --profile ci
 
@@ -176,6 +176,7 @@ jobs:
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
           --exclude gossip-coordination-etcd
+          ${{ matrix.extra-excludes }}
           --profile ci
 
       # nextest does not run doctests; run them separately.

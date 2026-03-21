@@ -338,7 +338,7 @@ See `references/branch-trace-cookbook.md` for detailed decode procedures.
 
 ### x86-64 Intel
 
-```
+```text
 # TMA Level 1 raw events
 topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound
 
@@ -356,7 +356,7 @@ vendor-specific names accessed through the JSON metric system).
 
 ### AArch64
 
-```
+```text
 # Topdown (N1/V1 cycle-based)
 cpu_cycles,inst_retired,stall_frontend,stall_backend,stall_backend_mem
 

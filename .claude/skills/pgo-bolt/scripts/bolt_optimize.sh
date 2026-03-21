@@ -88,7 +88,7 @@ select_perf_event() {
             if perf list 2>/dev/null | grep -q 'arm_spe'; then
                 echo "arm_spe_0/branch_filter=1,min_latency=0/"
             else
-                warn "ARM SPE not available. Using generic branch event."
+                warn "ARM SPE not available. Using generic branch event." >&2
                 echo "branches:u"
             fi
             ;;

@@ -261,7 +261,7 @@ cmd_full() {
 
     ok "=== PGO Pipeline Complete ==="
     echo "  Baseline: ${release_bin}.baseline"
-    echo "  Compare:  hyperfine './target/release/$binary.baseline <args>' './target/release/$binary <args>'"
+    echo "  Compare:  hyperfine '${release_bin}.baseline <args>' '${release_bin} <args>'"
 }
 
 # Dispatch
