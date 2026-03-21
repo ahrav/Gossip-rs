@@ -12,3 +12,4 @@
 
 pub mod config;
 pub mod production;
+pub mod recorder;

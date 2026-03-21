@@ -52,18 +52,18 @@ pub enum ProductionBootstrapError {
 impl fmt::Display for ProductionBootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DoneLedgerConnect(source) => {
-                write!(
-                    f,
-                    "failed to connect done-ledger PostgreSQL backend: {source}"
-                )
+            // Connection-error arms intentionally omit the inner source from
+            // the Display output. Driver error messages may echo DSN fragments
+            // (hostname, port, username) that the config layer redacts
+            // elsewhere. Callers that need the driver-level detail can inspect
+            // `Error::source()`.
+            Self::DoneLedgerConnect(_) => {
+                f.write_str("failed to connect done-ledger PostgreSQL backend")
             }
-            Self::FindingsConnect(source) => {
-                write!(f, "failed to connect findings PostgreSQL backend: {source}")
+            Self::FindingsConnect(_) => {
+                f.write_str("failed to connect findings PostgreSQL backend")
             }
-            Self::EtcdConnect(source) => {
-                write!(f, "failed to connect etcd coordination backend: {source}")
-            }
+            Self::EtcdConnect(_) => f.write_str("failed to connect etcd coordination backend"),
             Self::DoneLedgerMigration(source) => {
                 write!(f, "done-ledger schema migration failed: {source}")
             }
