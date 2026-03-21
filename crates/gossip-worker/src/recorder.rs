@@ -340,7 +340,9 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
 }
 
 /// Routes a diagnostic record to the tracing level matching `diagnostic_level`.
-/// Unrecognized levels default to `info!`.
+///
+/// The `"info"` level is handled by the wildcard arm along with any
+/// unrecognized level strings, both of which emit at `info!`.
 fn emit_diagnostic(
     shard_id: RedactedDigest,
     diagnostic_level: &'static str,
@@ -391,7 +393,9 @@ fn emit_diagnostic(
                 "coordination core diagnostic",
             );
         }
-        "info" | _ => {
+        // Covers both `"info"` (the common-case default) and any unrecognized
+        // level strings.
+        _ => {
             tracing::info!(
                 target: TELEMETRY_TARGET,
                 event_name = "coordination_core_diagnostic",
