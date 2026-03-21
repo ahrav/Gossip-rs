@@ -192,10 +192,10 @@ pub enum ProductionBootstrapError {
     DoneLedgerConnect(postgres::Error),
     /// Establishing the findings PostgreSQL connection failed.
     FindingsConnect(postgres::Error),
-    /// Connecting the etcd coordinator failed.
+    /// Connecting the etcd coordinator failed.  `EtcdCoordinator::connect`
+    /// validates cluster health as part of the connection handshake, so this
+    /// variant also covers unreachable-after-connect scenarios.
     EtcdConnect(EtcdCoordinatorError),
-    /// The etcd backend did not remain healthy during startup validation.
-    EtcdReadiness(EtcdCoordinatorError),
     /// The done-ledger schema is not ready for worker startup.
     DoneLedgerSchemaReadiness(ProductionSchemaReadinessError),
     /// The findings schema is not ready for worker startup.
@@ -221,12 +221,6 @@ impl fmt::Display for ProductionBootstrapError {
                 f.write_str("failed to connect findings PostgreSQL backend")
             }
             Self::EtcdConnect(_) => f.write_str("failed to connect etcd coordination backend"),
-            Self::EtcdReadiness(source) => {
-                write!(
-                    f,
-                    "etcd coordination backend failed startup readiness: {source}"
-                )
-            }
             Self::DoneLedgerSchemaReadiness(source) => write!(
                 f,
                 "done-ledger PostgreSQL schema is not ready for worker startup: {source}"
@@ -255,7 +249,6 @@ impl Error for ProductionBootstrapError {
             Self::DoneLedgerConnect(_) => None,
             Self::FindingsConnect(_) => None,
             Self::EtcdConnect(_) => None,
-            Self::EtcdReadiness(source) => Some(source),
             Self::DoneLedgerSchemaReadiness(source) => Some(source),
             Self::FindingsSchemaReadiness(source) => Some(source),
             Self::DoneLedgerAutoMigrate(source) => Some(source),
@@ -278,7 +271,6 @@ impl fmt::Debug for ProductionBootstrapError {
                 .field(&"[redacted]")
                 .finish(),
             Self::EtcdConnect(_) => f.debug_tuple("EtcdConnect").field(&"[redacted]").finish(),
-            Self::EtcdReadiness(e) => f.debug_tuple("EtcdReadiness").field(e).finish(),
             Self::DoneLedgerSchemaReadiness(e) => {
                 f.debug_tuple("DoneLedgerSchemaReadiness").field(e).finish()
             }
@@ -290,12 +282,6 @@ impl fmt::Debug for ProductionBootstrapError {
             }
             Self::FindingsAutoMigrate(e) => f.debug_tuple("FindingsAutoMigrate").field(e).finish(),
         }
-    }
-}
-
-impl From<EtcdCoordinatorError> for ProductionBootstrapError {
-    fn from(value: EtcdCoordinatorError) -> Self {
-        Self::EtcdConnect(value)
     }
 }
 
@@ -469,8 +455,8 @@ pub fn build_production_backends(
 /// # Errors
 ///
 /// Returns [`ProductionBootstrapError`] when the etcd coordinator rejects
-/// the config, etcd readiness fails, or either PostgreSQL schema does not
-/// satisfy the supplied startup policy.
+/// the config (connection includes a cluster health check) or either
+/// PostgreSQL schema does not satisfy the supplied startup policy.
 ///
 /// # Panics
 ///
@@ -489,7 +475,6 @@ pub fn build_production_backends_from_clients(
         tracing::warn!(error = %err, "etcd coordinator connection failed");
         ProductionBootstrapError::EtcdConnect(err)
     })?;
-    validate_etcd_readiness(&coordinator)?;
     prepare_done_ledger_backend(&mut done_ledger_client, startup)?;
     prepare_findings_backend(&mut findings_client, startup)?;
     let persistence = DistributedPersistence::new(
@@ -661,14 +646,6 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
         tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
         err
     })
-}
-
-/// Confirm the etcd cluster is reachable and healthy after initial connect.
-fn validate_etcd_readiness(coordinator: &EtcdCoordinator) -> Result<(), ProductionBootstrapError> {
-    coordinator
-        .status()
-        .map(|_| ())
-        .map_err(ProductionBootstrapError::EtcdReadiness)
 }
 
 /// Apply the startup policy to the done-ledger database: auto-migrate first
@@ -959,7 +936,7 @@ mod tests {
             std::io::ErrorKind::ConnectionRefused,
             "synthetic etcd failure",
         ));
-        let bootstrap: ProductionBootstrapError = inner.into();
+        let bootstrap = ProductionBootstrapError::EtcdConnect(inner);
 
         assert!(matches!(
             bootstrap,

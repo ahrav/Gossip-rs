@@ -114,8 +114,7 @@ caller
         -> connect_postgres_client(...) [done-ledger]
         -> connect_postgres_client(...) [findings]
         -> build_production_backends_from_clients(..., startup)
-           -> EtcdCoordinator::connect(...)
-           -> validate_etcd_readiness(...)
+           -> EtcdCoordinator::connect(...) [includes cluster health check]
            -> prepare_done_ledger_backend(...)
            -> prepare_findings_backend(...)
      -> distributed::run_worker(...)
