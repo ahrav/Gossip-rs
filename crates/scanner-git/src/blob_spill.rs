@@ -113,3 +113,33 @@ impl<'a> BlobSpillWriter<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BlobSpill;
+
+    #[test]
+    fn blob_spill_writer_publishes_bytes_to_reader() {
+        let dir = tempfile::tempdir().expect("create spill dir");
+        let mut spill = BlobSpill::new(dir.path(), 5).expect("create spill");
+
+        let mut writer = spill.writer();
+        writer.write(b"he").expect("write first chunk");
+        writer.write(b"llo").expect("write second chunk");
+        writer.finish().expect("finish spill");
+
+        assert_eq!(spill.as_slice(), b"hello");
+        assert_eq!(spill.len(), 5);
+    }
+
+    #[test]
+    fn blob_spill_zero_length_is_empty() {
+        let dir = tempfile::tempdir().expect("create spill dir");
+        let mut spill = BlobSpill::new(dir.path(), 0).expect("create spill");
+
+        spill.writer().finish().expect("finish empty spill");
+
+        assert!(spill.is_empty());
+        assert!(spill.as_slice().is_empty());
+    }
+}
