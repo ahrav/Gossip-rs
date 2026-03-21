@@ -1070,35 +1070,35 @@ impl fmt::Debug for RawWorkerConfig {
 }
 
 impl RawWorkerConfig {
-    fn from_env<E: EnvProvider + ?Sized>(env: &E) -> Self {
-        Self {
-            execution_mode: env.get(ENV_WORKER_MODE),
-            backend: env.get(ENV_WORKER_BACKEND),
-            source: env.get(ENV_WORKER_SOURCE),
-            path: env.get(ENV_WORKER_PATH),
-            rules_file: env.get(ENV_WORKER_RULES_FILE),
-            decode_depth: env.get(ENV_WORKER_DECODE_DEPTH),
-            scan_binary: env.get(ENV_WORKER_SCAN_BINARY),
-            skip_archives: env.get(ENV_FS_SKIP_ARCHIVES),
-            anchor_mode: env.get(ENV_WORKER_ANCHOR_MODE),
-            max_items: env.get(ENV_MAX_ITEMS),
-            max_bytes: env.get(ENV_MAX_BYTES),
-            commit_queue_capacity: env.get(ENV_COMMIT_QUEUE_CAPACITY),
-            etcd_endpoints_csv: env.get(ENV_ETCD_ENDPOINTS),
-            etcd_namespace: env.get(ENV_ETCD_NAMESPACE),
-            done_ledger_postgres_dsn: env.get(ENV_DONE_LEDGER_POSTGRES_DSN),
-            findings_postgres_dsn: env.get(ENV_FINDINGS_POSTGRES_DSN),
-            startup_schema_mode: env.get(ENV_STARTUP_SCHEMA_MODE),
-            tenant: env.get(ENV_TENANT_ID),
-            run: env.get(ENV_RUN_ID),
-            worker: env.get(ENV_WORKER_ID),
-            policy_hash: env.get(ENV_POLICY_HASH),
-            tenant_secret_key: env.get(ENV_TENANT_SECRET_KEY),
+    fn from_env<E: EnvProvider + ?Sized>(env: &E) -> Result<Self, WorkerConfigError> {
+        Ok(Self {
+            execution_mode: env.get(ENV_WORKER_MODE)?,
+            backend: env.get(ENV_WORKER_BACKEND)?,
+            source: env.get(ENV_WORKER_SOURCE)?,
+            path: env.get(ENV_WORKER_PATH)?,
+            rules_file: env.get(ENV_WORKER_RULES_FILE)?,
+            decode_depth: env.get(ENV_WORKER_DECODE_DEPTH)?,
+            scan_binary: env.get(ENV_WORKER_SCAN_BINARY)?,
+            skip_archives: env.get(ENV_FS_SKIP_ARCHIVES)?,
+            anchor_mode: env.get(ENV_WORKER_ANCHOR_MODE)?,
+            max_items: env.get(ENV_MAX_ITEMS)?,
+            max_bytes: env.get(ENV_MAX_BYTES)?,
+            commit_queue_capacity: env.get(ENV_COMMIT_QUEUE_CAPACITY)?,
+            etcd_endpoints_csv: env.get(ENV_ETCD_ENDPOINTS)?,
+            etcd_namespace: env.get(ENV_ETCD_NAMESPACE)?,
+            done_ledger_postgres_dsn: env.get(ENV_DONE_LEDGER_POSTGRES_DSN)?,
+            findings_postgres_dsn: env.get(ENV_FINDINGS_POSTGRES_DSN)?,
+            startup_schema_mode: env.get(ENV_STARTUP_SCHEMA_MODE)?,
+            tenant: env.get(ENV_TENANT_ID)?,
+            run: env.get(ENV_RUN_ID)?,
+            worker: env.get(ENV_WORKER_ID)?,
+            policy_hash: env.get(ENV_POLICY_HASH)?,
+            tenant_secret_key: env.get(ENV_TENANT_SECRET_KEY)?,
             cli_tenant_secret_key: false,
             cli_done_ledger_dsn: false,
             cli_findings_dsn: false,
             cli_etcd_endpoints: false,
-        }
+        })
     }
 
     fn apply_cli_args<I, S>(&mut self, args: I) -> Result<(), WorkerConfigError>
@@ -1245,8 +1245,14 @@ impl RawWorkerConfig {
             parse_from_str::<WorkerSource>,
         )?
         .unwrap_or(WorkerSource::Fs);
-        let path = parse_optional(self.path.as_deref(), "path", parse_path)?
-            .unwrap_or_else(|| PathBuf::from("."));
+        let path = parse_optional(self.path.as_deref(), "path", parse_path)?.unwrap_or_else(|| {
+            let default = PathBuf::from(".");
+            tracing::warn!(
+                path = %default.display(),
+                "no scan path configured; defaulting to current directory"
+            );
+            default
+        });
         let rules_file = parse_optional(self.rules_file.as_deref(), "rules_file", parse_path)?;
         let decode_depth =
             parse_optional(self.decode_depth.as_deref(), "decode_depth", parse_usize)?;
@@ -1494,7 +1500,7 @@ where
     S: Into<String>,
     E: EnvProvider + ?Sized,
 {
-    let mut raw = RawWorkerConfig::from_env(env);
+    let mut raw = RawWorkerConfig::from_env(env)?;
     raw.apply_cli_args(args)?;
     raw.resolve()
 }
@@ -1866,8 +1872,8 @@ mod tests {
     }
 
     impl EnvProvider for TestEnv {
-        fn get(&self, key: &'static str) -> Option<String> {
-            self.vars.get(key).cloned()
+        fn get(&self, key: &'static str) -> Result<Option<String>, WorkerConfigError> {
+            Ok(self.vars.get(key).cloned())
         }
     }
 

@@ -331,10 +331,12 @@ enum StartupSchemaMode {
 ```
 
 Startup policy for the production composition root. `Validate` is the
-fail-closed default: it requires etcd status plus both PostgreSQL schemas and
-migration history tables to already be ready. `DevAutoMigrate` is reserved for
-local development and integration workflows where applying embedded migrations
-at startup is acceptable.
+fail-closed default: both PostgreSQL schemas and their migration history
+tables must already exist and match the embedded checksums.
+`DevAutoMigrate` is reserved for local development and integration
+workflows where applying embedded migrations at startup is acceptable.
+The etcd cluster health check runs unconditionally regardless of schema
+mode.
 
 ### ProductionStartupSettings
 

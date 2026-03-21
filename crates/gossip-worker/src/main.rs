@@ -77,12 +77,23 @@ enum WorkerRunReport {
 
 /// Initialize the global tracing subscriber.
 ///
-/// Reads `RUST_LOG` if present, silently falls back to `info` when absent,
-/// and accepts partial/lossy directives without warning.
+/// Reads `RUST_LOG` if present and falls back to `info` when absent. When
+/// `RUST_LOG` contains invalid directives, a warning is printed to stderr
+/// (the tracing subscriber is not yet available at that point) and the
+/// filter falls back to lossy parsing so the process still starts.
 fn init_tracing() {
-    let filter = EnvFilter::builder()
+    let filter = match EnvFilter::builder()
         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
-        .from_env_lossy();
+        .from_env()
+    {
+        Ok(f) => f,
+        Err(err) => {
+            eprintln!("WARNING: malformed RUST_LOG directive ({err}); falling back to default");
+            EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy()
+        }
+    };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

@@ -216,12 +216,16 @@ impl fmt::Display for ProductionBootstrapError {
             // username) that the config layer redacts elsewhere. Both Display
             // and Error::source() suppress the inner value so that error chain
             // formatters (anyhow, eyre, tracing-error) cannot bypass redaction.
-            Self::DoneLedgerConnect(_) => {
-                f.write_str("failed to connect done-ledger PostgreSQL backend")
-            }
-            Self::FindingsConnect(_) => {
-                f.write_str("failed to connect findings PostgreSQL backend")
-            }
+            Self::DoneLedgerConnect(inner) => write!(
+                f,
+                "failed to connect done-ledger PostgreSQL backend ({})",
+                classify_pg_error(inner),
+            ),
+            Self::FindingsConnect(inner) => write!(
+                f,
+                "failed to connect findings PostgreSQL backend ({})",
+                classify_pg_error(inner),
+            ),
             Self::EtcdConnect(_) => f.write_str("failed to connect etcd coordination backend"),
             Self::DoneLedgerSchemaReadiness(source) => write!(
                 f,
@@ -500,7 +504,11 @@ pub fn build_production_backends_from_clients(
     tracing::info!(schema_mode = %startup.schema_mode(), "applying startup schema policy");
 
     let coordinator = EtcdCoordinator::connect(etcd).map_err(|err| {
-        tracing::warn!(error = %err, "etcd coordinator connection failed");
+        // Log at error level — this is a fatal startup failure. The raw error
+        // is kept at debug level to avoid leaking endpoint URLs, consistent
+        // with the PostgreSQL connection redaction strategy.
+        tracing::error!("etcd coordinator connection failed");
+        tracing::debug!(error = %err, "etcd connection diagnostic");
         ProductionBootstrapError::EtcdConnect(err)
     })?;
     prepare_done_ledger_backend(&mut done_ledger_client, startup)?;
@@ -644,6 +652,29 @@ fn log_thread_panic(backend: &str, payload: &dyn std::any::Any) {
     tracing::error!(backend, panic_message = msg, "connection thread panicked");
 }
 
+/// Classify a `postgres::Error` into a safe, DSN-free category string.
+///
+/// The returned label is safe to include in logs and error messages without
+/// risk of leaking DSN fragments (hostname, port, credentials).
+fn classify_pg_error(err: &postgres::Error) -> &'static str {
+    let msg = err.to_string();
+    if msg.contains("timed out") || msg.contains("timeout") {
+        "timeout"
+    } else if msg.contains("authentication") || msg.contains("password") {
+        "authentication failed"
+    } else if msg.contains("Connection refused") || msg.contains("connection refused") {
+        "connection refused"
+    } else if msg.contains("could not translate host name")
+        || msg.contains("Name or service not known")
+    {
+        "DNS resolution failed"
+    } else if msg.contains("SSL") || msg.contains("TLS") || msg.contains("certificate") {
+        "TLS error"
+    } else {
+        "connection failed"
+    }
+}
+
 fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     // Best-effort warning when connecting without TLS to a non-local host.
     // If host extraction fails, assume local and stay silent.
@@ -658,10 +689,12 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
 
     if has_connect_timeout(dsn) {
         return Client::connect(dsn, NoTls).map_err(|err| {
-            // Log a generic message at warn; the raw driver error may echo
-            // DSN fragments (hostname, port, username). Diagnostics are
-            // available at debug level only.
-            tracing::warn!("PostgreSQL connection failed");
+            // Log a safe category at error level; the raw driver error may
+            // echo DSN fragments so full diagnostics stay at debug level.
+            tracing::error!(
+                reason = classify_pg_error(&err),
+                "PostgreSQL connection failed"
+            );
             tracing::debug!(error = %err, "PostgreSQL connection diagnostic");
             err
         });
@@ -897,11 +930,21 @@ mod tests {
         .expect("findings migrations should succeed");
     }
 
-    fn migrated_backend_config() -> ProductionBackendConfig {
+    /// Create two test databases, migrate both, and return their DSNs.
+    ///
+    /// Callers that need to mutate schema state (corrupt checksums, delete
+    /// migration rows) before validation can connect to the returned DSNs
+    /// directly.
+    fn setup_migrated_test_dbs() -> (String, String) {
         let done_ledger_dsn = create_test_db();
         let findings_dsn = create_test_db();
         migrate_done_ledger_database(&done_ledger_dsn);
         migrate_findings_database(&findings_dsn);
+        (done_ledger_dsn, findings_dsn)
+    }
+
+    fn migrated_backend_config() -> ProductionBackendConfig {
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
         ProductionBackendConfig::new(
             test_async_coordinator_config(),
             done_ledger_dsn,
@@ -1178,10 +1221,7 @@ mod tests {
 
     #[test]
     fn validate_only_fails_when_done_ledger_checksum_mismatches() {
-        let done_ledger_dsn = create_test_db();
-        let findings_dsn = create_test_db();
-        migrate_done_ledger_database(&done_ledger_dsn);
-        migrate_findings_database(&findings_dsn);
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
         let version = DONE_LEDGER_MIGRATIONS[0].version();
         let mut client = Client::connect(&done_ledger_dsn, NoTls)
             .expect("done-ledger test database should accept connections");
@@ -1215,10 +1255,7 @@ mod tests {
 
     #[test]
     fn validate_only_fails_when_findings_checksum_mismatches() {
-        let done_ledger_dsn = create_test_db();
-        let findings_dsn = create_test_db();
-        migrate_done_ledger_database(&done_ledger_dsn);
-        migrate_findings_database(&findings_dsn);
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
         let version = FINDINGS_MIGRATIONS[0].version();
         let mut client = Client::connect(&findings_dsn, NoTls)
             .expect("findings test database should accept connections");
@@ -1252,11 +1289,7 @@ mod tests {
 
     #[test]
     fn validate_only_fails_when_done_ledger_checksum_is_corrupted() {
-        let done_ledger_dsn = create_test_db();
-        let findings_dsn = create_test_db();
-        migrate_done_ledger_database(&done_ledger_dsn);
-        migrate_findings_database(&findings_dsn);
-
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
         let version = DONE_LEDGER_MIGRATIONS[0].version();
         let mut client = Client::connect(&done_ledger_dsn, NoTls)
             .expect("done-ledger test database should accept connections");
@@ -1296,6 +1329,44 @@ mod tests {
                 ProductionSchemaReadinessError::CorruptedAppliedMigration { found_len: 16, .. }
             )
         ));
+    }
+
+    #[test]
+    fn validate_only_fails_when_done_ledger_migration_row_is_missing() {
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
+        let version = DONE_LEDGER_MIGRATIONS[0].version();
+        let mut client = Client::connect(&done_ledger_dsn, NoTls)
+            .expect("done-ledger test database should accept connections");
+        client
+            .execute(
+                "DELETE FROM done_ledger_schema_migrations WHERE version = $1",
+                &[&version],
+            )
+            .expect("migration row deletion should succeed");
+
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must reject missing migration history rows");
+
+        assert!(
+            matches!(
+                error,
+                ProductionBootstrapError::DoneLedgerSchemaReadiness(
+                    ProductionSchemaReadinessError::MissingAppliedMigration {
+                        history_table,
+                        version: found_version,
+                    }
+                ) if history_table == done_ledger_schema::SCHEMA_MIGRATIONS_TABLE
+                  && found_version == version
+            ),
+            "expected MissingAppliedMigration for {version}, got {error:?}"
+        );
     }
 
     #[test]
@@ -1612,16 +1683,12 @@ mod tests {
 
     #[test]
     fn validate_only_fails_when_done_ledger_checksum_is_truncated() {
-        let done_ledger_dsn = create_test_db();
-        let findings_dsn = create_test_db();
-        migrate_done_ledger_database(&done_ledger_dsn);
-        migrate_findings_database(&findings_dsn);
-
+        let (done_ledger_dsn, findings_dsn) = setup_migrated_test_dbs();
         let version = DONE_LEDGER_MIGRATIONS[0].version();
         let mut client = Client::connect(&done_ledger_dsn, NoTls)
             .expect("done-ledger test database should accept connections");
 
-        // Drop the inline CHECK constraint so we can insert a truncated
+        // Drop the inline CHECK constraint so we can insert an empty
         // checksum that would normally be rejected by the schema.
         client
             .batch_execute(
@@ -1637,9 +1704,9 @@ mod tests {
         client
             .execute(
                 "UPDATE done_ledger_schema_migrations SET checksum = $1 WHERE version = $2",
-                &[&vec![0_u8; 16], &version],
+                &[&vec![0_u8; 0], &version],
             )
-            .expect("truncated checksum update should succeed");
+            .expect("empty checksum update should succeed");
 
         let config = ProductionBackendConfig::new(
             test_async_coordinator_config(),
@@ -1649,16 +1716,16 @@ mod tests {
         .expect("backend config should be valid");
 
         let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
-            .expect_err("validate-only boot must reject a truncated done-ledger checksum");
+            .expect_err("validate-only boot must reject an empty done-ledger checksum");
 
         assert!(
             matches!(
                 error,
                 ProductionBootstrapError::DoneLedgerSchemaReadiness(
-                    ProductionSchemaReadinessError::CorruptedAppliedMigration { found_len: 16, .. }
+                    ProductionSchemaReadinessError::CorruptedAppliedMigration { found_len: 0, .. }
                 )
             ),
-            "expected CorruptedAppliedMigration with 16 bytes, got {error:?}"
+            "expected CorruptedAppliedMigration with 0 bytes, got {error:?}"
         );
     }
 }
