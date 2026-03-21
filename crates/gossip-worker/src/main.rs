@@ -8,10 +8,10 @@
 
 use std::fmt;
 
-use gossip_scanner_runtime::{scan_fs, scan_git, ScanRuntimeError};
+use gossip_scanner_runtime::{ScanRuntimeError, scan_fs, scan_git};
 use gossip_worker::config::{
-    resolve_worker_config_from_env_and_args, DistributedWorkerConfig, LocalWorkerConfig,
-    ResolvedWorkerConfig, WorkerSourceSettings,
+    DistributedWorkerConfig, LocalWorkerConfig, ResolvedWorkerConfig, WorkerSourceSettings,
+    resolve_worker_config_from_env_and_args,
 };
 use gossip_worker::production::run_production_worker;
 use tracing_subscriber::EnvFilter;

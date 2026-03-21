@@ -721,7 +721,7 @@ mod tests {
         let error = build_production_backends(&config)
             .expect_err("unreachable etcd endpoint should fail startup");
 
-         assert!(
+        assert!(
             matches!(error, ProductionBootstrapError::EtcdConnect(_)),
             "expected typed etcd startup error, got {error:?}"
         );
