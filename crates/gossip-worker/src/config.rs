@@ -417,7 +417,9 @@ impl LocalWorkerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerConfigError`] when `max_items` or `max_bytes` is zero.
+    /// Returns [`WorkerConfigError`] when `max_items` or `max_bytes` is zero,
+    /// or when either value exceeds the configured validation ceiling
+    /// (`max_items` > 10,000,000 or `max_bytes` > 64 GiB).
     pub fn new(
         execution_mode: ExecutionMode,
         source: WorkerSourceSettings,
@@ -1186,9 +1188,15 @@ impl RawWorkerConfig {
             parse_optional(self.decode_depth.as_deref(), "decode_depth", parse_usize)?;
         let scan_binary = parse_optional(self.scan_binary.as_deref(), "scan_binary", parse_bool)?
             .unwrap_or(false);
-        let skip_archives =
+        // skip_archives is only meaningful for filesystem scans. Defer
+        // parsing so an invalid value in the environment does not reject
+        // git launches where the option is irrelevant.
+        let skip_archives = if source == WorkerSource::Fs {
             parse_optional(self.skip_archives.as_deref(), "skip_archives", parse_bool)?
-                .unwrap_or(false);
+                .unwrap_or(false)
+        } else {
+            false
+        };
         let anchor_mode = parse_optional(
             self.anchor_mode.as_deref(),
             "anchor_mode",
@@ -2610,5 +2618,17 @@ mod tests {
             }
             other => panic!("expected local git config, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_skip_archives_does_not_reject_git_launches() {
+        let env = TestEnv::default()
+            .with(ENV_WORKER_MODE, "direct")
+            .with(ENV_FS_SKIP_ARCHIVES, "maybe");
+        let result = resolve_worker_config_from(["git", "/some/path"], &env);
+        assert!(
+            result.is_ok(),
+            "invalid skip_archives must not reject git launches: {result:?}"
+        );
     }
 }

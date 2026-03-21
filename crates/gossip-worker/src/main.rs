@@ -211,8 +211,11 @@ mod tests {
     #[test]
     fn local_worker_scans_filesystem_path() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), "password=xK9mP2qL7wN4vR8t")
-            .expect("write fixture");
+        fs::write(
+            dir.path().join("sample.txt"),
+            "fixture-local-worker-content",
+        )
+        .expect("write fixture");
 
         let cfg = LocalWorkerConfig::new(
             ExecutionMode::Connector,
@@ -233,7 +236,8 @@ mod tests {
     fn local_worker_scans_git_repo_path() {
         let dir = tempdir().expect("tempdir");
         create_git_repo(dir.path());
-        fs::write(dir.path().join("secret.txt"), "token=aB3dE5fG7hJ9kL1m").expect("write fixture");
+        fs::write(dir.path().join("sample.txt"), "fixture-git-worker-content")
+            .expect("write fixture");
         run_git(dir.path(), &["add", "."]);
         run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
 
