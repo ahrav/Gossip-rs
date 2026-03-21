@@ -127,6 +127,8 @@ fn log_distributed_report(
     cfg: &DistributedWorkerConfig,
     report: gossip_scanner_runtime::distributed::DistributedRunReport,
 ) {
+    // `DistributedWorkerConfig` is type-constrained to `FsSourceSettings`,
+    // so source is always "fs" and mode is always `Connector`.
     tracing::info!(
         backend = "production",
         source = "fs",
