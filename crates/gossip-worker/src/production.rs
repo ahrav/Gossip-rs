@@ -1,7 +1,7 @@
 //! Production composition root for the distributed worker.
 //!
 //! This module is the thin outer layer that binds the generic distributed
-//! runtime to the real infrastructure backends used by MVP-A:
+//! runtime to the real infrastructure backends used in production:
 //!
 //! - [`gossip_coordination_etcd::EtcdCoordinator`]
 //! - [`gossip_done_ledger_postgres::DoneLedgerPg`]
@@ -12,7 +12,7 @@
 //! classification.
 //!
 //! The DSN-based convenience constructor in this module uses
-//! [`postgres::NoTls`]. That is appropriate for local MVP-A deployments and
+//! [`postgres::NoTls`]. That is appropriate for local deployments and
 //! integration tests where the worker talks to a trusted local PostgreSQL
 //! instance. Callers that need TLS or custom PostgreSQL connection handling
 //! should connect clients themselves and use
@@ -22,8 +22,8 @@ use std::error::Error;
 use std::fmt;
 
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
-use gossip_done_ledger_postgres::DoneLedgerPg;
-use gossip_findings_postgres::FindingsSinkPg;
+use gossip_done_ledger_postgres::{DoneLedgerPg, DoneLedgerPgError};
+use gossip_findings_postgres::{FindingsPgError, FindingsSinkPg};
 use gossip_scanner_runtime::distributed::{
     DistributedPersistence, DistributedRunReport, DistributedRuntimeConfig,
     DistributedRuntimeError, WorkerIdentity, run_worker,
@@ -137,8 +137,8 @@ impl Error for ProductionBackendConfigError {}
 
 /// Typed startup failures for the production composition root.
 ///
-/// Every variant is fail-closed. No branch falls back to in-memory
-/// coordination, in-memory persistence, or a no-op commit path.
+/// Each variant identifies which backend connection or migration step
+/// failed during construction.
 #[derive(Debug)]
 pub enum ProductionBootstrapError {
     /// Establishing the done-ledger PostgreSQL connection failed.
@@ -147,6 +147,10 @@ pub enum ProductionBootstrapError {
     FindingsConnect(postgres::Error),
     /// Connecting the etcd coordinator failed.
     EtcdConnect(EtcdCoordinatorError),
+    /// Done-ledger schema migration failed after a successful connection.
+    DoneLedgerMigration(DoneLedgerPgError),
+    /// Findings schema migration failed after a successful connection.
+    FindingsMigration(FindingsPgError),
 }
 
 impl fmt::Display for ProductionBootstrapError {
@@ -164,6 +168,12 @@ impl fmt::Display for ProductionBootstrapError {
             Self::EtcdConnect(source) => {
                 write!(f, "failed to connect etcd coordination backend: {source}")
             }
+            Self::DoneLedgerMigration(source) => {
+                write!(f, "done-ledger schema migration failed: {source}")
+            }
+            Self::FindingsMigration(source) => {
+                write!(f, "findings schema migration failed: {source}")
+            }
         }
     }
 }
@@ -174,6 +184,8 @@ impl Error for ProductionBootstrapError {
             Self::DoneLedgerConnect(source) => Some(source),
             Self::FindingsConnect(source) => Some(source),
             Self::EtcdConnect(source) => Some(source),
+            Self::DoneLedgerMigration(source) => Some(source),
+            Self::FindingsMigration(source) => Some(source),
         }
     }
 }
@@ -240,7 +252,6 @@ impl ProductionRuntimeBackends {
 
     /// Borrow the live etcd coordinator mutably.
     #[inline]
-    #[must_use]
     pub fn coordinator_mut(&mut self) -> &mut EtcdCoordinator {
         &mut self.coordinator
     }
@@ -254,7 +265,6 @@ impl ProductionRuntimeBackends {
 
     /// Borrow the live PostgreSQL persistence handles mutably.
     #[inline]
-    #[must_use]
     pub fn persistence_mut(&mut self) -> &mut DistributedPersistence<FindingsSinkPg, DoneLedgerPg> {
         &mut self.persistence
     }
@@ -285,10 +295,13 @@ impl ProductionRuntimeBackends {
     }
 }
 
-/// Build the real backend bundle from the DSN-based MVP-A config path.
+/// Build the real backend bundle from a DSN-based config.
 ///
 /// This helper uses [`postgres::NoTls`]. Callers that need TLS or custom
 /// connection setup should use [`build_production_backends_from_clients`].
+///
+/// Every code path is fail-closed: no branch falls back to in-memory
+/// coordination, in-memory persistence, or a no-op commit path.
 ///
 /// # Errors
 ///
@@ -305,27 +318,40 @@ impl ProductionRuntimeBackends {
 /// # Panics
 ///
 /// Panics if called from within an active Tokio runtime.
-/// [`EtcdCoordinator::connect`] uses a single-threaded runtime internally
-/// and `block_on` within an existing runtime deadlocks.
+/// [`EtcdCoordinator::connect`] asserts that no Tokio runtime is active
+/// before building its own single-threaded runtime.
 pub fn build_production_backends(
     config: &ProductionBackendConfig,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
+    // Connect etcd first — it is the most likely to fail in misconfigured
+    // environments, and this avoids opening Postgres connections that would
+    // be immediately discarded on etcd failure.
+    let coordinator = EtcdCoordinator::connect(config.etcd().clone())
+        .map_err(ProductionBootstrapError::EtcdConnect)?;
+
     let done_ledger_client = connect_postgres_client(config.done_ledger_postgres_dsn())
         .map_err(ProductionBootstrapError::DoneLedgerConnect)?;
     let findings_client = connect_postgres_client(config.findings_postgres_dsn())
         .map_err(ProductionBootstrapError::FindingsConnect)?;
 
-    build_production_backends_from_clients(
-        config.etcd().clone(),
-        done_ledger_client,
-        findings_client,
-    )
+    let persistence = DistributedPersistence::new(
+        FindingsSinkPg::from_client(findings_client),
+        DoneLedgerPg::from_client(done_ledger_client),
+    );
+
+    Ok(ProductionRuntimeBackends {
+        coordinator,
+        persistence,
+    })
 }
 
 /// Build the real backend bundle from already-connected PostgreSQL clients.
 ///
 /// This is the preferred constructor when the caller needs TLS, custom socket
 /// options, or connection pooling policy outside this crate.
+///
+/// Every code path is fail-closed: no branch falls back to in-memory
+/// coordination, in-memory persistence, or a no-op commit path.
 ///
 /// # Errors
 ///
@@ -342,8 +368,8 @@ pub fn build_production_backends(
 /// # Panics
 ///
 /// Panics if called from within an active Tokio runtime.
-/// [`EtcdCoordinator::connect`] uses a single-threaded runtime internally
-/// and `block_on` within an existing runtime deadlocks.
+/// [`EtcdCoordinator::connect`] asserts that no Tokio runtime is active
+/// before building its own single-threaded runtime.
 pub fn build_production_backends_from_clients(
     etcd: EtcdCoordinatorConfig,
     done_ledger_client: Client,
@@ -364,34 +390,74 @@ pub fn build_production_backends_from_clients(
 
 /// Production worker entrypoint for the real backend path.
 ///
+/// Connects the real backends, applies schema migrations on both PostgreSQL
+/// databases (idempotent and concurrency-safe), then delegates to the generic
+/// distributed runtime.
+///
 /// This function never falls back to in-memory doubles or the CLI no-op commit
 /// path. Either the real backends are built successfully and the generic
 /// distributed runtime runs, or the function returns a typed error.
 ///
+/// Callers that need to separate migration from execution (e.g., dedicated
+/// migration tooling or staged rollouts) should use
+/// [`build_production_backends`] directly and manage the migration step
+/// themselves.
+///
 /// # Errors
 ///
-/// Returns [`ProductionWorkerError::Startup`] when backend construction fails
-/// before any shard work begins, or [`ProductionWorkerError::Runtime`] when
-/// the generic distributed worker loop fails after startup succeeds.
+/// Returns [`ProductionWorkerError::Startup`] when backend construction or
+/// schema migration fails before any shard work begins, or
+/// [`ProductionWorkerError::Runtime`] when the generic distributed worker
+/// loop fails after startup succeeds.
 ///
 /// # Panics
 ///
 /// Panics if called from within an active Tokio runtime.
-/// [`EtcdCoordinator::connect`] uses a single-threaded runtime internally
-/// and `block_on` within an existing runtime deadlocks.
+/// [`EtcdCoordinator::connect`] asserts that no Tokio runtime is active
+/// before building its own single-threaded runtime.
 pub fn run_production_worker(
     config: &ProductionBackendConfig,
     identity: WorkerIdentity,
     runtime: DistributedRuntimeConfig,
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
     let backends = build_production_backends(config)?;
+
+    // Apply schema migrations before any shard work. Both calls are
+    // idempotent and serialized by advisory locks, so concurrent workers
+    // converge safely.
+    backends
+        .persistence()
+        .done_ledger
+        .apply_migrations()
+        .map_err(|e| {
+            ProductionWorkerError::Startup(ProductionBootstrapError::DoneLedgerMigration(e))
+        })?;
+    backends
+        .persistence()
+        .findings_sink
+        .apply_migrations()
+        .map_err(|e| {
+            ProductionWorkerError::Startup(ProductionBootstrapError::FindingsMigration(e))
+        })?;
+
     backends
         .run(identity, runtime)
         .map_err(ProductionWorkerError::Runtime)
 }
 
+/// Default TCP-level connect timeout (seconds) injected when the caller DSN
+/// does not include an explicit `connect_timeout` parameter. Without this
+/// fallback the `postgres` crate defaults to *no timeout*, which can block
+/// the calling thread for minutes on an unreachable host.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 30;
+
 fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
-    Client::connect(dsn, NoTls)
+    if dsn.contains("connect_timeout") {
+        Client::connect(dsn, NoTls)
+    } else {
+        let timed = format!("{dsn} connect_timeout={DEFAULT_CONNECT_TIMEOUT_SECS}");
+        Client::connect(&timed, NoTls)
+    }
 }
 
 #[cfg(test)]
@@ -561,7 +627,12 @@ mod tests {
             .findings_sink
             .validate_connection(Duration::from_secs(1))
             .expect("findings connection should remain usable after bootstrap");
-        let _ = backends.coordinator_mut();
+
+        // Verify mutable access compiles and does not panic.
+        assert!(
+            !format!("{:?}", backends.coordinator_mut()).is_empty(),
+            "mutable coordinator borrow should produce non-empty Debug output"
+        );
     }
 
     #[test]
