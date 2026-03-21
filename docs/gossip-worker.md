@@ -137,7 +137,10 @@ paths, git identity bytes, and diagnostic text. Before emission, the recorder
 converts every event into a `SanitizedCoordinationRecord` where all such
 toxic fields are replaced by `RedactedDigest` values. A `RedactedDigest`
 stores `(original_length, 64-bit BLAKE3 hash)` -- enough to correlate
-records and gauge payload size, but non-reversible. The hash is
+records across workers and gauge payload size without exposing raw bytes.
+The digest is a deterministic correlation token, not a cryptographic
+secrecy mechanism: the derive-key context is public, so low-entropy fields
+are theoretically brute-forceable by someone with log access. The hash is
 domain-separated by a fixed derive-key context and further keyed by a
 field-level label (e.g. `"shard_id"`, `"item_key"`), so identical byte
 sequences in different field positions produce distinct digests.
@@ -385,10 +388,12 @@ pub(crate) struct RedactedDigest {
 }
 ```
 
-`Copy` type storing `(original_length, 64-bit BLAKE3 hash)`. Non-reversible.
-The hash uses BLAKE3 derive-key mode with a fixed domain context, and the
-update stream includes a field-level label so identical payloads in different
-field positions produce distinct digests. Display format:
+`Copy` type storing `(original_length, 64-bit BLAKE3 hash)`. A deterministic
+correlation token that prevents inadvertent exposure of raw field values in
+telemetry; not a cryptographic secrecy mechanism (the derive-key context is
+public). The hash uses BLAKE3 derive-key mode with a fixed domain context,
+and the update stream includes a field-level label so identical payloads in
+different field positions produce distinct digests. Display format:
 `len=<n>,hash=<016x>`.
 
 ### CoordinationTelemetrySink
@@ -464,7 +469,7 @@ The recorder module checks:
 - `redacted_digest_distinguishes_same_length_inputs_and_field_labels` --
   verifies that same-length inputs with different content produce distinct
   hashes, and that identical content under different field labels produces
-  distinct hashes (collision resistance across the label/payload domain)
+  distinct hashes (digest separation across the label/payload domain)
 - `sanitized_records_hash_toxic_fields` -- exhaustive variant coverage
   confirming every toxic field across all eight `SanitizedCoordinationRecord`
   variants is replaced by a `RedactedDigest` that does not contain the raw input
