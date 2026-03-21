@@ -58,10 +58,12 @@ case "$ARCH" in
                     "$@" 2>&1 | tee /tmp/topdown-quick.log
                 echo
                 echo "=== Derived Metrics ==="
-                # Extract cycles and instructions for CPI
-                CYCLES=$(grep -m1 "cycles" /tmp/topdown-quick.log 2>/dev/null | awk '{print $1}' | tr -d ',.' || echo "")
-                INSTR=$(grep -m1 "instructions" /tmp/topdown-quick.log 2>/dev/null | awk '{print $1}' | tr -d ',.' || echo "")
-                if [ -n "$CYCLES" ] && [ -n "$INSTR" ] && [ "$INSTR" -gt 0 ] 2>/dev/null; then
+                # Extract cycles and instructions for CPI.
+                # `perf stat` formats counts with commas as thousands separators
+                # (e.g. 1,234,567). Strip commas only; event counts are integers.
+                CYCLES=$(grep -m1 "cycles" /tmp/topdown-quick.log 2>/dev/null | awk '{gsub(/,/,""); print $1}' || echo "")
+                INSTR=$(grep -m1 "instructions" /tmp/topdown-quick.log 2>/dev/null | awk '{gsub(/,/,""); print $1}' || echo "")
+                if [[ -n "$CYCLES" && "$CYCLES" =~ ^[0-9]+$ && -n "$INSTR" && "$INSTR" =~ ^[0-9]+$ && "$INSTR" -gt 0 ]]; then
                     CPI=$(awk "BEGIN {printf \"%.2f\", $CYCLES / $INSTR}")
                     echo "  CPI: $CPI"
                     if (( $(awk "BEGIN {print ($CPI > 1.0)}") )); then
@@ -79,16 +81,16 @@ case "$ARCH" in
                 else
                     echo
                     echo "[Fallback] --topdown not supported. Trying -M TopdownL1..."
-                    if ! perf stat -M TopdownL1 -- "$@" 2>&1; then
+                    if ! sudo perf stat -M TopdownL1 -- "$@" 2>&1; then
                         echo "[Fallback] Trying AMD -M PipelineL1..."
-                        perf stat -M PipelineL1 -- "$@" 2>&1 || echo "Error: No topdown support found. Check kernel version (need 4.8+ for Intel, 6.2+ for AMD)."
+                        sudo perf stat -M PipelineL1 -- "$@" 2>&1 || echo "Error: No topdown support found. Check kernel version (need 4.8+ for Intel, 6.2+ for AMD)."
                     fi
                 fi
                 ;;
             branches)
                 echo "[x86-64] LBR branch recording"
-                # Check LBR availability
-                if ! perf record -b -e cycles:u -- sleep 0.01 2>/dev/null; then
+                # Check LBR availability (with sudo, matching the actual recording).
+                if ! sudo perf record -b -e cycles:u -- sleep 0.01 2>/dev/null; then
                     echo "Error: LBR not available (common in VMs/cloud). Use BOLT instrumentation instead."
                     exit 1
                 fi
@@ -127,9 +129,9 @@ case "$ARCH" in
                     "$@" 2>&1 | tee /tmp/topdown-quick.log
                 echo
                 echo "=== Derived Metrics ==="
-                CYCLES=$(grep -m1 "cpu_cycles" /tmp/topdown-quick.log 2>/dev/null | awk '{print $1}' | tr -d ',.' || echo "")
-                INSTR=$(grep -m1 "inst_retired" /tmp/topdown-quick.log 2>/dev/null | awk '{print $1}' | tr -d ',.' || echo "")
-                if [ -n "$CYCLES" ] && [ -n "$INSTR" ] && [ "$INSTR" -gt 0 ] 2>/dev/null; then
+                CYCLES=$(grep -m1 "cpu_cycles" /tmp/topdown-quick.log 2>/dev/null | awk '{gsub(/,/,""); print $1}' || echo "")
+                INSTR=$(grep -m1 "inst_retired" /tmp/topdown-quick.log 2>/dev/null | awk '{gsub(/,/,""); print $1}' || echo "")
+                if [[ -n "$CYCLES" && "$CYCLES" =~ ^[0-9]+$ && -n "$INSTR" && "$INSTR" =~ ^[0-9]+$ && "$INSTR" -gt 0 ]]; then
                     CPI=$(awk "BEGIN {printf \"%.2f\", $CYCLES / $INSTR}")
                     echo "  CPI: $CPI"
                     if (( $(awk "BEGIN {print ($CPI > 1.0)}") )); then

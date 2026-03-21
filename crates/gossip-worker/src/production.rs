@@ -431,14 +431,20 @@ pub fn build_production_backends(
     let dl_handle = std::thread::spawn(move || connect_postgres_client(&dl_dsn));
     let f_handle = std::thread::spawn(move || connect_postgres_client(&f_dsn));
 
-    let done_ledger_client = dl_handle
+    // Join both threads before propagating errors. If only the first result
+    // were inspected with `?`, an early return would drop the second
+    // `JoinHandle`, detaching a thread that may still be blocked in
+    // `Client::connect`. Under repeated startup retries the leaked threads
+    // accumulate and consume process resources.
+    let dl_result = dl_handle
         .join()
-        .expect("done-ledger connection thread should not panic")
-        .map_err(ProductionBootstrapError::DoneLedgerConnect)?;
-    let findings_client = f_handle
+        .expect("done-ledger connection thread should not panic");
+    let f_result = f_handle
         .join()
-        .expect("findings connection thread should not panic")
-        .map_err(ProductionBootstrapError::FindingsConnect)?;
+        .expect("findings connection thread should not panic");
+
+    let done_ledger_client = dl_result.map_err(ProductionBootstrapError::DoneLedgerConnect)?;
+    let findings_client = f_result.map_err(ProductionBootstrapError::FindingsConnect)?;
 
     build_production_backends_from_clients(
         config.etcd().clone(),
@@ -708,6 +714,11 @@ fn validate_schema_readiness(
     migrations: &[EmbeddedMigration],
     history_table: &'static str,
 ) -> Result<(), ProductionSchemaReadinessError> {
+    debug_assert!(
+        expected_tables.contains(&history_table),
+        "history_table '{history_table}' must be included in expected_tables \
+         so that a missing table produces MissingTable, not a raw Query error"
+    );
     ensure_expected_tables_exist(client, expected_tables)?;
     let required = migrations
         .iter()
@@ -751,6 +762,14 @@ fn ensure_expected_tables_exist(
 /// reducing round trips from N to 1. Detects missing migrations, truncated
 /// checksums, and checksum drift from out-of-band schema edits.
 ///
+/// **Forward-compatibility**: the check is intentionally one-directional.
+/// Extra rows in the history table (migrations applied by a newer binary)
+/// are ignored. This allows rolling deployments where an updated worker
+/// applies new migrations while older workers still pass validation against
+/// their known set. If strict version pinning is ever needed, add a
+/// separate `UnexpectedMigration` variant; do not change this function's
+/// contract without considering the rolling-deploy impact.
+///
 /// **Precondition:** the history table must already exist. Callers should
 /// run [`ensure_expected_tables_exist`] first; calling this function against
 /// a missing table produces a [`ProductionSchemaReadinessError::Query`]
@@ -765,6 +784,11 @@ fn ensure_migration_history_ready(
     }
 
     let versions: Vec<&str> = required_migrations.iter().map(|(v, _)| *v).collect();
+    // SAFETY (sql-injection): `history_table` is `&'static str`, so only
+    // compile-time string literals can reach this interpolation — no runtime
+    // input path exists. Both call sites pass module-level constants
+    // (`done_ledger_schema::SCHEMA_MIGRATIONS_TABLE` and
+    //  `findings_schema::SCHEMA_MIGRATIONS_TABLE`).
     let rows = client.query(
         &format!("SELECT version, checksum FROM {history_table} WHERE version = ANY($1)"),
         &[&versions],

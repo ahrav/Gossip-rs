@@ -118,17 +118,25 @@ simple_mode() {
         hyperfine_args+=(--export-json "$EXPORT_JSON")
     fi
 
+    # Escape arguments for safe interpolation into hyperfine command strings.
+    # Without escaping, arguments containing spaces or shell metacharacters
+    # would break when hyperfine passes them to its internal shell.
+    local escaped_args=""
+    if [[ ${#args[@]} -gt 0 ]]; then
+        escaped_args=" $(printf '%q ' "${args[@]}")"
+    fi
+
     if $have_bolt; then
         # 3-way comparison
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline'  "$baseline ${args[*]:-}" \
-            -n 'pgo-only'  "$pgo_bin ${args[*]:-}" \
-            -n 'pgo+bolt'  "$bolt_bin ${args[*]:-}"
+            -n 'baseline'  "${baseline}${escaped_args}" \
+            -n 'pgo-only'  "${pgo_bin}${escaped_args}" \
+            -n 'pgo+bolt'  "${bolt_bin}${escaped_args}"
     else
         # 2-way comparison
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline' "$baseline ${args[*]:-}" \
-            -n 'pgo-only' "$pgo_bin ${args[*]:-}"
+            -n 'baseline' "${baseline}${escaped_args}" \
+            -n 'pgo-only' "${pgo_bin}${escaped_args}"
     fi
 
     echo ""
@@ -174,15 +182,20 @@ explicit_mode() {
         hyperfine_args+=(--export-json "$EXPORT_JSON")
     fi
 
+    local escaped_args=""
+    if [[ ${#args[@]} -gt 0 ]]; then
+        escaped_args=" $(printf '%q ' "${args[@]}")"
+    fi
+
     if [[ -n "$bolt" ]]; then
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline' "$baseline ${args[*]:-}" \
-            -n 'pgo-only' "$pgo ${args[*]:-}" \
-            -n 'pgo+bolt' "$bolt ${args[*]:-}"
+            -n 'baseline' "${baseline}${escaped_args}" \
+            -n 'pgo-only' "${pgo}${escaped_args}" \
+            -n 'pgo+bolt' "${bolt}${escaped_args}"
     else
         hyperfine "${hyperfine_args[@]}" \
-            -n 'baseline' "$baseline ${args[*]:-}" \
-            -n 'pgo-only' "$pgo ${args[*]:-}"
+            -n 'baseline' "${baseline}${escaped_args}" \
+            -n 'pgo-only' "${pgo}${escaped_args}"
     fi
 
     echo ""

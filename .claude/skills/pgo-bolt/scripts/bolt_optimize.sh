@@ -138,7 +138,7 @@ cmd_profile() {
 
     local sample_count
     sample_count=$(perf report -i "$BOLT_DATA_DIR/perf.data" --stdio 2>&1 | grep -c 'Event count' || echo "unknown")
-    ok "Profile collected: $BOLT_DATA_DIR/perf.data"
+    ok "Profile collected: $BOLT_DATA_DIR/perf.data (events: $sample_count)"
     info "Run 'bolt_optimize.sh convert <binary>' to convert to BOLT format."
 }
 
@@ -216,7 +216,7 @@ cmd_apply() {
     size_before=$(stat --format='%s' "$binary" 2>/dev/null || stat -f'%z' "$binary")
     size_after=$(stat --format='%s' "$output" 2>/dev/null || stat -f'%z' "$output")
     local pct
-    pct=$(echo "scale=1; ($size_after - $size_before) * 100 / $size_before" | bc)
+    pct=$(awk "BEGIN {printf \"%.1f\", ($size_after - $size_before) * 100 / $size_before}")
 
     ok "BOLT optimization complete!"
     echo "  Before: $(numfmt --to=iec "$size_before" 2>/dev/null || echo "$size_before bytes")"

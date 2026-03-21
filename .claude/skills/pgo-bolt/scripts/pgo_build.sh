@@ -228,13 +228,31 @@ cmd_full() {
     info "Profile dir: $PGO_DATA_DIR"
     echo ""
 
+    # Save a baseline copy before instrumentation so verify_improvement.sh
+    # can compare against the unoptimized build.
+    local target_triple
+    target_triple=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
+    local release_bin="./target/${target_triple}/release/$binary"
+    if [[ ! -x "$release_bin" ]]; then
+        release_bin="./target/release/$binary"
+    fi
+    if [[ -x "$release_bin" ]]; then
+        cp "$release_bin" "${release_bin}.baseline"
+        ok "Baseline saved: ${release_bin}.baseline"
+    else
+        warn "No existing release binary found — skipping baseline save."
+        warn "Build a release binary first if you need an A/B comparison."
+    fi
+    echo ""
+
     cmd_instrument "$binary"
     echo ""
 
     info "Running workload 3 times for profile diversity..."
     for i in 1 2 3; do
         info "Run $i/3..."
-        eval "LLVM_PROFILE_FILE='$PGO_DATA_DIR/run-$i-%p-%m.profraw' $workload" || true
+        LLVM_PROFILE_FILE="$PGO_DATA_DIR/run-$i-%p-%m.profraw" \
+            bash -c "$workload" || true
     done
     echo ""
 
@@ -242,7 +260,7 @@ cmd_full() {
     echo ""
 
     ok "=== PGO Pipeline Complete ==="
-    echo "  Baseline: save current binary before re-running"
+    echo "  Baseline: ${release_bin}.baseline"
     echo "  Compare:  hyperfine './target/release/$binary.baseline <args>' './target/release/$binary <args>'"
 }
 

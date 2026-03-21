@@ -70,7 +70,7 @@ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 ```
 
 **Graviton note**: AWS Graviton processors run at fixed frequency with no
-turbo/boost control. Steps 2 is unnecessary; steps 1, 3-6 still apply.
+turbo/boost control. Step 2 is unnecessary; steps 1, 3-6 still apply.
 
 ---
 
