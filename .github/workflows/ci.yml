@@ -638,8 +638,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Kani verifies all #[kani::proof] harnesses per crate.
-      # 90 total proofs across 4 crates.
-      - name: Kani — gossip-stdx (64 proofs)
+      # 97 total proofs across 4 crates.
+      - name: Kani — gossip-stdx (71 proofs)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           args: --package gossip-stdx --features kani
