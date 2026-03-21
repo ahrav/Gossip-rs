@@ -1450,6 +1450,7 @@ dependencies = [
  "gossip-pg-common",
  "gossip-scanner-runtime",
  "postgres",
+ "scanner-scheduler",
  "tempfile",
  "tracing",
  "tracing-subscriber",
