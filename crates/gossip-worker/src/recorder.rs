@@ -19,7 +19,8 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use gossip_contracts::identity::{domain_hasher, finalize_64};
+use gossip_contracts::identity::domain::COORDINATION_TELEMETRY_V1;
+use gossip_contracts::identity::finalize_64;
 use gossip_scanner_runtime::OwnedCoreEvent;
 use gossip_scanner_runtime::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent,
@@ -29,16 +30,11 @@ use gossip_scanner_runtime::coordination_sink::{
 /// on this target to isolate coordination output from other worker logs.
 const TELEMETRY_TARGET: &str = "gossip_worker::coordination";
 
-/// BLAKE3 derive-key context for [`RedactedDigest`] hashing. Changing this
-/// value rotates every digest in the telemetry stream; existing log-based
-/// alerts that match on specific hash values will stop matching.
-const DIGEST_DOMAIN: &str = "gossip/worker/coordination-telemetry/v1";
-
 /// Cached BLAKE3 derive-key hasher for [`RedactedDigest`]. Cloning the
 /// post-setup state avoids repeating the key-schedule compression on every
 /// hash call.
 static TELEMETRY_HASHER: LazyLock<gossip_contracts::blake3::Hasher> =
-    LazyLock::new(|| domain_hasher(DIGEST_DOMAIN));
+    LazyLock::new(|| gossip_contracts::blake3::Hasher::new_derive_key(COORDINATION_TELEMETRY_V1));
 
 /// Production recorder for distributed coordination telemetry.
 ///
@@ -440,10 +436,10 @@ impl RecorderCategory {
 ///
 /// Stores `(original_length, 64-bit BLAKE3 hash)` so operators can correlate
 /// records ("same hash ⇒ same input") and gauge payload size without exposing
-/// raw bytes. The hash is domain-separated by [`DIGEST_DOMAIN`] and further
-/// keyed by a field-level `label` (e.g. `"shard_id"`, `"item_key"`), so
-/// identical byte sequences in different field positions produce distinct
-/// digests.
+/// raw bytes. The hash is domain-separated by
+/// [`COORDINATION_TELEMETRY_V1`] and further keyed by a field-level `label`
+/// (e.g. `"shard_id"`, `"item_key"`), so identical byte sequences in different
+/// field positions produce distinct digests.
 ///
 /// Display format: `len=<n>,hash=<016x>`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -454,10 +450,10 @@ pub(crate) struct RedactedDigest {
 
 impl RedactedDigest {
     /// Builds a digest from raw bytes. Uses BLAKE3 derive-key mode with
-    /// [`DIGEST_DOMAIN`] as the context (key derivation, not part of the update
-    /// stream). The update stream is `label || 0x00 || le64(len) || bytes`,
-    /// where the null separator and length prefix prevent label/payload
-    /// ambiguity.
+    /// [`COORDINATION_TELEMETRY_V1`] as the context (key derivation, not part
+    /// of the update stream). The update stream is
+    /// `label || 0x00 || le64(len) || bytes`, where the null separator and
+    /// length prefix prevent label/payload ambiguity.
     #[inline]
     fn bytes(label: &'static str, bytes: &[u8]) -> Self {
         let mut hasher = TELEMETRY_HASHER.clone();

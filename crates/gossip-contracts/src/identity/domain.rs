@@ -129,6 +129,15 @@ pub const DONE_LEDGER_KEY_V1: &str = "gossip/persistence/v1/done-key";
 pub const TRIAGE_GROUP_KEY_V1: &str = "gossip/persistence/v1/triage-group";
 
 // =========================================================================
+// Worker subsystem
+// =========================================================================
+
+/// Coordination telemetry redaction digest.
+///
+/// Hash mode: BLAKE3 derive-key via `domain_hasher`.
+pub const COORDINATION_TELEMETRY_V1: &str = "gossip/worker/v1/coordination-telemetry";
+
+// =========================================================================
 // Authoritative constant list
 // =========================================================================
 
@@ -137,7 +146,7 @@ pub const TRIAGE_GROUP_KEY_V1: &str = "gossip/persistence/v1/triage-group";
 /// The array length is checked at compile time — adding a constant without
 /// updating `ALL` is a compile error. Tests use this for uniqueness and
 /// coverage checks.
-pub const ALL: [&str; 15] = [
+pub const ALL: [&str; 16] = [
     SPLIT_ID_V1,
     OP_PAYLOAD_V1,
     FINDING_ID_V1,
@@ -153,6 +162,7 @@ pub const ALL: [&str; 15] = [
     OVID_V1,
     DONE_LEDGER_KEY_V1,
     TRIAGE_GROUP_KEY_V1,
+    COORDINATION_TELEMETRY_V1,
 ];
 
 // =========================================================================
@@ -186,6 +196,7 @@ pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static str)> {
         ("OVID_V1", OVID_V1),
         ("DONE_LEDGER_KEY_V1", DONE_LEDGER_KEY_V1),
         ("TRIAGE_GROUP_KEY_V1", TRIAGE_GROUP_KEY_V1),
+        ("COORDINATION_TELEMETRY_V1", COORDINATION_TELEMETRY_V1),
     ]
 }
 
