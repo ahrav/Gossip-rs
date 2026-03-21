@@ -372,8 +372,8 @@ the receipt-driven durability model:
    concurrently: scan execution calls `scan_fs_with_prebuilt_engine` with
    the `ReceiptCommitSink`, while a second thread calls
    `drain_commit_stage` with the drainer.
-6. After both threads complete, resolves the concurrent scan, submission,
-   and drain outcomes in diagnostic order. Scan-runtime failures surface
+6. After both threads complete, resolves the scan, submission, and drain
+   outcomes in diagnostic order. Scan-runtime failures surface
    before downstream submission or drain failures because a broken scan often
    cascades into receipt-drain errors. Once outcome resolution succeeds, the
    runtime cross-checks submitted vs. committed sequence numbers via
