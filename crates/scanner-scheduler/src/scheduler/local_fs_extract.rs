@@ -105,15 +105,15 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
         .saturating_sub(after_prefix)
         .saturating_add(dedupe_removed);
     account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
+    emit_persistence_batch(
+        scratch.store_producer.as_deref(),
+        &*scratch.event_sink,
+        path_bytes,
+        &scratch.pending,
+        &mut scratch.persist_batch,
+        &mut ctx.metrics,
+    );
     if !scratch.pending.is_empty() {
-        emit_persistence_batch(
-            scratch.store_producer.as_deref(),
-            &*scratch.event_sink,
-            path_bytes,
-            &scratch.pending,
-            &mut scratch.persist_batch,
-            &mut ctx.metrics,
-        );
         emit_findings(
             engine.as_ref(),
             &*scratch.event_sink,

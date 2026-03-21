@@ -931,4 +931,26 @@ mod tests {
         assert_eq!(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
     }
+
+    #[test]
+    fn iter_walker_emits_files_in_sorted_order() {
+        let dir = TempDir::new().unwrap();
+
+        // Names chosen to break naive (insertion-order) iteration.
+        fs::write(dir.path().join("z_first.txt"), "zzz").unwrap();
+        fs::write(dir.path().join("a_second.txt"), "aaa").unwrap();
+        fs::write(dir.path().join("m_middle.txt"), "mmm").unwrap();
+
+        let config = small_config();
+        let mut walker = IterWalker::new(dir.path(), &config);
+
+        let mut names: Vec<String> = Vec::new();
+        while let Some(file) = walker.next_file() {
+            if let Some(name) = file.path.file_name() {
+                names.push(name.to_string_lossy().into_owned());
+            }
+        }
+
+        assert_eq!(names, vec!["a_second.txt", "m_middle.txt", "z_first.txt"]);
+    }
 }

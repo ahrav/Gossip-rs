@@ -547,11 +547,13 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
     }
 }
 
-/// Build and emit a persistence batch for one chunk's post-dedupe findings.
+/// Build and emit a persistence batch for post-dedupe findings.
 ///
-/// No-ops when `store_producer` is `None`. Emits even when `findings` is
-/// empty so the downstream pipeline can record a "scanned clean" done-ledger
-/// entry for objects with zero matches.
+/// No-ops when `store_producer` is `None`. Accepts empty findings slices
+/// so the downstream pipeline can record a "scanned clean" done-ledger
+/// entry for objects with zero matches. Callers control emission frequency:
+/// for plain files, per-chunk when findings are present plus once per file
+/// for clean files; for archive entries, per-chunk unconditionally.
 ///
 /// # Fail-soft design
 ///
@@ -574,9 +576,9 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
         return;
     };
 
-    // Emit even when findings is empty: the downstream pipeline uses each
-    // batch to create a done-ledger entry, so clean files (zero findings)
-    // still need a batch to record "scanned, nothing found."
+    // Handles empty findings slices: callers pass empty batches for clean
+    // files so the downstream pipeline can record a "scanned, nothing
+    // found" done-ledger entry.
     build_persistence_batch(findings, persist_batch);
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]
@@ -660,21 +662,32 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// open(path) ─► metadata.len() ─► acquire_buffer()
 ///                    │
 ///                    ▼
-///     ┌──────────────────────────────────┐
-///     │     for each chunk:              │◄───────────────┐
-///     │  1. copy_within(overlap)         │                │
-///     │  2. read(new_bytes)              │                │
-///     │  3. scan_chunk_into()            │                │
-///     │  4. drop_prefix_findings()       │                │
-///     │  5. drain + apply_cross_rule_dedupe() │             │
-///     │  6. emit_persistence_batch()     │                │
-///     │  7. emit_findings()              │                │
-///     └──────────────┬───────────────────┘                │
-///                    │                                   │
-///                    ▼                                   │
-///            offset < file_size? ───yes──────────────────┘
+///     ┌─────────────────────────────────────────┐
+///     │     for each chunk:                     │◄──────────┐
+///     │  1. copy_within(overlap)                │           │
+///     │  2. read(new_bytes)                     │           │
+///     │  3. scan_chunk_into()                   │           │
+///     │  4. drop_prefix_findings()              │           │
+///     │  5. drain + apply_cross_rule_dedupe()   │           │
+///     │  6. if findings: emit_persistence_batch()│          │
+///     │  7. emit_findings()                     │           │
+///     └──────────────┬──────────────────────────┘           │
+///                    │                                      │
+///                    ▼                                      │
+///            offset < file_size? ───yes─────────────────────┘
 ///                    │
-///                    no
+///                    no (scan_completed)
+///                    ▼
+///     scan_completed && !file_had_findings?
+///            │                │
+///           yes               no
+///            ▼                ▼
+///     emit_persistence_batch  (skip — already
+///       (empty batch;          emitted per-chunk)
+///        done-ledger marks
+///        file as "clean")
+///            │                │
+///            └───────┬────────┘
 ///                    ▼
 ///             release_buffer()
 /// ```
@@ -777,8 +790,17 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             .saturating_add(open_start.elapsed().as_nanos() as u64);
     }
 
-    // Empty file: nothing to scan
+    // Empty file: record a clean sentinel and return.
     if file_size == 0 {
+        scratch.pending.clear();
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+        );
         return;
     }
 
@@ -859,6 +881,8 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     let mut carry: usize = 0; // Bytes of overlap prefix for next scan
     let mut have: usize = 0; // Total bytes in buffer from last iteration
     let mut preloaded: usize = first_n; // First chunk already in buf[0..first_n]
+    let mut file_had_findings = false;
+    let mut scan_completed = false;
 
     loop {
         // Move tail overlap bytes to front as next prefix
@@ -879,6 +903,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             let remaining_in_snapshot = file_size.saturating_sub(offset) as usize;
             if remaining_in_snapshot == 0 {
                 // Reached snapshot boundary - done with this file
+                scan_completed = true;
                 break;
             }
             let read_max = chunk_size.min(buf.len() - carry).min(remaining_in_snapshot);
@@ -912,6 +937,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         // EOF: done with this file
         if n == 0 {
+            scan_completed = true;
             break;
         }
 
@@ -935,15 +961,19 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &mut ctx.metrics,
         );
 
-        emit_persistence_batch(
-            scratch.store_producer.as_deref(),
-            &*scratch.event_sink,
-            path_bytes,
-            &scratch.pending,
-            &mut scratch.persist_batch,
-            &mut ctx.metrics,
-        );
-        // Emit findings
+        // Emit persistence batches only for chunks that produced findings.
+        // Clean-file done-ledger entries are emitted once after the loop.
+        if !scratch.pending.is_empty() {
+            file_had_findings = true;
+            emit_persistence_batch(
+                scratch.store_producer.as_deref(),
+                &*scratch.event_sink,
+                path_bytes,
+                &scratch.pending,
+                &mut scratch.persist_batch,
+                &mut ctx.metrics,
+            );
+        }
         emit_findings(
             engine.as_ref(),
             &*scratch.event_sink,
@@ -958,8 +988,28 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         // Stop at snapshot size (consistent point-in-time semantics)
         if offset >= file_size {
+            scan_completed = true;
             break;
         }
+    }
+
+    // Clean files emit a single empty batch so the done-ledger records
+    // "scanned, nothing found." Finding-bearing files already emitted
+    // per-chunk batches inside the loop. Skip the sentinel when the loop
+    // exited due to an IO error — a partially-scanned file must not be
+    // recorded as clean.
+    if scan_completed && !file_had_findings {
+        // `scan_chunk_postprocess` clears `pending` before draining, so
+        // it is already empty here when no chunk produced findings.
+        debug_assert!(scratch.pending.is_empty());
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+        );
     }
 
     // Buffer returned to pool on drop

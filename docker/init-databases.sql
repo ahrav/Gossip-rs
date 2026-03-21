@@ -1,0 +1,2 @@
+CREATE DATABASE done_ledger;
+CREATE DATABASE findings;
