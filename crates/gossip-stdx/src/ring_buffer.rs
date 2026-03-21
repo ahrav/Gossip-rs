@@ -528,3 +528,299 @@ impl<T, const N: usize> IntoIterator for RingBuffer<T, N> {
 #[cfg(test)]
 #[path = "ring_buffer_tests.rs"]
 mod tests;
+
+// ============================================================================
+// Kani formal verification proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod kani_proofs {
+    //! Kani formal verification proofs for `RingBuffer`.
+    //!
+    //! Each proof targets one or more `unsafe` operations, verifying that
+    //! wrapping index arithmetic and `MaybeUninit` access are sound for all
+    //! valid inputs (symbolic, not sampled). Together the 10 proofs cover
+    //! all 9 `unsafe` blocks in `RingBuffer`.
+    //!
+    //! Key difference from `InlineVec` proofs: RingBuffer uses wrapping
+    //! index arithmetic `(head + offset) & MASK`. Proofs #2-#10 construct
+    //! non-zero `head` positions via push/pop warmup so that elements span
+    //! the wrap boundary, exercising the `& MASK` logic that a `head = 0`
+    //! test would miss.
+    //!
+    //! Proofs use `CAP = 4` and `u32` elements for tractable SAT solving.
+    //!
+    //! Coverage:
+    //! - Proof 1: `uninit_array` (trivially sound for MaybeUninit)
+    //! - Proof 2: `push_back_assume_capacity` (write at wrapped tail)
+    //! - Proof 3: `get` (read at wrapped physical index)
+    //! - Proof 4: `pop_front` (read at wrapped head)
+    //! - Proof 5: `clone` (read across wrap boundary)
+    //! - Proof 6: `drop` via `clear` -> `pop_front` (correct element count)
+    //! - Proof 7: `Iter::next` (forward traversal across wrap)
+    //! - Proof 8: `DoubleEndedIterator::next_back` (reverse across wrap)
+    //! - Proof 9: push/pop rotation preserves elements (combined L217+L264)
+    //! - Proof 10: `push_back_overwrite` sequence (transitive: pop_front + push_back_assume_capacity)
+
+    use super::*;
+
+    const CAP: usize = 4;
+
+    /// Rotates `head` to position `offset` by pushing then popping.
+    ///
+    /// After this call the ring is empty with `head == offset`.
+    /// Callers use a symbolic `offset` with `kani::assume(offset < CAP)`
+    /// so Kani explores all head positions.
+    fn rotate_head(ring: &mut RingBuffer<u32, CAP>, offset: u32) {
+        for _ in 0..offset {
+            ring.push_back(0).unwrap();
+        }
+        for _ in 0..offset {
+            ring.pop_front();
+        }
+    }
+
+    // Proof 1: `uninit_array` produces a valid `[MaybeUninit<T>; N]` for
+    // both sized types and ZSTs.
+    #[kani::proof]
+    fn uninit_array_is_valid() {
+        let _arr = uninit_array::<u32, CAP>();
+        let _arr_zst = uninit_array::<(), CAP>();
+    }
+
+    // Proof 2: `push_back_assume_capacity` writes within bounds for all
+    // head positions and fill levels.
+    // Covers unsafe at L217: `get_unchecked_mut(index(tail)).write(value)`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn push_back_within_capacity_is_safe() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for _ in 0..n {
+            ring.push_back(kani::any()).unwrap();
+        }
+        assert_eq!(ring.len(), n);
+    }
+
+    // Proof 3: `get` returns initialized references only, for all head
+    // positions and logical indices. Out-of-bounds returns None.
+    // Covers unsafe at L167: `get_unchecked(physical).assume_init_ref()`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn get_returns_initialized_only() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for i in 0..n {
+            ring.push_back(i as u32).unwrap();
+        }
+
+        // Valid index: dereference must succeed and return the correct value.
+        if n > 0 {
+            let idx: usize = kani::any();
+            kani::assume(idx < n);
+            let val = ring.get(idx);
+            assert!(val.is_some());
+            assert_eq!(*val.unwrap(), idx as u32);
+        }
+
+        // Out-of-bounds index: must return None.
+        assert!(ring.get(n).is_none());
+    }
+
+    // Proof 4: `pop_front` reads only initialized memory, for all head
+    // positions. After popping all elements, the ring is empty.
+    // Covers unsafe at L264: `get_unchecked(index(idx)).as_ptr().read()`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn pop_front_reads_initialized() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for i in 0..n {
+            ring.push_back(i as u32).unwrap();
+        }
+
+        // Pop all elements and verify FIFO order.
+        for i in 0..n {
+            let val = ring.pop_front();
+            assert_eq!(val, Some(i as u32));
+        }
+        assert!(ring.is_empty());
+        assert!(ring.pop_front().is_none());
+    }
+
+    // Proof 5: `clone` reads only initialized slots across the wrap
+    // boundary and produces an equal ring buffer.
+    // Covers unsafe at L351: `get_unchecked(index(physical)).assume_init_ref()`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn clone_is_sound() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for i in 0..n {
+            ring.push_back(i as u32).unwrap();
+        }
+
+        let cloned = ring.clone();
+        assert_eq!(cloned.len(), ring.len());
+
+        // Verify element-by-element equality across the wrap boundary.
+        for i in 0..n {
+            assert_eq!(cloned.get(i), ring.get(i));
+        }
+    }
+
+    // Proof 6: `Drop` (via `clear` -> `pop_front`) visits exactly `len`
+    // elements for all head positions, including wrapped layouts.
+    // Covers unsafe at L264 transitively via `pop_front` in `clear`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn drop_visits_correct_count() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for _ in 0..n {
+            ring.push_back(kani::any()).unwrap();
+        }
+        assert_eq!(ring.len(), n);
+        drop(ring); // Kani verifies all pop_front reads are in-bounds.
+    }
+
+    // Proof 7: forward iteration via `Iter::next` traverses exactly the
+    // initialized elements across the wrap boundary in FIFO order.
+    // Covers unsafe at L441 and L459: `get_unchecked` -> `assume_init_ref`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn iter_forward_is_sound() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for i in 0..n {
+            ring.push_back(i as u32).unwrap();
+        }
+
+        let mut count = 0usize;
+        let mut expected = 0u32;
+        for val in ring.iter() {
+            assert_eq!(*val, expected);
+            expected += 1;
+            count += 1;
+        }
+        assert_eq!(count, n);
+    }
+
+    // Proof 8: reverse iteration via `DoubleEndedIterator::next_back`
+    // traverses elements in reverse FIFO order across the wrap boundary.
+    // Covers unsafe at L441 and L479: `get_unchecked` -> `assume_init_ref`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn iter_reverse_is_sound() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for i in 0..n {
+            ring.push_back(i as u32).unwrap();
+        }
+
+        let mut count = 0usize;
+        let mut expected = if n > 0 { n as u32 - 1 } else { 0 };
+        for val in ring.iter().rev() {
+            assert_eq!(*val, expected);
+            expected = expected.wrapping_sub(1);
+            count += 1;
+        }
+        assert_eq!(count, n);
+    }
+
+    // Proof 9: interleaved push/pop rotation preserves element values.
+    // Exercises both L217 (push write) and L264 (pop read) with head
+    // advancing through all positions modulo CAPACITY.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn push_pop_rotate_preserves_elements() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        // Fill the ring.
+        let n: usize = kani::any();
+        kani::assume(n > 0 && n <= CAP);
+        for i in 0..n {
+            ring.push_back(i as u32).unwrap();
+        }
+
+        // Pop one element and push a new one, rotating head.
+        let front = ring.pop_front();
+        assert_eq!(front, Some(0));
+        ring.push_back(n as u32).unwrap();
+        assert_eq!(ring.len(), n);
+
+        // Verify all remaining elements are correct.
+        for i in 0..n {
+            assert_eq!(ring.get(i), Some(&((i + 1) as u32)));
+        }
+    }
+
+    // Proof 10: repeated `push_back_overwrite` exercises the most
+    // wrapping-intensive single operation. It delegates to `pop_front`
+    // (L264) + `push_back_assume_capacity` (L217), covering both unsafe
+    // blocks transitively with head AND tail wrapping simultaneously.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn push_back_overwrite_sequence_is_sound() {
+        let mut ring = RingBuffer::<u32, CAP>::new();
+        let offset: u32 = kani::any();
+        kani::assume(offset < CAP as u32);
+        rotate_head(&mut ring, offset);
+
+        // Fill the ring to capacity.
+        for i in 0..CAP {
+            ring.push_back(i as u32).unwrap();
+        }
+        assert!(ring.is_full());
+
+        // Overwrite all elements with new values, rotating the entire ring.
+        for i in 0..CAP {
+            let evicted = ring.push_back_overwrite((CAP + i) as u32);
+            assert_eq!(evicted, Some(i as u32));
+        }
+        assert!(ring.is_full());
+
+        // Verify the ring contains only the new values in order.
+        for i in 0..CAP {
+            assert_eq!(ring.get(i), Some(&((CAP + i) as u32)));
+        }
+    }
+}
