@@ -340,7 +340,7 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
 }
 
 /// Routes a diagnostic record to the tracing level matching `diagnostic_level`.
-/// Unrecognized levels (including `"info"` itself) fall through to `info!`.
+/// Unrecognized levels default to `info!`.
 fn emit_diagnostic(
     shard_id: RedactedDigest,
     diagnostic_level: &'static str,
@@ -391,7 +391,7 @@ fn emit_diagnostic(
                 "coordination core diagnostic",
             );
         }
-        _ => {
+        "info" | _ => {
             tracing::info!(
                 target: TELEMETRY_TARGET,
                 event_name = "coordination_core_diagnostic",
@@ -1240,10 +1240,16 @@ mod tests {
                 .expect("commit begin with None size_hint should succeed");
         });
 
-        assert!(
-            logs.contains("none"),
-            "OptionalField::None should render as \"none\" in tracing output",
-        );
+        // Verify specific structured fields render as "none" — tying the
+        // assertion to the exact OptionalField usage rather than a bare
+        // substring that could match unrelated log output.
+        for field in ["commit_id=none", "change_kind=none", "size_hint=none"] {
+            assert!(
+                logs.contains(field),
+                "OptionalField::None should render as \"{field}\" in tracing output, \
+                 but captured logs were: {logs}",
+            );
+        }
         assert!(
             !logs.contains(&canary),
             "canary must not leak into tracing output",
