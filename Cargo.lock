@@ -1441,9 +1441,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gossip-contracts",
+ "gossip-coordination",
  "gossip-coordination-etcd",
  "gossip-done-ledger-postgres",
  "gossip-findings-postgres",
+ "gossip-frontier",
+ "gossip-persistence-inmemory",
  "gossip-pg-common",
  "gossip-scanner-runtime",
  "postgres",
