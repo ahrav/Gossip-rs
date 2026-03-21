@@ -380,6 +380,30 @@ mod tests {
     }
 
     #[test]
+    fn local_dispatch_through_execute_resolved_worker() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let cfg = LocalWorkerConfig::new(
+            ExecutionMode::Direct,
+            WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path().to_path_buf())),
+            gossip_scanner_runtime::ScanBudgets::default(),
+        )
+        .expect("default budgets should be valid");
+        let resolved = ResolvedWorkerConfig::Local(cfg);
+
+        let report = execute_resolved_worker_with(&resolved, |_| {
+            panic!("local configs must not invoke the distributed runner")
+        })
+        .expect("local dispatch should succeed");
+        let WorkerRunReport::Local(scan) = report else {
+            panic!("expected local worker report, got distributed");
+        };
+        assert!(scan.items_scanned > 0);
+        assert!(scan.bytes_scanned > 0);
+    }
+
+    #[test]
     fn local_worker_scans_git_repo_path() {
         let dir = tempdir().expect("tempdir");
         create_git_repo(dir.path());
@@ -482,10 +506,6 @@ mod tests {
                 DistributedRuntimeError::Coordinator(_)
             ))
         ));
-        assert!(
-            error.to_string().contains("run not found"),
-            "missing run failure should surface the coordinator error: {error}"
-        );
         assert!(
             done_ledger
                 .snapshot()

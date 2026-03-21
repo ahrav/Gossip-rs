@@ -1282,7 +1282,7 @@ impl RawWorkerConfig {
             tracing::warn!(
                 flag = "--etcd-endpoints",
                 preferred_env = ENV_ETCD_ENDPOINTS,
-                "credential provided via CLI flag; prefer env var to avoid process-table exposure"
+                "endpoint provided via CLI flag; prefer env var to avoid process-table exposure"
             );
         }
 

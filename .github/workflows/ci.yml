@@ -638,8 +638,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Kani verifies all #[kani::proof] harnesses per crate.
-      # 80 total proofs across 4 crates.
-      - name: Kani — gossip-stdx (54 proofs)
+      # 100 total proofs across 4 crates.
+      - name: Kani — gossip-stdx (74 proofs)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           args: --package gossip-stdx --features kani
@@ -678,8 +678,7 @@ jobs:
           save-cache: "false"
 
       # Loom exhaustively explores thread interleavings.
-      # 12 loom::model tests across 2 crates (gossip-stdx, scanner-scheduler).
-      - name: Loom — gossip-stdx (8 tests)
+      - name: Loom — gossip-stdx (11 tests)
         run: >-
           RUSTFLAGS="--cfg loom" cargo test --lib
           -p gossip-stdx --features loom -- loom_tests
