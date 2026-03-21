@@ -551,9 +551,9 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
 ///
 /// No-ops when `store_producer` is `None`. Accepts empty findings slices
 /// so the downstream pipeline can record a "scanned clean" done-ledger
-/// entry for objects with zero matches. Callers control the emission
-/// frequency: per-chunk for finding-bearing chunks, once per file for
-/// clean files.
+/// entry for objects with zero matches. Callers control emission frequency:
+/// for plain files, per-chunk when findings are present plus once per file
+/// for clean files; for archive entries, per-chunk unconditionally.
 ///
 /// # Fail-soft design
 ///
@@ -576,9 +576,9 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
         return;
     };
 
-    // Emit even when findings is empty: the downstream pipeline uses each
-    // batch to create a done-ledger entry, so clean files (zero findings)
-    // still need a batch to record "scanned, nothing found."
+    // Handles empty findings slices: callers pass empty batches for clean
+    // files so the downstream pipeline can record a "scanned, nothing
+    // found" done-ledger entry.
     build_persistence_batch(findings, persist_batch);
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]
@@ -662,21 +662,32 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// open(path) ─► metadata.len() ─► acquire_buffer()
 ///                    │
 ///                    ▼
-///     ┌──────────────────────────────────┐
-///     │     for each chunk:              │◄───────────────┐
-///     │  1. copy_within(overlap)         │                │
-///     │  2. read(new_bytes)              │                │
-///     │  3. scan_chunk_into()            │                │
-///     │  4. drop_prefix_findings()       │                │
-///     │  5. drain + apply_cross_rule_dedupe() │             │
-///     │  6. emit_persistence_batch()     │                │
-///     │  7. emit_findings()              │                │
-///     └──────────────┬───────────────────┘                │
-///                    │                                   │
-///                    ▼                                   │
-///            offset < file_size? ───yes──────────────────┘
+///     ┌─────────────────────────────────────────┐
+///     │     for each chunk:                     │◄──────────┐
+///     │  1. copy_within(overlap)                │           │
+///     │  2. read(new_bytes)                     │           │
+///     │  3. scan_chunk_into()                   │           │
+///     │  4. drop_prefix_findings()              │           │
+///     │  5. drain + apply_cross_rule_dedupe()   │           │
+///     │  6. if findings: emit_persistence_batch()│          │
+///     │  7. emit_findings()                     │           │
+///     └──────────────┬──────────────────────────┘           │
+///                    │                                      │
+///                    ▼                                      │
+///            offset < file_size? ───yes─────────────────────┘
 ///                    │
-///                    no
+///                    no (scan_completed)
+///                    ▼
+///     scan_completed && !file_had_findings?
+///            │                │
+///           yes               no
+///            ▼                ▼
+///     emit_persistence_batch  (skip — already
+///       (empty batch;          emitted per-chunk)
+///        done-ledger marks
+///        file as "clean")
+///            │                │
+///            └───────┬────────┘
 ///                    ▼
 ///             release_buffer()
 /// ```

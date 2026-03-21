@@ -167,7 +167,9 @@ fn cmd_seed(
 
     let next_now = LogicalTime::from_raw(2);
     match coordinator.register_shards(next_now, tenant, run_id, &manifest, OpId::from_raw(1)) {
-        Ok(_) => {}
+        Ok(_) => {
+            eprintln!("registered shard {shard_id_raw}");
+        }
         Err(RegisterShardsError::OpIdConflict(_)) => {
             // OpIdConflict means the same OpId was used with a different payload
             // hash. Since this tool always uses OpId(1), re-seeding with a
@@ -177,6 +179,9 @@ fn cmd_seed(
                 "shard {shard_id_raw} already registered with a different path; \
                  run `just reset` then re-seed"
             );
+        }
+        Err(RegisterShardsError::RunNotFound) => {
+            bail!("run {run_id_raw} not found — was it created? try `just seed` from scratch");
         }
         Err(err) => {
             return Err(anyhow::Error::new(err).context("failed to register shards"));
@@ -226,26 +231,30 @@ fn cmd_inspect(done_ledger_dsn: &str, findings_dsn: &str) -> Result<()> {
         println!("{label:<24} {count}");
     }
     if had_error {
-        bail!("one or more inspect queries failed (see output above)");
+        bail!("one or more table queries failed — is postgres running? try `just up`");
     }
     Ok(())
 }
 
 fn table_count(dsn: &str, table: &str) -> Result<i64, String> {
+    use postgres::error::SqlState;
+
     debug_assert!(
         !table.is_empty() && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
         "table_count requires a plain SQL identifier, got: {table:?}"
     );
-    let mut client = Client::connect(dsn, NoTls).map_err(|e| e.to_string())?;
+    let mut client =
+        Client::connect(dsn, NoTls).map_err(|e| format!("cannot connect to database: {e}"))?;
     client
         .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
         .map(|row| row.get::<_, i64>(0))
         .map_err(|e| {
-            if e.to_string().contains("does not exist") {
-                "table not found — run `just scan` or `just migrate` first".to_string()
-            } else {
-                e.to_string()
+            if let Some(db_err) = e.as_db_error()
+                && *db_err.code() == SqlState::UNDEFINED_TABLE
+            {
+                return "table not found — run `just migrate` first".to_string();
             }
+            e.to_string()
         })
 }
 
@@ -272,12 +281,19 @@ fn cmd_migrate(done_ledger_dsn: &str, findings_dsn: &str) -> Result<()> {
         // Collect both results before propagating so neither error is lost.
         let dl_result = dl_handle
             .join()
-            .expect("done-ledger migration thread panicked");
-        let f_result = f_handle.join().expect("findings migration thread panicked");
+            .map_err(|_| anyhow::anyhow!("done-ledger migration thread panicked"))?;
+        let f_result = f_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("findings migration thread panicked"))?;
 
-        dl_result.context("done-ledger migrations failed")?;
-        f_result.context("findings migrations failed")?;
-        Ok(())
+        match (dl_result, f_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(()), Err(e)) => Err(e),
+            (Err(dl_e), Err(f_e)) => {
+                Err(dl_e.context(format!("findings migration also failed: {f_e:#}")))
+            }
+        }
     })?;
 
     eprintln!("migrations applied to both databases");

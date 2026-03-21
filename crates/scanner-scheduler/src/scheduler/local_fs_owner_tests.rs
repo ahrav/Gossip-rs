@@ -1512,3 +1512,151 @@ fn emit_persistence_batch_emits_for_empty_findings() {
         "successful emit should not increment failure counter"
     );
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end persistence: clean file produces exactly one empty batch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clean_file_emits_single_empty_persistence_batch() {
+    let engine = Arc::new(test_engine());
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(b"hello world, nothing secret here").unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_path_buf();
+    let size = tmp.as_file().metadata().unwrap().len();
+
+    let source = VecFileSource::new(vec![LocalFile {
+        path: path.clone(),
+        size,
+    }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.store_producer = Some(producer.clone());
+
+    let _report = scan_local(engine, source, cfg);
+    let batches = producer.batches();
+
+    assert_eq!(batches.len(), 1, "clean file should emit exactly one batch");
+    assert!(
+        batches[0].findings.is_empty(),
+        "batch for a clean file must contain no findings"
+    );
+
+    let obj_path =
+        std::str::from_utf8(&batches[0].object_path).expect("object_path should be valid UTF-8");
+    let file_name = path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .expect("temp file name should be valid UTF-8");
+    assert!(
+        obj_path.contains(file_name),
+        "object_path {obj_path:?} should contain the file name {file_name:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end persistence: multi-chunk file emits per-chunk batches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_chunk_file_emits_per_chunk_persistence_batches() {
+    let engine = Arc::new(test_engine());
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    // chunk_size is 64 bytes; each line is 65 bytes so it forces a chunk boundary.
+    // Every line contains "SECRET" so each chunk produces at least one finding.
+    let line = format!("SECRET {:>57}\n", "x"); // 65 bytes: "SECRET" + 57-char padded field + newline
+    assert_eq!(line.len(), 65, "each line must be exactly 65 bytes");
+    let content = line.repeat(4); // 260 bytes across 4+ chunks
+
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(content.as_bytes()).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_path_buf();
+    let size = tmp.as_file().metadata().unwrap().len();
+
+    let source = VecFileSource::new(vec![LocalFile { path, size }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.store_producer = Some(producer.clone());
+
+    let _report = scan_local(engine, source, cfg);
+    let batches = producer.batches();
+
+    assert!(
+        batches.len() >= 2,
+        "multi-chunk file should produce at least 2 persistence batches, got {}",
+        batches.len()
+    );
+    for (i, batch) in batches.iter().enumerate() {
+        assert!(
+            !batch.findings.is_empty(),
+            "batch {i} should contain at least one finding"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-scenario: multi-chunk file where only some chunks have findings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_chunk_file_with_partial_findings_emits_only_finding_batches() {
+    let engine = Arc::new(test_engine());
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    // chunk_size=64. Build a file spanning 3+ chunks where only the
+    // middle chunk contains a detectable pattern.
+    //   Chunk 1: 65 bytes of padding (no SECRET/PASSWORD)
+    //   Chunk 2: "SECRET" + padding to 65 bytes
+    //   Chunk 3: 65 bytes of padding (no SECRET/PASSWORD)
+    let mut data = Vec::new();
+    data.extend_from_slice(&[b'x'; 64]);
+    data.push(b'\n'); // 65 bytes — forces chunk boundary
+    data.extend_from_slice(b"SECRET ");
+    data.extend_from_slice(&[b'a'; 57]);
+    data.push(b'\n'); // 65 bytes — second chunk with finding
+    data.extend_from_slice(&[b'y'; 64]);
+    data.push(b'\n'); // 65 bytes — third chunk, clean
+
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(&data).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_path_buf();
+    let size = tmp.as_file().metadata().unwrap().len();
+
+    let source = VecFileSource::new(vec![LocalFile { path, size }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.store_producer = Some(producer.clone());
+
+    let report = scan_local(engine, source, cfg);
+    let batches = producer.batches();
+
+    // At least one persistence batch was emitted (the chunk with findings).
+    assert!(
+        !batches.is_empty(),
+        "expected at least one persistence batch for the chunk with findings"
+    );
+
+    // Every emitted batch must contain at least one finding. Because
+    // `file_had_findings` is true, the post-loop clean-file sentinel
+    // batch is suppressed — only per-chunk finding batches are emitted.
+    for (i, batch) in batches.iter().enumerate() {
+        assert!(
+            !batch.findings.is_empty(),
+            "batch {i} should not be empty — clean-file sentinel is suppressed when findings exist"
+        );
+    }
+
+    // The report must reflect that findings were emitted.
+    assert!(
+        report.metrics.findings_emitted > 0,
+        "expected findings_emitted > 0, got {}",
+        report.metrics.findings_emitted
+    );
+}
