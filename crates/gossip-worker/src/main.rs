@@ -159,9 +159,7 @@ fn main() {
             );
             match run_production_worker(
                 cfg.production_backends(),
-                // No-op recorder — wire a real CoordinationEventRecorder via
-                // worker_identity_with_recorder once the telemetry sink is built.
-                cfg.worker_identity(),
+                cfg.worker_identity_noop(),
                 cfg.runtime_config(),
             ) {
                 Ok(report) => log_distributed_report(&cfg, report),

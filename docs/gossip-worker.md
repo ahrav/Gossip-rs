@@ -339,7 +339,7 @@ The binary test module checks:
 - successful filesystem scans for a valid local path
 - successful git scans for a valid repository root
 
-The production module adds:
+The production module includes:
 
 - config validation for empty PostgreSQL DSNs
 - DSN whitespace trimming validation
@@ -361,8 +361,9 @@ Pass secrets exclusively through environment variables. CLI flags like
 
 ### TLS for PostgreSQL
 
-The default `connect_postgres_client` connects with `NoTls` and emits a
-warning when the target host is not local. For TLS-capable connections, use
+The default `connect_postgres_client` connects with `NoTls` and performs a
+best-effort warning when the parsed target host appears non-local. For
+TLS-capable connections, use
 `build_production_backends_from_clients`, which accepts pre-configured
 `postgres::Client` instances where the caller controls the TLS configuration.
 

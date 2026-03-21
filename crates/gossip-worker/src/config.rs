@@ -809,11 +809,11 @@ impl DistributedWorkerConfig {
     }
 
     /// Build the runtime `WorkerIdentity` with a no-op recorder that discards
-    /// all coordination events. Use [`Self::worker_identity_with_recorder`] to
-    /// inject a production telemetry recorder once the coordination event sink
-    /// is built.
+    /// all coordination events.
+    ///
+    /// Use [`Self::worker_identity_with_recorder`] to supply a real recorder.
     #[must_use]
-    pub fn worker_identity(&self) -> WorkerIdentity {
+    pub fn worker_identity_noop(&self) -> WorkerIdentity {
         self.worker_identity_with_recorder(Arc::new(NoopCoordinationEventRecorder))
     }
 
@@ -1346,12 +1346,22 @@ impl RawWorkerConfig {
                             done_ledger_postgres_dsn,
                             findings_postgres_dsn,
                         )?;
-                        if !path.exists() {
-                            return Err(WorkerConfigError::invalid_value(
-                                "path",
-                                path.display().to_string(),
-                                "path does not exist on this host",
-                            ));
+                        match path.try_exists() {
+                            Ok(false) => {
+                                return Err(WorkerConfigError::invalid_value(
+                                    "path",
+                                    path.display().to_string(),
+                                    "path does not exist on this host",
+                                ));
+                            }
+                            Err(io_err) => {
+                                return Err(WorkerConfigError::invalid_value(
+                                    "path",
+                                    path.display().to_string(),
+                                    format!("cannot verify path existence: {io_err}"),
+                                ));
+                            }
+                            Ok(true) => {}
                         }
                         let source = FsSourceSettings::new(path)
                             .with_rules_file(rules_file)
@@ -2009,9 +2019,7 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("ultra-secret"));
-        assert!(
-            !debug.contains("3333333333333333333333333333333333333333333333333333333333333333")
-        );
+        assert!(!debug.contains("3333333333333333333333333333333333333333333333333333333333333333"));
         assert!(debug.contains("[redacted]"));
     }
 
@@ -2024,7 +2032,7 @@ mod tests {
         let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
             panic!("expected distributed config");
         };
-        let identity = cfg.worker_identity();
+        let identity = cfg.worker_identity_noop();
         assert_eq!(identity.tenant, cfg.tenant());
         assert_eq!(identity.run, cfg.run());
         assert_eq!(identity.worker, cfg.worker());
