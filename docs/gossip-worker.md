@@ -130,13 +130,13 @@ override environment values when both are present.
 | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the done-ledger database. |
 | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the findings database. |
 | `GOSSIP_TENANT_ID` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant identity. Accepts optional `0x` prefix. |
-| `GOSSIP_RUN_ID` | unsigned 64-bit integer | *(none)* | Yes (production) | Run identity. |
-| `GOSSIP_WORKER_ID` | unsigned 64-bit integer | *(none)* | Yes (production) | Worker identity. |
+| `GOSSIP_RUN_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Run identity. Zero is the unassigned sentinel and is rejected. |
+| `GOSSIP_WORKER_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Worker identity. Zero is the unassigned sentinel and is rejected. |
 | `GOSSIP_POLICY_HASH` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Policy hash for the scan ruleset. Accepts optional `0x` prefix. |
 | `GOSSIP_TENANT_SECRET_KEY` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant secret key. Must not be all zeros. Accepts optional `0x` prefix. |
-| `GOSSIP_MAX_ITEMS` | positive integer | `256` | No | Maximum items processed between checkpoints. |
-| `GOSSIP_MAX_BYTES` | positive integer | `1000000` | No | Maximum bytes processed between checkpoints (1 MB default). |
-| `GOSSIP_COMMIT_QUEUE_CAPACITY` | positive integer | `64` | No | Bounded commit queue capacity for the distributed runtime. |
+| `GOSSIP_MAX_ITEMS` | 1..10,000,000 | `256` | No | Maximum items processed between checkpoints. |
+| `GOSSIP_MAX_BYTES` | 1..64 GiB | `1000000` | No | Maximum bytes processed between checkpoints (1 MB default). |
+| `GOSSIP_COMMIT_QUEUE_CAPACITY` | 1..65,536 | `64` | No | Bounded commit queue capacity for the distributed runtime. |
 | `GOSSIP_WORKER_RULES_FILE` | filesystem path | *(none)* | No | Path to an optional rules file. |
 | `GOSSIP_WORKER_DECODE_DEPTH` | non-negative integer | *(none)* | No | Maximum decode depth for nested content extraction. |
 | `GOSSIP_WORKER_SCAN_BINARY` | boolean | `false` | No | Enable binary file scanning. Accepts `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`. |
@@ -161,13 +161,13 @@ All flags use `--name=value` syntax (equals-sign required; space-separated
 | `--done-ledger-postgres-dsn` | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN |
 | `--findings-postgres-dsn` | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN |
 | `--tenant-id` | `GOSSIP_TENANT_ID` | 64 hex chars |
-| `--run-id` | `GOSSIP_RUN_ID` | u64 |
-| `--worker-id` | `GOSSIP_WORKER_ID` | u64 |
+| `--run-id` | `GOSSIP_RUN_ID` | u64, >= 1 |
+| `--worker-id` | `GOSSIP_WORKER_ID` | u64, >= 1 |
 | `--policy-hash` | `GOSSIP_POLICY_HASH` | 64 hex chars |
 | `--tenant-secret-key` | `GOSSIP_TENANT_SECRET_KEY` | 64 hex chars |
-| `--max-items` | `GOSSIP_MAX_ITEMS` | positive integer |
-| `--max-bytes` | `GOSSIP_MAX_BYTES` | positive integer |
-| `--commit-queue-capacity` | `GOSSIP_COMMIT_QUEUE_CAPACITY` | positive integer |
+| `--max-items` | `GOSSIP_MAX_ITEMS` | 1..10,000,000 |
+| `--max-bytes` | `GOSSIP_MAX_BYTES` | 1..64 GiB |
+| `--commit-queue-capacity` | `GOSSIP_COMMIT_QUEUE_CAPACITY` | 1..65,536 |
 | `--rules-file` | `GOSSIP_WORKER_RULES_FILE` | filesystem path |
 | `--decode-depth` | `GOSSIP_WORKER_DECODE_DEPTH` | non-negative integer |
 | `--scan-binary` | `GOSSIP_WORKER_SCAN_BINARY` | boolean |
@@ -178,7 +178,7 @@ All flags use `--name=value` syntax (equals-sign required; space-separated
 
 Two optional positional arguments follow the flags:
 
-```
+```text
 gossip-worker [flags...] [source] [path]
 ```
 
@@ -339,7 +339,7 @@ The binary test module checks:
 - successful filesystem scans for a valid local path
 - successful git scans for a valid repository root
 
-The production module adds:
+The production module includes:
 
 - config validation for empty PostgreSQL DSNs
 - DSN whitespace trimming validation
@@ -361,8 +361,9 @@ Pass secrets exclusively through environment variables. CLI flags like
 
 ### TLS for PostgreSQL
 
-The default `connect_postgres_client` connects with `NoTls` and emits a
-warning when the target host is not local. For TLS-capable connections, use
+The default `connect_postgres_client` connects with `NoTls` and performs a
+best-effort warning when the parsed target host appears non-local. For
+TLS-capable connections, use
 `build_production_backends_from_clients`, which accepts pre-configured
 `postgres::Client` instances where the caller controls the TLS configuration.
 

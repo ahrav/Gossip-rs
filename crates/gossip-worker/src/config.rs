@@ -430,7 +430,9 @@ impl LocalWorkerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerConfigError`] when `max_items` or `max_bytes` is zero.
+    /// Returns [`WorkerConfigError`] when `max_items` or `max_bytes` is zero,
+    /// or when either value exceeds the configured validation ceiling
+    /// (`max_items` > 10,000,000 or `max_bytes` > 64 GiB).
     pub fn new(
         execution_mode: ExecutionMode,
         source: WorkerSourceSettings,
@@ -644,7 +646,8 @@ impl WorkerIdentityConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerConfigError`] when `tenant_secret_key` is all zeros.
+    /// Returns [`WorkerConfigError`] when `run` or `worker` is the zero
+    /// sentinel, or when `tenant_secret_key` is all zeros.
     pub fn new(
         tenant: TenantId,
         run: RunId,
@@ -652,6 +655,20 @@ impl WorkerIdentityConfig {
         policy_hash: PolicyHash,
         tenant_secret_key: TenantSecretKey,
     ) -> Result<Self, WorkerConfigError> {
+        if run == RunId::ZERO {
+            return Err(WorkerConfigError::invalid_value(
+                "run_id",
+                "0",
+                "must be > 0 (0 is the unassigned sentinel)",
+            ));
+        }
+        if worker == WorkerId::ZERO {
+            return Err(WorkerConfigError::invalid_value(
+                "worker_id",
+                "0",
+                "must be > 0 (0 is the unassigned sentinel)",
+            ));
+        }
         if !tenant_secret_key.is_valid() {
             return Err(WorkerConfigError::invalid_redacted_value(
                 "tenant_secret_key",
@@ -722,8 +739,9 @@ pub struct DistributedWorkerConfig {
 impl DistributedWorkerConfig {
     /// Construct one validated distributed worker configuration bundle.
     ///
-    /// Enforces non-zero budget invariants as defense-in-depth. The secret-key
-    /// invariant is enforced by [`WorkerIdentityConfig::new`].
+    /// Enforces non-zero budget invariants and resource-exhaustion ceilings as
+    /// defense-in-depth. The secret-key and zero-ID invariants are enforced by
+    /// [`WorkerIdentityConfig::new`].
     pub fn new(
         backends: ProductionBackendConfig,
         identity: WorkerIdentityConfig,
@@ -731,6 +749,13 @@ impl DistributedWorkerConfig {
         runtime: DistributedWorkerRuntimeSettings,
     ) -> Result<Self, WorkerConfigError> {
         validate_budgets(&runtime.budgets)?;
+        if runtime.commit_queue_capacity().get() > MAX_COMMIT_QUEUE_CEILING {
+            return Err(WorkerConfigError::invalid_value(
+                "commit_queue_capacity",
+                runtime.commit_queue_capacity().get().to_string(),
+                format!("exceeds maximum of {MAX_COMMIT_QUEUE_CEILING}"),
+            ));
+        }
         Ok(Self {
             backends,
             identity,
@@ -801,11 +826,11 @@ impl DistributedWorkerConfig {
     }
 
     /// Build the runtime `WorkerIdentity` with a no-op recorder that discards
-    /// all coordination events. Use [`Self::worker_identity_with_recorder`] to
-    /// inject a production telemetry recorder once the coordination event sink
-    /// is built.
+    /// all coordination events.
+    ///
+    /// Use [`Self::worker_identity_with_recorder`] to supply a real recorder.
     #[must_use]
-    pub fn worker_identity(&self) -> WorkerIdentity {
+    pub fn worker_identity_noop(&self) -> WorkerIdentity {
         self.worker_identity_with_recorder(Arc::new(NoopCoordinationEventRecorder))
     }
 
@@ -1084,13 +1109,28 @@ impl RawWorkerConfig {
         match positionals.len() {
             0 => Ok(()),
             1 => {
-                if flag_set_path {
-                    return Err(WorkerConfigError::Usage(format!(
-                        "path specified both as --path flag and as positional argument\n{}",
-                        usage()
-                    )));
+                // A single positional that matches a known source token
+                // ("fs" or "git") is interpreted as the source selector,
+                // not the path. This matches the documented CLI shape:
+                //   gossip-worker [flags...] [source] [path]
+                let token = positionals[0].trim().to_ascii_lowercase();
+                if token == "fs" || token == "git" {
+                    if flag_set_source {
+                        return Err(WorkerConfigError::Usage(format!(
+                            "source specified both as --source flag and as positional argument\n{}",
+                            usage()
+                        )));
+                    }
+                    self.source = Some(positionals[0].clone());
+                } else {
+                    if flag_set_path {
+                        return Err(WorkerConfigError::Usage(format!(
+                            "path specified both as --path flag and as positional argument\n{}",
+                            usage()
+                        )));
+                    }
+                    self.path = Some(positionals[0].clone());
                 }
-                self.path = Some(positionals[0].clone());
                 Ok(())
             }
             2 => {
@@ -1186,9 +1226,15 @@ impl RawWorkerConfig {
             parse_optional(self.decode_depth.as_deref(), "decode_depth", parse_usize)?;
         let scan_binary = parse_optional(self.scan_binary.as_deref(), "scan_binary", parse_bool)?
             .unwrap_or(false);
-        let skip_archives =
+        // skip_archives is only meaningful for filesystem scans. Defer
+        // parsing so an invalid value in the environment does not reject
+        // git launches where the option is irrelevant.
+        let skip_archives = if source == WorkerSource::Fs {
             parse_optional(self.skip_archives.as_deref(), "skip_archives", parse_bool)?
-                .unwrap_or(false);
+                .unwrap_or(false)
+        } else {
+            false
+        };
         let anchor_mode = parse_optional(
             self.anchor_mode.as_deref(),
             "anchor_mode",
@@ -1353,12 +1399,22 @@ impl RawWorkerConfig {
                             done_ledger_postgres_dsn,
                             findings_postgres_dsn,
                         )?;
-                        if !path.exists() {
-                            return Err(WorkerConfigError::invalid_value(
-                                "path",
-                                path.display().to_string(),
-                                "path does not exist on this host",
-                            ));
+                        match path.try_exists() {
+                            Ok(false) => {
+                                return Err(WorkerConfigError::invalid_value(
+                                    "path",
+                                    path.display().to_string(),
+                                    "path does not exist on this host",
+                                ));
+                            }
+                            Err(io_err) => {
+                                return Err(WorkerConfigError::invalid_value(
+                                    "path",
+                                    path.display().to_string(),
+                                    format!("cannot verify path existence: {io_err}"),
+                                ));
+                            }
+                            Ok(true) => {}
                         }
                         let source = FsSourceSettings::new(path)
                             .with_rules_file(rules_file)
@@ -2030,7 +2086,9 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("ultra-secret"));
-        assert!(!debug.contains("3333333333333333333333333333333333333333333333333333333333333333"));
+        assert!(
+            !debug.contains("3333333333333333333333333333333333333333333333333333333333333333")
+        );
         assert!(debug.contains("[redacted]"));
     }
 
@@ -2043,7 +2101,7 @@ mod tests {
         let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
             panic!("expected distributed config");
         };
-        let identity = cfg.worker_identity();
+        let identity = cfg.worker_identity_noop();
         assert_eq!(identity.tenant, cfg.tenant());
         assert_eq!(identity.run, cfg.run());
         assert_eq!(identity.worker, cfg.worker());
@@ -3053,5 +3111,99 @@ mod tests {
             err,
             WorkerConfigError::UnsupportedCombination { .. }
         ));
+    }
+
+    // --- Direct WorkerIdentityConfig construction validation ---
+
+    #[test]
+    fn worker_identity_config_rejects_zero_run_id() {
+        let result = WorkerIdentityConfig::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(0),
+            WorkerId::from_raw(1),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+        );
+        assert!(
+            result.is_err(),
+            "WorkerIdentityConfig::new must reject RunId(0), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn worker_identity_config_rejects_zero_worker_id() {
+        let result = WorkerIdentityConfig::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(1),
+            WorkerId::from_raw(0),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+        );
+        assert!(
+            result.is_err(),
+            "WorkerIdentityConfig::new must reject WorkerId(0), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn distributed_config_rejects_commit_queue_capacity_above_ceiling() {
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "host=127.0.0.1 dbname=done",
+            "host=127.0.0.1 dbname=findings",
+        )
+        .expect("backend config should be valid");
+        let identity = WorkerIdentityConfig::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(1),
+            WorkerId::from_raw(1),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+        )
+        .expect("identity should be valid");
+        let over_ceiling = NonZeroUsize::new(MAX_COMMIT_QUEUE_CEILING + 1).unwrap();
+        let runtime = DistributedWorkerRuntimeSettings::new(ScanBudgets::default(), over_ceiling);
+        let result = DistributedWorkerConfig::new(
+            backends,
+            identity,
+            FsSourceSettings::new("/tmp"),
+            runtime,
+        );
+        assert!(
+            result.is_err(),
+            "commit_queue_capacity above ceiling must be rejected, got: {result:?}"
+        );
+    }
+
+    // --- Positional argument edge cases ---
+
+    #[test]
+    fn single_positional_git_selects_source_not_path() {
+        let env = TestEnv::default()
+            .with(ENV_WORKER_MODE, "direct")
+            .with(ENV_WORKER_PATH, "/some/path");
+        let result = resolve_worker_config_from(["git"], &env);
+        match result {
+            Ok(ResolvedWorkerConfig::Local(cfg)) => {
+                assert!(
+                    matches!(cfg.source(), WorkerSourceSettings::Git(_)),
+                    "single positional 'git' must select git source, got: {:?}",
+                    cfg.source()
+                );
+            }
+            other => panic!("expected local git config, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_skip_archives_does_not_reject_git_launches() {
+        let env = TestEnv::default()
+            .with(ENV_WORKER_MODE, "direct")
+            .with(ENV_FS_SKIP_ARCHIVES, "maybe");
+        let result = resolve_worker_config_from(["git", "/some/path"], &env);
+        assert!(
+            result.is_ok(),
+            "invalid skip_archives must not reject git launches: {result:?}"
+        );
     }
 }
