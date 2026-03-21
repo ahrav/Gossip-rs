@@ -899,6 +899,8 @@ pub enum WorkerConfigError {
     InvalidBackendConfig(ProductionBackendConfigError),
     /// The provided combination of mode, backend, and source is unsupported.
     UnsupportedCombination { message: String },
+    /// An environment variable is set but contains invalid UTF-8.
+    InvalidEncoding { key: &'static str },
 }
 
 impl WorkerConfigError {
@@ -943,6 +945,10 @@ impl fmt::Display for WorkerConfigError {
                 write!(f, "invalid production backend configuration: {source}")
             }
             Self::UnsupportedCombination { message } => f.write_str(message),
+            Self::InvalidEncoding { key } => write!(
+                f,
+                "environment variable {key} is set but contains invalid UTF-8"
+            ),
         }
     }
 }
@@ -972,7 +978,12 @@ impl From<ProductionBackendConfigError> for WorkerConfigError {
 /// Provider abstraction for environment variable access.
 pub trait EnvProvider {
     /// Return the current value for `key`, if it is set.
-    fn get(&self, key: &'static str) -> Option<String>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerConfigError::InvalidEncoding`] when the variable is set
+    /// but contains bytes that are not valid UTF-8.
+    fn get(&self, key: &'static str) -> Result<Option<String>, WorkerConfigError>;
 }
 
 /// Environment provider backed by the current process environment.
@@ -980,16 +991,12 @@ pub trait EnvProvider {
 pub struct ProcessEnv;
 
 impl EnvProvider for ProcessEnv {
-    fn get(&self, key: &'static str) -> Option<String> {
+    fn get(&self, key: &'static str) -> Result<Option<String>, WorkerConfigError> {
         match std::env::var(key) {
-            Ok(val) => Some(val),
-            Err(std::env::VarError::NotPresent) => None,
+            Ok(val) => Ok(Some(val)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
             Err(std::env::VarError::NotUnicode(_)) => {
-                tracing::error!(
-                    env_var = key,
-                    "environment variable contains invalid UTF-8; treating as absent"
-                );
-                None
+                Err(WorkerConfigError::InvalidEncoding { key })
             }
         }
     }

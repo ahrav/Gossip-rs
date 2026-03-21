@@ -204,6 +204,8 @@ pub enum ProductionBootstrapError {
     DoneLedgerAutoMigrate(DoneLedgerPgMigrationError),
     /// Development auto-migration of the findings schema failed.
     FindingsAutoMigrate(FindingsPgMigrationError),
+    /// A connection thread panicked instead of returning a result.
+    ThreadPanicked { backend: &'static str },
 }
 
 impl fmt::Display for ProductionBootstrapError {
@@ -239,6 +241,9 @@ impl fmt::Display for ProductionBootstrapError {
             Self::FindingsAutoMigrate(source) => {
                 write!(f, "findings PostgreSQL auto-migrate failed: {source}")
             }
+            Self::ThreadPanicked { backend } => {
+                write!(f, "{backend} connection thread panicked unexpectedly")
+            }
         }
     }
 }
@@ -257,6 +262,7 @@ impl Error for ProductionBootstrapError {
             Self::FindingsSchemaReadiness(source) => Some(source),
             Self::DoneLedgerAutoMigrate(source) => Some(source),
             Self::FindingsAutoMigrate(source) => Some(source),
+            Self::ThreadPanicked { .. } => None,
         }
     }
 }
@@ -285,6 +291,10 @@ impl fmt::Debug for ProductionBootstrapError {
                 f.debug_tuple("DoneLedgerAutoMigrate").field(e).finish()
             }
             Self::FindingsAutoMigrate(e) => f.debug_tuple("FindingsAutoMigrate").field(e).finish(),
+            Self::ThreadPanicked { backend } => f
+                .debug_struct("ThreadPanicked")
+                .field("backend", backend)
+                .finish(),
         }
     }
 }
@@ -431,17 +441,25 @@ pub fn build_production_backends(
     let dl_handle = std::thread::spawn(move || connect_postgres_client(&dl_dsn));
     let f_handle = std::thread::spawn(move || connect_postgres_client(&f_dsn));
 
-    // Join both threads before propagating errors. If only the first result
-    // were inspected with `?`, an early return would drop the second
-    // `JoinHandle`, detaching a thread that may still be blocked in
-    // `Client::connect`. Under repeated startup retries the leaked threads
-    // accumulate and consume process resources.
-    let dl_result = dl_handle
-        .join()
-        .expect("done-ledger connection thread should not panic");
-    let f_result = f_handle
-        .join()
-        .expect("findings connection thread should not panic");
+    // Join both threads before propagating errors so that an early `?`
+    // never drops a `JoinHandle` and silently detaches a thread still
+    // blocked in `Client::connect`. Thread panics produce a typed error
+    // instead of crashing the process.
+    let dl_join = dl_handle.join();
+    let f_join = f_handle.join();
+
+    let dl_result = dl_join.map_err(|payload| {
+        log_thread_panic("done-ledger", &payload);
+        ProductionBootstrapError::ThreadPanicked {
+            backend: "done-ledger",
+        }
+    })?;
+    let f_result = f_join.map_err(|payload| {
+        log_thread_panic("findings", &payload);
+        ProductionBootstrapError::ThreadPanicked {
+            backend: "findings",
+        }
+    })?;
 
     let done_ledger_client = dl_result.map_err(ProductionBootstrapError::DoneLedgerConnect)?;
     let findings_client = f_result.map_err(ProductionBootstrapError::FindingsConnect)?;
@@ -614,6 +632,16 @@ fn extract_pg_host(dsn: &str) -> Option<&str> {
 /// to a local Unix socket when no host is specified).
 fn is_local_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.starts_with('/')
+}
+
+/// Log a human-readable message extracted from a thread panic payload.
+fn log_thread_panic(backend: &str, payload: &dyn std::any::Any) {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>");
+    tracing::error!(backend, panic_message = msg, "connection thread panicked");
 }
 
 fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {

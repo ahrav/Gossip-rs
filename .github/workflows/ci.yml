@@ -139,6 +139,13 @@ jobs:
       STRESS_ITERATIONS: "20"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # macOS runners lack Docker; install it so testcontainers can
+      # start etcd / PostgreSQL containers for gossip-worker tests.
+      - name: Set up Docker (macOS)
+        if: runner.os == 'macOS'
+        uses: docker/setup-docker-action@1a6edb0ba9ac496f6850236981f15d8f9a82254d # v5.0.0
+
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
