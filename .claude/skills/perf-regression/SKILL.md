@@ -122,4 +122,5 @@ Report results as:
 - `/bench-compare` — Quick before/after benchmark comparison
 - `/asm-forge` — Assembly-guided optimization for hot functions
 - `/linux-perf-profile` — Hardware counter analysis for deeper investigation
+- `/perf-topdown` — Hardware counter analysis for deeper root cause investigation
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns

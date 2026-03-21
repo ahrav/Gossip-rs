@@ -443,4 +443,5 @@ Stop forging when:
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns
 - `/linux-perf-profile` — Hardware counter analysis on Linux (PMU, cache, TLB)
 - `/bench-compare` — Quick before/after benchmark comparison
+- `/perf-topdown` — TMA + branch trace profiling to identify hot functions before ASM analysis
 - `/perf-regression` — Full regression testing workflow before merging

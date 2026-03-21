@@ -351,4 +351,5 @@ PMU data to source-level patterns. Reference specific lines/functions.]
 
 - `/bench-compare` — Criterion before/after measurement (use first to detect regressions)
 - `/perf-regression` — Full regression workflow with acceptance criteria
+- `/perf-topdown` — Structured TMA + branch trace workflow (start here for classify→trace→fix on any architecture)
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns
