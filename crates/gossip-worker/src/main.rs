@@ -107,16 +107,9 @@ fn run_local_worker(cfg: &LocalWorkerConfig) -> Result<ScanReport, WorkerError> 
 fn run_distributed_worker(
     cfg: &DistributedWorkerConfig,
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
-    tracing::warn!(
-        tenant = %cfg.tenant(),
-        run = %cfg.run(),
-        worker = %cfg.worker(),
-        "coordination event recorder is a no-op — \
-         all coordination telemetry will be silently discarded"
-    );
     run_production_worker(
         cfg.production_backends(),
-        cfg.worker_identity_noop(),
+        cfg.worker_identity(),
         cfg.runtime_config(),
     )
 }
@@ -229,7 +222,7 @@ mod tests {
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
     use gossip_scanner_runtime::{
-        ExecutionMode, ScanBudgets,
+        ScanBudgets,
         distributed::{DistributedPersistence, DistributedRuntimeError, run_worker},
     };
     use gossip_worker::config::{
@@ -317,6 +310,36 @@ mod tests {
         .expect("distributed worker config should be valid")
     }
 
+    fn unreachable_production_config(path: &Path) -> DistributedWorkerConfig {
+        let defaults = gossip_scanner_runtime::distributed::DistributedRuntimeConfig::default();
+        let identity = WorkerIdentityConfig::new(
+            tenant(),
+            run_id(),
+            worker_id(),
+            policy_hash(),
+            tenant_secret_key(),
+        )
+        .expect("test worker identity config should be valid");
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::new(["http://127.0.0.1:1"], "/gossip/v1")
+                .expect("unreachable etcd config should still validate"),
+            "postgresql://scanner@127.0.0.1:1/done_ledger?connect_timeout=1",
+            "postgresql://scanner@127.0.0.1:1/findings?connect_timeout=1",
+        )
+        .expect("unreachable production backend config should be valid");
+
+        DistributedWorkerConfig::new(
+            backends,
+            identity,
+            FsSourceSettings::new(path.to_path_buf()),
+            DistributedWorkerRuntimeSettings::new(
+                ScanBudgets::default(),
+                defaults.commit_queue_capacity,
+            ),
+        )
+        .expect("distributed worker config should be valid")
+    }
+
     fn setup_coordinator_with_fs_shard(
         path: &Path,
         start: &[u8],
@@ -359,7 +382,6 @@ mod tests {
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
         let cfg = LocalWorkerConfig::new(
-            ExecutionMode::Direct,
             WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path().to_path_buf())),
             gossip_scanner_runtime::ScanBudgets::default(),
         )
@@ -380,7 +402,6 @@ mod tests {
         run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
 
         let cfg = LocalWorkerConfig::new(
-            ExecutionMode::Direct,
             WorkerSourceSettings::Git(GitSourceSettings::new(dir.path().to_path_buf())),
             gossip_scanner_runtime::ScanBudgets::default(),
         )
@@ -407,7 +428,7 @@ mod tests {
             distributed_runner_called = true;
             run_worker(
                 &mut coordinator,
-                cfg.worker_identity_noop(),
+                cfg.worker_identity(),
                 DistributedPersistence::new(findings.clone(), done_ledger.clone()),
                 cfg.runtime_config(),
             )
@@ -456,7 +477,7 @@ mod tests {
             distributed_runner_called = true;
             run_worker(
                 &mut coordinator,
-                cfg.worker_identity_noop(),
+                cfg.worker_identity(),
                 DistributedPersistence::new(findings.clone(), done_ledger.clone()),
                 cfg.runtime_config(),
             )
@@ -491,6 +512,26 @@ mod tests {
                 .expect("findings snapshot should succeed")
                 .is_empty(),
             "missing run should fail before any findings are written"
+        );
+    }
+
+    #[test]
+    fn connector_filesystem_production_dispatch_uses_real_backend_bootstrap() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let resolved =
+            ResolvedWorkerConfig::Distributed(Box::new(unreachable_production_config(dir.path())));
+        let error = execute_resolved_worker_with(&resolved, run_distributed_worker)
+            .expect_err("unreachable production backends must fail during startup");
+
+        assert!(matches!(
+            error,
+            WorkerError::ProductionRuntime(ProductionWorkerError::Startup(_))
+        ));
+        assert!(
+            !error.to_string().to_ascii_lowercase().contains("in-memory"),
+            "production bootstrap failure must not mention in-memory fallbacks: {error}"
         );
     }
 }

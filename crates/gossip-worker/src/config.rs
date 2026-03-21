@@ -3,11 +3,11 @@
 //! This module resolves environment variables plus CLI overrides into one of
 //! two explicit launch paths:
 //!
-//! - local scans (`ExecutionMode::Direct` or explicit `--backend=local`)
-//! - real distributed scans (`--backend=production`)
+//! - local scans (`ExecutionMode::Direct`)
+//! - real distributed scans (`ExecutionMode::Connector`)
 //!
-//! Connector mode never silently falls back to a local or fake backend. The
-//! caller must select a backend explicitly.
+//! Connector mode defaults to the real production backends and never silently
+//! falls back to a local or fake backend.
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -15,16 +15,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::Result as AnyhowResult;
 use gossip_contracts::identity::{PolicyHash, RunId, TenantId, TenantSecretKey, WorkerId};
 use gossip_coordination_etcd::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
-use gossip_scanner_runtime::coordination_sink::{
-    CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent,
-};
+use gossip_scanner_runtime::coordination_sink::CoordinationEventRecorder;
 use gossip_scanner_runtime::distributed::{DistributedRuntimeConfig, WorkerIdentity};
-use gossip_scanner_runtime::{
-    AnchorMode, ExecutionMode, FsScanConfig, GitScanConfig, OwnedCoreEvent, ScanBudgets,
-};
+use gossip_scanner_runtime::{AnchorMode, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets};
+
+use crate::recorder::ProductionCoordinationEventRecorder;
 
 /// Environment variable selecting the worker runtime family.
 pub const ENV_WORKER_MODE: &str = "GOSSIP_WORKER_MODE";
@@ -76,10 +73,10 @@ const MAX_BYTES_CEILING: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
 /// Ceiling for commit_queue_capacity to prevent resource exhaustion from misconfiguration.
 const MAX_COMMIT_QUEUE_CEILING: usize = 65_536;
 
-/// Backend selection for connector-mode launches.
+/// Backend selection parsed from the worker config surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendSelection {
-    /// Existing local/non-production worker path.
+    /// Existing local/non-production worker path used by direct scans.
     Local,
     /// Real etcd + PostgreSQL production path.
     Production,
@@ -419,16 +416,18 @@ pub enum WorkerSourceSettings {
     Git(GitSourceSettings),
 }
 
-/// Typed local worker launch configuration.
+/// Typed local direct worker launch configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalWorkerConfig {
-    execution_mode: ExecutionMode,
     source: WorkerSourceSettings,
     budgets: ScanBudgets,
 }
 
 impl LocalWorkerConfig {
-    /// Construct one local worker launch configuration.
+    /// Construct one local direct worker launch configuration.
+    ///
+    /// Local configs never carry connector semantics. The execution mode is
+    /// structurally fixed to [`ExecutionMode::Direct`].
     ///
     /// # Errors
     ///
@@ -436,22 +435,17 @@ impl LocalWorkerConfig {
     /// or when either value exceeds the configured validation ceiling
     /// (`max_items` > 10,000,000 or `max_bytes` > 64 GiB).
     pub fn new(
-        execution_mode: ExecutionMode,
         source: WorkerSourceSettings,
         budgets: ScanBudgets,
     ) -> Result<Self, WorkerConfigError> {
         validate_budgets(&budgets)?;
-        Ok(Self {
-            execution_mode,
-            source,
-            budgets,
-        })
+        Ok(Self { source, budgets })
     }
 
     #[inline]
     #[must_use]
     pub fn execution_mode(&self) -> ExecutionMode {
-        self.execution_mode
+        ExecutionMode::Direct
     }
 
     #[inline]
@@ -828,13 +822,11 @@ impl DistributedWorkerConfig {
         self.runtime
     }
 
-    /// Build the runtime `WorkerIdentity` with a no-op recorder that discards
-    /// all coordination events.
-    ///
-    /// Use [`Self::worker_identity_with_recorder`] to supply a real recorder.
+    /// Build the runtime `WorkerIdentity` with the production telemetry
+    /// recorder.
     #[must_use]
-    pub fn worker_identity_noop(&self) -> WorkerIdentity {
-        self.worker_identity_with_recorder(Arc::new(NoopCoordinationEventRecorder))
+    pub fn worker_identity(&self) -> WorkerIdentity {
+        self.worker_identity_with_recorder(Arc::new(ProductionCoordinationEventRecorder::default()))
     }
 
     /// Build the runtime `WorkerIdentity` using a caller-supplied recorder.
@@ -866,7 +858,7 @@ impl DistributedWorkerConfig {
 /// Fully resolved worker launch configuration.
 #[derive(Clone, Debug)]
 pub enum ResolvedWorkerConfig {
-    /// Local scan path (direct or explicit local connector mode).
+    /// Local direct scan path.
     Local(LocalWorkerConfig),
     /// Real etcd + PostgreSQL distributed worker path.
     Distributed(Box<DistributedWorkerConfig>),
@@ -1222,7 +1214,8 @@ impl RawWorkerConfig {
             self.backend.as_deref(),
             "backend",
             parse_from_str::<BackendSelection>,
-        )?;
+        )?
+        .or_else(|| default_backend_for_mode(execution_mode));
         let source = parse_optional(
             self.source.as_deref(),
             "source",
@@ -1293,8 +1286,8 @@ impl RawWorkerConfig {
             );
         }
 
-        // Helper: build a local config for the given execution mode.
-        let make_local = |mode| {
+        // Helper: build a direct local config.
+        let make_local = || {
             match path.try_exists() {
                 Ok(false) => {
                     return Err(WorkerConfigError::invalid_value(
@@ -1313,7 +1306,6 @@ impl RawWorkerConfig {
                 Ok(true) => {}
             }
             LocalWorkerConfig::new(
-                mode,
                 build_local_source_settings(
                     source,
                     path.clone(),
@@ -1335,20 +1327,18 @@ impl RawWorkerConfig {
                         message: "backend=production requires connector mode; direct mode cannot use real distributed backends".to_owned(),
                     });
                 }
-                make_local(ExecutionMode::Direct)
+                make_local()
             }
             ExecutionMode::Connector => {
-                let backend = backend.ok_or(WorkerConfigError::MissingRequiredValue {
-                    field: "backend",
-                    flag: "--backend",
-                    env: ENV_WORKER_BACKEND,
-                })?;
+                let backend = backend.expect("connector mode always defaults a backend");
                 match backend {
-                    BackendSelection::Local => make_local(ExecutionMode::Connector),
+                    BackendSelection::Local => Err(WorkerConfigError::UnsupportedCombination {
+                        message: "connector mode runs the distributed worker loop against the real production backends; switch to --mode=direct for local scans".to_owned(),
+                    }),
                     BackendSelection::Production => {
                         if source != WorkerSource::Fs {
                             return Err(WorkerConfigError::UnsupportedCombination {
-                                message: "backend=production currently supports only source=fs"
+                                message: "connector mode currently supports only source=fs; git connector mode is not supported (use --mode=direct for local git scans)"
                                     .to_owned(),
                             });
                         }
@@ -1511,7 +1501,14 @@ fn usage() -> &'static str {
      [--max-items=N] [--max-bytes=N] [--commit-queue-capacity=N] \\
      [fs|git] [path]\n\
      defaults: --mode=connector fs .\n\
-     note: connector mode requires explicit backend selection; backend=production currently supports only fs"
+     note: connector mode defaults to backend=production; use --mode=direct for local scans"
+}
+
+fn default_backend_for_mode(execution_mode: ExecutionMode) -> Option<BackendSelection> {
+    match execution_mode {
+        ExecutionMode::Direct => None,
+        ExecutionMode::Connector => Some(BackendSelection::Production),
+    }
 }
 
 fn validate_budgets(budgets: &ScanBudgets) -> Result<(), WorkerConfigError> {
@@ -1806,28 +1803,6 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-/// Recorder that discards coordination events while still satisfying the runtime interface.
-#[derive(Default)]
-pub(crate) struct NoopCoordinationEventRecorder;
-
-impl CoordinationEventRecorder for NoopCoordinationEventRecorder {
-    fn record_core_event(&self, _shard_id: &str, _event: OwnedCoreEvent) -> AnyhowResult<()> {
-        Ok(())
-    }
-
-    fn record_git_event(&self, _shard_id: &str, _event: StoredGitEvent) -> AnyhowResult<()> {
-        Ok(())
-    }
-
-    fn record_commit_progress(
-        &self,
-        _shard_id: &str,
-        _event: CommitProgressRecord,
-    ) -> AnyhowResult<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1968,16 +1943,34 @@ mod tests {
     }
 
     #[test]
-    fn connector_mode_requires_explicit_backend_selection() {
+    fn connector_mode_defaults_backend_to_production() {
+        let env = {
+            let mut vars = production_env().vars;
+            vars.remove(ENV_WORKER_BACKEND);
+            TestEnv { vars }
+        };
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("connector mode should default backend to production");
+
+        match resolved {
+            ResolvedWorkerConfig::Distributed(cfg) => {
+                assert_eq!(cfg.backend(), BackendSelection::Production);
+            }
+            other => panic!("expected distributed config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_worker_path_fails_closed_when_backend_config_is_absent() {
         let err = resolve_worker_config_from(["fs", "/tmp/project"], &TestEnv::default())
-            .expect_err("connector mode without backend must fail closed");
+            .expect_err("default worker launch without backend config must fail closed");
 
         assert!(matches!(
             err,
             WorkerConfigError::MissingRequiredValue {
-                field: "backend",
-                flag: "--backend",
-                env: ENV_WORKER_BACKEND,
+                field: "etcd_endpoints",
+                flag: "--etcd-endpoints",
+                env: ENV_ETCD_ENDPOINTS,
             }
         ));
     }
@@ -2026,15 +2019,16 @@ mod tests {
     }
 
     #[test]
-    fn production_rejects_git_source() {
+    fn connector_mode_rejects_git_source_for_local_git_scans() {
         let env = production_env().with(ENV_WORKER_SOURCE, "git");
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("production backend must reject git");
+            .expect_err("connector mode must reject git");
 
         assert!(matches!(
             err,
             WorkerConfigError::UnsupportedCombination { ref message }
                 if message.contains("source=fs")
+                    && message.contains("--mode=direct")
         ));
     }
 
@@ -2107,7 +2101,7 @@ mod tests {
         let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
             panic!("expected distributed config");
         };
-        let identity = cfg.worker_identity_noop();
+        let identity = cfg.worker_identity();
         assert_eq!(identity.tenant, cfg.tenant());
         assert_eq!(identity.run, cfg.run());
         assert_eq!(identity.worker, cfg.worker());
@@ -2435,7 +2429,6 @@ mod tests {
     #[test]
     fn local_config_rejects_zero_budgets() {
         let err = LocalWorkerConfig::new(
-            ExecutionMode::Direct,
             WorkerSourceSettings::Fs(FsSourceSettings::new("/tmp")),
             ScanBudgets {
                 max_items: 0,
@@ -2601,10 +2594,15 @@ mod tests {
     #[test]
     fn local_backend_rejects_nonexistent_path() {
         let err = resolve_worker_config_from(
-            ["--backend=local", "fs", "/nonexistent/review-test"],
+            [
+                "--mode=direct",
+                "--backend=local",
+                "fs",
+                "/nonexistent/review-test",
+            ],
             &TestEnv::default(),
         )
-        .expect_err("nonexistent path must be rejected with local backend");
+        .expect_err("nonexistent path must be rejected with direct local backend");
         assert!(matches!(
             err,
             WorkerConfigError::InvalidValue { field: "path", .. }
@@ -2631,22 +2629,22 @@ mod tests {
         );
     }
 
-    // --- Connector + local backend resolution ---
+    // --- Connector rejection rules ---
 
     #[test]
-    fn connector_local_backend_resolves_to_local_config_with_connector_mode() {
+    fn connector_mode_rejects_local_backend_for_filesystem_scans() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dir_str = dir.path().to_str().expect("utf-8 path");
-        let resolved =
+        let err =
             resolve_worker_config_from(["--backend=local", "fs", dir_str], &TestEnv::default())
-                .expect("connector + local should resolve");
+                .expect_err("connector mode must reject local backend selection");
 
-        match resolved {
-            ResolvedWorkerConfig::Local(cfg) => {
-                assert_eq!(cfg.execution_mode(), ExecutionMode::Connector);
-            }
-            other => panic!("expected local config, got {other:?}"),
-        }
+        assert!(matches!(
+            err,
+            WorkerConfigError::UnsupportedCombination { ref message }
+                if message.contains("distributed worker loop against the real production backends")
+                    && message.contains("--mode=direct")
+        ));
     }
 
     // --- InvalidEtcdConfig error variant coverage ---
@@ -2970,7 +2968,6 @@ mod tests {
     fn local_config_rejects_zero_max_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = LocalWorkerConfig::new(
-            ExecutionMode::Direct,
             WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path())),
             ScanBudgets {
                 max_items: 100,
@@ -2991,7 +2988,6 @@ mod tests {
     fn local_config_rejects_max_items_above_ceiling() {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = LocalWorkerConfig::new(
-            ExecutionMode::Direct,
             WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path())),
             ScanBudgets {
                 max_items: MAX_ITEMS_CEILING + 1,
@@ -3012,7 +3008,6 @@ mod tests {
     fn local_config_rejects_max_bytes_above_ceiling() {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = LocalWorkerConfig::new(
-            ExecutionMode::Direct,
             WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path())),
             ScanBudgets {
                 max_items: 100,
@@ -3115,13 +3110,15 @@ mod tests {
     // --- Git source rejection via CLI positional arg ---
 
     #[test]
-    fn production_rejects_git_source_via_cli_positional() {
+    fn connector_mode_rejects_git_source_via_cli_positional() {
         let env = production_env();
         let err = resolve_worker_config_from(["git", "/tmp"], &env)
-            .expect_err("production backend must reject git via positional arg");
+            .expect_err("connector mode must reject git via positional arg");
         assert!(matches!(
             err,
-            WorkerConfigError::UnsupportedCombination { .. }
+            WorkerConfigError::UnsupportedCombination { ref message }
+                if message.contains("source=fs")
+                    && message.contains("--mode=direct")
         ));
     }
 
