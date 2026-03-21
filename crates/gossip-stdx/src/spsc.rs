@@ -350,8 +350,8 @@ impl<T, const N: usize> SpscConsumer<T, N> {
 /// tx.try_push(42).unwrap();
 /// assert_eq!(rx.try_pop(), Some(42));
 /// ```
-pub fn spsc_channel<T: Send + 'static, const N: usize>(
-) -> (OwnedSpscProducer<T, N>, OwnedSpscConsumer<T, N>) {
+pub fn spsc_channel<T: Send + 'static, const N: usize>()
+-> (OwnedSpscProducer<T, N>, OwnedSpscConsumer<T, N>) {
     // Force compile-time capacity check.
     let _ = SpscRing::<T, N>::CAPACITY;
 
@@ -590,8 +590,8 @@ mod tests {
 
     #[test]
     fn drop_remaining_items() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let drop_count = Arc::new(AtomicUsize::new(0));
 
@@ -656,8 +656,8 @@ mod tests {
     /// are dropped — verifying no leak or double-drop.
     #[test]
     fn cross_thread_drop_tracking() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct Dt(Arc<AtomicUsize>);
         impl Drop for Dt {
