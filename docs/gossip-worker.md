@@ -65,6 +65,9 @@ gossip-worker
             --> gossip-done-ledger-postgres
             --> gossip-findings-postgres
             --> gossip-scanner-runtime distributed runtime
+       --> src/recorder.rs
+            --> CoordinationTelemetrySink (pub(crate) sink trait)
+            --> TracingCoordinationTelemetrySink (default structured tracing sink)
 ```
 
 ### Execution flow
@@ -111,6 +114,48 @@ caller
 
 Callers that need more control can build the backends manually with
 `build_production_backends` or `build_production_backends_from_clients`.
+
+### Coordination telemetry recorder
+
+The `recorder` module provides a production-safe implementation of
+`CoordinationEventRecorder` that emits structured telemetry for the
+distributed coordination lifecycle. All telemetry output is best-effort:
+the distributed runtime continues making progress through the durable commit
+pipeline even if the telemetry sink is unavailable.
+
+**Event families.** The recorder handles three categories of coordination
+events, each with independent error-suppression tracking:
+
+- **Core** -- scanner-level findings, progress snapshots, summaries, and
+  diagnostics.
+- **Git** -- commit metadata and identity dictionary entries.
+- **Progress** -- commit lifecycle markers (begin/finish).
+
+**Redaction boundary.** Raw events from the runtime contain tenant data, file
+paths, git identity bytes, and diagnostic text. Before emission, the recorder
+converts every event into a `SanitizedCoordinationRecord` where all such
+toxic fields are replaced by `RedactedDigest` values. A `RedactedDigest`
+stores `(original_length, 64-bit BLAKE3 hash)` -- enough to correlate
+records and gauge payload size, but non-reversible. The hash is
+domain-separated by a fixed derive-key context and further keyed by a
+field-level label (e.g. `"shard_id"`, `"item_key"`), so identical byte
+sequences in different field positions produce distinct digests.
+
+**Telemetry target.** All recorder output is emitted under the tracing target
+`gossip_worker::coordination`, enabling subscribers to filter coordination
+telemetry independently from other worker logs.
+
+**Error suppression.** The first sink failure per category (core, git,
+progress) emits a warning through the tracing target. Subsequent failures
+for the same category are silently absorbed to prevent log flooding during
+sustained sink outages.
+
+**Sink extensibility.** The `CoordinationTelemetrySink` trait is `pub(crate)`
+and accepts only pre-sanitized records. The default implementation
+(`TracingCoordinationTelemetrySink`) emits structured `tracing` events at
+appropriate severity levels. Alternative sink backends (metrics, file, etc.)
+can be added by implementing this trait without changing the runtime-facing
+`CoordinationEventRecorder` contract.
 
 ---
 
@@ -302,6 +347,71 @@ redacts both DSNs so credentials do not leak into logs.
 Concrete bundle of the live etcd coordinator and persistence handles passed to
 the generic distributed runtime.
 
+### ProductionCoordinationEventRecorder
+
+Production recorder implementing `CoordinationEventRecorder`. Sanitizes all
+incoming events through the redaction boundary before forwarding to the
+configured `CoordinationTelemetrySink`. Sink failures are absorbed with
+once-per-category warning suppression so the distributed runtime never blocks
+on telemetry availability.
+
+### SanitizedCoordinationRecord
+
+```rust
+pub(crate) enum SanitizedCoordinationRecord {
+    CoreFinding { .. },
+    CoreProgress { .. },
+    CoreSummary { .. },
+    CoreDiagnostic { .. },
+    GitCommitMeta { .. },
+    GitIdentityDictionary { .. },
+    CommitBegin { .. },
+    CommitFinish { .. },
+}
+```
+
+Eight-variant enum mirroring the three event families of
+`CoordinationEventRecorder`. Every field that could contain tenant data, file
+paths, git identity bytes, or diagnostic text is stored as a `RedactedDigest`.
+Scalar metrics, `&'static str` labels, and integer IDs pass through unchanged.
+
+### RedactedDigest
+
+```rust
+pub(crate) struct RedactedDigest {
+    len: usize,
+    hash64: u64,
+}
+```
+
+`Copy` type storing `(original_length, 64-bit BLAKE3 hash)`. Non-reversible.
+The hash uses BLAKE3 derive-key mode with a fixed domain context, and the
+update stream includes a field-level label so identical payloads in different
+field positions produce distinct digests. Display format:
+`len=<n>,hash=<016x>`.
+
+### CoordinationTelemetrySink
+
+```rust
+pub(crate) trait CoordinationTelemetrySink: Send + Sync {
+    fn emit(&self, record: SanitizedCoordinationRecord) -> Result<()>;
+}
+```
+
+Crate-internal sink trait for sanitized telemetry records. The recorder owns
+the sanitization contract: callers outside the crate interact only with
+`CoordinationEventRecorder` (which accepts raw events). Alternative sink
+backends can be added by implementing this trait without changing the
+runtime-facing API.
+
+### TracingCoordinationTelemetrySink
+
+Default sink used by `ProductionCoordinationEventRecorder`. Emits each
+`SanitizedCoordinationRecord` variant as a structured `tracing` event at an
+appropriate severity level (`info!` for summaries, `debug!` for findings and
+progress, `trace!` for git metadata and commit lifecycle, and level-matched
+output for diagnostics).
+
 ---
 
 ## Functions
@@ -348,6 +458,24 @@ The production module includes:
 - ignored live-backend bootstrap tests that require configured etcd and
   PostgreSQL endpoints
 
+The recorder module checks:
+
+- `redacted_digest_distinguishes_same_length_inputs_and_field_labels` --
+  verifies that same-length inputs with different content produce distinct
+  hashes, and that identical content under different field labels produces
+  distinct hashes (collision resistance across the label/payload domain)
+- `sanitized_records_hash_toxic_fields` -- exhaustive variant coverage
+  confirming every toxic field across all eight `SanitizedCoordinationRecord`
+  variants is replaced by a `RedactedDigest` that does not contain the raw input
+- `tracing_sink_never_logs_raw_canary_bytes` -- end-to-end canary test that
+  exercises all event types through the default `TracingCoordinationTelemetrySink`,
+  captures the tracing output, and asserts the canary string never appears in
+  the log stream while all expected event names are present
+- `recorder_suppresses_repeated_sink_failures_per_category` -- injects a
+  `FailingSink` that always returns `Err`, fires four events per category
+  (core, git, progress), and asserts exactly three warning lines appear (one
+  per category) with no raw canary leakage
+
 ---
 
 ## Security Notes
@@ -383,6 +511,7 @@ side-channel leakage of key material.
 | Worker binary entrypoint | `crates/gossip-worker/src/main.rs` |
 | Worker config surface | `crates/gossip-worker/src/config.rs` |
 | Worker library surface | `crates/gossip-worker/src/lib.rs` |
+| Coordination telemetry recorder | `crates/gossip-worker/src/recorder.rs` |
 | Production composition root | `crates/gossip-worker/src/production.rs` |
 | Runtime scan entrypoints | `crates/gossip-scanner-runtime/src/lib.rs` |
 | Distributed runtime API | `crates/gossip-scanner-runtime/src/distributed.rs` |

@@ -15,6 +15,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -24,8 +25,20 @@ use gossip_scanner_runtime::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent,
 };
 
+/// Tracing target for all coordination telemetry events. Subscribers can filter
+/// on this target to isolate coordination output from other worker logs.
 const TELEMETRY_TARGET: &str = "gossip_worker::coordination";
+
+/// BLAKE3 derive-key context for [`RedactedDigest`] hashing. Changing this
+/// value rotates every digest in the telemetry stream; existing log-based
+/// alerts that match on specific hash values will stop matching.
 const DIGEST_DOMAIN: &str = "gossip/worker/coordination-telemetry/v1";
+
+/// Cached BLAKE3 derive-key hasher for [`RedactedDigest`]. Cloning the
+/// post-setup state avoids repeating the key-schedule compression on every
+/// hash call.
+static TELEMETRY_HASHER: LazyLock<gossip_contracts::blake3::Hasher> =
+    LazyLock::new(|| domain_hasher(DIGEST_DOMAIN));
 
 /// Production recorder for distributed coordination telemetry.
 ///
@@ -37,6 +50,26 @@ pub struct ProductionCoordinationEventRecorder {
     core_error_logged: AtomicBool,
     git_error_logged: AtomicBool,
     progress_error_logged: AtomicBool,
+}
+
+impl fmt::Debug for ProductionCoordinationEventRecorder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProductionCoordinationEventRecorder")
+            .field("sink", &"<sink>")
+            .field(
+                "core_error_logged",
+                &self.core_error_logged.load(Ordering::Relaxed),
+            )
+            .field(
+                "git_error_logged",
+                &self.git_error_logged.load(Ordering::Relaxed),
+            )
+            .field(
+                "progress_error_logged",
+                &self.progress_error_logged.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
 }
 
 impl Default for ProductionCoordinationEventRecorder {
@@ -62,8 +95,15 @@ impl ProductionCoordinationEventRecorder {
         }
     }
 
+    /// Forwards a sanitized record to the sink, absorbing failures. The first
+    /// failure per [`RecorderCategory`] emits a warning; subsequent failures
+    /// for the same category are silently suppressed to avoid log flooding
+    /// during sustained sink outages.
     fn emit_best_effort(&self, category: RecorderCategory, record: SanitizedCoordinationRecord) {
         let shard_id = record.shard_id();
+        // The `swap(true)` returns the *previous* value: `false` on the first
+        // failure, `true` on every subsequent one. Combined with the `is_err()`
+        // short-circuit, the warning fires exactly once per category.
         if self.sink.emit(record).is_err()
             && !category.error_flag(self).swap(true, Ordering::Relaxed)
         {
@@ -105,7 +145,15 @@ impl CoordinationEventRecorder for ProductionCoordinationEventRecorder {
 }
 
 /// Crate-local sink boundary for sanitized telemetry records.
+///
+/// Kept `pub(crate)` so the recorder owns the sanitization contract: callers
+/// outside this crate interact only with [`CoordinationEventRecorder`] (which
+/// accepts raw events), and this trait accepts only pre-sanitized records.
+/// Alternative sink backends (metrics, file, etc.) can be added by
+/// implementing this trait without changing the runtime-facing API.
 pub(crate) trait CoordinationTelemetrySink: Send + Sync {
+    /// Emit a single sanitized record. Returning `Err` signals a transient
+    /// sink failure; the caller (`emit_best_effort`) handles suppression.
     fn emit(&self, record: SanitizedCoordinationRecord) -> Result<()>;
 }
 
@@ -290,6 +338,8 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
     }
 }
 
+/// Routes a diagnostic record to the tracing level matching `diagnostic_level`.
+/// Unrecognized levels (including `"info"` itself) fall through to `info!`.
 fn emit_diagnostic(
     shard_id: RedactedDigest,
     diagnostic_level: &'static str,
@@ -354,6 +404,11 @@ fn emit_diagnostic(
     }
 }
 
+/// Discriminant for the three independent error-suppression channels.
+///
+/// Each category tracks its own "first failure logged" flag so that a broken
+/// git sink does not suppress the first-failure warning for core events (or
+/// vice versa).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecorderCategory {
     Core,
@@ -370,6 +425,8 @@ impl RecorderCategory {
         }
     }
 
+    /// Returns the per-category atomic flag on `recorder` that tracks whether
+    /// the first sink failure has already been logged.
     fn error_flag(self, recorder: &ProductionCoordinationEventRecorder) -> &AtomicBool {
         match self {
             Self::Core => &recorder.core_error_logged,
@@ -379,6 +436,16 @@ impl RecorderCategory {
     }
 }
 
+/// One-way digest that replaces sensitive field values in telemetry output.
+///
+/// Stores `(original_length, 64-bit BLAKE3 hash)` so operators can correlate
+/// records ("same hash ⇒ same input") and gauge payload size without exposing
+/// raw bytes. The hash is domain-separated by [`DIGEST_DOMAIN`] and further
+/// keyed by a field-level `label` (e.g. `"shard_id"`, `"item_key"`), so
+/// identical byte sequences in different field positions produce distinct
+/// digests.
+///
+/// Display format: `len=<n>,hash=<016x>`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RedactedDigest {
     len: usize,
@@ -386,9 +453,14 @@ pub(crate) struct RedactedDigest {
 }
 
 impl RedactedDigest {
+    /// Builds a digest from raw bytes. Uses BLAKE3 derive-key mode with
+    /// [`DIGEST_DOMAIN`] as the context (key derivation, not part of the update
+    /// stream). The update stream is `label || 0x00 || le64(len) || bytes`,
+    /// where the null separator and length prefix prevent label/payload
+    /// ambiguity.
     #[inline]
     fn bytes(label: &'static str, bytes: &[u8]) -> Self {
-        let mut hasher = domain_hasher(DIGEST_DOMAIN);
+        let mut hasher = TELEMETRY_HASHER.clone();
         hasher.update(label.as_bytes());
         hasher.update(&[0]);
         hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -417,6 +489,12 @@ impl fmt::Debug for RedactedDigest {
     }
 }
 
+/// Wrapper that formats `None` as `"none"` instead of being omitted.
+///
+/// `tracing` field values must implement `Display`. Bare `Option<T>` cannot be
+/// used directly as a field value, and omitting the field entirely would make
+/// log schemas inconsistent across records. This wrapper ensures every
+/// optional field always appears in the structured output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OptionalField<T>(Option<T>);
 
@@ -435,6 +513,15 @@ impl<T: fmt::Display> fmt::Display for OptionalField<T> {
     }
 }
 
+/// Pre-sanitized coordination telemetry record ready for sink emission.
+///
+/// Every field that could contain tenant data, file paths, git identity bytes,
+/// or diagnostic text is stored as a [`RedactedDigest`]. Scalar metrics
+/// (`u64` counters, `f64` throughput), `&'static str` labels, and integer IDs
+/// pass through unchanged because they carry no customer-attributable content.
+///
+/// Variants mirror the three event families of [`CoordinationEventRecorder`]:
+/// core scanner events, git metadata, and commit lifecycle progress.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SanitizedCoordinationRecord {
     CoreFinding {
@@ -509,8 +596,10 @@ pub(crate) enum SanitizedCoordinationRecord {
 }
 
 impl SanitizedCoordinationRecord {
+    /// Converts a raw core event into a sanitized record, redacting `shard_id`,
+    /// `object_path`, `rule_name`, `change_kind`, and diagnostic messages.
     fn from_core_event(shard_id: &str, event: OwnedCoreEvent) -> Self {
-        let shard_id = redact_text("shard_id", shard_id);
+        let shard_id = RedactedDigest::text("shard_id", shard_id);
         match event {
             OwnedCoreEvent::Finding {
                 source,
@@ -525,15 +614,15 @@ impl SanitizedCoordinationRecord {
             } => Self::CoreFinding {
                 shard_id,
                 source: source.as_str(),
-                object_path: redact_bytes("object_path", &object_path),
+                object_path: RedactedDigest::bytes("object_path", &object_path),
                 start,
                 end,
                 rule_id,
-                rule_name: redact_text("rule_name", &rule_name),
+                rule_name: RedactedDigest::text("rule_name", &rule_name),
                 commit_id,
                 change_kind: change_kind
                     .as_deref()
-                    .map(|value| redact_text("change_kind", value)),
+                    .map(|value| RedactedDigest::text("change_kind", value)),
                 confidence_score,
             },
             OwnedCoreEvent::Progress {
@@ -571,13 +660,15 @@ impl SanitizedCoordinationRecord {
             OwnedCoreEvent::Diagnostic { level, message } => Self::CoreDiagnostic {
                 shard_id,
                 diagnostic_level: level,
-                diagnostic_message: redact_text("diagnostic_message", &message),
+                diagnostic_message: RedactedDigest::text("diagnostic_message", &message),
             },
         }
     }
 
+    /// Converts a git event into a sanitized record, redacting `shard_id`,
+    /// commit OIDs, and identity dictionary values (raw name/email bytes).
     fn from_git_event(shard_id: &str, event: StoredGitEvent) -> Self {
-        let shard_id = redact_text("shard_id", shard_id);
+        let shard_id = RedactedDigest::text("shard_id", shard_id);
         match event {
             StoredGitEvent::CommitMeta {
                 commit_id,
@@ -590,7 +681,7 @@ impl SanitizedCoordinationRecord {
             } => Self::GitCommitMeta {
                 shard_id,
                 commit_id,
-                oid: redact_text("git_commit_oid", &oid_hex),
+                oid: RedactedDigest::text("git_commit_oid", &oid_hex),
                 timestamp,
                 author_name_id,
                 author_email_id,
@@ -600,13 +691,15 @@ impl SanitizedCoordinationRecord {
             StoredGitEvent::IdentityDictionary { id, value } => Self::GitIdentityDictionary {
                 shard_id,
                 identity_id: id,
-                value: redact_bytes("git_identity_value", &value),
+                value: RedactedDigest::bytes("git_identity_value", &value),
             },
         }
     }
 
+    /// Converts a commit lifecycle marker into a sanitized record, redacting
+    /// `shard_id`, `tenant_id`, `policy_hash`, and `item_key`.
     fn from_commit_progress(shard_id: &str, event: CommitProgressRecord) -> Self {
-        let shard_id = redact_text("shard_id", shard_id);
+        let shard_id = RedactedDigest::text("shard_id", shard_id);
         match event {
             CommitProgressRecord::Begin {
                 write_context,
@@ -614,12 +707,15 @@ impl SanitizedCoordinationRecord {
                 size_hint,
             } => Self::CommitBegin {
                 shard_id,
-                tenant_id: redact_bytes("tenant_id", write_context.tenant_id().as_bytes()),
-                policy_hash: redact_bytes("policy_hash", write_context.policy_hash().as_bytes()),
+                tenant_id: RedactedDigest::bytes("tenant_id", write_context.tenant_id().as_bytes()),
+                policy_hash: RedactedDigest::bytes(
+                    "policy_hash",
+                    write_context.policy_hash().as_bytes(),
+                ),
                 run_id: write_context.run_id().as_raw(),
                 lease_shard_id: write_context.shard_id().as_raw(),
                 fence_epoch: write_context.fence_epoch().as_raw(),
-                item_key: redact_bytes("item_key", item_key.as_bytes()),
+                item_key: RedactedDigest::bytes("item_key", item_key.as_bytes()),
                 size_hint,
             },
             CommitProgressRecord::Finish {
@@ -627,16 +723,20 @@ impl SanitizedCoordinationRecord {
                 item_key,
             } => Self::CommitFinish {
                 shard_id,
-                tenant_id: redact_bytes("tenant_id", write_context.tenant_id().as_bytes()),
-                policy_hash: redact_bytes("policy_hash", write_context.policy_hash().as_bytes()),
+                tenant_id: RedactedDigest::bytes("tenant_id", write_context.tenant_id().as_bytes()),
+                policy_hash: RedactedDigest::bytes(
+                    "policy_hash",
+                    write_context.policy_hash().as_bytes(),
+                ),
                 run_id: write_context.run_id().as_raw(),
                 lease_shard_id: write_context.shard_id().as_raw(),
                 fence_epoch: write_context.fence_epoch().as_raw(),
-                item_key: redact_bytes("item_key", item_key.as_bytes()),
+                item_key: RedactedDigest::bytes("item_key", item_key.as_bytes()),
             },
         }
     }
 
+    /// Extracts the (already redacted) shard ID for error-suppression log context.
     fn shard_id(&self) -> RedactedDigest {
         match self {
             Self::CoreFinding { shard_id, .. }
@@ -649,16 +749,6 @@ impl SanitizedCoordinationRecord {
             | Self::CommitFinish { shard_id, .. } => *shard_id,
         }
     }
-}
-
-#[inline]
-fn redact_bytes(label: &'static str, bytes: &[u8]) -> RedactedDigest {
-    RedactedDigest::bytes(label, bytes)
-}
-
-#[inline]
-fn redact_text(label: &'static str, text: &str) -> RedactedDigest {
-    RedactedDigest::text(label, text)
 }
 
 #[cfg(test)]
@@ -1057,9 +1147,9 @@ mod tests {
         let recorder = ProductionCoordinationEventRecorder::with_sink(Arc::new(FailingSink {
             canary: canary.clone(),
         }));
-        let core_shard = redact_text("shard_id", "core-shard").to_string();
-        let git_shard = redact_text("shard_id", "git-shard").to_string();
-        let progress_shard = redact_text("shard_id", "progress-shard").to_string();
+        let core_shard = RedactedDigest::text("shard_id", "core-shard").to_string();
+        let git_shard = RedactedDigest::text("shard_id", "git-shard").to_string();
+        let progress_shard = RedactedDigest::text("shard_id", "progress-shard").to_string();
 
         let logs = capture_logs(Level::WARN, || {
             for _ in 0..4 {

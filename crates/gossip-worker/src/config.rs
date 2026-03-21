@@ -1020,6 +1020,8 @@ struct RawWorkerConfig {
     cli_done_ledger_dsn: bool,
     /// Tracks whether the findings DSN was supplied via a CLI flag.
     cli_findings_dsn: bool,
+    /// Tracks whether the etcd endpoints were supplied via a CLI flag.
+    cli_etcd_endpoints: bool,
 }
 
 impl fmt::Debug for RawWorkerConfig {
@@ -1037,7 +1039,7 @@ impl fmt::Debug for RawWorkerConfig {
             .field("max_items", &self.max_items)
             .field("max_bytes", &self.max_bytes)
             .field("commit_queue_capacity", &self.commit_queue_capacity)
-            .field("etcd_endpoints_csv", &self.etcd_endpoints_csv)
+            .field("etcd_endpoints_csv", &"[redacted]")
             .field("etcd_namespace", &self.etcd_namespace)
             .field("done_ledger_postgres_dsn", &"[redacted]")
             .field("findings_postgres_dsn", &"[redacted]")
@@ -1049,6 +1051,7 @@ impl fmt::Debug for RawWorkerConfig {
             .field("cli_tenant_secret_key", &self.cli_tenant_secret_key)
             .field("cli_done_ledger_dsn", &self.cli_done_ledger_dsn)
             .field("cli_findings_dsn", &self.cli_findings_dsn)
+            .field("cli_etcd_endpoints", &self.cli_etcd_endpoints)
             .finish()
     }
 }
@@ -1080,6 +1083,7 @@ impl RawWorkerConfig {
             cli_tenant_secret_key: false,
             cli_done_ledger_dsn: false,
             cli_findings_dsn: false,
+            cli_etcd_endpoints: false,
         }
     }
 
@@ -1180,7 +1184,10 @@ impl RawWorkerConfig {
             "max-items" => self.max_items = Some(value.to_owned()),
             "max-bytes" => self.max_bytes = Some(value.to_owned()),
             "commit-queue-capacity" => self.commit_queue_capacity = Some(value.to_owned()),
-            "etcd-endpoints" => self.etcd_endpoints_csv = Some(value.to_owned()),
+            "etcd-endpoints" => {
+                self.etcd_endpoints_csv = Some(value.to_owned());
+                self.cli_etcd_endpoints = true;
+            }
             "etcd-namespace" => self.etcd_namespace = Some(value.to_owned()),
             "done-ledger-postgres-dsn" => {
                 self.done_ledger_postgres_dsn = Some(value.to_owned());
@@ -1275,6 +1282,13 @@ impl RawWorkerConfig {
             tracing::warn!(
                 flag = "--findings-postgres-dsn",
                 preferred_env = ENV_FINDINGS_POSTGRES_DSN,
+                "credential provided via CLI flag; prefer env var to avoid process-table exposure"
+            );
+        }
+        if self.cli_etcd_endpoints {
+            tracing::warn!(
+                flag = "--etcd-endpoints",
+                preferred_env = ENV_ETCD_ENDPOINTS,
                 "credential provided via CLI flag; prefer env var to avoid process-table exposure"
             );
         }
