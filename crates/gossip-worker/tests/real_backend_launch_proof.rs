@@ -12,8 +12,9 @@
 //! commits.
 
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId};
@@ -33,6 +34,7 @@ use gossip_findings_postgres::{
 };
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
 use gossip_pg_common::test_support::create_test_db;
+use gossip_stdx::hex_encode;
 use gossip_worker::config::{
     ENV_COMMIT_QUEUE_CAPACITY, ENV_DONE_LEDGER_POSTGRES_DSN, ENV_ETCD_ENDPOINTS,
     ENV_ETCD_NAMESPACE, ENV_FINDINGS_POSTGRES_DSN, ENV_FS_SKIP_ARCHIVES, ENV_MAX_BYTES,
@@ -43,6 +45,7 @@ use gossip_worker::config::{
 };
 use postgres::{Client, NoTls};
 use tempfile::TempDir;
+use wait_timeout::ChildExt;
 
 const DEFAULT_LEASE_DURATION_MS: u64 = 30_000;
 const SHARD_ID_RAW: u64 = 1;
@@ -88,7 +91,11 @@ const WORKER_ENV_KEYS: &[&str] = &[
 ];
 
 struct SafeScanFixture {
+    /// Held for Drop — keeps the scan directory alive for the test lifetime.
+    #[allow(dead_code)]
     scan_root: TempDir,
+    /// Held for Drop — keeps the rules directory alive for the test lifetime.
+    #[allow(dead_code)]
     rules_root: TempDir,
     scan_path: PathBuf,
     rules_path: PathBuf,
@@ -127,10 +134,6 @@ impl SafeScanFixture {
 
     fn rules_path(&self) -> &Path {
         &self.rules_path
-    }
-
-    fn keepalive_paths(&self) -> (&Path, &Path) {
-        (self.scan_root.path(), self.rules_root.path())
     }
 }
 
@@ -188,6 +191,21 @@ impl SeededLaunchProof {
 
     fn observation_row_count(&self) -> i64 {
         table_row_count(&self.findings_dsn, findings_schema::OBSERVATIONS_TABLE)
+    }
+
+    fn observations_for_run(&self) -> i64 {
+        let mut client =
+            Client::connect(&self.findings_dsn, NoTls).expect("findings DB should connect");
+        client
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {} WHERE run_id = $1 AND shard_id = $2",
+                    findings_schema::OBSERVATIONS_TABLE,
+                ),
+                &[&(run_id().as_raw() as i64), &(SHARD_ID_RAW as i64)],
+            )
+            .expect("observation query should succeed")
+            .get::<_, i64>(0)
     }
 }
 
@@ -275,15 +293,6 @@ fn worker_binary_path() -> PathBuf {
     panic!("could not locate the compiled gossip-worker binary for integration tests");
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    hex
-}
-
 fn migrate_database_pair(done_ledger_dsn: &str, findings_dsn: &str) {
     let mut done_ledger_client =
         Client::connect(done_ledger_dsn, NoTls).expect("done-ledger test DB should connect");
@@ -311,25 +320,47 @@ fn run_worker_process(
         .arg("--mode=connector")
         .arg("fs")
         .arg(scan_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .env(ENV_ETCD_ENDPOINTS, etcd_config.endpoints().join(","))
         .env(ENV_ETCD_NAMESPACE, etcd_config.namespace_prefix())
         .env(ENV_DONE_LEDGER_POSTGRES_DSN, done_ledger_dsn)
         .env(ENV_FINDINGS_POSTGRES_DSN, findings_dsn)
-        .env(ENV_TENANT_ID, bytes_to_hex(&TENANT_ID_BYTES))
+        .env(ENV_TENANT_ID, hex_encode(&TENANT_ID_BYTES))
         .env(ENV_RUN_ID, run_id().as_raw().to_string())
         .env(ENV_WORKER_ID, worker_id().as_raw().to_string())
-        .env(ENV_POLICY_HASH, bytes_to_hex(&POLICY_HASH_BYTES))
-        .env(
-            ENV_TENANT_SECRET_KEY,
-            bytes_to_hex(&TENANT_SECRET_KEY_BYTES),
-        )
+        .env(ENV_POLICY_HASH, hex_encode(&POLICY_HASH_BYTES))
+        .env(ENV_TENANT_SECRET_KEY, hex_encode(&TENANT_SECRET_KEY_BYTES))
         .env(ENV_WORKER_RULES_FILE, rules_path)
         .env(ENV_STARTUP_SCHEMA_MODE, "validate")
         .env("RUST_LOG", "info");
 
-    command
-        .output()
-        .expect("gossip-worker process should launch for the real-backend tests")
+    let mut child = command
+        .spawn()
+        .expect("gossip-worker process should launch for the real-backend tests");
+
+    let timeout = Duration::from_secs(30);
+    match child.wait_timeout(timeout).expect("wait should not fail") {
+        Some(status) => {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(ref mut out) = child.stdout {
+                out.read_to_end(&mut stdout).ok();
+            }
+            if let Some(ref mut err) = child.stderr {
+                err.read_to_end(&mut stderr).ok();
+            }
+            Output {
+                status,
+                stdout,
+                stderr,
+            }
+        }
+        None => {
+            child.kill().expect("kill should succeed");
+            panic!("gossip-worker did not exit within {timeout:?}");
+        }
+    }
 }
 
 fn assert_worker_success(output: &Output, context: &str) {
@@ -372,7 +403,6 @@ fn wait_for_owner_binding_expiry(coordinator: &EtcdCoordinator, key: ShardKey, t
 #[test]
 fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
     let proof = SeededLaunchProof::new();
-    let _ = proof.fixture.keepalive_paths();
 
     let output = proof.run_worker_binary();
     assert_worker_success(&output, "real-backend worker happy path");
@@ -387,6 +417,13 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
         observation_rows > 0,
         "happy path must durably persist findings observations for the safe test rule '{}'",
         SAFE_RULE_NAME,
+    );
+    let targeted_observations = proof.observations_for_run();
+    assert!(
+        targeted_observations > 0,
+        "observations must belong to the seeded run_id={} and shard_id={}",
+        RUN_ID_RAW,
+        SHARD_ID_RAW,
     );
 
     let shard = proof
@@ -408,7 +445,6 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
 #[test]
 fn worker_binary_restart_is_idempotent_after_completed_shard() {
     let proof = SeededLaunchProof::new();
-    let _ = proof.fixture.keepalive_paths();
 
     let first = proof.run_worker_binary();
     assert_worker_success(&first, "first real-backend worker launch");
@@ -451,7 +487,6 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
     let mut backend_a = test_coordinator_in_namespace_with_tuning(&namespace, 1, 8, 8);
     let mut backend_b = test_coordinator_in_namespace_with_tuning(&namespace, 1, 8, 8);
     let fixture = SafeScanFixture::new();
-    let _ = fixture.keepalive_paths();
     let key = seed_filesystem_run(
         &mut backend_a,
         fixture.scan_path(),
@@ -530,5 +565,24 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
     assert!(
         lease_b.fence() > lease_a.fence(),
         "replacement lease must advance the fencing epoch"
+    );
+
+    let _ = backend_b
+        .checkpoint(
+            now(7),
+            tenant_id(),
+            &lease_b,
+            &CursorUpdate::new(b"p"),
+            OpId::from_raw(300),
+        )
+        .expect("replacement worker should checkpoint successfully after reacquisition");
+    let post_replace = backend_b
+        .test_load_shard_snapshot(tenant_id(), key)
+        .expect("snapshot should succeed after replacement checkpoint")
+        .expect("shard should exist after replacement checkpoint");
+    assert_eq!(
+        post_replace.cursor.last_key(post_replace.slab()),
+        Some(b"p".as_slice()),
+        "replacement worker's checkpoint must advance the cursor"
     );
 }
