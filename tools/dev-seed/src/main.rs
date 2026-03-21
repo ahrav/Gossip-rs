@@ -173,10 +173,11 @@ fn cmd_seed(
         Err(RegisterShardsError::OpIdConflict(_)) => {
             // OpIdConflict means the same OpId was used with a different payload
             // hash. Since this tool always uses OpId(1), re-seeding with a
-            // different path triggers this. The old shard metadata stays in etcd,
-            // so we must not print success — the user needs to reset first.
+            // different path or shard configuration triggers this. The old shard
+            // metadata stays in etcd, so we must not print success — the user
+            // needs to reset first.
             bail!(
-                "shard {shard_id_raw} already registered with a different path; \
+                "run {run_id_raw} already has a different shard registration payload; \
                  run `just reset` then re-seed"
             );
         }

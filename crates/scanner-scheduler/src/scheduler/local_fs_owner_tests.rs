@@ -1559,6 +1559,40 @@ fn clean_file_emits_single_empty_persistence_batch() {
 }
 
 // ---------------------------------------------------------------------------
+// End-to-end persistence: zero-byte file emits clean sentinel
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zero_byte_file_emits_clean_persistence_batch() {
+    let engine = Arc::new(test_engine());
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    let source = VecFileSource::new(vec![LocalFile {
+        path: path.clone(),
+        size: 0,
+    }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.store_producer = Some(producer.clone());
+
+    let _report = scan_local(engine, source, cfg);
+    let batches = producer.batches();
+
+    assert_eq!(
+        batches.len(),
+        1,
+        "zero-byte file should emit exactly one clean sentinel batch"
+    );
+    assert!(
+        batches[0].findings.is_empty(),
+        "batch for a zero-byte file must contain no findings"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end persistence: multi-chunk file emits per-chunk batches
 // ---------------------------------------------------------------------------
 

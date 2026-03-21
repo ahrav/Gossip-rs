@@ -790,8 +790,17 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             .saturating_add(open_start.elapsed().as_nanos() as u64);
     }
 
-    // Empty file: nothing to scan
+    // Empty file: record a clean sentinel and return.
     if file_size == 0 {
+        scratch.pending.clear();
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+        );
         return;
     }
 
