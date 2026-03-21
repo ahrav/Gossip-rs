@@ -8,8 +8,8 @@
 //! - [`gossip_findings_postgres::FindingsSinkPg`]
 //!
 //! The core runtime stays generic over `CoordinationFacade`, `DoneLedger`, and
-//! `FindingsSink`. This module owns only startup wiring and typed startup error
-//! classification.
+//! `FindingsSink`. This module owns startup wiring, schema readiness
+//! validation, and typed startup error classification.
 //!
 //! The DSN-based convenience constructor in this module uses
 //! [`postgres::NoTls`]. That is appropriate for local deployments and
@@ -75,13 +75,16 @@ impl ProductionStartupSettings {
         Self { schema_mode }
     }
 
-    /// Validate-only startup policy.
+    /// Fail-closed startup: both PostgreSQL schemas and their migration
+    /// history must already exist and match the embedded checksums.
     #[must_use]
     pub fn validate_only() -> Self {
         Self::new(StartupSchemaMode::Validate)
     }
 
-    /// Development-only auto-migrate startup policy.
+    /// Development startup: apply embedded migrations first, then validate.
+    /// Not intended for production — external migration tooling should own
+    /// schema state there.
     #[must_use]
     pub fn dev_auto_migrate() -> Self {
         Self::new(StartupSchemaMode::DevAutoMigrate)
@@ -95,7 +98,12 @@ impl ProductionStartupSettings {
     }
 }
 
-/// Deterministic readiness failure for a PostgreSQL schema.
+/// Readiness failure for a PostgreSQL schema.
+///
+/// Readiness validation checks two things: (1) every required table exists
+/// in the current schema, and (2) the migration history table contains a row
+/// for every embedded migration version whose BLAKE3 checksum matches the
+/// compiled-in digest.
 #[derive(Debug)]
 pub enum ProductionSchemaReadinessError {
     /// A SQL query required for readiness validation failed.
@@ -445,9 +453,9 @@ pub fn build_production_backends(
 ///
 /// # Errors
 ///
-/// Returns [`ProductionBootstrapError::EtcdConnect`] when the etcd
-/// coordinator rejects the config or when readiness validation fails for
-/// etcd or either PostgreSQL schema under the supplied startup policy.
+/// Returns [`ProductionBootstrapError`] when the etcd coordinator rejects
+/// the config, etcd readiness fails, or either PostgreSQL schema does not
+/// satisfy the supplied startup policy.
 ///
 /// # Panics
 ///
@@ -633,6 +641,7 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     })
 }
 
+/// Confirm the etcd cluster is reachable and healthy after initial connect.
 fn validate_etcd_readiness(coordinator: &EtcdCoordinator) -> Result<(), ProductionBootstrapError> {
     coordinator
         .status()
@@ -640,6 +649,9 @@ fn validate_etcd_readiness(coordinator: &EtcdCoordinator) -> Result<(), Producti
         .map_err(ProductionBootstrapError::EtcdReadiness)
 }
 
+/// Apply the startup policy to the done-ledger database: auto-migrate first
+/// when `DevAutoMigrate` is selected, then validate table existence and
+/// migration-history integrity in both modes.
 fn prepare_done_ledger_backend(
     client: &mut Client,
     startup: ProductionStartupSettings,
@@ -656,6 +668,9 @@ fn prepare_done_ledger_backend(
     }
 }
 
+/// Apply the startup policy to the findings database: auto-migrate first
+/// when `DevAutoMigrate` is selected, then validate table existence and
+/// migration-history integrity in both modes.
 fn prepare_findings_backend(
     client: &mut Client,
     startup: ProductionStartupSettings,
@@ -672,6 +687,8 @@ fn prepare_findings_backend(
     }
 }
 
+/// Verify the done-ledger schema has all required tables and that every
+/// embedded migration version is recorded with a matching checksum.
 fn validate_done_ledger_schema_readiness(
     client: &mut Client,
 ) -> Result<(), ProductionSchemaReadinessError> {
@@ -694,6 +711,8 @@ fn validate_done_ledger_schema_readiness(
     )
 }
 
+/// Verify the findings schema has all required tables and that every
+/// embedded migration version is recorded with a matching checksum.
 fn validate_findings_schema_readiness(
     client: &mut Client,
 ) -> Result<(), ProductionSchemaReadinessError> {
@@ -751,6 +770,10 @@ fn ensure_table_exists(
     }
 }
 
+/// For every `(version, sha256)` pair in `required_migrations`, verify the
+/// migration history table contains a row whose stored checksum matches the
+/// compiled-in digest. Detects missing migrations, truncated checksums, and
+/// checksum drift from out-of-band schema edits.
 fn ensure_migration_history_ready(
     client: &mut Client,
     history_table: &'static str,
