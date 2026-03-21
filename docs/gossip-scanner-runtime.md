@@ -372,10 +372,13 @@ the receipt-driven durability model:
    concurrently: scan execution calls `scan_fs_with_prebuilt_engine` with
    the `ReceiptCommitSink`, while a second thread calls
    `drain_commit_stage` with the drainer.
-6. After both threads complete, cross-checks submitted vs. committed
-   sequence numbers via `wait_for_submitted_commits` and verifies that the
-   durable receipt count matches the number of items submitted to the commit
-   pipeline.
+6. After both threads complete, resolves the scan, submission, and drain
+   outcomes in diagnostic order. Scan-runtime failures surface
+   before downstream submission or drain failures because a broken scan often
+   cascades into receipt-drain errors. Once outcome resolution succeeds, the
+   runtime cross-checks submitted vs. committed sequence numbers via
+   `wait_for_submitted_commits` and verifies that the durable receipt count
+   matches the number of items submitted to the commit pipeline.
 7. Prepares a checkpoint prefix from the aggregator, acknowledges the
    checkpoint to advance the aggregator watermark, and returns the checkpoint
    cursor to the caller. Shards with zero durable commit units (empty
@@ -601,7 +604,10 @@ metadata.
 groups the findings sink and done-ledger handle that the worker loop clones
 per shard, while `DistributedRuntimeError`
 distinguishes coordinator failures, scan-runtime failures, and local
-durability pipeline failures.
+durability pipeline failures. When scan execution and downstream submission or
+drain paths fail in the same lease, `run_filesystem_lease` reports the runtime
+failure first so the caller sees the closest cause instead of a cascaded
+durability symptom.
 
 `run_worker` ties those types together into the lease loop. It claims shards
 directly through `CoordinationFacade::claim_next_available`, retries on
@@ -626,7 +632,8 @@ The runtime tests focus on the behavior that exists today:
 - deterministic result translation into findings and done-ledger persistence rows
 - distributed config defaults
 - distributed persistence handle cloning
-- distributed runtime error layering
+- distributed runtime error layering, including runtime-first precedence when
+  scan and submission or drain failures race
 - distributed worker-loop lease accounting, claim retry, and receipt-derived
   completion
 - `gossip_coordination::InMemoryCoordinator` snapshots for completed shards
