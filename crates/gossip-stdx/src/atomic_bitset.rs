@@ -234,6 +234,55 @@ mod loom_tests {
             assert_eq!(bs.count(), 3);
         });
     }
+
+    /// Verify dedup-exactly-one-winner semantics after a `clear` cycle.
+    ///
+    /// The `clear` contract requires no concurrent `test_and_set` during the
+    /// clear itself. This test exercises the documented usage pattern:
+    /// sequential clear, then concurrent re-use. `thread::spawn` provides
+    /// the happens-before edge ensuring the zero'd state is visible to the
+    /// spawned threads.
+    #[test]
+    fn loom_atomic_bitset_clear_then_reuse() {
+        loom::model(|| {
+            let bs = std::sync::Arc::new(AtomicBitSet::empty(64));
+
+            // Pre-set bits so `clear` has work to do.
+            assert!(bs.test_and_set(0));
+            assert!(bs.test_and_set(1));
+
+            // Sequential clear — per the documented usage contract.
+            bs.clear();
+            assert!(!bs.is_set(0), "bit 0 should be zero after clear");
+            assert!(!bs.is_set(1), "bit 1 should be zero after clear");
+
+            // After clear, spawn threads that race on the same bits.
+            // `thread::spawn` provides happens-before, so both threads
+            // observe the zero'd state.
+            let bs1 = bs.clone();
+            let bs2 = bs.clone();
+
+            let h1 = thread::spawn(move || (bs1.test_and_set(0), bs1.test_and_set(1)));
+            let h2 = thread::spawn(move || (bs2.test_and_set(0), bs2.test_and_set(1)));
+
+            let (won0_h1, won1_h1) = h1.join().unwrap();
+            let (won0_h2, won1_h2) = h2.join().unwrap();
+
+            // Exactly one winner per bit position (same invariant as
+            // `test_concurrent_dedup`, but after a reset cycle).
+            assert!(
+                won0_h1 ^ won0_h2,
+                "bit 0: exactly one winner after clear: h1={won0_h1}, h2={won0_h2}"
+            );
+            assert!(
+                won1_h1 ^ won1_h2,
+                "bit 1: exactly one winner after clear: h1={won1_h1}, h2={won1_h2}"
+            );
+            assert!(bs.is_set(0));
+            assert!(bs.is_set(1));
+            assert_eq!(bs.count(), 2);
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
