@@ -49,6 +49,10 @@ impl ProductionBackendConfig {
     /// environment variables or config files does not survive into the startup
     /// path.
     ///
+    /// See [`EtcdCoordinatorConfig::new`] for endpoint and namespace
+    /// configuration, and [`EtcdCoordinatorConfig::with_auth`] for
+    /// authentication setup.
+    ///
     /// # Errors
     ///
     /// Returns [`ProductionBackendConfigError`] when either PostgreSQL DSN is
@@ -85,14 +89,14 @@ impl ProductionBackendConfig {
     /// PostgreSQL connection string for the done-ledger backend.
     #[inline]
     #[must_use]
-    pub fn done_ledger_postgres_dsn(&self) -> &str {
+    pub(crate) fn done_ledger_postgres_dsn(&self) -> &str {
         &self.done_ledger_postgres_dsn
     }
 
     /// PostgreSQL connection string for the findings backend.
     #[inline]
     #[must_use]
-    pub fn findings_postgres_dsn(&self) -> &str {
+    pub(crate) fn findings_postgres_dsn(&self) -> &str {
         &self.findings_postgres_dsn
     }
 }
@@ -290,6 +294,19 @@ impl ProductionRuntimeBackends {
 ///
 /// Returns [`ProductionBootstrapError`] when either PostgreSQL connection
 /// fails or the etcd coordinator cannot be constructed.
+///
+/// # Caller Obligations
+///
+/// Schema migrations must be applied on both persistence backends before
+/// the first call to [`ProductionRuntimeBackends::run`]. Access the
+/// backends via [`ProductionRuntimeBackends::persistence`] and call
+/// `apply_migrations()` on both `done_ledger` and `findings_sink`.
+///
+/// # Panics
+///
+/// Panics if called from within an active Tokio runtime.
+/// [`EtcdCoordinator::connect`] uses a single-threaded runtime internally
+/// and `block_on` within an existing runtime deadlocks.
 pub fn build_production_backends(
     config: &ProductionBackendConfig,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
@@ -314,6 +331,19 @@ pub fn build_production_backends(
 ///
 /// Returns [`ProductionBootstrapError::EtcdConnect`] when the etcd
 /// coordinator rejects the config or cannot establish a healthy connection.
+///
+/// # Caller Obligations
+///
+/// Schema migrations must be applied on both persistence backends before
+/// the first call to [`ProductionRuntimeBackends::run`]. Access the
+/// backends via [`ProductionRuntimeBackends::persistence`] and call
+/// `apply_migrations()` on both `done_ledger` and `findings_sink`.
+///
+/// # Panics
+///
+/// Panics if called from within an active Tokio runtime.
+/// [`EtcdCoordinator::connect`] uses a single-threaded runtime internally
+/// and `block_on` within an existing runtime deadlocks.
 pub fn build_production_backends_from_clients(
     etcd: EtcdCoordinatorConfig,
     done_ledger_client: Client,
@@ -343,6 +373,12 @@ pub fn build_production_backends_from_clients(
 /// Returns [`ProductionWorkerError::Startup`] when backend construction fails
 /// before any shard work begins, or [`ProductionWorkerError::Runtime`] when
 /// the generic distributed worker loop fails after startup succeeds.
+///
+/// # Panics
+///
+/// Panics if called from within an active Tokio runtime.
+/// [`EtcdCoordinator::connect`] uses a single-threaded runtime internally
+/// and `block_on` within an existing runtime deadlocks.
 pub fn run_production_worker(
     config: &ProductionBackendConfig,
     identity: WorkerIdentity,
@@ -362,10 +398,12 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use gossip_coordination_etcd::test_support::test_async_coordinator_config;
     use gossip_pg_common::test_support::create_test_db;
+    use gossip_scanner_runtime::ScanRuntimeError;
 
     fn valid_backend_config() -> ProductionBackendConfig {
         ProductionBackendConfig::new(
@@ -389,6 +427,10 @@ mod tests {
             error,
             ProductionBackendConfigError::EmptyDoneLedgerPostgresDsn,
         );
+        assert_eq!(
+            error.to_string(),
+            "done-ledger PostgreSQL DSN must not be empty",
+        );
     }
 
     #[test]
@@ -403,6 +445,10 @@ mod tests {
         assert_eq!(
             error,
             ProductionBackendConfigError::EmptyFindingsPostgresDsn
+        );
+        assert_eq!(
+            error.to_string(),
+            "findings PostgreSQL DSN must not be empty",
         );
     }
 
@@ -429,6 +475,68 @@ mod tests {
             debug.contains("[redacted]"),
             "Debug output should indicate that DSNs were redacted"
         );
+    }
+
+    #[test]
+    fn bootstrap_error_from_etcd_preserves_source_chain() {
+        let inner = EtcdCoordinatorError::RuntimeBuild(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "synthetic etcd failure",
+        ));
+        let bootstrap: ProductionBootstrapError = inner.into();
+
+        assert!(matches!(
+            bootstrap,
+            ProductionBootstrapError::EtcdConnect(_)
+        ));
+        assert!(bootstrap.source().is_some());
+        assert!(bootstrap.to_string().contains("etcd coordination backend"));
+    }
+
+    #[test]
+    fn worker_error_from_bootstrap_preserves_source_chain() {
+        let inner = EtcdCoordinatorError::RuntimeBuild(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "synthetic",
+        ));
+        let bootstrap = ProductionBootstrapError::EtcdConnect(inner);
+        let worker: ProductionWorkerError = bootstrap.into();
+
+        assert!(matches!(worker, ProductionWorkerError::Startup(_)));
+        assert!(worker.source().is_some());
+        assert!(worker.to_string().contains("worker startup failed"));
+    }
+
+    #[test]
+    fn worker_error_from_runtime_preserves_source_chain() {
+        let scan_err = ScanRuntimeError::InvalidPath {
+            source: "test",
+            path: PathBuf::from("/nonexistent"),
+            message: "synthetic runtime failure".into(),
+        };
+        let runtime_err = DistributedRuntimeError::from(scan_err);
+        let worker: ProductionWorkerError = runtime_err.into();
+
+        assert!(matches!(worker, ProductionWorkerError::Runtime(_)));
+        assert!(worker.source().is_some());
+        assert!(worker.to_string().contains("worker runtime failed"));
+    }
+
+    #[test]
+    fn config_new_trims_and_stores_valid_dsns() {
+        let cfg = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "  host=127.0.0.1 dbname=done  ",
+            "  host=127.0.0.1 dbname=findings  ",
+        )
+        .expect("valid DSNs with surrounding whitespace should be accepted");
+
+        assert_eq!(cfg.done_ledger_postgres_dsn(), "host=127.0.0.1 dbname=done");
+        assert_eq!(
+            cfg.findings_postgres_dsn(),
+            "host=127.0.0.1 dbname=findings"
+        );
+        assert_eq!(cfg.etcd().namespace_prefix(), "/gossip/v1");
     }
 
     #[test]
