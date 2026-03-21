@@ -1278,12 +1278,22 @@ impl RawWorkerConfig {
 
         // Helper: build a local config for the given execution mode.
         let make_local = |mode| {
-            if !path.exists() {
-                return Err(WorkerConfigError::invalid_value(
-                    "path",
-                    path.display().to_string(),
-                    "path does not exist",
-                ));
+            match path.try_exists() {
+                Ok(false) => {
+                    return Err(WorkerConfigError::invalid_value(
+                        "path",
+                        path.display().to_string(),
+                        "path does not exist",
+                    ));
+                }
+                Err(io_err) => {
+                    return Err(WorkerConfigError::invalid_value(
+                        "path",
+                        path.display().to_string(),
+                        format!("cannot verify path existence: {io_err}"),
+                    ));
+                }
+                Ok(true) => {}
             }
             LocalWorkerConfig::new(
                 mode,
@@ -1428,13 +1438,6 @@ impl RawWorkerConfig {
                             parse_nonzero_usize,
                         )?
                         .unwrap_or(defaults.commit_queue_capacity);
-                        if commit_queue_capacity.get() > MAX_COMMIT_QUEUE_CEILING {
-                            return Err(WorkerConfigError::invalid_value(
-                                "commit_queue_capacity",
-                                commit_queue_capacity.to_string(),
-                                format!("exceeds maximum of {MAX_COMMIT_QUEUE_CEILING}"),
-                            ));
-                        }
                         let runtime =
                             DistributedWorkerRuntimeSettings::new(budgets, commit_queue_capacity);
                         let identity = WorkerIdentityConfig::new(
