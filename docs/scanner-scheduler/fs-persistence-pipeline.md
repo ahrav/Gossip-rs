@@ -149,10 +149,11 @@ pub trait StoreProducer: Send + Sync + 'static {
 ```
 
 **Contract:**
-- `emit_fs_batch` is called once per finding-bearing chunk within a scanned
-  object, and once for clean objects (empty findings slice). A multi-chunk
-  file with findings produces multiple batches. Batches may arrive out of
-  file order when workers run in parallel.
+- `emit_fs_batch` is called one or more times per scanned object.
+  For plain files: once per chunk that produced findings, plus a single
+  empty-findings call for fully-scanned clean files. For archive entries
+  and extracted binaries: once per chunk unconditionally. Batches may
+  arrive out of file order when workers run in parallel.
 - `record_fs_run_loss` is called exactly once at the end of a scan run.
 - `end_run` has a default no-op implementation. It is available for backends
   that need explicit run finalization but is **not called** by the local
@@ -388,8 +389,7 @@ These feed into `LocalStats` and then into `FsRunLoss` at run end.
 
 ## Scan Site Coverage
 
-The `emit_persistence_batch()` call is inserted at every scan site that
-produces findings:
+The `emit_persistence_batch()` call is inserted at every scan site:
 
 | Scan site              | Function                    | File                  |
 | ---------------------- | --------------------------- | --------------------- |
@@ -399,6 +399,12 @@ produces findings:
 | Nested compressed stream | `scan_compressed_stream_nested()` | `local_fs_archive_ctx.rs` |
 | Tar entry stream       | `scan_tar_stream_nested()`  | `local_fs_tar.rs`     |
 | Zip entry              | `process_zip_file()`        | `local_fs_zip.rs`     |
+
+> **Note:** `emit_persistence_batch` and `emit_findings` have different
+> emission conditions at different scan sites. For plain files,
+> `emit_persistence_batch` runs only when findings are present (per-chunk)
+> or once for clean files (post-loop), while `emit_findings` runs on every
+> chunk. For archive entries, both run unconditionally per-chunk.
 
 ## Configuration and Wiring
 
