@@ -150,10 +150,12 @@ pub trait StoreProducer: Send + Sync + 'static {
 ```
 
 **Contract:**
-- `emit_fs_batch` is called zero or more times during a scan, once per
-  scanned object (including objects with no findings; empty batches record
-  "scanned clean" status). Batches may arrive out of file order when
-  workers run in parallel.
+- `emit_fs_batch` is called zero or more times during a scan: once per
+  finding-producing chunk for objects with findings (so objects with
+  multiple finding-bearing chunks produce multiple calls), and exactly
+  once with an empty findings slice for clean objects to record "scanned
+  clean" status. Batches may arrive out of file order when workers run
+  in parallel.
 - `record_fs_run_loss` is called exactly once at the end of a scan run.
 - `end_run` is called once after `record_fs_run_loss` to finalize the run
   (set end time and derive final status). The default implementation is a

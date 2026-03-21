@@ -862,6 +862,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     let mut have: usize = 0; // Total bytes in buffer from last iteration
     let mut preloaded: usize = first_n; // First chunk already in buf[0..first_n]
     let mut file_had_findings = false;
+    let mut scan_completed = false;
 
     loop {
         // Move tail overlap bytes to front as next prefix
@@ -882,6 +883,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             let remaining_in_snapshot = file_size.saturating_sub(offset) as usize;
             if remaining_in_snapshot == 0 {
                 // Reached snapshot boundary - done with this file
+                scan_completed = true;
                 break;
             }
             let read_max = chunk_size.min(buf.len() - carry).min(remaining_in_snapshot);
@@ -915,6 +917,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         // EOF: done with this file
         if n == 0 {
+            scan_completed = true;
             break;
         }
 
@@ -965,15 +968,20 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         // Stop at snapshot size (consistent point-in-time semantics)
         if offset >= file_size {
+            scan_completed = true;
             break;
         }
     }
 
     // Clean files emit a single empty batch so the done-ledger records
     // "scanned, nothing found." Finding-bearing files already emitted
-    // per-chunk batches inside the loop.
-    if !file_had_findings {
-        scratch.pending.clear();
+    // per-chunk batches inside the loop. Skip the sentinel when the loop
+    // exited due to an IO error — a partially-scanned file must not be
+    // recorded as clean.
+    if scan_completed && !file_had_findings {
+        // `scan_chunk_postprocess` clears `pending` before draining, so
+        // it is already empty here when no chunk produced findings.
+        debug_assert!(scratch.pending.is_empty());
         emit_persistence_batch(
             scratch.store_producer.as_deref(),
             &*scratch.event_sink,

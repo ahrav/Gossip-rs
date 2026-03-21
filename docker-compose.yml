@@ -10,7 +10,7 @@ services:
       - --name=node1
       - --data-dir=/etcd-data
       - --listen-client-urls=http://0.0.0.0:2379
-      - --advertise-client-urls=http://node1:2379
+      - --advertise-client-urls=http://127.0.0.1:2379
       - --listen-peer-urls=http://0.0.0.0:2380
       - --initial-advertise-peer-urls=http://node1:2380
       - --initial-cluster=node1=http://node1:2380
