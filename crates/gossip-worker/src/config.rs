@@ -1059,6 +1059,21 @@ impl RawWorkerConfig {
                 .unwrap_or(defaults.budgets.max_bytes),
         };
 
+        if budgets.max_items > MAX_ITEMS_CEILING {
+            return Err(WorkerConfigError::invalid_value(
+                "max_items",
+                budgets.max_items.to_string(),
+                format!("exceeds maximum of {MAX_ITEMS_CEILING}"),
+            ));
+        }
+        if budgets.max_bytes > MAX_BYTES_CEILING {
+            return Err(WorkerConfigError::invalid_value(
+                "max_bytes",
+                budgets.max_bytes.to_string(),
+                format!("exceeds maximum of {MAX_BYTES_CEILING}"),
+            ));
+        }
+
         match execution_mode {
             ExecutionMode::Direct => {
                 if matches!(backend, Some(BackendSelection::Production)) {
@@ -1126,14 +1141,14 @@ impl RawWorkerConfig {
                         )?;
                         let done_ledger_postgres_dsn = parse_required(
                             self.done_ledger_postgres_dsn.as_deref(),
-                            parse_nonempty_string,
+                            parse_nonempty_string_redacted,
                             "done_ledger_postgres_dsn",
                             "--done-ledger-postgres-dsn",
                             ENV_DONE_LEDGER_POSTGRES_DSN,
                         )?;
                         let findings_postgres_dsn = parse_required(
                             self.findings_postgres_dsn.as_deref(),
-                            parse_nonempty_string,
+                            parse_nonempty_string_redacted,
                             "findings_postgres_dsn",
                             "--findings-postgres-dsn",
                             ENV_FINDINGS_POSTGRES_DSN,
@@ -1189,15 +1204,21 @@ impl RawWorkerConfig {
                             .with_scan_binary(scan_binary)
                             .with_skip_archives(skip_archives)
                             .with_anchor_mode(anchor_mode);
-                        let runtime = DistributedWorkerRuntimeSettings::new(
-                            budgets,
-                            parse_optional(
-                                self.commit_queue_capacity.as_deref(),
+                        let commit_queue_capacity = parse_optional(
+                            self.commit_queue_capacity.as_deref(),
+                            "commit_queue_capacity",
+                            parse_nonzero_usize,
+                        )?
+                        .unwrap_or(defaults.commit_queue_capacity);
+                        if commit_queue_capacity.get() > MAX_COMMIT_QUEUE_CEILING {
+                            return Err(WorkerConfigError::invalid_value(
                                 "commit_queue_capacity",
-                                parse_nonzero_usize,
-                            )?
-                            .unwrap_or(defaults.commit_queue_capacity),
-                        );
+                                commit_queue_capacity.to_string(),
+                                format!("exceeds maximum of {MAX_COMMIT_QUEUE_CEILING}"),
+                            ));
+                        }
+                        let runtime =
+                            DistributedWorkerRuntimeSettings::new(budgets, commit_queue_capacity);
                         let identity = WorkerIdentityConfig {
                             tenant,
                             run,
@@ -1364,6 +1385,22 @@ fn parse_nonempty_string(field: &'static str, raw: &str) -> Result<String, Worke
         return Err(WorkerConfigError::invalid_value(
             field,
             raw,
+            "must not be empty",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Same as [`parse_nonempty_string`] but uses redacted error values to avoid
+/// leaking credentials (e.g. DSN passwords) in error messages.
+fn parse_nonempty_string_redacted(
+    field: &'static str,
+    raw: &str,
+) -> Result<String, WorkerConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(WorkerConfigError::invalid_redacted_value(
+            field,
             "must not be empty",
         ));
     }
@@ -2146,5 +2183,85 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn max_items_exceeding_ceiling_is_rejected() {
+        let env = production_env().with(ENV_MAX_ITEMS, "20000000");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("max_items above ceiling must be rejected");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_items",
+                ref reason,
+                ..
+            } if reason.contains("exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn max_bytes_exceeding_ceiling_is_rejected() {
+        let above_ceiling = (MAX_BYTES_CEILING + 1).to_string();
+        let env = production_env().with(ENV_MAX_BYTES, &above_ceiling);
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("max_bytes above ceiling must be rejected");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "max_bytes",
+                ref reason,
+                ..
+            } if reason.contains("exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn commit_queue_capacity_exceeding_ceiling_is_rejected() {
+        let above_ceiling = (MAX_COMMIT_QUEUE_CEILING + 1).to_string();
+        let env = production_env().with(ENV_COMMIT_QUEUE_CAPACITY, &above_ceiling);
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("commit_queue_capacity above ceiling must be rejected");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "commit_queue_capacity",
+                ref reason,
+                ..
+            } if reason.contains("exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn max_items_at_ceiling_is_accepted() {
+        let at_ceiling = MAX_ITEMS_CEILING.to_string();
+        let env = production_env().with(ENV_MAX_ITEMS, &at_ceiling);
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("max_items at exactly the ceiling must be accepted");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        assert_eq!(cfg.runtime().budgets().max_items, MAX_ITEMS_CEILING);
+    }
+
+    #[test]
+    fn dsn_error_messages_are_redacted() {
+        let env = production_env().with(ENV_DONE_LEDGER_POSTGRES_DSN, "   ");
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("whitespace-only DSN must be rejected");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("[redacted]"),
+            "error message must use [redacted] instead of the raw DSN value"
+        );
+        assert!(
+            !message.contains("postgresql://"),
+            "error message must not contain actual DSN content"
+        );
     }
 }

@@ -114,6 +114,85 @@ Callers that need more control can build the backends manually with
 
 ---
 
+## Environment Variables
+
+All variables are read from the process environment at startup. CLI flags
+override environment values when both are present.
+
+| Variable | Format | Default | Required | Description |
+|----------|--------|---------|----------|-------------|
+| `GOSSIP_WORKER_MODE` | `direct` or `connector` | `connector` | No | Selects the execution mode family. |
+| `GOSSIP_WORKER_BACKEND` | `local` or `production` | *(none)* | Yes (connector mode) | Selects the backend for connector mode. Connector mode fails closed without an explicit backend. |
+| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Production backend supports only `fs`. |
+| `GOSSIP_WORKER_PATH` | filesystem path | `.` | No | Filesystem or git repository path to scan. |
+| `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs | *(none)* | Yes (production) | etcd endpoint CSV for the coordination backend. |
+| `GOSSIP_ETCD_NAMESPACE` | string | *(none)* | Yes (production) | etcd namespace prefix for key isolation. |
+| `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the done-ledger database. |
+| `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the findings database. |
+| `GOSSIP_TENANT_ID` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant identity. Accepts optional `0x` prefix. |
+| `GOSSIP_RUN_ID` | unsigned 64-bit integer | *(none)* | Yes (production) | Run identity. |
+| `GOSSIP_WORKER_ID` | unsigned 64-bit integer | *(none)* | Yes (production) | Worker identity. |
+| `GOSSIP_POLICY_HASH` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Policy hash for the scan ruleset. Accepts optional `0x` prefix. |
+| `GOSSIP_TENANT_SECRET_KEY` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant secret key. Must not be all zeros. Accepts optional `0x` prefix. |
+| `GOSSIP_MAX_ITEMS` | positive integer | `256` | No | Maximum items processed between checkpoints. |
+| `GOSSIP_MAX_BYTES` | positive integer | `1000000` | No | Maximum bytes processed between checkpoints (1 MB default). |
+| `GOSSIP_COMMIT_QUEUE_CAPACITY` | positive integer | `64` | No | Bounded commit queue capacity for the distributed runtime. |
+| `GOSSIP_WORKER_RULES_FILE` | filesystem path | *(none)* | No | Path to an optional rules file. |
+| `GOSSIP_WORKER_DECODE_DEPTH` | non-negative integer | *(none)* | No | Maximum decode depth for nested content extraction. |
+| `GOSSIP_WORKER_SCAN_BINARY` | boolean | `false` | No | Enable binary file scanning. Accepts `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`. |
+| `GOSSIP_FS_SKIP_ARCHIVES` | boolean | `false` | No | Skip archive expansion during filesystem scans. Same boolean tokens as above. |
+| `GOSSIP_WORKER_ANCHOR_MODE` | `manual` or `derived` | `manual` | No | Anchor extraction mode for rule planning. |
+
+---
+
+## CLI Flags
+
+All flags use `--name=value` syntax (equals-sign required; space-separated
+`--name value` is rejected). CLI flags override environment variables.
+
+| Flag | Env Variable | Accepted Values |
+|------|-------------|-----------------|
+| `--mode` | `GOSSIP_WORKER_MODE` | `direct`, `connector` |
+| `--backend` | `GOSSIP_WORKER_BACKEND` | `local`, `production` |
+| `--source` | `GOSSIP_WORKER_SOURCE` | `fs`, `git` |
+| `--path` | `GOSSIP_WORKER_PATH` | filesystem path |
+| `--etcd-endpoints` | `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs |
+| `--etcd-namespace` | `GOSSIP_ETCD_NAMESPACE` | string |
+| `--done-ledger-postgres-dsn` | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN |
+| `--findings-postgres-dsn` | `GOSSIP_FINDINGS_POSTGRES_DSN` | PostgreSQL DSN |
+| `--tenant-id` | `GOSSIP_TENANT_ID` | 64 hex chars |
+| `--run-id` | `GOSSIP_RUN_ID` | u64 |
+| `--worker-id` | `GOSSIP_WORKER_ID` | u64 |
+| `--policy-hash` | `GOSSIP_POLICY_HASH` | 64 hex chars |
+| `--tenant-secret-key` | `GOSSIP_TENANT_SECRET_KEY` | 64 hex chars |
+| `--max-items` | `GOSSIP_MAX_ITEMS` | positive integer |
+| `--max-bytes` | `GOSSIP_MAX_BYTES` | positive integer |
+| `--commit-queue-capacity` | `GOSSIP_COMMIT_QUEUE_CAPACITY` | positive integer |
+| `--rules-file` | `GOSSIP_WORKER_RULES_FILE` | filesystem path |
+| `--decode-depth` | `GOSSIP_WORKER_DECODE_DEPTH` | non-negative integer |
+| `--scan-binary` | `GOSSIP_WORKER_SCAN_BINARY` | boolean |
+| `--skip-archives` | `GOSSIP_FS_SKIP_ARCHIVES` | boolean |
+| `--anchor-mode` | `GOSSIP_WORKER_ANCHOR_MODE` | `manual`, `derived` |
+
+### Positional arguments
+
+Two optional positional arguments follow the flags:
+
+```
+gossip-worker [flags...] [source] [path]
+```
+
+- **`[source]`** -- `fs` or `git`. Conflicts with `--source` if both are given.
+- **`[path]`** -- Scan target path. Conflicts with `--path` if both are given.
+
+### Precedence
+
+CLI flags override environment variables unconditionally. When a CLI flag
+supplies a valid value, the corresponding environment variable is ignored even
+if the environment value is malformed.
+
+---
+
 ## Key Types
 
 ### BackendSelection
@@ -271,6 +350,31 @@ The production module adds:
 - error-chain preservation for bootstrap and worker error conversions
 - ignored live-backend bootstrap tests that require configured etcd and
   PostgreSQL endpoints
+
+---
+
+## Security Notes
+
+### Secret delivery
+
+Pass secrets exclusively through environment variables. CLI flags like
+`--tenant-secret-key`, `--done-ledger-postgres-dsn`, and
+`--findings-postgres-dsn` are visible in process listings (`ps aux`,
+`/proc/<pid>/cmdline`). Environment variables avoid this exposure.
+
+### TLS for PostgreSQL
+
+The default `connect_postgres_client` connects with `NoTls` and emits a
+warning when the target host is not local. For TLS-capable connections, use
+`build_production_backends_from_clients`, which accepts pre-configured
+`postgres::Client` instances where the caller controls the TLS configuration.
+
+### Debug output
+
+Config types redact sensitive fields (DSNs, tenant secret key) in their
+`Debug` implementations. The `TenantSecretKey` type uses constant-time
+equality comparison (`subtle::ConstantTimeEq`) to prevent timing
+side-channel leakage of key material.
 
 ---
 
