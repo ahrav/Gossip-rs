@@ -23,13 +23,156 @@ use std::fmt;
 
 use crate::config::ProductionBackendConfig;
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
-use gossip_done_ledger_postgres::{DoneLedgerPg, DoneLedgerPgError};
-use gossip_findings_postgres::{FindingsPgError, FindingsSinkPg};
+use gossip_done_ledger_postgres::{
+    DoneLedgerPg, DoneLedgerPgMigrationError, MIGRATIONS as DONE_LEDGER_MIGRATIONS,
+    apply_all_migrations as apply_done_ledger_migrations, schema as done_ledger_schema,
+};
+use gossip_findings_postgres::{
+    FindingsPgMigrationError, FindingsSinkPg, MIGRATIONS as FINDINGS_MIGRATIONS,
+    apply_all_migrations as apply_findings_migrations, schema as findings_schema,
+};
 use gossip_scanner_runtime::distributed::{
     DistributedPersistence, DistributedRunReport, DistributedRuntimeConfig,
     DistributedRuntimeError, WorkerIdentity, run_worker,
 };
 use postgres::{Client, NoTls};
+
+/// Schema-readiness mode applied during backend bootstrap.
+///
+/// `Validate` is the production default. It fails closed when the required
+/// tables or migration history are absent. `DevAutoMigrate` is intended for
+/// local development and integration workflows where applying the embedded
+/// migrations on boot is acceptable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartupSchemaMode {
+    /// Require both PostgreSQL schemas to already exist and match the embedded
+    /// migration history.
+    #[default]
+    Validate,
+    /// Apply embedded migrations before validating readiness.
+    DevAutoMigrate,
+}
+
+impl fmt::Display for StartupSchemaMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Validate => f.write_str("validate"),
+            Self::DevAutoMigrate => f.write_str("dev-auto-migrate"),
+        }
+    }
+}
+
+/// Startup-time readiness and migration policy for real backend boot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProductionStartupSettings {
+    schema_mode: StartupSchemaMode,
+}
+
+impl ProductionStartupSettings {
+    /// Construct one startup policy bundle.
+    #[must_use]
+    pub fn new(schema_mode: StartupSchemaMode) -> Self {
+        Self { schema_mode }
+    }
+
+    /// Validate-only startup policy.
+    #[must_use]
+    pub fn validate_only() -> Self {
+        Self::new(StartupSchemaMode::Validate)
+    }
+
+    /// Development-only auto-migrate startup policy.
+    #[must_use]
+    pub fn dev_auto_migrate() -> Self {
+        Self::new(StartupSchemaMode::DevAutoMigrate)
+    }
+
+    /// Selected schema-readiness mode.
+    #[inline]
+    #[must_use]
+    pub fn schema_mode(self) -> StartupSchemaMode {
+        self.schema_mode
+    }
+}
+
+/// Deterministic readiness failure for a PostgreSQL schema.
+#[derive(Debug)]
+pub enum ProductionSchemaReadinessError {
+    /// A SQL query required for readiness validation failed.
+    Query(postgres::Error),
+    /// An expected table is missing from the current schema.
+    MissingTable { table: &'static str },
+    /// An expected migration history row is absent.
+    MissingAppliedMigration {
+        history_table: &'static str,
+        version: &'static str,
+    },
+    /// A stored checksum row is not the expected 32 bytes.
+    CorruptedAppliedMigration {
+        history_table: &'static str,
+        version: &'static str,
+        found_len: usize,
+    },
+    /// A stored checksum does not match the embedded migration source.
+    MigrationChecksumMismatch {
+        history_table: &'static str,
+        version: &'static str,
+    },
+}
+
+impl fmt::Display for ProductionSchemaReadinessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Query(source) => write!(f, "schema readiness query failed: {source}"),
+            Self::MissingTable { table } => {
+                write!(
+                    f,
+                    "required table '{table}' is missing from the current schema"
+                )
+            }
+            Self::MissingAppliedMigration {
+                history_table,
+                version,
+            } => write!(
+                f,
+                "migration history table '{history_table}' is missing required version '{version}'"
+            ),
+            Self::CorruptedAppliedMigration {
+                history_table,
+                version,
+                found_len,
+            } => write!(
+                f,
+                "migration history table '{history_table}' stores a corrupted checksum for version '{version}' ({found_len} bytes)"
+            ),
+            Self::MigrationChecksumMismatch {
+                history_table,
+                version,
+            } => write!(
+                f,
+                "migration history table '{history_table}' does not match the embedded checksum for version '{version}'"
+            ),
+        }
+    }
+}
+
+impl Error for ProductionSchemaReadinessError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Query(source) => Some(source),
+            Self::MissingTable { .. }
+            | Self::MissingAppliedMigration { .. }
+            | Self::CorruptedAppliedMigration { .. }
+            | Self::MigrationChecksumMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<postgres::Error> for ProductionSchemaReadinessError {
+    fn from(value: postgres::Error) -> Self {
+        Self::Query(value)
+    }
+}
 
 /// Typed startup failures for the production composition root.
 ///
@@ -42,10 +185,16 @@ pub enum ProductionBootstrapError {
     FindingsConnect(postgres::Error),
     /// Connecting the etcd coordinator failed.
     EtcdConnect(EtcdCoordinatorError),
-    /// Done-ledger schema migration failed after a successful connection.
-    DoneLedgerMigration(DoneLedgerPgError),
-    /// Findings schema migration failed after a successful connection.
-    FindingsMigration(FindingsPgError),
+    /// The etcd backend did not remain healthy during startup validation.
+    EtcdReadiness(EtcdCoordinatorError),
+    /// The done-ledger schema is not ready for worker startup.
+    DoneLedgerSchemaReadiness(ProductionSchemaReadinessError),
+    /// The findings schema is not ready for worker startup.
+    FindingsSchemaReadiness(ProductionSchemaReadinessError),
+    /// Development auto-migration of the done-ledger schema failed.
+    DoneLedgerAutoMigrate(DoneLedgerPgMigrationError),
+    /// Development auto-migration of the findings schema failed.
+    FindingsAutoMigrate(FindingsPgMigrationError),
 }
 
 impl fmt::Display for ProductionBootstrapError {
@@ -63,11 +212,25 @@ impl fmt::Display for ProductionBootstrapError {
                 f.write_str("failed to connect findings PostgreSQL backend")
             }
             Self::EtcdConnect(_) => f.write_str("failed to connect etcd coordination backend"),
-            Self::DoneLedgerMigration(source) => {
-                write!(f, "done-ledger schema migration failed: {source}")
+            Self::EtcdReadiness(source) => {
+                write!(
+                    f,
+                    "etcd coordination backend failed startup readiness: {source}"
+                )
             }
-            Self::FindingsMigration(source) => {
-                write!(f, "findings schema migration failed: {source}")
+            Self::DoneLedgerSchemaReadiness(source) => write!(
+                f,
+                "done-ledger PostgreSQL schema is not ready for worker startup: {source}"
+            ),
+            Self::FindingsSchemaReadiness(source) => write!(
+                f,
+                "findings PostgreSQL schema is not ready for worker startup: {source}"
+            ),
+            Self::DoneLedgerAutoMigrate(source) => {
+                write!(f, "done-ledger PostgreSQL auto-migrate failed: {source}")
+            }
+            Self::FindingsAutoMigrate(source) => {
+                write!(f, "findings PostgreSQL auto-migrate failed: {source}")
             }
         }
     }
@@ -83,8 +246,11 @@ impl Error for ProductionBootstrapError {
             Self::DoneLedgerConnect(_) => None,
             Self::FindingsConnect(_) => None,
             Self::EtcdConnect(_) => None,
-            Self::DoneLedgerMigration(source) => Some(source),
-            Self::FindingsMigration(source) => Some(source),
+            Self::EtcdReadiness(source) => Some(source),
+            Self::DoneLedgerSchemaReadiness(source) => Some(source),
+            Self::FindingsSchemaReadiness(source) => Some(source),
+            Self::DoneLedgerAutoMigrate(source) => Some(source),
+            Self::FindingsAutoMigrate(source) => Some(source),
         }
     }
 }
@@ -103,8 +269,17 @@ impl fmt::Debug for ProductionBootstrapError {
                 .field(&"[redacted]")
                 .finish(),
             Self::EtcdConnect(_) => f.debug_tuple("EtcdConnect").field(&"[redacted]").finish(),
-            Self::DoneLedgerMigration(e) => f.debug_tuple("DoneLedgerMigration").field(e).finish(),
-            Self::FindingsMigration(e) => f.debug_tuple("FindingsMigration").field(e).finish(),
+            Self::EtcdReadiness(e) => f.debug_tuple("EtcdReadiness").field(e).finish(),
+            Self::DoneLedgerSchemaReadiness(e) => {
+                f.debug_tuple("DoneLedgerSchemaReadiness").field(e).finish()
+            }
+            Self::FindingsSchemaReadiness(e) => {
+                f.debug_tuple("FindingsSchemaReadiness").field(e).finish()
+            }
+            Self::DoneLedgerAutoMigrate(e) => {
+                f.debug_tuple("DoneLedgerAutoMigrate").field(e).finish()
+            }
+            Self::FindingsAutoMigrate(e) => f.debug_tuple("FindingsAutoMigrate").field(e).finish(),
         }
     }
 }
@@ -229,25 +404,15 @@ impl ProductionRuntimeBackends {
 ///
 /// Every code path is fail-closed: no branch falls back to in-memory
 /// coordination, in-memory persistence, or a no-op commit path.
+/// The supplied startup policy determines whether PostgreSQL schemas must
+/// already exist (`Validate`) or may be auto-migrated first
+/// (`DevAutoMigrate`).
 ///
 /// # Errors
 ///
 /// Returns [`ProductionBootstrapError`] when either PostgreSQL connection
-/// fails or the etcd coordinator cannot be constructed.
-///
-/// # Caller Obligations
-///
-/// **Schema migrations are required before calling
-/// [`ProductionRuntimeBackends::run`].** Access the backends via
-/// [`ProductionRuntimeBackends::persistence`] and call
-/// `apply_migrations()` on both `done_ledger` and `findings_sink`.
-/// Calling `run()` on un-migrated backends is a hard runtime error
-/// (missing tables / columns), not a silent degradation.
-///
-/// [`run_production_worker`] is the convenience entrypoint that handles
-/// migrations automatically. Use `build_production_backends` only when
-/// you need to separate the migration step from execution (e.g.,
-/// dedicated migration tooling or staged rollouts).
+/// fails, the etcd coordinator cannot be constructed or remain healthy, or
+/// the selected schema-readiness policy fails.
 ///
 /// # Panics
 ///
@@ -256,29 +421,18 @@ impl ProductionRuntimeBackends {
 /// before building its own single-threaded runtime.
 pub fn build_production_backends(
     config: &ProductionBackendConfig,
+    startup: ProductionStartupSettings,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
-    // Connect etcd first — it is the most likely to fail in misconfigured
-    // environments, and this avoids opening Postgres connections that would
-    // be immediately discarded on etcd failure.
-    let coordinator = EtcdCoordinator::connect(config.etcd().clone()).map_err(|err| {
-        tracing::warn!(error = %err, "etcd coordinator connection failed");
-        ProductionBootstrapError::EtcdConnect(err)
-    })?;
-
     let done_ledger_client = connect_postgres_client(config.done_ledger_postgres_dsn())
         .map_err(ProductionBootstrapError::DoneLedgerConnect)?;
     let findings_client = connect_postgres_client(config.findings_postgres_dsn())
         .map_err(ProductionBootstrapError::FindingsConnect)?;
-
-    let persistence = DistributedPersistence::new(
-        FindingsSinkPg::from_client(findings_client),
-        DoneLedgerPg::from_client(done_ledger_client),
-    );
-
-    Ok(ProductionRuntimeBackends {
-        coordinator,
-        persistence,
-    })
+    build_production_backends_from_clients(
+        config.etcd().clone(),
+        done_ledger_client,
+        findings_client,
+        startup,
+    )
 }
 
 /// Build the real backend bundle from already-connected PostgreSQL clients.
@@ -292,22 +446,8 @@ pub fn build_production_backends(
 /// # Errors
 ///
 /// Returns [`ProductionBootstrapError::EtcdConnect`] when the etcd
-/// coordinator rejects the config or cannot establish a healthy connection.
-///
-/// # Caller Obligations
-///
-/// **Schema migrations are required before calling
-/// [`ProductionRuntimeBackends::run`].** Access the backends via
-/// [`ProductionRuntimeBackends::persistence`] and call
-/// `apply_migrations()` on both `done_ledger` and `findings_sink`.
-/// Calling `run()` on un-migrated backends is a hard runtime error
-/// (missing tables / columns), not a silent degradation.
-///
-/// [`run_production_worker`] is the convenience entrypoint that handles
-/// migrations automatically. Use `build_production_backends_from_clients`
-/// only when you need to separate the migration step from execution
-/// (e.g., dedicated migration tooling or staged rollouts) and also need
-/// TLS or custom connection handling.
+/// coordinator rejects the config or when readiness validation fails for
+/// etcd or either PostgreSQL schema under the supplied startup policy.
 ///
 /// # Panics
 ///
@@ -316,13 +456,17 @@ pub fn build_production_backends(
 /// before building its own single-threaded runtime.
 pub fn build_production_backends_from_clients(
     etcd: EtcdCoordinatorConfig,
-    done_ledger_client: Client,
-    findings_client: Client,
+    mut done_ledger_client: Client,
+    mut findings_client: Client,
+    startup: ProductionStartupSettings,
 ) -> Result<ProductionRuntimeBackends, ProductionBootstrapError> {
     let coordinator = EtcdCoordinator::connect(etcd).map_err(|err| {
         tracing::warn!(error = %err, "etcd coordinator connection failed");
         ProductionBootstrapError::EtcdConnect(err)
     })?;
+    validate_etcd_readiness(&coordinator)?;
+    prepare_done_ledger_backend(&mut done_ledger_client, startup)?;
+    prepare_findings_backend(&mut findings_client, startup)?;
     let persistence = DistributedPersistence::new(
         FindingsSinkPg::from_client(findings_client),
         DoneLedgerPg::from_client(done_ledger_client),
@@ -336,23 +480,17 @@ pub fn build_production_backends_from_clients(
 
 /// Production worker entrypoint for the real backend path.
 ///
-/// Connects the real backends, applies schema migrations on both PostgreSQL
-/// databases (idempotent and concurrency-safe), then delegates to the generic
-/// distributed runtime.
+/// Connects the real backends, applies the selected startup schema policy,
+/// then delegates to the generic distributed runtime.
 ///
 /// This function never falls back to in-memory doubles or the CLI no-op commit
 /// path. Either the real backends are built successfully and the generic
 /// distributed runtime runs, or the function returns a typed error.
 ///
-/// Callers that need to separate migration from execution (e.g., dedicated
-/// migration tooling or staged rollouts) should use
-/// [`build_production_backends`] directly and manage the migration step
-/// themselves.
-///
 /// # Errors
 ///
 /// Returns [`ProductionWorkerError::Startup`] when backend construction or
-/// schema migration fails before any shard work begins, or
+/// startup readiness fails before any shard work begins, or
 /// [`ProductionWorkerError::Runtime`] when the generic distributed worker
 /// loop fails after startup succeeds.
 ///
@@ -363,29 +501,11 @@ pub fn build_production_backends_from_clients(
 /// before building its own single-threaded runtime.
 pub fn run_production_worker(
     config: &ProductionBackendConfig,
+    startup: ProductionStartupSettings,
     identity: WorkerIdentity,
     runtime: DistributedRuntimeConfig,
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
-    let backends = build_production_backends(config)?;
-
-    // Apply schema migrations before any shard work. Both calls are
-    // idempotent and serialized by advisory locks, so concurrent workers
-    // converge safely.
-    backends
-        .persistence()
-        .done_ledger
-        .apply_migrations()
-        .map_err(|e| {
-            ProductionWorkerError::Startup(ProductionBootstrapError::DoneLedgerMigration(e))
-        })?;
-    backends
-        .persistence()
-        .findings_sink
-        .apply_migrations()
-        .map_err(|e| {
-            ProductionWorkerError::Startup(ProductionBootstrapError::FindingsMigration(e))
-        })?;
-
+    let backends = build_production_backends(config, startup)?;
     backends
         .run(identity, runtime)
         .map_err(ProductionWorkerError::Runtime)
@@ -513,25 +633,231 @@ fn connect_postgres_client(dsn: &str) -> Result<Client, postgres::Error> {
     })
 }
 
+fn validate_etcd_readiness(coordinator: &EtcdCoordinator) -> Result<(), ProductionBootstrapError> {
+    coordinator
+        .status()
+        .map(|_| ())
+        .map_err(ProductionBootstrapError::EtcdReadiness)
+}
+
+fn prepare_done_ledger_backend(
+    client: &mut Client,
+    startup: ProductionStartupSettings,
+) -> Result<(), ProductionBootstrapError> {
+    match startup.schema_mode() {
+        StartupSchemaMode::Validate => validate_done_ledger_schema_readiness(client)
+            .map_err(ProductionBootstrapError::DoneLedgerSchemaReadiness),
+        StartupSchemaMode::DevAutoMigrate => {
+            apply_done_ledger_migrations(client)
+                .map_err(ProductionBootstrapError::DoneLedgerAutoMigrate)?;
+            validate_done_ledger_schema_readiness(client)
+                .map_err(ProductionBootstrapError::DoneLedgerSchemaReadiness)
+        }
+    }
+}
+
+fn prepare_findings_backend(
+    client: &mut Client,
+    startup: ProductionStartupSettings,
+) -> Result<(), ProductionBootstrapError> {
+    match startup.schema_mode() {
+        StartupSchemaMode::Validate => validate_findings_schema_readiness(client)
+            .map_err(ProductionBootstrapError::FindingsSchemaReadiness),
+        StartupSchemaMode::DevAutoMigrate => {
+            apply_findings_migrations(client)
+                .map_err(ProductionBootstrapError::FindingsAutoMigrate)?;
+            validate_findings_schema_readiness(client)
+                .map_err(ProductionBootstrapError::FindingsSchemaReadiness)
+        }
+    }
+}
+
+fn validate_done_ledger_schema_readiness(
+    client: &mut Client,
+) -> Result<(), ProductionSchemaReadinessError> {
+    ensure_expected_tables_exist(
+        client,
+        &[
+            done_ledger_schema::DONE_LEDGER_ENTRIES_TABLE,
+            done_ledger_schema::SCHEMA_MIGRATIONS_TABLE,
+        ],
+    )?;
+
+    let required_migrations = DONE_LEDGER_MIGRATIONS
+        .iter()
+        .map(|migration| (migration.version(), *migration.checksum().as_bytes()))
+        .collect::<Vec<_>>();
+    ensure_migration_history_ready(
+        client,
+        done_ledger_schema::SCHEMA_MIGRATIONS_TABLE,
+        &required_migrations,
+    )
+}
+
+fn validate_findings_schema_readiness(
+    client: &mut Client,
+) -> Result<(), ProductionSchemaReadinessError> {
+    ensure_expected_tables_exist(
+        client,
+        &[
+            findings_schema::FINDINGS_TABLE,
+            findings_schema::OCCURRENCES_TABLE,
+            findings_schema::OBSERVATIONS_TABLE,
+            findings_schema::SCHEMA_MIGRATIONS_TABLE,
+        ],
+    )?;
+
+    let required_migrations = FINDINGS_MIGRATIONS
+        .iter()
+        .map(|migration| (migration.version(), *migration.checksum().as_bytes()))
+        .collect::<Vec<_>>();
+    ensure_migration_history_ready(
+        client,
+        findings_schema::SCHEMA_MIGRATIONS_TABLE,
+        &required_migrations,
+    )
+}
+
+fn ensure_expected_tables_exist(
+    client: &mut Client,
+    expected_tables: &[&'static str],
+) -> Result<(), ProductionSchemaReadinessError> {
+    for &table in expected_tables {
+        ensure_table_exists(client, table)?;
+    }
+    Ok(())
+}
+
+fn ensure_table_exists(
+    client: &mut Client,
+    table: &'static str,
+) -> Result<(), ProductionSchemaReadinessError> {
+    let exists = client
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM pg_catalog.pg_tables
+                  WHERE schemaname = current_schema()
+                    AND tablename = $1
+             )",
+            &[&table],
+        )?
+        .get::<_, bool>(0);
+
+    if exists {
+        Ok(())
+    } else {
+        Err(ProductionSchemaReadinessError::MissingTable { table })
+    }
+}
+
+fn ensure_migration_history_ready(
+    client: &mut Client,
+    history_table: &'static str,
+    required_migrations: &[(&'static str, [u8; 32])],
+) -> Result<(), ProductionSchemaReadinessError> {
+    let statement = client.prepare(&format!(
+        "SELECT checksum FROM {history_table} WHERE version = $1"
+    ))?;
+
+    for &(version, expected_checksum) in required_migrations {
+        let maybe_row = client.query_opt(&statement, &[&version])?;
+        let Some(row) = maybe_row else {
+            return Err(ProductionSchemaReadinessError::MissingAppliedMigration {
+                history_table,
+                version,
+            });
+        };
+
+        let stored_checksum: Vec<u8> = row.get(0);
+        if stored_checksum.len() != expected_checksum.len() {
+            return Err(ProductionSchemaReadinessError::CorruptedAppliedMigration {
+                history_table,
+                version,
+                found_len: stored_checksum.len(),
+            });
+        }
+        if stored_checksum.as_slice() != &expected_checksum[..] {
+            return Err(ProductionSchemaReadinessError::MigrationChecksumMismatch {
+                history_table,
+                version,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
-    use std::time::Duration;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
 
-    use crate::config::ProductionBackendConfigError;
+    use crate::{
+        config::ProductionBackendConfigError, recorder::ProductionCoordinationEventRecorder,
+    };
+    use gossip_contracts::identity::{PolicyHash, RunId, TenantId, TenantSecretKey, WorkerId};
     use gossip_coordination_etcd::test_support::test_async_coordinator_config;
     use gossip_pg_common::test_support::create_test_db;
-    use gossip_scanner_runtime::ScanRuntimeError;
+    use gossip_scanner_runtime::{ExecutionMode, FsScanConfig, ScanBudgets, ScanRuntimeError};
+    use tempfile::tempdir;
 
-    fn valid_backend_config() -> ProductionBackendConfig {
+    fn fresh_backend_config() -> ProductionBackendConfig {
         ProductionBackendConfig::new(
             test_async_coordinator_config(),
             create_test_db(),
             create_test_db(),
         )
         .expect("test backend config should be valid")
+    }
+
+    fn migrate_done_ledger_database(dsn: &str) {
+        apply_done_ledger_migrations(
+            &mut Client::connect(dsn, NoTls)
+                .expect("done-ledger test database should accept connections"),
+        )
+        .expect("done-ledger migrations should succeed");
+    }
+
+    fn migrate_findings_database(dsn: &str) {
+        apply_findings_migrations(
+            &mut Client::connect(dsn, NoTls)
+                .expect("findings test database should accept connections"),
+        )
+        .expect("findings migrations should succeed");
+    }
+
+    fn migrated_backend_config() -> ProductionBackendConfig {
+        let done_ledger_dsn = create_test_db();
+        let findings_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        migrate_findings_database(&findings_dsn);
+        ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+        )
+        .expect("test backend config should be valid")
+    }
+
+    fn production_worker_identity(path: &Path) -> WorkerIdentity {
+        WorkerIdentity::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(42),
+            WorkerId::from_raw(7),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+            FsScanConfig::new(path.to_path_buf())
+                .with_execution_mode(ExecutionMode::Connector)
+                .with_budgets(ScanBudgets::default()),
+            Arc::new(ProductionCoordinationEventRecorder::default()),
+        )
     }
 
     #[test]
@@ -751,11 +1077,86 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live etcd and PostgreSQL backends or Docker-backed testcontainers"]
-    fn build_production_backends_connects_live_backends_from_dsns() {
-        let config = valid_backend_config();
-        let mut backends =
-            build_production_backends(&config).expect("live backend construction should succeed");
+    fn validate_only_fails_when_done_ledger_schema_is_missing() {
+        let config = fresh_backend_config();
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must fail on a fresh done-ledger database");
+
+        assert!(matches!(
+            error,
+            ProductionBootstrapError::DoneLedgerSchemaReadiness(
+                ProductionSchemaReadinessError::MissingTable { .. }
+                    | ProductionSchemaReadinessError::MissingAppliedMigration { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn validate_only_fails_when_findings_schema_is_missing() {
+        let done_ledger_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            create_test_db(),
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must fail when the findings schema is missing");
+
+        assert!(matches!(
+            error,
+            ProductionBootstrapError::FindingsSchemaReadiness(
+                ProductionSchemaReadinessError::MissingTable { .. }
+                    | ProductionSchemaReadinessError::MissingAppliedMigration { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn validate_only_fails_when_done_ledger_checksum_mismatches() {
+        let done_ledger_dsn = create_test_db();
+        let findings_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        migrate_findings_database(&findings_dsn);
+        let version = DONE_LEDGER_MIGRATIONS[0].version();
+        let mut client = Client::connect(&done_ledger_dsn, NoTls)
+            .expect("done-ledger test database should accept connections");
+        client
+            .execute(
+                "UPDATE done_ledger_schema_migrations SET checksum = $1 WHERE version = $2",
+                &[&vec![0_u8; 32], &version],
+            )
+            .expect("checksum corruption update should succeed");
+        let config = ProductionBackendConfig::new(
+            test_async_coordinator_config(),
+            done_ledger_dsn,
+            findings_dsn,
+        )
+        .expect("backend config should be valid");
+
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
+            .expect_err("validate-only boot must reject mismatched done-ledger checksums");
+
+        assert!(matches!(
+            error,
+            ProductionBootstrapError::DoneLedgerSchemaReadiness(
+                ProductionSchemaReadinessError::MigrationChecksumMismatch {
+                    history_table,
+                    version: found_version,
+                }
+            ) if history_table == done_ledger_schema::SCHEMA_MIGRATIONS_TABLE
+                && found_version == version
+        ));
+    }
+
+    #[test]
+    fn dev_auto_migrate_bootstraps_fresh_databases() {
+        let config = fresh_backend_config();
+        let backends =
+            build_production_backends(&config, ProductionStartupSettings::dev_auto_migrate())
+                .expect("development auto-migrate should make fresh databases ready");
 
         backends
             .persistence()
@@ -765,33 +1166,47 @@ mod tests {
         backends
             .persistence()
             .findings_sink
-            .apply_migrations()
-            .expect("findings migrations should succeed on the connected backend");
-        backends
-            .persistence()
-            .findings_sink
             .validate_connection(Duration::from_secs(1))
-            .expect("findings connection should remain usable after bootstrap");
-
-        // Verify mutable access compiles and does not panic.
-        assert!(
-            !format!("{:?}", backends.coordinator_mut()).is_empty(),
-            "mutable coordinator borrow should produce non-empty Debug output"
-        );
+            .expect("findings connection should remain usable after startup readiness");
     }
 
     #[test]
-    #[ignore = "requires live etcd and PostgreSQL backends or Docker-backed testcontainers"]
+    fn dev_auto_migrate_is_idempotent() {
+        let config = fresh_backend_config();
+        let first =
+            build_production_backends(&config, ProductionStartupSettings::dev_auto_migrate())
+                .expect("first auto-migrate boot should succeed");
+        drop(first);
+
+        let second =
+            build_production_backends(&config, ProductionStartupSettings::dev_auto_migrate())
+                .expect("second auto-migrate boot should also succeed");
+        second
+            .persistence()
+            .findings_sink
+            .validate_connection(Duration::from_secs(1))
+            .expect("findings connection should remain usable after repeated auto-migrate");
+    }
+
+    #[test]
     fn build_production_backends_from_clients_connects_live_backends() {
         let etcd = test_async_coordinator_config();
-        let done_ledger_client = Client::connect(&create_test_db(), NoTls)
+        let done_ledger_dsn = create_test_db();
+        let findings_dsn = create_test_db();
+        migrate_done_ledger_database(&done_ledger_dsn);
+        migrate_findings_database(&findings_dsn);
+        let done_ledger_client = Client::connect(&done_ledger_dsn, NoTls)
             .expect("done-ledger test database should accept connections");
-        let findings_client = Client::connect(&create_test_db(), NoTls)
+        let findings_client = Client::connect(&findings_dsn, NoTls)
             .expect("findings test database should accept connections");
 
-        let backends =
-            build_production_backends_from_clients(etcd, done_ledger_client, findings_client)
-                .expect("live backend construction from explicit clients should succeed");
+        let backends = build_production_backends_from_clients(
+            etcd,
+            done_ledger_client,
+            findings_client,
+            ProductionStartupSettings::validate_only(),
+        )
+        .expect("live backend construction from explicit clients should succeed");
 
         backends
             .persistence()
@@ -801,7 +1216,55 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live etcd and PostgreSQL backends or Docker-backed testcontainers"]
+    fn run_production_worker_uses_real_backends_and_never_falls_back() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("secret.txt"),
+            "token=worker-real-backend-proof",
+        )
+        .expect("write fixture");
+        let error = run_production_worker(
+            &migrated_backend_config(),
+            ProductionStartupSettings::validate_only(),
+            production_worker_identity(dir.path()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("missing run should fail after real backend bootstrap");
+
+        assert!(matches!(
+            error,
+            ProductionWorkerError::Runtime(DistributedRuntimeError::Coordinator(_))
+        ));
+        assert!(
+            error.to_string().contains("run not found"),
+            "runtime error should come from the real coordinator path: {error}"
+        );
+    }
+
+    #[test]
+    fn run_production_worker_fails_before_runtime_when_schema_is_not_ready() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("secret.txt"),
+            "token=worker-readiness-proof",
+        )
+        .expect("write fixture");
+        let error = run_production_worker(
+            &fresh_backend_config(),
+            ProductionStartupSettings::validate_only(),
+            production_worker_identity(dir.path()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("startup readiness must fail before the runtime claims any shard");
+
+        assert!(matches!(error, ProductionWorkerError::Startup(_)));
+        assert!(
+            !matches!(error, ProductionWorkerError::Runtime(_)),
+            "schema readiness failure must not escape as a runtime error"
+        );
+    }
+
+    #[test]
     fn build_production_backends_returns_typed_done_ledger_startup_error() {
         let config = ProductionBackendConfig::new(
             test_async_coordinator_config(),
@@ -810,7 +1273,7 @@ mod tests {
         )
         .expect("backend config should be valid");
 
-        let error = build_production_backends(&config)
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
             .expect_err("invalid done-ledger DSN should fail startup");
 
         assert!(
@@ -820,7 +1283,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live etcd and PostgreSQL backends or Docker-backed testcontainers"]
     fn build_production_backends_returns_typed_findings_startup_error() {
         let config = ProductionBackendConfig::new(
             test_async_coordinator_config(),
@@ -829,7 +1291,7 @@ mod tests {
         )
         .expect("backend config should be valid");
 
-        let error = build_production_backends(&config)
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
             .expect_err("invalid findings DSN should fail startup");
 
         assert!(
@@ -839,7 +1301,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live etcd and PostgreSQL backends or Docker-backed testcontainers"]
     fn build_production_backends_returns_typed_etcd_startup_error() {
         let config = ProductionBackendConfig::new(
             EtcdCoordinatorConfig::new(["http://127.0.0.1:1"], "/gossip/test")
@@ -849,7 +1310,7 @@ mod tests {
         )
         .expect("backend config should be valid");
 
-        let error = build_production_backends(&config)
+        let error = build_production_backends(&config, ProductionStartupSettings::validate_only())
             .expect_err("unreachable etcd endpoint should fail startup");
 
         assert!(

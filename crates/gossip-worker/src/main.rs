@@ -109,6 +109,7 @@ fn run_distributed_worker(
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
     run_production_worker(
         cfg.production_backends(),
+        cfg.startup(),
         cfg.worker_identity(),
         cfg.runtime_config(),
     )
@@ -231,6 +232,7 @@ mod tests {
         DistributedWorkerRuntimeSettings, FsSourceSettings, GitSourceSettings,
         ProductionBackendConfig, WorkerIdentityConfig,
     };
+    use gossip_worker::production::ProductionStartupSettings;
     use tempfile::tempdir;
 
     fn create_git_repo(path: &Path) {
@@ -300,6 +302,7 @@ mod tests {
         .expect("test worker identity config should be valid");
         DistributedWorkerConfig::new(
             backends,
+            ProductionStartupSettings::validate_only(),
             identity,
             FsSourceSettings::new(path.to_path_buf()),
             DistributedWorkerRuntimeSettings::new(

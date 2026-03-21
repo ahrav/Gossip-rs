@@ -21,6 +21,7 @@ use gossip_scanner_runtime::coordination_sink::CoordinationEventRecorder;
 use gossip_scanner_runtime::distributed::{DistributedRuntimeConfig, WorkerIdentity};
 use gossip_scanner_runtime::{AnchorMode, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets};
 
+use crate::production::{ProductionStartupSettings, StartupSchemaMode};
 use crate::recorder::ProductionCoordinationEventRecorder;
 
 /// Environment variable selecting the worker runtime family.
@@ -49,6 +50,8 @@ pub const ENV_WORKER_ID: &str = "GOSSIP_WORKER_ID";
 pub const ENV_POLICY_HASH: &str = "GOSSIP_POLICY_HASH";
 /// Environment variable supplying the tenant secret key as a 32-byte hex string.
 pub const ENV_TENANT_SECRET_KEY: &str = "GOSSIP_TENANT_SECRET_KEY";
+/// Environment variable selecting startup schema validation policy.
+pub const ENV_STARTUP_SCHEMA_MODE: &str = "GOSSIP_STARTUP_SCHEMA_MODE";
 /// Environment variable supplying the maximum items processed between checkpoints.
 pub const ENV_MAX_ITEMS: &str = "GOSSIP_MAX_ITEMS";
 /// Environment variable supplying the maximum bytes processed between checkpoints.
@@ -728,6 +731,7 @@ impl fmt::Debug for WorkerIdentityConfig {
 #[derive(Clone, Debug)]
 pub struct DistributedWorkerConfig {
     backends: ProductionBackendConfig,
+    startup: ProductionStartupSettings,
     identity: WorkerIdentityConfig,
     source: FsSourceSettings,
     runtime: DistributedWorkerRuntimeSettings,
@@ -741,6 +745,7 @@ impl DistributedWorkerConfig {
     /// [`WorkerIdentityConfig::new`].
     pub fn new(
         backends: ProductionBackendConfig,
+        startup: ProductionStartupSettings,
         identity: WorkerIdentityConfig,
         source: FsSourceSettings,
         runtime: DistributedWorkerRuntimeSettings,
@@ -755,6 +760,7 @@ impl DistributedWorkerConfig {
         }
         Ok(Self {
             backends,
+            startup,
             identity,
             source,
             runtime,
@@ -772,6 +778,12 @@ impl DistributedWorkerConfig {
     #[must_use]
     pub fn production_backends(&self) -> &ProductionBackendConfig {
         &self.backends
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn startup(&self) -> ProductionStartupSettings {
+        self.startup
     }
 
     #[inline]
@@ -1001,6 +1013,7 @@ struct RawWorkerConfig {
     etcd_namespace: Option<String>,
     done_ledger_postgres_dsn: Option<String>,
     findings_postgres_dsn: Option<String>,
+    startup_schema_mode: Option<String>,
     tenant: Option<String>,
     run: Option<String>,
     worker: Option<String>,
@@ -1035,6 +1048,7 @@ impl fmt::Debug for RawWorkerConfig {
             .field("etcd_namespace", &self.etcd_namespace)
             .field("done_ledger_postgres_dsn", &"[redacted]")
             .field("findings_postgres_dsn", &"[redacted]")
+            .field("startup_schema_mode", &self.startup_schema_mode)
             .field("tenant", &self.tenant)
             .field("run", &self.run)
             .field("worker", &self.worker)
@@ -1067,6 +1081,7 @@ impl RawWorkerConfig {
             etcd_namespace: env.get(ENV_ETCD_NAMESPACE),
             done_ledger_postgres_dsn: env.get(ENV_DONE_LEDGER_POSTGRES_DSN),
             findings_postgres_dsn: env.get(ENV_FINDINGS_POSTGRES_DSN),
+            startup_schema_mode: env.get(ENV_STARTUP_SCHEMA_MODE),
             tenant: env.get(ENV_TENANT_ID),
             run: env.get(ENV_RUN_ID),
             worker: env.get(ENV_WORKER_ID),
@@ -1189,6 +1204,7 @@ impl RawWorkerConfig {
                 self.findings_postgres_dsn = Some(value.to_owned());
                 self.cli_findings_dsn = true;
             }
+            "startup-schema-mode" => self.startup_schema_mode = Some(value.to_owned()),
             "tenant-id" => self.tenant = Some(value.to_owned()),
             "run-id" => self.run = Some(value.to_owned()),
             "worker-id" => self.worker = Some(value.to_owned()),
@@ -1359,6 +1375,12 @@ impl RawWorkerConfig {
                             "--findings-postgres-dsn",
                             ENV_FINDINGS_POSTGRES_DSN,
                         )?;
+                        let startup_schema_mode = parse_optional(
+                            self.startup_schema_mode.as_deref(),
+                            "startup_schema_mode",
+                            parse_startup_schema_mode,
+                        )?
+                        .unwrap_or_default();
                         let tenant = parse_required(
                             self.tenant.as_deref(),
                             parse_tenant_id,
@@ -1419,6 +1441,7 @@ impl RawWorkerConfig {
                         .unwrap_or(defaults.commit_queue_capacity);
                         let runtime =
                             DistributedWorkerRuntimeSettings::new(budgets, commit_queue_capacity);
+                        let startup = ProductionStartupSettings::new(startup_schema_mode);
                         let identity = WorkerIdentityConfig::new(
                             tenant,
                             run,
@@ -1427,7 +1450,13 @@ impl RawWorkerConfig {
                             tenant_secret_key,
                         )?;
                         Ok(ResolvedWorkerConfig::Distributed(Box::new(
-                            DistributedWorkerConfig::new(backends, identity, source, runtime)?,
+                            DistributedWorkerConfig::new(
+                                backends,
+                                startup,
+                                identity,
+                                source,
+                                runtime,
+                            )?,
                         )))
                     }
                 }
@@ -1468,6 +1497,7 @@ fn usage() -> &'static str {
      [--tenant-id=HEX32] [--run-id=U64] [--worker-id=U64] [--policy-hash=HEX32] \\
      [--tenant-secret-key=HEX32] [--etcd-endpoints=CSV] [--etcd-namespace=PREFIX] \\
      [--done-ledger-postgres-dsn=DSN] [--findings-postgres-dsn=DSN] \\
+     [--startup-schema-mode=validate|dev-auto-migrate] \\
      [--rules-file=PATH] [--decode-depth=N] [--scan-binary=true|false] \\
      [--skip-archives=true|false] [--anchor-mode=manual|derived] \\
      [--max-items=N] [--max-bytes=N] [--commit-queue-capacity=N] \\
@@ -1586,6 +1616,21 @@ fn parse_optional<T>(
 fn parse_mode(field: &'static str, raw: &str) -> Result<ExecutionMode, WorkerConfigError> {
     raw.parse::<ExecutionMode>()
         .map_err(|error| WorkerConfigError::invalid_value(field, raw, error.to_string()))
+}
+
+fn parse_startup_schema_mode(
+    field: &'static str,
+    raw: &str,
+) -> Result<StartupSchemaMode, WorkerConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "validate" => Ok(StartupSchemaMode::Validate),
+        "dev-auto-migrate" | "dev_auto_migrate" => Ok(StartupSchemaMode::DevAutoMigrate),
+        _ => Err(WorkerConfigError::invalid_value(
+            field,
+            raw,
+            "expected 'validate' or 'dev-auto-migrate'",
+        )),
+    }
 }
 
 /// Parse a `FromStr` type whose `Err` is `WorkerConfigError`, remapping the
@@ -1885,6 +1930,21 @@ mod tests {
                     cfg.production_backends().etcd().namespace_prefix(),
                     "/gossip/v1"
                 );
+                assert_eq!(cfg.startup(), ProductionStartupSettings::validate_only());
+            }
+            other => panic!("expected distributed config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn production_config_reads_startup_schema_mode_from_env() {
+        let env = production_env().with(ENV_STARTUP_SCHEMA_MODE, "dev-auto-migrate");
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("production env should resolve");
+
+        match resolved {
+            ResolvedWorkerConfig::Distributed(cfg) => {
+                assert_eq!(cfg.startup(), ProductionStartupSettings::dev_auto_migrate());
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
@@ -1900,6 +1960,20 @@ mod tests {
             ResolvedWorkerConfig::Distributed(cfg) => {
                 assert_eq!(cfg.run(), RunId::from_raw(99));
                 assert_eq!(cfg.source().path(), Path::new("/tmp"));
+            }
+            other => panic!("expected distributed config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_overrides_env_for_startup_schema_mode() {
+        let env = production_env().with(ENV_STARTUP_SCHEMA_MODE, "validate");
+        let resolved = resolve_worker_config_from(["--startup-schema-mode=dev-auto-migrate"], &env)
+            .expect("CLI startup-schema-mode override should resolve");
+
+        match resolved {
+            ResolvedWorkerConfig::Distributed(cfg) => {
+                assert_eq!(cfg.startup(), ProductionStartupSettings::dev_auto_migrate());
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
@@ -2341,6 +2415,35 @@ mod tests {
     #[test]
     fn parse_anchor_mode_rejects_unknown() {
         parse_anchor_mode("anchor", "auto").expect_err("unknown anchor mode must fail");
+    }
+
+    #[test]
+    fn parse_startup_schema_mode_accepts_supported_variants() {
+        assert_eq!(
+            parse_startup_schema_mode("startup_schema_mode", "validate").unwrap(),
+            StartupSchemaMode::Validate
+        );
+        assert_eq!(
+            parse_startup_schema_mode("startup_schema_mode", "DEV-AUTO-MIGRATE").unwrap(),
+            StartupSchemaMode::DevAutoMigrate
+        );
+        assert_eq!(
+            parse_startup_schema_mode("startup_schema_mode", "dev_auto_migrate").unwrap(),
+            StartupSchemaMode::DevAutoMigrate
+        );
+    }
+
+    #[test]
+    fn parse_startup_schema_mode_rejects_unknown() {
+        let err = parse_startup_schema_mode("startup_schema_mode", "auto")
+            .expect_err("unknown startup schema mode must fail");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "startup_schema_mode",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3137,6 +3240,7 @@ mod tests {
         let runtime = DistributedWorkerRuntimeSettings::new(ScanBudgets::default(), over_ceiling);
         let result = DistributedWorkerConfig::new(
             backends,
+            ProductionStartupSettings::validate_only(),
             identity,
             FsSourceSettings::new("/tmp"),
             runtime,
