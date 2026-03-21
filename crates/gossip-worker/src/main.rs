@@ -385,7 +385,6 @@ mod tests {
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
         let cfg = LocalWorkerConfig::new(
-            ExecutionMode::Direct,
             WorkerSourceSettings::Fs(FsSourceSettings::new(dir.path().to_path_buf())),
             gossip_scanner_runtime::ScanBudgets::default(),
         )
