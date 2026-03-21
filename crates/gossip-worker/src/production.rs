@@ -21,6 +21,7 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::config::ProductionBackendConfig;
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
 use gossip_done_ledger_postgres::{DoneLedgerPg, DoneLedgerPgError};
 use gossip_findings_postgres::{FindingsPgError, FindingsSinkPg};
@@ -29,111 +30,6 @@ use gossip_scanner_runtime::distributed::{
     DistributedRuntimeError, WorkerIdentity, run_worker,
 };
 use postgres::{Client, NoTls};
-
-/// Configuration for the real backend composition root.
-///
-/// The etcd config already performs its own validation when it is created.
-/// This type adds only the PostgreSQL routing inputs needed to build the real
-/// persistence backends.
-#[derive(Clone)]
-pub struct ProductionBackendConfig {
-    etcd: EtcdCoordinatorConfig,
-    done_ledger_postgres_dsn: String,
-    findings_postgres_dsn: String,
-}
-
-impl ProductionBackendConfig {
-    /// Construct one validated production-backend configuration bundle.
-    ///
-    /// DSNs are trimmed before storage so accidental surrounding whitespace in
-    /// environment variables or config files does not survive into the startup
-    /// path.
-    ///
-    /// See [`EtcdCoordinatorConfig::new`] for endpoint and namespace
-    /// configuration, and [`EtcdCoordinatorConfig::with_auth`] for
-    /// authentication setup.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProductionBackendConfigError`] when either PostgreSQL DSN is
-    /// empty after trimming whitespace.
-    pub fn new(
-        etcd: EtcdCoordinatorConfig,
-        done_ledger_postgres_dsn: impl Into<String>,
-        findings_postgres_dsn: impl Into<String>,
-    ) -> Result<Self, ProductionBackendConfigError> {
-        let done_ledger_postgres_dsn = done_ledger_postgres_dsn.into().trim().to_owned();
-        if done_ledger_postgres_dsn.is_empty() {
-            return Err(ProductionBackendConfigError::EmptyDoneLedgerPostgresDsn);
-        }
-
-        let findings_postgres_dsn = findings_postgres_dsn.into().trim().to_owned();
-        if findings_postgres_dsn.is_empty() {
-            return Err(ProductionBackendConfigError::EmptyFindingsPostgresDsn);
-        }
-
-        Ok(Self {
-            etcd,
-            done_ledger_postgres_dsn,
-            findings_postgres_dsn,
-        })
-    }
-
-    /// Validated etcd coordination config.
-    #[inline]
-    #[must_use]
-    pub fn etcd(&self) -> &EtcdCoordinatorConfig {
-        &self.etcd
-    }
-
-    /// PostgreSQL connection string for the done-ledger backend.
-    #[inline]
-    #[must_use]
-    pub(crate) fn done_ledger_postgres_dsn(&self) -> &str {
-        &self.done_ledger_postgres_dsn
-    }
-
-    /// PostgreSQL connection string for the findings backend.
-    #[inline]
-    #[must_use]
-    pub(crate) fn findings_postgres_dsn(&self) -> &str {
-        &self.findings_postgres_dsn
-    }
-}
-
-impl fmt::Debug for ProductionBackendConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProductionBackendConfig")
-            .field("etcd", &self.etcd)
-            .field("done_ledger_postgres_dsn", &"[redacted]")
-            .field("findings_postgres_dsn", &"[redacted]")
-            .finish()
-    }
-}
-
-/// Validation errors for [`ProductionBackendConfig`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProductionBackendConfigError {
-    /// The done-ledger PostgreSQL DSN was empty after trimming whitespace.
-    EmptyDoneLedgerPostgresDsn,
-    /// The findings PostgreSQL DSN was empty after trimming whitespace.
-    EmptyFindingsPostgresDsn,
-}
-
-impl fmt::Display for ProductionBackendConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyDoneLedgerPostgresDsn => {
-                f.write_str("done-ledger PostgreSQL DSN must not be empty")
-            }
-            Self::EmptyFindingsPostgresDsn => {
-                f.write_str("findings PostgreSQL DSN must not be empty")
-            }
-        }
-    }
-}
-
-impl Error for ProductionBackendConfigError {}
 
 /// Typed startup failures for the production composition root.
 ///
@@ -310,10 +206,17 @@ impl ProductionRuntimeBackends {
 ///
 /// # Caller Obligations
 ///
-/// Schema migrations must be applied on both persistence backends before
-/// the first call to [`ProductionRuntimeBackends::run`]. Access the
-/// backends via [`ProductionRuntimeBackends::persistence`] and call
+/// **Schema migrations are required before calling
+/// [`ProductionRuntimeBackends::run`].** Access the backends via
+/// [`ProductionRuntimeBackends::persistence`] and call
 /// `apply_migrations()` on both `done_ledger` and `findings_sink`.
+/// Calling `run()` on un-migrated backends is a hard runtime error
+/// (missing tables / columns), not a silent degradation.
+///
+/// [`run_production_worker`] is the convenience entrypoint that handles
+/// migrations automatically. Use `build_production_backends` only when
+/// you need to separate the migration step from execution (e.g.,
+/// dedicated migration tooling or staged rollouts).
 ///
 /// # Panics
 ///
@@ -360,10 +263,18 @@ pub fn build_production_backends(
 ///
 /// # Caller Obligations
 ///
-/// Schema migrations must be applied on both persistence backends before
-/// the first call to [`ProductionRuntimeBackends::run`]. Access the
-/// backends via [`ProductionRuntimeBackends::persistence`] and call
+/// **Schema migrations are required before calling
+/// [`ProductionRuntimeBackends::run`].** Access the backends via
+/// [`ProductionRuntimeBackends::persistence`] and call
 /// `apply_migrations()` on both `done_ledger` and `findings_sink`.
+/// Calling `run()` on un-migrated backends is a hard runtime error
+/// (missing tables / columns), not a silent degradation.
+///
+/// [`run_production_worker`] is the convenience entrypoint that handles
+/// migrations automatically. Use `build_production_backends_from_clients`
+/// only when you need to separate the migration step from execution
+/// (e.g., dedicated migration tooling or staged rollouts) and also need
+/// TLS or custom connection handling.
 ///
 /// # Panics
 ///
@@ -475,6 +386,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use crate::config::ProductionBackendConfigError;
     use gossip_coordination_etcd::test_support::test_async_coordinator_config;
     use gossip_pg_common::test_support::create_test_db;
     use gossip_scanner_runtime::ScanRuntimeError;

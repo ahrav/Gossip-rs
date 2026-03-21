@@ -26,8 +26,6 @@ use gossip_scanner_runtime::{
     AnchorMode, ExecutionMode, FsScanConfig, GitScanConfig, OwnedCoreEvent, ScanBudgets,
 };
 
-use crate::production::{ProductionBackendConfig, ProductionBackendConfigError};
-
 /// Environment variable selecting the worker runtime family.
 pub const ENV_WORKER_MODE: &str = "GOSSIP_WORKER_MODE";
 /// Environment variable selecting the worker backend.
@@ -112,6 +110,22 @@ pub enum WorkerSource {
     Fs,
     /// Local Git repository scan.
     Git,
+}
+
+impl FromStr for WorkerSource {
+    type Err = WorkerConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fs" => Ok(Self::Fs),
+            "git" => Ok(Self::Git),
+            _ => Err(WorkerConfigError::invalid_value(
+                "source",
+                value,
+                "expected 'fs' or 'git'",
+            )),
+        }
+    }
 }
 
 /// Filesystem-specific source settings.
@@ -379,6 +393,111 @@ impl LocalWorkerConfig {
     }
 }
 
+/// Configuration for the real backend composition root.
+///
+/// The etcd config already performs its own validation when it is created.
+/// This type adds only the PostgreSQL routing inputs needed to build the real
+/// persistence backends.
+#[derive(Clone)]
+pub struct ProductionBackendConfig {
+    etcd: EtcdCoordinatorConfig,
+    done_ledger_postgres_dsn: String,
+    findings_postgres_dsn: String,
+}
+
+impl ProductionBackendConfig {
+    /// Construct one validated production-backend configuration bundle.
+    ///
+    /// DSNs are trimmed before storage so accidental surrounding whitespace in
+    /// environment variables or config files does not survive into the startup
+    /// path.
+    ///
+    /// See [`EtcdCoordinatorConfig::new`] for endpoint and namespace
+    /// configuration, and [`EtcdCoordinatorConfig::with_auth`] for
+    /// authentication setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProductionBackendConfigError`] when either PostgreSQL DSN is
+    /// empty after trimming whitespace.
+    pub fn new(
+        etcd: EtcdCoordinatorConfig,
+        done_ledger_postgres_dsn: impl Into<String>,
+        findings_postgres_dsn: impl Into<String>,
+    ) -> Result<Self, ProductionBackendConfigError> {
+        let done_ledger_postgres_dsn = done_ledger_postgres_dsn.into().trim().to_owned();
+        if done_ledger_postgres_dsn.is_empty() {
+            return Err(ProductionBackendConfigError::EmptyDoneLedgerPostgresDsn);
+        }
+
+        let findings_postgres_dsn = findings_postgres_dsn.into().trim().to_owned();
+        if findings_postgres_dsn.is_empty() {
+            return Err(ProductionBackendConfigError::EmptyFindingsPostgresDsn);
+        }
+
+        Ok(Self {
+            etcd,
+            done_ledger_postgres_dsn,
+            findings_postgres_dsn,
+        })
+    }
+
+    /// Validated etcd coordination config.
+    #[inline]
+    #[must_use]
+    pub fn etcd(&self) -> &EtcdCoordinatorConfig {
+        &self.etcd
+    }
+
+    /// PostgreSQL connection string for the done-ledger backend.
+    #[inline]
+    #[must_use]
+    pub(crate) fn done_ledger_postgres_dsn(&self) -> &str {
+        &self.done_ledger_postgres_dsn
+    }
+
+    /// PostgreSQL connection string for the findings backend.
+    #[inline]
+    #[must_use]
+    pub(crate) fn findings_postgres_dsn(&self) -> &str {
+        &self.findings_postgres_dsn
+    }
+}
+
+impl fmt::Debug for ProductionBackendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProductionBackendConfig")
+            .field("etcd", &self.etcd)
+            .field("done_ledger_postgres_dsn", &"[redacted]")
+            .field("findings_postgres_dsn", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Validation errors for [`ProductionBackendConfig`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProductionBackendConfigError {
+    /// The done-ledger PostgreSQL DSN was empty after trimming whitespace.
+    EmptyDoneLedgerPostgresDsn,
+    /// The findings PostgreSQL DSN was empty after trimming whitespace.
+    EmptyFindingsPostgresDsn,
+}
+
+impl fmt::Display for ProductionBackendConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyDoneLedgerPostgresDsn => {
+                f.write_str("done-ledger PostgreSQL DSN must not be empty")
+            }
+            Self::EmptyFindingsPostgresDsn => {
+                f.write_str("findings PostgreSQL DSN must not be empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProductionBackendConfigError {}
+
 /// Distributed runtime tuning parsed from worker config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DistributedWorkerRuntimeSettings {
@@ -428,39 +547,52 @@ impl DistributedWorkerRuntimeSettings {
     }
 }
 
+/// Grouped identity fields for a distributed worker.
+///
+/// These five fields travel together and map directly to
+/// [`WorkerIdentity`] at runtime.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WorkerIdentityConfig {
+    pub tenant: TenantId,
+    pub run: RunId,
+    pub worker: WorkerId,
+    pub policy_hash: PolicyHash,
+    pub tenant_secret_key: TenantSecretKey,
+}
+
+impl fmt::Debug for WorkerIdentityConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerIdentityConfig")
+            .field("tenant", &self.tenant)
+            .field("run", &self.run)
+            .field("worker", &self.worker)
+            .field("policy_hash", &self.policy_hash)
+            .field("tenant_secret_key", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Typed real-backend distributed worker launch configuration.
 #[derive(Clone, Debug)]
 pub struct DistributedWorkerConfig {
-    backend: BackendSelection,
     backends: ProductionBackendConfig,
-    tenant: TenantId,
-    run: RunId,
-    worker: WorkerId,
-    policy_hash: PolicyHash,
-    tenant_secret_key: TenantSecretKey,
+    identity: WorkerIdentityConfig,
     source: FsSourceSettings,
     runtime: DistributedWorkerRuntimeSettings,
 }
 
 impl DistributedWorkerConfig {
     /// Construct one validated distributed worker configuration bundle.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Enforces business rules as defense-in-depth: non-zero budgets and a
+    /// valid (non-all-zeros) tenant secret key. The resolution pipeline
+    /// validates format; this constructor validates semantics.
     pub fn new(
-        backend: BackendSelection,
         backends: ProductionBackendConfig,
-        tenant: TenantId,
-        run: RunId,
-        worker: WorkerId,
-        policy_hash: PolicyHash,
-        tenant_secret_key: TenantSecretKey,
+        identity: WorkerIdentityConfig,
         source: FsSourceSettings,
         runtime: DistributedWorkerRuntimeSettings,
     ) -> Result<Self, WorkerConfigError> {
-        if backend != BackendSelection::Production {
-            return Err(WorkerConfigError::UnsupportedCombination {
-                message: "distributed worker configuration requires backend=production".to_owned(),
-            });
-        }
         if runtime.budgets.max_items == 0 {
             return Err(WorkerConfigError::invalid_value(
                 "max_items",
@@ -475,7 +607,7 @@ impl DistributedWorkerConfig {
                 "must be > 0",
             ));
         }
-        if !tenant_secret_key.is_valid() {
+        if !identity.tenant_secret_key.is_valid() {
             return Err(WorkerConfigError::invalid_redacted_value(
                 "tenant_secret_key",
                 "must not be all zeros",
@@ -483,22 +615,18 @@ impl DistributedWorkerConfig {
         }
 
         Ok(Self {
-            backend,
             backends,
-            tenant,
-            run,
-            worker,
-            policy_hash,
-            tenant_secret_key,
+            identity,
             source,
             runtime,
         })
     }
 
+    /// The distributed config is always the production backend path.
     #[inline]
     #[must_use]
     pub fn backend(&self) -> BackendSelection {
-        self.backend
+        BackendSelection::Production
     }
 
     #[inline]
@@ -509,32 +637,38 @@ impl DistributedWorkerConfig {
 
     #[inline]
     #[must_use]
+    pub fn identity(&self) -> &WorkerIdentityConfig {
+        &self.identity
+    }
+
+    #[inline]
+    #[must_use]
     pub fn tenant(&self) -> TenantId {
-        self.tenant
+        self.identity.tenant
     }
 
     #[inline]
     #[must_use]
     pub fn run(&self) -> RunId {
-        self.run
+        self.identity.run
     }
 
     #[inline]
     #[must_use]
     pub fn worker(&self) -> WorkerId {
-        self.worker
+        self.identity.worker
     }
 
     #[inline]
     #[must_use]
     pub fn policy_hash(&self) -> PolicyHash {
-        self.policy_hash
+        self.identity.policy_hash
     }
 
     #[inline]
     #[must_use]
     pub fn tenant_secret_key(&self) -> TenantSecretKey {
-        self.tenant_secret_key
+        self.identity.tenant_secret_key
     }
 
     #[inline]
@@ -562,11 +696,11 @@ impl DistributedWorkerConfig {
         recorder: Arc<dyn CoordinationEventRecorder>,
     ) -> WorkerIdentity {
         WorkerIdentity::new(
-            self.tenant,
-            self.run,
-            self.worker,
-            self.policy_hash,
-            self.tenant_secret_key,
+            self.identity.tenant,
+            self.identity.run,
+            self.identity.worker,
+            self.identity.policy_hash,
+            self.identity.tenant_secret_key,
             self.source
                 .to_scan_config(ExecutionMode::Connector, self.runtime.budgets()),
             recorder,
@@ -699,7 +833,7 @@ impl EnvProvider for ProcessEnv {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct RawWorkerConfig {
     execution_mode: Option<String>,
     backend: Option<String>,
@@ -722,6 +856,34 @@ struct RawWorkerConfig {
     worker: Option<String>,
     policy_hash: Option<String>,
     tenant_secret_key: Option<String>,
+}
+
+impl fmt::Debug for RawWorkerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawWorkerConfig")
+            .field("execution_mode", &self.execution_mode)
+            .field("backend", &self.backend)
+            .field("source", &self.source)
+            .field("path", &self.path)
+            .field("rules_file", &self.rules_file)
+            .field("decode_depth", &self.decode_depth)
+            .field("scan_binary", &self.scan_binary)
+            .field("skip_archives", &self.skip_archives)
+            .field("anchor_mode", &self.anchor_mode)
+            .field("max_items", &self.max_items)
+            .field("max_bytes", &self.max_bytes)
+            .field("commit_queue_capacity", &self.commit_queue_capacity)
+            .field("etcd_endpoints_csv", &self.etcd_endpoints_csv)
+            .field("etcd_namespace", &self.etcd_namespace)
+            .field("done_ledger_postgres_dsn", &"[redacted]")
+            .field("findings_postgres_dsn", &"[redacted]")
+            .field("tenant", &self.tenant)
+            .field("run", &self.run)
+            .field("worker", &self.worker)
+            .field("policy_hash", &self.policy_hash)
+            .field("tenant_secret_key", &"[redacted]")
+            .finish()
+    }
 }
 
 impl RawWorkerConfig {
@@ -820,26 +982,36 @@ impl RawWorkerConfig {
     }
 
     fn resolve(self) -> Result<ResolvedWorkerConfig, WorkerConfigError> {
-        let execution_mode = parse_optional_mode(self.execution_mode.as_deref(), "mode")?
+        let execution_mode = parse_optional(self.execution_mode.as_deref(), "mode", parse_mode)?
             .unwrap_or(ExecutionMode::Connector);
-        let backend = parse_optional_backend(self.backend.as_deref(), "backend")?;
-        let source =
-            parse_optional_source(self.source.as_deref(), "source")?.unwrap_or(WorkerSource::Fs);
-        let path = parse_optional_path(self.path.as_deref(), "path")?
+        let backend = parse_optional(self.backend.as_deref(), "backend", parse_backend)?;
+        let source = parse_optional(self.source.as_deref(), "source", parse_source)?
+            .unwrap_or(WorkerSource::Fs);
+        let path = parse_optional(self.path.as_deref(), "path", parse_path)?
             .unwrap_or_else(|| PathBuf::from("."));
-        let rules_file = parse_optional_path(self.rules_file.as_deref(), "rules_file")?;
-        let decode_depth = parse_optional_usize(self.decode_depth.as_deref(), "decode_depth")?;
-        let scan_binary =
-            parse_optional_bool(self.scan_binary.as_deref(), "scan_binary")?.unwrap_or(false);
+        let rules_file = parse_optional(self.rules_file.as_deref(), "rules_file", parse_path)?;
+        let decode_depth =
+            parse_optional(self.decode_depth.as_deref(), "decode_depth", parse_usize)?;
+        let scan_binary = parse_optional(self.scan_binary.as_deref(), "scan_binary", parse_bool)?
+            .unwrap_or(false);
         let skip_archives =
-            parse_optional_bool(self.skip_archives.as_deref(), "skip_archives")?.unwrap_or(false);
-        let anchor_mode = parse_optional_anchor_mode(self.anchor_mode.as_deref(), "anchor_mode")?
-            .unwrap_or(AnchorMode::Manual);
+            parse_optional(self.skip_archives.as_deref(), "skip_archives", parse_bool)?
+                .unwrap_or(false);
+        let anchor_mode = parse_optional(
+            self.anchor_mode.as_deref(),
+            "anchor_mode",
+            parse_anchor_mode,
+        )?
+        .unwrap_or(AnchorMode::Manual);
         let defaults = DistributedRuntimeConfig::default();
         let budgets = ScanBudgets {
-            max_items: parse_optional_positive_usize(self.max_items.as_deref(), "max_items")?
-                .unwrap_or(defaults.budgets.max_items),
-            max_bytes: parse_optional_positive_u64(self.max_bytes.as_deref(), "max_bytes")?
+            max_items: parse_optional(
+                self.max_items.as_deref(),
+                "max_items",
+                parse_positive_usize,
+            )?
+            .unwrap_or(defaults.budgets.max_items),
+            max_bytes: parse_optional(self.max_bytes.as_deref(), "max_bytes", parse_positive_u64)?
                 .unwrap_or(defaults.budgets.max_bytes),
         };
 
@@ -975,24 +1147,22 @@ impl RawWorkerConfig {
                             .with_anchor_mode(anchor_mode);
                         let runtime = DistributedWorkerRuntimeSettings::new(
                             budgets,
-                            parse_optional_nonzero_usize(
+                            parse_optional(
                                 self.commit_queue_capacity.as_deref(),
                                 "commit_queue_capacity",
+                                parse_nonzero_usize,
                             )?
                             .unwrap_or(defaults.commit_queue_capacity),
                         );
+                        let identity = WorkerIdentityConfig {
+                            tenant,
+                            run,
+                            worker,
+                            policy_hash,
+                            tenant_secret_key,
+                        };
                         Ok(ResolvedWorkerConfig::Distributed(Box::new(
-                            DistributedWorkerConfig::new(
-                                BackendSelection::Production,
-                                backends,
-                                tenant,
-                                run,
-                                worker,
-                                policy_hash,
-                                tenant_secret_key,
-                                source,
-                                runtime,
-                            )?,
+                            DistributedWorkerConfig::new(backends, identity, source, runtime)?,
                         )))
                     }
                 }
@@ -1082,23 +1252,17 @@ fn parse_required<T>(
     }
 }
 
-fn parse_optional_mode(
+fn parse_optional<T>(
     value: Option<&str>,
     field: &'static str,
-) -> Result<Option<ExecutionMode>, WorkerConfigError> {
-    value.map(|raw| parse_mode(field, raw)).transpose()
+    parser: fn(&'static str, &str) -> Result<T, WorkerConfigError>,
+) -> Result<Option<T>, WorkerConfigError> {
+    value.map(|raw| parser(field, raw)).transpose()
 }
 
 fn parse_mode(field: &'static str, raw: &str) -> Result<ExecutionMode, WorkerConfigError> {
     raw.parse::<ExecutionMode>()
         .map_err(|error| WorkerConfigError::invalid_value(field, raw, error.to_string()))
-}
-
-fn parse_optional_backend(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<BackendSelection>, WorkerConfigError> {
-    value.map(|raw| parse_backend(field, raw)).transpose()
 }
 
 fn parse_backend(field: &'static str, raw: &str) -> Result<BackendSelection, WorkerConfigError> {
@@ -1111,30 +1275,13 @@ fn parse_backend(field: &'static str, raw: &str) -> Result<BackendSelection, Wor
         })
 }
 
-fn parse_optional_source(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<WorkerSource>, WorkerConfigError> {
-    value.map(|raw| parse_source(field, raw)).transpose()
-}
-
 fn parse_source(field: &'static str, raw: &str) -> Result<WorkerSource, WorkerConfigError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "fs" => Ok(WorkerSource::Fs),
-        "git" => Ok(WorkerSource::Git),
-        _ => Err(WorkerConfigError::invalid_value(
-            field,
-            raw,
-            "expected 'fs' or 'git'",
-        )),
-    }
-}
-
-fn parse_optional_path(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<PathBuf>, WorkerConfigError> {
-    value.map(|raw| parse_path(field, raw)).transpose()
+    raw.parse::<WorkerSource>().map_err(|error| match error {
+        WorkerConfigError::InvalidValue { reason, .. } => {
+            WorkerConfigError::invalid_value(field, raw, reason)
+        }
+        other => other,
+    })
 }
 
 fn parse_path(field: &'static str, raw: &str) -> Result<PathBuf, WorkerConfigError> {
@@ -1161,13 +1308,6 @@ fn parse_nonempty_string(field: &'static str, raw: &str) -> Result<String, Worke
     Ok(trimmed.to_owned())
 }
 
-fn parse_optional_bool(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<bool>, WorkerConfigError> {
-    value.map(|raw| parse_bool(field, raw)).transpose()
-}
-
 fn parse_bool(field: &'static str, raw: &str) -> Result<bool, WorkerConfigError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -1178,13 +1318,6 @@ fn parse_bool(field: &'static str, raw: &str) -> Result<bool, WorkerConfigError>
             "expected a boolean (true/false, yes/no, on/off, 1/0)",
         )),
     }
-}
-
-fn parse_optional_anchor_mode(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<AnchorMode>, WorkerConfigError> {
-    value.map(|raw| parse_anchor_mode(field, raw)).transpose()
 }
 
 fn parse_anchor_mode(field: &'static str, raw: &str) -> Result<AnchorMode, WorkerConfigError> {
@@ -1199,26 +1332,10 @@ fn parse_anchor_mode(field: &'static str, raw: &str) -> Result<AnchorMode, Worke
     }
 }
 
-fn parse_optional_usize(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<usize>, WorkerConfigError> {
-    value.map(|raw| parse_usize(field, raw)).transpose()
-}
-
 fn parse_usize(field: &'static str, raw: &str) -> Result<usize, WorkerConfigError> {
     raw.trim()
         .parse::<usize>()
         .map_err(|error| WorkerConfigError::invalid_value(field, raw, error.to_string()))
-}
-
-fn parse_optional_positive_usize(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<usize>, WorkerConfigError> {
-    value
-        .map(|raw| parse_positive_usize(field, raw))
-        .transpose()
 }
 
 fn parse_positive_usize(field: &'static str, raw: &str) -> Result<usize, WorkerConfigError> {
@@ -1227,13 +1344,6 @@ fn parse_positive_usize(field: &'static str, raw: &str) -> Result<usize, WorkerC
         return Err(WorkerConfigError::invalid_value(field, raw, "must be > 0"));
     }
     Ok(value)
-}
-
-fn parse_optional_positive_u64(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<u64>, WorkerConfigError> {
-    value.map(|raw| parse_positive_u64(field, raw)).transpose()
 }
 
 fn parse_positive_u64(field: &'static str, raw: &str) -> Result<u64, WorkerConfigError> {
@@ -1247,17 +1357,9 @@ fn parse_positive_u64(field: &'static str, raw: &str) -> Result<u64, WorkerConfi
     Ok(value)
 }
 
-fn parse_optional_nonzero_usize(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<NonZeroUsize>, WorkerConfigError> {
-    value.map(|raw| parse_nonzero_usize(field, raw)).transpose()
-}
-
 fn parse_nonzero_usize(field: &'static str, raw: &str) -> Result<NonZeroUsize, WorkerConfigError> {
     let value = parse_positive_usize(field, raw)?;
-    NonZeroUsize::new(value)
-        .ok_or_else(|| WorkerConfigError::invalid_value(field, raw, "must be > 0"))
+    Ok(NonZeroUsize::new(value).expect("parse_positive_usize guarantees > 0"))
 }
 
 fn parse_tenant_id(field: &'static str, raw: &str) -> Result<TenantId, WorkerConfigError> {
@@ -1272,14 +1374,9 @@ fn parse_tenant_secret_key(
     field: &'static str,
     raw: &str,
 ) -> Result<TenantSecretKey, WorkerConfigError> {
-    let secret = TenantSecretKey::from_bytes(parse_hex_32_redacted(field, raw)?);
-    if !secret.is_valid() {
-        return Err(WorkerConfigError::invalid_redacted_value(
-            field,
-            "must not be all zeros",
-        ));
-    }
-    Ok(secret)
+    Ok(TenantSecretKey::from_bytes(parse_hex_32_redacted(
+        field, raw,
+    )?))
 }
 
 fn parse_run_id(field: &'static str, raw: &str) -> Result<RunId, WorkerConfigError> {
@@ -1295,55 +1392,42 @@ fn parse_worker_id(field: &'static str, raw: &str) -> Result<WorkerId, WorkerCon
 }
 
 fn parse_hex_32(field: &'static str, raw: &str) -> Result<[u8; 32], WorkerConfigError> {
-    let trimmed = raw.trim();
-    let hex = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-    if hex.len() != 64 {
-        return Err(WorkerConfigError::invalid_value(
-            field,
-            raw,
-            "expected exactly 64 hex characters",
-        ));
-    }
-
-    let bytes = hex.as_bytes();
-    let mut out = [0u8; 32];
-    for index in 0..32 {
-        let hi = decode_hex_nibble(bytes[index * 2]).ok_or_else(|| {
-            WorkerConfigError::invalid_value(field, raw, "contains a non-hex character")
-        })?;
-        let lo = decode_hex_nibble(bytes[index * 2 + 1]).ok_or_else(|| {
-            WorkerConfigError::invalid_value(field, raw, "contains a non-hex character")
-        })?;
-        out[index] = (hi << 4) | lo;
-    }
-    Ok(out)
+    parse_hex_32_inner(field, raw, false)
 }
 
 fn parse_hex_32_redacted(field: &'static str, raw: &str) -> Result<[u8; 32], WorkerConfigError> {
+    parse_hex_32_inner(field, raw, true)
+}
+
+fn parse_hex_32_inner(
+    field: &'static str,
+    raw: &str,
+    redact: bool,
+) -> Result<[u8; 32], WorkerConfigError> {
+    let make_err = |reason: &str| {
+        if redact {
+            WorkerConfigError::invalid_redacted_value(field, reason)
+        } else {
+            WorkerConfigError::invalid_value(field, raw, reason)
+        }
+    };
+
     let trimmed = raw.trim();
     let hex = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
     if hex.len() != 64 {
-        return Err(WorkerConfigError::invalid_redacted_value(
-            field,
-            "expected exactly 64 hex characters",
-        ));
+        return Err(make_err("expected exactly 64 hex characters"));
     }
 
     let bytes = hex.as_bytes();
     let mut out = [0u8; 32];
     for index in 0..32 {
-        let hi = decode_hex_nibble(bytes[index * 2]).ok_or_else(|| {
-            WorkerConfigError::invalid_redacted_value(field, "contains a non-hex character")
-        })?;
-        let lo = decode_hex_nibble(bytes[index * 2 + 1]).ok_or_else(|| {
-            WorkerConfigError::invalid_redacted_value(field, "contains a non-hex character")
-        })?;
+        let hi = decode_hex_nibble(bytes[index * 2])
+            .ok_or_else(|| make_err("contains a non-hex character"))?;
+        let lo = decode_hex_nibble(bytes[index * 2 + 1])
+            .ok_or_else(|| make_err("contains a non-hex character"))?;
         out[index] = (hi << 4) | lo;
     }
     Ok(out)
@@ -1713,6 +1797,40 @@ mod tests {
                 ..
             } if reason.contains("non-hex")
         ));
+    }
+
+    #[test]
+    fn raw_worker_config_debug_redacts_sensitive_fields() {
+        let raw = RawWorkerConfig {
+            done_ledger_postgres_dsn: Some(
+                "postgresql://scanner:super-secret@db:5432/done".to_owned(),
+            ),
+            findings_postgres_dsn: Some(
+                "host=db user=scanner password=ultra-secret dbname=findings".to_owned(),
+            ),
+            tenant_secret_key: Some(
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_owned(),
+            ),
+            ..RawWorkerConfig::default()
+        };
+
+        let debug = format!("{raw:?}");
+        assert!(
+            !debug.contains("super-secret"),
+            "Debug output must not leak the done-ledger DSN password"
+        );
+        assert!(
+            !debug.contains("ultra-secret"),
+            "Debug output must not leak the findings DSN password"
+        );
+        assert!(
+            !debug.contains("abcdef1234567890"),
+            "Debug output must not leak the tenant secret key"
+        );
+        assert!(
+            debug.contains("[redacted]"),
+            "Debug output should indicate that sensitive fields were redacted"
+        );
     }
 
     #[test]
