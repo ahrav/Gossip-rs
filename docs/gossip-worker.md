@@ -100,7 +100,8 @@ call:
 ```text
 caller
   -> ProductionBackendConfig::new(...)
-  -> DistributedWorkerConfig::worker_identity_noop() | worker_identity_with_recorder()
+  -> DistributedWorkerConfig::worker_identity_noop()
+     (worker_identity_with_recorder() is available for callers that opt into production telemetry recording)
   -> DistributedWorkerConfig::runtime_config()
   -> run_production_worker(config, identity, runtime)
      -> build_production_backends(config)

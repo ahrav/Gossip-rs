@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use gossip_contracts::identity::domain::COORDINATION_TELEMETRY_V1;
-use gossip_contracts::identity::finalize_64;
+use gossip_contracts::identity::{domain_hasher, finalize_64};
 use gossip_scanner_runtime::OwnedCoreEvent;
 use gossip_scanner_runtime::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent,
@@ -31,10 +31,10 @@ use gossip_scanner_runtime::coordination_sink::{
 const TELEMETRY_TARGET: &str = "gossip_worker::coordination";
 
 /// Cached BLAKE3 derive-key hasher for [`RedactedDigest`]. Cloning the
-/// post-setup state avoids repeating the key-schedule compression on every
-/// hash call.
+/// post-derivation state avoids re-deriving the key from the context string
+/// on every hash call.
 static TELEMETRY_HASHER: LazyLock<gossip_contracts::blake3::Hasher> =
-    LazyLock::new(|| gossip_contracts::blake3::Hasher::new_derive_key(COORDINATION_TELEMETRY_V1));
+    LazyLock::new(|| domain_hasher(COORDINATION_TELEMETRY_V1));
 
 /// Production recorder for distributed coordination telemetry.
 ///
@@ -51,7 +51,7 @@ pub struct ProductionCoordinationEventRecorder {
 impl fmt::Debug for ProductionCoordinationEventRecorder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProductionCoordinationEventRecorder")
-            .field("sink", &"<sink>")
+            .field("sink", &*self.sink)
             .field(
                 "core_error_logged",
                 &self.core_error_logged.load(Ordering::Relaxed),
@@ -98,9 +98,9 @@ impl ProductionCoordinationEventRecorder {
     fn emit_best_effort(&self, category: RecorderCategory, record: SanitizedCoordinationRecord) {
         let shard_id = record.shard_id();
         // The `swap(true)` returns the *previous* value: `false` on the first
-        // failure, `true` on every subsequent one. Combined with the `is_err()`
-        // short-circuit, the warning fires exactly once per category.
-        if self.sink.emit(record).is_err()
+        // failure, `true` on every subsequent one. The warning fires exactly
+        // once per category.
+        if let Err(error) = self.sink.emit(record)
             && !category.error_flag(self).swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
@@ -108,12 +108,17 @@ impl ProductionCoordinationEventRecorder {
                 event_name = "coordination_recorder_sink_failure",
                 category = category.as_str(),
                 shard_id = %shard_id,
+                %error,
                 "coordination telemetry sink failed; subsequent failures suppressed",
             );
         }
     }
 }
 
+/// Best-effort recorder: all methods return `Ok(())` regardless of sink
+/// outcome. Sink failures are absorbed internally and logged once per
+/// category. Upstream callers must not couple durable commit progress to
+/// telemetry availability.
 impl CoordinationEventRecorder for ProductionCoordinationEventRecorder {
     fn record_core_event(&self, shard_id: &str, event: OwnedCoreEvent) -> Result<()> {
         self.emit_best_effort(
@@ -147,7 +152,7 @@ impl CoordinationEventRecorder for ProductionCoordinationEventRecorder {
 /// accepts raw events), and this trait accepts only pre-sanitized records.
 /// Alternative sink backends (metrics, file, etc.) can be added by
 /// implementing this trait without changing the runtime-facing API.
-pub(crate) trait CoordinationTelemetrySink: Send + Sync {
+pub(crate) trait CoordinationTelemetrySink: Send + Sync + fmt::Debug {
     /// Emit a single sanitized record. Returning `Err` signals a transient
     /// sink failure; the caller (`emit_best_effort`) handles suppression.
     fn emit(&self, record: SanitizedCoordinationRecord) -> Result<()>;
@@ -442,7 +447,7 @@ impl RecorderCategory {
 /// field positions produce distinct digests.
 ///
 /// Display format: `len=<n>,hash=<016x>`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(crate) struct RedactedDigest {
     len: usize,
     hash64: u64,
@@ -696,38 +701,44 @@ impl SanitizedCoordinationRecord {
     /// `shard_id`, `tenant_id`, `policy_hash`, and `item_key`.
     fn from_commit_progress(shard_id: &str, event: CommitProgressRecord) -> Self {
         let shard_id = RedactedDigest::text("shard_id", shard_id);
-        match event {
+        let (write_context, item_key, size_hint) = match event {
             CommitProgressRecord::Begin {
                 write_context,
                 item_key,
                 size_hint,
-            } => Self::CommitBegin {
-                shard_id,
-                tenant_id: RedactedDigest::bytes("tenant_id", write_context.tenant_id().as_bytes()),
-                policy_hash: RedactedDigest::bytes(
-                    "policy_hash",
-                    write_context.policy_hash().as_bytes(),
-                ),
-                run_id: write_context.run_id().as_raw(),
-                lease_shard_id: write_context.shard_id().as_raw(),
-                fence_epoch: write_context.fence_epoch().as_raw(),
-                item_key: RedactedDigest::bytes("item_key", item_key.as_bytes()),
-                size_hint,
-            },
+            } => (write_context, item_key, Some(size_hint)),
             CommitProgressRecord::Finish {
                 write_context,
                 item_key,
-            } => Self::CommitFinish {
+            } => (write_context, item_key, None),
+        };
+        let tenant_id = RedactedDigest::bytes("tenant_id", write_context.tenant_id().as_bytes());
+        let policy_hash =
+            RedactedDigest::bytes("policy_hash", write_context.policy_hash().as_bytes());
+        let run_id = write_context.run_id().as_raw();
+        let lease_shard_id = write_context.shard_id().as_raw();
+        let fence_epoch = write_context.fence_epoch().as_raw();
+        let item_key = RedactedDigest::bytes("item_key", item_key.as_bytes());
+
+        match size_hint {
+            Some(size_hint) => Self::CommitBegin {
                 shard_id,
-                tenant_id: RedactedDigest::bytes("tenant_id", write_context.tenant_id().as_bytes()),
-                policy_hash: RedactedDigest::bytes(
-                    "policy_hash",
-                    write_context.policy_hash().as_bytes(),
-                ),
-                run_id: write_context.run_id().as_raw(),
-                lease_shard_id: write_context.shard_id().as_raw(),
-                fence_epoch: write_context.fence_epoch().as_raw(),
-                item_key: RedactedDigest::bytes("item_key", item_key.as_bytes()),
+                tenant_id,
+                policy_hash,
+                run_id,
+                lease_shard_id,
+                fence_epoch,
+                item_key,
+                size_hint,
+            },
+            None => Self::CommitFinish {
+                shard_id,
+                tenant_id,
+                policy_hash,
+                run_id,
+                lease_shard_id,
+                fence_epoch,
+                item_key,
             },
         }
     }
@@ -828,13 +839,23 @@ mod tests {
         )
     }
 
-    fn full_coverage_records(canary: &str) -> [SanitizedCoordinationRecord; 8] {
+    /// Builds the raw event tuples for full-coverage testing. Each tuple is
+    /// `(shard_id, event)`. Grouped by recorder category so callers can route
+    /// them through either the sanitization layer or the public trait methods.
+    #[allow(clippy::type_complexity)]
+    fn canary_raw_events(
+        canary: &str,
+    ) -> (
+        Vec<(String, OwnedCoreEvent)>,
+        Vec<(String, StoredGitEvent)>,
+        Vec<(String, CommitProgressRecord)>,
+    ) {
         let canary_item_key =
             ItemKey::try_from_slice(canary.as_bytes()).expect("canary item key should be valid");
 
-        [
-            SanitizedCoordinationRecord::from_core_event(
-                &format!("finding-shard-{canary}"),
+        let core = vec![
+            (
+                format!("finding-shard-{canary}"),
                 OwnedCoreEvent::Finding {
                     source: SourceKind::Fs,
                     object_path: canary.as_bytes().to_vec(),
@@ -847,8 +868,8 @@ mod tests {
                     confidence_score: 7,
                 },
             ),
-            SanitizedCoordinationRecord::from_core_event(
-                &format!("progress-shard-{canary}"),
+            (
+                format!("progress-shard-{canary}"),
                 OwnedCoreEvent::Progress {
                     source: SourceKind::Git,
                     stage: "scan",
@@ -857,8 +878,8 @@ mod tests {
                     findings_emitted: 3,
                 },
             ),
-            SanitizedCoordinationRecord::from_core_event(
-                &format!("summary-shard-{canary}"),
+            (
+                format!("summary-shard-{canary}"),
                 OwnedCoreEvent::Summary {
                     source: SourceKind::Fs,
                     status: "ok",
@@ -869,15 +890,17 @@ mod tests {
                     throughput_mib_s: 12.5,
                 },
             ),
-            SanitizedCoordinationRecord::from_core_event(
-                &format!("diagnostic-shard-{canary}"),
+            (
+                format!("diagnostic-shard-{canary}"),
                 OwnedCoreEvent::Diagnostic {
                     level: "warn",
                     message: canary.to_owned(),
                 },
             ),
-            SanitizedCoordinationRecord::from_git_event(
-                &format!("git-commit-shard-{canary}"),
+        ];
+        let git = vec![
+            (
+                format!("git-commit-shard-{canary}"),
                 StoredGitEvent::CommitMeta {
                     commit_id: 17,
                     oid_hex: canary.to_owned(),
@@ -888,29 +911,53 @@ mod tests {
                     committer_email_id: Some(4),
                 },
             ),
-            SanitizedCoordinationRecord::from_git_event(
-                &format!("git-identity-shard-{canary}"),
+            (
+                format!("git-identity-shard-{canary}"),
                 StoredGitEvent::IdentityDictionary {
                     id: 11,
                     value: canary.as_bytes().to_vec(),
                 },
             ),
-            SanitizedCoordinationRecord::from_commit_progress(
-                &format!("commit-begin-shard-{canary}"),
+        ];
+        let progress = vec![
+            (
+                format!("commit-begin-shard-{canary}"),
                 CommitProgressRecord::Begin {
                     write_context: write_context(),
                     item_key: canary_item_key.clone(),
                     size_hint: Some(64),
                 },
             ),
-            SanitizedCoordinationRecord::from_commit_progress(
-                &format!("commit-finish-shard-{canary}"),
+            (
+                format!("commit-finish-shard-{canary}"),
                 CommitProgressRecord::Finish {
                     write_context: write_context(),
                     item_key: canary_item_key,
                 },
             ),
-        ]
+        ];
+        (core, git, progress)
+    }
+
+    fn full_coverage_records(canary: &str) -> Vec<SanitizedCoordinationRecord> {
+        let (core, git, progress) = canary_raw_events(canary);
+        let mut records: Vec<SanitizedCoordinationRecord> = Vec::new();
+        for (shard_id, event) in core {
+            records.push(SanitizedCoordinationRecord::from_core_event(
+                &shard_id, event,
+            ));
+        }
+        for (shard_id, event) in git {
+            records.push(SanitizedCoordinationRecord::from_git_event(
+                &shard_id, event,
+            ));
+        }
+        for (shard_id, event) in progress {
+            records.push(SanitizedCoordinationRecord::from_commit_progress(
+                &shard_id, event,
+            ));
+        }
+        records
     }
 
     fn assert_digest_string_is_redacted(display: &str, canary: &str) {
@@ -929,6 +976,34 @@ mod tests {
         assert_ne!(left, relabeled);
         assert_eq!(left.len, right.len);
         assert_eq!(left.len, relabeled.len);
+    }
+
+    #[test]
+    fn redacted_digest_is_deterministic_and_text_bytes_equivalent() {
+        let a = RedactedDigest::text("shard_id", "abc");
+        let b = RedactedDigest::text("shard_id", "abc");
+        assert_eq!(a, b);
+
+        let text = RedactedDigest::text("field", "hello");
+        let bytes = RedactedDigest::bytes("field", b"hello");
+        assert_eq!(text, bytes);
+    }
+
+    #[test]
+    fn redacted_digest_handles_empty_input() {
+        let empty = RedactedDigest::bytes("field", &[]);
+        assert_eq!(empty.len, 0);
+        let nonempty = RedactedDigest::bytes("field", &[1]);
+        assert_ne!(empty, nonempty);
+    }
+
+    #[test]
+    fn redacted_digest_display_format_is_stable() {
+        let d = RedactedDigest::text("shard_id", "test");
+        let s = d.to_string();
+        assert!(s.starts_with("len=4,hash="));
+        // 16 hex chars for the 64-bit hash
+        assert_eq!(s.len(), "len=4,hash=".len() + 16);
     }
 
     #[test]
@@ -1011,102 +1086,23 @@ mod tests {
     fn tracing_sink_never_logs_raw_canary_bytes() {
         let recorder = ProductionCoordinationEventRecorder::default();
         let canary = secret_canary();
-        let item_key =
-            ItemKey::try_from_slice(canary.as_bytes()).expect("canary item key should be valid");
+        let (core, git, progress) = canary_raw_events(&canary);
         let logs = capture_logs(Level::TRACE, || {
-            recorder
-                .record_core_event(
-                    &format!("finding-shard-{canary}"),
-                    OwnedCoreEvent::Finding {
-                        source: SourceKind::Fs,
-                        object_path: canary.as_bytes().to_vec(),
-                        start: 10,
-                        end: 20,
-                        rule_id: 17,
-                        rule_name: canary.clone(),
-                        commit_id: Some(99),
-                        change_kind: Some(canary.clone()),
-                        confidence_score: 7,
-                    },
-                )
-                .expect("finding telemetry should be best-effort");
-            recorder
-                .record_core_event(
-                    &format!("progress-shard-{canary}"),
-                    OwnedCoreEvent::Progress {
-                        source: SourceKind::Git,
-                        stage: "scan",
-                        objects_scanned: 100,
-                        bytes_scanned: 200,
-                        findings_emitted: 3,
-                    },
-                )
-                .expect("progress telemetry should be best-effort");
-            recorder
-                .record_core_event(
-                    &format!("summary-shard-{canary}"),
-                    OwnedCoreEvent::Summary {
-                        source: SourceKind::Fs,
-                        status: "ok",
-                        elapsed_ms: 55,
-                        bytes_scanned: 1024,
-                        findings_emitted: 4,
-                        errors: 0,
-                        throughput_mib_s: 12.5,
-                    },
-                )
-                .expect("summary telemetry should be best-effort");
-            recorder
-                .record_core_event(
-                    &format!("diagnostic-shard-{canary}"),
-                    OwnedCoreEvent::Diagnostic {
-                        level: "warn",
-                        message: canary.clone(),
-                    },
-                )
-                .expect("diagnostic telemetry should be best-effort");
-            recorder
-                .record_git_event(
-                    &format!("git-commit-shard-{canary}"),
-                    StoredGitEvent::CommitMeta {
-                        commit_id: 17,
-                        oid_hex: canary.clone(),
-                        timestamp: 1234,
-                        author_name_id: Some(1),
-                        author_email_id: Some(2),
-                        committer_name_id: Some(3),
-                        committer_email_id: Some(4),
-                    },
-                )
-                .expect("git telemetry should be best-effort");
-            recorder
-                .record_git_event(
-                    &format!("git-identity-shard-{canary}"),
-                    StoredGitEvent::IdentityDictionary {
-                        id: 11,
-                        value: canary.as_bytes().to_vec(),
-                    },
-                )
-                .expect("git identity telemetry should be best-effort");
-            recorder
-                .record_commit_progress(
-                    &format!("commit-begin-shard-{canary}"),
-                    CommitProgressRecord::Begin {
-                        write_context: write_context(),
-                        item_key: item_key.clone(),
-                        size_hint: Some(64),
-                    },
-                )
-                .expect("commit begin telemetry should be best-effort");
-            recorder
-                .record_commit_progress(
-                    &format!("commit-finish-shard-{canary}"),
-                    CommitProgressRecord::Finish {
-                        write_context: write_context(),
-                        item_key,
-                    },
-                )
-                .expect("commit finish telemetry should be best-effort");
+            for (shard_id, event) in core {
+                recorder
+                    .record_core_event(&shard_id, event)
+                    .expect("core telemetry should be best-effort");
+            }
+            for (shard_id, event) in git {
+                recorder
+                    .record_git_event(&shard_id, event)
+                    .expect("git telemetry should be best-effort");
+            }
+            for (shard_id, event) in progress {
+                recorder
+                    .record_commit_progress(&shard_id, event)
+                    .expect("progress telemetry should be best-effort");
+            }
         });
 
         for event_name in [
@@ -1129,20 +1125,16 @@ mod tests {
     #[test]
     fn recorder_suppresses_repeated_sink_failures_per_category() {
         #[derive(Debug)]
-        struct FailingSink {
-            canary: String,
-        }
+        struct FailingSink;
 
         impl CoordinationTelemetrySink for FailingSink {
             fn emit(&self, _record: SanitizedCoordinationRecord) -> Result<()> {
-                anyhow::bail!("telemetry sink exploded: {}", self.canary)
+                anyhow::bail!("simulated sink failure")
             }
         }
 
         let canary = secret_canary();
-        let recorder = ProductionCoordinationEventRecorder::with_sink(Arc::new(FailingSink {
-            canary: canary.clone(),
-        }));
+        let recorder = ProductionCoordinationEventRecorder::with_sink(Arc::new(FailingSink));
         let core_shard = RedactedDigest::text("shard_id", "core-shard").to_string();
         let git_shard = RedactedDigest::text("shard_id", "git-shard").to_string();
         let progress_shard = RedactedDigest::text("shard_id", "progress-shard").to_string();
