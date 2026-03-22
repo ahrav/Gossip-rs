@@ -82,9 +82,9 @@ Filesystem scans build a runtime engine, forward scheduler events through
 owned channel bridges, optionally forward persisted findings through the
 local commit sink surface, and convert scheduler counters into the local
 `ScanReport`. When persistence is enabled, the runtime derives each
-filesystem `StableItemId` from the canonical filesystem connector tag, a
-connector-instance hash of the canonical scan root, and the normalized
-root-relative item key. The commit forwarder (`forward_commits`) uses a
+filesystem `StableItemId` from the filesystem connector tag, a
+connector-instance hash of the canonicalized scan root, and the normalized
+root-relative path (the locator in `ItemIdentityKey`). The commit forwarder (`forward_commits`) uses a
 `DiscoveryOrderBuffer` to reorder finding batches from executor processing
 order (LIFO-reversed) back into file-path-sorted discovery order before
 calling `begin_item`. This ensures checkpoint sequence numbers are

@@ -1066,6 +1066,17 @@ pub(crate) fn forward_core_events(out: &dyn EventOutput, rx: Receiver<OwnedDrive
 /// resolve to the same canonical path always produce the same instance
 /// hash (and therefore the same stable IDs), while distinct roots
 /// produce distinct namespaces even for identical relative paths.
+///
+/// # Platform note
+///
+/// Identity stability assumes `fs::canonicalize` returns byte-identical
+/// results for the same logical directory across invocations. On macOS
+/// APFS, directory names containing non-ASCII characters may be stored in
+/// NFC or NFD Unicode normalization forms; `fs::canonicalize` preserves
+/// whichever form the filesystem reports. Two scans of the same directory
+/// created under different normalization forms would produce distinct
+/// connector-instance hashes. This edge case (non-ASCII directory names
+/// on APFS) does not warrant a `unicode-normalization` dependency.
 #[derive(Clone, Debug)]
 struct FilesystemIdentityScope {
     canonical_root: PathBuf,
@@ -1079,6 +1090,11 @@ impl FilesystemIdentityScope {
     /// namespace because the runtime canonicalizes before constructing this
     /// scope.
     fn from_canonical_root(canonical_root: PathBuf) -> Self {
+        debug_assert!(
+            std::fs::canonicalize(&canonical_root).is_ok_and(|c| c == canonical_root),
+            "FilesystemIdentityScope requires a fully canonicalized path \
+             (no symlinks, no `.`, no `..`), got: {canonical_root:?}"
+        );
         let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(
             canonical_root.as_os_str().as_encoded_bytes(),
         );
@@ -1479,8 +1495,9 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> anyhow::Result<Vec
     #[cfg(windows)]
     compile_error!("normalize_scheduler_path relies on Unix byte-string semantics for OsStr");
 
-    // SAFETY: raw_bytes are OS-string-encoded paths from the scheduler.
-    // On Unix, any &[u8] is a valid OsStr encoding.
+    // SAFETY: raw_bytes originate from FsFindingBatch::object_path, which the
+    // scanner-scheduler populates from std::fs directory traversal. On Unix,
+    // any &[u8] is a valid OsStr encoding.
     let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(raw_bytes) };
     let path = Path::new(os_str);
     let rel = path.strip_prefix(root).map_err(|_| {
