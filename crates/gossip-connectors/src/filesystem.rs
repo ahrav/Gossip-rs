@@ -25,11 +25,11 @@
 //!
 //! # Read-path confinement
 //!
-//! Directory roots are read with component-by-component `openat` traversal
-//! from a canonical root directory fd, using `O_NOFOLLOW` at each step. This
-//! blocks symlink escapes and intermediate directory substitution attacks.
-//! Single-file roots open the canonical file path directly with
-//! `O_NOFOLLOW | O_NONBLOCK`.
+//! Both directory and single-file roots are read with component-by-component
+//! `openat` traversal from a pinned parent directory fd, using `O_NOFOLLOW` at
+//! each step. This blocks symlink escapes and intermediate directory
+//! substitution attacks. Single-file roots additionally verify that the opened
+//! file's `(dev, ino)` matches the identity recorded at initialization.
 //!
 //! Files are opened with `O_NONBLOCK`, validated as regular files via
 //! metadata, then `O_NONBLOCK` is cleared before reads.
@@ -275,7 +275,11 @@ impl<'a> DirectoryWalker<'a> {
 
 enum RootMode {
     Directory,
-    SingleFile { file_name: Box<[u8]> },
+    SingleFile {
+        file_name: Box<[u8]>,
+        /// (dev, ino) recorded at init to detect file replacement.
+        expected_id: (u64, u64),
+    },
 }
 
 /// Deterministic filesystem connector rooted at a local directory or file.
@@ -363,14 +367,32 @@ impl FilesystemConnector {
                 .root
                 .file_name()
                 .ok_or_else(|| EnumerateError::permanent("single-file root has no file name"))?;
-            let file_name = file_name.as_bytes();
-            if file_name.is_empty() {
+            let file_name_bytes = file_name.as_bytes();
+            if file_name_bytes.is_empty() {
                 return Err(EnumerateError::permanent(
                     "single-file root encoded to an empty item key",
                 ));
             }
+
+            let expected_id = (path_meta.dev(), path_meta.ino());
+
+            // Pin the parent directory fd so single-file opens use `openat`,
+            // matching directory-root protection against parent-path swaps.
+            let parent = self.root.parent().ok_or_else(|| {
+                EnumerateError::permanent("single-file root has no parent directory")
+            })?;
+            let parent_meta = fs::metadata(parent)
+                .map_err(|e| classify_io_enumerate_error("stat_parent", parent, &e))?;
+            let parent_expected = (parent_meta.dev(), parent_meta.ino());
+            let parent_fd = open_dir_fd(parent)
+                .map_err(|e| classify_io_enumerate_error("open_parent_dir", parent, &e))?;
+            verify_root_identity(&parent_fd, parent_expected)
+                .map_err(|e| classify_io_enumerate_error("verify_parent_identity", parent, &e))?;
+            self.root_fd = Some(parent_fd);
+
             self.root_mode = Some(RootMode::SingleFile {
-                file_name: file_name.into(),
+                file_name: file_name_bytes.into(),
+                expected_id,
             });
             return Ok(());
         }
@@ -471,6 +493,7 @@ impl FilesystemConnector {
     fn fill_page_single_file(
         &self,
         file_name: &[u8],
+        expected_id: (u64, u64),
         effective_start: Option<&[u8]>,
         effective_end: Option<&[u8]>,
         cursor: &Cursor,
@@ -493,6 +516,12 @@ impl FilesystemConnector {
         if !metadata.is_file() {
             return Err(EnumerateError::permanent(
                 "single-file root is no longer a regular file",
+            ));
+        }
+        let actual_id = (metadata.dev(), metadata.ino());
+        if actual_id != expected_id {
+            return Err(EnumerateError::permanent(
+                "single-file identity changed (dev/ino mismatch); rebuild the connector",
             ));
         }
 
@@ -651,13 +680,25 @@ impl FilesystemConnector {
             .expect("root mode is initialized by ensure_root_ready")
         {
             RootMode::Directory => self.open_beneath_root(item_ref.as_bytes()),
-            RootMode::SingleFile { file_name } => {
+            RootMode::SingleFile {
+                file_name,
+                expected_id,
+            } => {
                 if item_ref.as_bytes() != file_name.as_ref() {
                     return Err(ReadError::permanent(
                         "item_ref does not match the single-file root",
                     ));
                 }
-                open_regular_file(&self.root)
+                // Open via the pinned parent dir fd, matching directory-root
+                // protection against parent-path manipulation.
+                let (file, metadata) = self.open_beneath_root(file_name)?;
+                let actual_id = (metadata.dev(), metadata.ino());
+                if actual_id != *expected_id {
+                    return Err(ReadError::permanent(
+                        "single-file identity changed (dev/ino mismatch); rebuild the connector",
+                    ));
+                }
+                Ok((file, metadata))
             }
         }
     }
@@ -731,8 +772,12 @@ impl FilesystemConnector {
             RootMode::Directory => {
                 self.fill_page_directory(effective_start, effective_end, cursor, budgets)
             }
-            RootMode::SingleFile { file_name } => self.fill_page_single_file(
+            RootMode::SingleFile {
+                file_name,
+                expected_id,
+            } => self.fill_page_single_file(
                 file_name.as_ref(),
+                *expected_id,
                 effective_start,
                 effective_end,
                 cursor,
@@ -877,6 +922,11 @@ fn derive_filesystem_version(rel_path: &[u8], metadata: &fs::Metadata) -> Object
     ObjectVersionId::from_version_bytes(&version_bytes)
 }
 
+/// Hard cap on buffered entries per single directory to prevent unbounded
+/// memory growth from pathological fan-out.  Page-level budgets are enforced
+/// later; this cap guards the intermediate sort buffer.
+const MAX_DIR_ENTRIES: usize = 500_000;
+
 fn read_sorted_dir_entries(
     dir: &Path,
     deadline: Option<Instant>,
@@ -891,6 +941,12 @@ fn read_sorted_dir_entries(
     for entry in dir_iter {
         if deadline_expired(deadline) {
             return Err(EnumerateError::retryable("budget deadline expired"));
+        }
+        if entries.len() >= MAX_DIR_ENTRIES {
+            return Err(EnumerateError::permanent(format!(
+                "directory {:?} exceeds {MAX_DIR_ENTRIES} entry cap",
+                dir,
+            )));
         }
 
         let entry =
@@ -1077,35 +1133,6 @@ fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     }
     // SAFETY: `fd >= 0` from the check above.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// Open one canonical regular file path with `O_NOFOLLOW | O_NONBLOCK`.
-fn open_regular_file(path: &Path) -> Result<(fs::File, fs::Metadata), ReadError> {
-    let c_path = path_to_cstring(path).map_err(|_| ReadError::permanent("null byte in path"))?;
-    // SAFETY: POSIX open(2) with a valid null-terminated path.
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(classify_io_read_error(
-            "open",
-            Some(path),
-            &io::Error::last_os_error(),
-        ));
-    }
-
-    // SAFETY: `fd >= 0` from the check above.
-    let file = unsafe { fs::File::from_raw_fd(fd) };
-    let metadata = file
-        .metadata()
-        .map_err(|error| classify_io_read_error("fstat", Some(path), &error))?;
-    if !metadata.is_file() {
-        return Err(ReadError::permanent("path is not a regular file"));
-    }
-    Ok((file, metadata))
 }
 
 /// Clear `O_NONBLOCK` from an already-opened file descriptor.
