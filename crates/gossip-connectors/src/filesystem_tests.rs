@@ -303,6 +303,48 @@ fn fill_page_emits_large_first_item_to_make_progress() {
 }
 
 #[test]
+fn max_items_exactly_matching_file_count_yields_complete_page() {
+    let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+    let mut connector = FilesystemConnector::new(dir.path());
+
+    // max_items == file count: the peek after collection should see None and
+    // report Complete. Before the peek-error fix this path propagated errors
+    // from the peek via `?`, discarding valid items.
+    let page = fill_page_with_limits(
+        &mut connector,
+        &unbounded_shard(),
+        &Cursor::initial(),
+        3,
+        u64::MAX,
+    );
+    assert_eq!(page.len(), 3);
+    assert!(
+        matches!(page.state(), PageState::Complete),
+        "page should be Complete when max_items equals total file count"
+    );
+}
+
+#[test]
+fn max_items_less_than_file_count_yields_has_more() {
+    let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+    let mut connector = FilesystemConnector::new(dir.path());
+
+    // max_items < file count: the peek sees another file and reports HasMore.
+    let page = fill_page_with_limits(
+        &mut connector,
+        &unbounded_shard(),
+        &Cursor::initial(),
+        2,
+        u64::MAX,
+    );
+    assert_eq!(page.len(), 2);
+    assert!(
+        matches!(page.state(), PageState::HasMore { .. }),
+        "page should be HasMore when more files remain"
+    );
+}
+
+#[test]
 fn fill_page_rejects_expired_deadline() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
     let mut connector = FilesystemConnector::new(dir.path());
