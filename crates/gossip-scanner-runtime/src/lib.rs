@@ -1104,6 +1104,7 @@ impl StoreProducer for ChannelStoreProducer {
                 object_path: normalized_path,
                 stable_item_id,
                 findings: batch.findings.to_vec(),
+                discovery_sequence: batch.discovery_sequence,
             }))
             .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
     }
@@ -1144,6 +1145,102 @@ pub(crate) struct OwnedCommitBatch {
     object_path: Vec<u8>,
     stable_item_id: StableItemId,
     findings: Vec<FsFindingRecord>,
+    /// Discovery-order sequence from the sorted file walk. Used by the
+    /// commit forwarder to reorder batches so `begin_item` calls respect
+    /// the original path-sorted discovery order, ensuring checkpoint
+    /// sequence numbers are monotonically consistent with `ItemKey`.
+    discovery_sequence: u32,
+}
+
+/// Reorder buffer that ensures commit batches are forwarded in
+/// discovery order (file-path-sorted) rather than executor processing
+/// order (LIFO-reversed).
+///
+/// The work-stealing executor's LIFO local deque reverses file
+/// processing order relative to the sorted discovery order. Without
+/// reordering, `ReceiptCommitSink::begin_item` assigns monotonically
+/// increasing sequence numbers in *processing* order, causing
+/// `PrefixCheckpointAggregator::build_contiguous_prefix` to observe
+/// decreasing `ItemKey` values and return `BoundaryRegression`.
+///
+/// With `workers=1` (enforced for receipt-driven execution), files are
+/// processed sequentially: all batches for one file arrive on the
+/// channel before any batches for the next file. The buffer exploits
+/// this by tracking discovery-sequence transitions: when the incoming
+/// `discovery_sequence` changes, the previous sequence is known to be
+/// complete and can be flushed if it is the next expected sequence.
+///
+/// Memory is bounded by at most `batch_cap` (≤64) files worth of
+/// `OwnedCommitBatch` data.
+struct DiscoveryOrderBuffer {
+    /// Batches grouped by their discovery sequence.
+    pending: std::collections::BTreeMap<u32, Vec<OwnedCommitBatch>>,
+    /// Discovery sequences for which all batches have been received.
+    complete: std::collections::HashSet<u32>,
+    /// The discovery sequence currently being received (all batches
+    /// arriving on the channel belong to this sequence until it changes).
+    current_ds: Option<u32>,
+    /// Next discovery sequence to flush (starts at 0, increments after
+    /// each successful flush).
+    next_flush: u32,
+}
+
+impl DiscoveryOrderBuffer {
+    fn new() -> Self {
+        Self {
+            pending: std::collections::BTreeMap::new(),
+            complete: std::collections::HashSet::new(),
+            current_ds: None,
+            next_flush: 0,
+        }
+    }
+
+    /// Accept a batch. If the discovery sequence changed, the previous
+    /// sequence is marked complete and a flush of all contiguous complete
+    /// sequences from `next_flush` is triggered.
+    fn push(&mut self, batch: OwnedCommitBatch) {
+        let ds = batch.discovery_sequence;
+        if let Some(prev) = self.current_ds
+            && prev != ds
+        {
+            self.complete.insert(prev);
+        }
+        self.current_ds = Some(ds);
+        self.pending.entry(ds).or_default().push(batch);
+    }
+
+    /// Drain all contiguous complete discovery sequences starting at
+    /// `next_flush`, preserving arrival order within each sequence.
+    fn drain_ready(&mut self, out: &mut Vec<OwnedCommitBatch>) {
+        while self.complete.contains(&self.next_flush) {
+            self.complete.remove(&self.next_flush);
+            if let Some(batches) = self.pending.remove(&self.next_flush) {
+                out.extend(batches);
+            }
+            self.next_flush += 1;
+        }
+    }
+
+    /// Mark the current sequence as complete and return all remaining
+    /// batches in discovery order. Called when the channel is closed.
+    fn finish(mut self) -> Vec<OwnedCommitBatch> {
+        if let Some(ds) = self.current_ds {
+            self.complete.insert(ds);
+        }
+        let mut out = Vec::new();
+        // Flush contiguous complete prefix.
+        while self.complete.remove(&self.next_flush) {
+            if let Some(batches) = self.pending.remove(&self.next_flush) {
+                out.extend(batches);
+            }
+            self.next_flush += 1;
+        }
+        // Safety net: flush any residual batches in ascending key order.
+        for (_ds, batches) in self.pending {
+            out.extend(batches);
+        }
+        out
+    }
 }
 
 /// Drain commit messages from the channel and forward finding batches to
@@ -1164,30 +1261,56 @@ pub(crate) fn forward_commits(
 ) -> anyhow::Result<()> {
     let mut first_error: Option<anyhow::Error> = None;
     let mut error_count: u64 = 0;
+    let mut buffer = DiscoveryOrderBuffer::new();
+    let mut ready = Vec::new();
+
+    /// Record an error, keeping only the first.
+    fn record_err(
+        result: anyhow::Result<()>,
+        first_error: &mut Option<anyhow::Error>,
+        error_count: &mut u64,
+    ) {
+        if let Err(error) = result {
+            *error_count += 1;
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+        }
+    }
 
     while let Ok(message) = rx.recv() {
-        let result = match message {
-            CommitMessage::Batch(batch) => forward_commit_batch(commit, batch),
+        match message {
+            CommitMessage::Batch(batch) => {
+                buffer.push(batch);
+                buffer.drain_ready(&mut ready);
+                for b in ready.drain(..) {
+                    record_err(
+                        forward_commit_batch(commit, b),
+                        &mut first_error,
+                        &mut error_count,
+                    );
+                }
+            }
             CommitMessage::RunLoss(loss) => {
                 tracing::debug!(
                     dropped_findings = loss.dropped_findings,
                     persistence_emit_failures = loss.persistence_emit_failures,
                     "received run-loss record",
                 );
-                Ok(())
             }
             CommitMessage::EndRun(had_coverage_limits) => {
                 tracing::debug!(had_coverage_limits, "received end-run signal");
-                Ok(())
-            }
-        };
-
-        if let Err(error) = result {
-            error_count += 1;
-            if first_error.is_none() {
-                first_error = Some(error);
             }
         }
+    }
+
+    // Channel closed: flush remaining buffered batches in discovery order.
+    for batch in buffer.finish() {
+        record_err(
+            forward_commit_batch(commit, batch),
+            &mut first_error,
+            &mut error_count,
+        );
     }
 
     if error_count > 1 {

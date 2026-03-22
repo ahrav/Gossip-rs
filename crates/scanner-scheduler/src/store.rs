@@ -73,6 +73,13 @@ pub struct FsFindingBatch<'a> {
     pub object_path: &'a [u8],
     /// Post-dedupe findings for this object, in scan-order.
     pub findings: &'a [FsFindingRecord],
+    /// Monotonic counter assigned at file discovery time in sorted path
+    /// order. For top-level files this is the [`FileId`] from the
+    /// discovery loop; for archive entries it equals the parent file's
+    /// discovery sequence. Used downstream to reorder commit batches
+    /// into discovery order so checkpoint sequence numbers are
+    /// monotonically consistent with [`ItemKey`] ordering.
+    pub discovery_sequence: u32,
 }
 
 /// Run-level loss accounting for FS persistence.
@@ -206,6 +213,7 @@ pub struct InMemoryStoreProducer {
 pub struct OwnedFsFindingBatch {
     pub object_path: Vec<u8>,
     pub findings: Vec<FsFindingRecord>,
+    pub discovery_sequence: u32,
 }
 
 impl InMemoryStoreProducer {
@@ -237,6 +245,7 @@ impl StoreProducer for InMemoryStoreProducer {
         guard.push(OwnedFsFindingBatch {
             object_path: batch.object_path.to_vec(),
             findings: batch.findings.to_vec(),
+            discovery_sequence: batch.discovery_sequence,
         });
         Ok(())
     }
@@ -319,6 +328,7 @@ mod tests {
         let batch = FsFindingBatch {
             object_path: b"/tmp/test.txt",
             findings: &[],
+            discovery_sequence: 0,
         };
         assert!(producer.emit_fs_batch(batch).is_ok());
     }
@@ -353,10 +363,12 @@ mod tests {
         let batch1 = FsFindingBatch {
             object_path: b"/file1.txt",
             findings: &[rec],
+            discovery_sequence: 0,
         };
         let batch2 = FsFindingBatch {
             object_path: b"/file2.txt",
             findings: &[],
+            discovery_sequence: 1,
         };
         producer.emit_fs_batch(batch1).unwrap();
         producer.emit_fs_batch(batch2).unwrap();
@@ -433,6 +445,7 @@ mod tests {
         let batch = FsFindingBatch {
             object_path: b"/test",
             findings: &[],
+            discovery_sequence: 0,
         };
         let err = producer.emit_fs_batch(batch).unwrap_err();
         assert!(err.detail().contains("injected"));
@@ -457,6 +470,7 @@ mod tests {
         let batch = FsFindingBatch {
             object_path: b"/ok",
             findings: &[],
+            discovery_sequence: 0,
         };
         assert!(producer.emit_fs_batch(batch).is_ok());
         assert!(producer.record_fs_run_loss(FsRunLoss::default()).is_err());

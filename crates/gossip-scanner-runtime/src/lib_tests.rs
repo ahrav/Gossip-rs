@@ -752,12 +752,14 @@ fn forward_commits_surfaces_first_commit_error() {
         object_path: b"file_a.txt".to_vec(),
         stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x01; 32]),
         findings: Vec::new(),
+        discovery_sequence: 0,
     }))
     .unwrap();
     tx.send(CommitMessage::Batch(OwnedCommitBatch {
         object_path: b"file_b.txt".to_vec(),
         stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x02; 32]),
         findings: Vec::new(),
+        discovery_sequence: 1,
     }))
     .unwrap();
     drop(tx);
@@ -821,6 +823,7 @@ fn forward_commits_drains_channel_after_error() {
             object_path: format!("file_{i}.txt").into_bytes(),
             stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([i; 32]),
             findings: Vec::new(),
+            discovery_sequence: u32::from(i),
         }))
         .unwrap();
     }
@@ -1125,4 +1128,208 @@ fn owned_git_event_identity_dictionary_round_trips() {
     let event = &events[0];
     assert_eq!(event["type"], "identity_dictionary");
     assert_eq!(event["id"], 99);
+}
+
+// ===========================================================================
+// DiscoveryOrderBuffer unit tests
+// ===========================================================================
+
+/// Helper to build a minimal `OwnedCommitBatch` with a given path and
+/// discovery sequence. Findings are empty; the stable item id is derived
+/// from the sequence for uniqueness.
+fn test_batch(path: &[u8], ds: u32) -> OwnedCommitBatch {
+    OwnedCommitBatch {
+        object_path: path.to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([ds as u8; 32]),
+        findings: Vec::new(),
+        discovery_sequence: ds,
+    }
+}
+
+/// Convenience: collect all flushed paths from a buffer via push + drain_ready.
+fn push_and_collect(buf: &mut DiscoveryOrderBuffer, batch: OwnedCommitBatch) -> Vec<Vec<u8>> {
+    let mut ready = Vec::new();
+    buf.push(batch);
+    buf.drain_ready(&mut ready);
+    ready.iter().map(|b| b.object_path.clone()).collect()
+}
+
+#[test]
+fn discovery_order_buffer_passthrough_when_already_sorted() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // Batches arrive in discovery order: ds=0, ds=1, ds=2.
+    // Each ds transition marks the previous as complete.
+    let flushed_0 = push_and_collect(&mut buf, test_batch(b"a.txt", 0));
+    // ds=0 is current but not yet complete (no transition).
+    assert!(flushed_0.is_empty());
+
+    let flushed_1 = push_and_collect(&mut buf, test_batch(b"b.txt", 1));
+    // ds=0 is now complete; it matches next_flush=0, so it flushes.
+    assert_eq!(flushed_1, vec![b"a.txt".to_vec()]);
+
+    let flushed_2 = push_and_collect(&mut buf, test_batch(b"c.txt", 2));
+    assert_eq!(flushed_2, vec![b"b.txt".to_vec()]);
+
+    // Finish drains the last item.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(remaining, vec![b"c.txt".to_vec()]);
+}
+
+#[test]
+fn discovery_order_buffer_reorders_reversed_input() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // LIFO reversal: files arrive as ds=2, ds=1, ds=0.
+    let f = push_and_collect(&mut buf, test_batch(b"c.txt", 2));
+    assert!(f.is_empty(), "ds=2 not ready (next_flush=0)");
+
+    let f = push_and_collect(&mut buf, test_batch(b"b.txt", 1));
+    assert!(
+        f.is_empty(),
+        "ds=1 not ready (next_flush=0), ds=2 complete but not contiguous"
+    );
+
+    let f = push_and_collect(&mut buf, test_batch(b"a.txt", 0));
+    assert!(
+        f.is_empty(),
+        "ds=0 not ready yet (ds=1 just became complete)"
+    );
+
+    // Channel close: finish flushes everything in discovery order.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()],
+        "finish must produce batches in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_multi_batch_reversal() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // Two injection batches, each reversed by LIFO.
+    // Discovery: [A(0), B(1), C(2), D(3), E(4), F(5)]
+    // Batch 1 (LIFO): C(2), B(1), A(0)
+    // Batch 2 (LIFO): F(5), E(4), D(3)
+    for &(path, ds) in &[
+        (&b"c.txt"[..], 2u32),
+        (b"b.txt", 1),
+        (b"a.txt", 0),
+        (b"f.txt", 5),
+        (b"e.txt", 4),
+        (b"d.txt", 3),
+    ] {
+        buf.push(test_batch(path, ds));
+    }
+
+    // After all pushes, transitions have marked {2,1,0,5,4} complete.
+    // current_ds = 3 (not yet complete). drain_ready flushes 0→1→2.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    let flushed: Vec<Vec<u8>> = ready.into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        flushed,
+        vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()],
+        "first injection batch should flush in discovery order"
+    );
+
+    // finish marks ds=3 complete, then flushes 3→4→5.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"d.txt".to_vec(), b"e.txt".to_vec(), b"f.txt".to_vec(),],
+        "second injection batch should flush in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_multi_batch_per_file() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // File with ds=1 has two chunks. File with ds=0 has one chunk.
+    // Arrival: ds=1 chunk_a, ds=1 chunk_b, ds=0 chunk_a.
+    buf.push(test_batch(b"b_chunk1.txt", 1));
+    buf.push(test_batch(b"b_chunk2.txt", 1));
+    buf.push(test_batch(b"a_chunk1.txt", 0));
+    // ds=1 is marked complete when ds=0 arrives.
+    // drain_ready: next_flush=0, 0 not in complete → nothing.
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![
+            b"a_chunk1.txt".to_vec(),
+            b"b_chunk1.txt".to_vec(),
+            b"b_chunk2.txt".to_vec(),
+        ],
+        "within a ds group, batches must preserve arrival order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_single_item() {
+    let mut buf = DiscoveryOrderBuffer::new();
+    buf.push(test_batch(b"only.txt", 0));
+
+    // No transition → nothing drained eagerly.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    assert!(ready.is_empty());
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(remaining, vec![b"only.txt".to_vec()]);
+}
+
+#[test]
+fn discovery_order_buffer_empty() {
+    let buf = DiscoveryOrderBuffer::new();
+    let remaining: Vec<OwnedCommitBatch> = buf.finish().into_iter().collect();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn forward_commits_reorders_lifo_reversed_batches() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Simulate LIFO reversal: discovery order is a,b,c but processing
+    // order is c,b,a. Discovery sequences are 2,1,0 respectively.
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok());
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 3, "all three items should be committed");
+    let keys: Vec<&[u8]> = begun.iter().map(|(k, _)| k.as_slice()).collect();
+    // Verify discovery order is preserved: a < b < c.
+    assert!(
+        keys[0] < keys[1] && keys[1] < keys[2],
+        "begin_item must be called in discovery (path-sorted) order: {keys:?}"
+    );
 }

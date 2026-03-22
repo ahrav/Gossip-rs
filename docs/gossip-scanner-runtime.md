@@ -81,7 +81,13 @@ Current behavior after validation:
 Filesystem scans build a runtime engine, forward scheduler events through
 owned channel bridges, optionally forward persisted findings through the
 local commit sink surface, and convert scheduler counters into the local
-`ScanReport`.
+`ScanReport`. The commit forwarder (`forward_commits`) uses a
+`DiscoveryOrderBuffer` to reorder finding batches from executor processing
+order (LIFO-reversed) back into file-path-sorted discovery order before
+calling `begin_item`. This ensures checkpoint sequence numbers are
+monotonically consistent with `ItemKey` ordering, preventing
+`BoundaryRegression` errors in the prefix checkpoint aggregator for
+ordered-content shards with multiple files.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the

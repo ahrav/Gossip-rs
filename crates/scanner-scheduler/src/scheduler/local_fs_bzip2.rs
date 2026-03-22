@@ -77,6 +77,7 @@ pub(super) fn process_bzip2_file<E: ScanEngine>(
         archive: &scratch.archive,
         chunk_size: scratch.chunk_size,
         abort_run: scratch.abort_run.as_ref(),
+        discovery_sequence: task.file_id.0,
     };
 
     scan.budgets.reset();

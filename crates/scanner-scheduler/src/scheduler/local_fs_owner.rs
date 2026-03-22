@@ -571,6 +571,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     findings: &[F],
     persist_batch: &mut Vec<FsFindingRecord>,
     metrics: &mut WorkerMetricsLocal,
+    discovery_sequence: u32,
 ) {
     let Some(producer) = store_producer else {
         return;
@@ -587,6 +588,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     let emit_result = producer.emit_fs_batch(FsFindingBatch {
         object_path: path,
         findings: persist_batch.as_slice(),
+        discovery_sequence,
     });
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]
@@ -800,6 +802,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &scratch.pending,
             &mut scratch.persist_batch,
             &mut ctx.metrics,
+            task.file_id.0,
         );
         return;
     }
@@ -972,6 +975,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 &scratch.pending,
                 &mut scratch.persist_batch,
                 &mut ctx.metrics,
+                task.file_id.0,
             );
         }
         emit_findings(
@@ -1009,6 +1013,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &scratch.pending,
             &mut scratch.persist_batch,
             &mut ctx.metrics,
+            task.file_id.0,
         );
     }
 

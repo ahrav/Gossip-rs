@@ -1494,6 +1494,7 @@ fn emit_persistence_batch_emits_for_empty_findings() {
         empty_findings,
         &mut persist_batch,
         &mut metrics,
+        0,
     );
 
     let batches = producer.batches();
