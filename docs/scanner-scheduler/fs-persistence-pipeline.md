@@ -483,7 +483,7 @@ in its `FindingKey`.
 The orchestrator now reports persistence-related counters in the debug
 summary (multi-line, one `key=value` per line):
 
-```
+```text
 files=N
 chunks=N
 bytes=N
