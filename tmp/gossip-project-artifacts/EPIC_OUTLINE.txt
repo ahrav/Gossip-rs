@@ -1,0 +1,524 @@
+Here is the **updated epic list** with the **control-plane / API / scheduler / shard-creation work folded in**, and aligned to the current MVP goal:
+
+**MVP target**
+
+* distributed secret scanner
+* `gossip-coordination-etcd`
+* `gossip-done-ledger-postgres`
+* `gossip-findings-postgres`
+* filesystem + Git only
+
+---
+
+# Epic 1 — Production runtime cutover to real backends
+
+## Goal
+
+Make the worker/runtime use the **real** coordinator and **real** Postgres persistence path as the default MVP path.
+
+## Tasks
+
+* Wire `gossip-worker` and `gossip-scanner-runtime` to:
+
+  * `gossip-coordination-etcd`
+  * `gossip-done-ledger-postgres`
+  * `gossip-findings-postgres`
+* Remove any remaining non-test runtime dependence on:
+
+  * in-memory coordination
+  * `InMemoryDoneLedger`
+  * `InMemoryFindingsSink`
+* Finish the glue between:
+
+  * `distributed.rs`
+  * `coordination_sink.rs`
+  * `result_committer.rs`
+  * `commit_pipeline.rs`
+  * `checkpoint_aggregator.rs`
+* Make the real commit pipeline the only production path
+* Keep in-memory implementations for:
+
+  * unit tests
+  * simulation
+  * workload harnesses only
+
+## Deliverables
+
+* worker boots and runs against etcd + Postgres
+* real backends are the default runtime path
+* in-memory persistence is test-only support
+
+## Dependencies
+
+* none
+
+## Exit criteria
+
+* a worker can boot against etcd + Postgres and start a real distributed run
+* no new runtime feature work depends on in-memory-only behavior
+
+---
+
+# Epic 2 — Filesystem distributed MVP + control plane
+
+## Goal
+
+Finish the filesystem family as the first real end-to-end distributed path, including the **submission/control-plane path** that turns a user request into runs and shards.
+
+## Tasks
+
+### Runtime/data plane
+
+* Finish the `OrderedContentSource` worker loop
+
+  * acquire lease
+  * `fill_page`
+  * validate page
+  * done-ledger prefilter
+  * scan misses
+  * findings commit
+  * done-ledger commit
+  * checkpoint committed prefix
+  * shard completion
+* Finalize `FilesystemConnector` on the new contract
+* Make filesystem resume real
+
+  * actual key-authoritative paging/resume
+  * no fake cursor plumbing
+* Add ordered-content conformance + failure tests for filesystem
+
+  * ordering
+  * range membership
+  * token fallback
+  * prefix commit
+  * exhausted-empty behavior
+  * non-empty final page behavior
+  * lease loss mid-page
+  * retry after reassignment
+
+### Control plane / scheduler / shard creation
+
+* Implement the first real scan submission path for filesystem requests
+* Accept requests for:
+
+  * single file
+  * directory root
+* Normalize a request into:
+
+  * run spec
+  * filesystem source config
+  * shard metadata
+* Decide initial shard geometry for filesystem MVP
+
+  * single file -> one shard
+  * directory -> one initial shard over the root, with residual splits used for scale-out first
+* Call coordination to:
+
+  * `create_run(...)`
+  * `register_shards(...)`
+* Pack filesystem connector metadata into shards
+
+  * root path
+  * source mode
+  * any initial bounds
+
+## Deliverables
+
+* working distributed filesystem scanner on real backends
+* real filesystem resume semantics
+* minimal filesystem submission/control-plane path
+* filesystem request -> run -> shard registration flow
+
+## Dependencies
+
+* Epic 1
+
+## Exit criteria
+
+* a user request to scan a file/directory can create a run and shards in etcd
+* workers can claim and execute those shards end-to-end
+* checkpoints advance only from committed receipts
+
+---
+
+# Epic 3 — Git local/static distributed MVP + control plane
+
+## Goal
+
+Finish the Git family enough for an MVP using **local/static repo inputs**, and add the **submission/control-plane path** that turns repo/ref/commit requests into repo-frontier shards.
+
+## Tasks
+
+### Runtime/data plane
+
+* Finalize `GitRepoDiscoverySource`, `GitMirrorManager`, and `GitRepoExecutor` usage in runtime
+* Wire repo-target frontier paging into the distributed runtime
+* Finalize `RepoKey` encoding and repo-target ordering
+* Implement deterministic local mirror management
+
+  * mirror path layout
+  * create / update / fetch
+  * retry classification
+* Finalize the `scanner-git` adapter
+
+  * map `GitRepoTarget` to `run_git_scan(...)`
+  * preserve inner watermark / seen-store semantics
+  * classify retryable vs fatal outcomes
+* Lock outer vs inner progress ownership
+
+  * outer checkpoint = repo frontier
+  * inner progress = `scanner-git` state
+
+### Control plane / scheduler / shard creation
+
+* Implement Git submission path for local/static inputs
+* Accept requests for:
+
+  * single repo
+  * explicit repo list
+  * single repo + explicit refs
+  * single repo + explicit commit
+* Normalize those requests into `GitRepoTarget`s
+* Decide initial shard geometry for Git MVP
+
+  * one repo target = one initial shard
+  * explicit repo list = one shard per repo target initially
+  * use repo-frontier splits later if needed
+* Implement explicit commit lowering
+
+  * stable synthetic ref naming
+  * stable mapping from commit target to executor input
+* Call coordination to:
+
+  * `create_run(...)`
+  * `register_shards(...)`
+* Pack Git shard metadata into repo-frontier shards
+
+## Deliverables
+
+* working distributed Git runtime path for local/static inputs
+* mirror manager
+* `scanner-git` executor adapter
+* Git submission/control-plane path
+* repo-frontier shard registration flow
+
+## Dependencies
+
+* Epic 1
+
+## Exit criteria
+
+* a user request to scan repo/ref/commit can create a run and repo shards in etcd
+* workers can claim and execute those repo shards end-to-end
+* outer repo frontier progress and inner `scanner-git` progress are cleanly separated
+
+---
+
+# Epic 4 — Hosted Git discovery and provider-backed control plane
+
+## Goal
+
+Extend the Git control plane to support **GitHub / GitLab / Gerrit** discovery, so hosted Git becomes the next real external source family.
+
+## Tasks
+
+* Implement provider-backed repo discovery
+
+  * GitHub org / repo list
+  * GitLab group / project list
+  * Gerrit project list
+* Freeze deterministic provider ordering
+* Finalize canonical `RepoKey` generation for hosted providers
+* Wire provider discovery into the Git submission/control-plane path
+* Convert provider inventory into `GitRepoTarget`s
+* Register repo-frontier shards in etcd from hosted-provider requests
+* Add provider discovery conformance tests
+
+  * deterministic ordering
+  * stable repo keys
+  * split safety
+  * retry safety on provider paging
+
+## Deliverables
+
+* GitHub/GitLab/Gerrit discovery connectors
+* hosted Git submission/control-plane path
+* provider-backed repo-target generation
+
+## Dependencies
+
+* Epic 3
+
+## Exit criteria
+
+* given org / repo list / single repo / explicit commit, the system can create correct repo-frontier shards and execute them through `scanner-git`
+* provider paging is not treated as durable frontier state
+
+---
+
+# Epic 5 — Production hardening for the FS/Git MVP
+
+## Goal
+
+Close the correctness and durability holes between “working” and “safe MVP.”
+
+## Tasks
+
+* Finish production integration with:
+
+  * `DoneLedger`
+  * `FindingsSink`
+  * `PageCommit`
+* Make empty exhausted completion explicit and safe
+* Make zero-newly-committed page handling explicit and safe
+* Ensure prefix commit always drops token
+* Enforce the Git outer completion rule
+
+  * repo frontier advances only after durable repo execution persistence
+* Add idempotency guarantees for Git persistence adapters
+* Tighten stale-owner/data-plane fencing behavior
+* Finish etcd/frontier edge cases required by the MVP families
+
+  * empty completion semantics
+  * split correctness
+  * residual split safety
+  * repo-frontier support
+* Harden run submission / shard registration behavior
+
+  * duplicate submission safety
+  * replay-safe registration
+  * consistent run/shard metadata validation
+* Remove any remaining runtime behavior that still assumes local-only or test-only semantics
+
+## Deliverables
+
+* durable ordered-content runtime
+* durable outer Git runtime
+* hardened checkpoint semantics
+* hardened control-plane run/shard registration path
+* stale-owner protection model
+
+## Dependencies
+
+* Epic 2
+* Epic 3
+* Epic 4 if hosted discovery is part of MVP
+
+## Exit criteria
+
+* crash/retry cannot advance progress without durable downstream state
+* repo-target replay is safe
+* stale workers cannot make progress look authoritative
+* run creation and shard registration are safe enough for MVP production use
+
+---
+
+# Epic 6 — Observability and safety guardrails
+
+## Goal
+
+Make the new runtime and control plane observable and safe enough to operate in production, while enforcing “no secrets in telemetry.”
+
+## Tasks
+
+* Standardize metrics, traces, and logs around the new runtime
+* Add low-cardinality metrics for:
+
+  * page fill
+  * read
+  * scan
+  * findings commit
+  * done-ledger commit
+  * checkpoint
+  * retries
+  * backpressure
+  * split activity
+  * run creation
+  * shard registration
+* Add Git-specific observability
+
+  * discovery timing
+  * mirror timing
+  * executor timing
+  * replay counts
+* Add structured logging with redaction-by-construction
+* Add frontier/coverage auditing
+
+  * no-overlap audit
+  * no-gap audit
+  * stalled-shard detection
+* Add “no secrets in telemetry” tests
+* Add dashboards and alerts for the MVP families and control plane
+
+## Deliverables
+
+* runtime observability baseline
+* control-plane observability baseline
+* redacted structured logging
+* frontier audit signals
+* dashboards and alerts
+
+## Dependencies
+
+* Epic 2
+* Epic 3
+* Epic 5
+
+## Exit criteria
+
+* operators can see progress, retries, stalls, and cost
+* operators can see run creation and shard registration behavior
+* no raw secret material appears in logs, traces, or metrics
+
+---
+
+# Epic 7 — Read/query plane
+
+## Goal
+
+Build the central read plane so findings and progress can be queried without contacting scanner workers.
+
+## Tasks
+
+* Implement query-plane storage model for:
+
+  * findings
+  * occurrences
+  * observations
+  * triage state
+  * job progress
+* Build query services / APIs
+
+  * search
+  * detail
+  * state update
+  * summary
+  * job progress
+* Add caching, query sharding, and fairness controls
+* Add safe-by-default result behavior
+
+  * no raw secret material by default
+* Keep the query plane fully decoupled from worker execution
+
+## Deliverables
+
+* central query plane
+* search/detail/state/progress APIs
+* triage state model
+
+## Dependencies
+
+* Epic 5
+* Epic 6
+
+## Exit criteria
+
+* read queries do not fan out to workers
+* findings and progress are queryable centrally
+* tenant isolation is preserved on the read path
+
+---
+
+# Epic 8 — Workload harness, proving, and final stabilization
+
+## Goal
+
+Prove the FS/Git MVP path under realistic load and remove any remaining transition debris.
+
+## Tasks
+
+* Build the true workload harness
+
+  * docker-compose stack
+  * synthetic dataset generator
+  * throughput runner
+  * slow-sink proof
+* Add deterministic runtime simulation and churn tests
+* Add formal or semi-formal verification for:
+
+  * findings → ledger → checkpoint ordering
+  * replay safety
+  * reassignment safety
+* Add operational hardening
+
+  * retention
+  * partitioning
+  * tenant isolation checks
+* Run final failure suites for:
+
+  * filesystem ordered content
+  * Git family
+  * lease loss
+  * reassignment
+  * replay safety
+  * control-plane submission / registration failure cases
+* Remove dead compatibility code
+* Enforce the new architecture as the only path
+
+## Deliverables
+
+* workload harness
+* simulation / verification artifacts
+* final architecture cleanup
+* stabilized production-ready MVP path
+
+## Dependencies
+
+* Epics 2 through 7
+
+## Exit criteria
+
+* the FS/Git distributed scanner path is the only runtime path in the repo
+* old fallback code is gone
+* the system has realistic workload proof and invariant proof
+
+---
+
+## Recommended execution order
+
+* Epic 1
+* Epic 2
+* Epic 3 can overlap once Epic 1 is stable
+* Epic 4 after Epic 3 if hosted Git discovery is part of the MVP
+* Epic 5 after 2/3 and after 4 if hosted discovery is required
+* Epic 6 after 2/3/5 are materially in place
+* Epic 7 after 5 and 6
+* Epic 8 last
+
+---
+
+## MVP cut line
+
+### MVP-A
+
+If explicit filesystem paths and explicit/local Git repo inputs are enough:
+
+* Epic 1
+* Epic 2
+* Epic 3
+* Epic 5
+* Epic 6
+
+### MVP-B
+
+If hosted GitHub/GitLab/Gerrit repo discovery is required for MVP:
+
+* Epic 1
+* Epic 2
+* Epic 3
+* Epic 4
+* Epic 5
+* Epic 6
+
+---
+
+## Deferred after MVP
+
+After the FS/Git MVP is stable, the next connector-family epics are:
+
+* `PullFeedSource`
+* `PushIngressReceiver`
+* `ManifestSnapshotSource`
+* `ExportJobSource`
+
+Those stay outside the MVP critical path.
