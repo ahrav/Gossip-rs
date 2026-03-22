@@ -11,8 +11,8 @@ FS scan loops into a persistence backend.
 The detection engine emits findings during scanning, but those findings are
 transient — they flow through the `EventOutput` to stdout and are gone. The
 FS persistence pipeline adds a **durable write path** so post-dedupe findings
-are persisted to a SQLite database for cross-run deduplication, diff analysis,
-tracking, and reporting.
+are persisted for cross-run deduplication, diff analysis, tracking, and
+reporting.
 
 This module defines the **producer-side contracts** (what the scheduler
 emits). The consumer side (actual backend storage) is plugged in via the
@@ -53,30 +53,29 @@ commit pipeline writes them durably.
                      │   apply_cross_rule_dedupe()    (cross-rule winner dedupe)    │
                      │          │                     includes norm_hash in key    │
                      │          ▼                                                   │
-                     │   ┌──────┴──────────────┐                                   │
-                     │   │                     │                                   │
-                     │   ▼                     ▼                                   │
-                     │  emit_findings()   emit_persistence_batch()                 │
-                     │  (EventOutput)            │                                   │
-                     │                         │  build_persistence_batch()        │
-                     │                         │  converts to FsFindingRecord[]    │
-                     │                         │  wraps in FsFindingBatch          │
-                     │                         ▼                                   │
-                     │                  StoreProducer::emit_fs_batch()             │
-                     │                         │                                   │
-                     │           ┌─────────────┼──────────────┬─────────────┐      │
-                     │           ▼             ▼              ▼             ▼      │
-                      │   SqliteStoreProd  InMemoryProd  NullProducer   (custom)    │
-                      │    (planned)        (test/diag)    (discard)                │
+                      │   ┌──────┴──────────────┐                                   │
+                      │   │                     │                                   │
+                      │   ▼                     ▼                                   │
+                      │  emit_persistence_batch()   emit_findings()                 │
+                      │          │                  (EventOutput)                    │
+                      │          │  build_persistence_batch()                       │
+                      │          │  converts to FsFindingRecord[]                   │
+                      │          │  wraps in FsFindingBatch                         │
+                      │          ▼                                                  │
+                      │   StoreProducer::emit_fs_batch()                            │
+                      │          │                                                  │
+                      │    ┌─────┼─────────────────┬─────────────────┐              │
+                      │    ▼     ▼                  ▼                 ▼              │
+                      │  ChannelProd  InMemoryProd  NullProducer   (custom)          │
+                      │  (runtime)    (test/diag)    (discard)                      │
                      └─────────────────────────────────────────────────────────────┘
 
-                     At run end:
-                     ┌─────────────────────────────────────────────────┐
-                     │  Aggregate worker metrics                        │
-                     │  ──► FsRunLoss { dropped, failures }            │
-                     │  ──► StoreProducer::record_fs_run_loss()        │
-                     │  ──► StoreProducer::end_run(had_coverage_limits)│
-                     └─────────────────────────────────────────────────┘
+                      At run end:
+                      ┌─────────────────────────────────────────────────┐
+                      │  Aggregate worker metrics                        │
+                      │  ──► FsRunLoss { dropped, failures }            │
+                      │  ──► StoreProducer::record_fs_run_loss()        │
+                      └─────────────────────────────────────────────────┘
 ```
 
 ## Key Types
@@ -145,7 +144,9 @@ when `dropped_findings > 0 || persistence_emit_failures > 0`.
 pub trait StoreProducer: Send + Sync + 'static {
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError>;
     fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError>;
-    fn end_run(&self, had_coverage_limits: bool) -> Result<(), FsStoreError>;
+    fn end_run(&self, _had_coverage_limits: bool) -> Result<(), FsStoreError> {
+        Ok(())
+    }
 }
 ```
 
@@ -156,9 +157,9 @@ pub trait StoreProducer: Send + Sync + 'static {
   and extracted binaries: once per chunk unconditionally. Batches may
   arrive out of file order when workers run in parallel.
 - `record_fs_run_loss` is called exactly once at the end of a scan run.
-- `end_run` is called once after `record_fs_run_loss` to finalize the run
-  (set end time and derive final status). The default implementation is a
-  no-op, suitable for backends that don't need run finalization.
+- `end_run` has a default no-op implementation. It is available for backends
+  that need explicit run finalization but is **not called** by the local
+  scan path.
 - Errors from either method are counted but do **not** abort the scan.
 
 ### Implementations
@@ -316,6 +317,12 @@ Run status is derived from `RunCounters` at `end_run` time:
 
 Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
+> **Note:** `CompleteWithCoverageLimits` requires the `had_coverage_limits`
+> signal carried by `end_run()`. The local scan path does not call `end_run`,
+> so only `Complete` and `Incomplete` are reachable today. The
+> `CompleteWithCoverageLimits` status is available for backends (e.g. SQLite)
+> that implement `end_run` with full run finalization.
+
 #### Query Path (Planned -- Not Yet Implemented)
 
 > **Note:** The following query functions do not exist in `store.rs` yet.
@@ -370,12 +377,10 @@ Findings can be lost at two points, and both are tracked:
   └──────────────────────┘               │    incomplete = drops > 0      │
                                          │              OR failures > 0   │
                                          └────────────────────────────────┘
-                                                       │
-                                                       ▼
-                                              record_fs_run_loss()
-                                              ──► end_run()
-                                              Status: Complete / Incomplete
-                                              / CompleteWithCoverageLimits
+                                                        │
+                                                        ▼
+                                               record_fs_run_loss()
+                                               Status: Complete / Incomplete
 ```
 
 ### Metrics Rollup
@@ -404,9 +409,11 @@ The `emit_persistence_batch()` call is inserted at every scan site:
 
 > **Note:** `emit_persistence_batch` and `emit_findings` have different
 > emission conditions at different scan sites. For plain files,
-> `emit_persistence_batch` runs only when findings are present (per-chunk)
-> or once for clean files (post-loop), while `emit_findings` runs on every
-> chunk. For archive entries, both run unconditionally per-chunk.
+> `emit_persistence_batch` is called once per chunk that produced findings;
+> if the entire file is clean (no chunk produced findings), exactly one
+> empty-findings call is emitted post-loop so the done-ledger records the
+> file as scanned. `emit_findings` runs on every chunk unconditionally.
+> For archive entries, both run unconditionally per-chunk.
 
 ## Configuration and Wiring
 
@@ -418,14 +425,10 @@ scanner scan fs --path=/some/dir --persist-findings
 
 The `--persist-findings` flag sets `FsScanConfig.persist_findings = true`,
 which causes the orchestrator to wire a `StoreProducer` into the
-`ParallelScanConfig`. The default producer is the SQLite writer, which
-writes to `findings.db` under the store root.
-
-#### Environment Variables
-
-| Variable             | Purpose                                                                                                                |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `SCANNER_SECRET_KEY` | Stable secret key for BLAKE3-keyed identity hashes; if unset, an ephemeral key is generated (cross-run dedup disabled) |
+`ParallelScanConfig`. The producer is a `ChannelStoreProducer` (defined
+in `gossip-scanner-runtime`) that bridges finding batches into the
+runtime's commit pipeline. The downstream backend depends on the
+configured commit sink.
 
 ### Wiring Path
 
@@ -477,15 +480,22 @@ in its `FindingKey`.
 
 ## Output Changes
 
-The orchestrator now reports persistence-related counters in the summary
-line:
+The orchestrator now reports persistence-related counters in the debug
+summary (multi-line, one `key=value` per line):
 
-```
-files=N chunks=N bytes=N findings=N errors=N dropped_findings=N persist_emit_failures=N persist_incomplete=false ...
+```text
+files=N
+chunks=N
+bytes=N
+findings=N
+errors=N
+dropped_findings=N
+persist_emit_failures=N
+persist_incomplete=0
 ```
 
-The `SummaryEvent.status` field is set to `"partial"` when
-`persistence_incomplete` is true, instead of the default `"complete"`.
+`persist_incomplete` outputs `1` when any persistence loss was detected,
+`0` otherwise.
 
 ## Related Documentation
 
