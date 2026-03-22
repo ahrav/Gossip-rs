@@ -92,8 +92,6 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
         &mut scratch.scan_scratch,
     );
     let engine_dropped = scratch.scan_scratch.dropped_findings();
-    let before_prefix = scratch.scan_scratch.pending_findings_len();
-    let after_prefix = before_prefix;
 
     scratch.pending.clear();
     scratch
@@ -101,10 +99,7 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
         .drain_findings_into(&mut scratch.pending);
 
     let dedupe_removed = apply_cross_rule_dedupe(&mut scratch.pending, engine.as_ref());
-    let scheduler_pruned = before_prefix
-        .saturating_sub(after_prefix)
-        .saturating_add(dedupe_removed);
-    account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
+    account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, dedupe_removed);
     emit_persistence_batch(
         scratch.store_producer.as_deref(),
         &*scratch.event_sink,
