@@ -102,6 +102,10 @@ struct CachedFile {
 
 /// Reader adapter that enforces `max_bytes` and checks the deadline before
 /// every delegated read call.
+///
+/// When the byte budget is exhausted, `read()` returns `Ok(0)` (the standard
+/// EOF signal). Callers that need to distinguish budget exhaustion from true
+/// end-of-file must compare total bytes read against the item's `size_hint`.
 struct BudgetedReader<R> {
     inner: R,
     remaining: u64,
@@ -458,6 +462,10 @@ impl FilesystemConnector {
             total_bytes = total_bytes.saturating_add(item_size);
             items.push(item);
             if items.len() == budgets.max_items() {
+                // Peek one ahead to distinguish "exactly at capacity" from
+                // "at capacity with more remaining".  If the peek errors
+                // (e.g. deadline expiry), the collected items are abandoned
+                // and the caller retries from the same cursor position.
                 complete = walk.next_file()?.is_none();
                 break;
             }
