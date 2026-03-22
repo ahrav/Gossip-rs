@@ -1289,7 +1289,16 @@ where
         }
 
         let file_id = FileId(next_file_id);
-        next_file_id = next_file_id.wrapping_add(1);
+        next_file_id = match next_file_id.checked_add(1) {
+            Some(id) => id,
+            None => {
+                eprintln!(
+                    "discovery sequence overflow at u32::MAX files; \
+                     stopping file enumeration"
+                );
+                break;
+            }
+        };
 
         stats.files_enqueued = stats.files_enqueued.saturating_add(1);
         stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);

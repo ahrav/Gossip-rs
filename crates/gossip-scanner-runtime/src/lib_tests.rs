@@ -1140,9 +1140,11 @@ fn owned_git_event_identity_dictionary_round_trips() {
 /// discovery sequence. Findings are empty; the stable item id is derived
 /// from the sequence for uniqueness.
 fn test_batch(path: &[u8], ds: u32) -> OwnedCommitBatch {
+    let mut id_bytes = [0u8; 32];
+    id_bytes[..4].copy_from_slice(&ds.to_le_bytes());
     OwnedCommitBatch {
         object_path: path.to_vec(),
-        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([ds as u8; 32]),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes(id_bytes),
         findings: Vec::new(),
         discovery_sequence: ds,
     }
@@ -1329,10 +1331,15 @@ fn forward_commits_reorders_lifo_reversed_batches() {
     let begun = sink.begun();
     assert_eq!(begun.len(), 3, "all three items should be committed");
     let keys: Vec<&[u8]> = begun.iter().map(|(k, _)| k.as_slice()).collect();
-    // Verify discovery order is preserved: a < b < c.
-    assert!(
-        keys[0] < keys[1] && keys[1] < keys[2],
-        "begin_item must be called in discovery (path-sorted) order: {keys:?}"
+    // Verify discovery order is preserved: ds=0 -> ds=1 -> ds=2.
+    assert_eq!(
+        keys,
+        vec![
+            b"a.txt".as_slice(),
+            b"b.txt".as_slice(),
+            b"c.txt".as_slice()
+        ],
+        "begin_item must be called in discovery order"
     );
 }
 
@@ -1435,5 +1442,146 @@ fn forward_commits_captures_error_from_finish_flush() {
     assert!(
         err_msg.contains("injected failure"),
         "expected injected failure, got: {err_msg}"
+    );
+}
+
+#[test]
+fn forward_commits_eagerly_flushes_in_order_input() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Send batches in discovery order: ds=0, ds=1, ds=2. Each new
+    // sequence number completes the previous one, so drain_ready fires
+    // during the recv loop rather than deferring everything to finish().
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok());
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 3, "all three items should be committed");
+    let keys: Vec<&[u8]> = begun.iter().map(|(k, _)| k.as_slice()).collect();
+    // Verify discovery order is preserved: ds=0 -> ds=1 -> ds=2.
+    assert_eq!(
+        keys,
+        vec![
+            b"a.txt".as_slice(),
+            b"b.txt".as_slice(),
+            b"c.txt".as_slice()
+        ],
+        "begin_item must be called in discovery order"
+    );
+}
+
+#[test]
+fn forward_commits_handles_interleaved_run_loss_with_buffered_batches() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Batch(ds=1), RunLoss, Batch(ds=0): RunLoss must not interfere
+    // with the discovery-order buffer, and batches must still arrive at
+    // the sink in discovery order (ds=0 before ds=1).
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::RunLoss(
+        scanner_scheduler::store::FsRunLoss {
+            dropped_findings: 0,
+            persistence_emit_failures: 0,
+        },
+    ))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok(), "interleaved RunLoss must not cause errors");
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 2, "both batches should be committed");
+    assert_eq!(
+        begun[0].0,
+        b"a.txt".to_vec(),
+        "ds=0 batch must be forwarded first"
+    );
+    assert_eq!(
+        begun[1].0,
+        b"b.txt".to_vec(),
+        "ds=1 batch must be forwarded second"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_handles_multiple_gaps() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // ds=0, ds=3, ds=6: gaps at {1,2} and {4,5}. The buffer must
+    // produce all three in discovery order despite the missing sequences.
+    buf.push(test_batch(b"a.txt", 0));
+    buf.push(test_batch(b"d.txt", 3));
+    buf.push(test_batch(b"g.txt", 6));
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"d.txt".to_vec(), b"g.txt".to_vec()],
+        "finish must produce batches in discovery order despite multiple gaps"
+    );
+}
+
+#[test]
+fn scan_local_filesystem_rejects_multi_worker_persist() {
+    let dir = tempdir().expect("tempdir");
+    let cancel = CancellationToken::new();
+
+    let result = scan_fs_with_runtime(
+        &FsScanConfig::new(dir.path())
+            .with_persist_findings(true)
+            .with_workers(4),
+        &NullEventOutput,
+        &commit_sink::CliNoOpCommitSink,
+        &cancel,
+    );
+
+    assert!(result.is_err(), "multi-worker persist must be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("workers=1"),
+        "error should mention workers=1, got: {err_msg}"
     );
 }

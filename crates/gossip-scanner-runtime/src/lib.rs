@@ -1170,8 +1170,10 @@ pub(crate) struct OwnedCommitBatch {
 /// `discovery_sequence` changes, the previous sequence is known to be
 /// complete and can be flushed if it is the next expected sequence.
 ///
-/// Memory is bounded by at most `batch_cap` (≤64) files worth of
-/// `OwnedCommitBatch` data.
+/// When files arrive in near-discovery order, memory stays bounded by
+/// the number of in-flight files (`max_in_flight_objects`). When
+/// skipped files create gaps, `drain_ready` stalls and all produced
+/// batches accumulate until `finish()` drains them at channel close.
 ///
 /// Files that produce zero batches (skipped by extension, binary
 /// classification, size limit, or I/O error) create gaps in the
@@ -1207,11 +1209,15 @@ impl DiscoveryOrderBuffer {
     /// becomes eligible for flushing via [`drain_ready`].
     fn push(&mut self, batch: OwnedCommitBatch) {
         let ds = batch.discovery_sequence;
-        debug_assert!(
-            ds >= self.next_flush,
-            "batch arrived for already-flushed discovery sequence {ds} (next_flush={})",
-            self.next_flush,
-        );
+        if ds < self.next_flush {
+            tracing::error!(
+                discovery_sequence = ds,
+                next_flush = self.next_flush,
+                path = %String::from_utf8_lossy(&batch.object_path),
+                "batch arrived for already-flushed discovery sequence; \
+                 indicates a sequence assignment bug"
+            );
+        }
         self.current_ds = Some(ds);
         self.pending.entry(ds).or_default().push(batch);
     }
@@ -1224,7 +1230,15 @@ impl DiscoveryOrderBuffer {
         while Some(self.next_flush) != self.current_ds {
             match self.pending.remove(&self.next_flush) {
                 Some(batches) => out.extend(batches),
-                None => break,
+                None => {
+                    tracing::debug!(
+                        gap_at = self.next_flush,
+                        buffered_sequences = self.pending.len(),
+                        "drain stalled at sequence gap (skipped file); \
+                         remaining batches deferred to finish()"
+                    );
+                    break;
+                }
             }
             self.next_flush += 1;
         }
@@ -1232,23 +1246,21 @@ impl DiscoveryOrderBuffer {
 
     /// Flush all remaining batches in discovery order. Called when the
     /// channel is closed — all sequences are complete at this point.
-    fn finish(mut self) -> Vec<OwnedCommitBatch> {
-        let mut out = Vec::new();
-        // All sequences are complete since the channel is closed.
-        while let Some(batches) = self.pending.remove(&self.next_flush) {
-            out.extend(batches);
-            self.next_flush += 1;
-        }
-        // Safety net: flush any residual batches in ascending key order.
-        // This fires when the discovery-sequence space has gaps from
-        // skipped files (expected under normal workloads — see struct doc).
-        if !self.pending.is_empty() {
+    /// `BTreeMap::into_iter` yields entries in ascending key order,
+    /// which is discovery order by construction.
+    fn finish(self) -> Vec<OwnedCommitBatch> {
+        if self
+            .pending
+            .first_key_value()
+            .is_some_and(|(&ds, _)| ds != self.next_flush)
+        {
             tracing::debug!(
+                expected_next = self.next_flush,
                 residual_sequences = self.pending.len(),
-                next_flush = self.next_flush,
-                "discovery order buffer: flushing residual batches outside contiguous prefix"
+                "discovery order buffer: gaps detected in sequence space"
             );
         }
+        let mut out = Vec::new();
         for (_ds, batches) in self.pending {
             out.extend(batches);
         }
@@ -1277,7 +1289,8 @@ pub(crate) fn forward_commits(
     let mut buffer = DiscoveryOrderBuffer::new();
     let mut ready = Vec::new();
 
-    /// Record an error, keeping only the first.
+    /// Record an error, keeping only the first. Subsequent errors are
+    /// logged individually so operators have a trail for every failure.
     fn record_err(
         result: anyhow::Result<()>,
         first_error: &mut Option<anyhow::Error>,
@@ -1287,6 +1300,12 @@ pub(crate) fn forward_commits(
             *error_count += 1;
             if first_error.is_none() {
                 *first_error = Some(error);
+            } else {
+                tracing::warn!(
+                    error_number = *error_count,
+                    %error,
+                    "additional commit forwarding error (only first is propagated)"
+                );
             }
         }
     }
