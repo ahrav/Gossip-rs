@@ -144,7 +144,9 @@ when `dropped_findings > 0 || persistence_emit_failures > 0`.
 pub trait StoreProducer: Send + Sync + 'static {
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError>;
     fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError>;
-    fn end_run(&self, had_coverage_limits: bool) -> Result<(), FsStoreError>;
+    fn end_run(&self, _had_coverage_limits: bool) -> Result<(), FsStoreError> {
+        Ok(())
+    }
 }
 ```
 
@@ -315,6 +317,12 @@ Run status is derived from `RunCounters` at `end_run` time:
 
 Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
+> **Note:** `CompleteWithCoverageLimits` requires the `had_coverage_limits`
+> signal carried by `end_run()`. The local scan path does not call `end_run`,
+> so only `Complete` and `Incomplete` are reachable today. The
+> `CompleteWithCoverageLimits` status is available for backends (e.g. SQLite)
+> that implement `end_run` with full run finalization.
+
 #### Query Path (Planned -- Not Yet Implemented)
 
 > **Note:** The following query functions do not exist in `store.rs` yet.
@@ -373,7 +381,6 @@ Findings can be lost at two points, and both are tracked:
                                                         ▼
                                                record_fs_run_loss()
                                                Status: Complete / Incomplete
-                                               / CompleteWithCoverageLimits
 ```
 
 ### Metrics Rollup
@@ -402,9 +409,11 @@ The `emit_persistence_batch()` call is inserted at every scan site:
 
 > **Note:** `emit_persistence_batch` and `emit_findings` have different
 > emission conditions at different scan sites. For plain files,
-> `emit_persistence_batch` runs only when findings are present (per-chunk)
-> or once for clean files (post-loop), while `emit_findings` runs on every
-> chunk. For archive entries, both run unconditionally per-chunk.
+> `emit_persistence_batch` is called once per chunk that produced findings;
+> if the entire file is clean (no chunk produced findings), exactly one
+> empty-findings call is emitted post-loop so the done-ledger records the
+> file as scanned. `emit_findings` runs on every chunk unconditionally.
+> For archive entries, both run unconditionally per-chunk.
 
 ## Configuration and Wiring
 
