@@ -1404,6 +1404,7 @@ dependencies = [
  "blake3",
  "criterion",
  "gossip-contracts",
+ "gossip-persistence-inmemory",
  "gossip-stdx",
  "proptest",
  "rand",
