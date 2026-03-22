@@ -280,6 +280,11 @@ invariant accidentally violates another.
 
 Seven sub-tiers exercise the full simulation harness.
 
+Test-support builds also include a composition harness for the coordination +
+done-ledger boundary. It reuses the same `SimContext` determinism model but
+adds a synthetic scan driver and cross-component provenance log on top of the
+core coordination harness.
+
 ### Overload Scenario Tests (`crates/gossip-coordination/src/sim/overload_tests.rs`)
 
 Targeted tests for the scripted overload path (`run_overload`). Fixed-seed
@@ -585,6 +590,9 @@ Full invariant definitions and the checker implementation are in
 | `crates/gossip-coordination/src/sim/invariants_tests.rs`             | Targeted unit tests for `InvariantChecker` edge cases                  |
 | `crates/gossip-coordination/src/sim/overload.rs`                     | Overload scenario/reports and scripted op generators                   |
 | `crates/gossip-coordination/src/sim/overload_tests.rs`               | Overload scenario tests: per-kind, replay, D1 accuracy, proptest       |
+| `crates/gossip-coordination/src/sim/composition.rs`                  | Test-support composition harness coupling coordinator and done-ledger  |
+| `crates/gossip-coordination/src/sim/scan_driver_sim.rs`              | Deterministic synthetic scan-outcome generator for composition runs    |
+| `crates/gossip-coordination/src/sim/shared.rs`                       | Internal helper aliases and utility functions shared by both harnesses |
 | `crates/gossip-coordination/src/sim/backend.rs`                      | `SimIntrospection` and `SimulationBackend` trait definitions           |
 | `crates/gossip-coordination/src/sim/fault_injector.rs`               | Fault-injecting introspector for invariant checker validation          |
 | `crates/gossip-coordination/src/sim/worker.rs`                       | Simulated worker bookkeeping                                           |

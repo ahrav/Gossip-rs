@@ -57,6 +57,12 @@ The top-level driver. Runs a three-stage simulation (zombie preamble, safety,
 then liveness) with weighted random op generation, fault injection, and full
 invariant checking after every step.
 
+Test-support builds also expose a composition extension around that core
+harness. `sim/composition.rs` couples `InMemoryCoordinator` with
+`InMemoryDoneLedger` in a single deterministic loop, `sim/scan_driver_sim.rs`
+generates synthetic scan outcomes for that loop, and `sim/shared.rs` holds the
+borrow-friendly helper aliases and utilities reused by both harnesses.
+
 For split-replace operations, the harness uses the contracts-owned planner
 helper (`gossip_contracts::coordination::split::plan_split_replace_at_points_initial_cursor`)
 so simulation planning behavior stays aligned across boundary consumers.
@@ -275,3 +281,16 @@ submodules that are part of the crate's public API.
 | Type                    | Purpose                                                    |
 | ----------------------- | ---------------------------------------------------------- |
 | `GoodputTracker`        | Tracks completion ratio during overload rounds for goodput reporting |
+
+### Composition Extensions (`sim/composition.rs`, `sim/scan_driver_sim.rs`)
+
+| Type | Purpose |
+| ---- | ------- |
+| `CompositionSim` | Test-support harness that drives coordinator and done-ledger state in one deterministic loop |
+| `CompositionSimOp` | Operation enum for composition steps: coordinator passthrough, scan lifecycle, and ledger fault injection |
+| `CompositionSimEvent` | Outcome enum for composition operations |
+| `CompositionSimViolation` | Wrapper over coordination and persistence invariant violations |
+| `CompositionFaultConfig` | Cross-boundary fault-rate configuration for composition simulation |
+| `DoneLedgerFaultOp` | Imperative done-ledger fault injection operations used by the composition loop |
+| `ProvenanceEntry` | Bridge record linking shard completion to done-ledger writes for cross-component checking |
+| `ScanOutcome` | Synthetic scan result: done-ledger records plus cursor bytes for `complete()` |

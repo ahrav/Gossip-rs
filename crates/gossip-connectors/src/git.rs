@@ -73,7 +73,7 @@ use gossip_contracts::{
 
 use crate::common::{
     self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
-    enumerate_error_to_read, path_buf_from_bytes,
+    deadline_expired, enumerate_error_to_read, path_buf_from_bytes,
 };
 
 /// A single indexed file from `git ls-files`.
@@ -502,11 +502,6 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<Vec<u8>>, EnumerateError> {
         paths.push(entry.to_vec());
     }
     Ok(paths)
-}
-
-/// Returns `true` when a deadline is present and has already passed.
-fn deadline_expired(deadline: Option<Instant>) -> bool {
-    deadline.is_some_and(|value| Instant::now() >= value)
 }
 
 #[cfg(test)]

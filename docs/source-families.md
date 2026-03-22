@@ -40,9 +40,12 @@ fill_page(shard, cursor, budgets)
      checkpoint cursor
 ```
 
-**Concrete connectors** (inherent methods, not direct trait impls):
-`FilesystemConnector`, `GitConnector` (git-tracked files via `ls-files`),
-`InMemoryDeterministicConnector` — all in `gossip-connectors/src/`.
+**Concrete connectors:**
+`FilesystemConnector` directly implements `OrderedContentSource` and keeps
+matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
+`GitConnector` (git-tracked files via `ls-files`) and
+`InMemoryDeterministicConnector` still expose the same read/split surface as
+inherent methods in `gossip-connectors/src/`.
 
 ### Git Repo-Native
 

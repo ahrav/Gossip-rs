@@ -1,78 +1,65 @@
 # Cursor Resume Strategy
 
-This document details the two-layer cursor architecture used by the **B4 Connector**
-boundary for split-point selection and fault-tolerant resume. Every connector must
-produce globally sorted item keys and advance a `Cursor` that allows the coordination
-layer to resume work from an arbitrary checkpoint. The cursor carries both a
-key-authoritative progress marker and an optional connector-opaque token that enables
-O(1) position restoration when the token is valid.
+This document describes the current cursor contract for Boundary 4 connectors.
+`Cursor` always carries an authoritative `last_key` progress marker and may
+also carry an opaque token. The key is the only correctness boundary: a
+connector must resume from the first item strictly greater than `last_key`
+even when no token is present or a token is unusable.
 
-The key insight is a **safety-first, speed-second** design: the `last_key` field
-guarantees correct resume under any conditions (token loss, corruption, connector
-restart, filesystem mutation), while the optional `token` field accelerates the common
-case by allowing connectors to skip binary search or DFS traversal when the token is
-still valid.
+Today the filesystem connector is explicitly key-only. It rebuilds its live
+directory walk from the canonical root on each `fill_page` call and skips every
+entry at or below `cursor.last_key()`. Token-aware resume remains an optional
+capability for other ordered-content surfaces, but it cannot weaken the
+key-derived floor.
 
-All diagrams use the B4 Connector color palette (fill `#EF4444` / `#FEE2E2`, stroke
-`#991B1B`). Cross-boundary references use the corresponding boundary colors from the
+All diagrams use the B4 Connector color palette (fill `#EF4444` / `#FEE2E2`,
+stroke `#991B1B`). Cross-boundary references use the boundary colors from the
 [color legend](00-README.md#color-coding-legend).
 
 ---
 
-## 1. Two-Layer Cursor Architecture
+## 1. Cursor Contract
 
-The `Cursor` struct encodes progress in two complementary layers. The
-`last_key` field (an `ItemKey`) records the lexicographically greatest key that has
-been fully processed. This field is **always present** after the first call and is
-the authoritative resume position — the coordination layer uses it for cursor
-monotonicity enforcement, and connectors use it as the fallback resume anchor.
+The `Cursor` type encodes progress in two layers:
 
-The `token` field (an `Option<TokenBytes>`) carries connector-specific opaque state
-that can restore position in O(1) time. Connectors that support tokens
-encode internal state (DFS stack positions, sorted-index offsets) into this field.
-Token content is opaque to the coordination layer; it is round-tripped verbatim
-between connector calls.
+- `last_key: Option<ItemKey>` is the mandatory resume anchor once any progress
+  exists.
+- `token: Option<TokenBytes>` is an optional connector-local accelerator.
 
-The `Cursor` type makes the invalid state `(None, Some(token))` — a token without
-a progress key — unrepresentable. All constructors enforce this invariant, and
-`try_from_update` rejects it when crossing the coordination boundary.
+The invalid state `(None, Some(token))` is unrepresentable through the public
+constructors and rejected when crossing from coordination's borrowed cursor
+types.
 
 ```mermaid
-%% Diagram: two-layer-cursor-architecture
+%% Diagram: cursor-contract
 graph TD
     subgraph cursor_type["Cursor (gossip-contracts)"]
-        LK["<b>last_key: Option&lt;ItemKey&gt;</b><br/>Ordered progress marker<br/>Lexicographic comparison"]
-        TK["<b>token: Option&lt;TokenBytes&gt;</b><br/>Connector-opaque resume state<br/>Max 16 KiB, round-tripped verbatim"]
+        LK["<b>last_key: Option&lt;ItemKey&gt;</b><br/>Authoritative progress marker<br/>Used for monotonic resume"]
+        TK["<b>token: Option&lt;TokenBytes&gt;</b><br/>Optional connector-local accelerator<br/>Opaque to coordination"]
     end
 
-    subgraph constructors["Cursor Constructors"]
+    subgraph constructors["Constructors"]
         CI["<b>Cursor::initial()</b><br/>last_key: None<br/>token: None"]
         CK["<b>Cursor::with_last_key(key)</b><br/>last_key: Some(key)<br/>token: None"]
-        CT["<b>Cursor::with_token(key, tok)</b><br/>last_key: Some(key)<br/>token: Some(tok)"]
-        INVALID["<b>INVALID STATE</b><br/>last_key: None<br/>token: Some(_)<br/>← unrepresentable"]
+        CT["<b>Cursor::with_token(key, token)</b><br/>last_key: Some(key)<br/>token: Some(token)"]
+        INVALID["<b>INVALID</b><br/>last_key: None<br/>token: Some(_)<br/>unrepresentable"]
     end
 
-    subgraph states["Cursor Lifecycle"]
-        S0["<b>Initial</b><br/>No prior progress<br/>Start from shard beginning"]
-        S1["<b>Key-Only</b><br/>last_key present<br/>Resume via binary search /<br/>DFS walk + seek"]
-        S2["<b>Key + Token</b><br/>Both fields present<br/>O(1) resume when token valid,<br/>key fallback otherwise"]
+    subgraph connector_profiles["Connector profiles"]
+        FS["<b>FilesystemConnector</b><br/>token_resume = false<br/>always resumes from last_key"]
+        OPT["<b>Token-capable ordered-content source</b><br/>token_resume = true<br/>token may accelerate resume"]
     end
 
-    CI --> S0
-    CK --> S1
-    CT --> S2
+    CI --> CK
+    CI --> CT
+    LK -.-> TK
 
-    S0 -->|"first page returns items"| S1
-    S0 -->|"first page returns items<br/>(token-capable connector)"| S2
-    S1 -->|"connector emits token"| S2
-    S2 -->|"token lost or corrupt"| S1
-    S2 -->|"next page continues"| S2
-
-    TK -.->|"always paired with"| LK
+    CK --> FS
+    CT --> OPT
 
     style cursor_type fill:none,stroke:#991B1B,stroke-width:1px
     style constructors fill:none,stroke:#991B1B,stroke-width:1px
-    style states fill:none,stroke:#991B1B,stroke-width:1px
+    style connector_profiles fill:none,stroke:#991B1B,stroke-width:1px
 
     style LK fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style TK fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
@@ -80,289 +67,124 @@ graph TD
     style CK fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style CT fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style INVALID fill:#F3F4F6,stroke:#374151,stroke-width:2px,stroke-dasharray:5 5,color:#374151
-    style S0 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style S1 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style S2 fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+    style FS fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+    style OPT fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
 ```
 
 ---
 
 ## 2. Resume Decision Tree
 
-When a connector receives a cursor, it follows the same logical
-decision tree to determine where to begin emitting items. The two resume paths —
-token-assisted (O(1)) and key-based (O(log N) or O(N)) — are **semantically
-equivalent**: both must resume from the first item strictly greater than
-`cursor.last_key()`. The token path is a performance optimization, not a correctness
-requirement.
+Every ordered-content resume starts from the key-derived floor:
 
-Key-based resume uses `key_resume_start()`, which performs an O(log N)
-`upper_bound` binary search on sorted entries (git, in-memory connectors) or an
-O(N) DFS walk-and-skip from root (filesystem connector).
+- Filesystem resume: re-walk from the canonical root and skip `<= last_key`.
+- Sorted-snapshot resume: use `key_resume_start()` to find the first key
+  strictly greater than `last_key`.
 
-Token-assisted resume decodes the token and attempts to restore position directly.
-For index-based connectors (git, in-memory), this is an O(1) array index lookup
-cross-checked against the last emitted key. For the filesystem connector, this
-reconstructs the DFS stack from a serialized walk checkpoint, then seeks forward
-from the restored position.
-
-The token can only **advance** the resume position forward, never behind the
-key-derived floor — this is enforced by `start_idx = start_idx.max(token_idx)`.
+When a connector supports tokens, token handling is advisory. A token may move
+the start position forward to a validated fast path, but it must never move
+behind the `last_key` floor.
 
 ```mermaid
 %% Diagram: resume-decision-tree
 flowchart TD
-    START(["connector_call(shard, cursor, budgets)"])
+    START(["fill_page(shard, cursor, budgets)"])
     Q1{"cursor.last_key()<br/>is None?"}
-    Q2{"cursor.token()<br/>is Some?"}
-    Q3{"Token decode +<br/>restore succeeds?"}
-    Q4{"Cross-check:<br/>entry at token_idx − 1<br/>matches last_key?"}
+    Q2{"connector advertises<br/>token_resume?"}
+    Q3{"cursor.token()<br/>present and valid?"}
 
-    A1["Start from shard beginning<br/>(range_start index)"]
-    A2["Key-based resume<br/>upper_bound(last_key)<br/>O(log N) binary search /<br/>O(N) DFS walk + seek"]
-    A3["Token-assisted resume<br/>O(1) index lookup /<br/>DFS stack restore"]
-
-    MERGE["start_idx = max(key_resume, token_resume)<br/>Token can only advance, never retreat"]
-    EMIT["Emit items from start_idx<br/>within shard [start, end) range"]
+    A1["Start from shard lower bound"]
+    A2["Key-derived floor<br/>filesystem: re-walk + skip <= last_key<br/>sorted snapshot: key_resume_start(...)"]
+    A3["Connector-local fast path<br/>validated against the key-derived floor"]
+    EMIT["Emit first key strictly greater than last_key<br/>within [start, end)"]
 
     START --> Q1
     Q1 -->|"Yes"| A1
     Q1 -->|"No"| Q2
     Q2 -->|"No"| A2
     Q2 -->|"Yes"| Q3
-    Q3 -->|"No (malformed,<br/>out of range)"| A2
-    Q3 -->|"Yes"| Q4
-    Q4 -->|"No (stale token,<br/>snapshot drift)"| A2
-    Q4 -->|"Yes"| A3
+    Q3 -->|"No"| A2
+    Q3 -->|"Yes"| A3
 
     A1 --> EMIT
     A2 --> EMIT
-    A3 --> MERGE
-    MERGE --> EMIT
+    A3 --> EMIT
 
     style START fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
     style Q1 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style Q2 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style Q3 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style Q4 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style A1 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style A2 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style A3 fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
-    style MERGE fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
-    style EMIT fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style A3 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style EMIT fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
 ```
 
 ---
 
-## 3. Token Encoding per Connector
+## 3. Connector Profiles
 
-Each connector stores different internal state in the `TokenBytes` field. The
-coordination layer never interprets token contents — it validates only presence
-and size (`MAX_TOKEN_SIZE = 16 KiB`). The three concrete connectors use
-fundamentally different encoding strategies matched to their data access patterns.
+### FilesystemConnector
 
-**FilesystemConnector** encodes a `WalkToken` — a serialized snapshot of the DFS
-stack. Each frame records a directory path component and a `next_child_index` (the
-count of already-consumed children in that directory's sorted entry list). On
-resume, the connector re-reads each directory from disk, re-sorts entries, and
-fast-forwards past the consumed children. This restores DFS position without
-replaying the entire walk from root. The wire format includes a version byte for
-forward compatibility. When the token's frame count exceeds `MAX_TOKEN_SIZE`, deeper
-frames are truncated and the leaf frame's index is rewound by one to force
-re-descent into the truncated subtree.
+- `token_resume` is always `false`.
+- `fill_page_directory()` computes a resume floor from the maximum of shard
+  start and `cursor.last_key()`.
+- `DirectoryWalker::new(...)` rebuilds the walk from the canonical root on
+  each call and `next_file()` skips every key `<= floor`.
+- `PageState::HasMore` carries `Cursor::with_last_key(last_key)` only.
 
-**GitConnector** encodes the next absolute index in the sorted entry array as an
-8-byte big-endian `u64`. Since the git snapshot is immutable after indexing, the
-index is stable for the connector's lifetime. Resume decodes the u64, verifies
-`entries[token_idx - 1].key == cursor.last_key()`, and jumps directly to
-`entries[token_idx]`.
+### Token-capable ordered-content sources
 
-**InMemoryDeterministicConnector** uses the same 8-byte big-endian `u64` encoding
-as the git connector. The sorted `Vec<PreparedItem>` is immutable after
-construction, so the index provides the same O(1) guarantee.
-
-```mermaid
-%% Diagram: token-encoding-per-connector
-graph LR
-    subgraph fs_token["FilesystemConnector Token"]
-        FS_HDR["version: u8<br/>(0x01)"]
-        FS_FC["frame_count: u16 LE"]
-        FS_F0["Frame 0 (root):<br/>component: [] (empty)<br/>next_child_index: u32 LE"]
-        FS_F1["Frame 1:<br/>component: dir_name bytes<br/>next_child_index: u32 LE"]
-        FS_FN["Frame N (leaf):<br/>component: dir_name bytes<br/>next_child_index: u32 LE"]
-    end
-
-    subgraph git_token["GitConnector Token"]
-        GIT_TOK["8 bytes big-endian u64<br/>= next absolute index<br/>into sorted entry array"]
-    end
-
-    subgraph mem_token["InMemoryDeterministicConnector Token"]
-        MEM_TOK["8 bytes big-endian u64<br/>= next absolute index<br/>into sorted Vec"]
-    end
-
-    subgraph resume_cost["Resume Complexity"]
-        FS_COST["Filesystem:<br/>O(depth × entries_per_dir)<br/>Re-read + re-sort + skip"]
-        GIT_COST["Git:<br/>O(1) array index<br/>+ key cross-check"]
-        MEM_COST["In-Memory:<br/>O(1) array index<br/>+ key cross-check"]
-    end
-
-    FS_HDR --> FS_FC --> FS_F0 --> FS_F1 --> FS_FN
-    GIT_TOK --> GIT_COST
-    MEM_TOK --> MEM_COST
-    FS_FN --> FS_COST
-
-    style fs_token fill:none,stroke:#991B1B,stroke-width:1px
-    style git_token fill:none,stroke:#991B1B,stroke-width:1px
-    style mem_token fill:none,stroke:#991B1B,stroke-width:1px
-    style resume_cost fill:none,stroke:#991B1B,stroke-width:1px
-
-    style FS_HDR fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style FS_FC fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style FS_F0 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style FS_F1 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style FS_FN fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
-    style GIT_TOK fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style MEM_TOK fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style FS_COST fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style GIT_COST fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style MEM_COST fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-```
+- Token handling is capability-gated rather than universal.
+- The connector still needs a key-derived floor so token loss or validation
+  failure preserves the same suffix of items.
+- Token payloads remain opaque to coordination and bounded by
+  `MAX_TOKEN_SIZE`.
 
 ---
 
-## 4. Token Resilience Model
+## 4. Cursor Construction and Terminal Signaling
 
-The design ensures that token loss or corruption never causes data
-loss. Every connector must produce semantically identical results regardless of
-whether the cursor carries a valid token, no token, or a corrupted token. Two
-independent perturbation scenarios validate this property:
+Connectors only build a continuation cursor when a non-terminal page returns
+`PageState::HasMore`. Terminal signaling uses the ordered-content page state:
 
-- **Drop token** (`ResumeMode::DropToken`): Remove the cursor's `token` field
-  entirely, leaving only `last_key`. The connector must resume from the key
-  position using binary search or DFS walk-and-seek.
-
-- **Corrupt token** (`ResumeMode::CorruptToken`): Replace the cursor's `token`
-  with random bytes. The connector must detect the invalid token (wrong version
-  byte, malformed frames, index out of bounds, key cross-check failure) and
-  fall back to key-based resume.
-
-Both perturbation paths must produce the same suffix of items as normal
-token-assisted resume. This is verified by comparing `ItemObservation` sequences
-(BLAKE3 digests of key and fingerprint) element-by-element against the baseline
-trace.
+- `PageState::HasMore { cursor }` means more in-scope data remains.
+- `PageState::Complete` means the returned page was the last in-scope page.
+- `Ok(None)` means no in-scope items remain at all for this call.
 
 ```mermaid
-%% Diagram: token-resilience-model
-sequenceDiagram
-    participant H as Test Harness
-    participant C as Connector
-
-    Note over H,C: Phase 1 — Baseline call
-
-    H->>C: connector_call(shard, initial_cursor, budgets)
-    C-->>H: result₁ {items, cursor₁ with token}
-    H->>C: connector_call(shard, cursor₁, budgets)
-    C-->>H: result₂ {items, cursor₂ with token}
-    Note over H: Record baseline trace:<br/>items + cursor checkpoints
-
-    Note over H,C: Phase 2 — Resume from checkpoint with DROP TOKEN
-
-    H->>H: cursor₁' = Cursor::with_last_key(cursor₁.last_key)<br/>← token removed
-    H->>C: connector_call(shard, cursor₁', budgets)
-    Note over C: No token → key_resume_start()<br/>upper_bound(last_key) O(log N)
-    C-->>H: result₂' {items must match baseline suffix}
-
-    Note over H,C: Phase 3 — Resume from checkpoint with CORRUPT TOKEN
-
-    H->>H: cursor₁'' = Cursor::with_token(cursor₁.last_key, random_bytes)
-    H->>C: connector_call(shard, cursor₁'', budgets)
-    Note over C: Token decode fails →<br/>fall back to key_resume_start()
-    C-->>H: result₂'' {items must match baseline suffix}
-
-    Note over H,C: Phase 4 — Verification
-    H->>H: Assert result₂.items == result₂'.items == result₂''.items<br/>(element-by-element digest comparison)
-```
-
----
-
-## 5. Cursor Construction
-
-After emitting items, each connector builds the continuation cursor
-using shared helpers in `common.rs`. The process varies slightly between the
-streaming filesystem connector (which encodes DFS stack state) and the
-index-based connectors (git, in-memory) that encode a simple array offset.
-
-For index-based connectors, `build_next_cursor()` encodes `next_idx` (the index
-of the first un-emitted item) as an 8-byte big-endian `u64` token. The
-`build_next_cursor_from_staged()` variant reuses a pre-staged pooled token when
-one was already allocated during page assembly, avoiding a redundant allocation.
-
-For the filesystem connector, `build_next_walk_cursor()` serializes the current
-`WalkState` stack into a `WalkToken` via `WalkToken::encode_from_state()`. Token
-construction failure (for example, when the encoded size exceeds `MAX_TOKEN_SIZE`)
-gracefully degrades to a key-only cursor.
-
-When the data source is exhausted (no more items to emit), the connector returns
-`Cursor::initial()` — signalling that the shard is complete. An empty result with a
-non-initial cursor signals "no items in this range, but more data may exist beyond."
-
-```mermaid
-%% Diagram: cursor-construction
+%% Diagram: cursor-construction-and-terminal-signaling
 graph TD
-    subgraph page_emission["Item Emission"]
-        ITEMS["Emit items[start_idx .. start_idx + take]"]
-        LAST["last_key = items.last().item_key()"]
+    subgraph page_fill["Page Assembly"]
+        ITEMS["Collect in-scope items"]
+        LAST["last_key = final emitted item key"]
     end
 
-    subgraph index_path["Index-Based Path (Git / InMemory)"]
-        NEXT_IDX["next_idx = start_idx + take"]
-        ENCODE["token = u64(next_idx).to_be_bytes()"]
-        TOKEN_BYTES["TokenBytes::try_from_slice(&token)"]
-        BUILD["Cursor::with_token(last_key, token)"]
-    end
-
-    subgraph fs_path["Filesystem Path"]
-        WALK_STATE["WalkState { stack, current_path, ... }"]
-        WALK_ENCODE["WalkToken::encode_from_state(&state)<br/>version + frame_count + frames[]"]
-        WALK_TOKEN["TokenBytes::try_from_vec(encoded)"]
-        FS_BUILD["Cursor::with_token(last_key, walk_token)"]
-    end
-
-    subgraph no_token_path["Token Disabled / Encoding Failure"]
+    subgraph non_terminal["Non-terminal page"]
         KEY_ONLY["Cursor::with_last_key(last_key)"]
+        HAS_MORE["PageState::HasMore { cursor }"]
     end
 
-    subgraph exhausted["Data Source Exhausted"]
-        DONE["Return Cursor::initial()<br/>← signals shard complete"]
+    subgraph terminal["Terminal outcomes"]
+        COMPLETE["PageState::Complete"]
+        NONE["Ok(None)<br/>no in-scope items remain"]
     end
 
     ITEMS --> LAST
-    LAST -->|"emit_tokens = true<br/>(index-based)"| NEXT_IDX
-    LAST -->|"emit_tokens = true<br/>(filesystem)"| WALK_STATE
-    LAST -->|"emit_tokens = false"| KEY_ONLY
+    LAST --> KEY_ONLY --> HAS_MORE
+    ITEMS -->|"final in-scope page"| COMPLETE
+    ITEMS -->|"no items emitted"| NONE
 
-    NEXT_IDX --> ENCODE --> TOKEN_BYTES --> BUILD
-    WALK_STATE --> WALK_ENCODE --> WALK_TOKEN --> FS_BUILD
-    WALK_ENCODE -->|"encoding fails or<br/>exceeds MAX_TOKEN_SIZE"| KEY_ONLY
-
-    style page_emission fill:none,stroke:#991B1B,stroke-width:1px
-    style index_path fill:none,stroke:#991B1B,stroke-width:1px
-    style fs_path fill:none,stroke:#991B1B,stroke-width:1px
-    style no_token_path fill:none,stroke:#991B1B,stroke-width:1px
-    style exhausted fill:none,stroke:#991B1B,stroke-width:1px
+    style page_fill fill:none,stroke:#991B1B,stroke-width:1px
+    style non_terminal fill:none,stroke:#991B1B,stroke-width:1px
+    style terminal fill:none,stroke:#991B1B,stroke-width:1px
 
     style ITEMS fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style LAST fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style NEXT_IDX fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style ENCODE fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style TOKEN_BYTES fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style BUILD fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
-    style WALK_STATE fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style WALK_ENCODE fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style WALK_TOKEN fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style FS_BUILD fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
     style KEY_ONLY fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style DONE fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style HAS_MORE fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+    style COMPLETE fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style NONE fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
 ---
@@ -371,36 +193,31 @@ graph TD
 
 | Topic | Diagram | Relevance |
 |-------|---------|-----------|
-| Connector boundary overview | [09-circuit-breaker.md](09-circuit-breaker.md) | B4 fault isolation context |
-| Shard key ranges and splits | [12-split-operations.md](12-split-operations.md) | Shard bounds that constrain cursor ranges |
-| Shard algebra types | [13-shard-algebra-types.md](13-shard-algebra-types.md) | `ShardSpec` key range encoding that cursors operate within |
-| End-to-end scan flow | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) | Source-family runtime surface and distributed runtime placeholders |
-| Lease lifecycle | [07-lease-lifecycle.md](07-lease-lifecycle.md) | Cursor monotonicity enforcement by the coordination layer |
+| Connector boundary overview | [14-connector-architecture.md](14-connector-architecture.md) | Capability flags and method surface |
+| Filesystem walk internals | [17-filesystem-walk-state-machine.md](17-filesystem-walk-state-machine.md) | Key-only filesystem resume path |
+| Shard key ranges and splits | [12-split-operations.md](12-split-operations.md) | Shard bounds constraining cursor ranges |
+| End-to-end scan flow | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) | Family-oriented runtime entrypoints |
+| Lease lifecycle | [07-lease-lifecycle.md](07-lease-lifecycle.md) | Coordination-side cursor monotonicity |
 
 ---
 
 ## Source Code References
 
 | Symbol / Concept | File | Notes |
-|-----------------|------|-------|
-| `Cursor` struct | `crates/gossip-contracts/src/connector/types.rs` | Two-field struct: `last_key` + `token` |
+|------------------|------|-------|
+| `Cursor` | `crates/gossip-contracts/src/connector/types.rs` | Two-field progress type: `last_key` + optional `token` |
 | `Cursor::initial()` | `crates/gossip-contracts/src/connector/types.rs` | No-progress neutral state |
-| `Cursor::with_last_key()` | `crates/gossip-contracts/src/connector/types.rs` | Key-only cursor constructor |
-| `Cursor::with_token()` | `crates/gossip-contracts/src/connector/types.rs` | Key + token cursor constructor |
-| `Cursor::try_from_update()` | `crates/gossip-contracts/src/connector/types.rs` | Validates `TokenWithoutLastKey` invariant |
-| `ItemKey` | `crates/gossip-contracts/src/connector/types.rs` | Ordered toxic-byte wrapper, max 4 KiB |
-| `TokenBytes` | `crates/gossip-contracts/src/connector/types.rs` | Unordered toxic-byte wrapper, max 16 KiB |
-| `key_resume_start()` | `crates/gossip-connectors/src/common.rs` | O(log N) key-authoritative resume position |
-| `cursor_token_index()` | `crates/gossip-connectors/src/common.rs` | Decode u64 token as array index |
-| `build_next_cursor()` | `crates/gossip-connectors/src/common.rs` | Encode next_idx as u64 BE token |
-| `build_next_cursor_from_staged()` | `crates/gossip-connectors/src/common.rs` | Reuse pre-staged pooled token |
-| `upper_bound()` | `crates/gossip-connectors/src/common.rs` | First index where key > target |
-| `WalkToken` struct | `crates/gossip-connectors/src/filesystem.rs` | Serialized DFS stack checkpoint |
-| `WalkTokenFrame` | `crates/gossip-connectors/src/filesystem.rs` | Per-frame component + child index |
-| `WALK_TOKEN_VERSION` | `crates/gossip-connectors/src/filesystem.rs` | Version byte `0x01` |
-| `WalkToken::decode_bytes()` | `crates/gossip-connectors/src/filesystem.rs` | Deserialize with validation |
-| `WalkToken::encode_from_state()` | `crates/gossip-connectors/src/filesystem.rs` | Serialize walk stack with size truncation |
-| `WalkState::from_token()` | `crates/gossip-connectors/src/filesystem.rs` | Restore DFS state from token |
-| `align_walk_to_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | Token-first, key-fallback resume |
-| `build_next_walk_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | Encode walk state into cursor token |
-| Git token resume | `crates/gossip-connectors/src/git.rs` | O(1) token + key cross-check |
+| `Cursor::with_last_key()` | `crates/gossip-contracts/src/connector/types.rs` | Key-only continuation cursor |
+| `Cursor::with_token()` | `crates/gossip-contracts/src/connector/types.rs` | Key + token continuation cursor |
+| `Cursor::try_from_update()` | `crates/gossip-contracts/src/connector/types.rs` | Rejects token-without-key state |
+| `TokenBytes` | `crates/gossip-contracts/src/connector/types.rs` | Opaque bounded token wrapper |
+| `OrderedContentCapabilities::token_resume` | `crates/gossip-contracts/src/connector/ordered.rs` | Capability bit for optional token handling |
+| `key_resume_start()` | `crates/gossip-connectors/src/common.rs` | Key-derived resume floor for sorted snapshots |
+| `parse_u64_be()` | `crates/gossip-connectors/src/common.rs` | Shared helper for 8-byte opaque payload decoding |
+| `FilesystemConnector::caps()` | `crates/gossip-connectors/src/filesystem.rs` | Advertises `token_resume: false` |
+| `FilesystemConnector::fill_page()` | `crates/gossip-connectors/src/filesystem.rs` | Ordered-content entrypoint for filesystem pages |
+| `FilesystemConnector::fill_page_directory()` | `crates/gossip-connectors/src/filesystem.rs` | Directory-mode key-only resume path |
+| `DirectoryWalker::new()` | `crates/gossip-connectors/src/filesystem.rs` | Rebuilds the live walk from the canonical root |
+| `DirectoryWalker::next_file()` | `crates/gossip-connectors/src/filesystem.rs` | Skips all keys at or below the resume floor |
+| `GitConnector::with_tokens()` | `crates/gossip-connectors/src/git.rs` | Capability toggle for token-aware surfaces |
+| `InMemoryDeterministicConnector::with_tokens()` | `crates/gossip-connectors/src/in_memory.rs` | Capability toggle for token-aware fixture behavior |

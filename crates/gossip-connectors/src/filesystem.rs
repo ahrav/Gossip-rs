@@ -1,28 +1,65 @@
-//! Deterministic filesystem-backed connector (Unix-only).
+//! Deterministic filesystem-backed ordered-content connector (Unix-only).
 //!
-//! This module provides [`FilesystemConnector`], which implements split-point
-//! hints and read operations against a local directory tree.
+//! This module provides [`FilesystemConnector`], which implements the
+//! ordered-content source contract for local filesystem roots.
+//!
+//! # Enumeration model
+//!
+//! - Enumeration walks the canonical root lazily with a bounded stack of
+//!   per-directory entry buffers. The connector never builds a whole-tree
+//!   sorted snapshot.
+//! - Item ordering is the lexicographic order of relative path bytes.
+//!   Directory siblings are sorted with a virtual trailing `/` so depth-first
+//!   traversal emits files in the same order as their full relative paths.
+//! - Resumption is key-only for now. `fill_page` restarts from the root view
+//!   and skips all keys at or below `cursor.last_key()`.
+//!
+//! # Identity and version model
+//!
+//! - `item_key` and `item_ref` are identical relative-path bytes.
+//! - `StableItemId` is derived from the canonical filesystem connector tag,
+//!   the canonical root path, and the relative locator bytes.
+//! - Versions are intentionally weak: they derive from the relative path plus
+//!   filesystem metadata, which is useful for change detection but does not
+//!   claim immutable content identity.
 //!
 //! # Read-path confinement
 //!
-//! Reads are constrained with component-by-component `openat` traversal from a
-//! canonical root directory fd, using `O_NOFOLLOW` at each step. This prevents
-//! symlink escapes and intermediate directory substitution attacks.
+//! Directory roots are read with component-by-component `openat` traversal
+//! from a canonical root directory fd, using `O_NOFOLLOW` at each step. This
+//! blocks symlink escapes and intermediate directory substitution attacks.
+//! Single-file roots open the canonical file path directly with
+//! `O_NOFOLLOW | O_NONBLOCK`.
 //!
-//! Files are opened with `O_NONBLOCK`, validated as regular files via metadata,
-//! then `O_NONBLOCK` is cleared before reads.
+//! Files are opened with `O_NONBLOCK`, validated as regular files via
+//! metadata, then `O_NONBLOCK` is cleared before reads.
+//!
+//! # Budget behavior
+//!
+//! - `fill_page` rejects expired deadlines, caps page cardinality at
+//!   `max_items`, and treats `size_hint` bytes as the page byte budget.
+//!   The first in-scope item is still emitted even when its `size_hint`
+//!   exceeds `max_bytes`, which guarantees forward progress for large files.
+//! - `open()` rejects expired deadlines and returns a reader that enforces
+//!   `max_bytes` on subsequent reads.
+//! - `read_range()` rejects expired deadlines and clamps returned bytes to
+//!   `min(dst.len(), max_bytes)`.
 //!
 //! # Split hints
 //!
-//! Split hints are derived from the connector's integrated
-//! `StreamingSplitEstimator`. A fresh connector starts with an empty estimator
-//! and returns `None` until sufficient observations accumulate.
+//! The split-point API consults the connector's integrated
+//! `StreamingSplitEstimator`, but capability reporting still keeps
+//! `split_hints = false` because enumeration does not feed observations into
+//! that estimator yet. A fresh connector therefore returns `None` until an
+//! external caller records enough samples.
 //!
-//! Connector-level key-range bounds participate in split-point selection:
-//! split candidates outside the effective `[start, end)` range are rejected.
+//! Connector-level key-range bounds participate in both page fill and
+//! split-point selection: candidates outside the effective `[start, end)`
+//! interval are ignored.
 
 use std::{
-    ffi::CString,
+    cmp::Ordering,
+    ffi::{CString, OsString},
     fs, io,
     os::unix::{
         ffi::OsStrExt,
@@ -35,14 +72,17 @@ use std::{
 
 use gossip_contracts::{
     connector::{
-        Budgets, ConnectorCapabilities, Cursor, EnumerateError, ItemKey, ItemRef, ReadError,
+        Budgets, ConnectorCapabilities, Cursor, EnumerateError, FILESYSTEM_CONNECTOR_TAG, ItemKey,
+        ItemRef, PageBuf, PageState, ReadError, ScanItem, VersionId,
+        ordered::{OrderedContentCapabilities, OrderedContentSource},
     },
     coordination::ShardSpec,
+    identity::{ConnectorInstanceIdHash, ItemIdentityKey, ObjectVersionId},
 };
 
 use crate::common::{
     self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
-    enumerate_error_to_read,
+    deadline_expired, enumerate_error_to_read,
 };
 use crate::split_estimator::StreamingSplitEstimator;
 
@@ -53,25 +93,199 @@ use crate::split_estimator::StreamingSplitEstimator;
 /// Single-entry read cache keyed by `item_ref` bytes.
 ///
 /// `read_range` workloads often perform adjacent reads on the same file; this
-/// avoids repeated `openat` traversal in the common sequential case while
-/// keeping memory and fd retention bounded.
+/// avoids repeated open-path resolution in the common sequential case while
+/// keeping descriptor retention bounded.
 struct CachedFile {
     item_ref: Box<[u8]>,
     file: fs::File,
+}
+
+/// Reader adapter that enforces `max_bytes` and checks the deadline before
+/// every delegated read call.
+struct BudgetedReader<R> {
+    inner: R,
+    remaining: u64,
+    deadline: Option<Instant>,
+}
+
+impl<R> BudgetedReader<R> {
+    fn new(inner: R, budgets: Budgets) -> Self {
+        Self {
+            inner,
+            remaining: budgets.max_bytes(),
+            deadline: budgets.deadline(),
+        }
+    }
+}
+
+impl<R: io::Read> io::Read for BudgetedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if deadline_expired(self.deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "budget deadline expired",
+            ));
+        }
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+
+        let cap = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        let allowed = buf.len().min(cap);
+        let read = self.inner.read(&mut buf[..allowed])?;
+        self.remaining = self.remaining.saturating_sub(read as u64);
+        Ok(read)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enumeration walk state
+// ---------------------------------------------------------------------------
+
+/// Minimal per-entry state retained while sorting a single directory.
+struct BufferedDirEntry {
+    name: OsString,
+    file_type: fs::FileType,
+}
+
+/// One stack frame in the bounded depth-first walk.
+///
+/// Each frame owns only the currently-open directory's sorted entries plus the
+/// relative-path prefix needed to derive child keys.
+struct WalkFrame {
+    abs_path: PathBuf,
+    rel_path: Vec<u8>,
+    entries: Vec<BufferedDirEntry>,
+    next_index: usize,
+}
+
+/// File candidate yielded by the live directory walk.
+struct WalkFile {
+    rel_path: Vec<u8>,
+    metadata: fs::Metadata,
+}
+
+/// Bounded-memory filesystem walker over the canonical directory root.
+///
+/// The walk keeps only the active ancestor stack in memory. Each directory is
+/// read, sorted, and dropped once traversal leaves that subtree.
+struct DirectoryWalker<'a> {
+    stack: Vec<WalkFrame>,
+    start: Option<&'a [u8]>,
+    resume_after: Option<&'a [u8]>,
+    end: Option<&'a [u8]>,
+    deadline: Option<Instant>,
+}
+
+impl<'a> DirectoryWalker<'a> {
+    fn new(
+        root: &Path,
+        start: Option<&'a [u8]>,
+        resume_after: Option<&'a [u8]>,
+        end: Option<&'a [u8]>,
+        deadline: Option<Instant>,
+    ) -> Result<Self, EnumerateError> {
+        Ok(Self {
+            stack: vec![WalkFrame {
+                abs_path: root.to_path_buf(),
+                rel_path: Vec::new(),
+                entries: read_sorted_dir_entries(root, deadline)?,
+                next_index: 0,
+            }],
+            start,
+            resume_after,
+            end,
+            deadline,
+        })
+    }
+
+    fn next_file(&mut self) -> Result<Option<WalkFile>, EnumerateError> {
+        loop {
+            if deadline_expired(self.deadline) {
+                return Err(EnumerateError::retryable("budget deadline expired"));
+            }
+
+            let Some(frame) = self.stack.last_mut() else {
+                return Ok(None);
+            };
+            if frame.next_index >= frame.entries.len() {
+                self.stack.pop();
+                continue;
+            }
+
+            let entry = &frame.entries[frame.next_index];
+            frame.next_index += 1;
+
+            let name_bytes = entry.name.as_os_str().as_bytes();
+            if name_bytes.is_empty() {
+                continue;
+            }
+
+            let rel_path = join_relative_path(&frame.rel_path, name_bytes);
+            if entry.file_type.is_dir() {
+                if should_skip_subtree(&rel_path, self.start, self.resume_after, self.end) {
+                    continue;
+                }
+
+                let abs_path = frame.abs_path.join(&entry.name);
+                self.stack.push(WalkFrame {
+                    abs_path: abs_path.clone(),
+                    rel_path,
+                    entries: read_sorted_dir_entries(&abs_path, self.deadline)?,
+                    next_index: 0,
+                });
+                continue;
+            }
+
+            if !entry.file_type.is_file() {
+                continue;
+            }
+
+            // Shard/config starts are inclusive, while resume cursors must
+            // advance strictly past the last emitted key.
+            if self.start.is_some_and(|start| rel_path.as_slice() < start) {
+                continue;
+            }
+            if self
+                .resume_after
+                .is_some_and(|resume_after| rel_path.as_slice() <= resume_after)
+            {
+                continue;
+            }
+            if self.end.is_some_and(|end| rel_path.as_slice() >= end) {
+                return Ok(None);
+            }
+
+            let abs_path = frame.abs_path.join(&entry.name);
+            let metadata = fs::symlink_metadata(&abs_path).map_err(|error| {
+                classify_io_enumerate_error("symlink_metadata", &abs_path, &error)
+            })?;
+            if !metadata.is_file() {
+                continue;
+            }
+
+            return Ok(Some(WalkFile { rel_path, metadata }));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // FilesystemConnector
 // ---------------------------------------------------------------------------
 
-/// Deterministic filesystem connector rooted at a local directory.
-///
-/// See [module-level documentation](self) for full design details.
+enum RootMode {
+    Directory,
+    SingleFile { file_name: Box<[u8]> },
+}
+
+/// Deterministic filesystem connector rooted at a local directory or file.
 pub struct FilesystemConnector {
     root: PathBuf,
     walk_key_range_start: Option<Box<[u8]>>,
     walk_key_range_end: Option<Box<[u8]>>,
-    /// Directory fd for the canonical root, opened lazily.
+    root_mode: Option<RootMode>,
+    connector_instance: Option<ConnectorInstanceIdHash>,
+    /// Directory fd for canonical directory roots, opened lazily.
     root_fd: Option<OwnedFd>,
     /// Single-entry FD cache for sequential `read_range` calls.
     cached_file: Option<CachedFile>,
@@ -97,6 +311,8 @@ impl FilesystemConnector {
             root,
             walk_key_range_start: None,
             walk_key_range_end: None,
+            root_mode: None,
+            connector_instance: None,
             root_fd: None,
             cached_file: None,
             split_estimator: StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_SAMPLE_CAP),
@@ -104,8 +320,8 @@ impl FilesystemConnector {
     }
 
     #[must_use]
-    /// Restrict split-point selection to keys inside the half-open range
-    /// `[start, end)`.
+    /// Restrict enumeration and split-point selection to keys inside the
+    /// half-open range `[start, end)`.
     ///
     /// The range is intersected with per-request shard bounds. `None` means
     /// unbounded on that side.
@@ -115,43 +331,180 @@ impl FilesystemConnector {
         self
     }
 
-    /// Canonicalize and open the root directory once, then cache its fd.
-    ///
-    /// This method retries on every call when the root is unavailable rather
-    /// than latching permanent failures. Root-directory conditions can change
-    /// between calls (e.g., a mount appearing, permissions being adjusted),
-    /// and the per-attempt cost is low (3-4 syscalls).
-    ///
-    /// Root identity is verified by capturing the canonical path's `(dev, ino)`
-    /// *before* opening, then comparing it to the opened fd's `fstat` result.
-    /// This narrows the TOCTOU window: the race is stat→open (same direction)
-    /// rather than open→stat where the fd could refer to a different directory
-    /// than the one we stat'd.
-    fn ensure_root_fd(&mut self) -> Result<(), EnumerateError> {
-        if self.root_fd.is_some() {
+    /// Canonicalize the root and cache the root mode plus identity scope.
+    fn ensure_root_ready(&mut self) -> Result<(), EnumerateError> {
+        if self.root_mode.is_some() {
             return Ok(());
         }
 
-        // Canonicalize root to prevent cwd drift and resolve root symlinks.
         self.root = fs::canonicalize(&self.root)
-            .map_err(|err| classify_io_enumerate_error("canonicalize", &self.root, &err))?;
+            .map_err(|error| classify_io_enumerate_error("canonicalize", &self.root, &error))?;
+        self.connector_instance = Some(ConnectorInstanceIdHash::from_instance_id_bytes(
+            self.root.as_os_str().as_bytes(),
+        ));
 
-        // Capture path identity BEFORE open so the authoritative check is
-        // fstat on the fd (which cannot be swapped out from under us).
         let path_meta = fs::metadata(&self.root)
-            .map_err(|err| classify_io_enumerate_error("stat_root", &self.root, &err))?;
-        let expected_id = (path_meta.dev(), path_meta.ino());
+            .map_err(|error| classify_io_enumerate_error("stat_root", &self.root, &error))?;
+        if path_meta.is_dir() {
+            let expected_id = (path_meta.dev(), path_meta.ino());
+            let root_fd = open_dir_fd(&self.root).map_err(|error| {
+                classify_io_enumerate_error("open_root_dir", &self.root, &error)
+            })?;
+            verify_root_identity(&root_fd, expected_id).map_err(|error| {
+                classify_io_enumerate_error("verify_root_identity", &self.root, &error)
+            })?;
+            self.root_fd = Some(root_fd);
+            self.root_mode = Some(RootMode::Directory);
+            return Ok(());
+        }
 
-        // Open root as a directory fd for openat-based reads.
-        let root_fd = open_dir_fd(&self.root)
-            .map_err(|err| classify_io_enumerate_error("open_root_dir", &self.root, &err))?;
+        if path_meta.is_file() {
+            let file_name = self
+                .root
+                .file_name()
+                .ok_or_else(|| EnumerateError::permanent("single-file root has no file name"))?;
+            let file_name = file_name.as_bytes();
+            if file_name.is_empty() {
+                return Err(EnumerateError::permanent(
+                    "single-file root encoded to an empty item key",
+                ));
+            }
+            self.root_mode = Some(RootMode::SingleFile {
+                file_name: file_name.into(),
+            });
+            return Ok(());
+        }
 
-        // Verify the opened fd matches the pre-captured identity.
-        verify_root_identity(&root_fd, expected_id)
-            .map_err(|err| classify_io_enumerate_error("verify_root_identity", &self.root, &err))?;
+        Err(EnumerateError::permanent(
+            "filesystem root must be a regular file or directory",
+        ))
+    }
 
-        self.root_fd = Some(root_fd);
-        Ok(())
+    fn ordered_content_caps(&self) -> OrderedContentCapabilities {
+        OrderedContentCapabilities {
+            range_read: true,
+            split_hints: false,
+            token_resume: false,
+        }
+    }
+
+    fn connector_instance(&self) -> ConnectorInstanceIdHash {
+        self.connector_instance
+            .expect("root connector instance is initialized by ensure_root_ready")
+    }
+
+    fn fill_page_directory(
+        &self,
+        effective_start: Option<&[u8]>,
+        effective_end: Option<&[u8]>,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+        let resume_after = cursor.last_key().map(|last_key| last_key.as_bytes());
+        if let (Some(resume_after), Some(end)) = (resume_after, effective_end)
+            && resume_after >= end
+        {
+            return Ok(None);
+        }
+
+        let mut walk = DirectoryWalker::new(
+            &self.root,
+            effective_start,
+            resume_after,
+            effective_end,
+            budgets.deadline(),
+        )?;
+        let mut items = Vec::new();
+        let mut total_bytes = 0_u64;
+        let connector_instance = self.connector_instance();
+        let mut complete = true;
+
+        loop {
+            let Some(next_file) = walk.next_file()? else {
+                break;
+            };
+            let item =
+                build_scan_item(&next_file.rel_path, &next_file.metadata, connector_instance)?;
+            let item_size = item.size_hint().unwrap_or(0);
+            // Always admit the first in-scope item so a single large file does
+            // not stall cursor progress forever.
+            if !items.is_empty() && total_bytes.saturating_add(item_size) > budgets.max_bytes() {
+                complete = false;
+                break;
+            }
+
+            total_bytes = total_bytes.saturating_add(item_size);
+            items.push(item);
+            if items.len() == budgets.max_items() {
+                complete = walk.next_file()?.is_none();
+                break;
+            }
+        }
+
+        if items.is_empty() {
+            return Ok(None);
+        }
+
+        let last_key = items
+            .last()
+            .expect("non-empty page has a final item")
+            .item_key()
+            .clone();
+        let state = if complete {
+            PageState::Complete
+        } else {
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(last_key),
+            }
+        };
+
+        PageBuf::try_new_validated(
+            items,
+            state,
+            effective_start.unwrap_or(b""),
+            effective_end.unwrap_or(b""),
+        )
+        .map(Some)
+        .map_err(|error| EnumerateError::permanent(format!("invalid filesystem page: {error}")))
+    }
+
+    fn fill_page_single_file(
+        &self,
+        file_name: &[u8],
+        effective_start: Option<&[u8]>,
+        effective_end: Option<&[u8]>,
+        cursor: &Cursor,
+    ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+        if effective_start.is_some_and(|start| file_name < start) {
+            return Ok(None);
+        }
+        if cursor
+            .last_key()
+            .is_some_and(|last_key| file_name <= last_key.as_bytes())
+        {
+            return Ok(None);
+        }
+        if effective_end.is_some_and(|end| file_name >= end) {
+            return Ok(None);
+        }
+
+        let metadata = fs::symlink_metadata(&self.root)
+            .map_err(|error| classify_io_enumerate_error("symlink_metadata", &self.root, &error))?;
+        if !metadata.is_file() {
+            return Err(EnumerateError::permanent(
+                "single-file root is no longer a regular file",
+            ));
+        }
+
+        let item = build_scan_item(file_name, &metadata, self.connector_instance())?;
+        PageBuf::try_new_validated(
+            vec![item],
+            PageState::Complete,
+            effective_start.unwrap_or(b""),
+            effective_end.unwrap_or(b""),
+        )
+        .map(Some)
+        .map_err(|error| EnumerateError::permanent(format!("invalid filesystem page: {error}")))
     }
 
     // ---------------------------------------------------------------
@@ -187,13 +540,11 @@ impl FilesystemConnector {
         cursor: &Cursor,
         deadline: Option<Instant>,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        if let Some(dl) = deadline
-            && Instant::now() >= dl
-        {
+        if deadline_expired(deadline) {
             return Err(EnumerateError::retryable("budget deadline expired"));
         }
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
+        if let (Some(start), Some(end)) = (start, end)
+            && start > end
         {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
@@ -214,22 +565,19 @@ impl FilesystemConnector {
             return Ok(None);
         }
         let split = ItemKey::try_from_slice(split_key)
-            .map_err(|err| EnumerateError::permanent(format!("invalid split key: {err}")))?;
+            .map_err(|error| EnumerateError::permanent(format!("invalid split key: {error}")))?;
         Ok(Some(split))
     }
 
     // ---------------------------------------------------------------
-    // Read-path: openat traversal
+    // Read-path helpers
     // ---------------------------------------------------------------
 
     /// Open a file beneath `root_fd` using component-by-component `openat`
     /// with `O_NOFOLLOW` at every step.
     ///
-    /// The returned file descriptor has `O_NONBLOCK` set (to avoid blocking on
-    /// FIFOs or device nodes in a TOCTOU race). Callers must [`clear_nonblock`]
-    /// before performing any reads. Returned metadata is from the opened fd
-    /// itself (not from path re-resolution) and is used to enforce regular-file
-    /// reads only.
+    /// The returned file descriptor has `O_NONBLOCK` set. Callers must
+    /// [`clear_nonblock`] before reading from it.
     fn open_beneath_root(&self, ref_bytes: &[u8]) -> Result<(fs::File, fs::Metadata), ReadError> {
         let root_fd = self
             .root_fd
@@ -240,68 +588,55 @@ impl FilesystemConnector {
             return Err(ReadError::permanent("empty item_ref"));
         }
 
-        // Pre-count components (separators + 1) to detect the last component
-        // without collecting into a Vec.
-        let n = ref_bytes.iter().filter(|&&b| b == b'/').count() + 1;
-
+        let component_count = ref_bytes.iter().filter(|&&byte| byte == b'/').count() + 1;
         let mut dir_fd: Option<OwnedFd> = None;
+        let mut component_buf = [0u8; 256];
 
-        // Stack buffer for null-terminated component (NAME_MAX=255 + NUL).
-        let mut c_buf = [0u8; 256];
-
-        for (i, component) in ref_bytes.split(|&b| b == b'/').enumerate() {
-            // Defense-in-depth: only normal segments are accepted,
-            // and openat confinement prevents root escape even for hostile refs.
+        for (index, component) in ref_bytes.split(|&byte| byte == b'/').enumerate() {
             if component.is_empty() || component == b"." || component == b".." {
                 return Err(ReadError::permanent("invalid path component in item_ref"));
             }
 
-            let parent_raw = match &dir_fd {
+            let parent_fd = match &dir_fd {
                 Some(fd) => fd.as_raw_fd(),
                 None => root_fd.as_raw_fd(),
             };
-
-            // Reject embedded NUL bytes before building the C string.
             if component.contains(&0) {
                 return Err(ReadError::permanent("null byte in path component"));
             }
-
-            // Build a null-terminated component on the stack (NAME_MAX=255 + NUL).
-            if component.len() >= c_buf.len() {
+            if component.len() >= component_buf.len() {
                 return Err(ReadError::permanent("path component exceeds NAME_MAX"));
             }
-            c_buf[..component.len()].copy_from_slice(component);
-            c_buf[component.len()] = 0;
-            let c_ptr = c_buf.as_ptr().cast::<libc::c_char>();
 
-            let is_last = i == n - 1;
+            component_buf[..component.len()].copy_from_slice(component);
+            component_buf[component.len()] = 0;
+            let component_ptr = component_buf.as_ptr().cast::<libc::c_char>();
+            let is_last = index == component_count - 1;
             let flags = if is_last {
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC
             } else {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
             };
 
-            // SAFETY: `libc::openat` is a POSIX syscall. `parent_raw` is a valid
-            // fd. `c_ptr` points to a null-terminated stack buffer. Returned fd
-            // is wrapped in `OwnedFd` for close-on-drop.
-            let raw = unsafe { libc::openat(parent_raw, c_ptr, flags) };
-            if raw < 0 {
+            // SAFETY: `parent_fd` is a valid directory descriptor, the path is
+            // a null-terminated stack buffer, and successful `openat` returns a
+            // fresh fd that is wrapped in `OwnedFd`.
+            let raw_fd = unsafe { libc::openat(parent_fd, component_ptr, flags) };
+            if raw_fd < 0 {
                 return Err(classify_io_read_error(
-                    &format!("openat component {}/{n}", i + 1),
+                    &format!("openat component {}/{}", index + 1, component_count),
                     None,
                     &io::Error::last_os_error(),
                 ));
             }
-
-            // SAFETY: `raw >= 0` from the check above. `OwnedFd` takes
-            // ownership; assigning to `dir_fd` drops the previous intermediate.
-            dir_fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+            // SAFETY: `raw_fd >= 0` from the check above.
+            dir_fd = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
         }
 
         let file = fs::File::from(dir_fd.expect("path has at least one component"));
         let metadata = file
             .metadata()
-            .map_err(|e| classify_io_read_error("fstat", None, &e))?;
+            .map_err(|error| classify_io_read_error("fstat", None, &error))?;
         if !metadata.is_file() {
             return Err(ReadError::permanent("path is not a regular file"));
         }
@@ -309,19 +644,37 @@ impl FilesystemConnector {
         Ok((file, metadata))
     }
 
+    fn open_file_for_ref(&self, item_ref: &ItemRef) -> Result<(fs::File, fs::Metadata), ReadError> {
+        match self
+            .root_mode
+            .as_ref()
+            .expect("root mode is initialized by ensure_root_ready")
+        {
+            RootMode::Directory => self.open_beneath_root(item_ref.as_bytes()),
+            RootMode::SingleFile { file_name } => {
+                if item_ref.as_bytes() != file_name.as_ref() {
+                    return Err(ReadError::permanent(
+                        "item_ref does not match the single-file root",
+                    ));
+                }
+                open_regular_file(&self.root)
+            }
+        }
+    }
+
     /// Return a cached file handle when the `item_ref` matches, else reopen.
     ///
-    /// Cache size is intentionally one entry to match dominant sequential range
-    /// reads without retaining unbounded descriptors.
+    /// Cache size is intentionally one entry to match dominant sequential
+    /// range-read workloads without retaining unbounded descriptors.
     fn get_or_open_cached(&mut self, item_ref: &ItemRef) -> Result<&fs::File, ReadError> {
         let ref_bytes = item_ref.as_bytes();
-        let need_open = self
+        let needs_open = self
             .cached_file
             .as_ref()
             .is_none_or(|cached| cached.item_ref.as_ref() != ref_bytes);
-        if need_open {
-            self.ensure_root_fd().map_err(enumerate_error_to_read)?;
-            let (file, _metadata) = self.open_beneath_root(ref_bytes)?;
+        if needs_open {
+            self.ensure_root_ready().map_err(enumerate_error_to_read)?;
+            let (file, _metadata) = self.open_file_for_ref(item_ref)?;
             clear_nonblock(&file)?;
             self.cached_file = Some(CachedFile {
                 item_ref: ref_bytes.into(),
@@ -333,7 +686,7 @@ impl FilesystemConnector {
 }
 
 // ---------------------------------------------------------------------------
-// Read and split-point operations (inherent methods)
+// Ordered-content and read operations (inherent methods)
 // ---------------------------------------------------------------------------
 
 impl FilesystemConnector {
@@ -344,6 +697,46 @@ impl FilesystemConnector {
             token_resume: false,
             range_read: true,
             split_hints: false,
+        }
+    }
+
+    /// Fill one bounded page of ordered filesystem items.
+    pub fn fill_page(
+        &mut self,
+        shard: &ShardSpec,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+        if deadline_expired(budgets.deadline()) {
+            return Err(EnumerateError::retryable("budget deadline expired"));
+        }
+        self.ensure_root_ready()?;
+
+        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
+        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
+        let Some((effective_start, effective_end)) = intersect_key_bounds(
+            start,
+            end,
+            self.walk_key_range_start.as_deref(),
+            self.walk_key_range_end.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+
+        match self
+            .root_mode
+            .as_ref()
+            .expect("root mode is initialized by ensure_root_ready")
+        {
+            RootMode::Directory => {
+                self.fill_page_directory(effective_start, effective_end, cursor, budgets)
+            }
+            RootMode::SingleFile { file_name } => self.fill_page_single_file(
+                file_name.as_ref(),
+                effective_start,
+                effective_end,
+                cursor,
+            ),
         }
     }
 
@@ -359,20 +752,24 @@ impl FilesystemConnector {
         self.choose_split_point_bounds(start, end, cursor, budgets.deadline())
     }
 
-    /// Budget enforcement is left to the runtime layer (which wraps the
-    /// returned reader in a bounded adapter), consistent with the advisory
-    /// budget contract.
+    /// Open the full content for an item, enforcing the read byte budget on
+    /// the returned reader.
     pub fn open(
         &mut self,
         item_ref: &ItemRef,
-        _budgets: Budgets,
+        budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
-        self.ensure_root_fd().map_err(enumerate_error_to_read)?;
-        let (file, _metadata) = self.open_beneath_root(item_ref.as_bytes())?;
+        if deadline_expired(budgets.deadline()) {
+            return Err(ReadError::retryable("budget deadline expired"));
+        }
+
+        self.ensure_root_ready().map_err(enumerate_error_to_read)?;
+        let (file, _metadata) = self.open_file_for_ref(item_ref)?;
         clear_nonblock(&file)?;
-        Ok(Box::new(file))
+        Ok(Box::new(BudgetedReader::new(file, budgets)))
     }
 
+    /// Range-read a file, clamping the returned bytes to `budgets.max_bytes()`.
     pub fn read_range(
         &mut self,
         item_ref: &ItemRef,
@@ -380,8 +777,9 @@ impl FilesystemConnector {
         dst: &mut [u8],
         budgets: Budgets,
     ) -> Result<usize, ReadError> {
-        // Keep arithmetic explicit so offset checks fail permanently instead of
-        // wrapping through usize conversions on large inputs.
+        if deadline_expired(budgets.deadline()) {
+            return Err(ReadError::retryable("budget deadline expired"));
+        }
         if offset.checked_add(dst.len() as u64).is_none() {
             return Err(ReadError::permanent("offset + dst length overflow"));
         }
@@ -394,8 +792,234 @@ impl FilesystemConnector {
 
         let file = self.get_or_open_cached(item_ref)?;
         file.read_at(&mut dst[..allowed], offset)
-            .map_err(|err| classify_io_read_error("read_at", None, &err))
+            .map_err(|error| classify_io_read_error("read_at", None, &error))
     }
+}
+
+impl OrderedContentSource for FilesystemConnector {
+    fn capabilities(&self) -> OrderedContentCapabilities {
+        self.ordered_content_caps()
+    }
+
+    fn fill_page(
+        &mut self,
+        shard: &ShardSpec,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+        Self::fill_page(self, shard, cursor, budgets)
+    }
+
+    fn choose_split_point(
+        &mut self,
+        shard: &ShardSpec,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<Option<ItemKey>, EnumerateError> {
+        Self::choose_split_point(self, shard, cursor, budgets)
+    }
+
+    fn open(
+        &mut self,
+        item_ref: &ItemRef,
+        budgets: Budgets,
+    ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+        Self::open(self, item_ref, budgets)
+    }
+
+    fn read_range(
+        &mut self,
+        item_ref: &ItemRef,
+        offset: u64,
+        dst: &mut [u8],
+        budgets: Budgets,
+    ) -> Result<usize, ReadError> {
+        Self::read_range(self, item_ref, offset, dst, budgets)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem identity and ordering helpers
+// ---------------------------------------------------------------------------
+
+fn build_scan_item(
+    rel_path: &[u8],
+    metadata: &fs::Metadata,
+    connector_instance: ConnectorInstanceIdHash,
+) -> Result<ScanItem, EnumerateError> {
+    let item_key = ItemKey::try_from_slice(rel_path).map_err(|error| {
+        EnumerateError::permanent(format!("invalid filesystem item key: {error}"))
+    })?;
+    let item_ref = ItemRef::try_from_slice(rel_path).map_err(|error| {
+        EnumerateError::permanent(format!("invalid filesystem item_ref: {error}"))
+    })?;
+    let stable_item_id = ItemIdentityKey::new(
+        FILESYSTEM_CONNECTOR_TAG,
+        connector_instance,
+        item_key.as_bytes(),
+    )
+    .stable_id();
+    let version = VersionId::Weak(derive_filesystem_version(rel_path, metadata));
+
+    Ok(ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(metadata.len()))
+}
+
+fn derive_filesystem_version(rel_path: &[u8], metadata: &fs::Metadata) -> ObjectVersionId {
+    let mut version_bytes = Vec::with_capacity(rel_path.len() + 48);
+    version_bytes.extend_from_slice(rel_path);
+    version_bytes.push(0);
+    version_bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+    version_bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+    version_bytes.extend_from_slice(&metadata.len().to_le_bytes());
+    version_bytes.extend_from_slice(&metadata.mtime().to_le_bytes());
+    version_bytes.extend_from_slice(&metadata.mtime_nsec().to_le_bytes());
+    version_bytes.extend_from_slice(&metadata.mode().to_le_bytes());
+    ObjectVersionId::from_version_bytes(&version_bytes)
+}
+
+fn read_sorted_dir_entries(
+    dir: &Path,
+    deadline: Option<Instant>,
+) -> Result<Vec<BufferedDirEntry>, EnumerateError> {
+    if deadline_expired(deadline) {
+        return Err(EnumerateError::retryable("budget deadline expired"));
+    }
+
+    let mut entries = Vec::new();
+    let dir_iter =
+        fs::read_dir(dir).map_err(|error| classify_io_enumerate_error("read_dir", dir, &error))?;
+    for entry in dir_iter {
+        if deadline_expired(deadline) {
+            return Err(EnumerateError::retryable("budget deadline expired"));
+        }
+
+        let entry =
+            entry.map_err(|error| classify_io_enumerate_error("read_dir_entry", dir, &error))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| classify_io_enumerate_error("file_type", dir, &error))?;
+        entries.push(BufferedDirEntry {
+            name: entry.file_name(),
+            file_type,
+        });
+    }
+
+    entries.sort_unstable_by(cmp_buffered_dir_entries);
+    Ok(entries)
+}
+
+fn cmp_buffered_dir_entries(left: &BufferedDirEntry, right: &BufferedDirEntry) -> Ordering {
+    cmp_component_with_dir_suffix(
+        left.name.as_os_str().as_bytes(),
+        left.file_type.is_dir(),
+        right.name.as_os_str().as_bytes(),
+        right.file_type.is_dir(),
+    )
+}
+
+/// Compare one path component at a time, treating directories as if they had a
+/// synthetic trailing `/`.
+///
+/// That makes depth-first traversal emit the same order as lexicographically
+/// sorting full relative-path strings.
+fn cmp_component_with_dir_suffix(
+    left: &[u8],
+    left_is_dir: bool,
+    right: &[u8],
+    right_is_dir: bool,
+) -> Ordering {
+    let mut index = 0;
+    loop {
+        let left_byte = synthetic_component_byte(left, left_is_dir, index);
+        let right_byte = synthetic_component_byte(right, right_is_dir, index);
+        match (left_byte, right_byte) {
+            (Some(left_byte), Some(right_byte)) => match left_byte.cmp(&right_byte) {
+                Ordering::Equal => index += 1,
+                ordering => return ordering,
+            },
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+fn synthetic_component_byte(bytes: &[u8], is_dir: bool, index: usize) -> Option<u8> {
+    if index < bytes.len() {
+        Some(bytes[index])
+    } else if is_dir && index == bytes.len() {
+        Some(b'/')
+    } else {
+        None
+    }
+}
+
+fn join_relative_path(prefix: &[u8], component: &[u8]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(prefix.len() + component.len() + usize::from(!prefix.is_empty()));
+    if !prefix.is_empty() {
+        out.extend_from_slice(prefix);
+        out.push(b'/');
+    }
+    out.extend_from_slice(component);
+    out
+}
+
+/// Return `true` when a directory subtree cannot contain any key inside the
+/// active `[floor, end)` interval.
+///
+/// The synthetic `subtree_start/` prefix lets the walker reject whole
+/// directories before opening them when every descendant sorts below the
+/// inclusive shard/config start, at-or-below the exclusive resume cursor, or
+/// at-or-above `end`.
+fn should_skip_subtree(
+    dir_prefix: &[u8],
+    start: Option<&[u8]>,
+    resume_after: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> bool {
+    if dir_prefix.is_empty() {
+        return false;
+    }
+
+    let subtree_start = join_relative_path(dir_prefix, b"");
+    let successor = prefix_successor(&subtree_start);
+    if let Some(start) = start
+        && successor
+            .as_ref()
+            .is_some_and(|successor| successor.as_slice() <= start)
+    {
+        return true;
+    }
+    if let Some(resume_after) = resume_after
+        && successor
+            .as_ref()
+            .is_some_and(|successor| successor.as_slice() <= resume_after)
+    {
+        return true;
+    }
+    if let Some(end) = end
+        && end <= subtree_start.as_slice()
+    {
+        return true;
+    }
+    false
+}
+
+/// Smallest strict lexicographic successor for an arbitrary byte prefix.
+///
+/// Used to decide whether an entire `prefix/` subtree must sort before the
+/// current resume floor.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    for index in (0..successor.len()).rev() {
+        if successor[index] != u8::MAX {
+            successor[index] += 1;
+            successor.truncate(index + 1);
+            return Some(successor);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -414,21 +1038,21 @@ fn intersect_key_bounds<'a>(
     config_end: Option<&'a [u8]>,
 ) -> Option<(Option<&'a [u8]>, Option<&'a [u8]>)> {
     let effective_start = match config_start {
-        Some(cs) => Some(match request_start {
-            Some(rs) if rs >= cs => rs,
-            _ => cs,
+        Some(config_start) => Some(match request_start {
+            Some(request_start) if request_start >= config_start => request_start,
+            _ => config_start,
         }),
         None => request_start,
     };
     let effective_end = match config_end {
-        Some(ce) => Some(match request_end {
-            Some(re) if re <= ce => re,
-            _ => ce,
+        Some(config_end) => Some(match request_end {
+            Some(request_end) if request_end <= config_end => request_end,
+            _ => config_end,
         }),
         None => request_end,
     };
     match (effective_start, effective_end) {
-        (Some(s), Some(e)) if s >= e => None,
+        (Some(start), Some(end)) if start >= end => None,
         bounds => Some(bounds),
     }
 }
@@ -438,12 +1062,6 @@ fn intersect_key_bounds<'a>(
 // ---------------------------------------------------------------------------
 
 /// Open a directory file descriptor for use with `openat`.
-///
-/// Uses `O_RDONLY | O_DIRECTORY | O_CLOEXEC` flags to ensure we get a
-/// directory handle that won't leak to child processes. The `O_DIRECTORY`
-/// flag causes `open` to fail if the path isn't a directory. Symlink traversal
-/// hardening for child path components is enforced later via `openat` with
-/// `O_NOFOLLOW`.
 fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     let c_path = path_to_cstring(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "null byte in path"))?;
@@ -457,27 +1075,43 @@ fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: fd >= 0 from the check above.
+    // SAFETY: `fd >= 0` from the check above.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Open one canonical regular file path with `O_NOFOLLOW | O_NONBLOCK`.
+fn open_regular_file(path: &Path) -> Result<(fs::File, fs::Metadata), ReadError> {
+    let c_path = path_to_cstring(path).map_err(|_| ReadError::permanent("null byte in path"))?;
+    // SAFETY: POSIX open(2) with a valid null-terminated path.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(classify_io_read_error(
+            "open",
+            Some(path),
+            &io::Error::last_os_error(),
+        ));
+    }
+
+    // SAFETY: `fd >= 0` from the check above.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| classify_io_read_error("fstat", Some(path), &error))?;
+    if !metadata.is_file() {
+        return Err(ReadError::permanent("path is not a regular file"));
+    }
+    Ok((file, metadata))
+}
+
 /// Clear `O_NONBLOCK` from an already-opened file descriptor.
-///
-/// The read path opens leaf files with `O_NONBLOCK` to avoid blocking on
-/// FIFOs or device nodes that slip past the `fstat` regular-file check in
-/// a TOCTOU race. After validation, this function clears the flag so that
-/// subsequent `read`/`read_at` calls use normal blocking semantics.
-///
-/// # Safety invariant
-///
-/// We validate the file is regular (via `fstat`) before clearing O_NONBLOCK.
-/// This prevents hanging on FIFOs/devices that might have been swapped in
-/// via TOCTOU race. The window is narrow but non-zero: between our `openat`
-/// and `fstat`, the filesystem could change. This validation ensures we
-/// never block indefinitely on special files.
 fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     let fd = file.as_raw_fd();
-    // SAFETY: fcntl F_GETFL/F_SETFL on a valid fd.
+    // SAFETY: `fcntl(F_GETFL)` on a valid file descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(classify_io_read_error(
@@ -486,7 +1120,8 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
             &io::Error::last_os_error(),
         ));
     }
-    // SAFETY: F_SETFL on a valid fd with flags obtained from F_GETFL above.
+    // SAFETY: `fcntl(F_SETFL)` on a valid file descriptor with flags obtained
+    // from `F_GETFL`.
     let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
     if result < 0 {
         return Err(classify_io_read_error(
@@ -498,49 +1133,22 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     Ok(())
 }
 
-/// Convert a Path to a null-terminated C string for syscall use.
-///
-/// Unix paths can contain any bytes except NUL, but C APIs require
-/// NUL-termination. This function validates no embedded NULs exist
-/// and appends the terminator.
 fn path_to_cstring(path: &Path) -> Result<CString, std::ffi::NulError> {
     CString::new(path.as_os_str().as_bytes())
 }
 
-/// Extract `(dev, ino)` from an open file descriptor via `fstat`.
-///
-/// Used to verify that a directory fd matches the expected path identity,
-/// closing the TOCTOU window between `open_dir_fd` and the walk.
 fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `fstat` on a valid fd, writing into an uninitialized stat buffer.
+    // SAFETY: `fstat` writes a fully initialized `stat` struct on success.
     if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `fstat` succeeded, so the buffer is initialized.
     let stat = unsafe { stat.assume_init() };
-    // Use `as u64` to be portable across platforms where st_dev/st_ino
-    // may be narrower types, while allowing clippy to elide no-op casts.
     #[allow(clippy::unnecessary_cast)]
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
-/// Verify that the opened root fd matches a pre-captured `(dev, ino)` identity.
-///
-/// The caller captures the expected identity via `fs::metadata` *before*
-/// opening the fd, then passes it here. This keeps the authoritative check
-/// on the fd side (fstat cannot be raced) and narrows the TOCTOU window to
-/// stat→open rather than open→stat.
-///
-/// # Error classification
-///
-/// The returned `io::Error` uses `ErrorKind::Other`, which
-/// `is_permanent_io_error` does **not** recognize as permanent. This is
-/// intentional: a directory swap is a transient environmental condition
-/// (race with an external rename/mount), not a permanent attribute of the
-/// path itself. Retryable classification allows callers to re-canonicalize and
-/// re-open on the next attempt — at which point the fd and path will agree (or
-/// the path will have vanished, producing a different permanent error).
 fn verify_root_identity(root_fd: &OwnedFd, expected_id: (u64, u64)) -> Result<(), io::Error> {
     let (fd_dev, fd_ino) = fd_dev_ino(root_fd)?;
     if fd_dev != expected_id.0 || fd_ino != expected_id.1 {
