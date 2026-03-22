@@ -235,7 +235,16 @@ mod tests {
         let now = LogicalTime::from_raw(50);
         let stale = FenceEpoch::from_raw(999);
 
-        let out = generate_scan_outcome(&mut ctx, &lease, policy, &pool, 1..=3, now, Some(stale));
+        let out = generate_scan_outcome(
+            &mut ctx,
+            &lease,
+            policy,
+            &pool,
+            1..=3,
+            now,
+            Some(stale),
+            None,
+        );
 
         for rec in &out.records {
             assert_eq!(rec.provenance().fence_epoch(), stale);
