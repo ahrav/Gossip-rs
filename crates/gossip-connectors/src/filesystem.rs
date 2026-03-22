@@ -439,10 +439,7 @@ impl FilesystemConnector {
                 // Peek to decide Complete vs HasMore. On error (deadline
                 // race, transient IO), conservatively report HasMore rather
                 // than discarding the already-collected page via `?`.
-                complete = walk
-                    .next_file()
-                    .ok()
-                    .is_some_and(|next| next.is_none());
+                complete = walk.next_file().ok().is_some_and(|next| next.is_none());
                 break;
             }
         }
