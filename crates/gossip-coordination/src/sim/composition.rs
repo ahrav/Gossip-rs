@@ -15,9 +15,10 @@
 //! carrying `(run_id, shard_id, fence_epoch)`.
 //!
 //! The harness drives a deterministic claim-scan-complete loop that exercises
-//! both APIs and runs both invariant checker suites (S1–S9, I1–I10) after
-//! every step. Cross-component invariants (C1–C4) are wired by a follow-on
-//! task.
+//! both APIs, runs the coordination invariant checker (S1–S9) after every
+//! step, and the persistence invariant checker (I1–I10) inline during ledger
+//! writes. Cross-component invariants (C1–C4) are wired by a follow-on
+//! checker.
 //!
 //! # Determinism
 //!
@@ -45,13 +46,14 @@ use gossip_contracts::identity::{
     FenceEpoch, OpId, PolicyHash, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
 use gossip_contracts::persistence::{CommitHandle, DoneLedger, DoneLedgerRecord, OvidHash};
+use gossip_persistence_inmemory::CompletionOrder;
+use gossip_persistence_inmemory::InMemoryDoneLedger;
 use gossip_persistence_inmemory::sim::{
     DoneLedgerFaultConfig, DoneLedgerInvariantChecker, DoneLedgerInvariantViolation,
     DoneLedgerOracle,
 };
-use gossip_persistence_inmemory::CompletionOrder;
-use gossip_persistence_inmemory::InMemoryDoneLedger;
 
+use crate::Lease;
 use crate::error::{AcquireScratch, CheckpointError, CompleteError, IdempotentOutcome, SplitError};
 use crate::facade::{ClaimError, ShardClaiming};
 use crate::in_memory::InMemoryCoordinator;
@@ -59,9 +61,12 @@ use crate::record::ParkReason;
 use crate::run::{RunConfig, RunManagement};
 use crate::session::WorkerSession;
 use crate::traits::CoordinationBackend;
-use crate::Lease;
 
 use super::scan_driver_sim::generate_scan_outcome;
+use super::shared::{
+    CheckpointOpMap, DEFAULT_LEASE_DURATION, MAX_STALE_LEASES, SessionTerminalAction,
+    SplitInputCopy, random_midpoint, require_lease_and_op,
+};
 use super::worker::SimWorker;
 use super::{
     FaultConfig, FaultLevel, InvariantChecker, InvariantViolation, RejectionKind, RunTerminalKind,
@@ -72,32 +77,12 @@ use super::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default shard lease duration (logical time ticks).
-const DEFAULT_LEASE_DURATION: u64 = 100;
-
-/// Maximum retained stale leases for zombie checkpoint injection.
-const MAX_STALE_LEASES: usize = 64;
-
 /// Size of the OVID hash pool used for synthetic done-ledger records.
-/// Matches the pool size in DoneLedgerSim for consistency.
 const OVID_POOL_SIZE: usize = 50;
 
 /// Items generated per scan lifecycle (inclusive range).
 const SCAN_ITEMS_MIN: usize = 1;
 const SCAN_ITEMS_MAX: usize = 5;
-
-/// PPM ceiling for fault probability calculations.
-#[allow(dead_code)] // Used by random op generation to validate PPM ceilings.
-const PPM_MAX: u32 = 1_000_000;
-
-/// Saved checkpoint state: `(worker_raw, run_raw, shard_raw)` → `(op_id, cursor, worker, key)`.
-type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Vec<u8>, WorkerId, ShardKey)>;
-
-/// Split spec bounds: `(start_buf, start_len, end_buf, end_len)`.
-type SplitBoundsBuf = ([u8; MAX_KEY_SIZE], usize, [u8; MAX_KEY_SIZE], usize);
-
-/// Split input snapshot: spec bounds + optional first cursor byte.
-type SplitInputCopy = (SplitBoundsBuf, Option<u8>);
 
 // ---------------------------------------------------------------------------
 // DoneLedgerFaultOp
@@ -137,9 +122,11 @@ pub enum DoneLedgerFaultOp {
 #[derive(Debug, Clone)]
 pub struct CompositionFaultConfig {
     /// Coordination-level faults (lease expiry, pause, time jump).
-    pub coordination: FaultConfig,
+    #[allow(dead_code)]
+    coordination: FaultConfig,
     /// Persistence-level faults (submit fail, commit fail, delay).
-    pub persistence: DoneLedgerFaultConfig,
+    #[allow(dead_code)]
+    persistence: DoneLedgerFaultConfig,
     /// Probability (PPM) of crashing between coordinator `complete()` and
     /// done-ledger `batch_upsert()`. Models the most dangerous cross-component
     /// failure mode: the coordinator believes the shard is done but the
@@ -332,8 +319,11 @@ pub struct CompositionSim {
     coord_checker: InvariantChecker,
     ledger_checker: DoneLedgerInvariantChecker,
     workers: BTreeMap<WorkerId, SimWorker>,
-    /// Cross-boundary fault rates. Used by random op generation and the
-    /// cross-component invariant checker (C1-C4).
+    /// Cross-boundary fault rates reserved for the random op generator
+    /// (not yet implemented). Currently only consumed by
+    /// [`CompositionFaultConfig::for_level`] — the harness drives fault
+    /// injection imperatively via [`CompositionSimOp::InjectLedgerFault`]
+    /// until a probabilistic op selector is added.
     #[allow(dead_code)]
     fault_config: CompositionFaultConfig,
     tenant: TenantId,
@@ -505,9 +495,9 @@ impl CompositionSim {
 
     /// Execute a single operation and run invariant checkers.
     ///
-    /// Draw order contract: `execute_op → check_coordination_invariants →
-    /// check_persistence_invariants → return`. This matches the coordination
-    /// harness pattern.
+    /// Draw order contract: `execute_op` (scan lifecycle ops check persistence
+    /// invariants inline during ledger writes) → `check_coordination_invariants`
+    /// → return.
     pub fn step(
         &mut self,
         op: CompositionSimOp,
@@ -666,6 +656,9 @@ impl CompositionSim {
                     self.mark_shard_terminal(worker, key);
                     true
                 }
+                Err(CompleteError::BackendError(infra)) => {
+                    panic!("simulation backend produced unexpected infrastructure error: {infra}")
+                }
                 Err(_) => false,
             }
         } else {
@@ -754,6 +747,9 @@ impl CompositionSim {
                     self.mark_shard_terminal(worker, key);
                     true
                 }
+                Err(CompleteError::BackendError(infra)) => {
+                    panic!("simulation backend produced unexpected infrastructure error: {infra}")
+                }
                 Err(_) => false,
             };
 
@@ -835,6 +831,9 @@ impl CompositionSim {
                     self.mark_shard_terminal(worker, key);
                     true
                 }
+                Err(CompleteError::BackendError(infra)) => {
+                    panic!("simulation backend produced unexpected infrastructure error: {infra}")
+                }
                 Err(_) => false,
             };
 
@@ -874,10 +873,6 @@ impl CompositionSim {
             return Err(CompositionSimEvent::ScanClaimFailed { worker });
         }
 
-        if self.active_shard_keys.is_empty() {
-            return Err(CompositionSimEvent::ScanClaimFailed { worker });
-        }
-
         let now = self.context.now();
         let run = self.run;
         match self.coordinator.claim_next_available(
@@ -896,7 +891,18 @@ impl CompositionSim {
                     .record_claim_success(worker, self.context.now());
                 Ok((lease, key))
             }
-            Err(_) => Err(CompositionSimEvent::ScanClaimFailed { worker }),
+            Err(ClaimError::NoneAvailable { .. } | ClaimError::Throttled { .. }) => {
+                Err(CompositionSimEvent::ScanClaimFailed { worker })
+            }
+            Err(ClaimError::RunNotFound) => {
+                panic!("claim_shard_for_scan: run not found — simulation setup bug")
+            }
+            Err(ClaimError::TenantMismatch { .. }) => {
+                panic!("claim_shard_for_scan: tenant mismatch — simulation setup bug")
+            }
+            Err(ClaimError::BackendError(infra)) => {
+                panic!("simulation backend produced unexpected infrastructure error: {infra}")
+            }
         }
     }
 
@@ -1229,11 +1235,8 @@ impl CompositionSim {
         let plan =
             match plan_split_replace_at_points_initial_cursor(parent_spec, [mid_key.as_slice()]) {
                 Ok(p) => p,
-                Err(_e) => {
-                    debug_assert!(false, "unexpected split-replace plan failure: {_e:?}");
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::SplitValidation,
-                    };
+                Err(e) => {
+                    panic!("unexpected split-replace plan failure: {e:?}");
                 }
             };
 
@@ -1296,11 +1299,8 @@ impl CompositionSim {
         let parent_spec = ShardSpecRef::with_range(start, end);
         let plan = match plan_split_residual_at_point(parent_spec, mid_key.as_slice()) {
             Ok(p) => p,
-            Err(_e) => {
-                debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
-                return SimEvent::Rejected {
-                    kind: RejectionKind::SplitValidation,
-                };
+            Err(e) => {
+                panic!("unexpected split-residual plan failure: {e:?}");
             }
         };
 
@@ -1469,6 +1469,11 @@ impl CompositionSim {
             _ => SessionTerminalAction::Complete,
         };
 
+        // SplitResidualThenComplete needs 2 op-IDs (split + complete) so
+        // extra_ops = 2, but uses pre-computed split_residual_plan values
+        // instead of cursors[terminal_idx..] for the actual keys. The extra
+        // cursor draws are consumed unconditionally to keep the PRNG stream
+        // fixed for a given (seed, terminal_action) pair.
         let extra_ops = match terminal_action {
             SessionTerminalAction::SplitResidualThenComplete => 2,
             _ => 1,
@@ -1565,9 +1570,16 @@ impl CompositionSim {
             let terminal_idx = num_checkpoints as usize;
             match terminal_action {
                 SessionTerminalAction::Park => {
-                    let is_terminal = sess
-                        .park(now, ParkReason::Other, op_ids[terminal_idx])
-                        .is_ok();
+                    let is_terminal = match sess.park(now, ParkReason::Other, op_ids[terminal_idx])
+                    {
+                        Ok(_) => true,
+                        Err(crate::error::ParkError::BackendError(infra)) => {
+                            panic!(
+                                "simulation backend produced unexpected infrastructure error: {infra}"
+                            )
+                        }
+                        Err(_) => false,
+                    };
                     Ok(SessionOutcome {
                         lease,
                         is_terminal,
@@ -1611,14 +1623,10 @@ impl CompositionSim {
                         [mid_key.as_slice()],
                     ) {
                         Ok(plan) => plan,
-                        Err(_) => {
-                            return Ok(SessionOutcome {
-                                lease,
-                                is_terminal: false,
-                                checkpoints_ok,
-                                checkpoints_rejected,
-                                split_children: Vec::new(),
-                            });
+                        Err(e) => {
+                            panic!(
+                                "unexpected split-replace plan failure in session lifecycle: {e:?}"
+                            );
                         }
                     };
                     match sess.split_replace(now, plan, op_ids[terminal_idx]) {
@@ -1656,14 +1664,10 @@ impl CompositionSim {
                     let parent_spec = ShardSpecRef::with_range(&range_lo_key, &range_hi_key);
                     let plan = match plan_split_residual_at_point(parent_spec, mid_key.as_slice()) {
                         Ok(plan) => plan,
-                        Err(_) => {
-                            return Ok(SessionOutcome {
-                                lease,
-                                is_terminal: false,
-                                checkpoints_ok,
-                                checkpoints_rejected,
-                                split_children: Vec::new(),
-                            });
+                        Err(e) => {
+                            panic!(
+                                "unexpected split-residual plan failure in session lifecycle: {e:?}"
+                            );
                         }
                     };
                     let split_ok = match sess.split_residual(now, plan, op_ids[terminal_idx]) {
@@ -1883,8 +1887,8 @@ impl CompositionSim {
                 })?;
 
         let (start, end) = self.coordinator.spec_bounds(record);
-        debug_assert!(start.len() <= MAX_KEY_SIZE);
-        debug_assert!(end.len() <= MAX_KEY_SIZE);
+        assert!(start.len() <= MAX_KEY_SIZE);
+        assert!(end.len() <= MAX_KEY_SIZE);
 
         let mut start_buf = [0u8; MAX_KEY_SIZE];
         let mut end_buf = [0u8; MAX_KEY_SIZE];
@@ -1916,40 +1920,16 @@ impl CompositionSim {
 }
 
 // ---------------------------------------------------------------------------
-// Free functions
+// Composition-specific free function
 // ---------------------------------------------------------------------------
 
-/// Validate worker preconditions and consume the next op-ID.
-///
-/// Free function for borrow splitting: callers pass `&mut self.workers`
-/// while retaining mutable access to `self.coordinator` and `self.context`.
-fn require_lease_and_op(
-    workers: &mut BTreeMap<WorkerId, SimWorker>,
-    worker: WorkerId,
-    key: &ShardKey,
-) -> Result<(Lease, OpId), SimEvent> {
-    let w = workers
-        .get_mut(&worker)
-        .filter(|w| !w.is_paused())
-        .ok_or(SimEvent::Rejected {
-            kind: RejectionKind::WorkerPaused,
-        })?;
-    let lease = *w.lease_for(key).ok_or(SimEvent::Rejected {
-        kind: RejectionKind::NotLeased,
-    })?;
-    let op_id = w.next_op_id();
-    Ok((lease, op_id))
-}
-
-/// Compute a random split midpoint in the half-open interval `[lo, hi)`.
-fn random_midpoint(rng: &mut ChaCha8Rng, lo: u8, hi: u8) -> Option<u8> {
-    if lo >= hi {
-        return None;
-    }
-    Some(rng.random_range(lo..hi))
-}
-
 /// Pre-compute a split-residual plan and a post-split completion cursor.
+///
+/// Chooses a random midpoint after `last_checkpoint_byte` so the parent
+/// retains all previously scanned data. Returns the split point and a
+/// completion cursor for the narrowed parent.
+///
+/// Uses `saturating_add` on `range_lo` to avoid overflow when `range_lo == 255`.
 fn precompute_split_residual_plan(
     rng: &mut ChaCha8Rng,
     range_lo: u8,
@@ -1967,15 +1947,6 @@ fn precompute_split_residual_plan(
         rng.random_range(mid..range_hi)
     };
     Some((mid, complete_byte))
-}
-
-/// Terminal action selection for session lifecycle.
-#[derive(Debug, Clone, Copy)]
-enum SessionTerminalAction {
-    Complete,
-    Park,
-    SplitReplace,
-    SplitResidualThenComplete,
 }
 
 // ---------------------------------------------------------------------------
@@ -2129,38 +2100,6 @@ mod tests {
         assert!(
             !entry.committed,
             "provenance should record uncommitted after submit failure"
-        );
-    }
-
-    #[test]
-    fn submit_failure_records_uncommitted_provenance() {
-        let config = CompositionFaultConfig::for_level(FaultLevel::SunnyDay);
-        let mut sim = CompositionSim::new(55, config)
-            .with_workers_and_shards(1, 2)
-            .expect("setup should succeed");
-
-        sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
-
-        // Inject a submit failure so the ledger write is rejected.
-        sim.step(CompositionSimOp::InjectLedgerFault(
-            DoneLedgerFaultOp::InjectSubmitFailure { count: 1 },
-        ));
-
-        let (_event, violations) = sim.step(CompositionSimOp::ScanLifecycle {
-            worker: WorkerId::from_raw(1),
-        });
-        assert!(
-            violations.is_empty(),
-            "submit-failure rollback should be clean: {violations:?}"
-        );
-
-        let entry = sim
-            .write_log()
-            .last()
-            .expect("should have provenance entry");
-        assert!(
-            !entry.committed,
-            "provenance should record uncommitted when ledger write fails"
         );
     }
 }

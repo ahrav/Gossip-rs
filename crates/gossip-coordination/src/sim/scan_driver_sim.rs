@@ -17,8 +17,8 @@ use gossip_contracts::persistence::{
     OvidHash,
 };
 
-use crate::sim::SimContext;
 use crate::Lease;
+use crate::sim::SimContext;
 
 // ---------------------------------------------------------------------------
 // ScanOutcome
@@ -72,6 +72,7 @@ pub struct ScanOutcome {
 /// for the bounded byte.
 ///
 /// Appending new draws at the end preserves determinism for existing seeds.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_scan_outcome(
     context: &mut SimContext,
     lease: &Lease,

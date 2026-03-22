@@ -63,6 +63,7 @@ pub mod fault_injector;
 mod harness;
 mod invariants;
 mod overload;
+mod shared;
 mod worker;
 
 pub use backend::{SimIntrospection, SimulationBackend};
