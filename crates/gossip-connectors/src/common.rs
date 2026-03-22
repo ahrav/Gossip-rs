@@ -4,6 +4,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 #[cfg(unix)]
@@ -188,6 +189,12 @@ pub(crate) fn estimate_split_from_sorted<'a>(
     let split = ItemKey::try_from_slice(split_key)
         .expect("split key bytes from validated ItemKey must round-trip");
     Ok(Some(split))
+}
+
+/// Returns `true` when a deadline is present and has already passed.
+#[inline]
+pub(crate) fn deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|value| Instant::now() >= value)
 }
 
 // ---------------------------------------------------------------------------

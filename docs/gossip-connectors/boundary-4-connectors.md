@@ -32,10 +32,13 @@ The crate provides four core capabilities:
   (local mirror acquisition), and `GitRepoExecutor` (whole-repo
   execution). These operate on repositories rather than individual items.
 
-- **Connector method surface** -- each concrete connector exposes `caps`,
-  `choose_split_point`, `open`, and `read_range` as
-  inherent methods with shared signatures. `ConnectorCapabilities`
-  advertises optional features at registration time.
+- **Connector method surface** -- `FilesystemConnector` directly
+  implements `OrderedContentSource` while preserving matching inherent
+  helper methods (`fill_page`, `choose_split_point`, `open`,
+  `read_range`). `ConnectorCapabilities` advertises optional
+  features at registration time, and the other reference connectors keep
+  the same inherent `caps` / `choose_split_point` / `open` /
+  `read_range` signatures.
 
 ### Source files (excluding `*_tests.rs`)
 
@@ -55,7 +58,7 @@ The crate provides four core capabilities:
 | File             | Role                                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------------------- |
 | `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `GitConnector`, `MemItem`, `path_buf_from_bytes`, `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG` |
-| `common.rs`      | Shared utilities: binary search, identity derivation, split-point selection, pooled page assembly, I/O error classification, path conversion |
+| `common.rs`      | Shared utilities: shard-bound validation, binary search, deadline checks, I/O error classification, path conversion |
 | `in_memory.rs`   | `InMemoryDeterministicConnector` -- deterministic in-memory fixture                                           |
 | `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |
 | `split_estimator.rs` | `StreamingSplitEstimator` -- bounded-memory byte-weighted split-point estimation                          |
@@ -232,11 +235,12 @@ impl FilesystemConnector {  // same signatures on all three connectors
 
 Key design points:
 
-- `Budgets` values are advisory at the connector layer. Enforcement is the
-  runtime's responsibility.
 - `choose_split_point` takes all three parameters (`shard`, `cursor`,
   `budgets`) for interface consistency, even though some connectors ignore
   the budget.
+- `FilesystemConnector` rejects expired split deadlines directly; the other
+  reference connectors may still treat split budgets as advisory when the
+  operation is metadata-only.
 
 ### Read methods (inherent on each connector)
 
@@ -260,7 +264,9 @@ impl FilesystemConnector {  // same signatures on all three connectors
 
 The boxed `dyn Read + Send` return from `open` is intentional: it sits
 on the WARM read path (once per item, not per byte), and the IO cost of
-subsequent reads dominates the heap allocation.
+subsequent reads dominates the heap allocation. `FilesystemConnector`
+wraps the returned reader in a byte-budget guard, while higher runtime
+layers can still compose their own outer limits.
 
 ### ConnectorCapabilities (`api.rs`)
 
@@ -335,19 +341,33 @@ already-sorted in-memory range without a persistent estimator field.
 
 ### FilesystemConnector (`filesystem.rs`, Unix-only)
 
-Real-IO connector for local filesystem directories. Streaming sorted
-DFS walk (per-directory sorted frames, no full-tree materialization).
-`openat`-based reads with `O_NOFOLLOW` for read confinement.
-Symlinks are skipped during walk and rejected at open time.
+Real-IO ordered-content connector for local filesystem directories or a
+single canonical file. Enumeration uses a bounded stack of per-directory
+sorted entry buffers and walks the live filesystem view in lexicographic
+relative-path order without building a whole-tree snapshot. `openat`-based
+reads with `O_NOFOLLOW` keep directory roots confined, and single-file
+roots open the canonical file path directly with the same regular-file
+validation.
 
 Capabilities: `seek_by_key: true`, `token_resume: false`,
 `split_hints: false`, `range_read: true`.
 
-The `StreamingSplitEstimator` field exists on the struct but has no
-observation feed after the enumeration-walk removal. `choose_split_point`
-returns `Ok(None)` until an external caller populates the estimator.
-`openat`-based reads with `O_NOFOLLOW` reject symlink-based
-traversal at each path component.
+`FilesystemConnector` directly implements `OrderedContentSource` and
+emits `PageBuf<ScanItem>` pages with relative-path `ItemKey` /
+`ItemRef` values, root-scoped filesystem `StableItemId` derivation, weak
+metadata-based `VersionId` values, and metadata-backed `size_hint`s.
+Page fill applies connector-side `max_items`, `max_bytes`, and deadline
+budgets. Resume is key-authoritative: enumeration rescans the live root
+view and skips entries at or below `Cursor::last_key()`. The first
+in-scope item is still emitted even when its `size_hint` alone exceeds
+`max_bytes`, which preserves forward progress for oversized files. Full
+reads reject expired deadlines and return a bounded reader, while
+`read_range` clamps bytes to `max_bytes`.
+
+The `StreamingSplitEstimator` field has no internal observation
+feed from page enumeration, so `split_hints` remains `false`. The
+connector exposes `choose_split_point`, but it returns `Ok(None)`
+until an external caller populates the estimator with observations.
 
 ### GitConnector (`git.rs`)
 
@@ -399,40 +419,35 @@ to convert `git ls-files` output to filesystem paths.
 
 ### Shared utilities (`common.rs`)
 
-`common.rs` contains all shared connector infrastructure.
-This keeps connector implementations thin and ensures binary search,
-bound resolution, page assembly, and I/O error classification stay
-consistent across `FilesystemConnector`, `GitConnector`, and
-`InMemoryDeterministicConnector`.
+`common.rs` contains shared connector infrastructure for shard-bound
+validation, binary search, split-candidate validation, deadline checks,
+I/O error classification, and path conversion. This keeps connector
+implementations thin and ensures bound resolution and retry posture stay
+consistent across the reference connectors.
 
 #### Core search and split utilities
 
-| Function                | Purpose                                                          |
-| ----------------------- | ---------------------------------------------------------------- |
-| `derive_stable_item_id` | BLAKE3 domain-separated identity from `ConnectorTag` + `ItemKey` |
-| `borrowed_shard_bound`  | Validate + borrow shard key-range bound (empty = unbounded)      |
-| `lower_bound`           | Binary search: first index with key >= target                    |
-| `upper_bound`           | Binary search: first index with key > target                     |
+| Function                   | Purpose                                                          |
+| -------------------------- | ---------------------------------------------------------------- |
+| `borrowed_shard_bound`     | Validate + borrow shard key-range bound (empty = unbounded)      |
+| `lower_bound`              | Binary search: first index with key >= target                    |
+| `upper_bound`              | Binary search: first index with key > target                     |
 | `is_valid_split_candidate` | Post-selection guard: split advances past cursor, stays below end |
+| `deadline_expired`         | Shared monotonic deadline check for connector-local budget gates |
 
 Filesystem, git, and in-memory connectors all use
 `StreamingSplitEstimator` (`split_estimator.rs`) for byte-weighted split
-selection. The filesystem connector feeds it incrementally during the
-pagination walk; git and in-memory connectors bulk-load their
-already-materialized sorted ranges via `from_sorted_entries`.
-Count-balanced midpoint is the fallback when all entries are zero-size
-or weight concentrates in the leading entry.
+selection. Git and in-memory connectors bulk-load their already-sorted
+ranges via `from_sorted_entries`. `FilesystemConnector` keeps the same
+estimator field for future split-hint plumbing, but it does not feed the
+estimator internally yet, so split hints remain disabled.
 
 #### Bound resolution and cursor resume
 
-| Function              | Purpose                                                               |
-| --------------------- | --------------------------------------------------------------------- |
-| `resolve_bounds`      | Map shard byte bounds to half-open index range via binary search       |
-| `key_resume_start`    | Key-authoritative cursor resume: first index past last emitted key     |
-| `cursor_token_index`  | Decode optional cursor token as an absolute next-index                 |
-| `is_valid_split_candidate` | Post-selection guard: split advances past cursor, stays below end |
-| `build_next_cursor`   | Build continuation cursor with optional token encoding                 |
-| `build_next_cursor_from_staged` | Build cursor preserving staged pooled token when available  |
+| Function           | Purpose                                                           |
+| ------------------ | ----------------------------------------------------------------- |
+| `resolve_bounds`   | Map shard byte bounds to half-open index range via binary search  |
+| `key_resume_start` | Key-authoritative cursor resume: first index past last emitted key |
 
 #### I/O error classification
 
@@ -527,8 +542,11 @@ the only durable resumption primitive. If a token is lost, stale, or
 corrupt, the connector must be able to resume from `last_key` alone.
 Token-perturbation tests verify this property.
 
-### Budgets are advisory
+### Budget ownership
 
-`Budgets` values are advisory at the connector trait layer. Connectors
-should honor them but callers must not assume compliance. The runtime
-orchestration layer is responsible for enforcement.
+`Budgets` give the runtime the authoritative outer policy, but
+connectors can enforce local safety limits directly. `FilesystemConnector`
+rejects expired deadlines, bounds page assembly with `max_items` and
+`max_bytes`, and clamps full or ranged reads. Other connectors may
+treat some budget fields as advisory when their operations are
+metadata-only or already bounded by an in-memory snapshot.
