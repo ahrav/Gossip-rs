@@ -18,6 +18,7 @@ members = [
     "crates/gossip-frontier",
     "crates/gossip-worker",
     "crates/scanner-rs-cli",
+    "tools/dev-seed",
 ]
 
 [workspace.package]

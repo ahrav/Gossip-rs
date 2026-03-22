@@ -1,0 +1,19 @@
+[package]
+name = "dev-seed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+gossip-contracts = { workspace = true }
+gossip-coordination = { workspace = true }
+gossip-coordination-etcd = { workspace = true }
+gossip-frontier = { workspace = true }
+gossip-stdx = { workspace = true }
+gossip-done-ledger-postgres = { workspace = true }
+gossip-findings-postgres = { workspace = true }
+postgres = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }

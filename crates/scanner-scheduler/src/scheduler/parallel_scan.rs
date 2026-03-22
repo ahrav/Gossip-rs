@@ -445,8 +445,10 @@ impl IterWalker {
     /// Build a single-threaded directory walker rooted at `root`.
     ///
     /// Configures the `ignore` crate's `WalkBuilder` with gitignore,
-    /// symlink, and hidden-file settings from `config`. The resulting
-    /// iterator is consumed lazily by `next_file()`.
+    /// symlink, and hidden-file settings from `config`. Entries within
+    /// each directory are sorted by path so the emission order is
+    /// deterministic and monotonically increasing by key — a requirement
+    /// for the distributed checkpoint aggregator's resume semantics.
     fn new(root: &Path, config: &ParallelScanConfig) -> Self {
         let mut builder = ignore::WalkBuilder::new(root);
         builder
@@ -454,7 +456,8 @@ impl IterWalker {
             .hidden(config.skip_hidden)
             .git_ignore(config.respect_gitignore)
             .git_global(config.respect_gitignore)
-            .git_exclude(config.respect_gitignore);
+            .git_exclude(config.respect_gitignore)
+            .sort_by_file_path(|a, b| a.cmp(b));
         Self {
             walk: builder.build(),
         }
@@ -927,5 +930,27 @@ mod tests {
         assert_eq!(report.stats.files_enqueued, 1);
         assert_eq!(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn iter_walker_emits_files_in_sorted_order() {
+        let dir = TempDir::new().unwrap();
+
+        // Names chosen to break naive (insertion-order) iteration.
+        fs::write(dir.path().join("z_first.txt"), "zzz").unwrap();
+        fs::write(dir.path().join("a_second.txt"), "aaa").unwrap();
+        fs::write(dir.path().join("m_middle.txt"), "mmm").unwrap();
+
+        let config = small_config();
+        let mut walker = IterWalker::new(dir.path(), &config);
+
+        let mut names: Vec<String> = Vec::new();
+        while let Some(file) = walker.next_file() {
+            if let Some(name) = file.path.file_name() {
+                names.push(name.to_string_lossy().into_owned());
+            }
+        }
+
+        assert_eq!(names, vec!["a_second.txt", "m_middle.txt", "z_first.txt"]);
     }
 }

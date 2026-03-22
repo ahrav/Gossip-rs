@@ -2814,7 +2814,7 @@ mod tests {
     }
 
     #[test]
-    fn run_filesystem_lease_clean_only_shard_returns_no_checkpoint() {
+    fn run_filesystem_lease_clean_only_shard_produces_checkpoint_and_done_ledger_entry() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 
@@ -2834,18 +2834,23 @@ mod tests {
         .expect("clean-only filesystem shard should succeed");
 
         assert_eq!(report.items_scanned, 1);
-        assert!(checkpoint.is_none());
+        // Clean files still produce a done-ledger entry ("scanned, nothing
+        // found") and advance the checkpoint cursor so resume skips them.
+        assert!(
+            checkpoint.is_some(),
+            "clean file should still produce a checkpoint cursor for resume"
+        );
         assert!(
             findings_sink
                 .observations_snapshot()
                 .expect("observations snapshot")
                 .is_empty()
         );
-        assert!(
-            done_ledger
-                .snapshot()
-                .expect("done-ledger snapshot")
-                .is_empty()
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "clean file should produce exactly one done-ledger row"
         );
     }
 
@@ -3074,8 +3079,8 @@ mod tests {
         let rows = done_ledger.snapshot().expect("done-ledger snapshot");
         assert_eq!(
             rows.len(),
-            1,
-            "only the finding-bearing file produces a done-ledger row"
+            2,
+            "both files (finding-bearing and clean) produce a done-ledger row"
         );
     }
 
