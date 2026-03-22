@@ -1170,6 +1170,12 @@ pub(crate) struct OwnedCommitBatch {
 /// `discovery_sequence` changes, the previous sequence is known to be
 /// complete and can be flushed if it is the next expected sequence.
 ///
+/// Internally the buffer uses a `VecDeque` indexed by
+/// `(discovery_sequence - next_flush)`, giving O(1) insert and O(1)
+/// drain per slot with cache-linear iteration. Discovery sequences are
+/// dense `u32`s starting from 0, so direct indexing avoids the O(log n)
+/// overhead and pointer chasing of a tree-based map.
+///
 /// When files arrive in near-discovery order, memory stays bounded by
 /// the number of in-flight files (`max_in_flight_objects`). When
 /// skipped files create gaps, `drain_ready` stalls and all produced
@@ -1180,13 +1186,15 @@ pub(crate) struct OwnedCommitBatch {
 /// discovery-sequence space. `drain_ready` stalls at the first gap
 /// because the missing sequence is never marked complete. The
 /// `finish()` safety net handles this correctly: it flushes all
-/// residual batches in `BTreeMap` key order (ascending discovery
-/// sequence). Under real workloads with skipped files the buffer
-/// therefore degrades to sort-at-end rather than streaming, which is
-/// acceptable since it runs on a dedicated consumer thread.
+/// residual batches in index order (ascending discovery sequence).
+/// Under real workloads with skipped files the buffer therefore
+/// degrades to sort-at-end rather than streaming, which is acceptable
+/// since it runs on a dedicated consumer thread.
 struct DiscoveryOrderBuffer {
-    /// Batches grouped by their discovery sequence.
-    pending: std::collections::BTreeMap<u32, Vec<OwnedCommitBatch>>,
+    /// Batches indexed by `(discovery_sequence - next_flush)`. `None`
+    /// slots represent gaps from skipped files that produced zero
+    /// batches.
+    pending: std::collections::VecDeque<Option<Vec<OwnedCommitBatch>>>,
     /// The discovery sequence currently being received (all batches
     /// arriving on the channel belong to this sequence until it changes).
     current_ds: Option<u32>,
@@ -1198,7 +1206,7 @@ struct DiscoveryOrderBuffer {
 impl DiscoveryOrderBuffer {
     fn new() -> Self {
         Self {
-            pending: std::collections::BTreeMap::new(),
+            pending: std::collections::VecDeque::new(),
             current_ds: None,
             next_flush: 0,
         }
@@ -1215,11 +1223,16 @@ impl DiscoveryOrderBuffer {
                 next_flush = self.next_flush,
                 path = %String::from_utf8_lossy(&batch.object_path),
                 "batch arrived for already-flushed discovery sequence; \
-                 indicates a sequence assignment bug"
+                 dropping to prevent duplicate forwarding"
             );
+            return;
         }
         self.current_ds = Some(ds);
-        self.pending.entry(ds).or_default().push(batch);
+        let idx = (ds - self.next_flush) as usize;
+        if idx >= self.pending.len() {
+            self.pending.resize_with(idx + 1, || None);
+        }
+        self.pending[idx].get_or_insert_with(Vec::new).push(batch);
     }
 
     /// Drain all contiguous complete discovery sequences starting at
@@ -1228,17 +1241,24 @@ impl DiscoveryOrderBuffer {
     /// (the single-writer guarantee means no more batches will arrive).
     fn drain_ready(&mut self, out: &mut Vec<OwnedCommitBatch>) {
         while Some(self.next_flush) != self.current_ds {
-            match self.pending.remove(&self.next_flush) {
-                Some(batches) => out.extend(batches),
-                None => {
+            match self.pending.front() {
+                Some(Some(_)) => {
+                    // Front slot is populated — flush it.
+                    if let Some(Some(batches)) = self.pending.pop_front() {
+                        out.extend(batches);
+                    }
+                }
+                Some(None) => {
+                    // Gap: skipped file produced zero batches.
                     tracing::debug!(
                         gap_at = self.next_flush,
-                        buffered_sequences = self.pending.len(),
+                        buffered_sequences = self.pending.iter().filter(|s| s.is_some()).count(),
                         "drain stalled at sequence gap (skipped file); \
                          remaining batches deferred to finish()"
                     );
                     break;
                 }
+                None => break,
             }
             self.next_flush += 1;
         }
@@ -1246,22 +1266,19 @@ impl DiscoveryOrderBuffer {
 
     /// Flush all remaining batches in discovery order. Called when the
     /// channel is closed — all sequences are complete at this point.
-    /// `BTreeMap::into_iter` yields entries in ascending key order,
-    /// which is discovery order by construction.
+    /// Iterates the `VecDeque` front-to-back, which is ascending
+    /// discovery-sequence order by construction.
     fn finish(self) -> Vec<OwnedCommitBatch> {
-        if self
-            .pending
-            .first_key_value()
-            .is_some_and(|(&ds, _)| ds != self.next_flush)
-        {
+        let has_leading_gap = self.pending.front().is_some_and(|slot| slot.is_none());
+        if has_leading_gap {
             tracing::debug!(
                 expected_next = self.next_flush,
-                residual_sequences = self.pending.len(),
+                residual_sequences = self.pending.iter().filter(|s| s.is_some()).count(),
                 "discovery order buffer: gaps detected in sequence space"
             );
         }
         let mut out = Vec::new();
-        for (_ds, batches) in self.pending {
+        for batches in self.pending.into_iter().flatten() {
             out.extend(batches);
         }
         out

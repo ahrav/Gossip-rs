@@ -1289,13 +1289,29 @@ where
         }
 
         let file_id = FileId(next_file_id);
+        // Virtual archive-entry FileIds occupy 0x8000_0000.. so real
+        // file IDs must stay below that boundary to avoid aliasing.
+        const VIRTUAL_BASE: u32 = 0x8000_0000;
         next_file_id = match next_file_id.checked_add(1) {
-            Some(id) => id,
-            None => {
+            Some(id) if id < VIRTUAL_BASE => id,
+            _ => {
                 eprintln!(
-                    "discovery sequence overflow at u32::MAX files; \
-                     stopping file enumeration"
+                    "discovery file ID reached virtual-entry namespace \
+                     boundary ({VIRTUAL_BASE:#x}); stopping file enumeration"
                 );
+                // Enqueue this last file, then stop accepting new files.
+                stats.files_enqueued = stats.files_enqueued.saturating_add(1);
+                stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);
+                progress_sink.on_progress(LocalProgress {
+                    files_enqueued: stats.files_enqueued,
+                    bytes_enqueued: stats.bytes_enqueued,
+                });
+                let task = FileTask {
+                    file_id,
+                    path: file.path,
+                    _permit: permit,
+                };
+                batch.push(task);
                 break;
             }
         };

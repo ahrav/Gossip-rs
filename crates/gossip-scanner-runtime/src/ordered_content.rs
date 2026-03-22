@@ -113,6 +113,13 @@ pub(crate) fn scan_local_filesystem(
 /// already been requested. Otherwise spawns two scoped forwarder threads
 /// (event and commit), runs the parallel scanner, and joins both forwarders
 /// before returning.
+///
+/// # Errors
+///
+/// Returns `ScanRuntimeError::Driver` if `persist_findings` is enabled with
+/// `workers != 1`. Finding persistence requires single-threaded scanning so
+/// commit batches arrive in contiguous discovery-sequence groups; multi-worker
+/// scanning reorders batches and breaks checkpoint sequencing.
 pub(crate) fn scan_local_filesystem_with_engine(
     config: &FsScanConfig,
     canonical_path: PathBuf,
