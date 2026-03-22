@@ -1172,11 +1172,19 @@ pub(crate) struct OwnedCommitBatch {
 ///
 /// Memory is bounded by at most `batch_cap` (≤64) files worth of
 /// `OwnedCommitBatch` data.
+///
+/// Files that produce zero batches (skipped by extension, binary
+/// classification, size limit, or I/O error) create gaps in the
+/// discovery-sequence space. `drain_ready` stalls at the first gap
+/// because the missing sequence is never marked complete. The
+/// `finish()` safety net handles this correctly: it flushes all
+/// residual batches in `BTreeMap` key order (ascending discovery
+/// sequence). Under real workloads with skipped files the buffer
+/// therefore degrades to sort-at-end rather than streaming, which is
+/// acceptable since it runs on a dedicated consumer thread.
 struct DiscoveryOrderBuffer {
     /// Batches grouped by their discovery sequence.
     pending: std::collections::BTreeMap<u32, Vec<OwnedCommitBatch>>,
-    /// Discovery sequences for which all batches have been received.
-    complete: std::collections::HashSet<u32>,
     /// The discovery sequence currently being received (all batches
     /// arriving on the channel belong to this sequence until it changes).
     current_ds: Option<u32>,
@@ -1189,53 +1197,58 @@ impl DiscoveryOrderBuffer {
     fn new() -> Self {
         Self {
             pending: std::collections::BTreeMap::new(),
-            complete: std::collections::HashSet::new(),
             current_ds: None,
             next_flush: 0,
         }
     }
 
-    /// Accept a batch. If the discovery sequence changed, the previous
-    /// sequence is marked complete and a flush of all contiguous complete
-    /// sequences from `next_flush` is triggered.
+    /// Accept a batch. When the discovery sequence changes, the previous
+    /// sequence is implicitly complete (single-writer guarantee) and
+    /// becomes eligible for flushing via [`drain_ready`].
     fn push(&mut self, batch: OwnedCommitBatch) {
         let ds = batch.discovery_sequence;
-        if let Some(prev) = self.current_ds
-            && prev != ds
-        {
-            self.complete.insert(prev);
-        }
+        debug_assert!(
+            ds >= self.next_flush,
+            "batch arrived for already-flushed discovery sequence {ds} (next_flush={})",
+            self.next_flush,
+        );
         self.current_ds = Some(ds);
         self.pending.entry(ds).or_default().push(batch);
     }
 
     /// Drain all contiguous complete discovery sequences starting at
     /// `next_flush`, preserving arrival order within each sequence.
+    /// A pending sequence is complete when it differs from `current_ds`
+    /// (the single-writer guarantee means no more batches will arrive).
     fn drain_ready(&mut self, out: &mut Vec<OwnedCommitBatch>) {
-        while self.complete.contains(&self.next_flush) {
-            self.complete.remove(&self.next_flush);
-            if let Some(batches) = self.pending.remove(&self.next_flush) {
-                out.extend(batches);
+        while Some(self.next_flush) != self.current_ds {
+            match self.pending.remove(&self.next_flush) {
+                Some(batches) => out.extend(batches),
+                None => break,
             }
             self.next_flush += 1;
         }
     }
 
-    /// Mark the current sequence as complete and return all remaining
-    /// batches in discovery order. Called when the channel is closed.
+    /// Flush all remaining batches in discovery order. Called when the
+    /// channel is closed — all sequences are complete at this point.
     fn finish(mut self) -> Vec<OwnedCommitBatch> {
-        if let Some(ds) = self.current_ds {
-            self.complete.insert(ds);
-        }
         let mut out = Vec::new();
-        // Flush contiguous complete prefix.
-        while self.complete.remove(&self.next_flush) {
-            if let Some(batches) = self.pending.remove(&self.next_flush) {
-                out.extend(batches);
-            }
+        // All sequences are complete since the channel is closed.
+        while let Some(batches) = self.pending.remove(&self.next_flush) {
+            out.extend(batches);
             self.next_flush += 1;
         }
         // Safety net: flush any residual batches in ascending key order.
+        // This fires when the discovery-sequence space has gaps from
+        // skipped files (expected under normal workloads — see struct doc).
+        if !self.pending.is_empty() {
+            tracing::debug!(
+                residual_sequences = self.pending.len(),
+                next_flush = self.next_flush,
+                "discovery order buffer: flushing residual batches outside contiguous prefix"
+            );
+        }
         for (_ds, batches) in self.pending {
             out.extend(batches);
         }

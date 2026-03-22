@@ -112,7 +112,7 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
         &scratch.pending,
         &mut scratch.persist_batch,
         &mut ctx.metrics,
-        task.file_id.0,
+        task.discovery_sequence(),
     );
     if !scratch.pending.is_empty() {
         emit_findings(

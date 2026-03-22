@@ -455,7 +455,8 @@ fn scan_fs_with_runtime_forwards_persisted_findings() {
     let outcome = scan_fs_with_runtime(
         &FsScanConfig::new(dir.path())
             .with_rules_file(Some(rules.path().to_path_buf()))
-            .with_persist_findings(true),
+            .with_persist_findings(true)
+            .with_workers(1),
         &NullEventOutput,
         &sink,
         &cancel,
@@ -488,7 +489,8 @@ fn scan_fs_with_runtime_uses_file_name_for_single_file_persistence_key() {
     let outcome = scan_fs_with_runtime(
         &FsScanConfig::new(&file_path)
             .with_rules_file(Some(rules.path().to_path_buf()))
-            .with_persist_findings(true),
+            .with_persist_findings(true)
+            .with_workers(1),
         &NullEventOutput,
         &sink,
         &cancel,
@@ -1331,5 +1333,107 @@ fn forward_commits_reorders_lifo_reversed_batches() {
     assert!(
         keys[0] < keys[1] && keys[1] < keys[2],
         "begin_item must be called in discovery (path-sorted) order: {keys:?}"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_handles_gap_in_sequences() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // ds=0 and ds=2 present; ds=1 was never produced (file skipped).
+    buf.push(test_batch(b"c.txt", 2));
+    buf.push(test_batch(b"a.txt", 0));
+
+    // current_ds=0 after the second push. drain_ready stops when
+    // next_flush equals current_ds, so nothing is drained yet.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    assert!(ready.is_empty(), "ds=0 is current, not yet complete");
+
+    // finish() flushes the contiguous prefix (ds=0) then hits the gap
+    // at ds=1. The safety net flushes residual ds=2 in BTreeMap key
+    // order — correct discovery order despite the gap.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"c.txt".to_vec()],
+        "finish must produce batches in discovery order despite gap at ds=1"
+    );
+}
+
+#[test]
+fn forward_commits_captures_error_from_finish_flush() {
+    use std::sync::mpsc::sync_channel;
+
+    /// Commit sink that fails when `begin_item` sees a key starting
+    /// with "a". All other keys succeed.
+    struct FailOnASink;
+
+    impl commit_sink::CommitSink for FailOnASink {
+        fn begin_item(
+            &self,
+            item_key: &gossip_contracts::connector::ItemKey,
+            _meta: &commit_sink::ItemMeta,
+        ) -> anyhow::Result<()> {
+            if item_key.as_bytes().starts_with(b"a") {
+                anyhow::bail!("injected failure for key starting with 'a'");
+            }
+            Ok(())
+        }
+
+        fn upsert_findings(
+            &self,
+            _item_key: &gossip_contracts::connector::ItemKey,
+            _batch: &commit_sink::FindingsBatch,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_item(
+            &self,
+            _item_key: &gossip_contracts::connector::ItemKey,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = FailOnASink;
+    let (tx, rx) = sync_channel(16);
+
+    // Send reversed: ds=2, ds=1, ds=0. All batches buffer until
+    // finish() because the reversed arrival means drain_ready never
+    // flushes the contiguous prefix during the recv loop.
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(
+        result.is_err(),
+        "error from finish-path batch must propagate"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("injected failure"),
+        "expected injected failure, got: {err_msg}"
     );
 }

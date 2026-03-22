@@ -715,7 +715,7 @@ fn process_tar_like<E: ScanEngine>(
         (scratch, metrics)
     };
 
-    let mut scan = ArchiveScanCtx::new(scratch, metrics, task.file_id.0);
+    let mut scan = ArchiveScanCtx::new(scratch, metrics, task.discovery_sequence());
 
     scan.budgets.reset();
     if let Err(hit) = scan.budgets.enter_archive() {

@@ -146,6 +146,11 @@ pub(crate) fn scan_local_filesystem_with_engine(
             scan_cfg.archive.enabled = false;
         }
         if config.persist_findings {
+            assert_eq!(
+                config.workers, 1,
+                "persist_findings requires single-threaded scanning \
+                 so commit batches arrive in contiguous discovery-sequence groups"
+            );
             scan_cfg.store_producer = Some(Arc::new(ChannelStoreProducer::new(
                 commit_tx.clone(),
                 canonical_path.clone(),

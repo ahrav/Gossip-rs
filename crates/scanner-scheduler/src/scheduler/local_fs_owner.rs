@@ -316,6 +316,14 @@ pub(super) struct FileTask {
     pub(super) _permit: super::count_budget::CountPermit,
 }
 
+impl FileTask {
+    /// Discovery-order sequence number from the sorted-path file walk.
+    /// Used to reorder commit batches into discovery order downstream.
+    pub(super) fn discovery_sequence(&self) -> u32 {
+        self.file_id.0
+    }
+}
+
 // ============================================================================
 // Per-Worker Scratch
 // ============================================================================
@@ -802,7 +810,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &scratch.pending,
             &mut scratch.persist_batch,
             &mut ctx.metrics,
-            task.file_id.0,
+            task.discovery_sequence(),
         );
         return;
     }
@@ -975,7 +983,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 &scratch.pending,
                 &mut scratch.persist_batch,
                 &mut ctx.metrics,
-                task.file_id.0,
+                task.discovery_sequence(),
             );
         }
         emit_findings(
@@ -1013,7 +1021,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &scratch.pending,
             &mut scratch.persist_batch,
             &mut ctx.metrics,
-            task.file_id.0,
+            task.discovery_sequence(),
         );
     }
 
