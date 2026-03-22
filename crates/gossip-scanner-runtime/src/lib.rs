@@ -1057,35 +1057,70 @@ pub(crate) fn forward_core_events(out: &dyn EventOutput, rx: Receiver<OwnedDrive
     out.flush();
 }
 
-/// [`StoreProducer`] adapter that normalizes paths and derives stable item
-/// identities before forwarding finding batches through a commit channel.
+/// Derives deterministic [`StableItemId`] values for filesystem objects
+/// under a single canonicalized scan root.
 ///
-/// Path normalization strips the scan root prefix and converts to
-/// forward-slash-separated bytes, producing a deterministic item key
-/// regardless of platform path separators.
+/// Identity is a three-part hash: the fixed filesystem connector tag, a
+/// connector-instance hash derived from the canonical root path, and the
+/// normalized forward-slash-separated item key. Two scan roots that
+/// resolve to the same canonical path always produce the same instance
+/// hash (and therefore the same stable IDs), while distinct roots
+/// produce distinct namespaces even for identical relative paths.
+///
+/// # Platform note
+///
+/// Identity stability assumes `fs::canonicalize` returns byte-identical
+/// results for the same logical directory across invocations. On macOS
+/// APFS, directory names containing non-ASCII characters may be stored in
+/// NFC or NFD Unicode normalization forms; `fs::canonicalize` preserves
+/// whichever form the filesystem reports. Two scans of the same directory
+/// created under different normalization forms would produce distinct
+/// connector-instance hashes. This edge case (non-ASCII directory names
+/// on APFS) does not warrant a `unicode-normalization` dependency.
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelStoreProducer {
-    tx: SyncSender<CommitMessage>,
-    root: PathBuf,
+struct FilesystemIdentityScope {
+    canonical_root: PathBuf,
     connector_instance: ConnectorInstanceIdHash,
 }
 
-impl ChannelStoreProducer {
-    pub(crate) fn new(tx: SyncSender<CommitMessage>, root: PathBuf) -> Self {
-        let connector_instance =
-            ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_encoded_bytes());
+impl FilesystemIdentityScope {
+    /// Build one filesystem identity scope for a canonicalized scan root.
+    ///
+    /// Equivalent input spellings belong to the same connector-instance
+    /// namespace because the runtime canonicalizes before constructing this
+    /// scope.
+    fn from_canonical_root(canonical_root: PathBuf) -> Self {
+        debug_assert!(
+            canonical_root.is_absolute()
+                && !canonical_root.components().any(|c| matches!(
+                    c,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )),
+            "FilesystemIdentityScope requires a fully canonicalized path \
+             (no `.`, no `..`), got: {canonical_root:?}"
+        );
+        let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(
+            canonical_root.as_os_str().as_encoded_bytes(),
+        );
         Self {
-            tx,
-            root,
+            canonical_root,
             connector_instance,
         }
     }
-}
 
-impl StoreProducer for ChannelStoreProducer {
-    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+    /// Normalize a scheduler-produced object path and derive its stable
+    /// identity.
+    ///
+    /// Returns the normalized forward-slash path bytes alongside the
+    /// [`StableItemId`]. Fails if the path cannot be made relative to
+    /// the canonical root or if the resulting key exceeds [`ItemKey`]
+    /// length limits.
+    fn stable_item_id_for_scheduler_path(
+        &self,
+        object_path: &[u8],
+    ) -> Result<(Vec<u8>, StableItemId), FsStoreError> {
         let normalized_path =
-            normalize_scheduler_path(&self.root, batch.object_path).map_err(|error| {
+            normalize_scheduler_path(&self.canonical_root, object_path).map_err(|error| {
                 FsStoreError::backend(format!("path normalization failed: {error}"))
             })?;
         let item_key = gossip_contracts::connector::ItemKey::try_from_slice(&normalized_path)
@@ -1098,6 +1133,36 @@ impl StoreProducer for ChannelStoreProducer {
             item_key.as_bytes(),
         )
         .stable_id();
+        Ok((normalized_path, stable_item_id))
+    }
+}
+
+/// [`StoreProducer`] adapter that derives stable item identities via
+/// [`FilesystemIdentityScope`] and forwards finding batches through a
+/// bounded commit channel.
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelStoreProducer {
+    tx: SyncSender<CommitMessage>,
+    identity: FilesystemIdentityScope,
+}
+
+impl ChannelStoreProducer {
+    pub(crate) fn from_canonical_root(
+        tx: SyncSender<CommitMessage>,
+        canonical_root: PathBuf,
+    ) -> Self {
+        Self {
+            tx,
+            identity: FilesystemIdentityScope::from_canonical_root(canonical_root),
+        }
+    }
+}
+
+impl StoreProducer for ChannelStoreProducer {
+    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+        let (normalized_path, stable_item_id) = self
+            .identity
+            .stable_item_id_for_scheduler_path(batch.object_path)?;
 
         self.tx
             .send(CommitMessage::Batch(OwnedCommitBatch {
@@ -1434,8 +1499,9 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> anyhow::Result<Vec
     #[cfg(windows)]
     compile_error!("normalize_scheduler_path relies on Unix byte-string semantics for OsStr");
 
-    // SAFETY: raw_bytes are OS-string-encoded paths from the scheduler.
-    // On Unix, any &[u8] is a valid OsStr encoding.
+    // SAFETY: raw_bytes originate from FsFindingBatch::object_path, which the
+    // scanner-scheduler populates from std::fs directory traversal. On Unix,
+    // any &[u8] is a valid OsStr encoding.
     let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(raw_bytes) };
     let path = Path::new(os_str);
     let rel = path.strip_prefix(root).map_err(|_| {
