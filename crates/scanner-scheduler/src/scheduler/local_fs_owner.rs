@@ -622,6 +622,16 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     }
 }
 
+/// Record the archive result for either extension- or header-based dispatch.
+#[inline]
+fn record_archive_outcome(metrics: &mut WorkerMetricsLocal, path: &[u8], outcome: ArchiveEnd) {
+    match outcome {
+        ArchiveEnd::Scanned => metrics.archive.record_archive_scanned(),
+        ArchiveEnd::Skipped(reason) => metrics.archive.record_archive_skipped(reason, path, false),
+        ArchiveEnd::Partial(reason) => metrics.archive.record_archive_partial(reason, path, false),
+    }
+}
+
 // Archive scanning (gzip, bzip2, tar, zip) is in:
 //   local_fs_archive_ctx.rs — shared types, budget helpers, dispatch
 //   local_fs_bzip2.rs       — bzip2 scanning
@@ -725,17 +735,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     if let Some(kind) = ext_kind {
         ctx.metrics.archive.record_archive_seen();
         let outcome = dispatch_archive_scan(&task, ctx, kind);
-        match outcome {
-            ArchiveEnd::Scanned => ctx.metrics.archive.record_archive_scanned(),
-            ArchiveEnd::Skipped(r) => ctx
-                .metrics
-                .archive
-                .record_archive_skipped(r, path_bytes, false),
-            ArchiveEnd::Partial(r) => ctx
-                .metrics
-                .archive
-                .record_archive_partial(r, path_bytes, false),
-        }
+        record_archive_outcome(&mut ctx.metrics, path_bytes, outcome);
         return;
     }
 
@@ -850,17 +850,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             drop(buf); // release buffer before dispatch (re-opens file)
             ctx.metrics.archive.record_archive_seen();
             let outcome = dispatch_archive_scan(&task, ctx, kind);
-            match outcome {
-                ArchiveEnd::Scanned => ctx.metrics.archive.record_archive_scanned(),
-                ArchiveEnd::Skipped(r) => ctx
-                    .metrics
-                    .archive
-                    .record_archive_skipped(r, path_bytes, false),
-                ArchiveEnd::Partial(r) => ctx
-                    .metrics
-                    .archive
-                    .record_archive_partial(r, path_bytes, false),
-            }
+            record_archive_outcome(&mut ctx.metrics, path_bytes, outcome);
             return;
         }
     }
