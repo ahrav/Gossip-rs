@@ -316,6 +316,14 @@ pub(super) struct FileTask {
     pub(super) _permit: super::count_budget::CountPermit,
 }
 
+impl FileTask {
+    /// Discovery-order sequence number from the sorted-path file walk.
+    /// Used to reorder commit batches into discovery order downstream.
+    pub(super) fn discovery_sequence(&self) -> u32 {
+        self.file_id.0
+    }
+}
+
 // ============================================================================
 // Per-Worker Scratch
 // ============================================================================
@@ -571,6 +579,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     findings: &[F],
     persist_batch: &mut Vec<FsFindingRecord>,
     metrics: &mut WorkerMetricsLocal,
+    discovery_sequence: u32,
 ) {
     let Some(producer) = store_producer else {
         return;
@@ -587,6 +596,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     let emit_result = producer.emit_fs_batch(FsFindingBatch {
         object_path: path,
         findings: persist_batch.as_slice(),
+        discovery_sequence,
     });
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]
@@ -800,6 +810,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &scratch.pending,
             &mut scratch.persist_batch,
             &mut ctx.metrics,
+            task.discovery_sequence(),
         );
         return;
     }
@@ -972,6 +983,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 &scratch.pending,
                 &mut scratch.persist_batch,
                 &mut ctx.metrics,
+                task.discovery_sequence(),
             );
         }
         emit_findings(
@@ -1009,6 +1021,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &scratch.pending,
             &mut scratch.persist_batch,
             &mut ctx.metrics,
+            task.discovery_sequence(),
         );
     }
 
@@ -1276,7 +1289,32 @@ where
         }
 
         let file_id = FileId(next_file_id);
-        next_file_id = next_file_id.wrapping_add(1);
+        // Virtual archive-entry FileIds occupy 0x8000_0000.. so real
+        // file IDs must stay below that boundary to avoid aliasing.
+        const VIRTUAL_BASE: u32 = 0x8000_0000;
+        next_file_id = match next_file_id.checked_add(1) {
+            Some(id) if id < VIRTUAL_BASE => id,
+            _ => {
+                eprintln!(
+                    "discovery file ID reached virtual-entry namespace \
+                     boundary ({VIRTUAL_BASE:#x}); stopping file enumeration"
+                );
+                // Enqueue this last file, then stop accepting new files.
+                stats.files_enqueued = stats.files_enqueued.saturating_add(1);
+                stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);
+                progress_sink.on_progress(LocalProgress {
+                    files_enqueued: stats.files_enqueued,
+                    bytes_enqueued: stats.bytes_enqueued,
+                });
+                let task = FileTask {
+                    file_id,
+                    path: file.path,
+                    _permit: permit,
+                };
+                batch.push(task);
+                break;
+            }
+        };
 
         stats.files_enqueued = stats.files_enqueued.saturating_add(1);
         stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);

@@ -113,6 +113,13 @@ pub(crate) fn scan_local_filesystem(
 /// already been requested. Otherwise spawns two scoped forwarder threads
 /// (event and commit), runs the parallel scanner, and joins both forwarders
 /// before returning.
+///
+/// # Errors
+///
+/// Returns `ScanRuntimeError::Driver` if `persist_findings` is enabled with
+/// `workers != 1`. Finding persistence requires single-threaded scanning so
+/// commit batches arrive in contiguous discovery-sequence groups; multi-worker
+/// scanning reorders batches and breaks checkpoint sequencing.
 pub(crate) fn scan_local_filesystem_with_engine(
     config: &FsScanConfig,
     canonical_path: PathBuf,
@@ -146,6 +153,14 @@ pub(crate) fn scan_local_filesystem_with_engine(
             scan_cfg.archive.enabled = false;
         }
         if config.persist_findings {
+            if config.workers != 1 {
+                return Err(ScanRuntimeError::Driver(anyhow!(
+                    "finding persistence requires workers=1 (got {}); \
+                     multi-worker scanning reorders batches and breaks \
+                     checkpoint sequencing",
+                    config.workers
+                )));
+            }
             scan_cfg.store_producer = Some(Arc::new(ChannelStoreProducer::new(
                 commit_tx.clone(),
                 canonical_path.clone(),

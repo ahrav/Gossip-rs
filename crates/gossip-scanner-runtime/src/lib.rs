@@ -1104,6 +1104,7 @@ impl StoreProducer for ChannelStoreProducer {
                 object_path: normalized_path,
                 stable_item_id,
                 findings: batch.findings.to_vec(),
+                discovery_sequence: batch.discovery_sequence,
             }))
             .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
     }
@@ -1144,6 +1145,144 @@ pub(crate) struct OwnedCommitBatch {
     object_path: Vec<u8>,
     stable_item_id: StableItemId,
     findings: Vec<FsFindingRecord>,
+    /// Discovery-order sequence from the sorted file walk. Used by the
+    /// commit forwarder to reorder batches so `begin_item` calls respect
+    /// the original path-sorted discovery order, ensuring checkpoint
+    /// sequence numbers are monotonically consistent with `ItemKey`.
+    discovery_sequence: u32,
+}
+
+/// Reorder buffer that ensures commit batches are forwarded in
+/// discovery order (file-path-sorted) rather than executor processing
+/// order (LIFO-reversed).
+///
+/// The work-stealing executor's LIFO local deque reverses file
+/// processing order relative to the sorted discovery order. Without
+/// reordering, `ReceiptCommitSink::begin_item` assigns monotonically
+/// increasing sequence numbers in *processing* order, causing
+/// `PrefixCheckpointAggregator::build_contiguous_prefix` to observe
+/// decreasing `ItemKey` values and return `BoundaryRegression`.
+///
+/// With `workers=1` (enforced for receipt-driven execution), files are
+/// processed sequentially: all batches for one file arrive on the
+/// channel before any batches for the next file. The buffer exploits
+/// this by tracking discovery-sequence transitions: when the incoming
+/// `discovery_sequence` changes, the previous sequence is known to be
+/// complete and can be flushed if it is the next expected sequence.
+///
+/// Internally the buffer uses a `VecDeque` indexed by
+/// `(discovery_sequence - next_flush)`, giving O(1) insert and O(1)
+/// drain per slot with cache-linear iteration. Discovery sequences are
+/// dense `u32`s starting from 0, so direct indexing avoids the O(log n)
+/// overhead and pointer chasing of a tree-based map.
+///
+/// When files arrive in near-discovery order, memory stays bounded by
+/// the number of in-flight files (`max_in_flight_objects`). When
+/// skipped files create gaps, `drain_ready` stalls and all produced
+/// batches accumulate until `finish()` drains them at channel close.
+///
+/// Files that produce zero batches (skipped by extension, binary
+/// classification, size limit, or I/O error) create gaps in the
+/// discovery-sequence space. `drain_ready` stalls at the first gap
+/// because the missing sequence is never marked complete. The
+/// `finish()` safety net handles this correctly: it flushes all
+/// residual batches in index order (ascending discovery sequence).
+/// Under real workloads with skipped files the buffer therefore
+/// degrades to sort-at-end rather than streaming, which is acceptable
+/// since it runs on a dedicated consumer thread.
+struct DiscoveryOrderBuffer {
+    /// Batches indexed by `(discovery_sequence - next_flush)`. `None`
+    /// slots represent gaps from skipped files that produced zero
+    /// batches.
+    pending: std::collections::VecDeque<Option<Vec<OwnedCommitBatch>>>,
+    /// The discovery sequence currently being received (all batches
+    /// arriving on the channel belong to this sequence until it changes).
+    current_ds: Option<u32>,
+    /// Next discovery sequence to flush (starts at 0, increments after
+    /// each successful flush).
+    next_flush: u32,
+}
+
+impl DiscoveryOrderBuffer {
+    fn new() -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            current_ds: None,
+            next_flush: 0,
+        }
+    }
+
+    /// Accept a batch. When the discovery sequence changes, the previous
+    /// sequence is implicitly complete (single-writer guarantee) and
+    /// becomes eligible for flushing via [`drain_ready`].
+    fn push(&mut self, batch: OwnedCommitBatch) {
+        let ds = batch.discovery_sequence;
+        if ds < self.next_flush {
+            tracing::error!(
+                discovery_sequence = ds,
+                next_flush = self.next_flush,
+                path = %String::from_utf8_lossy(&batch.object_path),
+                "batch arrived for already-flushed discovery sequence; \
+                 dropping to prevent duplicate forwarding"
+            );
+            return;
+        }
+        self.current_ds = Some(ds);
+        let idx = (ds - self.next_flush) as usize;
+        if idx >= self.pending.len() {
+            self.pending.resize_with(idx + 1, || None);
+        }
+        self.pending[idx].get_or_insert_with(Vec::new).push(batch);
+    }
+
+    /// Drain all contiguous complete discovery sequences starting at
+    /// `next_flush`, preserving arrival order within each sequence.
+    /// A pending sequence is complete when it differs from `current_ds`
+    /// (the single-writer guarantee means no more batches will arrive).
+    fn drain_ready(&mut self, out: &mut Vec<OwnedCommitBatch>) {
+        while Some(self.next_flush) != self.current_ds {
+            match self.pending.front() {
+                Some(Some(_)) => {
+                    // Front slot is populated — flush it.
+                    if let Some(Some(batches)) = self.pending.pop_front() {
+                        out.extend(batches);
+                    }
+                }
+                Some(None) => {
+                    // Gap: skipped file produced zero batches.
+                    tracing::debug!(
+                        gap_at = self.next_flush,
+                        buffered_sequences = self.pending.iter().filter(|s| s.is_some()).count(),
+                        "drain stalled at sequence gap (skipped file); \
+                         remaining batches deferred to finish()"
+                    );
+                    break;
+                }
+                None => break,
+            }
+            self.next_flush += 1;
+        }
+    }
+
+    /// Flush all remaining batches in discovery order. Called when the
+    /// channel is closed — all sequences are complete at this point.
+    /// Iterates the `VecDeque` front-to-back, which is ascending
+    /// discovery-sequence order by construction.
+    fn finish(self) -> Vec<OwnedCommitBatch> {
+        let has_leading_gap = self.pending.front().is_some_and(|slot| slot.is_none());
+        if has_leading_gap {
+            tracing::debug!(
+                expected_next = self.next_flush,
+                residual_sequences = self.pending.iter().filter(|s| s.is_some()).count(),
+                "discovery order buffer: gaps detected in sequence space"
+            );
+        }
+        let mut out = Vec::new();
+        for batches in self.pending.into_iter().flatten() {
+            out.extend(batches);
+        }
+        out
+    }
 }
 
 /// Drain commit messages from the channel and forward finding batches to
@@ -1164,30 +1303,63 @@ pub(crate) fn forward_commits(
 ) -> anyhow::Result<()> {
     let mut first_error: Option<anyhow::Error> = None;
     let mut error_count: u64 = 0;
+    let mut buffer = DiscoveryOrderBuffer::new();
+    let mut ready = Vec::new();
+
+    /// Record an error, keeping only the first. Subsequent errors are
+    /// logged individually so operators have a trail for every failure.
+    fn record_err(
+        result: anyhow::Result<()>,
+        first_error: &mut Option<anyhow::Error>,
+        error_count: &mut u64,
+    ) {
+        if let Err(error) = result {
+            *error_count += 1;
+            if first_error.is_none() {
+                *first_error = Some(error);
+            } else {
+                tracing::warn!(
+                    error_number = *error_count,
+                    %error,
+                    "additional commit forwarding error (only first is propagated)"
+                );
+            }
+        }
+    }
 
     while let Ok(message) = rx.recv() {
-        let result = match message {
-            CommitMessage::Batch(batch) => forward_commit_batch(commit, batch),
+        match message {
+            CommitMessage::Batch(batch) => {
+                buffer.push(batch);
+                buffer.drain_ready(&mut ready);
+                for b in ready.drain(..) {
+                    record_err(
+                        forward_commit_batch(commit, b),
+                        &mut first_error,
+                        &mut error_count,
+                    );
+                }
+            }
             CommitMessage::RunLoss(loss) => {
                 tracing::debug!(
                     dropped_findings = loss.dropped_findings,
                     persistence_emit_failures = loss.persistence_emit_failures,
                     "received run-loss record",
                 );
-                Ok(())
             }
             CommitMessage::EndRun(had_coverage_limits) => {
                 tracing::debug!(had_coverage_limits, "received end-run signal");
-                Ok(())
-            }
-        };
-
-        if let Err(error) = result {
-            error_count += 1;
-            if first_error.is_none() {
-                first_error = Some(error);
             }
         }
+    }
+
+    // Channel closed: flush remaining buffered batches in discovery order.
+    for batch in buffer.finish() {
+        record_err(
+            forward_commit_batch(commit, batch),
+            &mut first_error,
+            &mut error_count,
+        );
     }
 
     if error_count > 1 {
