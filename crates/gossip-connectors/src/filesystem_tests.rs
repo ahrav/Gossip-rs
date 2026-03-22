@@ -592,6 +592,41 @@ fn transient_error_remains_retryable() {
 // ---------------------------------------------------------------
 
 #[test]
+fn single_file_open_detects_replacement_after_init() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file_path = dir.path().join("data.txt");
+    fs::write(&file_path, b"original").expect("write original");
+
+    let mut connector = FilesystemConnector::new(&file_path);
+    let item_ref = ItemRef::try_from_slice(b"data.txt").expect("valid ref");
+
+    // First open succeeds and initializes root mode with the file's identity.
+    let mut reader = connector
+        .open(&item_ref, crate::common::test_util::default_budgets())
+        .expect("initial open should succeed");
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).expect("read original content");
+    assert_eq!(buf, b"original");
+    drop(reader);
+
+    // Create the replacement while the original still exists so the
+    // filesystem must allocate a distinct inode (two live files cannot share
+    // one).  A plain remove+create can recycle the inode on ext4.
+    let staging = dir.path().join("data.txt.new");
+    fs::write(&staging, b"impostor").expect("write replacement");
+    fs::remove_file(&file_path).expect("remove original");
+    fs::rename(&staging, &file_path).expect("swap replacement into place");
+
+    // The replacement lives at the same path but has a different inode.
+    // A secure connector must reject it.
+    let result = connector.open(&item_ref, crate::common::test_util::default_budgets());
+    assert!(
+        result.is_err(),
+        "opening a replaced file should fail inode verification"
+    );
+}
+
+#[test]
 fn root_fd_identity_check_rejects_dev_ino_mismatch() {
     let dir_a = tempfile::tempdir().expect("create dir_a");
     let dir_b = tempfile::tempdir().expect("create dir_b");
