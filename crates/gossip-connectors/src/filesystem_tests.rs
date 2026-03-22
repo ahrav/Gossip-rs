@@ -609,9 +609,13 @@ fn single_file_open_detects_replacement_after_init() {
     assert_eq!(buf, b"original");
     drop(reader);
 
-    // Replace the file: same name, different inode.
+    // Create the replacement while the original still exists so the
+    // filesystem must allocate a distinct inode (two live files cannot share
+    // one).  A plain remove+create can recycle the inode on ext4.
+    let staging = dir.path().join("data.txt.new");
+    fs::write(&staging, b"impostor").expect("write replacement");
     fs::remove_file(&file_path).expect("remove original");
-    fs::write(&file_path, b"impostor").expect("write replacement");
+    fs::rename(&staging, &file_path).expect("swap replacement into place");
 
     // The replacement lives at the same path but has a different inode.
     // A secure connector must reject it.
