@@ -95,8 +95,6 @@ fn write_empty_rules() -> NamedTempFile {
 /// Re-derives the ID from raw primitives (connector tag + instance hash +
 /// locator) without going through [`FilesystemIdentityScope`], so tests
 /// can assert the production path matches an independently computed value.
-/// Compute the expected `StableItemId` for a filesystem item independently
-/// of `FilesystemIdentityScope`.
 ///
 /// Passes `locator` directly as the identity key's third component. This is
 /// equivalent to the production path (`ItemKey::try_from_slice` followed by
