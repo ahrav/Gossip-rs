@@ -45,13 +45,13 @@ use gossip_contracts::identity::{
     FenceEpoch, OpId, PolicyHash, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
 use gossip_contracts::persistence::{CommitHandle, DoneLedger, DoneLedgerRecord, OvidHash};
-use gossip_persistence_inmemory::InMemoryDoneLedger;
 use gossip_persistence_inmemory::sim::{
     DoneLedgerFaultConfig, DoneLedgerInvariantChecker, DoneLedgerInvariantViolation,
     DoneLedgerOracle,
 };
+use gossip_persistence_inmemory::CompletionOrder;
+use gossip_persistence_inmemory::InMemoryDoneLedger;
 
-use crate::Lease;
 use crate::error::{AcquireScratch, CheckpointError, CompleteError, IdempotentOutcome, SplitError};
 use crate::facade::{ClaimError, ShardClaiming};
 use crate::in_memory::InMemoryCoordinator;
@@ -59,6 +59,7 @@ use crate::record::ParkReason;
 use crate::run::{RunConfig, RunManagement};
 use crate::session::WorkerSession;
 use crate::traits::CoordinationBackend;
+use crate::Lease;
 
 use super::scan_driver_sim::generate_scan_outcome;
 use super::worker::SimWorker;
@@ -114,7 +115,14 @@ pub enum DoneLedgerFaultOp {
     /// Cause the next `count` committed writes to fail at commit time.
     InjectCommitFailure { count: usize },
     /// Delay the next `count` writes (enqueue as pending instead of auto-complete).
+    ///
+    /// After injecting a delay, use [`ReleasePendingWrites`](Self::ReleasePendingWrites)
+    /// to release them. Without a release, any subsequent scan lifecycle that
+    /// hits a delayed write will block indefinitely in `CommitHandle::wait()`.
     InjectDelay { count: usize },
+    /// Release the next pending (delayed) write so its `CommitHandle::wait()`
+    /// unblocks. Must be issued after `InjectDelay` to prevent deadlocks.
+    ReleasePendingWrites,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +263,8 @@ pub enum CompositionSimOp {
 pub enum CompositionSimEvent {
     /// Result of a pass-through coordination operation.
     Coord(SimEvent),
-    /// Full scan lifecycle completed: shard claimed, records written, shard
-    /// completed in coordinator.
+    /// Full scan lifecycle completed: shard claimed, done-ledger records
+    /// committed, and coordinator `complete()` succeeded (shard is terminal).
     ScanCompleted {
         worker: WorkerId,
         records_written: usize,
@@ -269,6 +277,13 @@ pub enum CompositionSimEvent {
     ScanStaleLeaseWrite {
         worker: WorkerId,
         stale_fence: FenceEpoch,
+    },
+    /// Done-ledger write succeeded but coordinator `complete()` was rejected
+    /// (e.g. cursor out of bounds, lease expired). The shard remains active in
+    /// coordinator state despite having done-ledger records committed.
+    ScanCoordinatorCompleteFailed {
+        worker: WorkerId,
+        records_written: usize,
     },
     /// Done-ledger write failed at submit or commit time during a scan lifecycle.
     ScanLedgerWriteFailed { worker: WorkerId },
@@ -616,6 +631,7 @@ impl CompositionSim {
 
         // Step 2: Generate synthetic scan outcome.
         let now = self.context.now();
+        let bounds = self.shard_cursor_bounds(&key);
         let scan = generate_scan_outcome(
             &mut self.context,
             &lease,
@@ -624,6 +640,7 @@ impl CompositionSim {
             SCAN_ITEMS_MIN..=SCAN_ITEMS_MAX,
             now,
             None,
+            bounds,
         );
 
         // Step 3: Write to done-ledger.
@@ -673,6 +690,16 @@ impl CompositionSim {
             );
         }
 
+        if !coordinator_completed {
+            return (
+                CompositionSimEvent::ScanCoordinatorCompleteFailed {
+                    worker,
+                    records_written,
+                },
+                violations,
+            );
+        }
+
         (
             CompositionSimEvent::ScanCompleted {
                 worker,
@@ -701,6 +728,7 @@ impl CompositionSim {
 
         // Generate scan outcome (consumes PRNG draws for determinism).
         let now = self.context.now();
+        let bounds = self.shard_cursor_bounds(&key);
         let scan = generate_scan_outcome(
             &mut self.context,
             &lease,
@@ -709,6 +737,7 @@ impl CompositionSim {
             SCAN_ITEMS_MIN..=SCAN_ITEMS_MAX,
             now,
             None,
+            bounds,
         );
 
         // Complete the shard in coordinator (before writing to ledger).
@@ -765,13 +794,17 @@ impl CompositionSim {
         let stale_raw = if current_fence > 1 {
             self.context.rng().random_range(1..current_fence)
         } else {
-            // Fence is already at minimum; use the same value (degenerate case).
-            current_fence
+            // No epoch smaller than the current one exists, so a truly stale
+            // write is impossible. Abort without consuming further PRNG draws
+            // to avoid emitting a misleading ScanStaleLeaseWrite event whose
+            // fence matches the real lease.
+            return (CompositionSimEvent::ScanClaimFailed { worker }, Vec::new());
         };
         let stale_fence = FenceEpoch::from_raw(stale_raw);
 
         // Generate scan outcome with stale provenance.
         let now = self.context.now();
+        let bounds = self.shard_cursor_bounds(&key);
         let scan = generate_scan_outcome(
             &mut self.context,
             &lease,
@@ -780,6 +813,7 @@ impl CompositionSim {
             SCAN_ITEMS_MIN..=SCAN_ITEMS_MAX,
             now,
             Some(stale_fence),
+            bounds,
         );
 
         // Write to done-ledger (with stale provenance).
@@ -864,6 +898,22 @@ impl CompositionSim {
             }
             Err(_) => Err(CompositionSimEvent::ScanClaimFailed { worker }),
         }
+    }
+
+    /// Look up the first-byte bounds of a shard's key range `[lo, hi)`.
+    ///
+    /// Returns `Some((lo, hi))` when the shard has a non-degenerate single-byte
+    /// range, or `None` when the range is too narrow or the shard is missing.
+    fn shard_cursor_bounds(&self, key: &ShardKey) -> Option<(u8, u8)> {
+        self.coordinator
+            .shard_lookup(&self.tenant, key)
+            .map(|r| {
+                let (start, end) = self.coordinator.spec_bounds(r);
+                let lo = start.first().copied().unwrap_or(b'a');
+                let hi = end.first().copied().unwrap_or(b'z');
+                (lo, hi)
+            })
+            .filter(|(lo, hi)| lo < hi)
     }
 
     /// Write scan records to the done-ledger and track in oracle.
@@ -957,6 +1007,11 @@ impl CompositionSim {
                 self.ledger
                     .delay_next_writes(*count)
                     .expect("delay_next_writes should not fail");
+            }
+            DoneLedgerFaultOp::ReleasePendingWrites => {
+                self.ledger
+                    .release_next(CompletionOrder::OldestFirst)
+                    .expect("release_next should not fail");
             }
         }
     }

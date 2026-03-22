@@ -17,8 +17,8 @@ use gossip_contracts::persistence::{
     OvidHash,
 };
 
-use crate::Lease;
 use crate::sim::SimContext;
+use crate::Lease;
 
 // ---------------------------------------------------------------------------
 // ScanOutcome
@@ -51,6 +51,11 @@ pub struct ScanOutcome {
 /// instead of the lease's actual epoch. This models a worker writing done-ledger
 /// records using credentials from a prior lease acquisition (stale provenance).
 ///
+/// When `cursor_bounds` is `Some((lo, hi))`, the cursor is generated as a
+/// single byte within `[lo, hi)` to satisfy coordinator cursor validation.
+/// When `None`, fully random 4-16 byte cursors are generated (suitable for
+/// tests that do not validate the cursor against shard bounds).
+///
 /// # PRNG ordering
 ///
 /// Calls `context.rng()` in a fixed sequence:
@@ -63,6 +68,9 @@ pub struct ScanOutcome {
 /// 3. Cursor length (1 draw)
 /// 4. Cursor bytes (length draws)
 ///
+/// When `cursor_bounds` is `Some`, steps 3-4 are replaced by a single draw
+/// for the bounded byte.
+///
 /// Appending new draws at the end preserves determinism for existing seeds.
 pub fn generate_scan_outcome(
     context: &mut SimContext,
@@ -72,6 +80,7 @@ pub fn generate_scan_outcome(
     items_range: core::ops::RangeInclusive<usize>,
     now: LogicalTime,
     fence_override: Option<FenceEpoch>,
+    cursor_bounds: Option<(u8, u8)>,
 ) -> ScanOutcome {
     assert!(!ovid_pool.is_empty(), "ovid_pool must not be empty");
 
@@ -104,7 +113,15 @@ pub fn generate_scan_outcome(
         records.push(record);
     }
 
-    let cursor_bytes = random_cursor_bytes(context);
+    let cursor_bytes = match cursor_bounds {
+        Some((lo, hi)) if lo < hi => {
+            // Bounded: single byte within shard's key range for valid
+            // cursor validation by the coordinator.
+            let byte = context.rng().random_range(lo..hi);
+            vec![byte]
+        }
+        _ => random_cursor_bytes(context),
+    };
 
     ScanOutcome {
         records,
@@ -196,11 +213,11 @@ mod tests {
         let policy = PolicyHash::from_bytes([0x22; 32]);
         let now = LogicalTime::from_raw(50);
 
-        let out1 = generate_scan_outcome(&mut ctx1, &lease, policy, &pool1, 1..=5, now, None);
+        let out1 = generate_scan_outcome(&mut ctx1, &lease, policy, &pool1, 1..=5, now, None, None);
 
         let mut ctx2 = SimContext::new(42);
         let pool2 = test_ovid_pool(&mut ctx2, 10);
-        let out2 = generate_scan_outcome(&mut ctx2, &lease, policy, &pool2, 1..=5, now, None);
+        let out2 = generate_scan_outcome(&mut ctx2, &lease, policy, &pool2, 1..=5, now, None, None);
 
         assert_eq!(out1.records.len(), out2.records.len());
         assert_eq!(out1.cursor_bytes, out2.cursor_bytes);
