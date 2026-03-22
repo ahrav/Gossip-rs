@@ -175,6 +175,7 @@ flowchart TD
     FIRST{"page empty?"}
     BYTES{"total_bytes + size_hint > max_bytes?"}
     COUNT{"items.len() == max_items?"}
+    PEEK{"one more in-range file<br/>after the capped page?"}
     PUSH["push item"]
     MORE["PageState::HasMore { cursor: Cursor::with_last_key(last_key) }"]
     COMPLETE["PageState::Complete"]
@@ -185,7 +186,9 @@ flowchart TD
     BYTES -->|"Yes"| MORE
     BYTES -->|"No"| PUSH
     PUSH --> COUNT
-    COUNT -->|"Yes"| MORE
+    COUNT -->|"Yes"| PEEK
+    PEEK -->|"Yes"| MORE
+    PEEK -->|"No"| COMPLETE
     COUNT -->|"No and walker exhausted"| COMPLETE
     COUNT -->|"No and walker continues"| WALK
 
@@ -194,6 +197,7 @@ flowchart TD
     style FIRST fill:#FEE2E2,stroke:#991B1B,color:#991B1B
     style BYTES fill:#FEE2E2,stroke:#991B1B,color:#991B1B
     style COUNT fill:#FEE2E2,stroke:#991B1B,color:#991B1B
+    style PEEK fill:#FEE2E2,stroke:#991B1B,color:#991B1B
     style PUSH fill:#FEE2E2,stroke:#991B1B,color:#991B1B
     style MORE fill:#EF4444,stroke:#991B1B,color:#FFFFFF
     style COMPLETE fill:#FEE2E2,stroke:#991B1B,color:#991B1B

@@ -462,11 +462,10 @@ impl FilesystemConnector {
             total_bytes = total_bytes.saturating_add(item_size);
             items.push(item);
             if items.len() == budgets.max_items() {
-                // Peek one ahead to distinguish "exactly at capacity" from
-                // "at capacity with more remaining".  If the peek errors
-                // (e.g. deadline expiry), the collected items are abandoned
-                // and the caller retries from the same cursor position.
-                complete = walk.next_file()?.is_none();
+                // Peek to decide Complete vs HasMore. On error (deadline
+                // race, transient IO), conservatively report HasMore rather
+                // than discarding the already-collected page via `?`.
+                complete = walk.next_file().ok().is_some_and(|next| next.is_none());
                 break;
             }
         }

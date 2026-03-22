@@ -1091,9 +1091,13 @@ impl FilesystemIdentityScope {
     /// scope.
     fn from_canonical_root(canonical_root: PathBuf) -> Self {
         debug_assert!(
-            std::fs::canonicalize(&canonical_root).is_ok_and(|c| c == canonical_root),
+            canonical_root.is_absolute()
+                && !canonical_root.components().any(|c| matches!(
+                    c,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )),
             "FilesystemIdentityScope requires a fully canonicalized path \
-             (no symlinks, no `.`, no `..`), got: {canonical_root:?}"
+             (no `.`, no `..`), got: {canonical_root:?}"
         );
         let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(
             canonical_root.as_os_str().as_encoded_bytes(),

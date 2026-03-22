@@ -44,7 +44,7 @@ fill_page(shard, cursor, budgets)
 `FilesystemConnector` directly implements `OrderedContentSource` and keeps
 matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
 `GitConnector` (git-tracked files via `ls-files`) and
-`InMemoryDeterministicConnector` still expose the same read/split surface as
+`InMemoryDeterministicConnector` expose the same read/split surface as
 inherent methods in `gossip-connectors/src/`.
 
 ### Git Repo-Native

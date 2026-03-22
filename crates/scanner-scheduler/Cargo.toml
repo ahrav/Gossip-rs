@@ -36,7 +36,7 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 loom = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.6"
+io-uring = "0.7"
 
 [features]
 default = []

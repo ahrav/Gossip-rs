@@ -32,10 +32,10 @@ The crate provides four core capabilities:
   (local mirror acquisition), and `GitRepoExecutor` (whole-repo
   execution). These operate on repositories rather than individual items.
 
-- **Connector method surface** -- `FilesystemConnector` now directly
+- **Connector method surface** -- `FilesystemConnector` directly
   implements `OrderedContentSource` while preserving matching inherent
   helper methods (`fill_page`, `choose_split_point`, `open`,
-  `read_range`). `ConnectorCapabilities` still advertises optional
+  `read_range`). `ConnectorCapabilities` advertises optional
   features at registration time, and the other reference connectors keep
   the same inherent `caps` / `choose_split_point` / `open` /
   `read_range` signatures.
@@ -364,9 +364,9 @@ in-scope item is still emitted even when its `size_hint` alone exceeds
 reads reject expired deadlines and return a bounded reader, while
 `read_range` clamps bytes to `max_bytes`.
 
-The `StreamingSplitEstimator` field still has no internal observation
+The `StreamingSplitEstimator` field has no internal observation
 feed from page enumeration, so `split_hints` remains `false`. The
-connector still exposes `choose_split_point`, but it returns `Ok(None)`
+connector exposes `choose_split_point`, but it returns `Ok(None)`
 until an external caller populates the estimator with observations.
 
 ### GitConnector (`git.rs`)
@@ -544,9 +544,9 @@ Token-perturbation tests verify this property.
 
 ### Budget ownership
 
-`Budgets` still give the runtime the authoritative outer policy, but
+`Budgets` give the runtime the authoritative outer policy, but
 connectors can enforce local safety limits directly. `FilesystemConnector`
 rejects expired deadlines, bounds page assembly with `max_items` and
-`max_bytes`, and clamps full or ranged reads. Other connectors may still
+`max_bytes`, and clamps full or ranged reads. Other connectors may
 treat some budget fields as advisory when their operations are
 metadata-only or already bounded by an in-memory snapshot.

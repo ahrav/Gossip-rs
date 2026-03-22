@@ -6,7 +6,7 @@ also carry an opaque token. The key is the only correctness boundary: a
 connector must resume from the first item strictly greater than `last_key`
 even when no token is present or a token is unusable.
 
-Today the filesystem connector is explicitly key-only. It rebuilds its live
+The filesystem connector is explicitly key-only. It rebuilds its live
 directory walk from the canonical root on each `fill_page` call and skips every
 entry at or below `cursor.last_key()`. Token-aware resume remains an optional
 capability for other ordered-content surfaces, but it cannot weaken the
