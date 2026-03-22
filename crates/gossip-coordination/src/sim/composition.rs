@@ -274,6 +274,10 @@ pub enum CompositionSimEvent {
     },
     /// Done-ledger write failed at submit or commit time during a scan lifecycle.
     ScanLedgerWriteFailed { worker: WorkerId },
+    /// Stale-lease write was requested but no epoch smaller than the current
+    /// fence exists (fence is at `FenceEpoch::INITIAL`). The shard was claimed
+    /// but no scan or completion was attempted.
+    ScanStaleLeaseNotPossible { worker: WorkerId },
     /// Done-ledger fault injection applied.
     LedgerFaultInjected,
 }
@@ -794,7 +798,10 @@ impl CompositionSim {
             // write is impossible. Abort without consuming further PRNG draws
             // to avoid emitting a misleading ScanStaleLeaseWrite event whose
             // fence matches the real lease.
-            return (CompositionSimEvent::ScanClaimFailed { worker }, Vec::new());
+            return (
+                CompositionSimEvent::ScanStaleLeaseNotPossible { worker },
+                Vec::new(),
+            );
         };
         let stale_fence = FenceEpoch::from_raw(stale_raw);
 

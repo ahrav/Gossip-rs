@@ -84,6 +84,13 @@ pub fn generate_scan_outcome(
     cursor_bounds: Option<(u8, u8)>,
 ) -> ScanOutcome {
     assert!(!ovid_pool.is_empty(), "ovid_pool must not be empty");
+    assert!(!items_range.is_empty(), "items_range must not be empty");
+    if let Some((lo, hi)) = cursor_bounds {
+        assert!(
+            lo < hi,
+            "cursor_bounds must satisfy lo < hi, got ({lo}, {hi})"
+        );
+    }
 
     let fence = fence_override.unwrap_or(lease.fence());
     let n = context.rng().random_range(items_range);
@@ -115,13 +122,13 @@ pub fn generate_scan_outcome(
     }
 
     let cursor_bytes = match cursor_bounds {
-        Some((lo, hi)) if lo < hi => {
+        Some((lo, hi)) => {
             // Bounded: single byte within shard's key range for valid
             // cursor validation by the coordinator.
             let byte = context.rng().random_range(lo..hi);
             vec![byte]
         }
-        _ => random_cursor_bytes(context),
+        None => random_cursor_bytes(context),
     };
 
     ScanOutcome {

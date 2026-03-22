@@ -1,8 +1,8 @@
 //! Shared simulation utilities used by both [`super::harness::CoordinationSim`]
 //! and [`super::composition::CompositionSim`].
 //!
-//! Extracted to eliminate duplication — every item here was previously defined
-//! identically in both harness modules.
+//! Centralizes simulation constants, helper aliases, and borrow-friendly helper
+//! functions so both harnesses use the same invariants and op-generation rules.
 
 use std::collections::BTreeMap;
 
