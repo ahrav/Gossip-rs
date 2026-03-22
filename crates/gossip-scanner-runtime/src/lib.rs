@@ -1117,6 +1117,9 @@ impl FilesystemIdentityScope {
     }
 }
 
+/// [`StoreProducer`] adapter that derives stable item identities via
+/// [`FilesystemIdentityScope`] and forwards finding batches through a
+/// bounded commit channel.
 #[derive(Clone, Debug)]
 pub(crate) struct ChannelStoreProducer {
     tx: SyncSender<CommitMessage>,

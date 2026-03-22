@@ -90,6 +90,11 @@ fn write_empty_rules() -> NamedTempFile {
     file
 }
 
+/// Independent oracle for filesystem stable-item-ID derivation.
+///
+/// Re-derives the ID from raw primitives (connector tag + instance hash +
+/// locator) without going through [`FilesystemIdentityScope`], so tests
+/// can assert the production path matches an independently computed value.
 fn expected_fs_stable_item_id(
     root: &Path,
     locator: &[u8],
@@ -99,6 +104,8 @@ fn expected_fs_stable_item_id(
     ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, locator).stable_id()
 }
 
+/// Run a single-worker filesystem scan with persistence enabled, returning
+/// the outcome and a spy sink that captured all commit-sink calls.
 fn scan_fs_with_spy_commit_sink(
     path: &Path,
     rules: &NamedTempFile,
