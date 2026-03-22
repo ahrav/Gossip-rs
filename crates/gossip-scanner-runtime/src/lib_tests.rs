@@ -455,7 +455,8 @@ fn scan_fs_with_runtime_forwards_persisted_findings() {
     let outcome = scan_fs_with_runtime(
         &FsScanConfig::new(dir.path())
             .with_rules_file(Some(rules.path().to_path_buf()))
-            .with_persist_findings(true),
+            .with_persist_findings(true)
+            .with_workers(1),
         &NullEventOutput,
         &sink,
         &cancel,
@@ -488,7 +489,8 @@ fn scan_fs_with_runtime_uses_file_name_for_single_file_persistence_key() {
     let outcome = scan_fs_with_runtime(
         &FsScanConfig::new(&file_path)
             .with_rules_file(Some(rules.path().to_path_buf()))
-            .with_persist_findings(true),
+            .with_persist_findings(true)
+            .with_workers(1),
         &NullEventOutput,
         &sink,
         &cancel,
@@ -752,12 +754,14 @@ fn forward_commits_surfaces_first_commit_error() {
         object_path: b"file_a.txt".to_vec(),
         stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x01; 32]),
         findings: Vec::new(),
+        discovery_sequence: 0,
     }))
     .unwrap();
     tx.send(CommitMessage::Batch(OwnedCommitBatch {
         object_path: b"file_b.txt".to_vec(),
         stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x02; 32]),
         findings: Vec::new(),
+        discovery_sequence: 1,
     }))
     .unwrap();
     drop(tx);
@@ -821,6 +825,7 @@ fn forward_commits_drains_channel_after_error() {
             object_path: format!("file_{i}.txt").into_bytes(),
             stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([i; 32]),
             findings: Vec::new(),
+            discovery_sequence: u32::from(i),
         }))
         .unwrap();
     }
@@ -1125,4 +1130,458 @@ fn owned_git_event_identity_dictionary_round_trips() {
     let event = &events[0];
     assert_eq!(event["type"], "identity_dictionary");
     assert_eq!(event["id"], 99);
+}
+
+// ===========================================================================
+// DiscoveryOrderBuffer unit tests
+// ===========================================================================
+
+/// Helper to build a minimal `OwnedCommitBatch` with a given path and
+/// discovery sequence. Findings are empty; the stable item id is derived
+/// from the sequence for uniqueness.
+fn test_batch(path: &[u8], ds: u32) -> OwnedCommitBatch {
+    let mut id_bytes = [0u8; 32];
+    id_bytes[..4].copy_from_slice(&ds.to_le_bytes());
+    OwnedCommitBatch {
+        object_path: path.to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes(id_bytes),
+        findings: Vec::new(),
+        discovery_sequence: ds,
+    }
+}
+
+/// Convenience: collect all flushed paths from a buffer via push + drain_ready.
+fn push_and_collect(buf: &mut DiscoveryOrderBuffer, batch: OwnedCommitBatch) -> Vec<Vec<u8>> {
+    let mut ready = Vec::new();
+    buf.push(batch);
+    buf.drain_ready(&mut ready);
+    ready.iter().map(|b| b.object_path.clone()).collect()
+}
+
+#[test]
+fn discovery_order_buffer_passthrough_when_already_sorted() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // Batches arrive in discovery order: ds=0, ds=1, ds=2.
+    // Each ds transition marks the previous as complete.
+    let flushed_0 = push_and_collect(&mut buf, test_batch(b"a.txt", 0));
+    // ds=0 is current but not yet complete (no transition).
+    assert!(flushed_0.is_empty());
+
+    let flushed_1 = push_and_collect(&mut buf, test_batch(b"b.txt", 1));
+    // ds=0 is now complete; it matches next_flush=0, so it flushes.
+    assert_eq!(flushed_1, vec![b"a.txt".to_vec()]);
+
+    let flushed_2 = push_and_collect(&mut buf, test_batch(b"c.txt", 2));
+    assert_eq!(flushed_2, vec![b"b.txt".to_vec()]);
+
+    // Finish drains the last item.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(remaining, vec![b"c.txt".to_vec()]);
+}
+
+#[test]
+fn discovery_order_buffer_reorders_reversed_input() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // LIFO reversal: files arrive as ds=2, ds=1, ds=0.
+    let f = push_and_collect(&mut buf, test_batch(b"c.txt", 2));
+    assert!(f.is_empty(), "ds=2 not ready (next_flush=0)");
+
+    let f = push_and_collect(&mut buf, test_batch(b"b.txt", 1));
+    assert!(
+        f.is_empty(),
+        "ds=1 not ready (next_flush=0), ds=2 complete but not contiguous"
+    );
+
+    let f = push_and_collect(&mut buf, test_batch(b"a.txt", 0));
+    assert!(
+        f.is_empty(),
+        "ds=0 not ready yet (ds=1 just became complete)"
+    );
+
+    // Channel close: finish flushes everything in discovery order.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()],
+        "finish must produce batches in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_multi_batch_reversal() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // Two injection batches, each reversed by LIFO.
+    // Discovery: [A(0), B(1), C(2), D(3), E(4), F(5)]
+    // Batch 1 (LIFO): C(2), B(1), A(0)
+    // Batch 2 (LIFO): F(5), E(4), D(3)
+    for &(path, ds) in &[
+        (&b"c.txt"[..], 2u32),
+        (b"b.txt", 1),
+        (b"a.txt", 0),
+        (b"f.txt", 5),
+        (b"e.txt", 4),
+        (b"d.txt", 3),
+    ] {
+        buf.push(test_batch(path, ds));
+    }
+
+    // After all pushes, transitions have marked {2,1,0,5,4} complete.
+    // current_ds = 3 (not yet complete). drain_ready flushes 0→1→2.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    let flushed: Vec<Vec<u8>> = ready.into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        flushed,
+        vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()],
+        "first injection batch should flush in discovery order"
+    );
+
+    // finish marks ds=3 complete, then flushes 3→4→5.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"d.txt".to_vec(), b"e.txt".to_vec(), b"f.txt".to_vec(),],
+        "second injection batch should flush in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_multi_batch_per_file() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // File with ds=1 has two chunks. File with ds=0 has one chunk.
+    // Arrival: ds=1 chunk_a, ds=1 chunk_b, ds=0 chunk_a.
+    buf.push(test_batch(b"b_chunk1.txt", 1));
+    buf.push(test_batch(b"b_chunk2.txt", 1));
+    buf.push(test_batch(b"a_chunk1.txt", 0));
+    // ds=1 is marked complete when ds=0 arrives.
+    // drain_ready: next_flush=0, 0 not in complete → nothing.
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![
+            b"a_chunk1.txt".to_vec(),
+            b"b_chunk1.txt".to_vec(),
+            b"b_chunk2.txt".to_vec(),
+        ],
+        "within a ds group, batches must preserve arrival order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_single_item() {
+    let mut buf = DiscoveryOrderBuffer::new();
+    buf.push(test_batch(b"only.txt", 0));
+
+    // No transition → nothing drained eagerly.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    assert!(ready.is_empty());
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(remaining, vec![b"only.txt".to_vec()]);
+}
+
+#[test]
+fn discovery_order_buffer_empty() {
+    let buf = DiscoveryOrderBuffer::new();
+    let remaining: Vec<OwnedCommitBatch> = buf.finish().into_iter().collect();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn forward_commits_reorders_lifo_reversed_batches() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Simulate LIFO reversal: discovery order is a,b,c but processing
+    // order is c,b,a. Discovery sequences are 2,1,0 respectively.
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok());
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 3, "all three items should be committed");
+    let keys: Vec<&[u8]> = begun.iter().map(|(k, _)| k.as_slice()).collect();
+    // Verify discovery order is preserved: ds=0 -> ds=1 -> ds=2.
+    assert_eq!(
+        keys,
+        vec![
+            b"a.txt".as_slice(),
+            b"b.txt".as_slice(),
+            b"c.txt".as_slice()
+        ],
+        "begin_item must be called in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_handles_gap_in_sequences() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // ds=0 and ds=2 present; ds=1 was never produced (file skipped).
+    buf.push(test_batch(b"c.txt", 2));
+    buf.push(test_batch(b"a.txt", 0));
+
+    // current_ds=0 after the second push. drain_ready stops when
+    // next_flush equals current_ds, so nothing is drained yet.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    assert!(ready.is_empty(), "ds=0 is current, not yet complete");
+
+    // finish() flushes the contiguous prefix (ds=0) then hits the gap
+    // at ds=1. The safety net flushes residual ds=2 in BTreeMap key
+    // order — correct discovery order despite the gap.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"c.txt".to_vec()],
+        "finish must produce batches in discovery order despite gap at ds=1"
+    );
+}
+
+#[test]
+fn forward_commits_captures_error_from_finish_flush() {
+    use std::sync::mpsc::sync_channel;
+
+    /// Commit sink that fails when `begin_item` sees a key starting
+    /// with "a". All other keys succeed.
+    struct FailOnASink;
+
+    impl commit_sink::CommitSink for FailOnASink {
+        fn begin_item(
+            &self,
+            item_key: &gossip_contracts::connector::ItemKey,
+            _meta: &commit_sink::ItemMeta,
+        ) -> anyhow::Result<()> {
+            if item_key.as_bytes().starts_with(b"a") {
+                anyhow::bail!("injected failure for key starting with 'a'");
+            }
+            Ok(())
+        }
+
+        fn upsert_findings(
+            &self,
+            _item_key: &gossip_contracts::connector::ItemKey,
+            _batch: &commit_sink::FindingsBatch,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_item(
+            &self,
+            _item_key: &gossip_contracts::connector::ItemKey,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = FailOnASink;
+    let (tx, rx) = sync_channel(16);
+
+    // Send reversed: ds=2, ds=1, ds=0. All batches buffer until
+    // finish() because the reversed arrival means drain_ready never
+    // flushes the contiguous prefix during the recv loop.
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(
+        result.is_err(),
+        "error from finish-path batch must propagate"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("injected failure"),
+        "expected injected failure, got: {err_msg}"
+    );
+}
+
+#[test]
+fn forward_commits_eagerly_flushes_in_order_input() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Send batches in discovery order: ds=0, ds=1, ds=2. Each new
+    // sequence number completes the previous one, so drain_ready fires
+    // during the recv loop rather than deferring everything to finish().
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok());
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 3, "all three items should be committed");
+    let keys: Vec<&[u8]> = begun.iter().map(|(k, _)| k.as_slice()).collect();
+    // Verify discovery order is preserved: ds=0 -> ds=1 -> ds=2.
+    assert_eq!(
+        keys,
+        vec![
+            b"a.txt".as_slice(),
+            b"b.txt".as_slice(),
+            b"c.txt".as_slice()
+        ],
+        "begin_item must be called in discovery order"
+    );
+}
+
+#[test]
+fn forward_commits_handles_interleaved_run_loss_with_buffered_batches() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Batch(ds=1), RunLoss, Batch(ds=0): RunLoss must not interfere
+    // with the discovery-order buffer, and batches must still arrive at
+    // the sink in discovery order (ds=0 before ds=1).
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::RunLoss(
+        scanner_scheduler::store::FsRunLoss {
+            dropped_findings: 0,
+            persistence_emit_failures: 0,
+        },
+    ))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok(), "interleaved RunLoss must not cause errors");
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 2, "both batches should be committed");
+    assert_eq!(
+        begun[0].0,
+        b"a.txt".to_vec(),
+        "ds=0 batch must be forwarded first"
+    );
+    assert_eq!(
+        begun[1].0,
+        b"b.txt".to_vec(),
+        "ds=1 batch must be forwarded second"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_handles_multiple_gaps() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // ds=0, ds=3, ds=6: gaps at {1,2} and {4,5}. The buffer must
+    // produce all three in discovery order despite the missing sequences.
+    buf.push(test_batch(b"a.txt", 0));
+    buf.push(test_batch(b"d.txt", 3));
+    buf.push(test_batch(b"g.txt", 6));
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"d.txt".to_vec(), b"g.txt".to_vec()],
+        "finish must produce batches in discovery order despite multiple gaps"
+    );
+}
+
+#[test]
+fn scan_local_filesystem_rejects_multi_worker_persist() {
+    let dir = tempdir().expect("tempdir");
+    let cancel = CancellationToken::new();
+
+    let result = scan_fs_with_runtime(
+        &FsScanConfig::new(dir.path())
+            .with_persist_findings(true)
+            .with_workers(4),
+        &NullEventOutput,
+        &commit_sink::CliNoOpCommitSink,
+        &cancel,
+    );
+
+    assert!(result.is_err(), "multi-worker persist must be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("workers=1"),
+        "error should mention workers=1, got: {err_msg}"
+    );
 }

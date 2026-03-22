@@ -1494,6 +1494,7 @@ fn emit_persistence_batch_emits_for_empty_findings() {
         empty_findings,
         &mut persist_batch,
         &mut metrics,
+        0,
     );
 
     let batches = producer.batches();
@@ -1503,6 +1504,10 @@ fn emit_persistence_batch_emits_for_empty_findings() {
         "expected exactly one batch for clean file"
     );
     assert_eq!(batches[0].object_path, path);
+    assert_eq!(
+        batches[0].discovery_sequence, 0,
+        "discovery_sequence should be forwarded to the emitted batch"
+    );
     assert!(
         batches[0].findings.is_empty(),
         "findings should be empty for a clean file"

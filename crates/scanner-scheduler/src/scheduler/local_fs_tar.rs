@@ -57,6 +57,7 @@ macro_rules! child_archive_ctx {
             archive: $scan.archive,
             chunk_size: $scan.chunk_size,
             abort_run: $scan.abort_run,
+            discovery_sequence: $scan.discovery_sequence,
         }
     };
 }
@@ -630,6 +631,7 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                 scan.pending,
                 scan.persist_batch,
                 scan.metrics,
+                scan.discovery_sequence,
             );
             emit_findings(
                 scan.engine.as_ref(),
@@ -713,7 +715,7 @@ fn process_tar_like<E: ScanEngine>(
         (scratch, metrics)
     };
 
-    let mut scan = ArchiveScanCtx::new(scratch, metrics);
+    let mut scan = ArchiveScanCtx::new(scratch, metrics, task.discovery_sequence());
 
     scan.budgets.reset();
     if let Err(hit) = scan.budgets.enter_archive() {

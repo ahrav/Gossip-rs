@@ -114,6 +114,7 @@ pub(super) fn process_gzip_file<E: ScanEngine>(
         archive: &scratch.archive,
         chunk_size: scratch.chunk_size,
         abort_run: scratch.abort_run.as_ref(),
+        discovery_sequence: task.discovery_sequence(),
     };
 
     scan.budgets.reset();

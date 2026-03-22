@@ -423,6 +423,7 @@ pub(super) fn process_zip_file<E: ScanEngine>(
                 pending,
                 persist_batch,
                 metrics,
+                task.discovery_sequence(),
             );
             emit_findings(engine.as_ref(), &**event_sink, path_bytes, pending);
 
