@@ -1057,35 +1057,50 @@ pub(crate) fn forward_core_events(out: &dyn EventOutput, rx: Receiver<OwnedDrive
     out.flush();
 }
 
-/// [`StoreProducer`] adapter that normalizes paths and derives stable item
-/// identities before forwarding finding batches through a commit channel.
+/// Derives deterministic [`StableItemId`] values for filesystem objects
+/// under a single canonicalized scan root.
 ///
-/// Path normalization strips the scan root prefix and converts to
-/// forward-slash-separated bytes, producing a deterministic item key
-/// regardless of platform path separators.
+/// Identity is a three-part hash: the fixed filesystem connector tag, a
+/// connector-instance hash derived from the canonical root path, and the
+/// normalized forward-slash-separated item key. Two scan roots that
+/// resolve to the same canonical path always produce the same instance
+/// hash (and therefore the same stable IDs), while distinct roots
+/// produce distinct namespaces even for identical relative paths.
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelStoreProducer {
-    tx: SyncSender<CommitMessage>,
-    root: PathBuf,
+struct FilesystemIdentityScope {
+    canonical_root: PathBuf,
     connector_instance: ConnectorInstanceIdHash,
 }
 
-impl ChannelStoreProducer {
-    pub(crate) fn new(tx: SyncSender<CommitMessage>, root: PathBuf) -> Self {
-        let connector_instance =
-            ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_encoded_bytes());
+impl FilesystemIdentityScope {
+    /// Build one filesystem identity scope for a canonicalized scan root.
+    ///
+    /// Equivalent input spellings belong to the same connector-instance
+    /// namespace because the runtime canonicalizes before constructing this
+    /// scope.
+    fn from_canonical_root(canonical_root: PathBuf) -> Self {
+        let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(
+            canonical_root.as_os_str().as_encoded_bytes(),
+        );
         Self {
-            tx,
-            root,
+            canonical_root,
             connector_instance,
         }
     }
-}
 
-impl StoreProducer for ChannelStoreProducer {
-    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+    /// Normalize a scheduler-produced object path and derive its stable
+    /// identity.
+    ///
+    /// Returns the normalized forward-slash path bytes alongside the
+    /// [`StableItemId`]. Fails if the path cannot be made relative to
+    /// the canonical root or if the resulting key exceeds [`ItemKey`]
+    /// length limits.
+    fn stable_item_id_for_scheduler_path(
+        &self,
+        object_path: &[u8],
+    ) -> Result<(Vec<u8>, StableItemId), FsStoreError> {
         let normalized_path =
-            normalize_scheduler_path(&self.root, batch.object_path).map_err(|error| {
+            normalize_scheduler_path(&self.canonical_root, object_path).map_err(|error| {
                 FsStoreError::backend(format!("path normalization failed: {error}"))
             })?;
         let item_key = gossip_contracts::connector::ItemKey::try_from_slice(&normalized_path)
@@ -1098,6 +1113,33 @@ impl StoreProducer for ChannelStoreProducer {
             item_key.as_bytes(),
         )
         .stable_id();
+        Ok((normalized_path, stable_item_id))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelStoreProducer {
+    tx: SyncSender<CommitMessage>,
+    identity: FilesystemIdentityScope,
+}
+
+impl ChannelStoreProducer {
+    pub(crate) fn from_canonical_root(
+        tx: SyncSender<CommitMessage>,
+        canonical_root: PathBuf,
+    ) -> Self {
+        Self {
+            tx,
+            identity: FilesystemIdentityScope::from_canonical_root(canonical_root),
+        }
+    }
+}
+
+impl StoreProducer for ChannelStoreProducer {
+    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+        let (normalized_path, stable_item_id) = self
+            .identity
+            .stable_item_id_for_scheduler_path(batch.object_path)?;
 
         self.tx
             .send(CommitMessage::Batch(OwnedCommitBatch {

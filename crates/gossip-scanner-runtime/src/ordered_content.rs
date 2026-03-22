@@ -161,7 +161,7 @@ pub(crate) fn scan_local_filesystem_with_engine(
                     config.workers
                 )));
             }
-            scan_cfg.store_producer = Some(Arc::new(ChannelStoreProducer::new(
+            scan_cfg.store_producer = Some(Arc::new(ChannelStoreProducer::from_canonical_root(
                 commit_tx.clone(),
                 canonical_path.clone(),
             )));

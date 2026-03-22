@@ -7,9 +7,11 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use gossip_contracts::{
+    connector::FILESYSTEM_CONNECTOR_TAG,
     coordination::ShardSpec,
     identity::{
-        LogicalTime, OpId, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey, WorkerId,
+        ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, OpId, PolicyHash, RunId, ShardId,
+        TenantId, TenantSecretKey, WorkerId,
     },
 };
 use gossip_coordination::{
@@ -86,6 +88,34 @@ fn write_empty_rules() -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("rules temp file");
     writeln!(file, "rules: []").expect("write empty rules");
     file
+}
+
+fn expected_fs_stable_item_id(
+    root: &Path,
+    locator: &[u8],
+) -> gossip_contracts::identity::StableItemId {
+    let connector_instance =
+        ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_encoded_bytes());
+    ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, locator).stable_id()
+}
+
+fn scan_fs_with_spy_commit_sink(
+    path: &Path,
+    rules: &NamedTempFile,
+) -> (AssignmentOutcome, SpyCommitSink) {
+    let sink = SpyCommitSink::default();
+    let cancel = CancellationToken::new();
+    let outcome = scan_fs_with_runtime(
+        &FsScanConfig::new(path)
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_persist_findings(true)
+            .with_workers(1),
+        &NullEventOutput,
+        &sink,
+        &cancel,
+    )
+    .expect("filesystem scan should succeed");
+    (outcome, sink)
 }
 
 fn parse_jsonl(bytes: Vec<u8>) -> Vec<Value> {
@@ -475,6 +505,71 @@ fn scan_fs_with_runtime_forwards_persisted_findings() {
     assert_eq!(batches[0].0, b"nested/secret.txt".to_vec());
     assert!(!batches[0].1.findings.is_empty());
     assert_eq!(finished, vec![b"nested/secret.txt".to_vec()]);
+}
+
+#[test]
+fn scan_fs_with_runtime_derives_expected_stable_item_id() {
+    let dir = tempdir().expect("tempdir");
+    let nested = dir.path().join("nested");
+    fs::create_dir_all(&nested).expect("create nested fixture dir");
+    fs::write(nested.join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    let rules = write_runtime_rules();
+    let canonical_root = fs::canonicalize(dir.path()).expect("canonicalize root");
+
+    let (outcome, sink) = scan_fs_with_spy_commit_sink(dir.path(), &rules);
+    let begun = sink.begun();
+
+    assert_eq!(outcome.report.items_scanned, 1);
+    assert_eq!(begun.len(), 1);
+    assert_eq!(begun[0].0, b"nested/secret.txt".to_vec());
+    assert_eq!(
+        begun[0].1.stable_item_id,
+        expected_fs_stable_item_id(&canonical_root, b"nested/secret.txt"),
+    );
+}
+
+#[test]
+fn scan_fs_with_runtime_distinguishes_same_relative_path_under_different_roots() {
+    let dir_a = tempdir().expect("tempdir");
+    let dir_b = tempdir().expect("tempdir");
+    for root in [dir_a.path(), dir_b.path()] {
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested fixture dir");
+        fs::write(nested.join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    }
+    let rules = write_runtime_rules();
+
+    let (_, sink_a) = scan_fs_with_spy_commit_sink(dir_a.path(), &rules);
+    let (_, sink_b) = scan_fs_with_spy_commit_sink(dir_b.path(), &rules);
+    let begun_a = sink_a.begun();
+    let begun_b = sink_b.begun();
+
+    assert_eq!(begun_a.len(), 1);
+    assert_eq!(begun_b.len(), 1);
+    assert_eq!(begun_a[0].0, b"nested/secret.txt".to_vec());
+    assert_eq!(begun_b[0].0, b"nested/secret.txt".to_vec());
+    assert_ne!(begun_a[0].1.stable_item_id, begun_b[0].1.stable_item_id);
+}
+
+#[test]
+fn scan_fs_with_runtime_aligns_equivalent_root_spellings() {
+    let dir = tempdir().expect("tempdir");
+    let nested = dir.path().join("nested");
+    fs::create_dir_all(&nested).expect("create nested fixture dir");
+    fs::write(nested.join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    let dotted_root = dir.path().join(".");
+    let rules = write_runtime_rules();
+
+    let (_, sink_a) = scan_fs_with_spy_commit_sink(dir.path(), &rules);
+    let (_, sink_b) = scan_fs_with_spy_commit_sink(&dotted_root, &rules);
+    let begun_a = sink_a.begun();
+    let begun_b = sink_b.begun();
+
+    assert_eq!(begun_a.len(), 1);
+    assert_eq!(begun_b.len(), 1);
+    assert_eq!(begun_a[0].0, b"nested/secret.txt".to_vec());
+    assert_eq!(begun_b[0].0, begun_a[0].0);
+    assert_eq!(begun_b[0].1.stable_item_id, begun_a[0].1.stable_item_id);
 }
 
 #[test]
@@ -873,7 +968,10 @@ fn channel_store_producer_sends_run_loss_and_end_run() {
 
     let (tx, rx) = sync_channel(16);
     let dir = tempdir().expect("tempdir");
-    let producer = ChannelStoreProducer::new(tx, dir.path().to_path_buf());
+    let producer = ChannelStoreProducer::from_canonical_root(
+        tx,
+        fs::canonicalize(dir.path()).expect("canonicalize root"),
+    );
 
     producer
         .record_fs_run_loss(scanner_scheduler::store::FsRunLoss {
