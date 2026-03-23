@@ -520,8 +520,37 @@ impl FilesystemConnector {
             return Ok(None);
         }
 
-        let metadata = fs::symlink_metadata(&self.root)
-            .map_err(|error| classify_io_enumerate_error("symlink_metadata", &self.root, &error))?;
+        let metadata = {
+            let parent_fd = self
+                .root_fd
+                .as_ref()
+                .expect("single-file root has a pinned parent fd after ensure_root_ready");
+            let c_name = CString::new(file_name)
+                .map_err(|_| EnumerateError::permanent("null byte in single-file name"))?;
+            // Open relative to the pinned parent fd with O_NOFOLLOW, matching
+            // the security model used by `open_file_for_ref`. Using fd-relative
+            // operations here avoids the TOCTOU gap inherent in path-based
+            // `symlink_metadata`.
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(classify_io_enumerate_error(
+                    "openat_single_file",
+                    &self.root,
+                    &io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fd >= 0` from the check above.
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            file.metadata().map_err(|error| {
+                classify_io_enumerate_error("fstat_single_file", &self.root, &error)
+            })?
+        };
         if !metadata.is_file() {
             return Err(EnumerateError::permanent(
                 "single-file root is no longer a regular file",
@@ -1127,6 +1156,10 @@ fn intersect_key_bounds<'a>(
 // ---------------------------------------------------------------------------
 
 /// Open a directory file descriptor for use with `openat`.
+///
+/// Includes `O_NOFOLLOW` for consistency with the module-wide policy of
+/// rejecting symlinks at every open, even though callers currently supply
+/// canonicalized paths.
 fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     let c_path = path_to_cstring(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "null byte in path"))?;
@@ -1134,7 +1167,7 @@ fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {

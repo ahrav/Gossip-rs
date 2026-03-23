@@ -173,13 +173,20 @@ pub enum OrderedContentConformanceError {
         actual_last: ItemKey,
     },
     /// A later page or resume cursor regressed or stalled instead of advancing.
+    ///
+    /// `observed_key` is the key that failed to advance past `previous_last`.
+    /// It may be the first key of a new page (page-level regression) or the
+    /// `last_key` on a `HasMore` cursor (cursor-level stall).
     CursorDidNotAdvance {
         page_index: usize,
         previous_last: ItemKey,
-        next_last: ItemKey,
+        observed_key: ItemKey,
     },
     /// After a `Complete` page, the suffix call still produced more items.
     CompletePageDidNotExhaust { page_index: usize },
+    /// The source returned `None` mid-drain (after a prior `HasMore`), but a
+    /// retry with the same key position found additional items.
+    NoneDidNotExhaust { page_index: usize },
     /// The harness exceeded its hard safety cap on page count.
     TooManyPages { limit: usize },
     /// Two fresh sources over the same fixed view produced different drains.
@@ -234,14 +241,18 @@ impl fmt::Display for OrderedContentConformanceError {
             Self::CursorDidNotAdvance {
                 page_index,
                 previous_last,
-                next_last,
+                observed_key,
             } => write!(
                 f,
-                "ordered-content conformance page {page_index} did not advance: previous_last={previous_last}, next_last={next_last}"
+                "ordered-content conformance page {page_index} did not advance: previous_last={previous_last}, observed_key={observed_key}"
             ),
             Self::CompletePageDidNotExhaust { page_index } => write!(
                 f,
                 "ordered-content conformance page {page_index} reported Complete but a suffix call still returned more items"
+            ),
+            Self::NoneDidNotExhaust { page_index } => write!(
+                f,
+                "ordered-content conformance page {page_index}: source returned None mid-drain but a retry with the same key position produced items"
             ),
             Self::TooManyPages { limit } => write!(
                 f,
@@ -557,9 +568,7 @@ where
                         source,
                     })?;
                 if probe.is_some() {
-                    return Err(OrderedContentConformanceError::CompletePageDidNotExhaust {
-                        page_index,
-                    });
+                    return Err(OrderedContentConformanceError::NoneDidNotExhaust { page_index });
                 }
             }
             return Ok(OrderedContentDrain::new(items, page_lengths));
@@ -580,7 +589,7 @@ where
             return Err(OrderedContentConformanceError::CursorDidNotAdvance {
                 page_index,
                 previous_last: prev.clone(),
-                next_last: first_key,
+                observed_key: first_key,
             });
         }
 
@@ -615,7 +624,7 @@ where
                     return Err(OrderedContentConformanceError::CursorDidNotAdvance {
                         page_index,
                         previous_last: prev.clone(),
-                        next_last,
+                        observed_key: next_last,
                     });
                 }
                 previous_last = Some(next_last.clone());
@@ -1143,7 +1152,7 @@ mod tests {
             .expect_err("has-more then none with remaining items must fail");
         assert!(matches!(
             err,
-            OrderedContentConformanceError::CompletePageDidNotExhaust { page_index: 1 }
+            OrderedContentConformanceError::NoneDidNotExhaust { page_index: 1 }
         ));
     }
 }
