@@ -786,4 +786,37 @@ mod tests {
             "Complete pages carry no opaque token"
         );
     }
+
+    #[test]
+    fn execute_source_counts_only_items_with_size_hints() {
+        let hinted = item(b"a.txt", 10);
+        let unhinted = ScanItem::new(
+            ItemKey::try_from_slice(b"b.txt").expect("item key"),
+            ItemRef::try_from_slice(b"b.txt").expect("item ref"),
+            StableItemId::from_bytes([b'b'; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"b.txt")),
+        );
+        let page = PageBuf::try_new(vec![hinted, unhinted], PageState::Complete).expect("page");
+        let mut source = ScriptedSource::returning(Ok(Some(page)));
+
+        let outcome = OrderedContentRuntime::execute_source(
+            &mut source,
+            &runtime_input(
+                ShardSpec::unbounded(),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+        )
+        .expect("mixed size_hint page");
+
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome");
+        };
+        assert_eq!(page.report().items_scanned, 2);
+        assert_eq!(
+            page.report().bytes_scanned,
+            10,
+            "only the item with a size_hint contributes to bytes_scanned"
+        );
+    }
 }

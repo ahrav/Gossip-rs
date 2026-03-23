@@ -1026,6 +1026,16 @@ const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
 /// If the shard's `connector_extra` field contains a non-empty UTF-8 path,
 /// that path overrides the template's `path` field. Otherwise the template
 /// path is used as-is.
+///
+/// # Trust boundary
+///
+/// The `connector_extra` metadata originates from a trusted coordination backend,
+/// so no path-containment check is performed — the worker scans whatever path the
+/// coordination layer provides. If the coordination backend ever accepts untrusted
+/// shard metadata, a containment check (e.g., verifying the canonical path falls
+/// within allowed roots) must be added here. Downstream, `validate_fs_path` rejects
+/// non-file/non-directory targets, and the connector's `openat`/`O_NOFOLLOW`
+/// enforcement prevents symlink traversal during reads.
 fn scan_config_from_spec(
     spec: gossip_coordination::ShardSpecRef<'_>,
     scan_template: &FsScanConfig,

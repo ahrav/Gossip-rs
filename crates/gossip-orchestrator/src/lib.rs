@@ -19,6 +19,9 @@
 pub mod planner;
 pub mod request;
 
+#[cfg(test)]
+mod test_support;
+
 pub use planner::{
     FilesystemInitialShardPlan, InitialShardGeometry, plan_filesystem_initial_shards,
 };

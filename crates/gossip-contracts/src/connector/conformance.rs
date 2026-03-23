@@ -594,62 +594,51 @@ pub fn assert_no_forbidden_fragments(
             ("item_ref", item.item_ref().as_bytes()),
             ("item_key", item.item_key().as_bytes()),
         ] {
-            for fragment in forbidden_fragments.iter().copied() {
-                if fragment.is_empty() {
-                    continue;
-                }
-                if field_bytes
-                    .windows(fragment.len())
-                    .any(|window| window == fragment)
-                {
-                    return Err(OrderedContentConformanceError::ForbiddenFragment {
-                        item_index,
-                        field: field_name,
-                        fragment: ToxicDigest::of_bytes(fragment),
-                        content: ToxicDigest::of_bytes(field_bytes),
-                    });
-                }
-            }
+            check_field_for_fragments(item_index, field_name, field_bytes, forbidden_fragments)?;
         }
 
         if let Some(location) = item.location() {
-            let display_bytes = location.display().as_bytes();
-            for fragment in forbidden_fragments.iter().copied() {
-                if fragment.is_empty() {
-                    continue;
-                }
-                if display_bytes
-                    .windows(fragment.len())
-                    .any(|window| window == fragment)
-                {
-                    return Err(OrderedContentConformanceError::ForbiddenFragment {
-                        item_index,
-                        field: "location_display",
-                        fragment: ToxicDigest::of_bytes(fragment),
-                        content: ToxicDigest::of_bytes(display_bytes),
-                    });
-                }
-            }
-
+            check_field_for_fragments(
+                item_index,
+                "location_display",
+                location.display().as_bytes(),
+                forbidden_fragments,
+            )?;
             if let Some(url) = location.url() {
-                let url_bytes = url.as_bytes();
-                for fragment in forbidden_fragments.iter().copied() {
-                    if fragment.is_empty() {
-                        continue;
-                    }
-                    if url_bytes
-                        .windows(fragment.len())
-                        .any(|window| window == fragment)
-                    {
-                        return Err(OrderedContentConformanceError::ForbiddenFragment {
-                            item_index,
-                            field: "location_url",
-                            fragment: ToxicDigest::of_bytes(fragment),
-                            content: ToxicDigest::of_bytes(url_bytes),
-                        });
-                    }
-                }
+                check_field_for_fragments(
+                    item_index,
+                    "location_url",
+                    url.as_bytes(),
+                    forbidden_fragments,
+                )?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Scans `bytes` for any non-empty forbidden fragment substring, returning
+/// a `ForbiddenFragment` error on the first match.
+fn check_field_for_fragments(
+    item_index: usize,
+    field: &'static str,
+    bytes: &[u8],
+    forbidden_fragments: &[&[u8]],
+) -> Result<(), OrderedContentConformanceError> {
+    for fragment in forbidden_fragments.iter().copied() {
+        if fragment.is_empty() {
+            continue;
+        }
+        if bytes
+            .windows(fragment.len())
+            .any(|window| window == fragment)
+        {
+            return Err(OrderedContentConformanceError::ForbiddenFragment {
+                item_index,
+                field,
+                fragment: ToxicDigest::of_bytes(fragment),
+                content: ToxicDigest::of_bytes(bytes),
+            });
         }
     }
     Ok(())

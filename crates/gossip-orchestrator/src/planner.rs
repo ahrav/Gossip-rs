@@ -11,35 +11,60 @@ use crate::request::NormalizedFilesystemRequest;
 /// This type carries only key-range geometry. Shard identifiers, connector
 /// metadata, cursor state, and manifest rows are downstream registration
 /// concerns.
+///
+/// Key-range bounds follow the [`ShardSpec`] convention: empty slices mean
+/// unbounded in that direction. Downstream lowering to [`InitialShardInput`]
+/// must translate unbounded geometry to connector-specific finite bounds
+/// before manifest registration, which rejects unbounded ranges.
+///
+/// [`ShardSpec`]: gossip_coordination::ShardSpec
+/// [`InitialShardInput`]: gossip_coordination::InitialShardInput
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitialShardGeometry {
-    key_range_start: [u8; 1],
-    key_range_end: [u8; 1],
+    key_range_start: &'static [u8],
+    key_range_end: &'static [u8],
 }
 
 impl InitialShardGeometry {
-    const FULL_CONNECTOR_KEYSPACE_START: [u8; 1] = [0x00];
-    const FULL_CONNECTOR_KEYSPACE_END: [u8; 1] = [0xFF];
-
-    /// Geometry covering the full filesystem connector keyspace.
+    /// Geometry covering the full connector keyspace (unbounded).
+    ///
+    /// Empty slices follow the [`ShardSpec::unbounded()`] convention: no lower
+    /// bound and no upper bound. Downstream lowering to [`InitialShardInput`]
+    /// must translate to connector-specific finite bounds before manifest
+    /// registration, which rejects unbounded ranges.
+    ///
+    /// [`ShardSpec::unbounded()`]: gossip_coordination::ShardSpec::unbounded
+    /// [`InitialShardInput`]: gossip_coordination::InitialShardInput
     #[must_use]
     pub const fn full_connector_keyspace() -> Self {
         Self {
-            key_range_start: Self::FULL_CONNECTOR_KEYSPACE_START,
-            key_range_end: Self::FULL_CONNECTOR_KEYSPACE_END,
+            key_range_start: &[],
+            key_range_end: &[],
         }
     }
 
-    /// Inclusive lower bound of the planned key range.
+    /// Returns `true` if the lower bound is unbounded (empty).
     #[must_use]
-    pub fn key_range_start(&self) -> &[u8] {
-        &self.key_range_start
+    pub fn is_start_unbounded(&self) -> bool {
+        self.key_range_start.is_empty()
     }
 
-    /// Exclusive upper bound of the planned key range.
+    /// Returns `true` if the upper bound is unbounded (empty).
+    #[must_use]
+    pub fn is_end_unbounded(&self) -> bool {
+        self.key_range_end.is_empty()
+    }
+
+    /// Inclusive lower bound of the planned key range, or empty for unbounded.
+    #[must_use]
+    pub fn key_range_start(&self) -> &[u8] {
+        self.key_range_start
+    }
+
+    /// Exclusive upper bound of the planned key range, or empty for unbounded.
     #[must_use]
     pub fn key_range_end(&self) -> &[u8] {
-        &self.key_range_end
+        self.key_range_end
     }
 }
 
@@ -99,16 +124,11 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
 
-    use gossip_coordination::{CursorSemantics, RunConfig};
     use tempfile::tempdir;
 
     use super::*;
     use crate::request::{FilesystemRequest, FilesystemSourceMode};
-
-    fn run_config() -> RunConfig {
-        RunConfig::try_new(CursorSemantics::Completed, 30_000, Some(5))
-            .expect("run config should be valid")
-    }
+    use crate::test_support::run_config;
 
     #[test]
     fn single_file_requests_plan_one_full_range_shard() {
@@ -128,8 +148,11 @@ mod tests {
             Some(OsStr::new("scan-target.txt"))
         );
         assert_eq!(plan.shard_geometries().len(), 1);
-        assert_eq!(plan.initial_shard().key_range_start(), b"\x00");
-        assert_eq!(plan.initial_shard().key_range_end(), b"\xFF");
+        let geom = plan.initial_shard();
+        assert!(geom.is_start_unbounded());
+        assert!(geom.is_end_unbounded());
+        assert_eq!(geom.key_range_start(), b"");
+        assert_eq!(geom.key_range_end(), b"");
     }
 
     #[test]
@@ -147,8 +170,11 @@ mod tests {
         assert_eq!(plan.request().mode(), FilesystemSourceMode::DirectoryRoot);
         assert_eq!(plan.request().relative_namespace_name(), None);
         assert_eq!(plan.shard_geometries().len(), 1);
-        assert_eq!(plan.initial_shard().key_range_start(), b"\x00");
-        assert_eq!(plan.initial_shard().key_range_end(), b"\xFF");
+        let geom = plan.initial_shard();
+        assert!(geom.is_start_unbounded());
+        assert!(geom.is_end_unbounded());
+        assert_eq!(geom.key_range_start(), b"");
+        assert_eq!(geom.key_range_end(), b"");
     }
 
     #[test]
