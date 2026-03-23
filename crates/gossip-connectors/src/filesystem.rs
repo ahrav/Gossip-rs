@@ -12,7 +12,9 @@
 //!   Directory siblings are sorted with a virtual trailing `/` so depth-first
 //!   traversal emits files in the same order as their full relative paths.
 //! - Resumption is key-only for now. `fill_page` restarts from the root view
-//!   and skips all keys at or below `cursor.last_key()`.
+//!   and skips all keys at or below `cursor.last_key()`. Incoming cursor
+//!   tokens are ignored because the connector does not advertise
+//!   `token_resume`.
 //!
 //! # Identity and version model
 //!

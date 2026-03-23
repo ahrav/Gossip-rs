@@ -19,6 +19,9 @@
 //! - `common.rs` defines shared paging vocabulary reused across connector
 //!   families and exposed at [`common`] ([`PageBuf`], [`PageState`],
 //!   [`PagingCapabilities`], [`KeyedPageItem`], [`validate_filled_page`]).
+//! - `conformance.rs` provides the reusable ordered-content conformance
+//!   harness ([`conformance::run_ordered_content_conformance`],
+//!   [`conformance::drain_ordered_source`]).
 //! - `ordered.rs` defines the ordered-content family contract
 //!   ([`ordered::OrderedContentCapabilities`],
 //!   [`ordered::OrderedContentSource`]).
@@ -71,6 +74,9 @@
 //! - Connector feature flags: [`ConnectorCapabilities`]
 //! - Ordered-content family contract: [`ordered::OrderedContentCapabilities`],
 //!   [`ordered::OrderedContentSource`]
+//! - Ordered-content conformance harness:
+//!   [`conformance::run_ordered_content_conformance`],
+//!   [`conformance::drain_ordered_source`]
 //! - Git family types and contracts: [`git::RepoKey`], [`git::RepoLocator`],
 //!   [`git::GitRepoTarget`], [`git::GitSelection`], [`git::LocalMirror`],
 //!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
@@ -93,6 +99,7 @@ use crate::identity::ConnectorTag;
 
 mod api;
 pub mod common;
+pub mod conformance;
 pub mod git;
 pub mod ordered;
 mod types;
@@ -104,6 +111,11 @@ pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 pub use api::fmt_sanitized_message;
 pub use common::{
     KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, validate_filled_page,
+};
+pub use conformance::{
+    ObservedScanItem, OrderedContentConformanceError, OrderedContentDrain,
+    assert_no_item_ref_contains, assert_repeatable_drain, assert_resume_after_corrupt_token,
+    drain_ordered_source, run_ordered_content_conformance,
 };
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, ItemKey, ItemRef, Location,

@@ -27,6 +27,10 @@ The crate provides four core capabilities:
   `Ok(Some(page))` delivers a non-empty page, `Ok(None)` signals terminal
   completion when no in-scope items remain (`PageBuf` enforces non-empty,
   so the `Option` wrapper carries the empty-terminal signal).
+  `conformance.rs` provides a reusable ordered-content harness for
+  sequence-level checks such as monotonic drain progression,
+  determinism across fresh sources, corrupt-token fallback, and
+  forbidden-fragment validation on emitted `ItemRef` values.
   `git.rs` defines the Git family's three-trait pipeline:
   `GitRepoDiscoverySource` (frontier discovery), `GitMirrorManager`
   (local mirror acquisition), and `GitRepoExecutor` (whole-repo
@@ -48,6 +52,7 @@ The crate provides four core capabilities:
 | ------------------- | ---------------------------------------------------------------------------- |
 | `mod.rs`            | Module root, re-exports all public types from sub-modules                    |
 | `common.rs`         | Shared paging vocabulary: `PageBuf`, `PageState`, `PagingCapabilities`, `KeyedPageItem`, page validation |
+| `conformance.rs`    | Reusable ordered-content conformance harness: drain snapshots, structured errors, and helper probes |
 | `types.rs`          | Toxic-byte wrappers, `Cursor`, `ScanItem`, `Budgets`, `ToxicDigest`         |
 | `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`         |
 | `ordered.rs`        | Ordered-content family contract: `OrderedContentSource` trait (`fill_page` → `Ok(None)` terminal), `OrderedContentCapabilities` flags |
@@ -358,11 +363,12 @@ emits `PageBuf<ScanItem>` pages with relative-path `ItemKey` /
 metadata-based `VersionId` values, and metadata-backed `size_hint`s.
 Page fill applies connector-side `max_items`, `max_bytes`, and deadline
 budgets. Resume is key-authoritative: enumeration rescans the live root
-view and skips entries at or below `Cursor::last_key()`. The first
-in-scope item is still emitted even when its `size_hint` alone exceeds
-`max_bytes`, which preserves forward progress for oversized files. Full
-reads reject expired deadlines and return a bounded reader, while
-`read_range` clamps bytes to `max_bytes`.
+view and skips entries at or below `Cursor::last_key()`. Incoming cursor
+tokens are ignored because the connector does not advertise
+`token_resume`. The first in-scope item is still emitted even when its
+`size_hint` alone exceeds `max_bytes`, which preserves forward progress
+for oversized files. Full reads reject expired deadlines and return a
+bounded reader, while `read_range` clamps bytes to `max_bytes`.
 
 The `StreamingSplitEstimator` field has no internal observation
 feed from page enumeration, so `split_hints` remains `false`. The
