@@ -29,10 +29,10 @@
 //!
 //! # Execution modes
 //!
-//! [`ExecutionMode::Direct`] keeps the existing scheduler-driven local scan
-//! path. [`ExecutionMode::Connector`] selects the family boundary instead:
-//! filesystem sources perform ordered page acquisition and validation through
-//! `OrderedContentRuntime`, while Git sources still reuse the direct path.
+//! [`ExecutionMode::Direct`] dispatches scans via the scheduler-driven local
+//! scan path. [`ExecutionMode::Connector`] selects the family boundary
+//! instead: filesystem sources perform ordered page acquisition and validation
+//! through `OrderedContentRuntime`, while Git sources use the direct path.
 //!
 //! # Durability model
 //!
@@ -114,10 +114,10 @@ pub mod result_translation;
 
 /// How the runtime acquires source items.
 ///
-/// `Direct` keeps the existing local scan implementation. `Connector`
+/// `Direct` dispatches via the local scan implementation. `Connector`
 /// selects the source-family boundary: filesystem scans run one ordered
 /// connector page acquisition/validation step, while Git connector mode
-/// still reuses the direct path.
+/// uses the direct path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// Scan source items directly from local state.
@@ -239,10 +239,11 @@ impl CancellationToken {
 /// Runtime budgets for source scans.
 ///
 /// Both fields must be non-zero; validation enforces this constraint
-/// before distributed scan dispatch. Local scan paths (`scan_fs_with_runtime`,
-/// `scan_git_with_runtime`) do not validate or consume budgets — they are
-/// relevant only to the distributed runtime. Both fields are validated
-/// (non-zero) before dispatch but are not yet enforced at execution time.
+/// before distributed scan dispatch and in the filesystem connector-mode
+/// local path (which constructs [`Budgets`] from these values). Direct
+/// local scan paths (`scan_fs_with_runtime`, `scan_git_with_runtime`) do
+/// not validate or consume budgets. Both fields are validated (non-zero)
+/// before dispatch but are not enforced at execution time.
 ///
 /// Defaults are intentionally conservative (256 items, 1 MB) to bound
 /// memory pressure in distributed workers.
@@ -732,7 +733,7 @@ pub struct AssignmentOutcome {
 /// Top-level filesystem scan dispatcher.
 ///
 /// Routes to `scan_fs_direct` or `scan_fs_connector` based on
-/// [`FsScanConfig::execution_mode`]. Direct mode runs the existing local scan;
+/// [`FsScanConfig::execution_mode`]. Direct mode runs the local scan;
 /// connector mode exercises the ordered-content page-fill boundary.
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
@@ -765,13 +766,10 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
 
 /// Connector-mode filesystem scan (single-page validation boundary).
 ///
-/// This path validates the target path, constructs a real
-/// [`FilesystemConnector`], and executes one ordered page acquisition through
-/// [`ordered_content::OrderedContentRuntime`]. Only a single page is acquired;
-/// multi-page iteration is not yet wired. Callers needing a complete scan
-/// should use [`scan_fs_direct`].
-///
-/// Content reads, rule execution, and durability remain on the direct scan path.
+/// Validates the target path, constructs a [`FilesystemConnector`], and
+/// executes one ordered page acquisition through
+/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
+/// and durability are handled by the direct filesystem runtime path.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
@@ -785,7 +783,17 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
 
     match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
         ordered_content::OrderedContentExecutionOutcome::Finished => Ok(ScanReport::default()),
-        ordered_content::OrderedContentExecutionOutcome::Page(page) => Ok(page.report()),
+        ordered_content::OrderedContentExecutionOutcome::Page(page) => {
+            if page.page().state().next_cursor().is_some() {
+                let items = page.report().items_scanned;
+                tracing::warn!(
+                    items_scanned = items,
+                    "connector page indicates more items available; \
+                     scan result is partial"
+                );
+            }
+            Ok(page.report())
+        }
         ordered_content::OrderedContentExecutionOutcome::Stopped(stop) => {
             Err(ScanRuntimeError::Driver(anyhow::anyhow!("{stop}")))
         }

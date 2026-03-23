@@ -1076,7 +1076,7 @@ fn scan_git_with_runtime_returns_empty_report_when_pre_cancelled() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedCoreEvent round-trip fidelity (F11)
+// OwnedCoreEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1156,7 +1156,7 @@ fn owned_core_event_diagnostic_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedGitEvent round-trip fidelity (F11)
+// OwnedGitEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]

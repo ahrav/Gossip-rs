@@ -76,7 +76,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Error as AnyError, Result, anyhow};
+use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_contracts::{
     connector::{Budgets, Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     coordination::{RestoredShardState, ShardSpec},
@@ -199,7 +199,7 @@ pub struct ShardLease {
 
 impl ShardLease {
     /// Construct one concrete filesystem shard lease.
-    pub fn new(
+    pub(crate) fn new(
         shard_id: Arc<str>,
         lease: Lease,
         state: RestoredShardState,
@@ -1035,16 +1035,27 @@ fn scan_config_from_spec(
 /// Convert an acquired coordination lease into the concrete runtime payload.
 ///
 /// Constructs a [`WriteContext`] from the lease's fencing fields and the
-/// worker's policy hash, then decodes the shard spec's `connector_extra`
-/// to derive the filesystem scan path.
+/// worker's policy hash, restores an owned [`ShardSpec`] and resume
+/// [`Cursor`] from the acquired snapshot, then decodes the shard spec's
+/// `connector_extra` to derive the filesystem scan path.
 fn build_lease_from_acquire(
     acquired: AcquireResultView<'_>,
     identity: &WorkerIdentity,
 ) -> Result<ShardLease> {
     let snapshot = acquired.snapshot;
     let spec = snapshot.spec();
-    let shard_spec = ShardSpec::try_from_ref(spec)?;
-    let resume_cursor = Cursor::try_from_update(snapshot.cursor())?;
+    let shard_spec = ShardSpec::try_from_ref(spec).with_context(|| {
+        format!(
+            "failed to restore shard spec for shard {}",
+            acquired.lease.shard()
+        )
+    })?;
+    let resume_cursor = Cursor::try_from_update(snapshot.cursor()).with_context(|| {
+        format!(
+            "failed to restore cursor for shard {}",
+            acquired.lease.shard()
+        )
+    })?;
     let state = RestoredShardState::new(shard_spec, resume_cursor, snapshot.cursor_semantics());
     let write_context = WriteContext::new(
         acquired.lease.tenant(),

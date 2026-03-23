@@ -1,6 +1,6 @@
 //! Ordered-content runtime boundary.
 //!
-//! This module owns two related filesystem execution paths:
+//! This module owns two related ordered-content execution paths:
 //!
 //! 1. `OrderedContentRuntime::execute_source`, which performs one
 //!    connector-driven ordered page acquisition and validates the page against
@@ -38,7 +38,7 @@ use anyhow::anyhow;
 use gossip_contracts::{
     connector::{
         Budgets, Cursor, EnumerateError, ErrorClass, PageBuf, PageState, ScanItem,
-        ordered::OrderedContentSource, validate_filled_page,
+        ordered::OrderedContentSource, validate_page_sequence,
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
 };
@@ -166,17 +166,19 @@ pub struct OrderedContentPage {
 
 impl OrderedContentPage {
     fn from_validated_page(page: PageBuf<ScanItem>) -> Self {
+        debug_assert!(
+            !page.items().is_empty(),
+            "from_validated_page requires a non-empty page"
+        );
+        let last_key = page
+            .items()
+            .last()
+            .expect("validated page is non-empty")
+            .item_key()
+            .clone();
         let resume_cursor = match page.state() {
             PageState::HasMore { cursor } => cursor.clone(),
-            PageState::Complete => {
-                let last_key = page
-                    .items()
-                    .last()
-                    .expect("validated page is non-empty")
-                    .item_key()
-                    .clone();
-                Cursor::with_last_key(last_key)
-            }
+            PageState::Complete => Cursor::with_last_key(last_key),
         };
         let bytes_scanned = page
             .items()
@@ -290,51 +292,20 @@ fn validate_page_contract(
     input: &OrderedContentRuntimeInput,
     page: &PageBuf<ScanItem>,
 ) -> Result<(), ScanRuntimeError> {
-    validate_filled_page(
+    validate_page_sequence(
         page.items(),
+        page.state(),
+        input.cursor().last_key(),
         input.shard().key_range_start(),
         input.shard().key_range_end(),
     )
-    .map_err(|error| {
+    .map_err(|e| {
         ScanRuntimeError::Driver(anyhow!(
-            "ordered-content page for shard [{:?}, {:?}) violated the page contract: {error}",
+            "ordered-content page for shard [{:?}, {:?}) violated the page contract: {e}",
             input.shard().key_range_start(),
             input.shard().key_range_end(),
         ))
-    })?;
-
-    let first_key = page
-        .items()
-        .first()
-        .expect("validated page is non-empty")
-        .item_key();
-    if let Some(previous_last) = input.cursor().last_key()
-        && first_key <= previous_last
-    {
-        return Err(ScanRuntimeError::Driver(anyhow!(
-            "ordered-content page did not advance past the restored resume cursor",
-        )));
-    }
-
-    let last_key = page
-        .items()
-        .last()
-        .expect("validated page is non-empty")
-        .item_key();
-    if let PageState::HasMore { cursor } = page.state() {
-        let Some(next_last) = cursor.last_key() else {
-            return Err(ScanRuntimeError::Driver(anyhow!(
-                "ordered-content resumable page omitted the authoritative last_key",
-            )));
-        };
-        if next_last != last_key {
-            return Err(ScanRuntimeError::Driver(anyhow!(
-                "ordered-content resumable page returned a cursor that does not match the page's last emitted key",
-            )));
-        }
-    }
-
-    Ok(())
+    })
 }
 
 /// Run a parallel filesystem scan against a local directory or single file.
@@ -670,7 +641,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("did not advance past the restored resume cursor"),
+                .contains("did not advance past previous last key"),
             "unexpected error: {err}"
         );
     }
@@ -760,8 +731,46 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("cursor that does not match the page's last emitted key"),
+                .contains("does not match page's last emitted key"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_source_returns_page_for_complete_state() {
+        let page = PageBuf::try_new(
+            vec![item(b"a.txt", 3), item(b"b.txt", 5)],
+            PageState::Complete,
+        )
+        .expect("page");
+        let mut source = ScriptedSource::returning(Ok(Some(page)));
+
+        let outcome = OrderedContentRuntime::execute_source(
+            &mut source,
+            &runtime_input(
+                ShardSpec::unbounded(),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+        )
+        .expect("complete page");
+
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome");
+        };
+        assert_eq!(page.report().items_scanned, 2);
+        assert_eq!(page.report().bytes_scanned, 8);
+        assert_eq!(
+            page.resume_cursor()
+                .last_key()
+                .expect("last key")
+                .as_bytes(),
+            b"b.txt",
+            "Complete pages derive resume cursor from the last emitted key"
+        );
+        assert!(
+            page.resume_cursor().token().is_none(),
+            "Complete pages carry no opaque token"
         );
     }
 }
