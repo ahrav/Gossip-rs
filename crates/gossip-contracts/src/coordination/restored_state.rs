@@ -9,6 +9,15 @@ use super::{CursorSemantics, ShardSpec};
 /// Groups the authoritative shard bounds, resume cursor, and cursor semantics
 /// that downstream runtime stages need to execute ordered-content work without
 /// a second coordination lookup.
+///
+/// Constructed from the coordination facade's acquire/restore response and
+/// stored on `ShardLease` in the scanner runtime. Passed to
+/// `OrderedContentRuntimeInput::new` to validate connector pages and derive
+/// checkpoint cursors during scans.
+///
+/// The fields are immutable for the shard's lifetime; downstream execution
+/// decides cursor advancement through checkpoint writes, not by mutating
+/// this state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoredShardState {
     shard_spec: ShardSpec,

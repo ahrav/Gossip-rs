@@ -5,6 +5,10 @@
 //!
 //! - Source mode stays explicit instead of being re-inferred from path shape.
 //! - Equivalent requests normalize to the same canonical root.
+//!
+//! Normalized requests flow to [`crate::planner`] for initial shard geometry
+//! planning, then into the scanner runtime's `OrderedContentRuntimeInput`
+//! for page validation.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -119,6 +123,51 @@ impl FilesystemRequest {
         self.run_config
     }
 
+    /// Canonicalize the request path, validate it against the requested mode,
+    /// and enforce that the canonical root resides within `allowed_root`.
+    ///
+    /// This is the recommended entry point for requests originating from
+    /// untrusted input. It delegates to [`Self::normalize`] for
+    /// canonicalization and mode validation, then verifies path containment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilesystemRequestError::AllowedRootCanonicalize`] if `allowed_root`
+    /// cannot be canonicalized, any error that [`Self::normalize`] can
+    /// produce, or [`FilesystemRequestError::PathConfinementViolation`] if
+    /// the canonical path escapes the allowed root.
+    ///
+    /// # Limitations
+    ///
+    /// A TOCTOU window exists between canonicalizing `allowed_root` and
+    /// canonicalizing the request path inside [`Self::normalize`]. The
+    /// containment check is advisory; the downstream connector's
+    /// `O_NOFOLLOW` / `openat` enforcement provides the authoritative
+    /// safety guard against filesystem races.
+    pub fn normalize_within(
+        &self,
+        allowed_root: &Path,
+    ) -> Result<NormalizedFilesystemRequest, FilesystemRequestError> {
+        let allowed_canonical = fs::canonicalize(allowed_root).map_err(|source| {
+            FilesystemRequestError::AllowedRootCanonicalize {
+                path: allowed_root.to_path_buf(),
+                source,
+            }
+        })?;
+
+        let normalized = self.normalize()?;
+
+        if !normalized.canonical_root().starts_with(&allowed_canonical) {
+            return Err(FilesystemRequestError::PathConfinementViolation {
+                mode: normalized.mode(),
+                path: normalized.canonical_root.clone(),
+                allowed_root: allowed_canonical,
+            });
+        }
+
+        Ok(normalized)
+    }
+
     /// Canonicalize the request path and validate it against the requested mode.
     ///
     /// The returned request preserves explicit source mode, stores the
@@ -164,6 +213,19 @@ impl FilesystemRequest {
                 actual: actual_kind,
             });
         }
+
+        // Defensive: single-file targets must resolve to a path with a file
+        // name component. Canonicalization + the mode/kind check above should
+        // already guarantee this (only root `/` lacks a file name, and root is
+        // a directory), but we verify explicitly because downstream consumers
+        // rely on `relative_namespace_name()` returning `Some` for single-file
+        // requests.
+        if self.mode == FilesystemSourceMode::SingleFile && canonical_root.file_name().is_none() {
+            return Err(FilesystemRequestError::SingleFileMissingName {
+                path: canonical_root,
+            });
+        }
+
         Ok(NormalizedFilesystemRequest {
             mode: self.mode,
             canonical_root,
@@ -217,6 +279,12 @@ impl NormalizedFilesystemRequest {
 }
 
 /// Normalization failures for [`FilesystemRequest`].
+///
+/// # Security note
+///
+/// Error messages include filesystem paths for operator diagnostics.
+/// Callers that surface errors to untrusted consumers must redact
+/// path details before returning.
 #[derive(Debug)]
 pub enum FilesystemRequestError {
     /// The request path was empty.
@@ -252,6 +320,27 @@ pub enum FilesystemRequestError {
         /// Canonical path.
         path: PathBuf,
     },
+    /// A canonical single-file target did not expose a file name component.
+    SingleFileMissingName {
+        /// Canonical path.
+        path: PathBuf,
+    },
+    /// The canonical path falls outside the allowed root directory.
+    PathConfinementViolation {
+        /// Requested source mode.
+        mode: FilesystemSourceMode,
+        /// Canonical path that escaped confinement.
+        path: PathBuf,
+        /// The root directory the path must reside within.
+        allowed_root: PathBuf,
+    },
+    /// The allowed root directory path could not be canonicalized.
+    AllowedRootCanonicalize {
+        /// Server-configured allowed root path.
+        path: PathBuf,
+        /// I/O error from canonicalization.
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for FilesystemRequestError {
@@ -285,6 +374,26 @@ impl fmt::Display for FilesystemRequestError {
                 "filesystem request path '{}' must be a regular file or directory",
                 path.display()
             ),
+            Self::SingleFileMissingName { path } => write!(
+                f,
+                "single-file request path '{}' does not have a file name",
+                path.display()
+            ),
+            Self::PathConfinementViolation {
+                mode,
+                path,
+                allowed_root,
+            } => write!(
+                f,
+                "filesystem request mode '{mode}' path '{}' is not contained within allowed root '{}'",
+                path.display(),
+                allowed_root.display()
+            ),
+            Self::AllowedRootCanonicalize { path, source } => write!(
+                f,
+                "failed to canonicalize allowed root directory '{}': {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -292,10 +401,14 @@ impl fmt::Display for FilesystemRequestError {
 impl std::error::Error for FilesystemRequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Canonicalize { source, .. } | Self::Metadata { source, .. } => Some(source),
+            Self::Canonicalize { source, .. }
+            | Self::Metadata { source, .. }
+            | Self::AllowedRootCanonicalize { source, .. } => Some(source),
             Self::EmptyPath { .. }
             | Self::PathKindMismatch { .. }
-            | Self::UnsupportedPathKind { .. } => None,
+            | Self::UnsupportedPathKind { .. }
+            | Self::SingleFileMissingName { .. }
+            | Self::PathConfinementViolation { .. } => None,
         }
     }
 }
@@ -322,15 +435,10 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
 
-    use gossip_coordination::CursorSemantics;
     use tempfile::tempdir;
 
     use super::*;
-
-    fn run_config() -> RunConfig {
-        RunConfig::try_new(CursorSemantics::Completed, 30_000, Some(5))
-            .expect("run config should be valid")
-    }
+    use crate::test_support::run_config;
 
     #[test]
     fn single_file_normalizes_path_and_preserves_mode() {
@@ -574,5 +682,129 @@ mod tests {
         let normalized = request.normalize().expect("symlink should normalize");
         let canonical_real = real_file.canonicalize().expect("canonicalize real");
         assert_eq!(normalized.canonical_root(), canonical_real.as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_path_kind_rejects_fifo() {
+        use std::process::Command;
+
+        let dir = tempdir().expect("tempdir");
+        let fifo_path = dir.path().join("test.fifo");
+        let status = Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo command");
+        assert!(status.success(), "mkfifo failed");
+
+        let request = FilesystemRequest::single_file(&fifo_path, run_config());
+        let err = request.normalize().expect_err("FIFO must be rejected");
+        assert!(matches!(
+            err,
+            FilesystemRequestError::UnsupportedPathKind { .. }
+        ));
+    }
+
+    #[test]
+    fn normalize_within_accepts_path_inside_allowed_root() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("inner.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+
+        let request = FilesystemRequest::single_file(&file_path, run_config());
+        let normalized = request
+            .normalize_within(dir.path())
+            .expect("path inside allowed root must succeed");
+
+        assert_eq!(normalized.mode(), FilesystemSourceMode::SingleFile);
+        let canonical_file = file_path.canonicalize().expect("canonicalize file");
+        assert_eq!(normalized.canonical_root(), canonical_file.as_path());
+    }
+
+    #[test]
+    fn normalize_within_rejects_path_outside_allowed_root() {
+        let allowed_dir = tempdir().expect("allowed tempdir");
+        let outside_dir = tempdir().expect("outside tempdir");
+        let file_path = outside_dir.path().join("escape.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+
+        let request = FilesystemRequest::single_file(&file_path, run_config());
+        let err = request
+            .normalize_within(allowed_dir.path())
+            .expect_err("path outside allowed root must be rejected");
+
+        assert!(matches!(
+            err,
+            FilesystemRequestError::PathConfinementViolation {
+                mode: FilesystemSourceMode::SingleFile,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_within_rejects_symlink_escaping_allowed_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let allowed = tempdir().expect("allowed tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let target = outside.path().join("secret.txt");
+        fs::write(&target, "sensitive").expect("write target");
+
+        let link = allowed.path().join("escape_link.txt");
+        unix_fs::symlink(&target, &link).expect("create symlink");
+
+        let request = FilesystemRequest::single_file(&link, run_config());
+        let err = request
+            .normalize_within(allowed.path())
+            .expect_err("symlink escaping allowed root must be rejected");
+
+        assert!(matches!(
+            err,
+            FilesystemRequestError::PathConfinementViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn normalize_within_accepts_path_at_allowed_root() {
+        let dir = tempdir().expect("tempdir");
+
+        let request = FilesystemRequest::directory_root(dir.path(), run_config());
+        let normalized = request
+            .normalize_within(dir.path())
+            .expect("path equal to allowed root must succeed");
+
+        assert_eq!(normalized.mode(), FilesystemSourceMode::DirectoryRoot);
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize dir");
+        assert_eq!(normalized.canonical_root(), canonical_dir.as_path());
+    }
+
+    #[test]
+    fn normalize_within_reports_allowed_root_canonicalization_failure() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("target.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+
+        let nonexistent_root = dir.path().join("does-not-exist");
+        let request = FilesystemRequest::single_file(&file_path, run_config());
+        let err = request
+            .normalize_within(&nonexistent_root)
+            .expect_err("nonexistent allowed root must fail");
+
+        assert!(matches!(
+            err,
+            FilesystemRequestError::AllowedRootCanonicalize { .. }
+        ));
+
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("allowed root"),
+            "error message should mention 'allowed root', got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("request path"),
+            "error message should not say 'request path', got: {err_msg}"
+        );
     }
 }

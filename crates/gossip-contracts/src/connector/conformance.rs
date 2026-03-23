@@ -348,15 +348,21 @@ impl Error for OrderedContentConformanceError {
 ///
 /// The suite performs four checks:
 ///
-/// 1. Drain page sequences while validating page shape, cursor advancement,
-///    and exhausted-empty behavior after a terminal page.
-/// 2. Repeat the drain on a fresh source and require an identical item
-///    sequence and identical page partitioning.
-/// 3. Verify that no emitted item field (`ItemRef`, `ItemKey`,
-///    `Location::display`, `Location::url`) contains any caller-supplied
-///    forbidden byte fragment (skipped when `forbidden_fragments` is empty).
-/// 4. Force a multi-page probe and require that a corrupt opaque token with
-///    the same `last_key` resumes to the same suffix as a key-only cursor.
+/// 1. **Page contract** — drain page sequences while validating non-empty
+///    shape, in-bounds keys, strict ordering, cursor advancement, and
+///    exhausted-empty behavior after a terminal page. Detects connector bugs
+///    that would break downstream resume logic.
+/// 2. **Determinism** — repeat the drain on a fresh source and require
+///    identical items in identical pages. Detects connectors that reorder
+///    items, repack pages, or vary behavior based on internal state.
+/// 3. **Forbidden fragments** — scan all emitted `ItemRef`, `ItemKey`,
+///    `Location::display`, and `Location::url` fields for caller-supplied
+///    byte patterns. Prevents root-path leakage or information disclosure
+///    in logging output (skipped when `forbidden_fragments` is empty).
+/// 4. **Token fallback** — force a multi-page probe and require that a
+///    corrupt opaque token with the same `last_key` resumes to the same
+///    suffix as a key-only cursor. Ensures the connector can fall back to
+///    key-only resumption if tokens are stale or corrupted in-flight.
 ///
 /// **Note**: The corrupt-token probe (step 4) fetches a first page with
 /// `max_items=1`. Sources with fewer than two total items in scope will not
@@ -585,35 +591,55 @@ pub fn assert_no_forbidden_fragments(
     forbidden_fragments: &[&[u8]],
 ) -> Result<(), OrderedContentConformanceError> {
     for (item_index, item) in drain.items().iter().enumerate() {
-        let check_field =
-            |bytes: &[u8], field: &'static str| -> Result<(), OrderedContentConformanceError> {
-                for fragment in forbidden_fragments.iter().copied() {
-                    if fragment.is_empty() {
-                        continue;
-                    }
-                    if bytes
-                        .windows(fragment.len())
-                        .any(|window| window == fragment)
-                    {
-                        return Err(OrderedContentConformanceError::ForbiddenFragment {
-                            item_index,
-                            field,
-                            fragment: ToxicDigest::of_bytes(fragment),
-                            content: ToxicDigest::of_bytes(bytes),
-                        });
-                    }
-                }
-                Ok(())
-            };
-
-        check_field(item.item_ref().as_bytes(), "item_ref")?;
-        check_field(item.item_key().as_bytes(), "item_key")?;
+        for &(field_name, field_bytes) in &[
+            ("item_ref", item.item_ref().as_bytes()),
+            ("item_key", item.item_key().as_bytes()),
+        ] {
+            check_field_for_fragments(item_index, field_name, field_bytes, forbidden_fragments)?;
+        }
 
         if let Some(location) = item.location() {
-            check_field(location.display().as_bytes(), "location_display")?;
+            check_field_for_fragments(
+                item_index,
+                "location_display",
+                location.display().as_bytes(),
+                forbidden_fragments,
+            )?;
             if let Some(url) = location.url() {
-                check_field(url.as_bytes(), "location_url")?;
+                check_field_for_fragments(
+                    item_index,
+                    "location_url",
+                    url.as_bytes(),
+                    forbidden_fragments,
+                )?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Scans `bytes` for any non-empty forbidden fragment substring, returning
+/// a `ForbiddenFragment` error on the first match.
+fn check_field_for_fragments(
+    item_index: usize,
+    field: &'static str,
+    bytes: &[u8],
+    forbidden_fragments: &[&[u8]],
+) -> Result<(), OrderedContentConformanceError> {
+    for fragment in forbidden_fragments.iter().copied() {
+        if fragment.is_empty() {
+            continue;
+        }
+        if bytes
+            .windows(fragment.len())
+            .any(|window| window == fragment)
+        {
+            return Err(OrderedContentConformanceError::ForbiddenFragment {
+                item_index,
+                field,
+                fragment: ToxicDigest::of_bytes(fragment),
+                content: ToxicDigest::of_bytes(bytes),
+            });
         }
     }
     Ok(())

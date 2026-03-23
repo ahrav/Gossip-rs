@@ -29,6 +29,14 @@
 //! Both channels are bounded (`EVENT_CHANNEL_CAP` and `COMMIT_CHANNEL_CAP`)
 //! and are explicitly dropped after the scan completes so the forwarder
 //! threads observe a clean EOF.
+//!
+//! # Integration with distributed scanning
+//!
+//! [`OrderedContentRuntime::execute_source`] is called by the distributed
+//! worker loop to validate pages before downstream item-scanning and commit
+//! work. The restored shard state and budgets are supplied via
+//! [`OrderedContentRuntimeInput`], constructed from a
+//! [`ShardLease`](crate::distributed::ShardLease).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +64,10 @@ use crate::{
 /// The runtime keeps the restored coordination state (shard bounds, resume
 /// cursor, cursor semantics) and page budgets together so the page-fill
 /// boundary always executes from authoritative state.
+///
+/// This bundle is self-contained: it carries everything needed to validate a
+/// page against the coordination contract. The runtime never mutates these
+/// fields; downstream execution decides checkpoint advancement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentRuntimeInput {
     state: RestoredShardState,
@@ -64,6 +76,9 @@ pub struct OrderedContentRuntimeInput {
 
 impl OrderedContentRuntimeInput {
     /// Construct one ordered-content execution input bundle.
+    ///
+    /// `state` must carry [`CursorSemantics::Completed`] — the runtime
+    /// rejects other semantics at execution time.
     #[must_use]
     pub fn new(state: RestoredShardState, budgets: Budgets) -> Self {
         Self { state, budgets }
@@ -96,8 +111,9 @@ impl OrderedContentRuntimeInput {
 
 /// Structured stop reason for connector enumeration failure.
 ///
-/// This preserves the connector's retry posture and advisory backoff hint
-/// without forcing callers to parse the connector message text.
+/// Preserves the connector's retry classification and advisory backoff hint
+/// so callers can route transient vs. terminal failures without parsing
+/// error text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentStop {
     class: ErrorClass,
@@ -320,7 +336,8 @@ fn validate_page_contract(
 /// wired into the parallel scanner. Finding batches flow through the commit
 /// channel to the `commit` sink, which is a no-op for CLI scans; distributed
 /// mode routes the same lifecycle into the receipt-driven commit pipeline via
-/// its commit-sink adapter.
+/// its commit-sink adapter. All forwarder threads are joined before this
+/// function returns, so the caller receives fully flushed scan counters.
 ///
 /// # Errors
 ///
@@ -771,6 +788,39 @@ mod tests {
         assert!(
             page.resume_cursor().token().is_none(),
             "Complete pages carry no opaque token"
+        );
+    }
+
+    #[test]
+    fn execute_source_counts_only_items_with_size_hints() {
+        let hinted = item(b"a.txt", 10);
+        let unhinted = ScanItem::new(
+            ItemKey::try_from_slice(b"b.txt").expect("item key"),
+            ItemRef::try_from_slice(b"b.txt").expect("item ref"),
+            StableItemId::from_bytes([b'b'; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"b.txt")),
+        );
+        let page = PageBuf::try_new(vec![hinted, unhinted], PageState::Complete).expect("page");
+        let mut source = ScriptedSource::returning(Ok(Some(page)));
+
+        let outcome = OrderedContentRuntime::execute_source(
+            &mut source,
+            &runtime_input(
+                ShardSpec::unbounded(),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+        )
+        .expect("mixed size_hint page");
+
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome");
+        };
+        assert_eq!(page.report().items_scanned, 2);
+        assert_eq!(
+            page.report().bytes_scanned,
+            10,
+            "only the item with a size_hint contributes to bytes_scanned"
         );
     }
 }
