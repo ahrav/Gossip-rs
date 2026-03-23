@@ -16,11 +16,10 @@
   leases, direct coordination claim/complete helpers, persistence handles,
   runtime configuration, run reports, and error layering
 
-The crate no longer depends on a separate scan-driver abstraction. Its
-public surface stays stable for callers while execution mode selects the
-family boundary: direct mode runs the local scan pipeline,
-filesystem connector mode performs ordered page acquisition and validation,
-and Git connector mode uses the direct path.
+The crate no longer depends on a separate scan-driver abstraction.
+Execution mode selects the family boundary: direct mode runs the local
+scan pipeline, filesystem connector mode performs ordered page acquisition
+and validation, and Git connector mode uses the direct path.
 
 ---
 

@@ -239,10 +239,11 @@ impl CancellationToken {
 /// Runtime budgets for source scans.
 ///
 /// Both fields must be non-zero; validation enforces this constraint
-/// before distributed scan dispatch. Local scan paths (`scan_fs_with_runtime`,
-/// `scan_git_with_runtime`) do not validate or consume budgets — they are
-/// relevant only to the distributed runtime. Both fields are validated
-/// (non-zero) before dispatch but are not yet enforced at execution time.
+/// before distributed scan dispatch and in the filesystem connector-mode
+/// local path (which constructs [`Budgets`] from these values). Direct
+/// local scan paths (`scan_fs_with_runtime`, `scan_git_with_runtime`) do
+/// not validate or consume budgets. Both fields are validated (non-zero)
+/// before dispatch but are not enforced at execution time.
 ///
 /// Defaults are intentionally conservative (256 items, 1 MB) to bound
 /// memory pressure in distributed workers.
@@ -768,7 +769,7 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
 /// Validates the target path, constructs a [`FilesystemConnector`], and
 /// executes one ordered page acquisition through
 /// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
-/// and durability are handled by [`scan_fs_direct`].
+/// and durability are handled by the direct filesystem runtime path.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
