@@ -64,7 +64,7 @@
 //! - Byte wrappers: [`ItemKey`], [`ItemRef`], [`TokenBytes`]
 //! - Pooled slab owner for page-scoped toxic-byte wrappers: [`PooledByteSlab`]
 //! - Shared paging vocabulary: [`PageBuf`], [`PageState`], [`PagingCapabilities`],
-//!   [`KeyedPageItem`], [`PageShapeError`]
+//!   [`KeyedPageItem`], [`PageShapeError`], [`PageSequenceViolation`]
 //! - Paging bridge: [`Cursor`]
 //! - Version semantics: [`VersionId`]
 //! - Optional metadata: [`ContentHints`], [`Location`]
@@ -120,7 +120,8 @@ pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 #[doc(hidden)]
 pub use api::fmt_sanitized_message;
 pub use common::{
-    KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, validate_filled_page,
+    KeyedPageItem, PageBuf, PageSequenceViolation, PageShapeError, PageState, PagingCapabilities,
+    validate_filled_page, validate_page_sequence,
 };
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, ItemKey, ItemRef, Location,

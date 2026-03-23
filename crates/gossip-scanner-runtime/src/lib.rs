@@ -765,10 +765,10 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
 
 /// Connector-mode filesystem scan.
 ///
-/// This path validates the target path, constructs a real
-/// [`FilesystemConnector`], and executes one ordered page acquisition through
-/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
-/// and durability remain on the direct scan path.
+/// Validates the target path, constructs a real [`FilesystemConnector`],
+/// and executes one ordered page acquisition through
+/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule
+/// execution, and durability are not yet wired into this path.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
@@ -782,7 +782,17 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
 
     match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
         ordered_content::OrderedContentExecutionOutcome::Finished => Ok(ScanReport::default()),
-        ordered_content::OrderedContentExecutionOutcome::Page(page) => Ok(page.report()),
+        ordered_content::OrderedContentExecutionOutcome::Page(page) => {
+            if page.page().state().next_cursor().is_some() {
+                let items = page.report().items_scanned;
+                tracing::warn!(
+                    items_scanned = items,
+                    "connector page indicates more items available; \
+                     scan result is partial"
+                );
+            }
+            Ok(page.report())
+        }
         ordered_content::OrderedContentExecutionOutcome::Stopped(stop) => {
             Err(ScanRuntimeError::Driver(anyhow::anyhow!("{stop}")))
         }

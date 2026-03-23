@@ -14,9 +14,9 @@ use std::{error::Error, fmt};
 
 use crate::{
     connector::{
-        Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef, PageShapeError,
-        PageState, ScanItem, TokenBytes, ToxicDigest, VersionId, ordered::OrderedContentSource,
-        validate_filled_page,
+        Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef,
+        PageSequenceViolation, PageShapeError, PageState, ScanItem, TokenBytes, ToxicDigest,
+        VersionId, ordered::OrderedContentSource, validate_page_sequence,
     },
     coordination::ShardSpec,
     identity::StableItemId,
@@ -151,6 +151,21 @@ impl OrderedContentDrain {
     }
 }
 
+/// Diagnostic detail for drain-comparison divergences.
+///
+/// Used by both determinism and corrupt-token-fallback checks to report
+/// where two independent drains of the same source first disagreed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainDivergence {
+    /// Zero-based index of the first item that differs, or `None` when items
+    /// match but page partitioning diverges.
+    pub first_divergent_item: Option<usize>,
+    /// Redacted digest of the expected key at the divergence point.
+    pub expected_key: Option<ToxicDigest>,
+    /// Redacted digest of the actual key at the divergence point.
+    pub actual_key: Option<ToxicDigest>,
+}
+
 /// Failure reported by the ordered-content conformance harness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentConformanceError {
@@ -194,29 +209,9 @@ pub enum OrderedContentConformanceError {
     /// The harness exceeded its hard safety cap on page count.
     TooManyPages { limit: usize },
     /// Two fresh sources over the same fixed view produced different drains.
-    DeterminismMismatch {
-        /// Index of the first item where the two drains diverged, or `None`
-        /// when the drains matched on items but differed on page partitioning.
-        first_divergent_item: Option<usize>,
-        /// Redacted digest of the expected key at the divergent index (first
-        /// drain), or `None` when the divergence is page-partitioning-only.
-        expected_key: Option<ToxicDigest>,
-        /// Redacted digest of the actual key at the divergent index (second
-        /// drain), or `None` when the divergence is page-partitioning-only.
-        actual_key: Option<ToxicDigest>,
-    },
+    DeterminismMismatch(DrainDivergence),
     /// Key-only resume and corrupt-token resume produced different suffixes.
-    TokenFallbackMismatch {
-        /// Index of the first item where the two suffixes diverged, or `None`
-        /// when the suffixes matched on items but differed on page partitioning.
-        first_divergent_item: Option<usize>,
-        /// Redacted digest of the expected key at the divergent index (key-only
-        /// resume), or `None` when the divergence is page-partitioning-only.
-        expected_key: Option<ToxicDigest>,
-        /// Redacted digest of the actual key at the divergent index (corrupt-token
-        /// resume), or `None` when the divergence is page-partitioning-only.
-        actual_key: Option<ToxicDigest>,
-    },
+    TokenFallbackMismatch(DrainDivergence),
     /// An emitted item contained a caller-supplied forbidden byte fragment.
     ForbiddenFragment {
         item_index: usize,
@@ -224,6 +219,30 @@ pub enum OrderedContentConformanceError {
         fragment: ToxicDigest,
         content: ToxicDigest,
     },
+}
+
+/// Formats a [`DrainDivergence`] with a caller-supplied prefix that
+/// distinguishes between determinism checks and token-fallback checks.
+fn fmt_divergence(
+    f: &mut fmt::Formatter<'_>,
+    prefix: &str,
+    divergence: &DrainDivergence,
+) -> fmt::Result {
+    match divergence.first_divergent_item {
+        Some(idx) => {
+            write!(f, "ordered-content conformance {prefix} at item {idx}")?;
+            if let (Some(expected), Some(actual)) =
+                (&divergence.expected_key, &divergence.actual_key)
+            {
+                write!(f, ": expected key {expected}, got {actual}")?;
+            }
+            Ok(())
+        }
+        None => write!(
+            f,
+            "ordered-content conformance {prefix} on page partitioning"
+        ),
+    }
 }
 
 impl fmt::Display for OrderedContentConformanceError {
@@ -274,46 +293,10 @@ impl fmt::Display for OrderedContentConformanceError {
                 f,
                 "ordered-content conformance exceeded the safety cap of {limit} pages"
             ),
-            Self::DeterminismMismatch {
-                first_divergent_item,
-                expected_key,
-                actual_key,
-            } => match first_divergent_item {
-                Some(idx) => {
-                    write!(
-                        f,
-                        "ordered-content conformance fresh drains diverged at item {idx}"
-                    )?;
-                    if let (Some(expected), Some(actual)) = (expected_key, actual_key) {
-                        write!(f, ": expected key {expected}, got {actual}")?;
-                    }
-                    Ok(())
-                }
-                None => write!(
-                    f,
-                    "ordered-content conformance fresh drains matched on items but diverged on page partitioning"
-                ),
-            },
-            Self::TokenFallbackMismatch {
-                first_divergent_item,
-                expected_key,
-                actual_key,
-            } => match first_divergent_item {
-                Some(idx) => {
-                    write!(
-                        f,
-                        "ordered-content conformance corrupt-token resume diverged from key-only resume at item {idx}"
-                    )?;
-                    if let (Some(expected), Some(actual)) = (expected_key, actual_key) {
-                        write!(f, ": expected key {expected}, got {actual}")?;
-                    }
-                    Ok(())
-                }
-                None => write!(
-                    f,
-                    "ordered-content conformance corrupt-token resume matched on items but diverged on page partitioning"
-                ),
-            },
+            Self::DeterminismMismatch(d) => fmt_divergence(f, "fresh drains diverged", d),
+            Self::TokenFallbackMismatch(d) => {
+                fmt_divergence(f, "corrupt-token resume diverged from key-only resume", d)
+            }
             Self::ForbiddenFragment {
                 item_index,
                 field,
@@ -360,9 +343,9 @@ impl Error for OrderedContentConformanceError {
 ///    and exhausted-empty behavior after a terminal page.
 /// 2. Repeat the drain on a fresh source and require an identical item
 ///    sequence and identical page partitioning.
-/// 3. Verify that emitted `ItemRef` and `ItemKey` bytes do not contain any
-///    caller-supplied forbidden fragments (skipped when `forbidden_fragments`
-///    is empty).
+/// 3. Verify that no emitted `ItemRef` or `ItemKey` contains any
+///    caller-supplied forbidden byte fragments (skipped when
+///    `forbidden_fragments` is empty).
 /// 4. Force a multi-page probe and require that a corrupt opaque token with
 ///    the same `last_key` resumes to the same suffix as a key-only cursor.
 ///
@@ -470,11 +453,13 @@ where
     if first != second {
         let (first_divergent_item, expected_key, actual_key) =
             first_divergent_detail(&first, &second);
-        return Err(OrderedContentConformanceError::DeterminismMismatch {
-            first_divergent_item,
-            expected_key,
-            actual_key,
-        });
+        return Err(OrderedContentConformanceError::DeterminismMismatch(
+            DrainDivergence {
+                first_divergent_item,
+                expected_key,
+                actual_key,
+            },
+        ));
     }
     Ok(first)
 }
@@ -525,35 +510,24 @@ where
         return Ok(false);
     };
 
-    validate_filled_page(
+    validate_page_sequence(
         first_page.items(),
+        first_page.state(),
+        None,
         shard.key_range_start(),
         shard.key_range_end(),
     )
-    .map_err(|source| OrderedContentConformanceError::InvalidPage {
-        page_index: 0,
-        source,
-    })?;
+    .map_err(|v| map_sequence_violation(v, 0, &None, &first_page))?;
 
     let PageState::HasMore { cursor } = first_page.state() else {
         return Ok(false);
     };
-    let Some(resume_key) = cursor.last_key().cloned() else {
-        return Err(OrderedContentConformanceError::HasMoreWithoutLastKey { page_index: 0 });
-    };
-
-    let expected_last = first_page
-        .items()
-        .last()
-        .expect("validated page must be non-empty")
-        .item_key();
-    if resume_key != *expected_last {
-        return Err(OrderedContentConformanceError::ResumeCursorMismatch {
-            page_index: 0,
-            expected_last: expected_last.clone(),
-            actual_last: resume_key,
-        });
-    }
+    // validate_page_sequence guarantees HasMore carries a last_key that
+    // matches the page's actual last emitted key.
+    let resume_key = cursor
+        .last_key()
+        .cloned()
+        .expect("validate_page_sequence guarantees HasMore carries last_key");
 
     let mut clean_source = factory();
     let clean = drain_from_cursor(
@@ -578,11 +552,13 @@ where
     if clean != corrupt {
         let (first_divergent_item, expected_key, actual_key) =
             first_divergent_detail(&clean, &corrupt);
-        return Err(OrderedContentConformanceError::TokenFallbackMismatch {
-            first_divergent_item,
-            expected_key,
-            actual_key,
-        });
+        return Err(OrderedContentConformanceError::TokenFallbackMismatch(
+            DrainDivergence {
+                first_divergent_item,
+                expected_key,
+                actual_key,
+            },
+        ));
     }
     Ok(true)
 }
@@ -651,17 +627,59 @@ fn first_divergent_detail(
     (None, None, None)
 }
 
+/// Map a [`PageSequenceViolation`] to the corresponding conformance error
+/// variant, attaching `page_index` and cloning key values from the page.
+fn map_sequence_violation(
+    v: PageSequenceViolation,
+    page_index: usize,
+    previous_last: &Option<ItemKey>,
+    page: &super::common::PageBuf<ScanItem>,
+) -> OrderedContentConformanceError {
+    match v {
+        PageSequenceViolation::Shape(source) => {
+            OrderedContentConformanceError::InvalidPage { page_index, source }
+        }
+        PageSequenceViolation::CursorDidNotAdvance { .. } => {
+            let observed_key = page
+                .items()
+                .first()
+                .expect("Shape check passed, page is non-empty")
+                .item_key()
+                .clone();
+            OrderedContentConformanceError::CursorDidNotAdvance {
+                page_index,
+                previous_last: previous_last
+                    .clone()
+                    .expect("CursorDidNotAdvance requires a previous last key"),
+                observed_key,
+            }
+        }
+        PageSequenceViolation::HasMoreWithoutLastKey => {
+            OrderedContentConformanceError::HasMoreWithoutLastKey { page_index }
+        }
+        PageSequenceViolation::CursorPageMismatch {
+            cursor_last,
+            page_last,
+        } => OrderedContentConformanceError::ResumeCursorMismatch {
+            page_index,
+            expected_last: ItemKey::try_from_slice(&page_last)
+                .expect("page_last originated from a valid ItemKey"),
+            actual_last: ItemKey::try_from_slice(&cursor_last)
+                .expect("cursor_last originated from a valid ItemKey"),
+        },
+    }
+}
+
 /// Page-by-page drain with per-page validation.
 ///
 /// Iterates `fill_page` calls from `cursor` until the source returns `None`
 /// (exhausted before first page) or `Complete`. On each page the loop:
 ///
-/// 1. Validates page shape via [`validate_filled_page`].
-/// 2. Checks that the first key on each page strictly advances past the
-///    previous `last_key` (from the prior page or from the initial cursor).
-/// 3. For `HasMore` pages, verifies the resume cursor's `last_key` matches
-///    the page's actual last emitted key.
-/// 4. After a `Complete` page, issues one additional suffix call to confirm
+/// 1. Validates page shape and inter-page sequence invariants via
+///    [`validate_page_sequence`].
+/// 2. Detects cursor stall (HasMore cursor whose `last_key` did not advance
+///    past the previous page boundary).
+/// 3. After a `Complete` page, issues one additional suffix call to confirm
 ///    the source truly has no more items.
 fn drain_from_cursor<S>(
     source: &mut S,
@@ -703,29 +721,19 @@ where
             return Ok(OrderedContentDrain::new(items, page_lengths));
         };
 
-        validate_filled_page(page.items(), shard.key_range_start(), shard.key_range_end())
-            .map_err(|source| OrderedContentConformanceError::InvalidPage { page_index, source })?;
-
-        let first_key = page
-            .items()
-            .first()
-            .expect("validated page must be non-empty")
-            .item_key()
-            .clone();
-        if let Some(prev) = previous_last.as_ref()
-            && first_key <= *prev
-        {
-            return Err(OrderedContentConformanceError::CursorDidNotAdvance {
-                page_index,
-                previous_last: prev.clone(),
-                observed_key: first_key,
-            });
-        }
+        validate_page_sequence(
+            page.items(),
+            page.state(),
+            previous_last.as_ref(),
+            shard.key_range_start(),
+            shard.key_range_end(),
+        )
+        .map_err(|v| map_sequence_violation(v, page_index, &previous_last, &page))?;
 
         let last_key = page
             .items()
             .last()
-            .expect("validated page must be non-empty")
+            .expect("validated page is non-empty")
             .item_key()
             .clone();
         page_lengths.push(page.len());
@@ -735,25 +743,22 @@ where
             PageState::HasMore {
                 cursor: next_cursor,
             } => {
-                let Some(next_last) = next_cursor.last_key().cloned() else {
-                    return Err(OrderedContentConformanceError::HasMoreWithoutLastKey {
-                        page_index,
-                    });
-                };
-                if next_last != last_key {
-                    return Err(OrderedContentConformanceError::ResumeCursorMismatch {
-                        page_index,
-                        expected_last: last_key,
-                        actual_last: next_last,
-                    });
-                }
+                // Cursor stall: the HasMore cursor's last_key must strictly
+                // advance past the previous page boundary. The shape and
+                // alignment checks in validate_page_sequence guarantee the
+                // cursor last_key equals the page's last emitted key, but a
+                // single-item page whose key equals the prior last_key is
+                // still a stall.
+                let next_last = next_cursor
+                    .last_key()
+                    .expect("validate_page_sequence guarantees HasMore carries last_key");
                 if let Some(prev) = previous_last.as_ref()
-                    && next_last <= *prev
+                    && *next_last <= *prev
                 {
                     return Err(OrderedContentConformanceError::CursorDidNotAdvance {
                         page_index,
                         previous_last: prev.clone(),
-                        observed_key: next_last,
+                        observed_key: next_last.clone(),
                     });
                 }
                 previous_last = Some(next_last.clone());
@@ -852,15 +857,7 @@ mod tests {
             cursor: &Cursor,
             budgets: Budgets,
         ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
-            let start = cursor
-                .last_key()
-                .map(|last_key| {
-                    self.items
-                        .iter()
-                        .position(|item| item.item_key() > last_key)
-                        .unwrap_or(self.items.len())
-                })
-                .unwrap_or(0);
+            let start = resolve_cursor_start(&self.items, cursor);
             if start >= self.items.len() {
                 return Ok(None);
             }
@@ -868,24 +865,12 @@ mod tests {
             let page_len = self.page_len.min(budgets.max_items());
             let end = (start + page_len).min(self.items.len());
             let page_items = self.items[start..end].to_vec();
-            let state = if end == self.items.len() {
-                PageState::Complete
-            } else {
-                PageState::HasMore {
-                    cursor: Cursor::with_last_key(
-                        page_items
-                            .last()
-                            .expect("page_items is non-empty")
-                            .item_key()
-                            .clone(),
-                    ),
-                }
-            };
-
-            Ok(Some(
-                PageBuf::try_new_validated(page_items, state, b"", b"")
-                    .expect("cursor-aware source emits valid pages"),
-            ))
+            let is_last = end == self.items.len();
+            Ok(Some(build_test_page(
+                page_items,
+                is_last,
+                "cursor-aware source emits valid pages",
+            )))
         }
 
         fn open(
@@ -895,6 +880,47 @@ mod tests {
         ) -> Result<Box<dyn io::Read + Send>, ReadError> {
             Err(ReadError::unsupported("unused in conformance tests"))
         }
+    }
+
+    /// Resolves the start index for cursor-based pagination over a sorted item
+    /// slice. Returns the index of the first item whose key is strictly greater
+    /// than `cursor.last_key()`, or 0 when the cursor carries no last key
+    /// (initial cursor). Returns `items.len()` when every item is at or below
+    /// the cursor position.
+    fn resolve_cursor_start(items: &[ScanItem], cursor: &Cursor) -> usize {
+        cursor
+            .last_key()
+            .map(|last_key| {
+                items
+                    .iter()
+                    .position(|item| item.item_key() > last_key)
+                    .unwrap_or(items.len())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Constructs a [`PageBuf`] from a non-empty item slice, choosing
+    /// `PageState::Complete` or `PageState::HasMore` based on `is_last_page`.
+    /// The `HasMore` cursor carries the last emitted item's key.
+    fn build_test_page(
+        page_items: Vec<ScanItem>,
+        is_last_page: bool,
+        expect_msg: &str,
+    ) -> PageBuf<ScanItem> {
+        let state = if is_last_page {
+            PageState::Complete
+        } else {
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(
+                    page_items
+                        .last()
+                        .expect("page_items must be non-empty")
+                        .item_key()
+                        .clone(),
+                ),
+            }
+        };
+        PageBuf::try_new_validated(page_items, state, b"", b"").expect(expect_msg)
     }
 
     fn scan_item(key: &[u8], seed: u8) -> ScanItem {
@@ -1144,10 +1170,10 @@ mod tests {
         .expect_err("nondeterministic factory must fail");
         assert!(matches!(
             err,
-            OrderedContentConformanceError::DeterminismMismatch {
+            OrderedContentConformanceError::DeterminismMismatch(DrainDivergence {
                 first_divergent_item: Some(1),
                 ..
-            }
+            })
         ));
     }
 
@@ -1171,6 +1197,8 @@ mod tests {
                 cursor: &Cursor,
                 budgets: Budgets,
             ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+                // Intentionally uses `==` instead of `>` for cursor resolution
+                // so this source can exercise the token-skip misbehavior below.
                 let start = cursor
                     .last_key()
                     .and_then(|last_key| {
@@ -1196,20 +1224,12 @@ mod tests {
                 let page_len = self.page_len.min(budgets.max_items());
                 let end = (start + page_len).min(self.items.len());
                 let page_items = self.items[start..end].to_vec();
-                let state = if end == self.items.len() {
-                    PageState::Complete
-                } else {
-                    PageState::HasMore {
-                        cursor: Cursor::with_last_key(
-                            page_items.last().unwrap().item_key().clone(),
-                        ),
-                    }
-                };
-
-                Ok(Some(
-                    PageBuf::try_new_validated(page_items, state, b"", b"")
-                        .expect("token-sensitive source emits valid pages"),
-                ))
+                let is_last = end == self.items.len();
+                Ok(Some(build_test_page(
+                    page_items,
+                    is_last,
+                    "token-sensitive source emits valid pages",
+                )))
             }
 
             fn open(
@@ -1241,10 +1261,10 @@ mod tests {
         .expect_err("token-sensitive source must fail");
         assert!(matches!(
             err,
-            OrderedContentConformanceError::TokenFallbackMismatch {
+            OrderedContentConformanceError::TokenFallbackMismatch(DrainDivergence {
                 first_divergent_item: Some(_),
                 ..
-            }
+            })
         ));
     }
 
@@ -1385,15 +1405,7 @@ mod tests {
             cursor: &Cursor,
             budgets: Budgets,
         ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
-            let start = cursor
-                .last_key()
-                .map(|last_key| {
-                    self.items
-                        .iter()
-                        .position(|item| item.item_key() > last_key)
-                        .unwrap_or(self.items.len())
-                })
-                .unwrap_or(0);
+            let start = resolve_cursor_start(&self.items, cursor);
             if start >= self.items.len() {
                 return Ok(None);
             }
@@ -1412,24 +1424,12 @@ mod tests {
             }
 
             let page_items = self.items[start..end].to_vec();
-            let state = if end == self.items.len() {
-                PageState::Complete
-            } else {
-                PageState::HasMore {
-                    cursor: Cursor::with_last_key(
-                        page_items
-                            .last()
-                            .expect("page_items is non-empty")
-                            .item_key()
-                            .clone(),
-                    ),
-                }
-            };
-
-            Ok(Some(
-                PageBuf::try_new_validated(page_items, state, b"", b"")
-                    .expect("byte-budget-aware source emits valid pages"),
-            ))
+            let is_last = end == self.items.len();
+            Ok(Some(build_test_page(
+                page_items,
+                is_last,
+                "byte-budget-aware source emits valid pages",
+            )))
         }
 
         fn open(
@@ -1522,11 +1522,11 @@ mod tests {
         .expect_err("same items with different page partitioning must fail");
         assert!(matches!(
             err,
-            OrderedContentConformanceError::DeterminismMismatch {
+            OrderedContentConformanceError::DeterminismMismatch(DrainDivergence {
                 first_divergent_item: None,
                 expected_key: None,
                 actual_key: None,
-            }
+            })
         ));
     }
 }

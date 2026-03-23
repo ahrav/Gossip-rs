@@ -98,7 +98,8 @@ with `ItemKey` ordering, preventing `BoundaryRegression` errors in the
 prefix checkpoint aggregator for ordered-content shards with multiple
 files.
 
-Connector-mode filesystem scans acquire one ordered page from the real
+Connector-mode filesystem scans acquire one ordered page through
+`OrderedContentRuntime::execute_source` from the real
 `FilesystemConnector`, validate shard bounds and cursor monotonicity,
 classify enumerate failures from the connector error taxonomy, and
 summarize the validated page into a `ScanReport`. Item reads, rule
@@ -582,11 +583,21 @@ pub struct WorkerIdentity {
 
 ```rust
 pub struct ShardLease {
+    /// String shard label used for routing recorder events.
     shard_id: Arc<str>,
+    /// Authoritative coordination-layer lease used for terminal completion.
     lease: Lease,
-    range_start: Vec<u8>,
+    /// Authoritative shard bounds and metadata restored from acquire/restore state.
+    shard_spec: ShardSpec,
+    /// Authoritative resume cursor restored from acquire/restore state.
+    resume_cursor: Cursor,
+    /// Coordination cursor semantics for this shard.
+    cursor_semantics: CursorSemantics,
+    /// Filesystem scan configuration for this shard.
     scan_config: FsScanConfig,
+    /// Shared routing and fencing metadata for all writes emitted under the lease.
     write_context: WriteContext,
+    /// Tenant secret key used for secret-hash derivation.
     tenant_secret_key: TenantSecretKey,
 }
 ```
