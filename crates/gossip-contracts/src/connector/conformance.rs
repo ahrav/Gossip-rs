@@ -22,10 +22,21 @@ use crate::{
     identity::StableItemId,
 };
 
+/// Safety cap on page count during a single drain. Prevents unbounded looping
+/// when a source never transitions to `Complete` or returns `None`.
 const DEFAULT_MAX_PAGES: usize = 4096;
+
+/// Arbitrary non-empty byte payload injected as a corrupt opaque token during
+/// the token-fallback probe. The specific value is irrelevant — any non-empty
+/// `TokenBytes` that differs from whatever the source originally emitted will
+/// exercise the fallback-to-key-only resume path.
 const CORRUPT_TOKEN_BYTES: &[u8] = b"ordered-content-conformance-corrupt-token";
 
 /// Stable snapshot of one emitted [`ScanItem`] for conformance comparisons.
+///
+/// Omits `content_hints` and `location` from [`ScanItem`], which are
+/// presentation-only metadata irrelevant to ordered-content conformance
+/// checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedScanItem {
     item_key: ItemKey,
@@ -91,6 +102,26 @@ pub struct OrderedContentDrain {
 }
 
 impl OrderedContentDrain {
+    /// Constructs a drain from pre-collected items and their page partitioning.
+    ///
+    /// `page_lengths` must exactly partition `items`: every entry must be
+    /// positive and `sum(page_lengths) == items.len()`.
+    fn new(items: Vec<ObservedScanItem>, page_lengths: Vec<usize>) -> Self {
+        debug_assert_eq!(
+            page_lengths.iter().sum::<usize>(),
+            items.len(),
+            "page_lengths must partition items exactly"
+        );
+        debug_assert!(
+            page_lengths.iter().all(|&len| len > 0),
+            "every page must be non-empty"
+        );
+        Self {
+            items,
+            page_lengths,
+        }
+    }
+
     /// Returns all emitted items in order.
     #[must_use]
     pub fn items(&self) -> &[ObservedScanItem] {
@@ -152,9 +183,17 @@ pub enum OrderedContentConformanceError {
     /// The harness exceeded its hard safety cap on page count.
     TooManyPages { limit: usize },
     /// Two fresh sources over the same fixed view produced different drains.
-    DeterminismMismatch,
+    DeterminismMismatch {
+        /// Index of the first item where the two drains diverged, or `None`
+        /// when the drains matched on items but differed on page partitioning.
+        first_divergent_item: Option<usize>,
+    },
     /// Key-only resume and corrupt-token resume produced different suffixes.
-    TokenFallbackMismatch,
+    TokenFallbackMismatch {
+        /// Index of the first item where the two suffixes diverged, or `None`
+        /// when the suffixes matched on items but differed on page partitioning.
+        first_divergent_item: Option<usize>,
+    },
     /// An emitted item reference contained a caller-supplied forbidden byte
     /// fragment.
     ForbiddenItemRefFragment {
@@ -208,14 +247,30 @@ impl fmt::Display for OrderedContentConformanceError {
                 f,
                 "ordered-content conformance exceeded the safety cap of {limit} pages"
             ),
-            Self::DeterminismMismatch => write!(
-                f,
-                "ordered-content conformance fresh drains over the same view were not identical"
-            ),
-            Self::TokenFallbackMismatch => write!(
-                f,
-                "ordered-content conformance corrupt-token resume diverged from key-only resume"
-            ),
+            Self::DeterminismMismatch {
+                first_divergent_item,
+            } => match first_divergent_item {
+                Some(idx) => write!(
+                    f,
+                    "ordered-content conformance fresh drains diverged at item {idx}"
+                ),
+                None => write!(
+                    f,
+                    "ordered-content conformance fresh drains matched on items but diverged on page partitioning"
+                ),
+            },
+            Self::TokenFallbackMismatch {
+                first_divergent_item,
+            } => match first_divergent_item {
+                Some(idx) => write!(
+                    f,
+                    "ordered-content conformance corrupt-token resume diverged from key-only resume at item {idx}"
+                ),
+                None => write!(
+                    f,
+                    "ordered-content conformance corrupt-token resume matched on items but diverged on page partitioning"
+                ),
+            },
             Self::ForbiddenItemRefFragment {
                 item_index,
                 fragment,
@@ -242,6 +297,19 @@ impl Error for OrderedContentConformanceError {
 /// Run the standard ordered-content conformance suite on a fresh-source
 /// factory.
 ///
+/// `factory` must produce fresh, independent source instances over the same
+/// fixed data view each time it is called. The harness calls it multiple times
+/// to test determinism and resume behavior.
+///
+/// `max_items` and `max_bytes` set the per-page budgets passed to each
+/// `fill_page` call during drains. Choose values small enough to force
+/// multi-page sequences so the harness exercises cursor advancement.
+///
+/// `forbidden_item_ref_fragments` lists byte substrings that must not appear
+/// anywhere inside any emitted `ItemRef`. Use this to detect root-path or
+/// secret leakage (e.g., pass the filesystem root directory name). Empty
+/// fragments are silently ignored.
+///
 /// The suite performs four checks:
 ///
 /// 1. Drain page sequences while validating page shape, cursor advancement,
@@ -252,6 +320,12 @@ impl Error for OrderedContentConformanceError {
 ///    the same `last_key` resumes to the same suffix as a key-only cursor.
 /// 4. Optionally verify that emitted item refs do not contain any
 ///    caller-supplied forbidden byte fragments.
+///
+/// **Note**: The corrupt-token probe requires at least two items under the
+/// probe budget to produce a `HasMore` page. Sources with zero or one item
+/// skip the token-fallback check silently.
+///
+/// Returns the drain from the first pass on success.
 pub fn run_ordered_content_conformance<F, S>(
     mut factory: F,
     shard: &ShardSpec,
@@ -303,12 +377,20 @@ where
     let second = drain_ordered_source(&mut second_source, shard, max_items, max_bytes)?;
 
     if first != second {
-        return Err(OrderedContentConformanceError::DeterminismMismatch);
+        return Err(OrderedContentConformanceError::DeterminismMismatch {
+            first_divergent_item: first_divergent_index(&first, &second),
+        });
     }
     Ok(first)
 }
 
 /// Require that resume with a corrupt token falls back to key-only resume.
+///
+/// Fetches one page using `first_page_max_items` as the item budget, then
+/// resumes from that page's `last_key` twice: once with a key-only cursor and
+/// once with the same key paired with a fabricated corrupt token. Both suffixes
+/// must be identical, proving the source does not depend on token contents for
+/// correct resume.
 pub fn assert_resume_after_corrupt_token<F, S>(
     factory: &mut F,
     shard: &ShardSpec,
@@ -375,7 +457,9 @@ where
     )?;
 
     if clean != corrupt {
-        return Err(OrderedContentConformanceError::TokenFallbackMismatch);
+        return Err(OrderedContentConformanceError::TokenFallbackMismatch {
+            first_divergent_item: first_divergent_index(&clean, &corrupt),
+        });
     }
     Ok(())
 }
@@ -407,6 +491,38 @@ pub fn assert_no_item_ref_contains(
     Ok(())
 }
 
+/// Returns the index of the first item that differs between two drains, or
+/// `None` when items match but page partitioning diverges.
+fn first_divergent_index(a: &OrderedContentDrain, b: &OrderedContentDrain) -> Option<usize> {
+    let idx = a
+        .items()
+        .iter()
+        .zip(b.items().iter())
+        .position(|(ai, bi)| ai != bi);
+    if idx.is_some() {
+        return idx;
+    }
+    // Items match up to the shorter length — a length difference is an item
+    // divergence at the shorter length.
+    if a.items().len() != b.items().len() {
+        return Some(a.items().len().min(b.items().len()));
+    }
+    // Items are identical; page_lengths must differ.
+    None
+}
+
+/// Page-by-page drain with per-page validation.
+///
+/// Iterates `fill_page` calls from `cursor` until the source returns `None`
+/// (exhausted before first page) or `Complete`. On each page the loop:
+///
+/// 1. Validates page shape via [`validate_filled_page`].
+/// 2. Checks that the first key on each page strictly advances past the
+///    previous page's last key.
+/// 3. For `HasMore` pages, verifies the resume cursor's `last_key` matches
+///    the page's actual last emitted key.
+/// 4. After a `Complete` page, issues one additional suffix call to confirm
+///    the source truly has no more items.
 fn drain_from_cursor<S>(
     source: &mut S,
     shard: &ShardSpec,
@@ -430,10 +546,23 @@ where
                 source,
             })?;
         let Some(page) = page else {
-            return Ok(OrderedContentDrain {
-                items,
-                page_lengths,
-            });
+            // When prior pages were consumed, verify the source does not produce
+            // more items on a retry with the same cursor position.
+            if let Some(prev_key) = previous_last.as_ref() {
+                let probe = source
+                    .fill_page(shard, &Cursor::with_last_key(prev_key.clone()), budgets)
+                    .map_err(|source| OrderedContentConformanceError::Enumerate {
+                        phase: "post-none-exhaustion-check",
+                        page_index,
+                        source,
+                    })?;
+                if probe.is_some() {
+                    return Err(OrderedContentConformanceError::CompletePageDidNotExhaust {
+                        page_index,
+                    });
+                }
+            }
+            return Ok(OrderedContentDrain::new(items, page_lengths));
         };
 
         validate_filled_page(page.items(), shard.key_range_start(), shard.key_range_end())
@@ -505,10 +634,7 @@ where
                         page_index,
                     });
                 }
-                return Ok(OrderedContentDrain {
-                    items,
-                    page_lengths,
-                });
+                return Ok(OrderedContentDrain::new(items, page_lengths));
             }
         }
     }
@@ -583,11 +709,11 @@ mod tests {
         ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
             let start = cursor
                 .last_key()
-                .and_then(|last_key| {
+                .map(|last_key| {
                     self.items
                         .iter()
-                        .position(|item| item.item_key() == last_key)
-                        .map(|index| index + 1)
+                        .position(|item| item.item_key() > last_key)
+                        .unwrap_or(self.items.len())
                 })
                 .unwrap_or(0);
             if start >= self.items.len() {
@@ -704,16 +830,320 @@ mod tests {
 
     #[test]
     fn no_item_ref_contains_rejects_forbidden_fragment() {
-        let drain = OrderedContentDrain {
-            items: vec![ObservedScanItem::from(&scan_item(b"safe/secret.txt", 9))],
-            page_lengths: vec![1],
-        };
+        let drain = OrderedContentDrain::new(
+            vec![ObservedScanItem::from(&scan_item(b"safe/secret.txt", 9))],
+            vec![1],
+        );
 
         let err = assert_no_item_ref_contains(&drain, &[b"secret".as_slice()])
             .expect_err("forbidden fragment must be rejected");
         assert!(matches!(
             err,
             OrderedContentConformanceError::ForbiddenItemRefFragment { item_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn drain_rejects_cursor_that_does_not_advance() {
+        // Page 2's first key ("a") does not advance past page 1's last key
+        // ("b"), so the harness must detect the regression.
+        let script = vec![
+            Ok(Some(page(
+                vec![scan_item(b"b", 1)],
+                PageState::HasMore {
+                    cursor: Cursor::with_last_key(ItemKey::try_from_slice(b"b").unwrap()),
+                },
+            ))),
+            Ok(Some(page(vec![scan_item(b"a", 2)], PageState::Complete))),
+        ];
+        let mut source = ScriptedSource::new(script);
+
+        let err = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 8, u64::MAX)
+            .expect_err("regressing cursor must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::CursorDidNotAdvance { page_index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn drain_rejects_source_exceeding_max_pages() {
+        // Source that always returns HasMore with a properly advancing key.
+        // With max_pages=2 the harness must bail after two pages.
+        struct InfiniteSource {
+            next_key: u32,
+        }
+
+        impl OrderedContentSource for InfiniteSource {
+            fn capabilities(&self) -> OrderedContentCapabilities {
+                OrderedContentCapabilities::default()
+            }
+
+            fn fill_page(
+                &mut self,
+                _shard: &ShardSpec,
+                _cursor: &Cursor,
+                _budgets: Budgets,
+            ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+                let key_bytes = format!("key-{:08x}", self.next_key);
+                self.next_key += 1;
+                let item = scan_item(key_bytes.as_bytes(), (self.next_key & 0xff) as u8);
+                let last_key = item.item_key().clone();
+                Ok(Some(
+                    PageBuf::try_new_validated(
+                        vec![item],
+                        PageState::HasMore {
+                            cursor: Cursor::with_last_key(last_key),
+                        },
+                        b"",
+                        b"",
+                    )
+                    .expect("infinite source emits valid pages"),
+                ))
+            }
+
+            fn open(
+                &mut self,
+                _item_ref: &ItemRef,
+                _budgets: Budgets,
+            ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+                Err(ReadError::unsupported("unused"))
+            }
+        }
+
+        let budgets = Budgets::try_new(8, u64::MAX, None).expect("valid budgets");
+        let mut source = InfiniteSource { next_key: 0 };
+        let err = drain_from_cursor(
+            &mut source,
+            &ShardSpec::unbounded(),
+            Cursor::initial(),
+            budgets,
+            2,
+        )
+        .expect_err("source exceeding max_pages must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::TooManyPages { limit: 2 }
+        ));
+    }
+
+    #[test]
+    fn drain_rejects_has_more_without_last_key() {
+        // HasMore cursor with no last_key violates the ordered-content
+        // contract — the harness must reject it.
+        let script = vec![Ok(Some(page(
+            vec![scan_item(b"a", 1)],
+            PageState::HasMore {
+                cursor: Cursor::initial(),
+            },
+        )))];
+        let mut source = ScriptedSource::new(script);
+
+        let err = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 8, u64::MAX)
+            .expect_err("HasMore without last_key must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::HasMoreWithoutLastKey { page_index: 0 }
+        ));
+    }
+
+    #[test]
+    fn repeatable_drain_rejects_nondeterministic_factory() {
+        // Factory returns different items on the second call.
+        let call_count = std::cell::Cell::new(0u32);
+        let err = assert_repeatable_drain(
+            &mut || {
+                let n = call_count.get();
+                call_count.set(n + 1);
+                let items = if n == 0 {
+                    vec![scan_item(b"a", 1), scan_item(b"b", 2)]
+                } else {
+                    vec![scan_item(b"a", 1), scan_item(b"c", 3)]
+                };
+                CursorAwareSource { items, page_len: 8 }
+            },
+            &ShardSpec::unbounded(),
+            8,
+            u64::MAX,
+        )
+        .expect_err("nondeterministic factory must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::DeterminismMismatch {
+                first_divergent_item: Some(1),
+            }
+        ));
+    }
+
+    #[test]
+    fn resume_after_corrupt_token_rejects_token_sensitive_source() {
+        // Source that changes its output when the cursor carries a token,
+        // violating the key-only fallback requirement.
+        struct TokenSensitiveSource {
+            items: Vec<ScanItem>,
+            page_len: usize,
+        }
+
+        impl OrderedContentSource for TokenSensitiveSource {
+            fn capabilities(&self) -> OrderedContentCapabilities {
+                OrderedContentCapabilities::default()
+            }
+
+            fn fill_page(
+                &mut self,
+                _shard: &ShardSpec,
+                cursor: &Cursor,
+                budgets: Budgets,
+            ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+                let start = cursor
+                    .last_key()
+                    .and_then(|last_key| {
+                        self.items
+                            .iter()
+                            .position(|item| item.item_key() == last_key)
+                            .map(|index| index + 1)
+                    })
+                    .unwrap_or(0);
+
+                // When a token is present, skip an extra item — this violates
+                // the contract because key-only and token resume must agree.
+                let start = if cursor.token().is_some() {
+                    (start + 1).min(self.items.len())
+                } else {
+                    start
+                };
+
+                if start >= self.items.len() {
+                    return Ok(None);
+                }
+
+                let page_len = self.page_len.min(budgets.max_items());
+                let end = (start + page_len).min(self.items.len());
+                let page_items = self.items[start..end].to_vec();
+                let state = if end == self.items.len() {
+                    PageState::Complete
+                } else {
+                    PageState::HasMore {
+                        cursor: Cursor::with_last_key(
+                            page_items.last().unwrap().item_key().clone(),
+                        ),
+                    }
+                };
+
+                Ok(Some(
+                    PageBuf::try_new_validated(page_items, state, b"", b"")
+                        .expect("token-sensitive source emits valid pages"),
+                ))
+            }
+
+            fn open(
+                &mut self,
+                _item_ref: &ItemRef,
+                _budgets: Budgets,
+            ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+                Err(ReadError::unsupported("unused"))
+            }
+        }
+
+        // Needs 3+ items so the first-page probe (max_items=1) gets HasMore,
+        // and the clean vs corrupt suffixes differ.
+        let err = assert_resume_after_corrupt_token(
+            &mut || TokenSensitiveSource {
+                items: vec![
+                    scan_item(b"a", 1),
+                    scan_item(b"b", 2),
+                    scan_item(b"c", 3),
+                    scan_item(b"d", 4),
+                ],
+                page_len: 8,
+            },
+            &ShardSpec::unbounded(),
+            1,
+            8,
+            u64::MAX,
+        )
+        .expect_err("token-sensitive source must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::TokenFallbackMismatch {
+                first_divergent_item: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn drain_rejects_zero_budget() {
+        let mut source = CursorAwareSource {
+            items: vec![scan_item(b"a", 1)],
+            page_len: 8,
+        };
+        let err = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 0, u64::MAX)
+            .expect_err("zero max_items budget must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::InvalidBudgets(_)
+        ));
+    }
+
+    #[test]
+    fn drain_propagates_enumerate_error() {
+        let script = vec![Err(EnumerateError::retryable("simulated transient fault"))];
+        let mut source = ScriptedSource::new(script);
+
+        let err = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 8, u64::MAX)
+            .expect_err("source error must propagate");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::Enumerate {
+                phase: "drain",
+                page_index: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn drain_rejects_invalid_page() {
+        // Build a page with out-of-order keys via try_new (which skips shape
+        // validation). The drain loop's validate_filled_page call catches it.
+        let bad_page = PageBuf::try_new(
+            vec![scan_item(b"z", 1), scan_item(b"a", 2)],
+            PageState::Complete,
+        )
+        .expect("try_new only checks non-empty");
+        let script = vec![Ok(Some(bad_page))];
+        let mut source = ScriptedSource::new(script);
+
+        let err = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 8, u64::MAX)
+            .expect_err("out-of-order keys must fail page validation");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::InvalidPage { page_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn drain_rejects_has_more_then_none_then_non_empty() {
+        // Source returns HasMore, then None, then a non-empty page on retry.
+        // The harness must detect this inconsistency via the post-None
+        // exhaustion probe.
+        let script = vec![
+            Ok(Some(page(
+                vec![scan_item(b"a", 1)],
+                PageState::HasMore {
+                    cursor: Cursor::with_last_key(ItemKey::try_from_slice(b"a").unwrap()),
+                },
+            ))),
+            Ok(None),
+            Ok(Some(page(vec![scan_item(b"b", 2)], PageState::Complete))),
+        ];
+        let mut source = ScriptedSource::new(script);
+
+        let err = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 8, u64::MAX)
+            .expect_err("has-more then none with remaining items must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::CompletePageDidNotExhaust { page_index: 1 }
         ));
     }
 }

@@ -37,7 +37,9 @@
 //! items are re-exported here so runtime crates keep a single import boundary
 //! for shared nouns and error taxonomy. [`common`] is public because the paging
 //! vocabulary is reused across families, while the family contracts stay
-//! namespaced under [`ordered`] and [`git`].
+//! namespaced under [`ordered`] and [`git`]. Conformance harnesses
+//! (`conformance`) are flat-exported as cross-cutting test utilities consumed
+//! by multiple downstream crates, matching the pattern in `persistence`.
 //!
 //! Family modules compose from the shared layers instead of inheriting a
 //! single universal connector model: [`ordered`] and [`git`] depend on
@@ -75,8 +77,15 @@
 //! - Ordered-content family contract: [`ordered::OrderedContentCapabilities`],
 //!   [`ordered::OrderedContentSource`]
 //! - Ordered-content conformance harness:
-//!   [`conformance::run_ordered_content_conformance`],
-//!   [`conformance::drain_ordered_source`]
+//!   [`run_ordered_content_conformance`],
+//!   [`drain_ordered_source`],
+//!   [`assert_repeatable_drain`],
+//!   [`assert_resume_after_corrupt_token`],
+//!   [`assert_no_item_ref_contains`]
+//! - Conformance snapshot types:
+//!   [`ObservedScanItem`],
+//!   [`OrderedContentDrain`],
+//!   [`OrderedContentConformanceError`]
 //! - Git family types and contracts: [`git::RepoKey`], [`git::RepoLocator`],
 //!   [`git::GitRepoTarget`], [`git::GitSelection`], [`git::LocalMirror`],
 //!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],

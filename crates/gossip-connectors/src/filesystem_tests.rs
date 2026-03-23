@@ -2,6 +2,7 @@
 
 use std::{
     io::{self, Read as _},
+    os::unix::ffi::OsStrExt,
     path::Path,
     time::{Duration, Instant},
 };
@@ -171,12 +172,13 @@ proptest! {
         }
         expected.sort();
 
+        let root_bytes = dir.path().as_os_str().as_bytes();
         let run = run_ordered_content_conformance(
             || FilesystemConnector::new(dir.path()),
             &unbounded_shard(),
             3,
             u64::MAX,
-            &[],
+            &[root_bytes],
         )
         .expect("random filesystem fixture should satisfy ordered-content conformance");
 
