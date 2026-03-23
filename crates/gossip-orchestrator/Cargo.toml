@@ -1,0 +1,15 @@
+[package]
+name = "gossip-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Filesystem request normalization and control-plane planning surfaces"
+
+[dependencies]
+gossip-coordination.workspace = true
+gossip-scanner-runtime.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

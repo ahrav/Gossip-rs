@@ -1458,6 +1458,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "gossip-coordination",
+ "gossip-scanner-runtime",
+ "tempfile",
+]
+
+[[package]]
 name = "gossip-persistence-inmemory"
 version = "0.1.0"
 dependencies = [
