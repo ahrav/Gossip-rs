@@ -76,6 +76,9 @@ pub struct OrderedContentRuntimeInput {
 
 impl OrderedContentRuntimeInput {
     /// Construct one ordered-content execution input bundle.
+    ///
+    /// `state` must carry [`CursorSemantics::Completed`] — the runtime
+    /// rejects other semantics at execution time.
     #[must_use]
     pub fn new(state: RestoredShardState, budgets: Budgets) -> Self {
         Self { state, budgets }

@@ -1,4 +1,4 @@
-//! Deterministic MVP initial shard geometry planning for filesystem requests.
+//! Deterministic initial shard geometry planning for filesystem requests.
 //!
 //! The planner deliberately emits one startup shard per normalized request.
 //! Any later fan-out comes from coordination split flows after the worker
@@ -29,12 +29,10 @@ impl InitialShardGeometry {
     /// Geometry covering the full connector keyspace (unbounded).
     ///
     /// Empty slices follow the [`ShardSpec::unbounded()`] convention: no lower
-    /// bound and no upper bound. Downstream lowering to [`InitialShardInput`]
-    /// must translate to connector-specific finite bounds before manifest
-    /// registration, which rejects unbounded ranges.
+    /// bound and no upper bound. See the struct-level docs for lowering
+    /// requirements.
     ///
     /// [`ShardSpec::unbounded()`]: gossip_coordination::ShardSpec::unbounded
-    /// [`InitialShardInput`]: gossip_coordination::InitialShardInput
     #[must_use]
     pub const fn full_connector_keyspace() -> Self {
         Self {
@@ -87,7 +85,7 @@ impl FilesystemInitialShardPlan {
         &self.request
     }
 
-    /// The single MVP startup shard geometry.
+    /// The single startup shard geometry.
     #[must_use]
     pub fn initial_shard(&self) -> InitialShardGeometry {
         self.initial_shard
@@ -95,7 +93,7 @@ impl FilesystemInitialShardPlan {
 
     /// Slice view of the planned startup geometries.
     ///
-    /// The MVP planner always returns exactly one shard. The slice surface
+    /// Currently returns a single-element slice. The slice surface
     /// keeps later lowering code uniform without introducing startup fan-out.
     #[must_use]
     pub fn shard_geometries(&self) -> &[InitialShardGeometry] {
@@ -105,7 +103,7 @@ impl FilesystemInitialShardPlan {
 
 /// Plan deterministic initial shard geometry for one normalized filesystem request.
 ///
-/// The current MVP startup policy is intentionally simple:
+/// The current startup policy is intentionally simple:
 /// `single_file` and `directory_root` requests both start with one full-range
 /// shard, while the normalized request retains the source-mode distinction for
 /// later payload and runtime hydration work.

@@ -136,6 +136,14 @@ impl FilesystemRequest {
     /// cannot be canonicalized, any error that [`Self::normalize`] can
     /// produce, or [`FilesystemRequestError::PathConfinementViolation`] if
     /// the canonical path escapes the allowed root.
+    ///
+    /// # Limitations
+    ///
+    /// A TOCTOU window exists between canonicalizing `allowed_root` and
+    /// canonicalizing the request path inside [`Self::normalize`]. The
+    /// containment check is advisory; the downstream connector's
+    /// `O_NOFOLLOW` / `openat` enforcement provides the authoritative
+    /// safety guard against filesystem races.
     pub fn normalize_within(
         &self,
         allowed_root: &Path,
@@ -205,6 +213,19 @@ impl FilesystemRequest {
                 actual: actual_kind,
             });
         }
+
+        // Defensive: single-file targets must resolve to a path with a file
+        // name component. Canonicalization + the mode/kind check above should
+        // already guarantee this (only root `/` lacks a file name, and root is
+        // a directory), but we verify explicitly because downstream consumers
+        // rely on `relative_namespace_name()` returning `Some` for single-file
+        // requests.
+        if self.mode == FilesystemSourceMode::SingleFile && canonical_root.file_name().is_none() {
+            return Err(FilesystemRequestError::SingleFileMissingName {
+                path: canonical_root,
+            });
+        }
+
         Ok(NormalizedFilesystemRequest {
             mode: self.mode,
             canonical_root,
@@ -707,6 +728,30 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn normalize_within_rejects_symlink_escaping_allowed_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let allowed = tempdir().expect("allowed tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let target = outside.path().join("secret.txt");
+        fs::write(&target, "sensitive").expect("write target");
+
+        let link = allowed.path().join("escape_link.txt");
+        unix_fs::symlink(&target, &link).expect("create symlink");
+
+        let request = FilesystemRequest::single_file(&link, run_config());
+        let err = request
+            .normalize_within(allowed.path())
+            .expect_err("symlink escaping allowed root must be rejected");
+
+        assert!(matches!(
+            err,
+            FilesystemRequestError::PathConfinementViolation { .. }
+        ));
+    }
+
     #[test]
     fn normalize_within_accepts_path_at_allowed_root() {
         let dir = tempdir().expect("tempdir");
@@ -719,5 +764,23 @@ mod tests {
         assert_eq!(normalized.mode(), FilesystemSourceMode::DirectoryRoot);
         let canonical_dir = dir.path().canonicalize().expect("canonicalize dir");
         assert_eq!(normalized.canonical_root(), canonical_dir.as_path());
+    }
+
+    #[test]
+    fn normalize_within_rejects_nonexistent_allowed_root() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("scan-target.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+
+        let nonexistent_root = dir.path().join("does-not-exist");
+        let request = FilesystemRequest::single_file(&file_path, run_config());
+        let err = request
+            .normalize_within(&nonexistent_root)
+            .expect_err("nonexistent allowed_root should fail");
+
+        assert!(
+            matches!(err, FilesystemRequestError::Canonicalize { .. }),
+            "expected Canonicalize error, got: {err}"
+        );
     }
 }
