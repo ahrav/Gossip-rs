@@ -132,7 +132,7 @@ impl FilesystemRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`FilesystemRequestError::Canonicalize`] if `allowed_root`
+    /// Returns [`FilesystemRequestError::AllowedRootCanonicalize`] if `allowed_root`
     /// cannot be canonicalized, any error that [`Self::normalize`] can
     /// produce, or [`FilesystemRequestError::PathConfinementViolation`] if
     /// the canonical path escapes the allowed root.
@@ -149,7 +149,7 @@ impl FilesystemRequest {
         allowed_root: &Path,
     ) -> Result<NormalizedFilesystemRequest, FilesystemRequestError> {
         let allowed_canonical = fs::canonicalize(allowed_root).map_err(|source| {
-            FilesystemRequestError::Canonicalize {
+            FilesystemRequestError::AllowedRootCanonicalize {
                 path: allowed_root.to_path_buf(),
                 source,
             }
@@ -334,6 +334,13 @@ pub enum FilesystemRequestError {
         /// The root directory the path must reside within.
         allowed_root: PathBuf,
     },
+    /// The allowed root directory path could not be canonicalized.
+    AllowedRootCanonicalize {
+        /// Server-configured allowed root path.
+        path: PathBuf,
+        /// I/O error from canonicalization.
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for FilesystemRequestError {
@@ -382,6 +389,11 @@ impl fmt::Display for FilesystemRequestError {
                 path.display(),
                 allowed_root.display()
             ),
+            Self::AllowedRootCanonicalize { path, source } => write!(
+                f,
+                "failed to canonicalize allowed root directory '{}': {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -389,7 +401,9 @@ impl fmt::Display for FilesystemRequestError {
 impl std::error::Error for FilesystemRequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Canonicalize { source, .. } | Self::Metadata { source, .. } => Some(source),
+            Self::Canonicalize { source, .. }
+            | Self::Metadata { source, .. }
+            | Self::AllowedRootCanonicalize { source, .. } => Some(source),
             Self::EmptyPath { .. }
             | Self::PathKindMismatch { .. }
             | Self::UnsupportedPathKind { .. }
@@ -767,20 +781,30 @@ mod tests {
     }
 
     #[test]
-    fn normalize_within_rejects_nonexistent_allowed_root() {
+    fn normalize_within_reports_allowed_root_canonicalization_failure() {
         let dir = tempdir().expect("tempdir");
-        let file_path = dir.path().join("scan-target.txt");
+        let file_path = dir.path().join("target.txt");
         fs::write(&file_path, "fixture").expect("write fixture");
 
         let nonexistent_root = dir.path().join("does-not-exist");
         let request = FilesystemRequest::single_file(&file_path, run_config());
         let err = request
             .normalize_within(&nonexistent_root)
-            .expect_err("nonexistent allowed_root should fail");
+            .expect_err("nonexistent allowed root must fail");
 
+        assert!(matches!(
+            err,
+            FilesystemRequestError::AllowedRootCanonicalize { .. }
+        ));
+
+        let err_msg = err.to_string();
         assert!(
-            matches!(err, FilesystemRequestError::Canonicalize { .. }),
-            "expected Canonicalize error, got: {err}"
+            err_msg.contains("allowed root"),
+            "error message should mention 'allowed root', got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("request path"),
+            "error message should not say 'request path', got: {err_msg}"
         );
     }
 }
