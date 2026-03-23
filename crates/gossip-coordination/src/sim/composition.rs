@@ -62,6 +62,7 @@ use crate::run::{RunConfig, RunManagement};
 use crate::session::WorkerSession;
 use crate::traits::CoordinationBackend;
 
+use super::composition_invariants::{CompositionInvariantChecker, CrossComponentViolation};
 use super::scan_driver_sim::generate_scan_outcome;
 use super::shared::{
     CheckpointOpMap, DEFAULT_LEASE_DURATION, MAX_STALE_LEASES, SessionTerminalAction,
@@ -200,8 +201,16 @@ pub struct ProvenanceEntry {
     pub run_id: RunId,
     /// Shard within the run.
     pub shard_id: ShardId,
-    /// Fence epoch from the lease at scan time.
+    /// Fence epoch written into done-ledger record provenance.
+    ///
+    /// Equals `lease_fence` for normal lifecycles. Differs for stale-lease
+    /// writes where the harness deliberately injects an older epoch.
     pub fence_epoch: FenceEpoch,
+    /// Actual fence epoch from the lease at claim time.
+    ///
+    /// The cross-component invariant checker (C4) compares this against
+    /// `fence_epoch` to detect fence propagation mismatches.
+    pub lease_fence: FenceEpoch,
     /// Number of done-ledger records produced by the scan.
     pub record_count: usize,
     /// Whether the done-ledger write was actually committed.
@@ -293,8 +302,8 @@ pub enum CompositionSimViolation {
     Coordination(InvariantViolation),
     /// Done-ledger invariant violation (I1–I10).
     Persistence(DoneLedgerInvariantViolation),
-    // Cross-component invariant violations (C1-C4) will be added when
-    // the cross-boundary checker is implemented.
+    /// Cross-component invariant violation (C1–C4).
+    CrossComponent(CrossComponentViolation),
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +331,7 @@ pub struct CompositionSim {
     oracle: DoneLedgerOracle,
     coord_checker: InvariantChecker,
     ledger_checker: DoneLedgerInvariantChecker,
+    cross_checker: CompositionInvariantChecker,
     workers: BTreeMap<WorkerId, SimWorker>,
     /// Cross-boundary fault rates reserved for the random op generator
     /// (not yet implemented). Currently only consumed by
@@ -369,6 +379,7 @@ impl CompositionSim {
             oracle: DoneLedgerOracle::new(),
             coord_checker: InvariantChecker::new(),
             ledger_checker: DoneLedgerInvariantChecker::new(),
+            cross_checker: CompositionInvariantChecker::new(),
             workers: BTreeMap::new(),
             fault_config,
             tenant,
@@ -538,6 +549,19 @@ impl CompositionSim {
                     .into_iter()
                     .map(CompositionSimViolation::Coordination),
             );
+
+            // Run cross-component invariant checker (C1–C4) after S1–S9.
+            let cross_viols = self.cross_checker.check_all(
+                &self.coordinator,
+                &self.oracle,
+                &self.write_log,
+                self.tenant,
+            );
+            violations.extend(
+                cross_viols
+                    .into_iter()
+                    .map(CompositionSimViolation::CrossComponent),
+            );
         }
 
         (event, violations)
@@ -675,6 +699,7 @@ impl CompositionSim {
             run_id: lease.run(),
             shard_id: lease.shard(),
             fence_epoch: lease.fence(),
+            lease_fence: lease.fence(),
             record_count: records_written,
             committed: ledger_committed,
             coordinator_completed,
@@ -767,6 +792,7 @@ impl CompositionSim {
             run_id: lease.run(),
             shard_id: lease.shard(),
             fence_epoch: lease.fence(),
+            lease_fence: lease.fence(),
             record_count: scan.records.len(),
             committed: false,
             coordinator_completed,
@@ -850,6 +876,7 @@ impl CompositionSim {
             run_id: lease.run(),
             shard_id: lease.shard(),
             fence_epoch: stale_fence,
+            lease_fence: lease.fence(),
             record_count: scan.records.len(),
             committed: ledger_committed,
             coordinator_completed,

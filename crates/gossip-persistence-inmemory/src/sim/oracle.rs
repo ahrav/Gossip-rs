@@ -129,6 +129,15 @@ impl DoneLedgerOracle {
         self.committed.len()
     }
 
+    /// Iterate all committed records.
+    ///
+    /// Used by the cross-component invariant checker (C1–C4) to validate
+    /// provenance fields against coordinator state. The iteration order
+    /// is unspecified.
+    pub fn committed_iter(&self) -> impl Iterator<Item = (&DoneLedgerKey, &DoneLedgerRecord)> {
+        self.committed.iter()
+    }
+
     /// Number of pending (uncommitted) batches.
     pub fn pending_batch_count(&self) -> usize {
         self.pending.len()
