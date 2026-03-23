@@ -164,14 +164,6 @@ impl FilesystemRequest {
                 actual: actual_kind,
             });
         }
-        if matches!(self.mode, FilesystemSourceMode::SingleFile)
-            && canonical_root.file_name().is_none()
-        {
-            return Err(FilesystemRequestError::SingleFileMissingName {
-                path: canonical_root,
-            });
-        }
-
         Ok(NormalizedFilesystemRequest {
             mode: self.mode,
             canonical_root,
@@ -260,11 +252,6 @@ pub enum FilesystemRequestError {
         /// Canonical path.
         path: PathBuf,
     },
-    /// A canonical single-file target did not expose a file name component.
-    SingleFileMissingName {
-        /// Canonical path.
-        path: PathBuf,
-    },
 }
 
 impl fmt::Display for FilesystemRequestError {
@@ -298,11 +285,6 @@ impl fmt::Display for FilesystemRequestError {
                 "filesystem request path '{}' must be a regular file or directory",
                 path.display()
             ),
-            Self::SingleFileMissingName { path } => write!(
-                f,
-                "single-file request path '{}' does not have a file name",
-                path.display()
-            ),
         }
     }
 }
@@ -313,8 +295,7 @@ impl std::error::Error for FilesystemRequestError {
             Self::Canonicalize { source, .. } | Self::Metadata { source, .. } => Some(source),
             Self::EmptyPath { .. }
             | Self::PathKindMismatch { .. }
-            | Self::UnsupportedPathKind { .. }
-            | Self::SingleFileMissingName { .. } => None,
+            | Self::UnsupportedPathKind { .. } => None,
         }
     }
 }

@@ -584,65 +584,34 @@ pub fn assert_no_forbidden_fragments(
     forbidden_fragments: &[&[u8]],
 ) -> Result<(), OrderedContentConformanceError> {
     for (item_index, item) in drain.items().iter().enumerate() {
-        for &(field_name, field_bytes) in &[
-            ("item_ref", item.item_ref().as_bytes()),
-            ("item_key", item.item_key().as_bytes()),
-        ] {
-            for fragment in forbidden_fragments.iter().copied() {
-                if fragment.is_empty() {
-                    continue;
-                }
-                if field_bytes
-                    .windows(fragment.len())
-                    .any(|window| window == fragment)
-                {
-                    return Err(OrderedContentConformanceError::ForbiddenFragment {
-                        item_index,
-                        field: field_name,
-                        fragment: ToxicDigest::of_bytes(fragment),
-                        content: ToxicDigest::of_bytes(field_bytes),
-                    });
-                }
-            }
-        }
-
-        if let Some(location) = item.location() {
-            let display_bytes = location.display().as_bytes();
-            for fragment in forbidden_fragments.iter().copied() {
-                if fragment.is_empty() {
-                    continue;
-                }
-                if display_bytes
-                    .windows(fragment.len())
-                    .any(|window| window == fragment)
-                {
-                    return Err(OrderedContentConformanceError::ForbiddenFragment {
-                        item_index,
-                        field: "location_display",
-                        fragment: ToxicDigest::of_bytes(fragment),
-                        content: ToxicDigest::of_bytes(display_bytes),
-                    });
-                }
-            }
-
-            if let Some(url) = location.url() {
-                let url_bytes = url.as_bytes();
+        let check_field =
+            |bytes: &[u8], field: &'static str| -> Result<(), OrderedContentConformanceError> {
                 for fragment in forbidden_fragments.iter().copied() {
                     if fragment.is_empty() {
                         continue;
                     }
-                    if url_bytes
+                    if bytes
                         .windows(fragment.len())
                         .any(|window| window == fragment)
                     {
                         return Err(OrderedContentConformanceError::ForbiddenFragment {
                             item_index,
-                            field: "location_url",
+                            field,
                             fragment: ToxicDigest::of_bytes(fragment),
-                            content: ToxicDigest::of_bytes(url_bytes),
+                            content: ToxicDigest::of_bytes(bytes),
                         });
                     }
                 }
+                Ok(())
+            };
+
+        check_field(item.item_ref().as_bytes(), "item_ref")?;
+        check_field(item.item_key().as_bytes(), "item_key")?;
+
+        if let Some(location) = item.location() {
+            check_field(location.display().as_bytes(), "location_display")?;
+            if let Some(url) = location.url() {
+                check_field(url.as_bytes(), "location_url")?;
             }
         }
     }
