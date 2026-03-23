@@ -70,8 +70,9 @@ path.
 The runtime performs setup work in a fixed order:
 
 1. Validate the requested path.
-2. Validate runtime budgets (distributed path and connector-mode local path
-   via `Budgets`; direct local scans skip budget validation).
+2. Validate runtime budgets (distributed path and filesystem connector-mode
+   local path via `Budgets`; direct local scans and Git connector mode skip
+   budget validation).
 3. Normalize source-specific inputs.
 4. Call the source family boundary.
 
@@ -636,9 +637,9 @@ completion helpers.
 `ShardLease` is the hand-off object from `gossip-coordination` into the worker
 loop. It keeps the string shard label used for recorder routing separate from
 the numeric shard identity carried inside `Lease` and `WriteContext`, stores
-the shard's key-range start for completion fallback, and carries the
-filesystem scan config derived from the claimed shard spec plus connector
-metadata.
+the authoritative shard bounds and resume state (`shard_spec`,
+`resume_cursor`, `cursor_semantics`), and carries the filesystem scan config
+derived from the claimed shard spec plus connector metadata.
 
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones

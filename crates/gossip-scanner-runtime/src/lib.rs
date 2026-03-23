@@ -765,10 +765,10 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
 
 /// Connector-mode filesystem scan.
 ///
-/// Validates the target path, constructs a real [`FilesystemConnector`],
-/// and executes one ordered page acquisition through
-/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule
-/// execution, and durability are not yet wired into this path.
+/// Validates the target path, constructs a [`FilesystemConnector`], and
+/// executes one ordered page acquisition through
+/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
+/// and durability are handled by [`scan_fs_direct`].
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
