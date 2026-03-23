@@ -168,11 +168,8 @@ impl WorkerIdentity {
 ///
 /// - **`shard_id`** — string label for telemetry routing.
 /// - **`lease`** — authoritative coordination lease used for terminal completion.
-/// - **`shard_spec`** — authoritative shard bounds and metadata restored from
-///   acquire/restore state.
-/// - **`resume_cursor`** — authoritative ordered-content resume cursor restored
-///   from acquire/restore state.
-/// - **`cursor_semantics`** — coordination cursor mode for the shard.
+/// - **`state`** — shard bounds, resume cursor, and cursor semantics restored
+///   from the acquire/restore coordination payload.
 /// - **`scan_config`** — filesystem scan configuration for this shard, derived
 ///   from the worker template with optional shard-level path overrides.
 /// - **`write_context`** — numeric shard identity plus fencing epoch for all

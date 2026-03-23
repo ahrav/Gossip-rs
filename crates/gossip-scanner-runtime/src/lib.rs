@@ -68,7 +68,7 @@ pub use gossip_contracts::connector::git::GitDebugLevel;
 use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
 use gossip_contracts::{
     connector::{Budgets, ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG},
-    coordination::{CursorSemantics, ShardSpec},
+    coordination::{CursorSemantics, RestoredShardState, ShardSpec},
 };
 use scanner_engine::TransformId;
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformMode, Tuning};
@@ -775,12 +775,12 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
-    let runtime_input = ordered_content::OrderedContentRuntimeInput::new(
+    let state = RestoredShardState::new(
         ShardSpec::unbounded(),
         Cursor::initial(),
         CursorSemantics::Completed,
-        budgets,
     );
+    let runtime_input = ordered_content::OrderedContentRuntimeInput::new(state, budgets);
     let mut source = FilesystemConnector::new(canonical_path);
 
     match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {

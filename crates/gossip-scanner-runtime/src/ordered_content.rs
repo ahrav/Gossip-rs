@@ -545,12 +545,8 @@ mod tests {
         cursor: Cursor,
         cursor_semantics: CursorSemantics,
     ) -> OrderedContentRuntimeInput {
-        OrderedContentRuntimeInput::new(
-            shard,
-            cursor,
-            cursor_semantics,
-            Budgets::try_new(8, 1_024, None).expect("budgets"),
-        )
+        let state = RestoredShardState::new(shard, cursor, cursor_semantics);
+        OrderedContentRuntimeInput::new(state, Budgets::try_new(8, 1_024, None).expect("budgets"))
     }
 
     #[test]
