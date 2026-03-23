@@ -408,13 +408,16 @@ fn scan_budgets_reject_zero_bytes() {
 fn scan_fs_direct_rejects_nonexistent_path() {
     let error = scan_fs_direct(&FsScanConfig::new("/no/such/path"))
         .expect_err("nonexistent path should fail");
-    assert!(matches!(
-        error,
-        ScanRuntimeError::InvalidPath {
-            source: "filesystem",
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            error,
+            ScanRuntimeError::Io {
+                op: "canonicalize",
+                ..
+            }
+        ),
+        "nonexistent path surfaces as an Io error from canonicalize: {error}"
+    );
 }
 
 #[test]
@@ -1715,4 +1718,42 @@ fn scan_local_filesystem_rejects_multi_worker_persist() {
         err_msg.contains("workers=1"),
         "error should mention workers=1, got: {err_msg}"
     );
+}
+
+#[test]
+fn scan_fs_connector_reports_all_items_when_budget_fits_entire_directory() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("a.txt"), "abc").expect("write a.txt");
+    fs::write(dir.path().join("b.txt"), "defgh").expect("write b.txt");
+
+    let config = FsScanConfig::new(dir.path())
+        .with_execution_mode(ExecutionMode::Connector)
+        .with_budgets(ScanBudgets {
+            max_items: 256,
+            max_bytes: 1_000_000,
+        });
+
+    let report = scan_fs(&config).expect("connector scan should succeed");
+
+    assert_eq!(
+        report.items_scanned, 2,
+        "both files fit within the page budget"
+    );
+    assert_eq!(
+        report.bytes_scanned, 8,
+        "total bytes: 3 (a.txt) + 5 (b.txt)"
+    );
+}
+
+#[test]
+fn scan_fs_connector_handles_single_file_path() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("target.txt");
+    fs::write(&file_path, "1234567").expect("write target.txt");
+
+    let config = FsScanConfig::new(&file_path).with_execution_mode(ExecutionMode::Connector);
+
+    let report = scan_fs(&config).expect("connector scan of single file should succeed");
+
+    assert_eq!(report.items_scanned, 1, "single file produces one item");
 }

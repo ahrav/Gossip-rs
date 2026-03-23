@@ -763,12 +763,15 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
     scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
-/// Connector-mode filesystem scan.
+/// Connector-mode filesystem scan (single-page validation boundary).
 ///
 /// This path validates the target path, constructs a real
 /// [`FilesystemConnector`], and executes one ordered page acquisition through
-/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
-/// and durability remain on the direct scan path.
+/// [`ordered_content::OrderedContentRuntime`]. Only a single page is acquired;
+/// multi-page iteration is not yet wired. Callers needing a complete scan
+/// should use [`scan_fs_direct`].
+///
+/// Content reads, rule execution, and durability remain on the direct scan path.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
@@ -1883,25 +1886,24 @@ pub(crate) fn join_scoped<T>(
 /// or are neither a regular file nor a directory (e.g. symlinks to special
 /// files, device nodes).
 fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
-    if !path.exists() {
-        return Err(ScanRuntimeError::InvalidPath {
-            source: "filesystem",
-            path: path.to_path_buf(),
-            message: "path does not exist".to_owned(),
-        });
-    }
-    if !path.is_file() && !path.is_dir() {
-        return Err(ScanRuntimeError::InvalidPath {
-            source: "filesystem",
-            path: path.to_path_buf(),
-            message: "path must be a regular file or directory".to_owned(),
-        });
-    }
-    fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
+    let canonical = fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
         op: "canonicalize",
         path: Some(path.to_path_buf()),
         error,
-    })
+    })?;
+    let meta = fs::metadata(&canonical).map_err(|error| ScanRuntimeError::Io {
+        op: "metadata",
+        path: Some(canonical.clone()),
+        error,
+    })?;
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "filesystem",
+            path: canonical,
+            message: "path must be a regular file or directory".to_owned(),
+        });
+    }
+    Ok(canonical)
 }
 
 /// Validate a Git scan target path.

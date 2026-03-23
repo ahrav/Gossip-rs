@@ -40,7 +40,7 @@ use gossip_contracts::{
         Budgets, Cursor, EnumerateError, ErrorClass, PageBuf, PageState, ScanItem,
         ordered::OrderedContentSource, validate_filled_page,
     },
-    coordination::{CursorSemantics, ShardSpec},
+    coordination::{CursorSemantics, RestoredShardState, ShardSpec},
 };
 use scanner_scheduler::events::EventOutput;
 use scanner_scheduler::scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
@@ -53,50 +53,38 @@ use crate::{
 
 /// Inputs required to acquire and validate one ordered connector page.
 ///
-/// The runtime keeps the shard bounds, resume cursor, cursor semantics, and
-/// page budgets together so the page-fill boundary always executes from
-/// authoritative state.
+/// The runtime keeps the restored coordination state (shard bounds, resume
+/// cursor, cursor semantics) and page budgets together so the page-fill
+/// boundary always executes from authoritative state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentRuntimeInput {
-    shard: ShardSpec,
-    cursor: Cursor,
-    cursor_semantics: CursorSemantics,
+    state: RestoredShardState,
     budgets: Budgets,
 }
 
 impl OrderedContentRuntimeInput {
     /// Construct one ordered-content execution input bundle.
     #[must_use]
-    pub fn new(
-        shard: ShardSpec,
-        cursor: Cursor,
-        cursor_semantics: CursorSemantics,
-        budgets: Budgets,
-    ) -> Self {
-        Self {
-            shard,
-            cursor,
-            cursor_semantics,
-            budgets,
-        }
+    pub fn new(state: RestoredShardState, budgets: Budgets) -> Self {
+        Self { state, budgets }
     }
 
     /// Authoritative shard bounds used for page validation.
     #[must_use]
     pub fn shard(&self) -> &ShardSpec {
-        &self.shard
+        self.state.shard_spec()
     }
 
     /// Resume cursor restored from runtime state.
     #[must_use]
     pub fn cursor(&self) -> &Cursor {
-        &self.cursor
+        self.state.resume_cursor()
     }
 
     /// Coordination cursor semantics for the shard.
     #[must_use]
     pub fn cursor_semantics(&self) -> CursorSemantics {
-        self.cursor_semantics
+        self.state.cursor_semantics()
     }
 
     /// Connector page budgets.
@@ -178,15 +166,17 @@ pub struct OrderedContentPage {
 
 impl OrderedContentPage {
     fn from_validated_page(page: PageBuf<ScanItem>) -> Self {
-        let last_key = page
-            .items()
-            .last()
-            .expect("validated page is non-empty")
-            .item_key()
-            .clone();
         let resume_cursor = match page.state() {
             PageState::HasMore { cursor } => cursor.clone(),
-            PageState::Complete => Cursor::with_last_key(last_key),
+            PageState::Complete => {
+                let last_key = page
+                    .items()
+                    .last()
+                    .expect("validated page is non-empty")
+                    .item_key()
+                    .clone();
+                Cursor::with_last_key(last_key)
+            }
         };
         let bytes_scanned = page
             .items()
@@ -685,6 +675,66 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("did not advance past the restored resume cursor"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_source_returns_validated_single_item_complete_page() {
+        let page =
+            PageBuf::try_new(vec![item(b"only.txt", 42)], PageState::Complete).expect("page");
+        let mut source = ScriptedSource::returning(Ok(Some(page)));
+
+        let outcome = OrderedContentRuntime::execute_source(
+            &mut source,
+            &runtime_input(
+                ShardSpec::unbounded(),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+        )
+        .expect("single-item complete page");
+
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome");
+        };
+        assert_eq!(page.report().items_scanned, 1);
+        assert_eq!(page.report().bytes_scanned, 42);
+        assert_eq!(
+            page.resume_cursor()
+                .last_key()
+                .expect("last_key")
+                .as_bytes(),
+            b"only.txt"
+        );
+        // Complete page resume cursor carries no opaque continuation token.
+        assert!(page.resume_cursor().token().is_none());
+    }
+
+    #[test]
+    fn execute_source_rejects_has_more_cursor_without_last_key() {
+        let page = PageBuf::try_new(
+            vec![item(b"a.txt", 3)],
+            PageState::HasMore {
+                cursor: Cursor::initial(), // no last_key
+            },
+        )
+        .expect("page");
+        let mut source = ScriptedSource::returning(Ok(Some(page)));
+
+        let err = OrderedContentRuntime::execute_source(
+            &mut source,
+            &runtime_input(
+                ShardSpec::unbounded(),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+        )
+        .expect_err("HasMore without last_key must fail");
+
+        assert!(
+            err.to_string()
+                .contains("omitted the authoritative last_key"),
             "unexpected error: {err}"
         );
     }
