@@ -19,6 +19,7 @@ aegis-pure-rust = [
 [dependencies]
 anyhow.workspace = true
 gossip-coordination.workspace = true
+gossip-connectors.workspace = true
 gossip-contracts.workspace = true
 gossip-frontier.workspace = true
 gossip-stdx.workspace = true

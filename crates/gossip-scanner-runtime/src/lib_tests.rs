@@ -436,23 +436,45 @@ fn scan_fs_direct_scans_directory_with_custom_rules() {
 }
 
 #[test]
-fn scan_fs_connector_matches_direct_counters() {
+fn scan_fs_connector_uses_ordered_page_fill_runtime() {
     let dir = tempdir().expect("tempdir");
-    fs::write(dir.path().join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    fs::write(dir.path().join("a.txt"), "a").expect("write first fixture");
+    fs::write(dir.path().join("secret.txt"), "prefix TOK_ABCDEFGH suffix")
+        .expect("write secret fixture");
+    fs::write(dir.path().join("z.txt"), "zz").expect("write last fixture");
     let rules = write_runtime_rules();
     let rules_path = rules.path().to_path_buf();
-    let base = FsScanConfig::new(dir.path()).with_rules_file(Some(rules_path));
+    let base = FsScanConfig::new(dir.path())
+        .with_rules_file(Some(rules_path))
+        .with_budgets(ScanBudgets {
+            max_items: 1,
+            max_bytes: 1_024,
+        });
 
     let direct = scan_fs(&base.clone().with_execution_mode(ExecutionMode::Direct))
         .expect("direct filesystem scan");
     let connector = scan_fs(&base.with_execution_mode(ExecutionMode::Connector))
         .expect("connector filesystem scan");
 
-    assert_eq!(connector.items_scanned, direct.items_scanned);
-    assert_eq!(connector.bytes_scanned, direct.bytes_scanned);
-    assert_eq!(connector.chunks_scanned, direct.chunks_scanned);
-    assert_eq!(connector.findings_emitted, direct.findings_emitted);
-    assert_eq!(connector.errors, direct.errors);
+    assert_eq!(
+        connector.items_scanned, 1,
+        "connector mode should report only the first validated ordered page"
+    );
+    assert_eq!(
+        connector.bytes_scanned, 1,
+        "the first ordered item is a.txt with one byte of content"
+    );
+    assert_eq!(connector.findings_emitted, 0);
+    assert_eq!(connector.errors, 0);
+
+    assert!(
+        direct.items_scanned >= 3,
+        "direct mode still performs the full local scan"
+    );
+    assert!(
+        direct.findings_emitted >= 1,
+        "direct mode still executes rule matching on item content"
+    );
 }
 
 #[test]
@@ -1051,7 +1073,7 @@ fn scan_git_with_runtime_returns_empty_report_when_pre_cancelled() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedCoreEvent round-trip fidelity (F11)
+// OwnedCoreEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1131,7 +1153,7 @@ fn owned_core_event_diagnostic_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedGitEvent round-trip fidelity (F11)
+// OwnedGitEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]

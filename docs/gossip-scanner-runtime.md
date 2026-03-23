@@ -16,9 +16,10 @@
   leases, direct coordination claim/complete helpers, persistence handles,
   runtime configuration, run reports, and error layering
 
-The crate no longer depends on a separate scan-driver abstraction. Its
-public surface stays stable for callers while direct and connector-mode
-entrypoints share the same local runtime execution paths.
+The crate no longer depends on a separate scan-driver abstraction.
+Execution mode selects the family boundary: direct mode runs the local
+scan pipeline, filesystem connector mode performs ordered page acquisition
+and validation, and Git connector mode uses the direct path.
 
 ---
 
@@ -36,7 +37,7 @@ entrypoints share the same local runtime execution paths.
 | `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
-| `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
+| `src/ordered_content.rs` | Ordered-content page-fill runtime plus direct local filesystem execution helpers |
 | `src/result_translation.rs` | Deterministic translation from completed item results into persistence rows (findings, occurrences, observations, done-ledger) |
 | `src/result_committer.rs` | Authoritative findings -> done-ledger durability stage for one completed unit, with request validation and `UnitCommitReceipt` construction |
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
@@ -57,40 +58,52 @@ The crate exposes two public scan entrypoints:
 - `scan_fs(&FsScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 - `scan_git(&GitScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 
-Each entrypoint dispatches on `ExecutionMode`, but both `Direct` and
-`Connector` currently converge on the same local family-facing runtime
-surface. The execution-mode flag is retained so callers can preserve
-their existing CLI and worker flows while the public runtime API stays
-stable.
+Each entrypoint dispatches on `ExecutionMode`. `Direct` runs the
+local scan implementation. `Connector` selects the family
+boundary instead: filesystem scans execute one ordered connector page
+acquisition/validation step, while Git scans use the direct
+path.
 
 ### Validation-first execution
 
 The runtime performs setup work in a fixed order:
 
 1. Validate the requested path.
-2. Validate runtime budgets (distributed path only; local paths skip budget validation).
+2. Validate runtime budgets (distributed path and filesystem connector-mode
+   local path via `Budgets`; direct local scans and Git connector mode skip
+   budget validation).
 3. Normalize source-specific inputs.
 4. Call the source family boundary.
 
 Current behavior after validation:
 
-- filesystem scans route to `ordered_content::scan_local_filesystem`
+- direct filesystem scans route to `ordered_content::scan_local_filesystem`
+- connector-mode filesystem scans instantiate `FilesystemConnector` and route
+  through `OrderedContentRuntime::execute_source`
 - git scans route to `git_repo::scan_local_repo`
 - distributed worker assembly uses the foundational types in `distributed.rs`
 
-Filesystem scans build a runtime engine, forward scheduler events through
-owned channel bridges, optionally forward persisted findings through the
-local commit sink surface, and convert scheduler counters into the local
-`ScanReport`. When persistence is enabled, the runtime derives each
-filesystem `StableItemId` from the filesystem connector tag, a
-connector-instance hash of the canonicalized scan root, and the normalized
-root-relative path (the locator in `ItemIdentityKey`). The commit forwarder (`forward_commits`) uses a
-`DiscoveryOrderBuffer` to reorder finding batches from executor processing
-order (LIFO-reversed) back into file-path-sorted discovery order before
-calling `begin_item`. This ensures checkpoint sequence numbers are
-monotonically consistent with `ItemKey` ordering, preventing
-`BoundaryRegression` errors in the prefix checkpoint aggregator for
-ordered-content shards with multiple files.
+Direct filesystem scans build a runtime engine, forward scheduler events
+through owned channel bridges, optionally forward persisted findings
+through the local commit sink surface, and convert scheduler counters
+into the local `ScanReport`. When persistence is enabled, the runtime
+derives each filesystem `StableItemId` from the filesystem connector tag,
+a connector-instance hash of the canonicalized scan root, and the
+normalized root-relative path (the locator in `ItemIdentityKey`). The
+commit forwarder (`forward_commits`) uses a `DiscoveryOrderBuffer` to
+reorder finding batches from executor processing order (LIFO-reversed)
+back into file-path-sorted discovery order before calling `begin_item`.
+This ensures checkpoint sequence numbers are monotonically consistent
+with `ItemKey` ordering, preventing `BoundaryRegression` errors in the
+prefix checkpoint aggregator for ordered-content shards with multiple
+files.
+
+Connector-mode filesystem scans acquire one ordered page through
+`OrderedContentRuntime::execute_source` from the real
+`FilesystemConnector`, validate shard bounds and cursor monotonicity,
+classify enumerate failures from the connector error taxonomy, and
+summarize the validated page into a `ScanReport`. Item reads, rule
+execution, and durability are handled by the direct scan path.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
@@ -570,11 +583,21 @@ pub struct WorkerIdentity {
 
 ```rust
 pub struct ShardLease {
+    /// String shard label used for routing recorder events.
     shard_id: Arc<str>,
+    /// Authoritative coordination-layer lease used for terminal completion.
     lease: Lease,
-    range_start: Vec<u8>,
+    /// Authoritative shard bounds and metadata restored from acquire/restore state.
+    shard_spec: ShardSpec,
+    /// Authoritative resume cursor restored from acquire/restore state.
+    resume_cursor: Cursor,
+    /// Coordination cursor semantics for this shard.
+    cursor_semantics: CursorSemantics,
+    /// Filesystem scan configuration for this shard.
     scan_config: FsScanConfig,
+    /// Shared routing and fencing metadata for all writes emitted under the lease.
     write_context: WriteContext,
+    /// Tenant secret key used for secret-hash derivation.
     tenant_secret_key: TenantSecretKey,
 }
 ```
@@ -613,9 +636,9 @@ completion helpers.
 `ShardLease` is the hand-off object from `gossip-coordination` into the worker
 loop. It keeps the string shard label used for recorder routing separate from
 the numeric shard identity carried inside `Lease` and `WriteContext`, stores
-the shard's key-range start for completion fallback, and carries the
-filesystem scan config derived from the claimed shard spec plus connector
-metadata.
+the authoritative shard bounds and resume state (`shard_spec`,
+`resume_cursor`, `cursor_semantics`), and carries the filesystem scan config
+derived from the claimed shard spec plus connector metadata.
 
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones
