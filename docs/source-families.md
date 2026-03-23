@@ -47,6 +47,12 @@ matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
 `InMemoryDeterministicConnector` expose the same read/split surface as
 inherent methods in `gossip-connectors/src/`.
 
+Distributed filesystem submission uses `gossip-orchestrator` as the
+control-plane seam ahead of runtime execution. `request.rs` canonicalizes raw
+filesystem submissions into `NormalizedFilesystemRequest`, and `planner.rs`
+maps those normalized requests into the deterministic one-shard startup
+geometry consumed by later payload and registration stages.
+
 ### Git Repo-Native
 
 Whole-repository operations: commit walks, tree diffs, pack scans. Git
@@ -110,6 +116,9 @@ and `types.rs`.
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
+| `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem request normalization and planning |
+| `crates/gossip-orchestrator/src/request.rs` | Canonical filesystem submission request normalization |
+| `crates/gossip-orchestrator/src/planner.rs` | Deterministic filesystem initial shard geometry planner |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
