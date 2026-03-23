@@ -205,6 +205,11 @@ impl FilesystemRequest {
                 actual: actual_kind,
             });
         }
+        if self.mode == FilesystemSourceMode::SingleFile && canonical_root.file_name().is_none() {
+            return Err(FilesystemRequestError::SingleFileMissingName {
+                path: canonical_root,
+            });
+        }
         Ok(NormalizedFilesystemRequest {
             mode: self.mode,
             canonical_root,
