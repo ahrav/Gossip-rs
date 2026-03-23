@@ -1,10 +1,13 @@
 use gossip_contracts::connector::{
-    self, KeyedPageItem, ObservedScanItem, OrderedContentConformanceError, OrderedContentDrain,
-    PageBuf, PageShapeError, PageState, PagingCapabilities, ReadError, ScanItem,
-    drain_ordered_source,
+    self, KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, ReadError,
+    ScanItem,
+    conformance::{
+        ObservedScanItem, OrderedContentConformanceError, OrderedContentDrain,
+        drain_ordered_source, drain_ordered_source_from, run_ordered_content_conformance,
+    },
     git::GitRepoTarget,
     ordered::{OrderedContentCapabilities, OrderedContentSource},
-    run_ordered_content_conformance, validate_filled_page,
+    validate_filled_page,
 };
 use gossip_contracts::coordination::ShardSpec;
 
@@ -38,6 +41,7 @@ fn family_contracts_are_available_from_namespaced_modules() {
     let _: Option<OrderedContentConformanceError> = None;
 
     let _drain = drain_ordered_source::<UnusedSource>;
+    let _drain_from = drain_ordered_source_from::<UnusedSource>;
     let _run = run_ordered_content_conformance::<fn() -> UnusedSource, UnusedSource>;
 }
 

@@ -10,7 +10,8 @@ use std::{
 use gossip_contracts::{
     connector::{
         Budgets, Cursor, FILESYSTEM_CONNECTOR_TAG, ItemRef, PageBuf, PageState, ScanItem,
-        TokenBytes, VersionId, ordered::OrderedContentSource, run_ordered_content_conformance,
+        TokenBytes, VersionId, conformance::run_ordered_content_conformance,
+        ordered::OrderedContentSource,
     },
     identity::{ConnectorInstanceIdHash, ItemIdentityKey, ObjectVersionId},
 };
@@ -67,7 +68,7 @@ fn expected_stable_item_id(
     ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, rel_path).stable_id()
 }
 
-fn drain_keys(run: &gossip_contracts::connector::OrderedContentDrain) -> Vec<Vec<u8>> {
+fn drain_keys(run: &gossip_contracts::connector::conformance::OrderedContentDrain) -> Vec<Vec<u8>> {
     run.items()
         .iter()
         .map(|item| item.item_key().as_bytes().to_vec())
