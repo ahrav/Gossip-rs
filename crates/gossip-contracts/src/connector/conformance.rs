@@ -891,11 +891,12 @@ mod tests {
             let mut end = start;
             for item in &self.items[start..self.items.len().min(start + item_limit)] {
                 let item_bytes = item.size_hint().unwrap_or(0);
-                if end > start && cumulative_bytes + item_bytes > budgets.max_bytes() {
+                let next_total = cumulative_bytes.saturating_add(item_bytes);
+                if end > start && next_total > budgets.max_bytes() {
                     break;
                 }
                 // Always include at least the first item to guarantee progress.
-                cumulative_bytes += item_bytes;
+                cumulative_bytes = next_total;
                 end += 1;
             }
 

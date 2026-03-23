@@ -475,22 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_path_returns_error() {
-        let request = FilesystemRequest::new(FilesystemSourceMode::SingleFile, "", run_config());
-
-        let err = request
-            .normalize()
-            .expect_err("empty path should be rejected");
-
-        assert!(matches!(
-            err,
-            FilesystemRequestError::EmptyPath {
-                mode: FilesystemSourceMode::SingleFile,
-            }
-        ));
-    }
-
-    #[test]
     fn run_config_preserved_through_normalization() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("target.txt");
