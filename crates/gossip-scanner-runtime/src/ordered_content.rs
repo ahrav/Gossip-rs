@@ -701,7 +701,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("omitted the authoritative last_key"),
+                .contains("HasMore cursor is missing a last_key"),
             "unexpected error: {err}"
         );
     }
