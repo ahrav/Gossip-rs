@@ -360,8 +360,8 @@ impl Error for OrderedContentConformanceError {
 ///    and exhausted-empty behavior after a terminal page.
 /// 2. Repeat the drain on a fresh source and require an identical item
 ///    sequence and identical page partitioning.
-/// 3. Verify that emitted item refs do not contain any caller-supplied
-///    forbidden byte fragments (skipped when `forbidden_item_ref_fragments`
+/// 3. Verify that emitted `ItemRef` and `ItemKey` bytes do not contain any
+///    caller-supplied forbidden fragments (skipped when `forbidden_fragments`
 ///    is empty).
 /// 4. Force a multi-page probe and require that a corrupt opaque token with
 ///    the same `last_key` resumes to the same suffix as a key-only cursor.
@@ -541,6 +541,19 @@ where
     let Some(resume_key) = cursor.last_key().cloned() else {
         return Err(OrderedContentConformanceError::HasMoreWithoutLastKey { page_index: 0 });
     };
+
+    let expected_last = first_page
+        .items()
+        .last()
+        .expect("validated page must be non-empty")
+        .item_key();
+    if resume_key != *expected_last {
+        return Err(OrderedContentConformanceError::ResumeCursorMismatch {
+            page_index: 0,
+            expected_last: expected_last.clone(),
+            actual_last: resume_key,
+        });
+    }
 
     let mut clean_source = factory();
     let clean = drain_from_cursor(

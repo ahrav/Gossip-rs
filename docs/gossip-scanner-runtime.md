@@ -18,9 +18,9 @@
 
 The crate no longer depends on a separate scan-driver abstraction. Its
 public surface stays stable for callers while execution mode selects the
-family boundary: direct mode keeps the existing local scan pipeline,
+family boundary: direct mode runs the local scan pipeline,
 filesystem connector mode performs ordered page acquisition and validation,
-and Git connector mode still reuses the direct path.
+and Git connector mode uses the direct path.
 
 ---
 
@@ -59,19 +59,19 @@ The crate exposes two public scan entrypoints:
 - `scan_fs(&FsScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 - `scan_git(&GitScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 
-Each entrypoint dispatches on `ExecutionMode`. `Direct` keeps the
-existing local scan implementation. `Connector` selects the family
+Each entrypoint dispatches on `ExecutionMode`. `Direct` runs the
+local scan implementation. `Connector` selects the family
 boundary instead: filesystem scans execute one ordered connector page
-acquisition/validation step, while Git scans still reuse the direct
-path. The execution-mode flag keeps the public runtime API stable while
-those family boundaries are wired in incrementally.
+acquisition/validation step, while Git scans use the direct
+path.
 
 ### Validation-first execution
 
 The runtime performs setup work in a fixed order:
 
 1. Validate the requested path.
-2. Validate runtime budgets (distributed path only; local paths skip budget validation).
+2. Validate runtime budgets (distributed path and connector-mode local path
+   via `Budgets`; direct local scans skip budget validation).
 3. Normalize source-specific inputs.
 4. Call the source family boundary.
 
@@ -98,11 +98,11 @@ with `ItemKey` ordering, preventing `BoundaryRegression` errors in the
 prefix checkpoint aggregator for ordered-content shards with multiple
 files.
 
-Connector-mode filesystem scans do not run item reads or rule execution
-yet. They acquire one ordered page from the real `FilesystemConnector`,
-validate shard bounds and cursor monotonicity, classify enumerate
-failures from the connector error taxonomy, and summarize the validated
-page into a `ScanReport`.
+Connector-mode filesystem scans acquire one ordered page from the real
+`FilesystemConnector`, validate shard bounds and cursor monotonicity,
+classify enumerate failures from the connector error taxonomy, and
+summarize the validated page into a `ScanReport`. Item reads, rule
+execution, and durability are handled by the direct scan path.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the

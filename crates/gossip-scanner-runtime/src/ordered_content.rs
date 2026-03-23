@@ -709,4 +709,42 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[test]
+    fn execute_source_returns_page_for_complete_state() {
+        let page = PageBuf::try_new(
+            vec![item(b"a.txt", 3), item(b"b.txt", 5)],
+            PageState::Complete,
+        )
+        .expect("page");
+        let mut source = ScriptedSource::returning(Ok(Some(page)));
+
+        let outcome = OrderedContentRuntime::execute_source(
+            &mut source,
+            &runtime_input(
+                ShardSpec::unbounded(),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+        )
+        .expect("complete page");
+
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome");
+        };
+        assert_eq!(page.report().items_scanned, 2);
+        assert_eq!(page.report().bytes_scanned, 8);
+        assert_eq!(
+            page.resume_cursor()
+                .last_key()
+                .expect("last key")
+                .as_bytes(),
+            b"b.txt",
+            "Complete pages derive resume cursor from the last emitted key"
+        );
+        assert!(
+            page.resume_cursor().token().is_none(),
+            "Complete pages carry no opaque token"
+        );
+    }
 }

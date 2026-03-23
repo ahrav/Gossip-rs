@@ -29,10 +29,10 @@
 //!
 //! # Execution modes
 //!
-//! [`ExecutionMode::Direct`] keeps the existing scheduler-driven local scan
-//! path. [`ExecutionMode::Connector`] selects the family boundary instead:
-//! filesystem sources perform ordered page acquisition and validation through
-//! `OrderedContentRuntime`, while Git sources still reuse the direct path.
+//! [`ExecutionMode::Direct`] dispatches scans via the scheduler-driven local
+//! scan path. [`ExecutionMode::Connector`] selects the family boundary
+//! instead: filesystem sources perform ordered page acquisition and validation
+//! through `OrderedContentRuntime`, while Git sources use the direct path.
 //!
 //! # Durability model
 //!
@@ -114,10 +114,10 @@ pub mod result_translation;
 
 /// How the runtime acquires source items.
 ///
-/// `Direct` keeps the existing local scan implementation. `Connector`
+/// `Direct` dispatches via the local scan implementation. `Connector`
 /// selects the source-family boundary: filesystem scans run one ordered
 /// connector page acquisition/validation step, while Git connector mode
-/// still reuses the direct path.
+/// uses the direct path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// Scan source items directly from local state.
@@ -732,7 +732,7 @@ pub struct AssignmentOutcome {
 /// Top-level filesystem scan dispatcher.
 ///
 /// Routes to `scan_fs_direct` or `scan_fs_connector` based on
-/// [`FsScanConfig::execution_mode`]. Direct mode runs the existing local scan;
+/// [`FsScanConfig::execution_mode`]. Direct mode runs the local scan;
 /// connector mode exercises the ordered-content page-fill boundary.
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
