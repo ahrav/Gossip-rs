@@ -68,7 +68,7 @@ pub use gossip_contracts::connector::git::GitDebugLevel;
 use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
 use gossip_contracts::{
     connector::{Budgets, ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG},
-    coordination::{CursorSemantics, ShardSpec},
+    coordination::{CursorSemantics, RestoredShardState, ShardSpec},
 };
 use scanner_engine::TransformId;
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformMode, Tuning};
@@ -764,7 +764,7 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
     scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
-/// Connector-mode filesystem scan.
+/// Connector-mode filesystem scan (single-page validation boundary).
 ///
 /// Validates the target path, constructs a [`FilesystemConnector`], and
 /// executes one ordered page acquisition through
@@ -773,12 +773,12 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
-    let runtime_input = ordered_content::OrderedContentRuntimeInput::new(
+    let state = RestoredShardState::new(
         ShardSpec::unbounded(),
         Cursor::initial(),
         CursorSemantics::Completed,
-        budgets,
     );
+    let runtime_input = ordered_content::OrderedContentRuntimeInput::new(state, budgets);
     let mut source = FilesystemConnector::new(canonical_path);
 
     match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
@@ -1893,15 +1893,26 @@ pub(crate) fn join_scoped<T>(
 /// Returns the canonicalized path on success. Rejects paths that do not exist
 /// or are neither a regular file nor a directory (e.g. symlinks to special
 /// files, device nodes).
+///
+/// `fs::metadata` runs first to check existence and classify the path kind.
+/// `NotFound` maps to `InvalidPath` (bad user input); other I/O failures
+/// (e.g. `PermissionDenied`) map to `Io` to preserve the underlying error
+/// chain. `fs::canonicalize` follows only when the kind is acceptable,
+/// avoiding a redundant second stat on the already-resolved path.
 fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
-    if !path.exists() {
-        return Err(ScanRuntimeError::InvalidPath {
+    let meta = fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ScanRuntimeError::InvalidPath {
             source: "filesystem",
             path: path.to_path_buf(),
             message: "path does not exist".to_owned(),
-        });
-    }
-    if !path.is_file() && !path.is_dir() {
+        },
+        _ => ScanRuntimeError::Io {
+            op: "metadata",
+            path: Some(path.to_path_buf()),
+            error,
+        },
+    })?;
+    if !meta.is_file() && !meta.is_dir() {
         return Err(ScanRuntimeError::InvalidPath {
             source: "filesystem",
             path: path.to_path_buf(),

@@ -4,7 +4,8 @@
 //! also need confidence that page sequences advance monotonically, resume from
 //! `last_key` even when tokens are stale or corrupt, terminate cleanly with an
 //! exhausted-empty `None` call, and do not leak connector-root fragments into
-//! emitted [`ItemRef`] or [`ItemKey`] values.
+//! emitted [`ItemRef`], [`ItemKey`], [`Location::display`], or [`Location::url`]
+//! values.
 //!
 //! This module provides a reusable test kit for that purpose. It assumes the
 //! factory passed to [`run_ordered_content_conformance`] produces fresh sources
@@ -14,7 +15,7 @@ use std::{error::Error, fmt};
 
 use crate::{
     connector::{
-        Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef,
+        Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef, Location,
         PageSequenceViolation, PageShapeError, PageState, ScanItem, TokenBytes, ToxicDigest,
         VersionId, ordered::OrderedContentSource, validate_page_sequence,
     },
@@ -34,9 +35,8 @@ const CORRUPT_TOKEN_BYTES: &[u8] = b"ordered-content-conformance-corrupt-token";
 
 /// Stable snapshot of one emitted [`ScanItem`] for conformance comparisons.
 ///
-/// Omits `content_hints` and `location` from [`ScanItem`], which are
-/// presentation-only metadata irrelevant to ordered-content conformance
-/// checks.
+/// Omits `content_hints` from [`ScanItem`], which is presentation-only
+/// metadata irrelevant to ordered-content conformance checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedScanItem {
     item_key: ItemKey,
@@ -44,6 +44,7 @@ pub struct ObservedScanItem {
     stable_item_id: StableItemId,
     version: VersionId,
     size_hint: Option<u64>,
+    location: Option<Location>,
 }
 
 impl ObservedScanItem {
@@ -76,6 +77,12 @@ impl ObservedScanItem {
     pub fn size_hint(&self) -> Option<u64> {
         self.size_hint
     }
+
+    /// Returns the optional display-safe location metadata.
+    #[must_use]
+    pub fn location(&self) -> Option<&Location> {
+        self.location.as_ref()
+    }
 }
 
 impl From<&ScanItem> for ObservedScanItem {
@@ -86,6 +93,7 @@ impl From<&ScanItem> for ObservedScanItem {
             stable_item_id: item.stable_item_id(),
             version: item.version(),
             size_hint: item.size_hint(),
+            location: item.location().cloned(),
         }
     }
 }
@@ -333,9 +341,10 @@ impl Error for OrderedContentConformanceError {
 /// multi-page sequences so the harness exercises cursor advancement.
 ///
 /// `forbidden_fragments` lists byte substrings that must not appear anywhere
-/// inside any emitted `ItemRef` or `ItemKey`. Use this to detect root-path or
-/// secret leakage (e.g., pass the filesystem root directory name). Empty
-/// fragments are silently ignored.
+/// inside any emitted `ItemRef`, `ItemKey`, `Location::display`, or
+/// `Location::url`. Use this to detect root-path or secret leakage (e.g.,
+/// pass the filesystem root directory name). Empty fragments are silently
+/// ignored.
 ///
 /// The suite performs four checks:
 ///
@@ -343,9 +352,9 @@ impl Error for OrderedContentConformanceError {
 ///    and exhausted-empty behavior after a terminal page.
 /// 2. Repeat the drain on a fresh source and require an identical item
 ///    sequence and identical page partitioning.
-/// 3. Verify that no emitted `ItemRef` or `ItemKey` contains any
-///    caller-supplied forbidden byte fragments (skipped when
-///    `forbidden_fragments` is empty).
+/// 3. Verify that no emitted item field (`ItemRef`, `ItemKey`,
+///    `Location::display`, `Location::url`) contains any caller-supplied
+///    forbidden byte fragment (skipped when `forbidden_fragments` is empty).
 /// 4. Force a multi-page probe and require that a corrupt opaque token with
 ///    the same `last_key` resumes to the same suffix as a key-only cursor.
 ///
@@ -564,31 +573,46 @@ where
 }
 
 /// Require that no emitted item contains any forbidden byte fragment in
-/// either its `ItemRef` or `ItemKey`. Empty fragments are ignored.
+/// its `ItemRef`, `ItemKey`, or `Location` fields. Empty fragments are ignored.
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::ForbiddenFragment`] when any
+/// non-empty fragment appears as a substring in an emitted `ItemRef`,
+/// `ItemKey`, `Location::display`, or `Location::url`.
 pub fn assert_no_forbidden_fragments(
     drain: &OrderedContentDrain,
     forbidden_fragments: &[&[u8]],
 ) -> Result<(), OrderedContentConformanceError> {
     for (item_index, item) in drain.items().iter().enumerate() {
-        for &(field_name, field_bytes) in &[
-            ("item_ref", item.item_ref().as_bytes()),
-            ("item_key", item.item_key().as_bytes()),
-        ] {
-            for fragment in forbidden_fragments.iter().copied() {
-                if fragment.is_empty() {
-                    continue;
+        let check_field =
+            |bytes: &[u8], field: &'static str| -> Result<(), OrderedContentConformanceError> {
+                for fragment in forbidden_fragments.iter().copied() {
+                    if fragment.is_empty() {
+                        continue;
+                    }
+                    if bytes
+                        .windows(fragment.len())
+                        .any(|window| window == fragment)
+                    {
+                        return Err(OrderedContentConformanceError::ForbiddenFragment {
+                            item_index,
+                            field,
+                            fragment: ToxicDigest::of_bytes(fragment),
+                            content: ToxicDigest::of_bytes(bytes),
+                        });
+                    }
                 }
-                if field_bytes
-                    .windows(fragment.len())
-                    .any(|window| window == fragment)
-                {
-                    return Err(OrderedContentConformanceError::ForbiddenFragment {
-                        item_index,
-                        field: field_name,
-                        fragment: ToxicDigest::of_bytes(fragment),
-                        content: ToxicDigest::of_bytes(field_bytes),
-                    });
-                }
+                Ok(())
+            };
+
+        check_field(item.item_ref().as_bytes(), "item_ref")?;
+        check_field(item.item_key().as_bytes(), "item_key")?;
+
+        if let Some(location) = item.location() {
+            check_field(location.display().as_bytes(), "location_display")?;
+            if let Some(url) = location.url() {
+                check_field(url.as_bytes(), "location_url")?;
             }
         }
     }
@@ -862,8 +886,20 @@ mod tests {
                 return Ok(None);
             }
 
-            let page_len = self.page_len.min(budgets.max_items());
-            let end = (start + page_len).min(self.items.len());
+            let item_limit = self.page_len.min(budgets.max_items());
+            let mut cumulative_bytes: u64 = 0;
+            let mut end = start;
+            for item in &self.items[start..self.items.len().min(start + item_limit)] {
+                let item_bytes = item.size_hint().unwrap_or(0);
+                let next_total = cumulative_bytes.saturating_add(item_bytes);
+                if end > start && next_total > budgets.max_bytes() {
+                    break;
+                }
+                // Always include at least the first item to guarantee progress.
+                cumulative_bytes = next_total;
+                end += 1;
+            }
+
             let page_items = self.items[start..end].to_vec();
             let is_last = end == self.items.len();
             Ok(Some(build_test_page(
@@ -1383,64 +1419,6 @@ mod tests {
         assert_eq!(drain.items()[0].item_key().as_bytes(), b"only");
     }
 
-    /// Source that respects both `max_items` and `max_bytes` from budgets.
-    ///
-    /// Tracks cumulative `size_hint` per page and stops adding items when the
-    /// next item would exceed the byte budget. Items without a size hint
-    /// contribute 0 bytes toward the budget.
-    #[derive(Clone)]
-    struct ByteBudgetAwareSource {
-        items: Vec<ScanItem>,
-        page_len: usize,
-    }
-
-    impl OrderedContentSource for ByteBudgetAwareSource {
-        fn capabilities(&self) -> OrderedContentCapabilities {
-            OrderedContentCapabilities::default()
-        }
-
-        fn fill_page(
-            &mut self,
-            _shard: &ShardSpec,
-            cursor: &Cursor,
-            budgets: Budgets,
-        ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
-            let start = resolve_cursor_start(&self.items, cursor);
-            if start >= self.items.len() {
-                return Ok(None);
-            }
-
-            let item_limit = self.page_len.min(budgets.max_items());
-            let mut cumulative_bytes: u64 = 0;
-            let mut end = start;
-            for item in &self.items[start..self.items.len().min(start + item_limit)] {
-                let item_bytes = item.size_hint().unwrap_or(0);
-                if end > start && cumulative_bytes + item_bytes > budgets.max_bytes() {
-                    break;
-                }
-                // Always include at least the first item to guarantee progress.
-                cumulative_bytes += item_bytes;
-                end += 1;
-            }
-
-            let page_items = self.items[start..end].to_vec();
-            let is_last = end == self.items.len();
-            Ok(Some(build_test_page(
-                page_items,
-                is_last,
-                "byte-budget-aware source emits valid pages",
-            )))
-        }
-
-        fn open(
-            &mut self,
-            _item_ref: &ItemRef,
-            _budgets: Budgets,
-        ) -> Result<Box<dyn io::Read + Send>, ReadError> {
-            Err(ReadError::unsupported("unused in conformance tests"))
-        }
-    }
-
     #[test]
     fn drain_handles_byte_budget_driven_page_splitting() {
         // Items a(2B), b(3B), c(4B), d(5B) with max_bytes=5 forces pages:
@@ -1453,7 +1431,7 @@ mod tests {
             scan_item(b"c", 3), // size_hint = 4
             scan_item(b"d", 4), // size_hint = 5
         ];
-        let mut source = ByteBudgetAwareSource { items, page_len: 8 };
+        let mut source = CursorAwareSource { items, page_len: 8 };
 
         let drain = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 8, 5)
             .expect("byte-budget-driven page splitting should produce a valid drain");
@@ -1480,7 +1458,7 @@ mod tests {
         // Verify the full conformance suite (determinism + token fallback)
         // works with a byte-budget-aware source under tight byte limits.
         let drain = run_ordered_content_conformance(
-            || ByteBudgetAwareSource {
+            || CursorAwareSource {
                 items: vec![
                     scan_item(b"a", 1), // 2B
                     scan_item(b"b", 2), // 3B
@@ -1527,6 +1505,70 @@ mod tests {
                 expected_key: None,
                 actual_key: None,
             })
+        ));
+    }
+
+    #[test]
+    fn forbidden_fragment_rejects_location_url_containing_fragment() {
+        // Item with clean key and ref but a location URL containing the
+        // forbidden fragment must be caught.
+        let key = ItemKey::try_from_slice(b"clean-key").expect("valid key");
+        let item_ref = ItemRef::try_from_slice(b"clean-ref").expect("valid item_ref");
+        let location = Location::try_new(
+            "safe display".to_string(),
+            Some("/data/secret/bucket".to_string()),
+        )
+        .expect("valid location");
+        let item = ScanItem::new(
+            key,
+            item_ref,
+            StableItemId::from_bytes([42; 32]),
+            VersionId::Weak(ObjectVersionId::from_bytes([43; 32])),
+        )
+        .with_location(location);
+        let drain = OrderedContentDrain::new(vec![ObservedScanItem::from(&item)], vec![1]);
+
+        let err = assert_no_forbidden_fragments(&drain, &[b"secret".as_slice()])
+            .expect_err("forbidden fragment in location_url must be rejected");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::ForbiddenFragment {
+                item_index: 0,
+                field: "location_url",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn forbidden_fragment_rejects_location_display_containing_fragment() {
+        // Item with clean key, ref, and URL but a location display string
+        // containing the forbidden fragment must be caught.
+        let key = ItemKey::try_from_slice(b"clean-key").expect("valid key");
+        let item_ref = ItemRef::try_from_slice(b"clean-ref").expect("valid item_ref");
+        let location = Location::try_new(
+            "/mnt/secret/share".to_string(),
+            Some("https://safe.example.com/bucket".to_string()),
+        )
+        .expect("valid location");
+        let item = ScanItem::new(
+            key,
+            item_ref,
+            StableItemId::from_bytes([44; 32]),
+            VersionId::Weak(ObjectVersionId::from_bytes([45; 32])),
+        )
+        .with_location(location);
+        let drain = OrderedContentDrain::new(vec![ObservedScanItem::from(&item)], vec![1]);
+
+        let err = assert_no_forbidden_fragments(&drain, &[b"secret".as_slice()])
+            .expect_err("forbidden fragment in location_display must be rejected");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::ForbiddenFragment {
+                item_index: 0,
+                field: "location_display",
+                ..
+            }
         ));
     }
 }

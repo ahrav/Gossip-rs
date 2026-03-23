@@ -78,8 +78,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_contracts::{
-    connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
-    coordination::ShardSpec,
+    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    coordination::{RestoredShardState, ShardSpec},
     identity::{
         CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
         RuleFingerprint, RunId, ShardKey, TenantId, TenantSecretKey, WorkerId, domain_hasher,
@@ -168,11 +168,8 @@ impl WorkerIdentity {
 ///
 /// - **`shard_id`** — string label for telemetry routing.
 /// - **`lease`** — authoritative coordination lease used for terminal completion.
-/// - **`shard_spec`** — authoritative shard bounds and metadata restored from
-///   acquire/restore state.
-/// - **`resume_cursor`** — authoritative ordered-content resume cursor restored
-///   from acquire/restore state.
-/// - **`cursor_semantics`** — coordination cursor mode for the shard.
+/// - **`state`** — shard bounds, resume cursor, and cursor semantics restored
+///   from the acquire/restore coordination payload.
 /// - **`scan_config`** — filesystem scan configuration for this shard, derived
 ///   from the worker template with optional shard-level path overrides.
 /// - **`write_context`** — numeric shard identity plus fencing epoch for all
@@ -188,12 +185,9 @@ pub struct ShardLease {
     shard_id: Arc<str>,
     /// Authoritative coordination-layer lease used for terminal completion.
     lease: Lease,
-    /// Authoritative shard bounds and metadata restored from acquire/restore state.
-    shard_spec: ShardSpec,
-    /// Authoritative resume cursor restored from acquire/restore state.
-    resume_cursor: Cursor,
-    /// Coordination cursor semantics for this shard.
-    cursor_semantics: CursorSemantics,
+    /// Shard bounds, resume cursor, and cursor semantics restored from
+    /// the acquire/restore coordination payload.
+    state: RestoredShardState,
     /// Filesystem scan configuration for this shard.
     scan_config: FsScanConfig,
     /// Shared routing and fencing metadata for all writes emitted under the
@@ -205,13 +199,10 @@ pub struct ShardLease {
 
 impl ShardLease {
     /// Construct one concrete filesystem shard lease.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         shard_id: Arc<str>,
         lease: Lease,
-        shard_spec: ShardSpec,
-        resume_cursor: Cursor,
-        cursor_semantics: CursorSemantics,
+        state: RestoredShardState,
         scan_config: FsScanConfig,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
@@ -219,9 +210,7 @@ impl ShardLease {
         Self {
             shard_id,
             lease,
-            shard_spec,
-            resume_cursor,
-            cursor_semantics,
+            state,
             scan_config,
             write_context,
             tenant_secret_key,
@@ -248,39 +237,46 @@ impl ShardLease {
         self.lease
     }
 
+    /// Restored coordination state for this shard.
+    #[inline]
+    #[must_use]
+    pub fn restored_state(&self) -> &RestoredShardState {
+        &self.state
+    }
+
     /// Inclusive lower bound of the shard's key range.
     #[inline]
     #[must_use]
     pub fn range_start(&self) -> &[u8] {
-        self.shard_spec.key_range_start()
+        self.state.shard_spec().key_range_start()
     }
 
     /// Exclusive upper bound of the shard's key range.
     #[inline]
     #[must_use]
     pub fn range_end(&self) -> &[u8] {
-        self.shard_spec.key_range_end()
+        self.state.shard_spec().key_range_end()
     }
 
     /// Full authoritative shard specification restored from acquire/restore.
     #[inline]
     #[must_use]
     pub fn shard_spec(&self) -> &ShardSpec {
-        &self.shard_spec
+        self.state.shard_spec()
     }
 
     /// Authoritative resume cursor restored from acquire/restore.
     #[inline]
     #[must_use]
     pub fn resume_cursor(&self) -> &Cursor {
-        &self.resume_cursor
+        self.state.resume_cursor()
     }
 
     /// Coordination cursor semantics for this shard.
     #[inline]
     #[must_use]
     pub fn cursor_semantics(&self) -> CursorSemantics {
-        self.cursor_semantics
+        self.state.cursor_semantics()
     }
 
     /// Filesystem scan configuration for this shard.
@@ -303,6 +299,15 @@ impl ShardLease {
     #[must_use]
     pub fn tenant_secret_key(&self) -> TenantSecretKey {
         self.tenant_secret_key
+    }
+
+    /// Build an ordered-content runtime input from this lease's restored state.
+    #[must_use]
+    pub fn to_runtime_input(
+        &self,
+        budgets: Budgets,
+    ) -> crate::ordered_content::OrderedContentRuntimeInput {
+        crate::ordered_content::OrderedContentRuntimeInput::new(self.state.clone(), budgets)
     }
 }
 
@@ -1051,6 +1056,7 @@ fn build_lease_from_acquire(
             acquired.lease.shard()
         )
     })?;
+    let state = RestoredShardState::new(shard_spec, resume_cursor, snapshot.cursor_semantics());
     let write_context = WriteContext::new(
         acquired.lease.tenant(),
         identity.policy_hash,
@@ -1062,9 +1068,7 @@ fn build_lease_from_acquire(
     Ok(ShardLease::new(
         Arc::from(acquired.lease.shard().to_string()),
         acquired.lease,
-        shard_spec,
-        resume_cursor,
-        snapshot.cursor_semantics(),
+        state,
         scan_config_from_spec(spec, &identity.scan_template)?,
         write_context,
         identity.tenant_secret_key,

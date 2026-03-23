@@ -19,12 +19,13 @@
 //!
 //! ```text
 //! coordination/
-//! ├── shard_spec.rs    ShardSpec, ShardSpecRef, CursorSemantics — key ranges and split validation
-//! ├── cursor.rs        CursorUpdate — two-layer progress marker
-//! ├── pooled.rs        PooledShardSpec, PooledCursor — arena-backed zero-alloc hot-path storage
-//! ├── split.rs         Split planner core (replace + residual, backend-agnostic)
-//! ├── manifest.rs      InitialShardInput, validate_manifest — shard registration validation
-//! └── limits.rs        MAX_SPLIT_CHILDREN, MAX_SPAWNED_PER_SHARD — split capacity constants
+//! ├── shard_spec.rs       ShardSpec, ShardSpecRef, CursorSemantics — key ranges and split validation
+//! ├── cursor.rs           CursorUpdate — two-layer progress marker
+//! ├── pooled.rs           PooledShardSpec, PooledCursor — arena-backed zero-alloc hot-path storage
+//! ├── restored_state.rs   RestoredShardState — grouped acquire/restore coordination payload
+//! ├── split.rs            Split planner core (replace + residual, backend-agnostic)
+//! ├── manifest.rs         InitialShardInput, validate_manifest — shard registration validation
+//! └── limits.rs           MAX_SPLIT_CHILDREN, MAX_SPAWNED_PER_SHARD — split capacity constants
 //! ```
 
 // ---- Sub-modules (alphabetical) ----
@@ -37,6 +38,7 @@ pub mod manifest;
 /// Coordination backends interact with pooled types through
 /// `gossip_coordination::ShardRecord` and `gossip_coordination::AcquireScratch`.
 pub mod pooled;
+pub mod restored_state;
 pub mod shard_spec;
 pub mod split;
 
@@ -57,6 +59,9 @@ pub use manifest::{
 
 // -- Arena-pooled storage --
 pub use pooled::{PooledCursor, PooledShardSpec, PooledSpawned, PooledSpawnedIter};
+
+// -- Restored coordination state --
+pub use restored_state::RestoredShardState;
 
 // -- Key ranges and split validation --
 pub use shard_spec::{
