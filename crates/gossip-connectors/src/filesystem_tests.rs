@@ -525,9 +525,9 @@ fn max_items_exactly_matching_file_count_yields_complete_page() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
 
-    // max_items == file count: the peek after collection should see None and
-    // report Complete. Before the peek-error fix this path propagated errors
-    // from the peek via `?`, discarding valid items.
+    // max_items == file count: the peek after collection sees None and reports
+    // Complete. The peek error is intentionally swallowed (ok().is_some_and)
+    // rather than propagated via ?, which would discard already-collected items.
     let page = fill_page_with_limits(
         &mut connector,
         &unbounded_shard(),
