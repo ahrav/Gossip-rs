@@ -93,8 +93,8 @@ impl FilesystemInitialShardPlan {
 
     /// Slice view of the planned startup geometries.
     ///
-    /// Currently returns a single-element slice. The slice surface
-    /// keeps later lowering code uniform without introducing startup fan-out.
+    /// Returns a single-element slice. The slice surface keeps lowering
+    /// code uniform without introducing startup fan-out.
     #[must_use]
     pub fn shard_geometries(&self) -> &[InitialShardGeometry] {
         std::slice::from_ref(&self.initial_shard)
@@ -103,9 +103,8 @@ impl FilesystemInitialShardPlan {
 
 /// Plan deterministic initial shard geometry for one normalized filesystem request.
 ///
-/// The current startup policy is intentionally simple:
-/// `single_file` and `directory_root` requests both start with one full-range
-/// shard, while the normalized request retains the source-mode distinction for
+/// Both `single_file` and `directory_root` requests start with one full-range
+/// shard. The normalized request retains the source-mode distinction for
 /// later payload and runtime hydration work.
 #[must_use]
 pub fn plan_filesystem_initial_shards(

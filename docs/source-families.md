@@ -52,7 +52,10 @@ inherent methods in `gossip-connectors/src/`.
 `gossip-orchestrator` stages filesystem submissions before runtime execution:
 - `request.rs` canonicalizes raw paths, validates them against the requested
   source mode (single file vs. directory root), and enforces path/mode
-  consistency. Produces `NormalizedFilesystemRequest`.
+  consistency. For untrusted input, `normalize_within(allowed_root)` also
+  verifies that the canonical path resides within a server-configured root
+  directory, rejecting symlink escapes and traversal attempts. Produces
+  `NormalizedFilesystemRequest`.
 - `planner.rs` maps normalized requests into the deterministic one-shard
   startup geometry consumed by later payload and registration stages.
 
