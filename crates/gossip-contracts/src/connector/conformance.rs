@@ -4,7 +4,8 @@
 //! also need confidence that page sequences advance monotonically, resume from
 //! `last_key` even when tokens are stale or corrupt, terminate cleanly with an
 //! exhausted-empty `None` call, and do not leak connector-root fragments into
-//! emitted [`ItemRef`] or [`ItemKey`] values.
+//! emitted [`ItemRef`], [`ItemKey`], [`Location::display`], or [`Location::url`]
+//! values.
 //!
 //! This module provides a reusable test kit for that purpose. It assumes the
 //! factory passed to [`run_ordered_content_conformance`] produces fresh sources
@@ -916,11 +917,12 @@ mod tests {
             let mut end = start;
             for item in &self.items[start..self.items.len().min(start + item_limit)] {
                 let item_bytes = item.size_hint().unwrap_or(0);
-                if end > start && cumulative_bytes + item_bytes > budgets.max_bytes() {
+                let next_total = cumulative_bytes.saturating_add(item_bytes);
+                if end > start && next_total > budgets.max_bytes() {
                     break;
                 }
                 // Always include at least the first item to guarantee progress.
-                cumulative_bytes += item_bytes;
+                cumulative_bytes = next_total;
                 end += 1;
             }
 

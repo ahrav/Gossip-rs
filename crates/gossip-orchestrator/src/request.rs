@@ -205,14 +205,6 @@ impl FilesystemRequest {
                 actual: actual_kind,
             });
         }
-        if matches!(self.mode, FilesystemSourceMode::SingleFile)
-            && canonical_root.file_name().is_none()
-        {
-            return Err(FilesystemRequestError::SingleFileMissingName {
-                path: canonical_root,
-            });
-        }
-
         Ok(NormalizedFilesystemRequest {
             mode: self.mode,
             canonical_root,
@@ -633,10 +625,9 @@ mod tests {
 
     #[test]
     fn nonexistent_path_rejected() {
-        let request = FilesystemRequest::single_file(
-            PathBuf::from("/nonexistent/path/that/does/not/exist.txt"),
-            run_config(),
-        );
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.txt");
+        let request = FilesystemRequest::single_file(missing, run_config());
         let err = request
             .normalize()
             .expect_err("nonexistent path must be rejected");

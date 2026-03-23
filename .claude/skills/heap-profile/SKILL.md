@@ -110,7 +110,7 @@ utilization, tracking custom events at known hot-path boundaries.
 
 Use when you know allocations exist but not where.
 
-```
+```text
 1. Identify target (AllocGuard trip, bench regression, /performance-analyzer finding)
       |
 2. Create integration test file with dhat::Alloc (heap mode, see template below)
@@ -136,7 +136,7 @@ Use when you know allocations exist but not where.
 
 Use when you need to prove a HOT-tier path is allocation-free.
 
-```
+```text
 1. Create testing-mode integration test with HeapStats assertions
       |
 2. Build and run:
@@ -151,11 +151,11 @@ Use when you need to prove a HOT-tier path is allocation-free.
 
 ### Regression Gating Workflow (CI)
 
-```
+```text
 1. Add testing-mode test with HeapStats budget assertions (see template)
       |
 2. CI command:
-      cargo test -p <crate> --features dhat-heap \
+      cargo test -p <crate> --profile dhat --features dhat-heap \
           --test <test_file_name> -- --test-threads=1
       |
 3. Change introduces allocations -> dhat::assert! fails -> investigate
@@ -419,7 +419,7 @@ cargo run --release
 
 ### Escalation Path
 
-```
+```text
 /performance-analyzer  -->  "allocations in hot loop"
         |
 /heap-profile          -->  "call site X allocated Y bytes"

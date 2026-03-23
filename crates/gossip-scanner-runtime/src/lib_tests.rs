@@ -411,12 +411,12 @@ fn scan_fs_direct_rejects_nonexistent_path() {
     assert!(
         matches!(
             error,
-            ScanRuntimeError::Io {
-                op: "canonicalize",
+            ScanRuntimeError::InvalidPath {
+                source: "filesystem",
                 ..
             }
         ),
-        "nonexistent path surfaces as an Io error from canonicalize: {error}"
+        "nonexistent path surfaces as an InvalidPath error: {error}"
     );
 }
 

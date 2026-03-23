@@ -39,24 +39,24 @@
 //! [`ShardLease`](crate::distributed::ShardLease).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use gossip_contracts::{
     connector::{
-        Budgets, Cursor, EnumerateError, ErrorClass, PageBuf, PageState, ScanItem,
-        ordered::OrderedContentSource, validate_page_sequence,
+        ordered::OrderedContentSource, validate_page_sequence, Budgets, Cursor, EnumerateError,
+        ErrorClass, PageBuf, PageState, ScanItem,
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
 };
 use scanner_scheduler::events::EventOutput;
-use scanner_scheduler::scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
+use scanner_scheduler::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
 
 use crate::{
-    AssignmentOutcome, COMMIT_CHANNEL_CAP, CancellationToken, ChannelEventOutput,
-    ChannelStoreProducer, EVENT_CHANNEL_CAP, FsScanConfig, ScanReport, ScanRuntimeError,
-    build_runtime_engine, forward_commits, forward_core_events, join_scoped,
+    build_runtime_engine, forward_commits, forward_core_events, join_scoped, AssignmentOutcome,
+    CancellationToken, ChannelEventOutput, ChannelStoreProducer, FsScanConfig, ScanReport,
+    ScanRuntimeError, COMMIT_CHANNEL_CAP, EVENT_CHANNEL_CAP,
 };
 
 /// Inputs required to acquire and validate one ordered connector page.
@@ -714,7 +714,8 @@ mod tests {
         .expect_err("HasMore without last_key must fail");
 
         assert!(
-            err.to_string().contains("missing a last_key"),
+            err.to_string()
+                .contains("HasMore cursor is missing a last_key"),
             "unexpected error: {err}"
         );
     }
