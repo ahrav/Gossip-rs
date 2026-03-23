@@ -92,9 +92,10 @@ impl From<&ScanItem> for ObservedScanItem {
 
 /// Exhaustive ordered drain of one source instance.
 ///
-/// `page_lengths` preserves the connector's page partitioning under the given
-/// budgets so the harness can detect nondeterministic repacking even when the
-/// item set itself is stable.
+/// `page_lengths` partitions `items`: every entry is positive and their sum
+/// equals `items.len()`. This preserves the connector's page partitioning
+/// under the given budgets so the harness can detect nondeterministic
+/// repacking even when the item set itself is stable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentDrain {
     items: Vec<ObservedScanItem>,
@@ -107,14 +108,17 @@ impl OrderedContentDrain {
     /// `page_lengths` must exactly partition `items`: every entry must be
     /// positive and `sum(page_lengths) == items.len()`.
     fn new(items: Vec<ObservedScanItem>, page_lengths: Vec<usize>) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             page_lengths.iter().sum::<usize>(),
             items.len(),
-            "page_lengths must partition items exactly"
+            "BUG: page_lengths must partition items exactly: \
+             sum(page_lengths)={}, items.len()={}",
+            page_lengths.iter().sum::<usize>(),
+            items.len(),
         );
-        debug_assert!(
+        assert!(
             page_lengths.iter().all(|&len| len > 0),
-            "every page must be non-empty"
+            "BUG: every page must be non-empty, got a zero-length entry"
         );
         Self {
             items,
@@ -327,14 +331,16 @@ impl Error for OrderedContentConformanceError {
 ///    and exhausted-empty behavior after a terminal page.
 /// 2. Repeat the drain on a fresh source and require an identical item
 ///    sequence and identical page partitioning.
-/// 3. Force a multi-page probe and require that a corrupt opaque token with
+/// 3. Verify that emitted item refs do not contain any caller-supplied
+///    forbidden byte fragments (skipped when `forbidden_item_ref_fragments`
+///    is empty).
+/// 4. Force a multi-page probe and require that a corrupt opaque token with
 ///    the same `last_key` resumes to the same suffix as a key-only cursor.
-/// 4. Optionally verify that emitted item refs do not contain any
-///    caller-supplied forbidden byte fragments.
 ///
-/// **Note**: The corrupt-token probe requires at least two items under the
-/// probe budget to produce a `HasMore` page. Sources with zero or one item
-/// skip the token-fallback check silently.
+/// **Note**: The corrupt-token probe (step 4) fetches a first page with
+/// `max_items=1`. Sources with fewer than two total items in scope will not
+/// produce a `HasMore` page, so the token-fallback check is skipped
+/// (returns `Ok(false)`).
 ///
 /// Returns the drain from the first pass on success.
 pub fn run_ordered_content_conformance<F, S>(
@@ -350,7 +356,8 @@ where
 {
     let drain = assert_repeatable_drain(&mut factory, shard, max_items, max_bytes)?;
     assert_no_item_ref_contains(&drain, forbidden_item_ref_fragments)?;
-    assert_resume_after_corrupt_token(&mut factory, shard, 1, max_items, max_bytes)?;
+    let _token_fallback_checked =
+        assert_resume_after_corrupt_token(&mut factory, shard, 1, max_items, max_bytes)?;
     Ok(drain)
 }
 
@@ -402,13 +409,17 @@ where
 /// once with the same key paired with a fabricated corrupt token. Both suffixes
 /// must be identical, proving the source does not depend on token contents for
 /// correct resume.
+///
+/// Returns `Ok(true)` when the probe ran and passed, or `Ok(false)` when the
+/// source had too few items to produce a `HasMore` page and the check was not
+/// exercised.
 pub fn assert_resume_after_corrupt_token<F, S>(
     factory: &mut F,
     shard: &ShardSpec,
     first_page_max_items: usize,
     drain_max_items: usize,
     max_bytes: u64,
-) -> Result<(), OrderedContentConformanceError>
+) -> Result<bool, OrderedContentConformanceError>
 where
     F: FnMut() -> S,
     S: OrderedContentSource,
@@ -427,7 +438,7 @@ where
             source,
         })?;
     let Some(first_page) = first_page else {
-        return Ok(());
+        return Ok(false);
     };
 
     validate_filled_page(
@@ -441,7 +452,7 @@ where
     })?;
 
     let PageState::HasMore { cursor } = first_page.state() else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(resume_key) = cursor.last_key().cloned() else {
         return Err(OrderedContentConformanceError::HasMoreWithoutLastKey { page_index: 0 });
@@ -472,7 +483,7 @@ where
             first_divergent_item: first_divergent_index(&clean, &corrupt),
         });
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Require that no emitted item reference contains any forbidden byte
@@ -529,7 +540,7 @@ fn first_divergent_index(a: &OrderedContentDrain, b: &OrderedContentDrain) -> Op
 ///
 /// 1. Validates page shape via [`validate_filled_page`].
 /// 2. Checks that the first key on each page strictly advances past the
-///    previous page's last key.
+///    previous `last_key` (from the prior page or from the initial cursor).
 /// 3. For `HasMore` pages, verifies the resume cursor's `last_key` matches
 ///    the page's actual last emitted key.
 /// 4. After a `Complete` page, issues one additional suffix call to confirm
@@ -685,7 +696,14 @@ mod tests {
             _cursor: &Cursor,
             _budgets: Budgets,
         ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
-            let out = self.steps.get(self.next).cloned().unwrap_or(Ok(None));
+            let out = self.steps.get(self.next).cloned().unwrap_or_else(|| {
+                panic!(
+                    "ScriptedSource exhausted: fill_page called {} times \
+                         but only {} steps provided",
+                    self.next + 1,
+                    self.steps.len(),
+                )
+            });
             self.next += 1;
             out
         }
