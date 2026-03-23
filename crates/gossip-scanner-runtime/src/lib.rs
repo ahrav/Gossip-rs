@@ -1894,15 +1894,23 @@ pub(crate) fn join_scoped<T>(
 /// or are neither a regular file nor a directory (e.g. symlinks to special
 /// files, device nodes).
 ///
-/// `fs::metadata` runs first to check existence and classify the path kind,
-/// keeping the `InvalidPath` diagnostic for missing or unsupported paths.
-/// `fs::canonicalize` follows only when the kind is acceptable, avoiding a
-/// redundant second stat on the already-resolved path.
+/// `fs::metadata` runs first to check existence and classify the path kind.
+/// `NotFound` maps to `InvalidPath` (bad user input); other I/O failures
+/// (e.g. `PermissionDenied`) map to `Io` to preserve the underlying error
+/// chain. `fs::canonicalize` follows only when the kind is acceptable,
+/// avoiding a redundant second stat on the already-resolved path.
 fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
-    let meta = fs::metadata(path).map_err(|error| ScanRuntimeError::InvalidPath {
-        source: "filesystem",
-        path: path.to_path_buf(),
-        message: error.to_string(),
+    let meta = fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ScanRuntimeError::InvalidPath {
+            source: "filesystem",
+            path: path.to_path_buf(),
+            message: "path does not exist".to_owned(),
+        },
+        _ => ScanRuntimeError::Io {
+            op: "metadata",
+            path: Some(path.to_path_buf()),
+            error,
+        },
     })?;
     if !meta.is_file() && !meta.is_dir() {
         return Err(ScanRuntimeError::InvalidPath {

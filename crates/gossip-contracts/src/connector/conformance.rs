@@ -4,7 +4,8 @@
 //! also need confidence that page sequences advance monotonically, resume from
 //! `last_key` even when tokens are stale or corrupt, terminate cleanly with an
 //! exhausted-empty `None` call, and do not leak connector-root fragments into
-//! emitted [`ItemRef`] or [`ItemKey`] values.
+//! emitted [`ItemRef`], [`ItemKey`], [`Location::display`], or [`Location::url`]
+//! values.
 //!
 //! This module provides a reusable test kit for that purpose. It assumes the
 //! factory passed to [`run_ordered_content_conformance`] produces fresh sources

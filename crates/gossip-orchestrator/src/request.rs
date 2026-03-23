@@ -568,10 +568,9 @@ mod tests {
 
     #[test]
     fn nonexistent_path_rejected() {
-        let request = FilesystemRequest::single_file(
-            PathBuf::from("/nonexistent/path/that/does/not/exist.txt"),
-            run_config(),
-        );
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.txt");
+        let request = FilesystemRequest::single_file(missing, run_config());
         let err = request
             .normalize()
             .expect_err("nonexistent path must be rejected");
