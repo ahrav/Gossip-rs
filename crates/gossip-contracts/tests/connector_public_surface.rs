@@ -1,7 +1,14 @@
 use gossip_contracts::connector::{
-    self, KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, ScanItem,
-    git::GitRepoTarget, ordered::OrderedContentSource, validate_filled_page,
+    self, KeyedPageItem, ObservedScanItem, OrderedContentConformanceError, OrderedContentDrain,
+    PageBuf, PageShapeError, PageState, PagingCapabilities, ReadError, ScanItem,
+    drain_ordered_source,
+    git::GitRepoTarget,
+    ordered::{OrderedContentCapabilities, OrderedContentSource},
+    run_ordered_content_conformance, validate_filled_page,
 };
+use gossip_contracts::coordination::ShardSpec;
+
+use std::io;
 
 #[test]
 fn shared_paging_types_are_available_from_flat_and_common_paths() {
@@ -26,4 +33,35 @@ fn shared_paging_types_are_available_from_flat_and_common_paths() {
 fn family_contracts_are_available_from_namespaced_modules() {
     let _: Option<&dyn OrderedContentSource> = None;
     let _: Option<GitRepoTarget> = None;
+    let _: Option<ObservedScanItem> = None;
+    let _: Option<OrderedContentDrain> = None;
+    let _: Option<OrderedContentConformanceError> = None;
+
+    let _drain = drain_ordered_source::<UnusedSource>;
+    let _run = run_ordered_content_conformance::<fn() -> UnusedSource, UnusedSource>;
+}
+
+struct UnusedSource;
+
+impl OrderedContentSource for UnusedSource {
+    fn capabilities(&self) -> OrderedContentCapabilities {
+        OrderedContentCapabilities::default()
+    }
+
+    fn fill_page(
+        &mut self,
+        _shard: &ShardSpec,
+        _cursor: &connector::Cursor,
+        _budgets: connector::Budgets,
+    ) -> Result<Option<PageBuf<ScanItem>>, connector::EnumerateError> {
+        Ok(None)
+    }
+
+    fn open(
+        &mut self,
+        _item_ref: &connector::ItemRef,
+        _budgets: connector::Budgets,
+    ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+        Err(ReadError::unsupported("unused"))
+    }
 }

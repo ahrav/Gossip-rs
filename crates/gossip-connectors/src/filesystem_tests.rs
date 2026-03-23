@@ -2,17 +2,19 @@
 
 use std::{
     io::{self, Read as _},
+    os::unix::ffi::OsStrExt,
     path::Path,
     time::{Duration, Instant},
 };
 
 use gossip_contracts::{
     connector::{
-        Budgets, FILESYSTEM_CONNECTOR_TAG, ItemRef, PageBuf, PageState, ScanItem, VersionId,
-        ordered::OrderedContentSource,
+        Budgets, Cursor, FILESYSTEM_CONNECTOR_TAG, ItemRef, PageBuf, PageState, ScanItem,
+        TokenBytes, VersionId, ordered::OrderedContentSource, run_ordered_content_conformance,
     },
     identity::{ConnectorInstanceIdHash, ItemIdentityKey, ObjectVersionId},
 };
+use proptest::prelude::*;
 use rstest::rstest;
 
 use super::*;
@@ -63,6 +65,127 @@ fn expected_stable_item_id(
     let connector_instance =
         ConnectorInstanceIdHash::from_instance_id_bytes(canonical_root.as_os_str().as_bytes());
     ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, rel_path).stable_id()
+}
+
+fn drain_keys(run: &gossip_contracts::connector::OrderedContentDrain) -> Vec<Vec<u8>> {
+    run.items()
+        .iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect()
+}
+
+// ---------------------------------------------------------------
+// Ordered-content conformance harness
+// ---------------------------------------------------------------
+
+#[test]
+fn ordered_content_conformance_accepts_empty_filesystem_root() {
+    let dir = create_test_dir(&[]);
+
+    let run = run_ordered_content_conformance(
+        || FilesystemConnector::new(dir.path()),
+        &unbounded_shard(),
+        2,
+        u64::MAX,
+        &[],
+    )
+    .expect("empty filesystem root should satisfy ordered-content conformance");
+
+    assert!(run.is_empty());
+    assert!(run.page_lengths().is_empty());
+}
+
+#[test]
+fn ordered_content_conformance_accepts_bounded_fixture_and_root_canary() {
+    let base = tempfile::tempdir().expect("create base tempdir");
+    let root = base.path().join("FS_ROOT_CANARY");
+    fs::create_dir(&root).expect("create root dir");
+    fs::write(root.join("a.txt"), b"a").expect("write a");
+    fs::write(root.join("b.txt"), b"b").expect("write b");
+    fs::create_dir(root.join("c")).expect("create nested dir");
+    fs::write(root.join("c").join("nested.txt"), b"c").expect("write c");
+    fs::write(root.join("d.txt"), b"d").expect("write d");
+
+    let shard = ShardSpec::try_with_range(b"b", b"d").expect("valid shard");
+    let run = run_ordered_content_conformance(
+        || FilesystemConnector::new(&root),
+        &shard,
+        2,
+        u64::MAX,
+        &[b"FS_ROOT_CANARY".as_slice()],
+    )
+    .expect("bounded filesystem fixture should satisfy ordered-content conformance");
+
+    assert_eq!(
+        drain_keys(&run),
+        vec![b"b.txt".to_vec(), b"c/nested.txt".to_vec()]
+    );
+    assert_eq!(run.page_lengths(), &[2]);
+}
+
+#[test]
+fn ordered_content_conformance_accepts_connector_range_intersection() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"a"),
+        ("b.txt", b"b"),
+        ("c.txt", b"c"),
+        ("d.txt", b"d"),
+        ("e.txt", b"e"),
+    ]);
+    let shard = ShardSpec::try_with_range(b"a", b"e").expect("valid shard");
+
+    let run = run_ordered_content_conformance(
+        || FilesystemConnector::new(dir.path()).with_key_range(Some(b"b"), Some(b"d")),
+        &shard,
+        2,
+        u64::MAX,
+        &[],
+    )
+    .expect("effective range intersection should satisfy conformance");
+
+    assert_eq!(drain_keys(&run), vec![b"b.txt".to_vec(), b"c.txt".to_vec()]);
+    assert_eq!(run.page_lengths(), &[2]);
+}
+
+proptest! {
+    #![proptest_config(gossip_contracts::test_util::miri_proptest_config())]
+
+    #[test]
+    fn ordered_content_conformance_matches_sorted_random_files(
+        ids in proptest::collection::btree_set(0u16..60000, 1..16)
+    ) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut expected = Vec::new();
+
+        for (index, id) in ids.iter().copied().enumerate() {
+            let rel = if index % 2 == 0 {
+                format!("{id:04x}.txt")
+            } else {
+                format!("nested/{id:04x}.txt")
+            };
+            let path = dir.path().join(&rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create parent dirs");
+            }
+            fs::write(&path, format!("payload-{id:04x}").as_bytes()).expect("write fixture file");
+            expected.push(rel.into_bytes());
+        }
+        expected.sort();
+
+        let root_bytes = dir.path().as_os_str().as_bytes();
+        let run = run_ordered_content_conformance(
+            || FilesystemConnector::new(dir.path()),
+            &unbounded_shard(),
+            3,
+            u64::MAX,
+            &[root_bytes],
+        )
+        .expect("random filesystem fixture should satisfy ordered-content conformance");
+
+        prop_assert_eq!(drain_keys(&run), expected);
+        prop_assert_eq!(run.page_lengths().iter().sum::<usize>(), ids.len());
+        prop_assert!(run.page_lengths().iter().all(|len| *len > 0 && *len <= 3));
+    }
 }
 
 // ---------------------------------------------------------------
@@ -149,6 +272,100 @@ fn fill_page_returns_sorted_items_and_resume_cursor() {
         )
         .expect("post-complete fill_page should succeed");
     assert!(exhausted.is_none(), "exhausted suffix should return None");
+}
+
+#[rstest]
+#[case::without_token(Cursor::with_last_key(make_key(b"b.txt")))]
+#[case::arbitrary_token(Cursor::with_token(
+    make_key(b"b.txt"),
+    TokenBytes::try_from_slice(b"ignored-token").expect("valid token"),
+))]
+#[case::stale_token(Cursor::with_token(
+    make_key(b"b.txt"),
+    TokenBytes::try_from_slice(b"stale-next-index=999").expect("valid token"),
+))]
+#[case::garbage_token(Cursor::with_token(
+    make_key(b"b.txt"),
+    TokenBytes::try_from_slice(b"\x00\xffstill-ignored").expect("valid token"),
+))]
+fn fill_page_resumes_from_last_key_for_same_connector(#[case] resume_cursor: Cursor) {
+    let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+    let mut connector = FilesystemConnector::new(dir.path());
+    let shard = unbounded_shard();
+
+    let first_page = fill_page_with_limits(&mut connector, &shard, &Cursor::initial(), 2, u64::MAX);
+    assert!(matches!(first_page.state(), PageState::HasMore { .. }));
+    assert_eq!(
+        first_page.items()[1].item_key().as_bytes(),
+        b"b.txt",
+        "test setup assumes the first page ends at b.txt"
+    );
+
+    fs::write(dir.path().join("aa.txt"), b"aa").expect("insert key before last_key");
+    fs::write(dir.path().join("d.txt"), b"d").expect("insert key after last_key");
+
+    let resumed_page = fill_page_with_limits(&mut connector, &shard, &resume_cursor, 8, u64::MAX);
+    let resumed_keys: Vec<&[u8]> = resumed_page
+        .items()
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+    assert_eq!(
+        resumed_keys,
+        vec![b"c.txt".as_slice(), b"d.txt".as_slice()],
+        "resume must honor only last_key and ignore connector tokens"
+    );
+    assert!(matches!(resumed_page.state(), PageState::Complete));
+}
+
+#[test]
+fn fresh_connector_resume_restarts_from_last_key_on_live_view() {
+    let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+    let shard = unbounded_shard();
+
+    let persisted_cursor = {
+        let mut first_connector = FilesystemConnector::new(dir.path());
+        let first_page = fill_page_with_limits(
+            &mut first_connector,
+            &shard,
+            &Cursor::initial(),
+            2,
+            u64::MAX,
+        );
+        let last_key = first_page
+            .items()
+            .last()
+            .expect("page should be non-empty")
+            .item_key()
+            .clone();
+        Cursor::with_token(
+            last_key,
+            TokenBytes::try_from_slice(b"persisted-but-ignored").expect("valid token"),
+        )
+    };
+
+    fs::write(dir.path().join("aa.txt"), b"aa").expect("insert key before persisted cursor");
+    fs::write(dir.path().join("d.txt"), b"d").expect("insert key after persisted cursor");
+
+    let mut resumed_connector = FilesystemConnector::new(dir.path());
+    let resumed_page = fill_page_with_limits(
+        &mut resumed_connector,
+        &shard,
+        &persisted_cursor,
+        8,
+        u64::MAX,
+    );
+    let resumed_keys: Vec<&[u8]> = resumed_page
+        .items()
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+    assert_eq!(
+        resumed_keys,
+        vec![b"c.txt".as_slice(), b"d.txt".as_slice()],
+        "fresh connectors must resume from last_key even when persisted tokens are stale"
+    );
+    assert!(matches!(resumed_page.state(), PageState::Complete));
 }
 
 #[test]
@@ -307,9 +524,9 @@ fn max_items_exactly_matching_file_count_yields_complete_page() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
 
-    // max_items == file count: the peek after collection should see None and
-    // report Complete. Before the peek-error fix this path propagated errors
-    // from the peek via `?`, discarding valid items.
+    // max_items == file count: the peek after collection sees None and reports
+    // Complete. The peek error is intentionally swallowed (ok().is_some_and)
+    // rather than propagated via ?, which would discard already-collected items.
     let page = fill_page_with_limits(
         &mut connector,
         &unbounded_shard(),
