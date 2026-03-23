@@ -47,11 +47,17 @@ matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
 `InMemoryDeterministicConnector` expose the same read/split surface as
 inherent methods in `gossip-connectors/src/`.
 
-Distributed filesystem submission uses `gossip-orchestrator` as the
-control-plane seam ahead of runtime execution. `request.rs` canonicalizes raw
-filesystem submissions into `NormalizedFilesystemRequest`, and `planner.rs`
-maps those normalized requests into the deterministic one-shard startup
-geometry consumed by later payload and registration stages.
+**Submission staging (filesystem-specific):**
+
+`gossip-orchestrator` stages filesystem submissions before runtime execution:
+- `request.rs` canonicalizes raw paths, validates them against the requested
+  source mode (single file vs. directory root), and enforces path/mode
+  consistency. Produces `NormalizedFilesystemRequest`.
+- `planner.rs` maps normalized requests into the deterministic one-shard
+  startup geometry consumed by later payload and registration stages.
+
+These stages are optional for other ordered-content sources (e.g., git
+ls-files connectors) but required for filesystem security and determinism.
 
 ### Git Repo-Native
 

@@ -5,6 +5,10 @@
 //!
 //! - Source mode stays explicit instead of being re-inferred from path shape.
 //! - Equivalent requests normalize to the same canonical root.
+//!
+//! Normalized requests flow to [`crate::planner`] for initial shard geometry
+//! planning, then into the scanner runtime's `OrderedContentRuntimeInput`
+//! for page validation.
 
 use std::ffi::OsStr;
 use std::fmt;

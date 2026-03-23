@@ -347,15 +347,21 @@ impl Error for OrderedContentConformanceError {
 ///
 /// The suite performs four checks:
 ///
-/// 1. Drain page sequences while validating page shape, cursor advancement,
-///    and exhausted-empty behavior after a terminal page.
-/// 2. Repeat the drain on a fresh source and require an identical item
-///    sequence and identical page partitioning.
-/// 3. Verify that no emitted item field (`ItemRef`, `ItemKey`,
-///    `Location::display`, `Location::url`) contains any caller-supplied
-///    forbidden byte fragment (skipped when `forbidden_fragments` is empty).
-/// 4. Force a multi-page probe and require that a corrupt opaque token with
-///    the same `last_key` resumes to the same suffix as a key-only cursor.
+/// 1. **Page contract** — drain page sequences while validating non-empty
+///    shape, in-bounds keys, strict ordering, cursor advancement, and
+///    exhausted-empty behavior after a terminal page. Detects connector bugs
+///    that would break downstream resume logic.
+/// 2. **Determinism** — repeat the drain on a fresh source and require
+///    identical items in identical pages. Detects connectors that reorder
+///    items, repack pages, or vary behavior based on internal state.
+/// 3. **Forbidden fragments** — scan all emitted `ItemRef`, `ItemKey`,
+///    `Location::display`, and `Location::url` fields for caller-supplied
+///    byte patterns. Prevents root-path leakage or information disclosure
+///    in logging output (skipped when `forbidden_fragments` is empty).
+/// 4. **Token fallback** — force a multi-page probe and require that a
+///    corrupt opaque token with the same `last_key` resumes to the same
+///    suffix as a key-only cursor. Ensures the connector can fall back to
+///    key-only resumption if tokens are stale or corrupted in-flight.
 ///
 /// **Note**: The corrupt-token probe (step 4) fetches a first page with
 /// `max_items=1`. Sources with fewer than two total items in scope will not

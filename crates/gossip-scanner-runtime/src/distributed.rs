@@ -176,6 +176,17 @@ impl WorkerIdentity {
 ///   persistence writes.
 /// - **`tenant_secret_key`** — key material for secret-hash derivation.
 ///
+/// # Lifecycle
+///
+/// 1. **Claim** — the coordination facade's acquire/restore call returns a
+///    [`Lease`] and restored state.
+/// 2. **Prepare** — `ShardLease::new` bundles the lease, restored state, scan
+///    config, and write context together.
+/// 3. **Execute** — the distributed worker loop scans the shard and commits
+///    findings using the bundled write context.
+/// 4. **Complete** — terminal completion uses the bundled [`Lease`] to emit
+///    a receipt-driven checkpoint cursor.
+///
 /// The coordination lease and restored shard state stay together so later
 /// runtime helpers can execute ordered-content work without a second acquire
 /// payload or side-map.
