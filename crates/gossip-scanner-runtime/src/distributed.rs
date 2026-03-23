@@ -79,6 +79,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Error as AnyError, Result, anyhow};
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    coordination::ShardSpec,
     identity::{
         CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
         RuleFingerprint, RunId, ShardKey, TenantId, TenantSecretKey, WorkerId, domain_hasher,
@@ -87,7 +88,8 @@ use gossip_contracts::{
     persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
 };
 use gossip_coordination::{
-    AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, Lease, OpKind,
+    AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, CursorSemantics, Lease,
+    OpKind,
 };
 use gossip_frontier::decode_connector_extra;
 use scanner_scheduler::store::FsFindingRecord;
@@ -166,24 +168,32 @@ impl WorkerIdentity {
 ///
 /// - **`shard_id`** — string label for telemetry routing.
 /// - **`lease`** — authoritative coordination lease used for terminal completion.
-/// - **`range_start`** — inclusive lower bound of the shard's key range, used as
-///   the fallback cursor when no items are committed.
+/// - **`shard_spec`** — authoritative shard bounds and metadata restored from
+///   acquire/restore state.
+/// - **`resume_cursor`** — authoritative ordered-content resume cursor restored
+///   from acquire/restore state.
+/// - **`cursor_semantics`** — coordination cursor mode for the shard.
 /// - **`scan_config`** — filesystem scan configuration for this shard, derived
 ///   from the worker template with optional shard-level path overrides.
 /// - **`write_context`** — numeric shard identity plus fencing epoch for all
 ///   persistence writes.
 /// - **`tenant_secret_key`** — key material for secret-hash derivation.
 ///
-/// The coordination lease and range start are kept together so that
-/// shard completion can finalize the lease without a side-map.
+/// The coordination lease and restored shard state stay together so later
+/// runtime helpers can execute ordered-content work without a second acquire
+/// payload or side-map.
 #[derive(Clone, Debug)]
 pub struct ShardLease {
     /// String shard label used for routing recorder events.
     shard_id: Arc<str>,
     /// Authoritative coordination-layer lease used for terminal completion.
     lease: Lease,
-    /// Inclusive lower bound of the shard's key range.
-    range_start: Vec<u8>,
+    /// Authoritative shard bounds and metadata restored from acquire/restore state.
+    shard_spec: ShardSpec,
+    /// Authoritative resume cursor restored from acquire/restore state.
+    resume_cursor: Cursor,
+    /// Coordination cursor semantics for this shard.
+    cursor_semantics: CursorSemantics,
     /// Filesystem scan configuration for this shard.
     scan_config: FsScanConfig,
     /// Shared routing and fencing metadata for all writes emitted under the
@@ -195,10 +205,13 @@ pub struct ShardLease {
 
 impl ShardLease {
     /// Construct one concrete filesystem shard lease.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_id: Arc<str>,
         lease: Lease,
-        range_start: Vec<u8>,
+        shard_spec: ShardSpec,
+        resume_cursor: Cursor,
+        cursor_semantics: CursorSemantics,
         scan_config: FsScanConfig,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
@@ -206,7 +219,9 @@ impl ShardLease {
         Self {
             shard_id,
             lease,
-            range_start,
+            shard_spec,
+            resume_cursor,
+            cursor_semantics,
             scan_config,
             write_context,
             tenant_secret_key,
@@ -237,7 +252,35 @@ impl ShardLease {
     #[inline]
     #[must_use]
     pub fn range_start(&self) -> &[u8] {
-        &self.range_start
+        self.shard_spec.key_range_start()
+    }
+
+    /// Exclusive upper bound of the shard's key range.
+    #[inline]
+    #[must_use]
+    pub fn range_end(&self) -> &[u8] {
+        self.shard_spec.key_range_end()
+    }
+
+    /// Full authoritative shard specification restored from acquire/restore.
+    #[inline]
+    #[must_use]
+    pub fn shard_spec(&self) -> &ShardSpec {
+        &self.shard_spec
+    }
+
+    /// Authoritative resume cursor restored from acquire/restore.
+    #[inline]
+    #[must_use]
+    pub fn resume_cursor(&self) -> &Cursor {
+        &self.resume_cursor
+    }
+
+    /// Coordination cursor semantics for this shard.
+    #[inline]
+    #[must_use]
+    pub fn cursor_semantics(&self) -> CursorSemantics {
+        self.cursor_semantics
     }
 
     /// Filesystem scan configuration for this shard.
@@ -993,7 +1036,10 @@ fn build_lease_from_acquire(
     acquired: AcquireResultView<'_>,
     identity: &WorkerIdentity,
 ) -> Result<ShardLease> {
-    let spec = acquired.snapshot.spec();
+    let snapshot = acquired.snapshot;
+    let spec = snapshot.spec();
+    let shard_spec = ShardSpec::try_from_ref(spec)?;
+    let resume_cursor = Cursor::try_from_update(snapshot.cursor())?;
     let write_context = WriteContext::new(
         acquired.lease.tenant(),
         identity.policy_hash,
@@ -1005,7 +1051,9 @@ fn build_lease_from_acquire(
     Ok(ShardLease::new(
         Arc::from(acquired.lease.shard().to_string()),
         acquired.lease,
-        spec.key_range_start().to_vec(),
+        shard_spec,
+        resume_cursor,
+        snapshot.cursor_semantics(),
         scan_config_from_spec(spec, &identity.scan_template)?,
         write_context,
         identity.tenant_secret_key,
@@ -2635,6 +2683,10 @@ mod tests {
         assert_eq!(lease.write_context().policy_hash(), policy_hash());
         assert_eq!(lease.write_context().fence_epoch(), FenceEpoch::from_raw(2));
         assert_eq!(lease.range_start(), &[0u8]);
+        assert_eq!(lease.range_end(), &[1u8]);
+        assert!(lease.resume_cursor().last_key().is_none());
+        assert!(lease.resume_cursor().token().is_none());
+        assert_eq!(lease.cursor_semantics(), CursorSemantics::Completed);
     }
 
     #[test]
@@ -2644,6 +2696,68 @@ mod tests {
         let lease = claim_lease(&mut coordinator, &identity);
 
         assert_eq!(lease.scan_config().path, Path::new("/fallback"));
+    }
+
+    #[test]
+    fn build_lease_from_acquire_preserves_restored_cursor_and_full_bounds() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = CoordinationInMemoryCoordinator::new(30_000);
+        let now = wall_clock_now();
+        coordinator
+            .create_run(now, tenant(), run(), test_run_config(30_000))
+            .expect("create run");
+
+        let mut scratch = ShardSpecScratch::new();
+        let connector_extra = dir
+            .path()
+            .to_str()
+            .expect("test paths must be valid UTF-8")
+            .as_bytes();
+        let spec_ref =
+            range_shard_ref(b"a", b"m", connector_extra, &mut scratch).expect("range shard spec");
+        let shard_spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec");
+        let initial_cursor = CoordCursorUpdate::with_token(b"f.txt", b"resume-token");
+        let shards = [InitialShardInput::new(
+            ShardId::from_raw(1),
+            shard_spec.as_ref(),
+            initial_cursor,
+        )];
+        let _ = coordinator
+            .register_shards(now, tenant(), run(), &shards, OpId::from_raw(1))
+            .expect("register shards");
+
+        let mut acquire_scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(
+                wall_clock_now(),
+                tenant(),
+                run(),
+                worker(1),
+                &mut acquire_scratch,
+            )
+            .expect("claim next available");
+        let lease = build_lease_from_acquire(acquired, &worker_identity(Path::new("/fallback")))
+            .expect("runtime lease");
+
+        assert_eq!(lease.range_start(), b"a");
+        assert_eq!(lease.range_end(), b"m");
+        assert_eq!(
+            lease
+                .resume_cursor()
+                .last_key()
+                .expect("resume cursor last_key")
+                .as_bytes(),
+            b"f.txt"
+        );
+        assert_eq!(
+            lease
+                .resume_cursor()
+                .token()
+                .expect("resume cursor token")
+                .as_bytes(),
+            b"resume-token"
+        );
+        assert_eq!(lease.cursor_semantics(), CursorSemantics::Completed);
     }
 
     #[test]

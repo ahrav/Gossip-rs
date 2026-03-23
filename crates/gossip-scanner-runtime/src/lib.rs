@@ -29,10 +29,10 @@
 //!
 //! # Execution modes
 //!
-//! [`ExecutionMode::Direct`] and [`ExecutionMode::Connector`] both resolve to
-//! the same scan logic today. The distinction exists so that worker and CLI
-//! entry points exercise the same runtime boundary, and so the connector path
-//! can diverge when remote source enumeration is added.
+//! [`ExecutionMode::Direct`] keeps the existing scheduler-driven local scan
+//! path. [`ExecutionMode::Connector`] selects the family boundary instead:
+//! filesystem sources perform ordered page acquisition and validation through
+//! `OrderedContentRuntime`, while Git sources still reuse the direct path.
 //!
 //! # Durability model
 //!
@@ -63,9 +63,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 
+use gossip_connectors::FilesystemConnector;
 pub use gossip_contracts::connector::git::GitDebugLevel;
-use gossip_contracts::connector::{ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG};
 use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
+use gossip_contracts::{
+    connector::{Budgets, ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG},
+    coordination::{CursorSemantics, ShardSpec},
+};
 use scanner_engine::TransformId;
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformMode, Tuning};
 use scanner_git::{
@@ -110,10 +114,10 @@ pub mod result_translation;
 
 /// How the runtime acquires source items.
 ///
-/// Both modes currently route through the same scan implementation.
-/// The distinction exists so worker and CLI entry points converge on a
-/// single runtime boundary, and so the `Connector` path can later add
-/// remote source enumeration without changing callers.
+/// `Direct` keeps the existing local scan implementation. `Connector`
+/// selects the source-family boundary: filesystem scans run one ordered
+/// connector page acquisition/validation step, while Git connector mode
+/// still reuses the direct path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// Scan source items directly from local state.
@@ -728,8 +732,8 @@ pub struct AssignmentOutcome {
 /// Top-level filesystem scan dispatcher.
 ///
 /// Routes to `scan_fs_direct` or `scan_fs_connector` based on
-/// [`FsScanConfig::execution_mode`]. Both currently resolve to the same
-/// implementation.
+/// [`FsScanConfig::execution_mode`]. Direct mode runs the existing local scan;
+/// connector mode exercises the ordered-content page-fill boundary.
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_fs_direct(config),
@@ -759,9 +763,30 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
     scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
-/// Connector-mode filesystem scan. Currently delegates to [`scan_fs_direct`].
+/// Connector-mode filesystem scan.
+///
+/// This path validates the target path, constructs a real
+/// [`FilesystemConnector`], and executes one ordered page acquisition through
+/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
+/// and durability remain on the direct scan path.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    scan_fs_direct(config)
+    let canonical_path = validate_fs_path(&config.path)?;
+    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
+    let runtime_input = ordered_content::OrderedContentRuntimeInput::new(
+        ShardSpec::unbounded(),
+        Cursor::initial(),
+        CursorSemantics::Completed,
+        budgets,
+    );
+    let mut source = FilesystemConnector::new(canonical_path);
+
+    match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
+        ordered_content::OrderedContentExecutionOutcome::Finished => Ok(ScanReport::default()),
+        ordered_content::OrderedContentExecutionOutcome::Page(page) => Ok(page.report()),
+        ordered_content::OrderedContentExecutionOutcome::Stopped(stop) => {
+            Err(ScanRuntimeError::Driver(anyhow::anyhow!("{stop}")))
+        }
+    }
 }
 
 /// Git scan using a null event sink (no event output).
