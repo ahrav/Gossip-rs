@@ -26,6 +26,9 @@ pub enum FilesystemSourceMode {
 }
 
 impl FilesystemSourceMode {
+    /// Returns the filesystem path kind that canonicalization must produce for
+    /// this source mode. Used during normalization to reject mode/path mismatches
+    /// (e.g., a `SingleFile` request targeting a directory).
     #[must_use]
     pub fn expected_path_kind(self) -> FilesystemPathKind {
         match self {

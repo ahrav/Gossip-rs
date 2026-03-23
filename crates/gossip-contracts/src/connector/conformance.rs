@@ -576,6 +576,12 @@ where
 
 /// Require that no emitted item contains any forbidden byte fragment in
 /// either its `ItemRef` or `ItemKey`. Empty fragments are ignored.
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::ForbiddenFragment`] when any
+/// non-empty fragment appears as a substring in an emitted `ItemRef` or
+/// `ItemKey`.
 pub fn assert_no_forbidden_fragments(
     drain: &OrderedContentDrain,
     forbidden_fragments: &[&[u8]],

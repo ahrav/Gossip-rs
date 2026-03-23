@@ -1,6 +1,7 @@
 ---
 name: heap-profile
 description: Use when AllocGuard trips and you need the call site, when /performance-analyzer flags allocations but you need attribution, when verifying HOT-tier allocation silence, or when /bench-compare shows regression and you suspect allocation overhead. Heap allocation profiling with DHAT.
+user-invocable: true
 ---
 
 # Heap Profile — Allocation Attribution and Verification
@@ -69,9 +70,9 @@ still running optimized code.
 
 Build with: `cargo build --profile dhat --features dhat-heap`
 
-## Two-Mode Architecture
+## Operating Modes
 
-DHAT has two modes that serve different purposes. Use both.
+DHAT has two core modes. Heap mode has a testing variant for CI assertions.
 
 ### Mode 1: Heap Mode (Full Attribution — Isolated Binary)
 
@@ -86,6 +87,14 @@ separate integration test file (each compiles to its own binary).
 **Use for**: Investigation -- finding where allocations come from, understanding
 allocation lifetimes, identifying churn.
 
+#### Heap Mode — Testing Variant (CI Assertions)
+
+Same allocator setup as heap mode, but uses `ProfilerBuilder::testing()` to
+enable programmatic `HeapStats` access and `dhat::assert!` macros. Suppresses
+file output on success, saves profile JSON on assertion failure for post-mortem.
+
+**Use for**: CI-gated allocation budgets on HOT-tier paths.
+
 ### Mode 2: Ad-Hoc Mode (Targeted — Coexists with CountingAllocator)
 
 Does NOT require `dhat::Alloc`. Instead, you call `dhat::ad_hoc_event(weight)`
@@ -94,13 +103,6 @@ same binary.
 
 **Use for**: Targeted instrumentation of specific code paths, measuring pool
 utilization, tracking custom events at known hot-path boundaries.
-
-### Mode 3: Testing Mode (CI Assertions)
-
-Adds programmatic access to `HeapStats` for assertion-based budget enforcement.
-Uses heap mode's allocator (needs isolated test file).
-
-**Use for**: CI-gated allocation budgets on HOT-tier paths.
 
 ## Workflow
 

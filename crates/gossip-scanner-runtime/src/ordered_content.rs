@@ -164,9 +164,11 @@ impl std::fmt::Display for OrderedContentStop {
 
 /// Validated ordered connector page plus runtime-local summary counters.
 ///
-/// `resume_cursor` is the connector cursor that would resume strictly after the
-/// page if downstream execution later decides the page was processed
-/// successfully. This module does not treat that cursor as committed progress.
+/// `resume_cursor` is derived from the page boundary: for `HasMore` pages it
+/// is the connector-supplied cursor (which carries token and last-key); for
+/// `Complete` pages it is synthesized from the page's final emitted key.
+/// Downstream execution decides whether to treat it as committed progress;
+/// this module never advances shard state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentPage {
     page: PageBuf<ScanItem>,
@@ -287,6 +289,13 @@ impl OrderedContentRuntime {
     }
 }
 
+/// Validate three page-level invariants after a successful `fill_page`:
+///
+/// 1. **Shape** — page is non-empty, keys are in-bounds, and strictly increasing.
+/// 2. **Monotonicity** — the first emitted key is strictly after the restored
+///    resume cursor's `last_key`, preventing duplicate processing on resume.
+/// 3. **Cursor agreement** — a `HasMore` cursor's `last_key` matches the page's
+///    final emitted key, so the next `fill_page` call starts from the right point.
 fn validate_page_contract(
     input: &OrderedContentRuntimeInput,
     page: &PageBuf<ScanItem>,
