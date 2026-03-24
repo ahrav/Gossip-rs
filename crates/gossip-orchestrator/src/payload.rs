@@ -244,7 +244,8 @@ impl std::error::Error for FilesystemShardPayloadEncodeError {}
 /// Errors from [`FilesystemShardPayload::decode`].
 ///
 /// Variants are ordered by the validation sequence: empty input is checked
-/// first, then the mode tag, then path presence, then path UTF-8 validity.
+/// first, then the mode tag, then path presence, then path UTF-8 validity,
+/// then absolute-path verification.
 #[derive(Debug)]
 pub enum FilesystemShardPayloadDecodeError {
     /// No payload bytes were present.
