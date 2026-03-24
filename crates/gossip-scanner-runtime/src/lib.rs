@@ -29,10 +29,10 @@
 //!
 //! # Execution modes
 //!
-//! [`ExecutionMode::Direct`] and [`ExecutionMode::Connector`] both resolve to
-//! the same scan logic today. The distinction exists so that worker and CLI
-//! entry points exercise the same runtime boundary, and so the connector path
-//! can diverge when remote source enumeration is added.
+//! [`ExecutionMode::Direct`] dispatches scans via the scheduler-driven local
+//! scan path. [`ExecutionMode::Connector`] selects the family boundary
+//! instead: filesystem sources perform ordered page acquisition and validation
+//! through `OrderedContentRuntime`, while Git sources use the direct path.
 //!
 //! # Durability model
 //!
@@ -63,9 +63,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 
+use gossip_connectors::FilesystemConnector;
 pub use gossip_contracts::connector::git::GitDebugLevel;
-use gossip_contracts::connector::{ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG};
 use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
+use gossip_contracts::{
+    connector::{Budgets, ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG},
+    coordination::{CursorSemantics, RestoredShardState, ShardSpec},
+};
 use scanner_engine::TransformId;
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformMode, Tuning};
 use scanner_git::{
@@ -110,10 +114,10 @@ pub mod result_translation;
 
 /// How the runtime acquires source items.
 ///
-/// Both modes currently route through the same scan implementation.
-/// The distinction exists so worker and CLI entry points converge on a
-/// single runtime boundary, and so the `Connector` path can later add
-/// remote source enumeration without changing callers.
+/// `Direct` dispatches via the local scan implementation. `Connector`
+/// selects the source-family boundary: filesystem scans run one ordered
+/// connector page acquisition/validation step, while Git connector mode
+/// uses the direct path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// Scan source items directly from local state.
@@ -235,10 +239,11 @@ impl CancellationToken {
 /// Runtime budgets for source scans.
 ///
 /// Both fields must be non-zero; validation enforces this constraint
-/// before distributed scan dispatch. Local scan paths (`scan_fs_with_runtime`,
-/// `scan_git_with_runtime`) do not validate or consume budgets — they are
-/// relevant only to the distributed runtime. Both fields are validated
-/// (non-zero) before dispatch but are not yet enforced at execution time.
+/// before distributed scan dispatch and in the filesystem connector-mode
+/// local path (which constructs [`Budgets`] from these values). Direct
+/// local scan paths (`scan_fs_with_runtime`, `scan_git_with_runtime`) do
+/// not validate or consume budgets. Both fields are validated (non-zero)
+/// before dispatch but are not enforced at execution time.
 ///
 /// Defaults are intentionally conservative (256 items, 1 MB) to bound
 /// memory pressure in distributed workers.
@@ -728,8 +733,8 @@ pub struct AssignmentOutcome {
 /// Top-level filesystem scan dispatcher.
 ///
 /// Routes to `scan_fs_direct` or `scan_fs_connector` based on
-/// [`FsScanConfig::execution_mode`]. Both currently resolve to the same
-/// implementation.
+/// [`FsScanConfig::execution_mode`]. Direct mode runs the local scan;
+/// connector mode exercises the ordered-content page-fill boundary.
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_fs_direct(config),
@@ -759,9 +764,40 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
     scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
-/// Connector-mode filesystem scan. Currently delegates to [`scan_fs_direct`].
+/// Connector-mode filesystem scan (single-page validation boundary).
+///
+/// Validates the target path, constructs a [`FilesystemConnector`], and
+/// executes one ordered page acquisition through
+/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
+/// and durability are handled by the direct filesystem runtime path.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    scan_fs_direct(config)
+    let canonical_path = validate_fs_path(&config.path)?;
+    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
+    let state = RestoredShardState::new(
+        ShardSpec::unbounded(),
+        Cursor::initial(),
+        CursorSemantics::Completed,
+    );
+    let runtime_input = ordered_content::OrderedContentRuntimeInput::new(state, budgets);
+    let mut source = FilesystemConnector::new(canonical_path);
+
+    match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
+        ordered_content::OrderedContentExecutionOutcome::Finished => Ok(ScanReport::default()),
+        ordered_content::OrderedContentExecutionOutcome::Page(page) => {
+            if page.page().state().next_cursor().is_some() {
+                let items = page.report().items_scanned;
+                tracing::warn!(
+                    items_scanned = items,
+                    "connector page indicates more items available; \
+                     scan result is partial"
+                );
+            }
+            Ok(page.report())
+        }
+        ordered_content::OrderedContentExecutionOutcome::Stopped(stop) => {
+            Err(ScanRuntimeError::Driver(anyhow::anyhow!("{stop}")))
+        }
+    }
 }
 
 /// Git scan using a null event sink (no event output).
@@ -1857,15 +1893,26 @@ pub(crate) fn join_scoped<T>(
 /// Returns the canonicalized path on success. Rejects paths that do not exist
 /// or are neither a regular file nor a directory (e.g. symlinks to special
 /// files, device nodes).
+///
+/// `fs::metadata` runs first to check existence and classify the path kind.
+/// `NotFound` maps to `InvalidPath` (bad user input); other I/O failures
+/// (e.g. `PermissionDenied`) map to `Io` to preserve the underlying error
+/// chain. `fs::canonicalize` follows only when the kind is acceptable,
+/// avoiding a redundant second stat on the already-resolved path.
 fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
-    if !path.exists() {
-        return Err(ScanRuntimeError::InvalidPath {
+    let meta = fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ScanRuntimeError::InvalidPath {
             source: "filesystem",
             path: path.to_path_buf(),
             message: "path does not exist".to_owned(),
-        });
-    }
-    if !path.is_file() && !path.is_dir() {
+        },
+        _ => ScanRuntimeError::Io {
+            op: "metadata",
+            path: Some(path.to_path_buf()),
+            error,
+        },
+    })?;
+    if !meta.is_file() && !meta.is_dir() {
         return Err(ScanRuntimeError::InvalidPath {
             source: "filesystem",
             path: path.to_path_buf(),

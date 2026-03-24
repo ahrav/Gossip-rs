@@ -14,6 +14,8 @@
 //! | [`PagingCapabilities`] | Optional paging behavior flags for a connector family |
 //! | [`KeyedPageItem`] | Trait for items that participate in ordered page emission |
 //! | [`validate_filled_page`] | Validates ordering, uniqueness, and shard bounds |
+//! | [`PageSequenceViolation`] | Inter-page sequence violation taxonomy |
+//! | [`validate_page_sequence`] | Validates shape + cursor advance + HasMore invariants |
 //!
 //! ## Bound semantics
 //!
@@ -305,6 +307,127 @@ pub fn validate_filled_page<T: KeyedPageItem>(
             });
         }
         previous = key;
+    }
+
+    Ok(())
+}
+
+/// Violation detected by [`validate_page_sequence`] when a page breaks one of
+/// the four page-sequence invariants: shape, cursor advance, HasMore last-key
+/// presence, or cursor-page alignment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageSequenceViolation {
+    /// The page failed intra-page shape validation (ordering, bounds, non-empty).
+    Shape(PageShapeError),
+    /// The first key on this page did not strictly advance past the previous
+    /// page's (or initial cursor's) last key.
+    CursorDidNotAdvance {
+        previous_last: Vec<u8>,
+        first_key: Vec<u8>,
+    },
+    /// A `HasMore` page returned a cursor without a `last_key`.
+    HasMoreWithoutLastKey,
+    /// A `HasMore` cursor's `last_key` does not match the page's actual last
+    /// emitted key.
+    CursorPageMismatch {
+        cursor_last: Vec<u8>,
+        page_last: Vec<u8>,
+    },
+}
+
+impl fmt::Display for PageSequenceViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Shape(inner) => write!(f, "page shape: {inner}"),
+            Self::CursorDidNotAdvance {
+                previous_last,
+                first_key,
+            } => write!(
+                f,
+                "page did not advance past previous last key \
+                 (previous_last={previous_last:?}, first_key={first_key:?})"
+            ),
+            Self::HasMoreWithoutLastKey => f.write_str("HasMore cursor is missing a last_key"),
+            Self::CursorPageMismatch {
+                cursor_last,
+                page_last,
+            } => write!(
+                f,
+                "HasMore cursor last_key does not match page's last emitted key \
+                 (cursor_last={cursor_last:?}, page_last={page_last:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PageSequenceViolation {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Shape(inner) => Some(inner),
+            _ => None,
+        }
+    }
+}
+
+impl From<PageShapeError> for PageSequenceViolation {
+    fn from(err: PageShapeError) -> Self {
+        Self::Shape(err)
+    }
+}
+
+/// Validate a page against both intra-page shape rules and inter-page sequence
+/// invariants.
+///
+/// Runs four checks in order:
+///
+/// 1. **Shape** — delegates to [`validate_filled_page`] (non-empty, strictly
+///    increasing keys within `[shard_start, shard_end)`).
+/// 2. **Cursor advance** — when `previous_last_key` is `Some`, the page's
+///    first key must be strictly greater.
+/// 3. **HasMore last-key presence** — a `HasMore` cursor must carry a
+///    `last_key`.
+/// 4. **Cursor-page alignment** — the `HasMore` cursor's `last_key` must
+///    match the page's actual last emitted key.
+///
+/// # Errors
+///
+/// Returns [`PageSequenceViolation`] describing the first detected violation.
+pub fn validate_page_sequence<T: KeyedPageItem>(
+    items: &[T],
+    page_state: &PageState,
+    previous_last_key: Option<&ItemKey>,
+    shard_start: &[u8],
+    shard_end: &[u8],
+) -> Result<(), PageSequenceViolation> {
+    validate_filled_page(items, shard_start, shard_end)?;
+
+    let first_key = items
+        .first()
+        .expect("validate_filled_page guarantees non-empty")
+        .item_key();
+    if let Some(prev) = previous_last_key
+        && first_key <= prev
+    {
+        return Err(PageSequenceViolation::CursorDidNotAdvance {
+            previous_last: prev.as_bytes().to_vec(),
+            first_key: first_key.as_bytes().to_vec(),
+        });
+    }
+
+    if let PageState::HasMore { cursor } = page_state {
+        let Some(cursor_last) = cursor.last_key() else {
+            return Err(PageSequenceViolation::HasMoreWithoutLastKey);
+        };
+        let page_last = items
+            .last()
+            .expect("validate_filled_page guarantees non-empty")
+            .item_key();
+        if cursor_last != page_last {
+            return Err(PageSequenceViolation::CursorPageMismatch {
+                cursor_last: cursor_last.as_bytes().to_vec(),
+                page_last: page_last.as_bytes().to_vec(),
+            });
+        }
     }
 
     Ok(())

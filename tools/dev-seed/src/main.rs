@@ -13,6 +13,7 @@ use gossip_coordination::{
 };
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig};
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
 use postgres::{Client, NoTls};
 
 const DEFAULT_ETCD_ENDPOINTS: &str = "http://127.0.0.1:2379";
@@ -151,11 +152,11 @@ fn cmd_seed(
     }
 
     let mut scratch = ShardSpecScratch::new();
-    let connector_extra = canonical
-        .to_str()
-        .context("scan path is not valid UTF-8")?
-        .as_bytes();
-    let spec_ref = range_shard_ref(b"\x00", b"\xFF", connector_extra, &mut scratch)
+    let connector_extra =
+        FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, &canonical)
+            .encode()
+            .context("failed to encode filesystem shard payload")?;
+    let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
         .context("failed to build shard spec")?;
     let spec = gossip_coordination::ShardSpec::try_from_ref(spec_ref)
         .context("failed to build owned shard spec")?;

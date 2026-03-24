@@ -37,9 +37,9 @@
 //! items are re-exported here so runtime crates keep a single import boundary
 //! for shared nouns and error taxonomy. [`common`] is public because the paging
 //! vocabulary is reused across families, while the family contracts stay
-//! namespaced under [`ordered`] and [`git`]. Conformance harnesses
-//! (`conformance`) are flat-exported as cross-cutting test utilities consumed
-//! by multiple downstream crates, matching the pattern in `persistence`.
+//! namespaced under [`ordered`] and [`git`]. Conformance harnesses stay
+//! namespaced under [`conformance`] as cross-cutting test utilities consumed
+//! by multiple downstream crates.
 //!
 //! Family modules compose from the shared layers instead of inheriting a
 //! single universal connector model: [`ordered`] and [`git`] depend on
@@ -64,7 +64,7 @@
 //! - Byte wrappers: [`ItemKey`], [`ItemRef`], [`TokenBytes`]
 //! - Pooled slab owner for page-scoped toxic-byte wrappers: [`PooledByteSlab`]
 //! - Shared paging vocabulary: [`PageBuf`], [`PageState`], [`PagingCapabilities`],
-//!   [`KeyedPageItem`], [`PageShapeError`]
+//!   [`KeyedPageItem`], [`PageShapeError`], [`PageSequenceViolation`]
 //! - Paging bridge: [`Cursor`]
 //! - Version semantics: [`VersionId`]
 //! - Optional metadata: [`ContentHints`], [`Location`]
@@ -76,16 +76,17 @@
 //! - Connector feature flags: [`ConnectorCapabilities`]
 //! - Ordered-content family contract: [`ordered::OrderedContentCapabilities`],
 //!   [`ordered::OrderedContentSource`]
-//! - Ordered-content conformance harness:
-//!   [`run_ordered_content_conformance`],
-//!   [`drain_ordered_source`],
-//!   [`assert_repeatable_drain`],
-//!   [`assert_resume_after_corrupt_token`],
-//!   [`assert_no_item_ref_contains`]
-//! - Conformance snapshot types:
-//!   [`ObservedScanItem`],
-//!   [`OrderedContentDrain`],
-//!   [`OrderedContentConformanceError`]
+//! - Ordered-content conformance harness (under [`conformance`]):
+//!   [`conformance::run_ordered_content_conformance`],
+//!   [`conformance::drain_ordered_source`],
+//!   [`conformance::drain_ordered_source_from`],
+//!   [`conformance::assert_repeatable_drain`],
+//!   [`conformance::assert_resume_after_corrupt_token`],
+//!   [`conformance::assert_no_forbidden_fragments`]
+//! - Conformance snapshot types (under [`conformance`]):
+//!   [`conformance::ObservedScanItem`],
+//!   [`conformance::OrderedContentDrain`],
+//!   [`conformance::OrderedContentConformanceError`]
 //! - Git family types and contracts: [`git::RepoKey`], [`git::RepoLocator`],
 //!   [`git::GitRepoTarget`], [`git::GitSelection`], [`git::LocalMirror`],
 //!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
@@ -119,12 +120,8 @@ pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 #[doc(hidden)]
 pub use api::fmt_sanitized_message;
 pub use common::{
-    KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, validate_filled_page,
-};
-pub use conformance::{
-    ObservedScanItem, OrderedContentConformanceError, OrderedContentDrain,
-    assert_no_item_ref_contains, assert_repeatable_drain, assert_resume_after_corrupt_token,
-    drain_ordered_source, run_ordered_content_conformance,
+    KeyedPageItem, PageBuf, PageSequenceViolation, PageShapeError, PageState, PagingCapabilities,
+    validate_filled_page, validate_page_sequence,
 };
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, ItemKey, ItemRef, Location,

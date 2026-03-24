@@ -19,6 +19,7 @@ use gossip_coordination::{
     RunConfig, RunManagement,
 };
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
 use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
 use serde_json::Value;
 use tempfile::{NamedTempFile, tempdir};
@@ -236,6 +237,16 @@ fn distributed_now() -> LogicalTime {
     LogicalTime::from_raw(1)
 }
 
+fn distributed_filesystem_payload(path: &Path, mode: FilesystemSourceMode) -> Vec<u8> {
+    FilesystemShardPayload::new(
+        mode,
+        path.canonicalize()
+            .expect("distributed payload path must canonicalize"),
+    )
+    .encode()
+    .expect("distributed payload must encode")
+}
+
 fn setup_distributed_coordinator(
     path: &Path,
     lease_duration_ms: u64,
@@ -251,13 +262,10 @@ fn setup_distributed_coordinator(
         )
         .expect("create run");
 
-    let connector_extra = path
-        .to_str()
-        .expect("test path must be valid UTF-8")
-        .as_bytes();
+    let connector_extra = distributed_filesystem_payload(path, FilesystemSourceMode::DirectoryRoot);
     let mut scratch = ShardSpecScratch::new();
-    let spec_ref =
-        range_shard_ref(b"\x00", b"\xFF", connector_extra, &mut scratch).expect("range shard spec");
+    let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
+        .expect("range shard spec");
     let spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec");
     let shard_id = ShardId::from_raw(1);
     let shards = [InitialShardInput::new(
@@ -408,13 +416,16 @@ fn scan_budgets_reject_zero_bytes() {
 fn scan_fs_direct_rejects_nonexistent_path() {
     let error = scan_fs_direct(&FsScanConfig::new("/no/such/path"))
         .expect_err("nonexistent path should fail");
-    assert!(matches!(
-        error,
-        ScanRuntimeError::InvalidPath {
-            source: "filesystem",
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            error,
+            ScanRuntimeError::InvalidPath {
+                source: "filesystem",
+                ..
+            }
+        ),
+        "nonexistent path surfaces as an InvalidPath error: {error}"
+    );
 }
 
 #[test]
@@ -436,23 +447,45 @@ fn scan_fs_direct_scans_directory_with_custom_rules() {
 }
 
 #[test]
-fn scan_fs_connector_matches_direct_counters() {
+fn scan_fs_connector_uses_ordered_page_fill_runtime() {
     let dir = tempdir().expect("tempdir");
-    fs::write(dir.path().join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    fs::write(dir.path().join("a.txt"), "a").expect("write first fixture");
+    fs::write(dir.path().join("secret.txt"), "prefix TOK_ABCDEFGH suffix")
+        .expect("write secret fixture");
+    fs::write(dir.path().join("z.txt"), "zz").expect("write last fixture");
     let rules = write_runtime_rules();
     let rules_path = rules.path().to_path_buf();
-    let base = FsScanConfig::new(dir.path()).with_rules_file(Some(rules_path));
+    let base = FsScanConfig::new(dir.path())
+        .with_rules_file(Some(rules_path))
+        .with_budgets(ScanBudgets {
+            max_items: 1,
+            max_bytes: 1_024,
+        });
 
     let direct = scan_fs(&base.clone().with_execution_mode(ExecutionMode::Direct))
         .expect("direct filesystem scan");
     let connector = scan_fs(&base.with_execution_mode(ExecutionMode::Connector))
         .expect("connector filesystem scan");
 
-    assert_eq!(connector.items_scanned, direct.items_scanned);
-    assert_eq!(connector.bytes_scanned, direct.bytes_scanned);
-    assert_eq!(connector.chunks_scanned, direct.chunks_scanned);
-    assert_eq!(connector.findings_emitted, direct.findings_emitted);
-    assert_eq!(connector.errors, direct.errors);
+    assert_eq!(
+        connector.items_scanned, 1,
+        "connector mode should report only the first validated ordered page"
+    );
+    assert_eq!(
+        connector.bytes_scanned, 1,
+        "the first ordered item is a.txt with one byte of content"
+    );
+    assert_eq!(connector.findings_emitted, 0);
+    assert_eq!(connector.errors, 0);
+
+    assert!(
+        direct.items_scanned >= 3,
+        "direct mode still performs the full local scan"
+    );
+    assert!(
+        direct.findings_emitted >= 1,
+        "direct mode still executes rule matching on item content"
+    );
 }
 
 #[test]
@@ -1051,7 +1084,7 @@ fn scan_git_with_runtime_returns_empty_report_when_pre_cancelled() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedCoreEvent round-trip fidelity (F11)
+// OwnedCoreEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1131,7 +1164,7 @@ fn owned_core_event_diagnostic_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedGitEvent round-trip fidelity (F11)
+// OwnedGitEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1693,4 +1726,42 @@ fn scan_local_filesystem_rejects_multi_worker_persist() {
         err_msg.contains("workers=1"),
         "error should mention workers=1, got: {err_msg}"
     );
+}
+
+#[test]
+fn scan_fs_connector_reports_all_items_when_budget_fits_entire_directory() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("a.txt"), "abc").expect("write a.txt");
+    fs::write(dir.path().join("b.txt"), "defgh").expect("write b.txt");
+
+    let config = FsScanConfig::new(dir.path())
+        .with_execution_mode(ExecutionMode::Connector)
+        .with_budgets(ScanBudgets {
+            max_items: 256,
+            max_bytes: 1_000_000,
+        });
+
+    let report = scan_fs(&config).expect("connector scan should succeed");
+
+    assert_eq!(
+        report.items_scanned, 2,
+        "both files fit within the page budget"
+    );
+    assert_eq!(
+        report.bytes_scanned, 8,
+        "total bytes: 3 (a.txt) + 5 (b.txt)"
+    );
+}
+
+#[test]
+fn scan_fs_connector_handles_single_file_path() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("target.txt");
+    fs::write(&file_path, "1234567").expect("write target.txt");
+
+    let config = FsScanConfig::new(&file_path).with_execution_mode(ExecutionMode::Connector);
+
+    let report = scan_fs(&config).expect("connector scan of single file should succeed");
+
+    assert_eq!(report.items_scanned, 1, "single file produces one item");
 }

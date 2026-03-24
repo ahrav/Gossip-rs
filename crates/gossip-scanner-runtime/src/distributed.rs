@@ -70,15 +70,16 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Error as AnyError, Result, anyhow};
+use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_contracts::{
-    connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    coordination::{RestoredShardState, ShardSpec},
     identity::{
         CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
         RuleFingerprint, RunId, ShardKey, TenantId, TenantSecretKey, WorkerId, domain_hasher,
@@ -87,9 +88,11 @@ use gossip_contracts::{
     persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
 };
 use gossip_coordination::{
-    AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, Lease, OpKind,
+    AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, CursorSemantics, Lease,
+    OpKind,
 };
 use gossip_frontier::decode_connector_extra;
+use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode};
 use scanner_scheduler::store::FsFindingRecord;
 
 use crate::{
@@ -159,6 +162,30 @@ impl WorkerIdentity {
     }
 }
 
+/// Hydrated filesystem scan config bundled with the explicit source mode decoded from shard metadata.
+#[derive(Clone, Debug)]
+struct HydratedFilesystemSource {
+    scan_config: FsScanConfig,
+    source_mode: FilesystemSourceMode,
+}
+
+impl HydratedFilesystemSource {
+    fn new(scan_config: FsScanConfig, source_mode: FilesystemSourceMode) -> Self {
+        Self {
+            scan_config,
+            source_mode,
+        }
+    }
+
+    fn scan_config(&self) -> &FsScanConfig {
+        &self.scan_config
+    }
+
+    fn source_mode(&self) -> FilesystemSourceMode {
+        self.source_mode
+    }
+}
+
 /// Lease payload consumed by the distributed runtime.
 ///
 /// One lease corresponds to one shard from the coordination layer. It carries
@@ -166,26 +193,40 @@ impl WorkerIdentity {
 ///
 /// - **`shard_id`** — string label for telemetry routing.
 /// - **`lease`** — authoritative coordination lease used for terminal completion.
-/// - **`range_start`** — inclusive lower bound of the shard's key range, used as
-///   the fallback cursor when no items are committed.
-/// - **`scan_config`** — filesystem scan configuration for this shard, derived
-///   from the worker template with optional shard-level path overrides.
+/// - **`state`** — shard bounds, resume cursor, and cursor semantics restored
+///   from the acquire/restore coordination payload.
+/// - **`filesystem_source`** — filesystem scan configuration for this shard,
+///   derived from the worker template and hydrated from typed shard payload
+///   bytes, plus the explicit source mode that the control plane registered.
 /// - **`write_context`** — numeric shard identity plus fencing epoch for all
 ///   persistence writes.
 /// - **`tenant_secret_key`** — key material for secret-hash derivation.
 ///
-/// The coordination lease and range start are kept together so that
-/// shard completion can finalize the lease without a side-map.
+/// # Lifecycle
+///
+/// 1. **Claim** — the coordination facade's acquire/restore call returns a
+///    [`Lease`] and restored state.
+/// 2. **Prepare** — `ShardLease::new` bundles the lease, restored state,
+///    hydrated filesystem source, and write context together.
+/// 3. **Execute** — the distributed worker loop scans the shard and commits
+///    findings using the bundled write context.
+/// 4. **Complete** — terminal completion uses the bundled [`Lease`] to emit
+///    a receipt-driven checkpoint cursor.
+///
+/// The coordination lease and restored shard state stay together so later
+/// runtime helpers can execute ordered-content work without a second acquire
+/// payload or side-map.
 #[derive(Clone, Debug)]
 pub struct ShardLease {
     /// String shard label used for routing recorder events.
     shard_id: Arc<str>,
     /// Authoritative coordination-layer lease used for terminal completion.
     lease: Lease,
-    /// Inclusive lower bound of the shard's key range.
-    range_start: Vec<u8>,
-    /// Filesystem scan configuration for this shard.
-    scan_config: FsScanConfig,
+    /// Shard bounds, resume cursor, and cursor semantics restored from
+    /// the acquire/restore coordination payload.
+    state: RestoredShardState,
+    /// Hydrated filesystem scan state for this shard.
+    filesystem_source: HydratedFilesystemSource,
     /// Shared routing and fencing metadata for all writes emitted under the
     /// lease.
     write_context: WriteContext,
@@ -195,19 +236,19 @@ pub struct ShardLease {
 
 impl ShardLease {
     /// Construct one concrete filesystem shard lease.
-    pub fn new(
+    fn new(
         shard_id: Arc<str>,
         lease: Lease,
-        range_start: Vec<u8>,
-        scan_config: FsScanConfig,
+        state: RestoredShardState,
+        filesystem_source: HydratedFilesystemSource,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
     ) -> Self {
         Self {
             shard_id,
             lease,
-            range_start,
-            scan_config,
+            state,
+            filesystem_source,
             write_context,
             tenant_secret_key,
         }
@@ -233,18 +274,60 @@ impl ShardLease {
         self.lease
     }
 
+    /// Restored coordination state for this shard.
+    #[inline]
+    #[must_use]
+    pub fn restored_state(&self) -> &RestoredShardState {
+        &self.state
+    }
+
     /// Inclusive lower bound of the shard's key range.
     #[inline]
     #[must_use]
     pub fn range_start(&self) -> &[u8] {
-        &self.range_start
+        self.state.shard_spec().key_range_start()
+    }
+
+    /// Exclusive upper bound of the shard's key range.
+    #[inline]
+    #[must_use]
+    pub fn range_end(&self) -> &[u8] {
+        self.state.shard_spec().key_range_end()
+    }
+
+    /// Full authoritative shard specification restored from acquire/restore.
+    #[inline]
+    #[must_use]
+    pub fn shard_spec(&self) -> &ShardSpec {
+        self.state.shard_spec()
+    }
+
+    /// Authoritative resume cursor restored from acquire/restore.
+    #[inline]
+    #[must_use]
+    pub fn resume_cursor(&self) -> &Cursor {
+        self.state.resume_cursor()
+    }
+
+    /// Coordination cursor semantics for this shard.
+    #[inline]
+    #[must_use]
+    pub fn cursor_semantics(&self) -> CursorSemantics {
+        self.state.cursor_semantics()
     }
 
     /// Filesystem scan configuration for this shard.
     #[inline]
     #[must_use]
     pub fn scan_config(&self) -> &FsScanConfig {
-        &self.scan_config
+        self.filesystem_source.scan_config()
+    }
+
+    /// Explicit filesystem source mode restored from shard metadata.
+    #[inline]
+    #[must_use]
+    pub fn source_mode(&self) -> FilesystemSourceMode {
+        self.filesystem_source.source_mode()
     }
 
     /// Shared routing and fencing metadata for all writes emitted under the
@@ -260,6 +343,15 @@ impl ShardLease {
     #[must_use]
     pub fn tenant_secret_key(&self) -> TenantSecretKey {
         self.tenant_secret_key
+    }
+
+    /// Build an ordered-content runtime input from this lease's restored state.
+    #[must_use]
+    pub fn to_runtime_input(
+        &self,
+        budgets: Budgets,
+    ) -> crate::ordered_content::OrderedContentRuntimeInput {
+        crate::ordered_content::OrderedContentRuntimeInput::new(self.state.clone(), budgets)
     }
 }
 
@@ -962,38 +1054,89 @@ const CLAIM_RACE_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// spec start is empty.
 const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
 
-/// Build a filesystem scan config by overlaying shard metadata onto a template.
+/// Build hydrated filesystem source state by decoding shard metadata onto a
+/// worker-owned scan template.
 ///
-/// If the shard's `connector_extra` field contains a non-empty UTF-8 path,
-/// that path overrides the template's `path` field. Otherwise the template
-/// path is used as-is.
-fn scan_config_from_spec(
+/// The shard's `connector_extra` bytes must contain a typed filesystem payload.
+/// Hydration restores the canonical root path, validates it against the
+/// payload's explicit source mode, and then overlays that path onto the worker
+/// template.
+///
+/// # Trust boundary
+///
+/// The `connector_extra` metadata originates from a trusted coordination backend,
+/// so no path-containment check is performed here. If the coordination backend
+/// ever accepts untrusted shard metadata, apply
+/// [`FilesystemRequest::normalize_within`] at submission time to verify the
+/// canonical path falls within allowed roots before registration. Downstream,
+/// the filesystem runtime still validates the hydrated path and the connector's
+/// `openat`/`O_NOFOLLOW` enforcement prevents symlink traversal during reads.
+/// Hydration uses `symlink_metadata` to reject symlinks before they reach the
+/// connector layer.
+///
+/// [`FilesystemRequest::normalize_within`]: gossip_orchestrator::FilesystemRequest::normalize_within
+fn hydrate_filesystem_source_from_spec(
     spec: gossip_coordination::ShardSpecRef<'_>,
     scan_template: &FsScanConfig,
-) -> Result<FsScanConfig> {
+) -> Result<HydratedFilesystemSource> {
+    fn validate_payload_path_kind(payload: &FilesystemShardPayload) -> Result<()> {
+        let metadata = fs::symlink_metadata(payload.canonical_root())
+            .context("failed to inspect filesystem shard payload path")?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            anyhow::bail!("filesystem shard payload path is a symlink; expected a canonical path");
+        }
+        let actual_kind = FilesystemPathKind::from_file_type(&file_type).ok_or_else(|| {
+            anyhow!("filesystem shard payload path must be a regular file or directory")
+        })?;
+        let expected_kind = payload.mode().expected_path_kind();
+        if actual_kind != expected_kind {
+            return Err(anyhow!(
+                "filesystem shard payload mode '{}' requires a {}, but the path is a {}",
+                payload.mode(),
+                expected_kind,
+                actual_kind
+            ));
+        }
+        Ok(())
+    }
+
     let mut scan_config = scan_template.clone();
     let connector_extra = decode_connector_extra(spec)
         .map_err(|err| anyhow!("failed to decode shard metadata envelope: {err}"))?;
+    let payload = FilesystemShardPayload::decode(connector_extra)
+        .map_err(|err| anyhow!("failed to decode filesystem shard payload: {err}"))?;
+    validate_payload_path_kind(&payload)?;
+    scan_config.path = payload.canonical_root().to_path_buf();
 
-    if !connector_extra.is_empty() {
-        let path = std::str::from_utf8(connector_extra)
-            .map_err(|err| anyhow!("filesystem shard metadata path is not valid UTF-8: {err}"))?;
-        scan_config.path = PathBuf::from(path);
-    }
-
-    Ok(scan_config)
+    Ok(HydratedFilesystemSource::new(scan_config, payload.mode()))
 }
 
 /// Convert an acquired coordination lease into the concrete runtime payload.
 ///
 /// Constructs a [`WriteContext`] from the lease's fencing fields and the
-/// worker's policy hash, then decodes the shard spec's `connector_extra`
-/// to derive the filesystem scan path.
+/// worker's policy hash, restores an owned [`ShardSpec`] and resume
+/// [`Cursor`] from the acquired snapshot, then decodes the shard spec's typed
+/// filesystem payload to restore the scan path and source mode.
 fn build_lease_from_acquire(
     acquired: AcquireResultView<'_>,
     identity: &WorkerIdentity,
 ) -> Result<ShardLease> {
-    let spec = acquired.snapshot.spec();
+    let snapshot = acquired.snapshot;
+    let spec = snapshot.spec();
+    let shard_spec = ShardSpec::try_from_ref(spec).with_context(|| {
+        format!(
+            "failed to restore shard spec for shard {}",
+            acquired.lease.shard()
+        )
+    })?;
+    let resume_cursor = Cursor::try_from_update(snapshot.cursor()).with_context(|| {
+        format!(
+            "failed to restore cursor for shard {}",
+            acquired.lease.shard()
+        )
+    })?;
+    let state = RestoredShardState::new(shard_spec, resume_cursor, snapshot.cursor_semantics());
     let write_context = WriteContext::new(
         acquired.lease.tenant(),
         identity.policy_hash,
@@ -1005,8 +1148,8 @@ fn build_lease_from_acquire(
     Ok(ShardLease::new(
         Arc::from(acquired.lease.shard().to_string()),
         acquired.lease,
-        spec.key_range_start().to_vec(),
-        scan_config_from_spec(spec, &identity.scan_template)?,
+        state,
+        hydrate_filesystem_source_from_spec(spec, &identity.scan_template)?,
         write_context,
         identity.tenant_secret_key,
     ))
@@ -1458,6 +1601,7 @@ mod tests {
         RunManagement, ShardClaiming, ShardFilter, ShardStatus,
     };
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+    use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
     use tempfile::tempdir;
 
@@ -1545,6 +1689,16 @@ mod tests {
         FsScanConfig::new(path.as_ref().to_path_buf())
     }
 
+    fn filesystem_payload(path: &Path, mode: FilesystemSourceMode) -> Vec<u8> {
+        FilesystemShardPayload::new(
+            mode,
+            path.canonicalize()
+                .expect("test filesystem payload paths must canonicalize"),
+        )
+        .encode()
+        .expect("test filesystem payload must encode")
+    }
+
     fn worker_identity(path: &Path) -> WorkerIdentity {
         WorkerIdentity::new(
             tenant(),
@@ -1627,12 +1781,7 @@ mod tests {
     ) -> CoordinationInMemoryCoordinator {
         let connector_extra: Vec<Vec<u8>> = paths
             .iter()
-            .map(|path| {
-                path.to_str()
-                    .expect("test paths must be valid UTF-8")
-                    .as_bytes()
-                    .to_vec()
-            })
+            .map(|path| filesystem_payload(path, FilesystemSourceMode::DirectoryRoot))
             .collect();
         setup_coordinator_with_connector_extra(&connector_extra, lease_duration_ms)
     }
@@ -1652,11 +1801,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(idx, (path, start, end))| {
-                let connector_extra = path
-                    .to_str()
-                    .expect("test paths must be valid UTF-8")
-                    .as_bytes();
-                let spec_ref = range_shard_ref(start, end, connector_extra, &mut scratch)
+                let connector_extra = filesystem_payload(path, FilesystemSourceMode::DirectoryRoot);
+                let spec_ref = range_shard_ref(start, end, &connector_extra, &mut scratch)
                     .expect("range shard spec");
                 (
                     ShardId::from_raw(idx as u64 + 1),
@@ -2621,29 +2767,124 @@ mod tests {
     }
 
     #[test]
-    fn build_lease_from_acquire_uses_metadata_path_override() {
+    fn build_lease_from_acquire_hydrates_directory_root_payload() {
         let dir = tempdir().expect("tempdir");
         let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize directory");
 
         assert_eq!(lease.shard_id(), "ShardId(1)");
-        assert_eq!(lease.scan_config().path, dir.path());
+        assert_eq!(lease.scan_config().path, canonical_dir);
+        assert_eq!(lease.source_mode(), FilesystemSourceMode::DirectoryRoot);
         assert_eq!(lease.write_context().tenant_id(), tenant());
         assert_eq!(lease.write_context().run_id(), run());
         assert_eq!(lease.write_context().shard_id(), ShardId::from_raw(1));
         assert_eq!(lease.write_context().policy_hash(), policy_hash());
         assert_eq!(lease.write_context().fence_epoch(), FenceEpoch::from_raw(2));
         assert_eq!(lease.range_start(), &[0u8]);
+        assert_eq!(lease.range_end(), &[1u8]);
+        assert!(lease.resume_cursor().last_key().is_none());
+        assert!(lease.resume_cursor().token().is_none());
+        assert_eq!(lease.cursor_semantics(), CursorSemantics::Completed);
     }
 
     #[test]
-    fn build_lease_from_acquire_falls_back_to_template_path_when_metadata_empty() {
-        let mut coordinator = setup_coordinator_with_connector_extra(&[Vec::new()], 30_000);
+    fn build_lease_from_acquire_hydrates_single_file_payload() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("single-file.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+        let payload = filesystem_payload(&file_path, FilesystemSourceMode::SingleFile);
+        let mut coordinator = setup_coordinator_with_connector_extra(&[payload], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
+        let canonical_file = file_path.canonicalize().expect("canonicalize file");
 
-        assert_eq!(lease.scan_config().path, Path::new("/fallback"));
+        assert_eq!(lease.scan_config().path, canonical_file);
+        assert_eq!(lease.source_mode(), FilesystemSourceMode::SingleFile);
+    }
+
+    #[test]
+    fn build_lease_from_acquire_rejects_empty_filesystem_payload() {
+        let mut coordinator = setup_coordinator_with_connector_extra(&[Vec::new()], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let mut scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(
+                wall_clock_now(),
+                identity.tenant,
+                identity.run,
+                identity.worker,
+                &mut scratch,
+            )
+            .expect("claim next available");
+        let err = build_lease_from_acquire(acquired, &identity)
+            .expect_err("empty filesystem payload must be rejected");
+
+        assert!(
+            err.to_string().contains(
+                "failed to decode filesystem shard payload: filesystem shard payload is empty"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_lease_from_acquire_preserves_restored_cursor_and_full_bounds() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = CoordinationInMemoryCoordinator::new(30_000);
+        let now = wall_clock_now();
+        coordinator
+            .create_run(now, tenant(), run(), test_run_config(30_000))
+            .expect("create run");
+
+        let mut scratch = ShardSpecScratch::new();
+        let connector_extra = filesystem_payload(dir.path(), FilesystemSourceMode::DirectoryRoot);
+        let spec_ref =
+            range_shard_ref(b"a", b"m", &connector_extra, &mut scratch).expect("range shard spec");
+        let shard_spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec");
+        let initial_cursor = CoordCursorUpdate::with_token(b"f.txt", b"resume-token");
+        let shards = [InitialShardInput::new(
+            ShardId::from_raw(1),
+            shard_spec.as_ref(),
+            initial_cursor,
+        )];
+        let _ = coordinator
+            .register_shards(now, tenant(), run(), &shards, OpId::from_raw(1))
+            .expect("register shards");
+
+        let mut acquire_scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(
+                wall_clock_now(),
+                tenant(),
+                run(),
+                worker(1),
+                &mut acquire_scratch,
+            )
+            .expect("claim next available");
+        let lease = build_lease_from_acquire(acquired, &worker_identity(Path::new("/fallback")))
+            .expect("runtime lease");
+
+        assert_eq!(lease.range_start(), b"a");
+        assert_eq!(lease.range_end(), b"m");
+        assert_eq!(
+            lease
+                .resume_cursor()
+                .last_key()
+                .expect("resume cursor last_key")
+                .as_bytes(),
+            b"f.txt"
+        );
+        assert_eq!(
+            lease
+                .resume_cursor()
+                .token()
+                .expect("resume cursor token")
+                .as_bytes(),
+            b"resume-token"
+        );
+        assert_eq!(lease.cursor_semantics(), CursorSemantics::Completed);
     }
 
     #[test]
@@ -3020,8 +3261,15 @@ mod tests {
     }
 
     #[test]
-    fn build_lease_from_acquire_rejects_non_utf8_connector_extra() {
-        let mut coordinator = setup_coordinator_with_connector_extra(&[vec![0xFF, 0xFE]], 30_000);
+    fn build_lease_from_acquire_rejects_non_utf8_filesystem_payload_path() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("target.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+        let mut payload = filesystem_payload(&file_path, FilesystemSourceMode::SingleFile);
+        // Wire format: byte 0 = mode tag, bytes 1.. = UTF-8 path.
+        // Overwriting byte 2 injects an invalid UTF-8 byte into the path portion.
+        payload[2] = 0xFF;
+        let mut coordinator = setup_coordinator_with_connector_extra(&[payload], 30_000);
         let mut scratch = AcquireScratch::new();
         let acquired = coordinator
             .claim_next_available(wall_clock_now(), tenant(), run(), worker(1), &mut scratch)
@@ -3029,9 +3277,61 @@ mod tests {
         let identity = worker_identity(Path::new("/fallback"));
 
         let err = build_lease_from_acquire(acquired, &identity)
-            .expect_err("non-UTF-8 connector_extra must be rejected");
+            .expect_err("non-UTF-8 filesystem payload path must be rejected");
         assert!(
-            err.to_string().contains("not valid UTF-8"),
+            err.to_string()
+                .contains("filesystem shard payload mode 'single_file' path is not valid UTF-8"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_lease_from_acquire_rejects_payload_mode_path_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let payload = FilesystemShardPayload::new(FilesystemSourceMode::SingleFile, dir.path())
+            .encode()
+            .expect("mismatched payload should still encode");
+        let mut coordinator = setup_coordinator_with_connector_extra(&[payload], 30_000);
+        let mut scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(wall_clock_now(), tenant(), run(), worker(1), &mut scratch)
+            .expect("claim next available");
+        let identity = worker_identity(Path::new("/fallback"));
+
+        let err = build_lease_from_acquire(acquired, &identity)
+            .expect_err("mode/path mismatch must fail during hydration");
+        assert!(
+            err.to_string()
+                .contains("filesystem shard payload mode 'single_file' requires a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_lease_from_acquire_rejects_symlink_payload_path() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("real.txt");
+        fs::write(&target, "fixture").expect("write target");
+        let link = dir.path().join("link.txt");
+        unix_fs::symlink(&target, &link).expect("create symlink");
+
+        let payload = FilesystemShardPayload::new(FilesystemSourceMode::SingleFile, &link)
+            .encode()
+            .expect("symlink payload should encode");
+        let mut coordinator = setup_coordinator_with_connector_extra(&[payload], 30_000);
+        let mut scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(wall_clock_now(), tenant(), run(), worker(1), &mut scratch)
+            .expect("claim next available");
+        let identity = worker_identity(Path::new("/fallback"));
+
+        let err = build_lease_from_acquire(acquired, &identity)
+            .expect_err("symlink payload path must be rejected");
+        assert!(
+            err.to_string().contains("is a symlink"),
             "unexpected error: {err}"
         );
     }

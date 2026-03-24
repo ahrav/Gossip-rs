@@ -4,7 +4,8 @@
 //! also need confidence that page sequences advance monotonically, resume from
 //! `last_key` even when tokens are stale or corrupt, terminate cleanly with an
 //! exhausted-empty `None` call, and do not leak connector-root fragments into
-//! emitted [`ItemRef`] values.
+//! emitted [`ItemRef`], [`ItemKey`], [`Location::display`], or [`Location::url`]
+//! values.
 //!
 //! This module provides a reusable test kit for that purpose. It assumes the
 //! factory passed to [`run_ordered_content_conformance`] produces fresh sources
@@ -14,9 +15,9 @@ use std::{error::Error, fmt};
 
 use crate::{
     connector::{
-        Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef, PageShapeError,
-        PageState, ScanItem, TokenBytes, ToxicDigest, VersionId, ordered::OrderedContentSource,
-        validate_filled_page,
+        Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef, Location,
+        PageSequenceViolation, PageShapeError, PageState, ScanItem, TokenBytes, ToxicDigest,
+        VersionId, ordered::OrderedContentSource, validate_page_sequence,
     },
     coordination::ShardSpec,
     identity::StableItemId,
@@ -34,9 +35,8 @@ const CORRUPT_TOKEN_BYTES: &[u8] = b"ordered-content-conformance-corrupt-token";
 
 /// Stable snapshot of one emitted [`ScanItem`] for conformance comparisons.
 ///
-/// Omits `content_hints` and `location` from [`ScanItem`], which are
-/// presentation-only metadata irrelevant to ordered-content conformance
-/// checks.
+/// Omits `content_hints` from [`ScanItem`], which is presentation-only
+/// metadata irrelevant to ordered-content conformance checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedScanItem {
     item_key: ItemKey,
@@ -44,6 +44,7 @@ pub struct ObservedScanItem {
     stable_item_id: StableItemId,
     version: VersionId,
     size_hint: Option<u64>,
+    location: Option<Location>,
 }
 
 impl ObservedScanItem {
@@ -76,6 +77,12 @@ impl ObservedScanItem {
     pub fn size_hint(&self) -> Option<u64> {
         self.size_hint
     }
+
+    /// Returns the optional display-safe location metadata.
+    #[must_use]
+    pub fn location(&self) -> Option<&Location> {
+        self.location.as_ref()
+    }
 }
 
 impl From<&ScanItem> for ObservedScanItem {
@@ -86,6 +93,7 @@ impl From<&ScanItem> for ObservedScanItem {
             stable_item_id: item.stable_item_id(),
             version: item.version(),
             size_hint: item.size_hint(),
+            location: item.location().cloned(),
         }
     }
 }
@@ -151,6 +159,21 @@ impl OrderedContentDrain {
     }
 }
 
+/// Diagnostic detail for drain-comparison divergences.
+///
+/// Used by both determinism and corrupt-token-fallback checks to report
+/// where two independent drains of the same source first disagreed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainDivergence {
+    /// Zero-based index of the first item that differs, or `None` when items
+    /// match but page partitioning diverges.
+    pub first_divergent_item: Option<usize>,
+    /// Redacted digest of the expected key at the divergence point.
+    pub expected_key: Option<ToxicDigest>,
+    /// Redacted digest of the actual key at the divergence point.
+    pub actual_key: Option<ToxicDigest>,
+}
+
 /// Failure reported by the ordered-content conformance harness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentConformanceError {
@@ -194,24 +217,40 @@ pub enum OrderedContentConformanceError {
     /// The harness exceeded its hard safety cap on page count.
     TooManyPages { limit: usize },
     /// Two fresh sources over the same fixed view produced different drains.
-    DeterminismMismatch {
-        /// Index of the first item where the two drains diverged, or `None`
-        /// when the drains matched on items but differed on page partitioning.
-        first_divergent_item: Option<usize>,
-    },
+    DeterminismMismatch(DrainDivergence),
     /// Key-only resume and corrupt-token resume produced different suffixes.
-    TokenFallbackMismatch {
-        /// Index of the first item where the two suffixes diverged, or `None`
-        /// when the suffixes matched on items but differed on page partitioning.
-        first_divergent_item: Option<usize>,
-    },
-    /// An emitted item reference contained a caller-supplied forbidden byte
-    /// fragment.
-    ForbiddenItemRefFragment {
+    TokenFallbackMismatch(DrainDivergence),
+    /// An emitted item contained a caller-supplied forbidden byte fragment.
+    ForbiddenFragment {
         item_index: usize,
+        field: &'static str,
         fragment: ToxicDigest,
-        item_ref: ToxicDigest,
+        content: ToxicDigest,
     },
+}
+
+/// Formats a [`DrainDivergence`] with a caller-supplied prefix that
+/// distinguishes between determinism checks and token-fallback checks.
+fn fmt_divergence(
+    f: &mut fmt::Formatter<'_>,
+    prefix: &str,
+    divergence: &DrainDivergence,
+) -> fmt::Result {
+    match divergence.first_divergent_item {
+        Some(idx) => {
+            write!(f, "ordered-content conformance {prefix} at item {idx}")?;
+            if let (Some(expected), Some(actual)) =
+                (&divergence.expected_key, &divergence.actual_key)
+            {
+                write!(f, ": expected key {expected}, got {actual}")?;
+            }
+            Ok(())
+        }
+        None => write!(
+            f,
+            "ordered-content conformance {prefix} on page partitioning"
+        ),
+    }
 }
 
 impl fmt::Display for OrderedContentConformanceError {
@@ -262,37 +301,18 @@ impl fmt::Display for OrderedContentConformanceError {
                 f,
                 "ordered-content conformance exceeded the safety cap of {limit} pages"
             ),
-            Self::DeterminismMismatch {
-                first_divergent_item,
-            } => match first_divergent_item {
-                Some(idx) => write!(
-                    f,
-                    "ordered-content conformance fresh drains diverged at item {idx}"
-                ),
-                None => write!(
-                    f,
-                    "ordered-content conformance fresh drains matched on items but diverged on page partitioning"
-                ),
-            },
-            Self::TokenFallbackMismatch {
-                first_divergent_item,
-            } => match first_divergent_item {
-                Some(idx) => write!(
-                    f,
-                    "ordered-content conformance corrupt-token resume diverged from key-only resume at item {idx}"
-                ),
-                None => write!(
-                    f,
-                    "ordered-content conformance corrupt-token resume matched on items but diverged on page partitioning"
-                ),
-            },
-            Self::ForbiddenItemRefFragment {
+            Self::DeterminismMismatch(d) => fmt_divergence(f, "fresh drains diverged", d),
+            Self::TokenFallbackMismatch(d) => {
+                fmt_divergence(f, "corrupt-token resume diverged from key-only resume", d)
+            }
+            Self::ForbiddenFragment {
                 item_index,
+                field,
                 fragment,
-                item_ref,
+                content,
             } => write!(
                 f,
-                "ordered-content conformance item_ref leak at item {item_index}: item_ref ({item_ref}) contained forbidden fragment ({fragment})"
+                "ordered-content conformance {field} leak at item {item_index}: {field} ({content}) contained forbidden fragment ({fragment})"
             ),
         }
     }
@@ -320,27 +340,40 @@ impl Error for OrderedContentConformanceError {
 /// `fill_page` call during drains. Choose values small enough to force
 /// multi-page sequences so the harness exercises cursor advancement.
 ///
-/// `forbidden_item_ref_fragments` lists byte substrings that must not appear
-/// anywhere inside any emitted `ItemRef`. Use this to detect root-path or
-/// secret leakage (e.g., pass the filesystem root directory name). Empty
-/// fragments are silently ignored.
+/// `forbidden_fragments` lists byte substrings that must not appear anywhere
+/// inside any emitted `ItemRef`, `ItemKey`, `Location::display`, or
+/// `Location::url`. Use this to detect root-path or secret leakage (e.g.,
+/// pass the filesystem root directory name). Empty fragments are silently
+/// ignored.
 ///
 /// The suite performs four checks:
 ///
-/// 1. Drain page sequences while validating page shape, cursor advancement,
-///    and exhausted-empty behavior after a terminal page.
-/// 2. Repeat the drain on a fresh source and require an identical item
-///    sequence and identical page partitioning.
-/// 3. Verify that emitted item refs do not contain any caller-supplied
-///    forbidden byte fragments (skipped when `forbidden_item_ref_fragments`
-///    is empty).
-/// 4. Force a multi-page probe and require that a corrupt opaque token with
-///    the same `last_key` resumes to the same suffix as a key-only cursor.
+/// 1. **Page contract** — drain page sequences while validating non-empty
+///    shape, in-bounds keys, strict ordering, cursor advancement, and
+///    exhausted-empty behavior after a terminal page. Detects connector bugs
+///    that would break downstream resume logic.
+/// 2. **Determinism** — repeat the drain on a fresh source and require
+///    identical items in identical pages. Detects connectors that reorder
+///    items, repack pages, or vary behavior based on internal state.
+/// 3. **Forbidden fragments** — scan all emitted `ItemRef`, `ItemKey`,
+///    `Location::display`, and `Location::url` fields for caller-supplied
+///    byte patterns. Prevents root-path leakage or information disclosure
+///    in logging output (skipped when `forbidden_fragments` is empty).
+/// 4. **Token fallback** — force a multi-page probe and require that a
+///    corrupt opaque token with the same `last_key` resumes to the same
+///    suffix as a key-only cursor. Ensures the connector can fall back to
+///    key-only resumption if tokens are stale or corrupted in-flight.
 ///
 /// **Note**: The corrupt-token probe (step 4) fetches a first page with
 /// `max_items=1`. Sources with fewer than two total items in scope will not
 /// produce a `HasMore` page, so the token-fallback check is skipped
 /// (returns `Ok(false)`).
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::InvalidBudgets`] if `max_items`
+/// or `max_bytes` is zero. Other error variants indicate specific contract
+/// violations detected during the suite.
 ///
 /// Returns the drain from the first pass on success.
 pub fn run_ordered_content_conformance<F, S>(
@@ -348,20 +381,25 @@ pub fn run_ordered_content_conformance<F, S>(
     shard: &ShardSpec,
     max_items: usize,
     max_bytes: u64,
-    forbidden_item_ref_fragments: &[&[u8]],
+    forbidden_fragments: &[&[u8]],
 ) -> Result<OrderedContentDrain, OrderedContentConformanceError>
 where
     F: FnMut() -> S,
     S: OrderedContentSource,
 {
     let drain = assert_repeatable_drain(&mut factory, shard, max_items, max_bytes)?;
-    assert_no_item_ref_contains(&drain, forbidden_item_ref_fragments)?;
-    let _token_fallback_checked =
-        assert_resume_after_corrupt_token(&mut factory, shard, 1, max_items, max_bytes)?;
+    assert_no_forbidden_fragments(&drain, forbidden_fragments)?;
+    assert_resume_after_corrupt_token(&mut factory, shard, 1, max_items, max_bytes)?;
     Ok(drain)
 }
 
 /// Drain one ordered-content source to exhaustion under fixed budgets.
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::InvalidBudgets`] if `max_items`
+/// or `max_bytes` is zero. Other error variants indicate page-level contract
+/// violations detected during the drain.
 pub fn drain_ordered_source<S>(
     source: &mut S,
     shard: &ShardSpec,
@@ -376,8 +414,41 @@ where
     drain_from_cursor(source, shard, Cursor::initial(), budgets, DEFAULT_MAX_PAGES)
 }
 
+/// Drain one ordered-content source starting from an arbitrary cursor.
+///
+/// Like [`drain_ordered_source`] but resumes from `cursor` instead of the
+/// beginning. Use this to test mid-stream resume scenarios beyond the
+/// built-in corrupt-token probe.
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::InvalidBudgets`] if `max_items`
+/// or `max_bytes` is zero. Other error variants indicate page-level contract
+/// violations detected during the drain.
+pub fn drain_ordered_source_from<S>(
+    source: &mut S,
+    shard: &ShardSpec,
+    cursor: Cursor,
+    max_items: usize,
+    max_bytes: u64,
+) -> Result<OrderedContentDrain, OrderedContentConformanceError>
+where
+    S: OrderedContentSource,
+{
+    let budgets = Budgets::try_new(max_items, max_bytes, None)
+        .map_err(OrderedContentConformanceError::InvalidBudgets)?;
+    drain_from_cursor(source, shard, cursor, budgets, DEFAULT_MAX_PAGES)
+}
+
 /// Require that two fresh drains over the same factory-produced view are
 /// identical.
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::InvalidBudgets`] if `max_items`
+/// or `max_bytes` is zero. Returns
+/// [`OrderedContentConformanceError::DeterminismMismatch`] when the two
+/// drains produce different item sequences or page partitioning.
 pub fn assert_repeatable_drain<F, S>(
     factory: &mut F,
     shard: &ShardSpec,
@@ -395,9 +466,15 @@ where
     let second = drain_ordered_source(&mut second_source, shard, max_items, max_bytes)?;
 
     if first != second {
-        return Err(OrderedContentConformanceError::DeterminismMismatch {
-            first_divergent_item: first_divergent_index(&first, &second),
-        });
+        let (first_divergent_item, expected_key, actual_key) =
+            first_divergent_detail(&first, &second);
+        return Err(OrderedContentConformanceError::DeterminismMismatch(
+            DrainDivergence {
+                first_divergent_item,
+                expected_key,
+                actual_key,
+            },
+        ));
     }
     Ok(first)
 }
@@ -413,6 +490,13 @@ where
 /// Returns `Ok(true)` when the probe ran and passed, or `Ok(false)` when the
 /// source had too few items to produce a `HasMore` page and the check was not
 /// exercised.
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::InvalidBudgets`] if
+/// `first_page_max_items`, `drain_max_items`, or `max_bytes` is zero. Returns
+/// [`OrderedContentConformanceError::TokenFallbackMismatch`] when the
+/// key-only and corrupt-token suffixes diverge.
 pub fn assert_resume_after_corrupt_token<F, S>(
     factory: &mut F,
     shard: &ShardSpec,
@@ -441,22 +525,24 @@ where
         return Ok(false);
     };
 
-    validate_filled_page(
+    validate_page_sequence(
         first_page.items(),
+        first_page.state(),
+        None,
         shard.key_range_start(),
         shard.key_range_end(),
     )
-    .map_err(|source| OrderedContentConformanceError::InvalidPage {
-        page_index: 0,
-        source,
-    })?;
+    .map_err(|v| map_sequence_violation(v, 0, &None, &first_page))?;
 
     let PageState::HasMore { cursor } = first_page.state() else {
         return Ok(false);
     };
-    let Some(resume_key) = cursor.last_key().cloned() else {
-        return Err(OrderedContentConformanceError::HasMoreWithoutLastKey { page_index: 0 });
-    };
+    // validate_page_sequence guarantees HasMore carries a last_key that
+    // matches the page's actual last emitted key.
+    let resume_key = cursor
+        .last_key()
+        .cloned()
+        .expect("validate_page_sequence guarantees HasMore carries last_key");
 
     let mut clean_source = factory();
     let clean = drain_from_cursor(
@@ -479,58 +565,159 @@ where
     )?;
 
     if clean != corrupt {
-        return Err(OrderedContentConformanceError::TokenFallbackMismatch {
-            first_divergent_item: first_divergent_index(&clean, &corrupt),
-        });
+        let (first_divergent_item, expected_key, actual_key) =
+            first_divergent_detail(&clean, &corrupt);
+        return Err(OrderedContentConformanceError::TokenFallbackMismatch(
+            DrainDivergence {
+                first_divergent_item,
+                expected_key,
+                actual_key,
+            },
+        ));
     }
     Ok(true)
 }
 
-/// Require that no emitted item reference contains any forbidden byte
-/// fragment. Empty fragments are ignored.
-pub fn assert_no_item_ref_contains(
+/// Require that no emitted item contains any forbidden byte fragment in
+/// its `ItemRef`, `ItemKey`, or `Location` fields. Empty fragments are ignored.
+///
+/// # Errors
+///
+/// Returns [`OrderedContentConformanceError::ForbiddenFragment`] when any
+/// non-empty fragment appears as a substring in an emitted `ItemRef`,
+/// `ItemKey`, `Location::display`, or `Location::url`.
+pub fn assert_no_forbidden_fragments(
     drain: &OrderedContentDrain,
-    forbidden_item_ref_fragments: &[&[u8]],
+    forbidden_fragments: &[&[u8]],
 ) -> Result<(), OrderedContentConformanceError> {
     for (item_index, item) in drain.items().iter().enumerate() {
-        let item_ref = item.item_ref().as_bytes();
-        for fragment in forbidden_item_ref_fragments.iter().copied() {
-            if fragment.is_empty() {
-                continue;
-            }
-            if item_ref
-                .windows(fragment.len())
-                .any(|window| window == fragment)
-            {
-                return Err(OrderedContentConformanceError::ForbiddenItemRefFragment {
+        for &(field_name, field_bytes) in &[
+            ("item_ref", item.item_ref().as_bytes()),
+            ("item_key", item.item_key().as_bytes()),
+        ] {
+            check_field_for_fragments(item_index, field_name, field_bytes, forbidden_fragments)?;
+        }
+
+        if let Some(location) = item.location() {
+            check_field_for_fragments(
+                item_index,
+                "location_display",
+                location.display().as_bytes(),
+                forbidden_fragments,
+            )?;
+            if let Some(url) = location.url() {
+                check_field_for_fragments(
                     item_index,
-                    fragment: ToxicDigest::of_bytes(fragment),
-                    item_ref: ToxicDigest::of(item.item_ref()),
-                });
+                    "location_url",
+                    url.as_bytes(),
+                    forbidden_fragments,
+                )?;
             }
         }
     }
     Ok(())
 }
 
-/// Returns the index of the first item that differs between two drains, or
-/// `None` when items match but page partitioning diverges.
-fn first_divergent_index(a: &OrderedContentDrain, b: &OrderedContentDrain) -> Option<usize> {
-    let idx = a
+/// Scans `bytes` for any non-empty forbidden fragment substring, returning
+/// a `ForbiddenFragment` error on the first match.
+fn check_field_for_fragments(
+    item_index: usize,
+    field: &'static str,
+    bytes: &[u8],
+    forbidden_fragments: &[&[u8]],
+) -> Result<(), OrderedContentConformanceError> {
+    for fragment in forbidden_fragments.iter().copied() {
+        if fragment.is_empty() {
+            continue;
+        }
+        if bytes
+            .windows(fragment.len())
+            .any(|window| window == fragment)
+        {
+            return Err(OrderedContentConformanceError::ForbiddenFragment {
+                item_index,
+                field,
+                fragment: ToxicDigest::of_bytes(fragment),
+                content: ToxicDigest::of_bytes(bytes),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Locates the first divergence between two drains and returns the index
+/// plus redacted key digests at the divergent position.
+///
+/// Returns `(Some(idx), Some(expected), Some(actual))` when items differ at
+/// `idx`. Returns `(Some(idx), None, None)` when one drain is shorter.
+/// Returns `(None, None, None)` when items match but page partitioning
+/// diverges.
+fn first_divergent_detail(
+    a: &OrderedContentDrain,
+    b: &OrderedContentDrain,
+) -> (Option<usize>, Option<ToxicDigest>, Option<ToxicDigest>) {
+    if let Some(idx) = a
         .items()
         .iter()
         .zip(b.items().iter())
-        .position(|(ai, bi)| ai != bi);
-    if idx.is_some() {
-        return idx;
+        .position(|(ai, bi)| ai != bi)
+    {
+        return (
+            Some(idx),
+            Some(ToxicDigest::of(a.items()[idx].item_key())),
+            Some(ToxicDigest::of(b.items()[idx].item_key())),
+        );
     }
     // Items match up to the shorter length — a length difference is an item
     // divergence at the shorter length.
     if a.items().len() != b.items().len() {
-        return Some(a.items().len().min(b.items().len()));
+        return (Some(a.items().len().min(b.items().len())), None, None);
     }
     // Items are identical; page_lengths must differ.
-    None
+    (None, None, None)
+}
+
+/// Map a [`PageSequenceViolation`] to the corresponding conformance error
+/// variant, attaching `page_index` and cloning key values from the page.
+fn map_sequence_violation(
+    v: PageSequenceViolation,
+    page_index: usize,
+    previous_last: &Option<ItemKey>,
+    page: &super::common::PageBuf<ScanItem>,
+) -> OrderedContentConformanceError {
+    match v {
+        PageSequenceViolation::Shape(source) => {
+            OrderedContentConformanceError::InvalidPage { page_index, source }
+        }
+        PageSequenceViolation::CursorDidNotAdvance { .. } => {
+            let observed_key = page
+                .items()
+                .first()
+                .expect("Shape check passed, page is non-empty")
+                .item_key()
+                .clone();
+            OrderedContentConformanceError::CursorDidNotAdvance {
+                page_index,
+                previous_last: previous_last
+                    .clone()
+                    .expect("CursorDidNotAdvance requires a previous last key"),
+                observed_key,
+            }
+        }
+        PageSequenceViolation::HasMoreWithoutLastKey => {
+            OrderedContentConformanceError::HasMoreWithoutLastKey { page_index }
+        }
+        PageSequenceViolation::CursorPageMismatch {
+            cursor_last,
+            page_last,
+        } => OrderedContentConformanceError::ResumeCursorMismatch {
+            page_index,
+            expected_last: ItemKey::try_from_slice(&page_last)
+                .expect("page_last originated from a valid ItemKey"),
+            actual_last: ItemKey::try_from_slice(&cursor_last)
+                .expect("cursor_last originated from a valid ItemKey"),
+        },
+    }
 }
 
 /// Page-by-page drain with per-page validation.
@@ -538,12 +725,11 @@ fn first_divergent_index(a: &OrderedContentDrain, b: &OrderedContentDrain) -> Op
 /// Iterates `fill_page` calls from `cursor` until the source returns `None`
 /// (exhausted before first page) or `Complete`. On each page the loop:
 ///
-/// 1. Validates page shape via [`validate_filled_page`].
-/// 2. Checks that the first key on each page strictly advances past the
-///    previous `last_key` (from the prior page or from the initial cursor).
-/// 3. For `HasMore` pages, verifies the resume cursor's `last_key` matches
-///    the page's actual last emitted key.
-/// 4. After a `Complete` page, issues one additional suffix call to confirm
+/// 1. Validates page shape and inter-page sequence invariants via
+///    [`validate_page_sequence`].
+/// 2. Detects cursor stall (HasMore cursor whose `last_key` did not advance
+///    past the previous page boundary).
+/// 3. After a `Complete` page, issues one additional suffix call to confirm
 ///    the source truly has no more items.
 fn drain_from_cursor<S>(
     source: &mut S,
@@ -585,29 +771,19 @@ where
             return Ok(OrderedContentDrain::new(items, page_lengths));
         };
 
-        validate_filled_page(page.items(), shard.key_range_start(), shard.key_range_end())
-            .map_err(|source| OrderedContentConformanceError::InvalidPage { page_index, source })?;
-
-        let first_key = page
-            .items()
-            .first()
-            .expect("validated page must be non-empty")
-            .item_key()
-            .clone();
-        if let Some(prev) = previous_last.as_ref()
-            && first_key <= *prev
-        {
-            return Err(OrderedContentConformanceError::CursorDidNotAdvance {
-                page_index,
-                previous_last: prev.clone(),
-                observed_key: first_key,
-            });
-        }
+        validate_page_sequence(
+            page.items(),
+            page.state(),
+            previous_last.as_ref(),
+            shard.key_range_start(),
+            shard.key_range_end(),
+        )
+        .map_err(|v| map_sequence_violation(v, page_index, &previous_last, &page))?;
 
         let last_key = page
             .items()
             .last()
-            .expect("validated page must be non-empty")
+            .expect("validated page is non-empty")
             .item_key()
             .clone();
         page_lengths.push(page.len());
@@ -617,25 +793,22 @@ where
             PageState::HasMore {
                 cursor: next_cursor,
             } => {
-                let Some(next_last) = next_cursor.last_key().cloned() else {
-                    return Err(OrderedContentConformanceError::HasMoreWithoutLastKey {
-                        page_index,
-                    });
-                };
-                if next_last != last_key {
-                    return Err(OrderedContentConformanceError::ResumeCursorMismatch {
-                        page_index,
-                        expected_last: last_key,
-                        actual_last: next_last,
-                    });
-                }
+                // Cursor stall: the HasMore cursor's last_key must strictly
+                // advance past the previous page boundary. The shape and
+                // alignment checks in validate_page_sequence guarantee the
+                // cursor last_key equals the page's last emitted key, but a
+                // single-item page whose key equals the prior last_key is
+                // still a stall.
+                let next_last = next_cursor
+                    .last_key()
+                    .expect("validate_page_sequence guarantees HasMore carries last_key");
                 if let Some(prev) = previous_last.as_ref()
-                    && next_last <= *prev
+                    && *next_last <= *prev
                 {
                     return Err(OrderedContentConformanceError::CursorDidNotAdvance {
                         page_index,
                         previous_last: prev.clone(),
-                        observed_key: next_last,
+                        observed_key: next_last.clone(),
                     });
                 }
                 previous_last = Some(next_last.clone());
@@ -734,40 +907,32 @@ mod tests {
             cursor: &Cursor,
             budgets: Budgets,
         ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
-            let start = cursor
-                .last_key()
-                .map(|last_key| {
-                    self.items
-                        .iter()
-                        .position(|item| item.item_key() > last_key)
-                        .unwrap_or(self.items.len())
-                })
-                .unwrap_or(0);
+            let start = resolve_cursor_start(&self.items, cursor);
             if start >= self.items.len() {
                 return Ok(None);
             }
 
-            let page_len = self.page_len.min(budgets.max_items());
-            let end = (start + page_len).min(self.items.len());
-            let page_items = self.items[start..end].to_vec();
-            let state = if end == self.items.len() {
-                PageState::Complete
-            } else {
-                PageState::HasMore {
-                    cursor: Cursor::with_last_key(
-                        page_items
-                            .last()
-                            .expect("page_items is non-empty")
-                            .item_key()
-                            .clone(),
-                    ),
+            let item_limit = self.page_len.min(budgets.max_items());
+            let mut cumulative_bytes: u64 = 0;
+            let mut end = start;
+            for item in &self.items[start..self.items.len().min(start + item_limit)] {
+                let item_bytes = item.size_hint().unwrap_or(0);
+                let next_total = cumulative_bytes.saturating_add(item_bytes);
+                if end > start && next_total > budgets.max_bytes() {
+                    break;
                 }
-            };
+                // Always include at least the first item to guarantee progress.
+                cumulative_bytes = next_total;
+                end += 1;
+            }
 
-            Ok(Some(
-                PageBuf::try_new_validated(page_items, state, b"", b"")
-                    .expect("cursor-aware source emits valid pages"),
-            ))
+            let page_items = self.items[start..end].to_vec();
+            let is_last = end == self.items.len();
+            Ok(Some(build_test_page(
+                page_items,
+                is_last,
+                "cursor-aware source emits valid pages",
+            )))
         }
 
         fn open(
@@ -777,6 +942,47 @@ mod tests {
         ) -> Result<Box<dyn io::Read + Send>, ReadError> {
             Err(ReadError::unsupported("unused in conformance tests"))
         }
+    }
+
+    /// Resolves the start index for cursor-based pagination over a sorted item
+    /// slice. Returns the index of the first item whose key is strictly greater
+    /// than `cursor.last_key()`, or 0 when the cursor carries no last key
+    /// (initial cursor). Returns `items.len()` when every item is at or below
+    /// the cursor position.
+    fn resolve_cursor_start(items: &[ScanItem], cursor: &Cursor) -> usize {
+        cursor
+            .last_key()
+            .map(|last_key| {
+                items
+                    .iter()
+                    .position(|item| item.item_key() > last_key)
+                    .unwrap_or(items.len())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Constructs a [`PageBuf`] from a non-empty item slice, choosing
+    /// `PageState::Complete` or `PageState::HasMore` based on `is_last_page`.
+    /// The `HasMore` cursor carries the last emitted item's key.
+    fn build_test_page(
+        page_items: Vec<ScanItem>,
+        is_last_page: bool,
+        expect_msg: &str,
+    ) -> PageBuf<ScanItem> {
+        let state = if is_last_page {
+            PageState::Complete
+        } else {
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(
+                    page_items
+                        .last()
+                        .expect("page_items must be non-empty")
+                        .item_key()
+                        .clone(),
+                ),
+            }
+        };
+        PageBuf::try_new_validated(page_items, state, b"", b"").expect(expect_msg)
     }
 
     fn scan_item(key: &[u8], seed: u8) -> ScanItem {
@@ -856,17 +1062,47 @@ mod tests {
     }
 
     #[test]
-    fn no_item_ref_contains_rejects_forbidden_fragment() {
+    fn forbidden_fragment_rejects_item_ref_containing_fragment() {
         let drain = OrderedContentDrain::new(
             vec![ObservedScanItem::from(&scan_item(b"safe/secret.txt", 9))],
             vec![1],
         );
 
-        let err = assert_no_item_ref_contains(&drain, &[b"secret".as_slice()])
-            .expect_err("forbidden fragment must be rejected");
+        let err = assert_no_forbidden_fragments(&drain, &[b"secret".as_slice()])
+            .expect_err("forbidden fragment in item_ref must be rejected");
         assert!(matches!(
             err,
-            OrderedContentConformanceError::ForbiddenItemRefFragment { item_index: 0, .. }
+            OrderedContentConformanceError::ForbiddenFragment {
+                item_index: 0,
+                field: "item_ref",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn forbidden_fragment_rejects_item_key_containing_fragment() {
+        // Build a ScanItem whose item_key contains the forbidden fragment but
+        // whose item_ref is clean.
+        let key = ItemKey::try_from_slice(b"/data/secret/file.txt").expect("valid key");
+        let item_ref = ItemRef::try_from_slice(b"clean-ref").expect("valid item_ref");
+        let item = ScanItem::new(
+            key,
+            item_ref,
+            StableItemId::from_bytes([42; 32]),
+            VersionId::Weak(ObjectVersionId::from_bytes([43; 32])),
+        );
+        let drain = OrderedContentDrain::new(vec![ObservedScanItem::from(&item)], vec![1]);
+
+        let err = assert_no_forbidden_fragments(&drain, &[b"secret".as_slice()])
+            .expect_err("forbidden fragment in item_key must be rejected");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::ForbiddenFragment {
+                item_index: 0,
+                field: "item_key",
+                ..
+            }
         ));
     }
 
@@ -996,9 +1232,10 @@ mod tests {
         .expect_err("nondeterministic factory must fail");
         assert!(matches!(
             err,
-            OrderedContentConformanceError::DeterminismMismatch {
+            OrderedContentConformanceError::DeterminismMismatch(DrainDivergence {
                 first_divergent_item: Some(1),
-            }
+                ..
+            })
         ));
     }
 
@@ -1022,6 +1259,8 @@ mod tests {
                 cursor: &Cursor,
                 budgets: Budgets,
             ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+                // Intentionally uses `==` instead of `>` for cursor resolution
+                // so this source can exercise the token-skip misbehavior below.
                 let start = cursor
                     .last_key()
                     .and_then(|last_key| {
@@ -1047,20 +1286,12 @@ mod tests {
                 let page_len = self.page_len.min(budgets.max_items());
                 let end = (start + page_len).min(self.items.len());
                 let page_items = self.items[start..end].to_vec();
-                let state = if end == self.items.len() {
-                    PageState::Complete
-                } else {
-                    PageState::HasMore {
-                        cursor: Cursor::with_last_key(
-                            page_items.last().unwrap().item_key().clone(),
-                        ),
-                    }
-                };
-
-                Ok(Some(
-                    PageBuf::try_new_validated(page_items, state, b"", b"")
-                        .expect("token-sensitive source emits valid pages"),
-                ))
+                let is_last = end == self.items.len();
+                Ok(Some(build_test_page(
+                    page_items,
+                    is_last,
+                    "token-sensitive source emits valid pages",
+                )))
             }
 
             fn open(
@@ -1092,9 +1323,10 @@ mod tests {
         .expect_err("token-sensitive source must fail");
         assert!(matches!(
             err,
-            OrderedContentConformanceError::TokenFallbackMismatch {
+            OrderedContentConformanceError::TokenFallbackMismatch(DrainDivergence {
                 first_divergent_item: Some(_),
-            }
+                ..
+            })
         ));
     }
 
@@ -1171,6 +1403,198 @@ mod tests {
         assert!(matches!(
             err,
             OrderedContentConformanceError::NoneDidNotExhaust { page_index: 1 }
+        ));
+    }
+
+    #[test]
+    fn run_conformance_accepts_empty_source() {
+        let drain = run_ordered_content_conformance(
+            || CursorAwareSource {
+                items: vec![],
+                page_len: 8,
+            },
+            &ShardSpec::unbounded(),
+            8,
+            u64::MAX,
+            &[],
+        )
+        .expect("empty source should pass full conformance suite");
+
+        assert!(drain.is_empty());
+        assert!(drain.page_lengths().is_empty());
+    }
+
+    #[test]
+    fn run_conformance_accepts_single_item_source() {
+        // A single-item source produces a Complete page on the first call.
+        // The corrupt-token probe is silently skipped because it needs
+        // HasMore to construct a resume point.
+        let drain = run_ordered_content_conformance(
+            || CursorAwareSource {
+                items: vec![scan_item(b"only", 1)],
+                page_len: 8,
+            },
+            &ShardSpec::unbounded(),
+            8,
+            u64::MAX,
+            &[],
+        )
+        .expect("single-item source should pass conformance (token probe skipped)");
+
+        assert_eq!(drain.len(), 1);
+        assert_eq!(drain.items()[0].item_key().as_bytes(), b"only");
+    }
+
+    #[test]
+    fn drain_handles_byte_budget_driven_page_splitting() {
+        // Items a(2B), b(3B), c(4B), d(5B) with max_bytes=5 forces pages:
+        //   page 0: [a, b] (2+3=5, at limit)
+        //   page 1: [c]    (4, adding d would exceed 5)
+        //   page 2: [d]    (5, fits alone)
+        let items = vec![
+            scan_item(b"a", 1), // size_hint = 2
+            scan_item(b"b", 2), // size_hint = 3
+            scan_item(b"c", 3), // size_hint = 4
+            scan_item(b"d", 4), // size_hint = 5
+        ];
+        let mut source = CursorAwareSource { items, page_len: 8 };
+
+        let drain = drain_ordered_source(&mut source, &ShardSpec::unbounded(), 8, 5)
+            .expect("byte-budget-driven page splitting should produce a valid drain");
+
+        let keys: Vec<&[u8]> = drain
+            .items()
+            .iter()
+            .map(|item| item.item_key().as_bytes())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                b"a".as_slice(),
+                b"b".as_slice(),
+                b"c".as_slice(),
+                b"d".as_slice()
+            ]
+        );
+        assert_eq!(drain.page_lengths(), &[2, 1, 1]);
+    }
+
+    #[test]
+    fn run_conformance_passes_with_byte_budget_source() {
+        // Verify the full conformance suite (determinism + token fallback)
+        // works with a byte-budget-aware source under tight byte limits.
+        let drain = run_ordered_content_conformance(
+            || CursorAwareSource {
+                items: vec![
+                    scan_item(b"a", 1), // 2B
+                    scan_item(b"b", 2), // 3B
+                    scan_item(b"c", 3), // 4B
+                    scan_item(b"d", 4), // 5B
+                ],
+                page_len: 8,
+            },
+            &ShardSpec::unbounded(),
+            8,
+            5,
+            &[],
+        )
+        .expect("byte-budget-aware source should pass full conformance suite");
+
+        assert_eq!(drain.len(), 4);
+        assert_eq!(drain.page_lengths(), &[2, 1, 1]);
+    }
+
+    #[test]
+    fn repeatable_drain_rejects_page_partitioning_divergence() {
+        // Factory returns the same items but different page sizes on each
+        // call. The harness must detect this as a DeterminismMismatch with
+        // first_divergent_item: None (items match, page partitioning differs).
+        let call_count = std::cell::Cell::new(0u32);
+        let err = assert_repeatable_drain(
+            &mut || {
+                let n = call_count.get();
+                call_count.set(n + 1);
+                CursorAwareSource {
+                    items: vec![scan_item(b"a", 1), scan_item(b"b", 2), scan_item(b"c", 3)],
+                    page_len: if n == 0 { 2 } else { 3 },
+                }
+            },
+            &ShardSpec::unbounded(),
+            8,
+            u64::MAX,
+        )
+        .expect_err("same items with different page partitioning must fail");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::DeterminismMismatch(DrainDivergence {
+                first_divergent_item: None,
+                expected_key: None,
+                actual_key: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn forbidden_fragment_rejects_location_url_containing_fragment() {
+        // Item with clean key and ref but a location URL containing the
+        // forbidden fragment must be caught.
+        let key = ItemKey::try_from_slice(b"clean-key").expect("valid key");
+        let item_ref = ItemRef::try_from_slice(b"clean-ref").expect("valid item_ref");
+        let location = Location::try_new(
+            "safe display".to_string(),
+            Some("/data/secret/bucket".to_string()),
+        )
+        .expect("valid location");
+        let item = ScanItem::new(
+            key,
+            item_ref,
+            StableItemId::from_bytes([42; 32]),
+            VersionId::Weak(ObjectVersionId::from_bytes([43; 32])),
+        )
+        .with_location(location);
+        let drain = OrderedContentDrain::new(vec![ObservedScanItem::from(&item)], vec![1]);
+
+        let err = assert_no_forbidden_fragments(&drain, &[b"secret".as_slice()])
+            .expect_err("forbidden fragment in location_url must be rejected");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::ForbiddenFragment {
+                item_index: 0,
+                field: "location_url",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn forbidden_fragment_rejects_location_display_containing_fragment() {
+        // Item with clean key, ref, and URL but a location display string
+        // containing the forbidden fragment must be caught.
+        let key = ItemKey::try_from_slice(b"clean-key").expect("valid key");
+        let item_ref = ItemRef::try_from_slice(b"clean-ref").expect("valid item_ref");
+        let location = Location::try_new(
+            "/mnt/secret/share".to_string(),
+            Some("https://safe.example.com/bucket".to_string()),
+        )
+        .expect("valid location");
+        let item = ScanItem::new(
+            key,
+            item_ref,
+            StableItemId::from_bytes([44; 32]),
+            VersionId::Weak(ObjectVersionId::from_bytes([45; 32])),
+        )
+        .with_location(location);
+        let drain = OrderedContentDrain::new(vec![ObservedScanItem::from(&item)], vec![1]);
+
+        let err = assert_no_forbidden_fragments(&drain, &[b"secret".as_slice()])
+            .expect_err("forbidden fragment in location_display must be rejected");
+        assert!(matches!(
+            err,
+            OrderedContentConformanceError::ForbiddenFragment {
+                item_index: 0,
+                field: "location_display",
+                ..
+            }
         ));
     }
 }

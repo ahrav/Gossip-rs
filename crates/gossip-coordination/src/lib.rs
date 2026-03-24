@@ -74,6 +74,8 @@ pub use gossip_contracts::coordination::{
     PooledShardSpec,
     PooledSpawned,
     PooledSpawnedIter,
+    // Restored coordination state
+    RestoredShardState,
     // Shard spec types
     ShardArena,
     ShardSpec,
