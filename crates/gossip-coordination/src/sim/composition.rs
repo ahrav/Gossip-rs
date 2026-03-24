@@ -32,6 +32,7 @@
 //! [`ChaCha8Rng`]: rand_chacha::ChaCha8Rng
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
@@ -306,6 +307,16 @@ pub enum CompositionSimViolation {
     CrossComponent(CrossComponentViolation),
 }
 
+impl fmt::Display for CompositionSimViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Coordination(v) => write!(f, "{v:?}"),
+            Self::Persistence(v) => write!(f, "{v}"),
+            Self::CrossComponent(v) => write!(f, "{v}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CompositionSim
 // ---------------------------------------------------------------------------
@@ -531,7 +542,7 @@ impl CompositionSim {
                 (CompositionSimEvent::LedgerFaultInjected, Vec::new())
             }
         };
-        self.ops_executed += 1;
+        self.ops_executed = self.ops_executed.saturating_add(1);
 
         // Record claim success for scan lifecycle claims (S9 cooldown) is
         // handled inside claim_shard_for_scan. For Coord(ClaimNext), it's
@@ -870,7 +881,9 @@ impl CompositionSim {
                 Err(_) => false,
             };
 
-        // Record provenance with the stale fence.
+        // Record provenance with the stale fence. The cross-component
+        // checker (C4) will fire FencePropagationMismatch for committed
+        // entries because fence_epoch != lease_fence — this is expected.
         self.write_log.push(ProvenanceEntry {
             worker,
             run_id: lease.run(),
@@ -2134,6 +2147,98 @@ mod tests {
         assert!(
             !entry.committed,
             "provenance should record uncommitted after submit failure"
+        );
+    }
+
+    /// Stale-lease write through the full `step()` pipeline produces a C4
+    /// `FencePropagationMismatch` violation.
+    ///
+    /// The stale-lease path requires `fence > INITIAL` (i.e. a shard must have
+    /// been acquired at least twice so its fence epoch advances beyond 1).
+    /// This test first claims shards via coordination pass-through to bump
+    /// fences by letting leases expire and re-claiming, then issues
+    /// `ScanLifecycleStaleLeaseWrite` ops until a C4 violation fires.
+    #[test]
+    fn stale_lease_write_produces_c4_violation() {
+        let config = CompositionFaultConfig::for_level(FaultLevel::SunnyDay);
+        let mut sim = CompositionSim::new(77, config)
+            .with_workers_and_shards(2, 6)
+            .expect("setup should succeed");
+
+        // Advance past initial registration so the clock is non-trivial.
+        sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+
+        // Phase 1: Claim shards to establish initial leases (fence = INITIAL).
+        // Each worker claims one shard, consuming it from the available pool.
+        for i in 1..=2u64 {
+            sim.step(CompositionSimOp::Coord(SimOp::ClaimNext {
+                worker: WorkerId::from_raw(i),
+            }));
+        }
+
+        // Advance time past lease duration so the claimed shards' leases expire
+        // and the shards become available for re-claim at a higher fence epoch.
+        sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime {
+            ticks: DEFAULT_LEASE_DURATION + 10,
+        }));
+
+        // Phase 2: Drive normal scan lifecycles and stale-lease attempts in a
+        // loop. Normal scans may re-claim expired shards (bumping their fence).
+        // Once any shard has fence > INITIAL, the stale-lease path succeeds
+        // and step() runs the cross-component checker producing a C4 violation.
+        let w1 = WorkerId::from_raw(1);
+        let w2 = WorkerId::from_raw(2);
+        let max_iterations = 50;
+        let mut found_c4 = false;
+
+        for i in 0..max_iterations {
+            // Alternate between normal lifecycle (to advance fences) and
+            // stale-lease attempts. Advance time periodically to expire
+            // leases so shards cycle back to the available pool.
+            if i % 5 == 4 {
+                sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime {
+                    ticks: DEFAULT_LEASE_DURATION + 1,
+                }));
+            }
+
+            let worker = if i % 2 == 0 { w1 } else { w2 };
+
+            // Every third iteration, try a stale-lease write.
+            if i % 3 == 2 {
+                let (event, violations) =
+                    sim.step(CompositionSimOp::ScanLifecycleStaleLeaseWrite { worker });
+
+                let has_c4 = violations.iter().any(|v| {
+                    matches!(
+                        v,
+                        CompositionSimViolation::CrossComponent(
+                            CrossComponentViolation::FencePropagationMismatch { .. }
+                        )
+                    )
+                });
+
+                if has_c4 {
+                    // Verify the event is the stale-lease variant (not NotPossible).
+                    assert!(
+                        matches!(event, CompositionSimEvent::ScanStaleLeaseWrite { .. }),
+                        "C4 violation should accompany ScanStaleLeaseWrite event, got {event:?}"
+                    );
+                    found_c4 = true;
+                    break;
+                }
+
+                // If the shard's fence is still at INITIAL, we get NotPossible
+                // or ScanClaimFailed — keep going.
+                continue;
+            }
+
+            // Normal scan lifecycle to advance fences by completing shards.
+            sim.step(CompositionSimOp::ScanLifecycle { worker });
+        }
+
+        assert!(
+            found_c4,
+            "expected at least one C4 FencePropagationMismatch within {max_iterations} steps"
         );
     }
 }

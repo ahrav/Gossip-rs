@@ -17,14 +17,37 @@
 //! | C3 | No writes after terminal completion | Incremental write-log scan |
 //! | C4 | Fence propagation (no stale fences) | Incremental write-log scan |
 //!
-//! C1 and C2 sweep all oracle committed records each step (bounded by
-//! `OVID_POOL_SIZE`, typically 50). C3 and C4 process only new
+//! C1 and C2 sweep all oracle committed records each step. The oracle
+//! accumulates records over the simulation lifetime (OVID_POOL_SIZE bounds
+//! OVID variety, not record count). C3 and C4 process only new
 //! [`ProvenanceEntry`] values since the last `check_all` call.
+//!
+//! # Stale-lease writes and C4
+//!
+//! [`ScanLifecycleStaleLeaseWrite`] ops deliberately inject provenance with
+//! a stale `fence_epoch` while the `lease_fence` reflects the real lease.
+//! C4 will fire for every such committed entry — this is expected behavior,
+//! not a false positive. Consumers that assert zero violations after a
+//! stale-lease step must filter or expect `FencePropagationMismatch`.
+//!
+//! [`ScanLifecycleStaleLeaseWrite`]: super::composition::CompositionSimOp::ScanLifecycleStaleLeaseWrite
+//!
+//! # Scope
+//!
+//! C3/C4 observe only the scan-lifecycle provenance log (`ProvenanceEntry`
+//! values appended by `exec_scan_lifecycle`, `exec_scan_crash_after_complete`,
+//! and `exec_scan_stale_lease`). Completions via pass-through coordinator ops
+//! (`Coord(SimOp::Complete)`) and `exec_session_lifecycle` terminal actions
+//! do not log provenance entries; post-completion writes from those paths
+//! are invisible to C3. Pass-through `Complete` never touches the
+//! done-ledger, so C3 false negatives cannot arise there. The
+//! `exec_session_lifecycle` gap requires threading provenance through
+//! `WorkerSession` and is deferred to follow-up work.
 //!
 //! [`InvariantChecker`]: super::InvariantChecker
 //! [`DoneLedgerInvariantChecker`]: gossip_persistence_inmemory::sim::DoneLedgerInvariantChecker
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fmt;
 
 use gossip_contracts::identity::{FenceEpoch, RunId, ShardId, ShardKey, TenantId};
@@ -70,6 +93,11 @@ pub enum CrossComponentViolation {
 
     /// C4: the fence epoch written into done-ledger provenance does not
     /// match the lease fence from `acquire_and_restore_into`.
+    ///
+    /// Expected for [`ScanLifecycleStaleLeaseWrite`] ops that deliberately
+    /// inject stale provenance. See module-level docs for details.
+    ///
+    /// [`ScanLifecycleStaleLeaseWrite`]: super::composition::CompositionSimOp::ScanLifecycleStaleLeaseWrite
     FencePropagationMismatch {
         lease_fence: FenceEpoch,
         provenance_fence: FenceEpoch,
@@ -141,7 +169,11 @@ pub struct CompositionInvariantChecker {
     /// `(run_id, shard_id, lease_fence)` triples whose coordinator
     /// `complete()` succeeded. Uses the real lease fence (not the provenance
     /// fence) because the coordinator completes with the actual lease epoch.
-    completed_shards: BTreeSet<(RunId, ShardId, FenceEpoch)>,
+    ///
+    /// Grows monotonically (no pruning). Bounded by the total number of
+    /// distinct shard completions across the simulation, which equals the
+    /// initial shard count plus any splits — typically low hundreds.
+    completed_shards: HashSet<(RunId, ShardId, FenceEpoch)>,
 
     /// Number of write-log entries processed so far. Entries before this
     /// index are skipped by C3/C4 on subsequent calls.
@@ -152,7 +184,7 @@ impl CompositionInvariantChecker {
     /// Create a checker with no history.
     pub fn new() -> Self {
         Self {
-            completed_shards: BTreeSet::new(),
+            completed_shards: HashSet::new(),
             last_write_log_len: 0,
         }
     }
@@ -203,8 +235,17 @@ impl CompositionInvariantChecker {
         write_log: &[ProvenanceEntry],
         violations: &mut Vec<CrossComponentViolation>,
     ) {
+        debug_assert!(
+            write_log.len() >= self.last_write_log_len,
+            "write_log must be append-only; got len {} but expected >= {}",
+            write_log.len(),
+            self.last_write_log_len,
+        );
+
         for entry in write_log.iter().skip(self.last_write_log_len) {
             // C3: detect committed writes for already-completed shard-epoch triples.
+            // Uses lease_fence (not fence_epoch) because the coordinator completes
+            // with the actual lease epoch — the completion key must match.
             if entry.committed {
                 let triple = (entry.run_id, entry.shard_id, entry.lease_fence);
                 if self.completed_shards.contains(&triple) {
