@@ -1,18 +1,39 @@
 //! Ordered-content runtime boundary.
 //!
-//! This module owns two related ordered-content execution paths:
+//! This module owns two related ordered-content execution paths and a
+//! done-ledger prefilter stage that sits between page acquisition and
+//! item-level scan work:
 //!
-//! 1. `OrderedContentRuntime::execute_source`, which performs one
-//!    connector-driven ordered page acquisition and validates the page against
-//!    the shard/cursor contract before any downstream read or scan work uses it.
-//! 2. `scan_local_filesystem`, which runs the existing direct scheduler-based
-//!    local filesystem scan and forwards events and persistence batches through
-//!    bounded channels.
+//! 1. **Page acquisition** — [`OrderedContentRuntime::execute_source`]
+//!    performs one connector-driven ordered page fill and validates the page
+//!    against the shard/cursor contract before any downstream read or scan
+//!    work uses it.
+//! 2. **Done-ledger prefilter** — [`OrderedContentPage::prefilter_done_ledger`]
+//!    classifies each validated item as `AlreadyDone` or `ScanMiss` by
+//!    looking up its object-version identity (OvidHash) in the done ledger.
+//!    Items that already have a durable done-ledger row are skipped before
+//!    any content is opened, saving I/O and scan budget.
+//! 3. **Local filesystem scan** — `scan_local_filesystem` runs the direct
+//!    scheduler-based parallel filesystem scan and forwards events and
+//!    persistence batches through bounded channels.
 //!
 //! The connector-facing entrypoint is intentionally narrower than the direct
 //! scan path. It validates authoritative shard bounds, resume cursor progress,
 //! and enumerate error classification without yet taking ownership of
 //! item-open, byte-read, findings, or durability orchestration.
+//!
+//! # Done-ledger prefilter
+//!
+//! The prefilter derives an [`OvidHash`](gossip_contracts::persistence::OvidHash)
+//! from each item's [`StableItemId`](gossip_contracts::identity::StableItemId)
+//! and [`VersionId`](gossip_contracts::connector::VersionId), then issues
+//! positional [`DoneLedger::batch_get`]
+//! calls scoped by the claim's `WriteContext` (tenant + policy). Lookups are
+//! chunked at [`RECOMMENDED_MAX_BATCH_SIZE`]
+//! to respect backend batch ceilings while preserving positional alignment
+//! with the original page order. Because the hash includes version strength
+//! (strong vs. weak), the same stable item under a different version claim
+//! is correctly treated as a miss.
 //!
 //! # Threading model
 //!
@@ -243,10 +264,33 @@ impl OrderedContentPage {
     /// Classify the validated page against the done ledger before any item
     /// content is opened or scanned.
     ///
-    /// Lookup keys are derived from each item's stable identity and version
-    /// claim, then queried in positional batches scoped by `write_context`.
-    /// The returned classification preserves the original page order, report,
-    /// resume cursor, and page completion state.
+    /// Each item's [`StableItemId`](gossip_contracts::identity::StableItemId)
+    /// and [`VersionId`](gossip_contracts::connector::VersionId) are hashed
+    /// into an `OvidHash`, then looked up via
+    /// [`DoneLedger::batch_get`]
+    /// under the supplied `write_context`'s tenant and policy scope.
+    ///
+    /// # Batching
+    ///
+    /// Lookups are chunked at
+    /// [`RECOMMENDED_MAX_BATCH_SIZE`]
+    /// to stay within backend batch limits. Chunks are issued sequentially and
+    /// their results are concatenated, preserving positional alignment with
+    /// the original page items.
+    ///
+    /// # Invariants preserved
+    ///
+    /// - Original page item order is maintained in the returned
+    ///   [`OrderedContentPrefilteredPage`].
+    /// - The `report`, `resume_cursor`, and `page_state` are carried through
+    ///   unmodified so downstream checkpoint logic remains correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScanRuntimeError::Driver`] if:
+    /// - The done-ledger `batch_get` call fails (I/O, timeout, etc.).
+    /// - The backend returns a result vector whose length does not match the
+    ///   number of lookup keys (violated positional contract).
     pub fn prefilter_done_ledger<D>(
         self,
         write_context: WriteContext,
@@ -321,16 +365,27 @@ impl OrderedContentPage {
     }
 }
 
-/// Page-level classification assigned by the done-ledger prefilter.
+/// Done-ledger classification for a single ordered-content page item.
+///
+/// Assigned by [`OrderedContentPage::prefilter_done_ledger`] based on whether
+/// the item's `OvidHash` (derived from its stable identity and version claim)
+/// already exists in the done ledger for the current tenant and policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderedContentPrefilterDisposition {
-    /// The item already has a durable done-ledger row for this version.
+    /// The item already has a durable done-ledger row for this exact
+    /// stable-item + version pair. No scan work is needed; the runtime
+    /// can skip content open entirely.
     AlreadyDone,
-    /// The item is not present in the done ledger and still needs scan work.
+    /// The item has no done-ledger entry and still needs content scan.
     ScanMiss,
 }
 
-/// One item from a validated ordered page plus its prefilter classification.
+/// A validated ordered-content item paired with its done-ledger disposition.
+///
+/// The disposition is assigned once during prefiltering and is immutable
+/// thereafter. Downstream stages use it to decide whether to open the item's
+/// content (`ScanMiss`) or skip it (`AlreadyDone`) without re-querying the
+/// done ledger.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentClassifiedItem {
     item: ScanItem,
@@ -342,13 +397,13 @@ impl OrderedContentClassifiedItem {
         Self { item, disposition }
     }
 
-    /// Classified scan item.
+    /// The underlying connector scan item.
     #[must_use]
     pub fn item(&self) -> &ScanItem {
         &self.item
     }
 
-    /// Done-ledger classification for the item.
+    /// Prefilter classification: `AlreadyDone` or `ScanMiss`.
     #[must_use]
     pub fn disposition(&self) -> OrderedContentPrefilterDisposition {
         self.disposition
@@ -357,9 +412,15 @@ impl OrderedContentClassifiedItem {
 
 /// Validated ordered page after done-ledger classification.
 ///
-/// Items remain in their original page order so later runtime stages can keep
-/// checkpoint-relevant sequencing while distinguishing "already done" items
-/// from work that still needs scanning.
+/// Items remain in their original page order so downstream runtime stages
+/// preserve checkpoint-relevant sequencing. The `report`, `resume_cursor`,
+/// and `page_state` are the same values produced by the pre-classification
+/// [`OrderedContentPage`]; prefiltering does not alter them.
+///
+/// Callers typically iterate `scan_miss()` to drive content-open and scan
+/// work, and count `already_done_len()` for metrics reporting. The full
+/// classified item list is available via [`items()`](Self::items) for stages
+/// that need per-item disposition regardless of classification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentPrefilteredPage {
     items: Vec<OrderedContentClassifiedItem>,
@@ -369,31 +430,45 @@ pub struct OrderedContentPrefilteredPage {
 }
 
 impl OrderedContentPrefilteredPage {
-    /// Ordered item classifications for the page.
+    /// Classified items in their original page order.
+    ///
+    /// The slice length equals the number of items in the source page.
     #[must_use]
     pub fn items(&self) -> &[OrderedContentClassifiedItem] {
         &self.items
     }
 
-    /// Original page completion state.
+    /// Page completion state from the connector (`HasMore` or `Complete`).
+    ///
+    /// Carried through unchanged from the source page; prefiltering does not
+    /// alter pagination state.
     #[must_use]
     pub fn page_state(&self) -> &PageState {
         &self.page_state
     }
 
-    /// Runtime-local summary counters derived from the validated page.
+    /// Runtime-local summary counters from the validated page.
+    ///
+    /// These reflect the full page (both done and miss items); prefiltering
+    /// does not adjust the counts.
     #[must_use]
     pub fn report(&self) -> ScanReport {
         self.report
     }
 
-    /// Resume cursor corresponding to the validated page boundary.
+    /// Resume cursor for checkpoint advancement.
+    ///
+    /// Carried through unchanged from the source page. Whether this cursor is
+    /// actually committed depends on downstream checkpoint logic, not on
+    /// prefilter results.
     #[must_use]
     pub fn resume_cursor(&self) -> &Cursor {
         &self.resume_cursor
     }
 
-    /// Number of page items already represented in the done ledger.
+    /// Number of page items classified as `AlreadyDone`.
+    ///
+    /// O(n) linear scan; prefer caching the result if called in a loop.
     #[must_use]
     pub fn already_done_len(&self) -> usize {
         self.items
@@ -402,7 +477,9 @@ impl OrderedContentPrefilteredPage {
             .count()
     }
 
-    /// Number of page items that still need scan work.
+    /// Number of page items classified as `ScanMiss`.
+    ///
+    /// O(n) linear scan; prefer caching the result if called in a loop.
     #[must_use]
     pub fn scan_miss_len(&self) -> usize {
         self.items
@@ -411,7 +488,10 @@ impl OrderedContentPrefilteredPage {
             .count()
     }
 
-    /// Ordered iterator over items already present in the done ledger.
+    /// Iterator over items with `AlreadyDone` disposition, in page order.
+    ///
+    /// Yields only the underlying [`ScanItem`] references; the disposition is
+    /// implicit. Items classified as `ScanMiss` are skipped.
     pub fn already_done(&self) -> impl Iterator<Item = &ScanItem> + '_ {
         self.items.iter().filter_map(|item| {
             (item.disposition() == OrderedContentPrefilterDisposition::AlreadyDone)
@@ -419,7 +499,11 @@ impl OrderedContentPrefilteredPage {
         })
     }
 
-    /// Ordered iterator over items that still need scan work.
+    /// Iterator over items with `ScanMiss` disposition, in page order.
+    ///
+    /// Yields only the underlying [`ScanItem`] references; the disposition is
+    /// implicit. Items classified as `AlreadyDone` are skipped. This is the
+    /// primary iterator for driving downstream content-open and scan work.
     pub fn scan_miss(&self) -> impl Iterator<Item = &ScanItem> + '_ {
         self.items.iter().filter_map(|item| {
             (item.disposition() == OrderedContentPrefilterDisposition::ScanMiss)
@@ -467,7 +551,8 @@ impl OrderedContentRuntime {
     ///
     /// - the runtime is operating under `Completed` cursor semantics;
     /// - page shape rules (non-empty, in bounds, strictly increasing keys);
-    /// - progress monotonicity relative to the restored resume cursor; and
+    /// - progress monotonicity relative to the restored resume cursor;
+    /// - `HasMore` cursor presence (must carry a `last_key`); and
     /// - `HasMore` cursor agreement with the page's final emitted key.
     ///
     /// Connector enumerate failures surface as [`OrderedContentExecutionOutcome::Stopped`]
@@ -500,12 +585,13 @@ impl OrderedContentRuntime {
     }
 }
 
-/// Validate three page-level invariants after a successful `fill_page`:
+/// Validate four page-level invariants after a successful `fill_page`:
 ///
 /// 1. **Shape** — page is non-empty, keys are in-bounds, and strictly increasing.
 /// 2. **Monotonicity** — the first emitted key is strictly after the restored
 ///    resume cursor's `last_key`, preventing duplicate processing on resume.
-/// 3. **Cursor agreement** — a `HasMore` cursor's `last_key` matches the page's
+/// 3. **HasMore presence** — a `HasMore` cursor must carry a `last_key`.
+/// 4. **Cursor agreement** — a `HasMore` cursor's `last_key` matches the page's
 ///    final emitted key, so the next `fill_page` call starts from the right point.
 fn validate_page_contract(
     input: &OrderedContentRuntimeInput,
