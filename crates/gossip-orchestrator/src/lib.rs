@@ -36,13 +36,13 @@ pub use payload::{
     FilesystemShardPayload, FilesystemShardPayloadDecodeError, FilesystemShardPayloadEncodeError,
 };
 pub use planner::{
-    plan_filesystem_initial_shards, FilesystemInitialShardPlan, InitialShardGeometry,
+    FilesystemInitialShardPlan, InitialShardGeometry, plan_filesystem_initial_shards,
 };
 pub use request::{
     FilesystemPathKind, FilesystemRequest, FilesystemRequestError, FilesystemSourceMode,
     NormalizedFilesystemRequest,
 };
 pub use setup::{
-    setup_filesystem_run, FilesystemRunSetupError, FilesystemRunSetupInput,
-    FilesystemRunSetupResult,
+    FilesystemRunSetupError, FilesystemRunSetupInput, FilesystemRunSetupResult,
+    setup_filesystem_run,
 };

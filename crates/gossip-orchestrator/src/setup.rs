@@ -10,7 +10,7 @@
 //! 1. Validate that the typed payload agrees with the normalized request
 //!    (mode and canonical root must match). This runs before any coordinator
 //!    mutation so a mismatch never leaves partial state.
-//! 2. Encode the typed filesystem payload into shard metadata bytes.
+//! 2. Encode the typed filesystem payload into connector-extra bytes.
 //! 3. Lower the planned startup geometry into bounded shard-spec ranges.
 //! 4. Build a validated manifest with [`gossip_frontier::builder::PreallocShardBuilder`].
 //! 5. Call [`gossip_coordination::RunManagement::create_run_with_shards`].
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use gossip_coordination::{
     CreateRunError, IdempotentOutcome, LogicalTime, OpId, RunId, RunManagement, RunRecord,
-    ShardArena, ShardId, TenantId,
+    RunStatus, ShardArena, ShardId, TenantId,
 };
 use gossip_frontier::builder::{PreallocShardBuilder, PreallocShardBuilderError};
 
@@ -57,6 +57,15 @@ pub struct FilesystemRunSetupResult {
 
 impl FilesystemRunSetupResult {
     fn from_run(run: RunRecord) -> Self {
+        debug_assert!(
+            run.status() == RunStatus::Active,
+            "FilesystemRunSetupResult requires Active status, got {:?}",
+            run.status()
+        );
+        debug_assert!(
+            !run.root_shards().is_empty(),
+            "FilesystemRunSetupResult requires non-empty root shards"
+        );
         Self { run }
     }
 
@@ -139,6 +148,12 @@ impl<'a> FilesystemRunSetupInput<'a> {
 }
 
 /// Errors from [`setup_filesystem_run`].
+///
+/// # Security note
+///
+/// Error messages include filesystem paths for operator diagnostics.
+/// Callers that surface errors to untrusted consumers must redact
+/// path details before returning.
 pub enum FilesystemRunSetupError {
     /// The typed payload mode disagrees with the normalized request.
     PayloadModeMismatch {
@@ -784,6 +799,74 @@ mod tests {
         assert!(
             !rendered.contains("/sensitive/payload"),
             "Debug output must not leak the payload root: {rendered}"
+        );
+    }
+
+    #[test]
+    fn all_error_variants_display_non_empty() {
+        let variants: Vec<FilesystemRunSetupError> = vec![
+            FilesystemRunSetupError::PayloadModeMismatch {
+                request: FilesystemSourceMode::DirectoryRoot,
+                payload: FilesystemSourceMode::SingleFile,
+            },
+            FilesystemRunSetupError::PayloadRootMismatch {
+                request_root: PathBuf::from("/a"),
+                payload_root: PathBuf::from("/b"),
+            },
+            FilesystemRunSetupError::PayloadEncode(FilesystemShardPayloadEncodeError::EmptyPath {
+                mode: FilesystemSourceMode::DirectoryRoot,
+            }),
+            FilesystemRunSetupError::ManifestBuild(PreallocShardBuilderError::EntryLimitZero),
+            FilesystemRunSetupError::CreateRun(CreateRunError::RunAlreadyExists { run: run() }),
+        ];
+        for err in &variants {
+            let display = format!("{err}");
+            assert!(!display.is_empty(), "Display must be non-empty for {err:?}");
+        }
+    }
+
+    #[test]
+    fn error_source_chaining() {
+        use std::error::Error;
+
+        // Wrapping variants must chain to their inner error.
+        let encode_err =
+            FilesystemRunSetupError::PayloadEncode(FilesystemShardPayloadEncodeError::EmptyPath {
+                mode: FilesystemSourceMode::DirectoryRoot,
+            });
+        assert!(
+            encode_err.source().is_some(),
+            "PayloadEncode must chain source"
+        );
+
+        let build_err =
+            FilesystemRunSetupError::ManifestBuild(PreallocShardBuilderError::EntryLimitZero);
+        assert!(
+            build_err.source().is_some(),
+            "ManifestBuild must chain source"
+        );
+
+        let create_err =
+            FilesystemRunSetupError::CreateRun(CreateRunError::RunAlreadyExists { run: run() });
+        assert!(create_err.source().is_some(), "CreateRun must chain source");
+
+        // Leaf variants must not have a source.
+        let mode_err = FilesystemRunSetupError::PayloadModeMismatch {
+            request: FilesystemSourceMode::DirectoryRoot,
+            payload: FilesystemSourceMode::SingleFile,
+        };
+        assert!(
+            mode_err.source().is_none(),
+            "PayloadModeMismatch must not chain source"
+        );
+
+        let root_err = FilesystemRunSetupError::PayloadRootMismatch {
+            request_root: PathBuf::from("/a"),
+            payload_root: PathBuf::from("/b"),
+        };
+        assert!(
+            root_err.source().is_none(),
+            "PayloadRootMismatch must not chain source"
         );
     }
 
