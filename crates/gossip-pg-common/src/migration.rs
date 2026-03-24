@@ -6,7 +6,7 @@
 //! backends only need to supply their migration slice plus backend-specific
 //! configuration such as the history-table name and advisory-lock key.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{fmt, time::Duration};
 
 use blake3::Hash;
 use postgres::{Client, Transaction};
@@ -114,18 +114,23 @@ impl EmbeddedMigration {
 }
 
 /// Error type for PostgreSQL schema migration operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PgMigrationError {
     /// PostgreSQL driver or SQL execution error, tagged with the operation
     /// that failed.
+    #[error("postgres migration {operation} failed: {source}")]
     Postgres {
         /// Which migration step produced the error.
         operation: MigrationOperation,
         /// The underlying driver error.
+        #[source]
         source: postgres::Error,
     },
     /// An already-applied migration's embedded SQL no longer matches the
     /// checksum recorded in the database.
+    #[error(
+        "migration checksum mismatch for version {version}: expected {expected_hex}, found {found_hex}"
+    )]
     ChecksumMismatch {
         /// Version string of the migration with the mismatched checksum.
         version: &'static str,
@@ -135,6 +140,9 @@ pub enum PgMigrationError {
         found_hex: String,
     },
     /// The stored checksum length is invalid for a BLAKE3 digest.
+    #[error(
+        "corrupted migration history: version {version} checksum is {found_len} bytes, expected 32"
+    )]
     CorruptedHistoryRecord {
         /// Version string of the migration with the corrupted checksum.
         version: &'static str,
@@ -148,37 +156,6 @@ impl PgMigrationError {
     #[must_use]
     pub fn postgres(operation: MigrationOperation, source: postgres::Error) -> Self {
         Self::Postgres { operation, source }
-    }
-}
-
-impl fmt::Display for PgMigrationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Postgres {
-                operation, source, ..
-            } => write!(f, "postgres migration {operation} failed: {source}"),
-            Self::ChecksumMismatch {
-                version,
-                expected_hex,
-                found_hex,
-            } => write!(
-                f,
-                "migration checksum mismatch for version {version}: expected {expected_hex}, found {found_hex}"
-            ),
-            Self::CorruptedHistoryRecord { version, found_len } => write!(
-                f,
-                "corrupted migration history: version {version} checksum is {found_len} bytes, expected 32"
-            ),
-        }
-    }
-}
-
-impl Error for PgMigrationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Postgres { source, .. } => Some(source),
-            Self::ChecksumMismatch { .. } | Self::CorruptedHistoryRecord { .. } => None,
-        }
     }
 }
 

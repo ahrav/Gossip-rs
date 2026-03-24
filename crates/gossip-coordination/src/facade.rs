@@ -77,7 +77,7 @@ use gossip_contracts::identity::{LogicalTime, RunId, ShardId, ShardKey, TenantId
 /// to prevent cross-tenant enumeration.
 ///
 /// [`AcquireError`]: crate::error::AcquireError
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClaimError {
     /// No available (active, unleased) shards exist for this run, or
@@ -108,7 +108,7 @@ pub enum ClaimError {
     Throttled { retry_after: LogicalTime },
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
-    BackendError(InfraError),
+    BackendError(#[source] InfraError),
 }
 
 /// Human-readable formatting for logging and error display chains.
@@ -141,15 +141,6 @@ impl fmt::Display for ClaimError {
             Self::BackendError(infra) => {
                 write!(f, "coordination backend error: {infra}")
             }
-        }
-    }
-}
-
-impl std::error::Error for ClaimError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BackendError(infra) => Some(infra),
-            _ => None,
         }
     }
 }

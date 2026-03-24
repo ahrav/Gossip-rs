@@ -1422,6 +1422,7 @@ dependencies = [
  "rand_chacha",
  "rstest",
  "testcontainers",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -1436,6 +1437,7 @@ dependencies = [
  "gossip-stdx",
  "postgres",
  "proptest",
+ "thiserror",
 ]
 
 [[package]]
@@ -1448,6 +1450,7 @@ dependencies = [
  "gossip-stdx",
  "postgres",
  "proptest",
+ "thiserror",
 ]
 
 [[package]]
@@ -1482,6 +1485,7 @@ dependencies = [
  "proptest",
  "rand",
  "rand_chacha",
+ "thiserror",
 ]
 
 [[package]]
@@ -1493,6 +1497,7 @@ dependencies = [
  "postgres",
  "proptest",
  "testcontainers",
+ "thiserror",
 ]
 
 [[package]]
@@ -3160,6 +3165,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "tempfile",
+ "thiserror",
  "vectorscan-rs-sys",
  "zip 0.6.6",
 ]
@@ -3255,6 +3261,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
  "zip 0.6.6",
 ]
 

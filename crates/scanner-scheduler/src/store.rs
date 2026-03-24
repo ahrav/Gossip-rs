@@ -29,7 +29,6 @@
 //! | [`InMemoryStoreProducer`] | Collects batches in memory for tests and diagnostics |
 
 use crate::engine::NormHash;
-use std::fmt;
 use std::sync::Mutex;
 
 /// Persistence-ready representation of one FS finding.
@@ -106,7 +105,8 @@ impl FsRunLoss {
 }
 
 /// Persistence producer error.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("fs persistence error: {detail}")]
 pub struct FsStoreError {
     detail: String,
 }
@@ -124,14 +124,6 @@ impl FsStoreError {
         &self.detail
     }
 }
-
-impl fmt::Display for FsStoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "fs persistence error: {}", self.detail)
-    }
-}
-
-impl std::error::Error for FsStoreError {}
 
 /// Producer interface for FS finding persistence.
 ///
