@@ -65,6 +65,7 @@
 //!   is retained so S3 can still detect illegal reversions.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
 use crate::record::{ShardRecord, ShardStatus};
 use crate::run::RunStatus;
@@ -92,6 +93,23 @@ pub enum SplitCoverageDetail {
     /// One or more child shards exist but their `parent` field does not
     /// reference this parent shard.
     WrongParent { children: Vec<ShardId> },
+}
+
+impl fmt::Display for SplitCoverageDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySpawned => write!(f, "split shard has no children (empty spawned list)"),
+            Self::MissingChildren { children } => {
+                write!(f, "child shard(s) {children:?} not found in coordinator")
+            }
+            Self::WrongParent { children } => {
+                write!(
+                    f,
+                    "child shard(s) {children:?} do not reference this parent"
+                )
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +214,93 @@ pub enum InvariantViolation {
         prev_claim: LogicalTime,
         min_interval: u64,
     },
+}
+
+impl fmt::Display for InvariantViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MutualExclusion { key, workers } => write!(
+                f,
+                "S1 MutualExclusion: shard {key:?} held by workers \
+                 {w0:?} and {w1:?} simultaneously",
+                w0 = workers[0],
+                w1 = workers[1],
+            ),
+            Self::FenceMonotonicity {
+                run,
+                shard,
+                prev,
+                current,
+            } => write!(
+                f,
+                "S2 FenceMonotonicity: shard (run={run:?}, shard={shard:?}) \
+                 fence regressed from {prev:?} to {current:?}"
+            ),
+            Self::TerminalIrreversibility {
+                run,
+                shard,
+                was,
+                now,
+            } => write!(
+                f,
+                "S3 TerminalIrreversibility: shard (run={run:?}, shard={shard:?}) \
+                 reverted from {was:?} to {now:?}"
+            ),
+            Self::RecordInvariant {
+                run,
+                shard,
+                message,
+            } => write!(
+                f,
+                "S4 RecordInvariant: shard (run={run:?}, shard={shard:?}) {message}"
+            ),
+            Self::CursorMonotonicity {
+                run,
+                shard,
+                prev,
+                current,
+            } => write!(
+                f,
+                "S5 CursorMonotonicity: shard (run={run:?}, shard={shard:?}) \
+                 cursor regressed from {prev:?} to {current:?}"
+            ),
+            Self::CursorOutOfBounds { run, shard } => write!(
+                f,
+                "S6 CursorOutOfBounds: shard (run={run:?}, shard={shard:?}) \
+                 cursor outside spec range"
+            ),
+            Self::SplitCoverage { run, shard, detail } => write!(
+                f,
+                "S7 SplitCoverage: shard (run={run:?}, shard={shard:?}) {detail}"
+            ),
+            Self::UnparkWithoutFenceBump {
+                run,
+                shard,
+                fence_at_park,
+                fence_at_unpark,
+            } => write!(
+                f,
+                "S3b UnparkWithoutFenceBump: shard (run={run:?}, shard={shard:?}) \
+                 unparked with fence {fence_at_unpark:?}, same as park fence {fence_at_park:?}"
+            ),
+            Self::RunTerminalIrreversibility { run, was, now } => write!(
+                f,
+                "S8 RunTerminalIrreversibility: run {run:?} reverted from {was:?} to {now:?}"
+            ),
+            Self::CooldownViolation {
+                worker,
+                this_claim,
+                prev_claim,
+                min_interval,
+            } => write!(
+                f,
+                "S9 CooldownViolation: worker {worker:?} claimed at {this_claim:?}, \
+                 only {gap} ticks after previous claim at {prev_claim:?} \
+                 (min interval: {min_interval})",
+                gap = this_claim.as_raw().saturating_sub(prev_claim.as_raw()),
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

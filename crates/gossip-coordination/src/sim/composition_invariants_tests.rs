@@ -12,10 +12,10 @@
 //! | Invariant | Tests |
 //! |---|---|
 //! | C1 (ProvenanceOrphan) | `c1_detects_provenance_orphan`, `c1_valid_provenance_no_violation`, `c1_detects_provenance_orphan_wrong_run_id` |
-//! | C2 (FenceExceeded) | `c2_detects_fence_exceeded`, `c2_accepts_equal_fence`, `c2_accepts_stale_fence` |
-//! | C3 (WriteAfterTerminal) | `c3_detects_write_after_terminal`, `c3_allows_write_in_same_lifecycle`, `c3_stale_epoch_not_flagged`, `c3_uncommitted_write_after_terminal_no_violation`, `c3_different_run_not_flagged` |
+//! | C2 (FenceExceeded) | `c2_detects_fence_exceeded`, `c2_accepts_equal_fence`, `c2_accepts_stale_fence`, `c2_detects_fence_exceeded_at_initial` |
+//! | C3 (WriteAfterTerminal) | `c3_detects_write_after_terminal`, `c3_allows_write_in_same_lifecycle`, `c3_stale_epoch_not_flagged`, `c3_uncommitted_write_after_terminal_no_violation`, `c3_different_run_not_flagged`, `c3_fires_after_crash_then_committed_write` |
 //! | C4 (FencePropagationMismatch) | `c4_detects_fence_mismatch`, `c4_no_violation_when_fences_match`, `c4_uncommitted_entry_not_checked` |
-//! | Cross-cutting | `smoke_no_violations_for_valid_state`, `incremental_processing_skips_old_entries` |
+//! | Cross-cutting | `smoke_no_violations_for_valid_state`, `incremental_processing_skips_old_entries`, `incremental_multi_round_with_interleaved_completions`, `multiple_violations_in_single_check`, `independent_per_shard`, `c1_c2_multiple_oracle_records`, `empty_state_no_violations` |
 //!
 //! # Test strategy
 //!
@@ -91,7 +91,7 @@ fn make_oracle_with_record(record: DoneLedgerRecord) -> DoneLedgerOracle {
 fn make_write_log_entry(
     run: RunId,
     shard: ShardId,
-    fence_epoch: FenceEpoch,
+    provenance_fence: FenceEpoch,
     lease_fence: FenceEpoch,
     committed: bool,
     coordinator_completed: bool,
@@ -100,7 +100,7 @@ fn make_write_log_entry(
         worker: WORKER,
         run_id: run,
         shard_id: shard,
-        fence_epoch,
+        provenance_fence,
         lease_fence,
         record_count: 1,
         committed,
@@ -323,11 +323,11 @@ fn c3_detects_write_after_terminal() {
         CrossComponentViolation::WriteAfterTerminal {
             run_id,
             shard_id,
-            fence_epoch,
+            lease_fence: lf,
         } => {
             assert_eq!(*run_id, RUN);
             assert_eq!(*shard_id, SHARD);
-            assert_eq!(*fence_epoch, fence);
+            assert_eq!(*lf, fence);
         }
         other => panic!("expected WriteAfterTerminal, got: {other:?}"),
     }
@@ -351,7 +351,7 @@ fn c3_allows_write_in_same_lifecycle() {
 }
 
 /// A stale-epoch write after completion of a different epoch should not
-/// trigger C3 (different fence_epoch means different triple).
+/// trigger C3 (different lease_fence means different triple).
 #[test]
 fn c3_stale_epoch_not_flagged() {
     let fence_v1 = FenceEpoch::from_raw(1);
@@ -391,7 +391,7 @@ fn c3_uncommitted_write_after_terminal_no_violation() {
 }
 
 /// A committed write under a different run_id should not trigger C3 even
-/// when the shard_id and fence_epoch match. The completed-set key is the
+/// when the shard_id and lease_fence match. The completed-set key is the
 /// full `(run_id, shard_id, lease_fence)` triple, so a different run is a
 /// distinct lifecycle.
 #[test]
@@ -427,7 +427,7 @@ fn c3_different_run_not_flagged() {
 // C4: Fence propagation mismatch
 // ---------------------------------------------------------------------------
 
-/// Stale-lease write: lease_fence differs from fence_epoch.
+/// Stale-lease write: lease_fence differs from provenance_fence.
 #[test]
 fn c4_detects_fence_mismatch() {
     let lease_fence = FenceEpoch::from_raw(3);
@@ -444,10 +444,12 @@ fn c4_detects_fence_mismatch() {
     assert_eq!(viols.len(), 1);
     match &viols[0] {
         CrossComponentViolation::FencePropagationMismatch {
+            run_id,
             lease_fence: lf,
             provenance_fence: pf,
             shard_id,
         } => {
+            assert_eq!(*run_id, RUN);
             assert_eq!(*lf, lease_fence);
             assert_eq!(*pf, stale_fence);
             assert_eq!(*shard_id, SHARD);
@@ -456,7 +458,7 @@ fn c4_detects_fence_mismatch() {
     }
 }
 
-/// Normal lifecycle: lease_fence == fence_epoch — no C4 violation.
+/// Normal lifecycle: lease_fence == provenance_fence — no C4 violation.
 #[test]
 fn c4_no_violation_when_fences_match() {
     let fence = FenceEpoch::from_raw(3);
@@ -547,25 +549,6 @@ fn c3_fires_after_crash_then_committed_write() {
     ));
 }
 
-/// An uncommitted write after terminal completion should NOT trigger C3
-/// (the write never landed in the done-ledger).
-#[test]
-fn c3_uncommitted_write_after_terminal_not_flagged() {
-    let fence = FenceEpoch::from_raw(2);
-    let coord = make_coordinator(RUN, SHARD, fence);
-    let oracle = DoneLedgerOracle::new();
-
-    // Normal completion.
-    let complete = make_write_log_entry(RUN, SHARD, fence, fence, true, true);
-    // Subsequent uncommitted write for the same triple.
-    let uncommitted = make_write_log_entry(RUN, SHARD, fence, fence, false, false);
-
-    let write_log = vec![complete, uncommitted];
-    let mut checker = CompositionInvariantChecker::new();
-    let viols = checker.check_all(&coord, &oracle, &write_log, TENANT);
-    assert!(viols.is_empty(), "expected no violations, got: {viols:?}");
-}
-
 /// A single write-log entry can trigger both C3 and C4 simultaneously:
 /// committed write for an already-completed triple with a stale fence.
 #[test]
@@ -635,80 +618,6 @@ fn independent_per_shard() {
     }
 }
 
-/// A single write-log entry can violate both C3 and C4: it commits records
-/// for a triple already completed (C3) and carries a provenance fence that
-/// differs from the lease fence (C4).
-#[test]
-fn c3_and_c4_dual_violation_from_single_entry() {
-    let coord = make_coordinator(RUN, SHARD, FenceEpoch::from_raw(3));
-    let oracle = DoneLedgerOracle::new();
-
-    // Entry 1: normal lifecycle that completes the triple.
-    let complete = make_write_log_entry(
-        RUN,
-        SHARD,
-        FenceEpoch::from_raw(3),
-        FenceEpoch::from_raw(3),
-        true,
-        true,
-    );
-    // Entry 2: committed write with stale provenance fence for the same
-    // lease triple. Violates C3 (triple already completed) and C4
-    // (lease_fence=3 != fence_epoch=1).
-    let bad_entry = make_write_log_entry(
-        RUN,
-        SHARD,
-        FenceEpoch::from_raw(1),
-        FenceEpoch::from_raw(3),
-        true,
-        false,
-    );
-
-    let write_log = vec![complete, bad_entry];
-    let mut checker = CompositionInvariantChecker::new();
-    let viols = checker.check_all(&coord, &oracle, &write_log, TENANT);
-
-    assert_eq!(viols.len(), 2, "expected 2 violations, got: {viols:?}");
-
-    let has_c3 = viols
-        .iter()
-        .any(|v| matches!(v, CrossComponentViolation::WriteAfterTerminal { .. }));
-    let has_c4 = viols
-        .iter()
-        .any(|v| matches!(v, CrossComponentViolation::FencePropagationMismatch { .. }));
-    assert!(has_c3, "expected WriteAfterTerminal in {viols:?}");
-    assert!(has_c4, "expected FencePropagationMismatch in {viols:?}");
-}
-
-/// Oracle record's provenance references an unknown `RunId` (shard exists
-/// under a different run). The `shard_lookup` key is `ShardKey(run, shard)`,
-/// so an unknown run yields `None` even when the shard ID exists elsewhere.
-#[test]
-fn c1_detects_provenance_orphan_unknown_run() {
-    // Coordinator has (RUN=1, SHARD=1).
-    let coord = make_coordinator(RUN, SHARD, FenceEpoch::from_raw(1));
-
-    // Oracle record references run 99 with the same shard ID.
-    let unknown_run = RunId::from_raw(99);
-    let prov = make_provenance(unknown_run, SHARD, FenceEpoch::from_raw(1));
-    let record = make_record(make_key(0xDD), prov);
-    let oracle = make_oracle_with_record(record);
-
-    let mut checker = CompositionInvariantChecker::new();
-    let viols = checker.check_all(&coord, &oracle, &[], TENANT);
-
-    assert_eq!(viols.len(), 1);
-    match &viols[0] {
-        CrossComponentViolation::ProvenanceOrphan {
-            run_id, shard_id, ..
-        } => {
-            assert_eq!(*run_id, unknown_run);
-            assert_eq!(*shard_id, SHARD);
-        }
-        other => panic!("expected ProvenanceOrphan, got: {other:?}"),
-    }
-}
-
 /// Degenerate case: empty coordinator, empty oracle, empty write log.
 #[test]
 fn empty_state_no_violations() {
@@ -718,4 +627,94 @@ fn empty_state_no_violations() {
     let mut checker = CompositionInvariantChecker::new();
     let viols = checker.check_all(&coord, &oracle, &[], TENANT);
     assert!(viols.is_empty(), "expected no violations, got: {viols:?}");
+}
+
+/// Multiple oracle records: one valid, one C1 orphan, one C2 fence-exceeded.
+/// Verifies the sweep processes all records rather than short-circuiting.
+#[test]
+fn c1_c2_multiple_oracle_records() {
+    let fence = FenceEpoch::from_raw(3);
+    let coord = make_coordinator(RUN, SHARD, fence);
+
+    // Record 1: valid — known shard, fence within bounds.
+    let valid_prov = make_provenance(RUN, SHARD, fence);
+    let valid_record = make_record(make_key(0x01), valid_prov);
+
+    // Record 2: C1 orphan — references shard 99 (not in coordinator).
+    let orphan_shard = ShardId::from_raw(99);
+    let orphan_prov = make_provenance(RUN, orphan_shard, FenceEpoch::from_raw(1));
+    let orphan_record = make_record(make_key(0x02), orphan_prov);
+
+    // Record 3: C2 fence exceeded — fence 10 > coordinator fence 3.
+    let exceeded_prov = make_provenance(RUN, SHARD, FenceEpoch::from_raw(10));
+    let exceeded_record = make_record(make_key(0x03), exceeded_prov);
+
+    let mut oracle = DoneLedgerOracle::new();
+    oracle.submit(
+        PendingWriteId::from_raw(1),
+        vec![valid_record, orphan_record, exceeded_record],
+    );
+    assert!(oracle.commit(PendingWriteId::from_raw(1)));
+
+    let mut checker = CompositionInvariantChecker::new();
+    let viols = checker.check_all(&coord, &oracle, &[], TENANT);
+
+    assert_eq!(viols.len(), 2, "expected 2 violations, got: {viols:?}");
+    let has_c1 = viols
+        .iter()
+        .any(|v| matches!(v, CrossComponentViolation::ProvenanceOrphan { .. }));
+    let has_c2 = viols
+        .iter()
+        .any(|v| matches!(v, CrossComponentViolation::FenceExceeded { .. }));
+    assert!(has_c1, "expected ProvenanceOrphan in {viols:?}");
+    assert!(has_c2, "expected FenceExceeded in {viols:?}");
+}
+
+/// Multi-round incremental processing: completions and writes span
+/// multiple `check_all` calls with different triples.
+#[test]
+fn incremental_multi_round_with_interleaved_completions() {
+    let fence_a = FenceEpoch::from_raw(2);
+    let fence_b = FenceEpoch::from_raw(3);
+
+    let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+    let r1 = TestRecordBuilder::new(TENANT, RUN, SHARD)
+        .fence_epoch(fence_a)
+        .build(coord.slab_mut());
+    coord.seed_shard(r1);
+    let r2 = TestRecordBuilder::new(TENANT, RUN, SHARD_2)
+        .fence_epoch(fence_b)
+        .build(coord.slab_mut());
+    coord.seed_shard(r2);
+
+    let oracle = DoneLedgerOracle::new();
+    let mut checker = CompositionInvariantChecker::new();
+
+    // Round 1: complete shard A, write shard B (no violation).
+    let mut write_log = vec![
+        make_write_log_entry(RUN, SHARD, fence_a, fence_a, true, true),
+        make_write_log_entry(RUN, SHARD_2, fence_b, fence_b, true, false),
+    ];
+    let viols = checker.check_all(&coord, &oracle, &write_log, TENANT);
+    assert!(viols.is_empty(), "round 1: {viols:?}");
+
+    // Round 2: complete shard B.
+    write_log.push(make_write_log_entry(
+        RUN, SHARD_2, fence_b, fence_b, true, true,
+    ));
+    let viols = checker.check_all(&coord, &oracle, &write_log, TENANT);
+    assert!(viols.is_empty(), "round 2: {viols:?}");
+
+    // Round 3: write again for shard B's completed triple — must fire C3.
+    write_log.push(make_write_log_entry(
+        RUN, SHARD_2, fence_b, fence_b, true, false,
+    ));
+    let viols = checker.check_all(&coord, &oracle, &write_log, TENANT);
+    assert_eq!(viols.len(), 1, "round 3: {viols:?}");
+    match &viols[0] {
+        CrossComponentViolation::WriteAfterTerminal { shard_id, .. } => {
+            assert_eq!(*shard_id, SHARD_2);
+        }
+        other => panic!("expected WriteAfterTerminal for SHARD_2, got: {other:?}"),
+    }
 }

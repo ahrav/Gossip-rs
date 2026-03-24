@@ -25,7 +25,7 @@
 //! # Stale-lease writes and C4
 //!
 //! [`ScanLifecycleStaleLeaseWrite`] ops deliberately inject provenance with
-//! a stale `fence_epoch` while the `lease_fence` reflects the real lease.
+//! a stale `provenance_fence` while the `lease_fence` reflects the real lease.
 //! C4 will fire for every such committed entry — this is expected behavior,
 //! not a false positive. Consumers that assert zero violations after a
 //! stale-lease step must filter or expect `FencePropagationMismatch`.
@@ -41,8 +41,8 @@
 //! do not log provenance entries; post-completion writes from those paths
 //! are invisible to C3. Pass-through `Complete` never touches the
 //! done-ledger, so C3 false negatives cannot arise there. The
-//! `exec_session_lifecycle` gap requires threading provenance through
-//! `WorkerSession` and is deferred to follow-up work.
+//! `exec_session_lifecycle` path does not log provenance entries; covering
+//! it requires threading provenance through `WorkerSession`.
 //!
 //! [`InvariantChecker`]: super::InvariantChecker
 //! [`DoneLedgerInvariantChecker`]: gossip_persistence_inmemory::sim::DoneLedgerInvariantChecker
@@ -88,7 +88,7 @@ pub enum CrossComponentViolation {
     WriteAfterTerminal {
         run_id: RunId,
         shard_id: ShardId,
-        fence_epoch: FenceEpoch,
+        lease_fence: FenceEpoch,
     },
 
     /// C4: the fence epoch written into done-ledger provenance does not
@@ -99,6 +99,7 @@ pub enum CrossComponentViolation {
     ///
     /// [`ScanLifecycleStaleLeaseWrite`]: super::composition::CompositionSimOp::ScanLifecycleStaleLeaseWrite
     FencePropagationMismatch {
+        run_id: RunId,
         lease_fence: FenceEpoch,
         provenance_fence: FenceEpoch,
         shard_id: ShardId,
@@ -129,20 +130,21 @@ impl fmt::Display for CrossComponentViolation {
             Self::WriteAfterTerminal {
                 run_id,
                 shard_id,
-                fence_epoch,
+                lease_fence,
             } => write!(
                 f,
                 "C3 WriteAfterTerminal: committed write for completed \
-                 triple (run={run_id:?}, shard={shard_id:?}, fence={fence_epoch:?})"
+                 triple (run={run_id:?}, shard={shard_id:?}, fence={lease_fence:?})"
             ),
             Self::FencePropagationMismatch {
+                run_id,
                 lease_fence,
                 provenance_fence,
                 shard_id,
             } => write!(
                 f,
-                "C4 FencePropagationMismatch: shard {shard_id:?} lease \
-                 fence {lease_fence:?} != provenance fence {provenance_fence:?}"
+                "C4 FencePropagationMismatch: run {run_id:?} shard {shard_id:?} \
+                 lease fence {lease_fence:?} != provenance fence {provenance_fence:?}"
             ),
         }
     }
@@ -155,7 +157,7 @@ impl fmt::Display for CrossComponentViolation {
 /// Stateful observer verifying cross-component invariants C1–C4.
 ///
 /// Maintains history across simulation steps:
-/// - `completed_shards`: tracks `(run_id, shard_id, fence_epoch)` triples
+/// - `completed_shards`: tracks `(run_id, shard_id, lease_fence)` triples
 ///   whose coordinator `complete()` succeeded, for C3 detection.
 /// - `last_write_log_len`: index into the write log so C3/C4 only process
 ///   new entries each step.
@@ -199,6 +201,7 @@ impl CompositionInvariantChecker {
     /// - `oracle`: done-ledger model oracle with committed records.
     /// - `write_log`: full provenance log from the composition harness.
     /// - `tenant`: tenant scope for coordinator lookups.
+    #[must_use = "violations must be inspected"]
     pub fn check_all(
         &mut self,
         coordinator: &impl SimIntrospection,
@@ -230,6 +233,13 @@ impl CompositionInvariantChecker {
     /// The check-then-update ordering for C3 ensures that the lifecycle
     /// that both writes and completes a shard is not falsely flagged —
     /// only subsequent writes for the same triple trigger a violation.
+    ///
+    /// # Panics (debug builds)
+    ///
+    /// Debug-asserts that `write_log.len() >= self.last_write_log_len`,
+    /// i.e. the log is append-only. A violation indicates a harness bug
+    /// (the simulation shrank or replaced the log), not a cross-component
+    /// invariant failure.
     fn check_write_log(
         &mut self,
         write_log: &[ProvenanceEntry],
@@ -243,27 +253,29 @@ impl CompositionInvariantChecker {
         );
 
         for entry in write_log.iter().skip(self.last_write_log_len) {
-            // C3: detect committed writes for already-completed shard-epoch triples.
-            // Uses lease_fence (not fence_epoch) because the coordinator completes
-            // with the actual lease epoch — the completion key must match.
             if entry.committed {
+                // C3: detect committed writes for already-completed shard-epoch
+                // triples. Uses lease_fence (not provenance_fence) because the
+                // coordinator completes with the actual lease epoch.
                 let triple = (entry.run_id, entry.shard_id, entry.lease_fence);
                 if self.completed_shards.contains(&triple) {
                     violations.push(CrossComponentViolation::WriteAfterTerminal {
                         run_id: entry.run_id,
                         shard_id: entry.shard_id,
-                        fence_epoch: entry.lease_fence,
+                        lease_fence: entry.lease_fence,
                     });
                 }
-            }
 
-            // C4: detect fence propagation mismatch (lease fence ≠ provenance fence).
-            if entry.committed && entry.lease_fence != entry.fence_epoch {
-                violations.push(CrossComponentViolation::FencePropagationMismatch {
-                    lease_fence: entry.lease_fence,
-                    provenance_fence: entry.fence_epoch,
-                    shard_id: entry.shard_id,
-                });
+                // C4: detect fence propagation mismatch (lease fence ≠
+                // provenance fence).
+                if entry.lease_fence != entry.provenance_fence {
+                    violations.push(CrossComponentViolation::FencePropagationMismatch {
+                        run_id: entry.run_id,
+                        lease_fence: entry.lease_fence,
+                        provenance_fence: entry.provenance_fence,
+                        shard_id: entry.shard_id,
+                    });
+                }
             }
 
             // Update completed-shards set for future C3 checks.
