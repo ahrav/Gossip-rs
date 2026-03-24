@@ -16,9 +16,9 @@
 //!
 //! The harness drives a deterministic claim-scan-complete loop that exercises
 //! both APIs, runs the coordination invariant checker (S1–S9) after every
-//! step, and the persistence invariant checker (I1–I10) inline during ledger
-//! writes. Cross-component invariants (C1–C4) are wired by a follow-on
-//! checker.
+//! step, the persistence invariant checker (I1–I10) inline during ledger
+//! writes, and the cross-component invariant checker (C1–C4) after every
+//! step.
 //!
 //! # Determinism
 //!
@@ -206,11 +206,11 @@ pub struct ProvenanceEntry {
     ///
     /// Equals `lease_fence` for normal lifecycles. Differs for stale-lease
     /// writes where the harness deliberately injects an older epoch.
-    pub fence_epoch: FenceEpoch,
+    pub provenance_fence: FenceEpoch,
     /// Actual fence epoch from the lease at claim time.
     ///
     /// The cross-component invariant checker (C4) compares this against
-    /// `fence_epoch` to detect fence propagation mismatches.
+    /// `provenance_fence` to detect fence propagation mismatches.
     pub lease_fence: FenceEpoch,
     /// Number of done-ledger records produced by the scan.
     pub record_count: usize,
@@ -310,7 +310,7 @@ pub enum CompositionSimViolation {
 impl fmt::Display for CompositionSimViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Coordination(v) => write!(f, "{v:?}"),
+            Self::Coordination(v) => write!(f, "{v}"),
             Self::Persistence(v) => write!(f, "{v}"),
             Self::CrossComponent(v) => write!(f, "{v}"),
         }
@@ -324,7 +324,8 @@ impl fmt::Display for CompositionSimViolation {
 /// Composition simulation harness: coordinator + done-ledger.
 ///
 /// Drives a deterministic claim-scan-complete loop with a single PRNG stream,
-/// running both invariant checker suites (S1–S9, I1–I10) after every step.
+/// running all three invariant checker suites (S1–S9, I1–I10, C1–C4) after
+/// every step.
 ///
 /// # Ownership model
 ///
@@ -709,7 +710,7 @@ impl CompositionSim {
             worker,
             run_id: lease.run(),
             shard_id: lease.shard(),
-            fence_epoch: lease.fence(),
+            provenance_fence: lease.fence(),
             lease_fence: lease.fence(),
             record_count: records_written,
             committed: ledger_committed,
@@ -802,7 +803,7 @@ impl CompositionSim {
             worker,
             run_id: lease.run(),
             shard_id: lease.shard(),
-            fence_epoch: lease.fence(),
+            provenance_fence: lease.fence(),
             lease_fence: lease.fence(),
             record_count: scan.records.len(),
             committed: false,
@@ -883,12 +884,12 @@ impl CompositionSim {
 
         // Record provenance with the stale fence. The cross-component
         // checker (C4) will fire FencePropagationMismatch for committed
-        // entries because fence_epoch != lease_fence — this is expected.
+        // entries because provenance_fence != lease_fence — this is expected.
         self.write_log.push(ProvenanceEntry {
             worker,
             run_id: lease.run(),
             shard_id: lease.shard(),
-            fence_epoch: stale_fence,
+            provenance_fence: stale_fence,
             lease_fence: lease.fence(),
             record_count: scan.records.len(),
             committed: ledger_committed,
