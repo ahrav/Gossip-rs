@@ -124,7 +124,7 @@ impl FilesystemShardPayload {
     ///   the canonical root contains bytes that are not valid UTF-8 (possible
     ///   on Unix with non-UTF-8 filenames).
     /// - [`RelativePath`](FilesystemShardPayloadEncodeError::RelativePath) —
-    ///   the canonical root is not an absolute path.
+    ///   the canonical root is relative; canonical paths must be absolute.
     pub fn encode(&self) -> Result<Vec<u8>, FilesystemShardPayloadEncodeError> {
         if self.canonical_root.as_os_str().is_empty() {
             return Err(FilesystemShardPayloadEncodeError::EmptyPath { mode: self.mode });
@@ -190,7 +190,7 @@ impl FilesystemShardPayload {
 
 /// Errors from [`FilesystemShardPayload::encode`].
 ///
-/// Variants indicate a payload that was constructed with a path the
+/// All variants indicate a payload that was constructed with a path the
 /// wire format cannot represent.  Normal operation through
 /// [`from_normalized_request`](FilesystemShardPayload::from_normalized_request)
 /// avoids these because request normalization canonicalizes the path first.
@@ -211,7 +211,7 @@ pub enum FilesystemShardPayloadEncodeError {
         /// The offending path.
         path: PathBuf,
     },
-    /// The canonical path is relative; the wire format requires absolute paths.
+    /// The payload path is relative; canonical paths must be absolute.
     RelativePath {
         /// Source mode being encoded.
         mode: FilesystemSourceMode,
