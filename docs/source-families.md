@@ -58,6 +58,13 @@ inherent methods in `gossip-connectors/src/`.
   `NormalizedFilesystemRequest`.
 - `planner.rs` maps normalized requests into the deterministic one-shard
   startup geometry consumed by later payload and registration stages.
+- `payload.rs` encodes the typed filesystem shard metadata that coordination
+  stores in `connector_extra` and the runtime later decodes during lease
+  hydration.
+- `setup.rs` lowers the normalized request, planned geometry, and typed
+  payload into a validated initial manifest, then executes the
+  `create_run_with_shards` lifecycle that makes the startup shard set
+  claimable.
 
 These stages are optional for other ordered-content sources (e.g., git
 ls-files connectors) but required for filesystem security and determinism.
@@ -125,10 +132,11 @@ and `types.rs`.
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
-| `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem request normalization and planning |
+| `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem request normalization, planning, and run setup |
 | `crates/gossip-orchestrator/src/request.rs` | Canonical filesystem submission request normalization |
 | `crates/gossip-orchestrator/src/planner.rs` | Deterministic filesystem initial shard geometry planner |
 | `crates/gossip-orchestrator/src/payload.rs` | Typed filesystem shard payload wire format (encode/decode) |
+| `crates/gossip-orchestrator/src/setup.rs` | Coordination-backed filesystem run setup and shard registration |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
