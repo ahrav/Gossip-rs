@@ -148,9 +148,10 @@ impl FilesystemShardPayload {
 
     /// Decode filesystem payload bytes previously stored in `connector_extra`.
     ///
-    /// Validates the mode tag, path presence, and UTF-8 well-formedness
-    /// in that order.  On success the returned payload is structurally
-    /// identical to the one that produced `bytes` via [`encode`](Self::encode).
+    /// Validates the mode tag, path presence, UTF-8 well-formedness, and
+    /// the absolute-path requirement in that order.  On success the returned
+    /// payload is structurally identical to the one that produced `bytes`
+    /// via [`encode`](Self::encode).
     ///
     /// # Errors
     ///
@@ -193,7 +194,9 @@ impl FilesystemShardPayload {
 /// All variants indicate a payload that was constructed with a path the
 /// wire format cannot represent.  Normal operation through
 /// [`from_normalized_request`](FilesystemShardPayload::from_normalized_request)
-/// avoids these because request normalization canonicalizes the path first.
+/// avoids the empty and relative cases because request normalization
+/// canonicalizes the path first; `NonUtf8Path` can still occur on
+/// platforms that allow canonical paths outside UTF-8.
 ///
 /// # Security note
 ///
@@ -496,5 +499,37 @@ mod tests {
             err,
             FilesystemShardPayloadEncodeError::NonUtf8Path { .. }
         ));
+    }
+
+    #[test]
+    fn debug_redacts_payload_path() {
+        let payload = FilesystemShardPayload::new(FilesystemSourceMode::SingleFile, "/secret/root");
+        let rendered = format!("{payload:?}");
+
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must include redaction placeholder: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/secret/root"),
+            "Debug output must not leak the raw path: {rendered}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_encode_error_path() {
+        let err = FilesystemShardPayloadEncodeError::NonUtf8Path {
+            path: PathBuf::from("/sensitive/path"),
+        };
+        let rendered = format!("{err:?}");
+
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must include redaction placeholder: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/sensitive/path"),
+            "Debug output must not leak the raw path: {rendered}"
+        );
     }
 }
