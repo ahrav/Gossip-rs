@@ -77,6 +77,12 @@ use gossip_contracts::identity::{LogicalTime, RunId, ShardId, ShardKey, TenantId
 /// to prevent cross-tenant enumeration.
 ///
 /// [`AcquireError`]: crate::error::AcquireError
+//
+// `thiserror::Error` is derived for `Error::source()` wiring on `BackendError`.
+// `Display` is implemented manually because `NoneAvailable` has conditional
+// formatting (Some vs None deadline) that a single `#[error("...")]` attribute
+// cannot express. New variants should add a match arm in the `Display` impl
+// below rather than an `#[error]` attribute.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClaimError {

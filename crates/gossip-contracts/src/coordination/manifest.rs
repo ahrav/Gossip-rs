@@ -98,6 +98,7 @@ pub enum ManifestValidationError {
     #[error("invalid spec for shard {shard_id:?}: {reason}")]
     InvalidSpec {
         shard_id: ShardId,
+        #[source]
         reason: ShardSpecInputError,
     },
     /// Too many shards (SEC-3).

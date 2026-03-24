@@ -1100,7 +1100,10 @@ macro_rules! impl_from_coord_error {
             arms: [
                 $($arms)*
                 CoordError::$variant { .. } => {
-                    unreachable!(concat!("CoordError variant is not valid for ", stringify!($target)))
+                    unreachable!(concat!(
+                        "CoordError::", stringify!($variant),
+                        " is not valid for ", stringify!($target)
+                    ))
                 },
             ],
             accept: [],
@@ -1120,7 +1123,10 @@ macro_rules! impl_from_coord_error {
             arms: [
                 $($arms)*
                 CoordError::$variant(_) => {
-                    unreachable!(concat!("CoordError variant is not valid for ", stringify!($target)))
+                    unreachable!(concat!(
+                        "CoordError::", stringify!($variant),
+                        " is not valid for ", stringify!($target)
+                    ))
                 },
             ],
             accept: [],
@@ -1140,7 +1146,10 @@ macro_rules! impl_from_coord_error {
             arms: [
                 $($arms)*
                 CoordError::$variant => {
-                    unreachable!(concat!("CoordError variant is not valid for ", stringify!($target)))
+                    unreachable!(concat!(
+                        "CoordError::", stringify!($variant),
+                        " is not valid for ", stringify!($target)
+                    ))
                 },
             ],
             accept: [],
