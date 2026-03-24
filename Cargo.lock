@@ -792,10 +792,10 @@ dependencies = [
  "gossip-coordination-etcd",
  "gossip-done-ledger-postgres",
  "gossip-findings-postgres",
- "gossip-frontier",
  "gossip-orchestrator",
  "gossip-stdx",
  "postgres",
+ "tempfile",
 ]
 
 [[package]]

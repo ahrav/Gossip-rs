@@ -30,9 +30,9 @@ migrate:
 
 # ── Scan workflow ─────────────────────────────────────────────────────
 
-# Seed a run with one full-range shard pointing at PATH
+# Submit a directory-root filesystem request for PATH
 seed PATH:
-    cargo run -p dev-seed -- seed "{{PATH}}"
+    cargo run -p dev-seed -- seed directory_root "{{PATH}}"
 
 # Run the distributed worker against local backends
 run-worker PATH:

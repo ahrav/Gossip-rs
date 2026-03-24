@@ -1,19 +1,21 @@
-//! Local development seed, inspect, and migrate tool for gossip-rs.
+//! Local development submission, inspect, and migrate tool for gossip-rs.
 //!
-//! Seeds coordination state (runs + shards) into etcd, applies PostgreSQL
+//! Submits filesystem requests into coordination state, applies PostgreSQL
 //! migrations, and queries persistence tables for row counts.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, TenantId};
 use gossip_coordination::{
-    CursorSemantics, CursorUpdate, InitialShardInput, RegisterShardsError, RunConfig, RunManagement,
+    CreateRunError, CursorSemantics, GetRunError, RegisterShardsError, RunConfig, RunManagement,
 };
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig};
-use gossip_frontier::{ShardSpecScratch, range_shard_ref};
-use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
+use gossip_orchestrator::{
+    FilesystemRequest, FilesystemRunSetupError, FilesystemRunSetupInput, FilesystemSourceMode,
+    plan_filesystem_initial_shards, setup_filesystem_run,
+};
 use postgres::{Client, NoTls};
 
 const DEFAULT_ETCD_ENDPOINTS: &str = "http://127.0.0.1:2379";
@@ -23,21 +25,44 @@ const DEFAULT_FINDINGS_DSN: &str = "postgresql://postgres:postgres@127.0.0.1:543
 
 const DEFAULT_TENANT_ID: [u8; 32] = [0x11; 32];
 const DEFAULT_RUN_ID: u64 = 42;
-const DEFAULT_SHARD_ID: u64 = 1;
 const DEFAULT_LEASE_DURATION_MS: u64 = 30_000;
+const DEFAULT_SETUP_LOGICAL_TIME: u64 = 1;
+const DEFAULT_SETUP_OP_ID: u64 = 1;
 
-#[derive(Parser)]
+/// Clap-facing parser that preserves the orchestrator's explicit filesystem
+/// request vocabulary without adding a `clap` dependency to the shared crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FilesystemSourceModeArg {
+    #[value(name = "single_file")]
+    SingleFile,
+    #[value(name = "directory_root")]
+    DirectoryRoot,
+}
+
+impl From<FilesystemSourceModeArg> for FilesystemSourceMode {
+    fn from(value: FilesystemSourceModeArg) -> Self {
+        match value {
+            FilesystemSourceModeArg::SingleFile => Self::SingleFile,
+            FilesystemSourceModeArg::DirectoryRoot => Self::DirectoryRoot,
+        }
+    }
+}
+
+#[derive(Debug, Parser, PartialEq, Eq)]
 #[command(name = "dev-seed", about = "Local dev helpers for gossip-rs")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Commands {
-    /// Create a run with one full-range shard pointing at PATH.
+    /// Submit a filesystem request and register its initial shard set.
     Seed {
-        /// Directory to scan.
+        /// Filesystem request mode (`single_file` or `directory_root`).
+        source_mode: FilesystemSourceModeArg,
+
+        /// File or directory to scan.
         path: PathBuf,
 
         #[arg(long, default_value = DEFAULT_ETCD_ENDPOINTS)]
@@ -48,9 +73,6 @@ enum Commands {
 
         #[arg(long, default_value_t = DEFAULT_RUN_ID)]
         run_id: u64,
-
-        #[arg(long, default_value_t = DEFAULT_SHARD_ID)]
-        shard_id: u64,
 
         #[arg(long, default_value_t = DEFAULT_LEASE_DURATION_MS)]
         lease_duration_ms: u64,
@@ -84,18 +106,18 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Seed {
+            source_mode,
             path,
             etcd_endpoints,
             etcd_namespace,
             run_id,
-            shard_id,
             lease_duration_ms,
         } => cmd_seed(
+            source_mode,
             &path,
             &etcd_endpoints,
             &etcd_namespace,
             run_id,
-            shard_id,
             lease_duration_ms,
         ),
         Commands::Inspect {
@@ -109,92 +131,131 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// Coordinator-authoritative summary that the CLI prints after a filesystem
+/// submission succeeds or replays.
+#[derive(Debug, PartialEq, Eq)]
+struct FilesystemSubmissionResult {
+    source_mode: FilesystemSourceMode,
+    canonical_target: PathBuf,
+    run_id: RunId,
+    root_shards: Vec<ShardId>,
+    replayed: bool,
+}
+
 fn cmd_seed(
+    source_mode: FilesystemSourceModeArg,
     path: &Path,
     etcd_endpoints: &str,
     etcd_namespace: &str,
     run_id_raw: u64,
-    shard_id_raw: u64,
     lease_duration_ms: u64,
 ) -> Result<()> {
-    if !path.exists() {
-        bail!("scan path does not exist: {}", path.display());
-    }
-    if !path.is_dir() {
-        bail!("scan path is not a directory: {}", path.display());
-    }
-
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize path: {}", path.display()))?;
-
     let config = EtcdCoordinatorConfig::from_endpoints_csv(etcd_endpoints, etcd_namespace)
         .context("invalid etcd config")?;
     let mut coordinator = EtcdCoordinator::connect(config).context("failed to connect to etcd")?;
 
-    let tenant = TenantId::from_bytes(DEFAULT_TENANT_ID);
-    let run_id = RunId::from_raw(run_id_raw);
-    let shard_id = ShardId::from_raw(shard_id_raw);
-    let now = LogicalTime::from_raw(1);
-
-    let run_config = RunConfig::try_new(CursorSemantics::Completed, lease_duration_ms, Some(5))
-        .context("invalid run config")?;
-
-    // Treat AlreadyExists as non-fatal for re-runnability.
-    match coordinator.create_run(now, tenant, run_id, run_config) {
-        Ok(_) => eprintln!("created run {run_id_raw}"),
-        Err(gossip_coordination::CreateRunError::RunAlreadyExists { .. }) => {
-            eprintln!(
-                "run {run_id_raw} already exists — skipping creation (use `just reset` to clear state)"
-            );
-        }
-        Err(err) => return Err(anyhow::Error::new(err).context("failed to create run")),
-    }
-
-    let mut scratch = ShardSpecScratch::new();
-    let connector_extra =
-        FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, &canonical)
-            .encode()
-            .context("failed to encode filesystem shard payload")?;
-    let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
-        .context("failed to build shard spec")?;
-    let spec = gossip_coordination::ShardSpec::try_from_ref(spec_ref)
-        .context("failed to build owned shard spec")?;
-    let manifest = [InitialShardInput::new(
-        shard_id,
-        spec.as_ref(),
-        CursorUpdate::initial(),
-    )];
-
-    let next_now = LogicalTime::from_raw(2);
-    match coordinator.register_shards(next_now, tenant, run_id, &manifest, OpId::from_raw(1)) {
-        Ok(_) => {
-            eprintln!("registered shard {shard_id_raw}");
-        }
-        Err(RegisterShardsError::OpIdConflict(_)) => {
-            // OpIdConflict means the same OpId was used with a different payload
-            // hash. Since this tool always uses OpId(1), re-seeding with a
-            // different path or shard configuration triggers this. The old shard
-            // metadata stays in etcd, so we must not print success — the user
-            // needs to reset first.
-            bail!(
-                "run {run_id_raw} already has a different shard registration payload; \
-                 run `just reset` then re-seed"
-            );
-        }
-        Err(RegisterShardsError::RunNotFound) => {
-            bail!("run {run_id_raw} not found — was it created? try `just seed` from scratch");
-        }
-        Err(err) => {
-            return Err(anyhow::Error::new(err).context("failed to register shards"));
-        }
-    }
-
-    eprintln!(
-        "seeded run {run_id_raw} with 1 shard covering {}",
-        canonical.display()
-    );
+    let submission = submit_filesystem_request(
+        &mut coordinator,
+        source_mode.into(),
+        path,
+        run_id_raw,
+        lease_duration_ms,
+    )?;
+    print_submission_result(&submission);
     Ok(())
+}
+
+/// Lower one filesystem request through normalization, shard planning, payload
+/// construction, and coordination-backed run setup.
+fn submit_filesystem_request<M>(
+    management: &mut M,
+    source_mode: FilesystemSourceMode,
+    path: &Path,
+    run_id_raw: u64,
+    lease_duration_ms: u64,
+) -> Result<FilesystemSubmissionResult>
+where
+    M: RunManagement,
+{
+    let run_config = RunConfig::try_new(CursorSemantics::Completed, lease_duration_ms, Some(5))
+        .context("invalid filesystem submission config")?;
+    let request = match source_mode {
+        FilesystemSourceMode::SingleFile => FilesystemRequest::single_file(path, run_config),
+        FilesystemSourceMode::DirectoryRoot => FilesystemRequest::directory_root(path, run_config),
+    };
+    let normalized = request.normalize().map_err(|error| {
+        anyhow::Error::new(error).context("invalid filesystem submission request")
+    })?;
+    let plan = plan_filesystem_initial_shards(normalized);
+    let payload = plan.shard_payload();
+    let run_id = RunId::from_raw(run_id_raw);
+    let canonical_target = plan.request().canonical_root().to_path_buf();
+    let outcome = setup_filesystem_run(
+        management,
+        LogicalTime::from_raw(DEFAULT_SETUP_LOGICAL_TIME),
+        TenantId::from_bytes(DEFAULT_TENANT_ID),
+        run_id,
+        FilesystemRunSetupInput::new(plan.request(), plan.initial_shard(), &payload),
+        OpId::from_raw(DEFAULT_SETUP_OP_ID),
+    )
+    .map_err(|error| classify_submission_error(run_id_raw, error))?;
+    let replayed = outcome.is_replay();
+    let setup = outcome.into_inner();
+    Ok(FilesystemSubmissionResult {
+        source_mode: plan.request().mode(),
+        canonical_target,
+        run_id,
+        root_shards: setup.root_shards().to_vec(),
+        replayed,
+    })
+}
+
+/// Collapse setup failures into operator-facing categories while preserving
+/// the original coordination error in the chain.
+fn classify_submission_error(run_id_raw: u64, error: FilesystemRunSetupError) -> anyhow::Error {
+    match error {
+        FilesystemRunSetupError::CreateRun(CreateRunError::ConfigMismatch { .. }) => {
+            anyhow::anyhow!(
+                "filesystem submission run {run_id_raw} already exists with a different run configuration"
+            )
+        }
+        FilesystemRunSetupError::CreateRun(CreateRunError::RegisterShardsFailed(
+            RegisterShardsError::OpIdConflict(_),
+        )) => anyhow::anyhow!(
+            "filesystem submission run {run_id_raw} already exists with a different shard registration payload"
+        ),
+        error @ FilesystemRunSetupError::CreateRun(CreateRunError::BackendError(_))
+        | error @ FilesystemRunSetupError::CreateRun(CreateRunError::RegisterShardsFailed(
+            RegisterShardsError::BackendError(_),
+        ))
+        | error @ FilesystemRunSetupError::CreateRun(CreateRunError::GetRunFailed(
+            GetRunError::BackendError(_),
+        )) => anyhow::Error::new(error)
+            .context("coordination backend error during filesystem submission"),
+        error => anyhow::Error::new(error).context("filesystem submission failed"),
+    }
+}
+
+/// Emit a compact summary that callers can feed into follow-on worker runs.
+fn print_submission_result(submission: &FilesystemSubmissionResult) {
+    let outcome = if submission.replayed {
+        "replayed"
+    } else {
+        "executed"
+    };
+    println!("outcome={outcome}");
+    println!("run_id={}", submission.run_id.as_raw());
+    println!("source_mode={}", submission.source_mode);
+    println!("canonical_target={}", submission.canonical_target.display());
+    println!(
+        "root_shards={}",
+        submission
+            .root_shards
+            .iter()
+            .map(|shard| shard.as_raw().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 }
 
 fn cmd_inspect(done_ledger_dsn: &str, findings_dsn: &str) -> Result<()> {
@@ -300,4 +361,125 @@ fn cmd_migrate(done_ledger_dsn: &str, findings_dsn: &str) -> Result<()> {
 
     eprintln!("migrations applied to both databases");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use clap::Parser;
+    use gossip_coordination::{InMemoryCoordinator, RunStatus};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn seed_cli_parses_explicit_filesystem_mode() {
+        let cli = Cli::try_parse_from([
+            "dev-seed",
+            "seed",
+            "single_file",
+            "/tmp/scan-target.txt",
+            "--run-id",
+            "77",
+        ])
+        .expect("seed command should parse");
+
+        assert_eq!(
+            cli.command,
+            Commands::Seed {
+                source_mode: FilesystemSourceModeArg::SingleFile,
+                path: PathBuf::from("/tmp/scan-target.txt"),
+                etcd_endpoints: DEFAULT_ETCD_ENDPOINTS.to_string(),
+                etcd_namespace: DEFAULT_ETCD_NAMESPACE.to_string(),
+                run_id: 77,
+                lease_duration_ms: DEFAULT_LEASE_DURATION_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn submit_filesystem_request_registers_directory_root_shard() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("scan-root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("alpha.txt"), "fixture").expect("write fixture");
+        let canonical_target = root.canonicalize().expect("canonical target");
+
+        let mut coordinator = InMemoryCoordinator::new(DEFAULT_LEASE_DURATION_MS);
+        let submission = submit_filesystem_request(
+            &mut coordinator,
+            FilesystemSourceMode::DirectoryRoot,
+            &root,
+            DEFAULT_RUN_ID,
+            DEFAULT_LEASE_DURATION_MS,
+        )
+        .expect("submission should succeed");
+
+        assert_eq!(submission.source_mode, FilesystemSourceMode::DirectoryRoot);
+        assert_eq!(submission.canonical_target, canonical_target);
+        assert_eq!(submission.run_id, RunId::from_raw(DEFAULT_RUN_ID));
+        assert_eq!(submission.root_shards.len(), 1);
+        assert!(!submission.replayed);
+
+        let run = coordinator
+            .get_run(
+                TenantId::from_bytes(DEFAULT_TENANT_ID),
+                RunId::from_raw(DEFAULT_RUN_ID),
+            )
+            .expect("run should exist");
+        assert_eq!(run.status(), RunStatus::Active);
+        assert_eq!(run.root_shards(), submission.root_shards.as_slice());
+    }
+
+    #[test]
+    fn submit_filesystem_request_replays_matching_request() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("scan-root");
+        fs::create_dir(&root).expect("create root");
+
+        let mut coordinator = InMemoryCoordinator::new(DEFAULT_LEASE_DURATION_MS);
+        let first = submit_filesystem_request(
+            &mut coordinator,
+            FilesystemSourceMode::DirectoryRoot,
+            &root,
+            DEFAULT_RUN_ID,
+            DEFAULT_LEASE_DURATION_MS,
+        )
+        .expect("initial submission should succeed");
+        let replay = submit_filesystem_request(
+            &mut coordinator,
+            FilesystemSourceMode::DirectoryRoot,
+            &root,
+            DEFAULT_RUN_ID,
+            DEFAULT_LEASE_DURATION_MS,
+        )
+        .expect("replayed submission should succeed");
+
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(replay.root_shards, first.root_shards);
+        assert_eq!(replay.canonical_target, first.canonical_target);
+    }
+
+    #[test]
+    fn submit_filesystem_request_rejects_mode_path_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("scan-target.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+
+        let mut coordinator = InMemoryCoordinator::new(DEFAULT_LEASE_DURATION_MS);
+        let error = submit_filesystem_request(
+            &mut coordinator,
+            FilesystemSourceMode::DirectoryRoot,
+            &file_path,
+            DEFAULT_RUN_ID,
+            DEFAULT_LEASE_DURATION_MS,
+        )
+        .expect_err("directory-root submission should reject regular files");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid filesystem submission request"));
+        assert!(message.contains("requires a directory"));
+    }
 }
