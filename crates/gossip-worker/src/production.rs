@@ -18,7 +18,6 @@
 //! should connect clients themselves and use
 //! [`build_production_backends_from_clients`].
 
-use std::error::Error;
 use std::fmt;
 
 use crate::config::ProductionBackendConfig;
@@ -105,76 +104,37 @@ impl ProductionStartupSettings {
 /// in the current schema, and (2) the migration history table contains a row
 /// for every embedded migration version whose BLAKE3 checksum matches the
 /// compiled-in digest.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProductionSchemaReadinessError {
     /// A SQL query required for readiness validation failed.
-    Query(postgres::Error),
+    #[error("schema readiness query failed: {0}")]
+    Query(#[source] postgres::Error),
     /// An expected table is missing from the current schema.
+    #[error("required table '{table}' is missing from the current schema")]
     MissingTable { table: &'static str },
     /// An expected migration history row is absent.
+    #[error("migration history table '{history_table}' is missing required version '{version}'")]
     MissingAppliedMigration {
         history_table: &'static str,
         version: &'static str,
     },
     /// A stored checksum row is not the expected 32 bytes.
+    #[error(
+        "migration history table '{history_table}' stores a corrupted checksum for version '{version}' ({found_len} bytes)"
+    )]
     CorruptedAppliedMigration {
         history_table: &'static str,
         version: &'static str,
         found_len: usize,
     },
     /// A stored checksum does not match the embedded migration source.
+    #[error(
+        "migration history table '{history_table}' does not match the embedded checksum for version '{version}'"
+    )]
     MigrationChecksumMismatch {
         history_table: &'static str,
         version: &'static str,
     },
-}
-
-impl fmt::Display for ProductionSchemaReadinessError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Query(source) => write!(f, "schema readiness query failed: {source}"),
-            Self::MissingTable { table } => {
-                write!(
-                    f,
-                    "required table '{table}' is missing from the current schema"
-                )
-            }
-            Self::MissingAppliedMigration {
-                history_table,
-                version,
-            } => write!(
-                f,
-                "migration history table '{history_table}' is missing required version '{version}'"
-            ),
-            Self::CorruptedAppliedMigration {
-                history_table,
-                version,
-                found_len,
-            } => write!(
-                f,
-                "migration history table '{history_table}' stores a corrupted checksum for version '{version}' ({found_len} bytes)"
-            ),
-            Self::MigrationChecksumMismatch {
-                history_table,
-                version,
-            } => write!(
-                f,
-                "migration history table '{history_table}' does not match the embedded checksum for version '{version}'"
-            ),
-        }
-    }
-}
-
-impl Error for ProductionSchemaReadinessError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Query(source) => Some(source),
-            Self::MissingTable { .. }
-            | Self::MissingAppliedMigration { .. }
-            | Self::CorruptedAppliedMigration { .. }
-            | Self::MigrationChecksumMismatch { .. } => None,
-        }
-    }
 }
 
 impl From<postgres::Error> for ProductionSchemaReadinessError {
@@ -187,88 +147,40 @@ impl From<postgres::Error> for ProductionSchemaReadinessError {
 ///
 /// Each variant identifies which backend connection or migration step
 /// failed during construction.
+#[derive(thiserror::Error)]
 pub enum ProductionBootstrapError {
     /// Establishing the done-ledger PostgreSQL connection failed.
+    /// Connection variants intentionally suppress `source()` to prevent DSN
+    /// fragment leakage through error chain formatters.
+    #[error("failed to connect done-ledger PostgreSQL backend ({})", classify_pg_error(.0))]
     DoneLedgerConnect(postgres::Error),
     /// Establishing the findings PostgreSQL connection failed.
+    /// Connection variants intentionally suppress `source()` to prevent DSN
+    /// fragment leakage through error chain formatters.
+    #[error("failed to connect findings PostgreSQL backend ({})", classify_pg_error(.0))]
     FindingsConnect(postgres::Error),
     /// Connecting the etcd coordinator failed.  `EtcdCoordinator::connect`
     /// validates cluster health as part of the connection handshake, so this
     /// variant also covers unreachable-after-connect scenarios.
+    #[error("failed to connect etcd coordination backend")]
     EtcdConnect(EtcdCoordinatorError),
     /// The done-ledger schema is not ready for worker startup.
-    DoneLedgerSchemaReadiness(ProductionSchemaReadinessError),
+    #[error("done-ledger PostgreSQL schema is not ready for worker startup: {0}")]
+    DoneLedgerSchemaReadiness(#[source] ProductionSchemaReadinessError),
     /// The findings schema is not ready for worker startup.
-    FindingsSchemaReadiness(ProductionSchemaReadinessError),
+    #[error("findings PostgreSQL schema is not ready for worker startup: {0}")]
+    FindingsSchemaReadiness(#[source] ProductionSchemaReadinessError),
     /// Development auto-migration of the done-ledger schema failed.
-    DoneLedgerAutoMigrate(DoneLedgerPgMigrationError),
+    /// DevAutoMigrate runs only in local development environments where DSN
+    /// exposure is acceptable.
+    #[error("done-ledger PostgreSQL auto-migrate failed: {0}")]
+    DoneLedgerAutoMigrate(#[source] DoneLedgerPgMigrationError),
     /// Development auto-migration of the findings schema failed.
-    FindingsAutoMigrate(FindingsPgMigrationError),
+    #[error("findings PostgreSQL auto-migrate failed: {0}")]
+    FindingsAutoMigrate(#[source] FindingsPgMigrationError),
     /// A connection thread panicked instead of returning a result.
+    #[error("{backend} connection thread panicked unexpectedly")]
     ThreadPanicked { backend: &'static str },
-}
-
-impl fmt::Display for ProductionBootstrapError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // Connection-error arms intentionally omit the inner source.
-            // Driver error messages may echo DSN fragments (hostname, port,
-            // username) that the config layer redacts elsewhere. Both Display
-            // and Error::source() suppress the inner value so that error chain
-            // formatters (anyhow, eyre, tracing-error) cannot bypass redaction.
-            Self::DoneLedgerConnect(inner) => write!(
-                f,
-                "failed to connect done-ledger PostgreSQL backend ({})",
-                classify_pg_error(inner),
-            ),
-            Self::FindingsConnect(inner) => write!(
-                f,
-                "failed to connect findings PostgreSQL backend ({})",
-                classify_pg_error(inner),
-            ),
-            Self::EtcdConnect(_) => f.write_str("failed to connect etcd coordination backend"),
-            Self::DoneLedgerSchemaReadiness(source) => write!(
-                f,
-                "done-ledger PostgreSQL schema is not ready for worker startup: {source}"
-            ),
-            Self::FindingsSchemaReadiness(source) => write!(
-                f,
-                "findings PostgreSQL schema is not ready for worker startup: {source}"
-            ),
-            // Auto-migrate variants expose the inner error without redaction:
-            // DevAutoMigrate runs only in local development environments where
-            // DSN exposure is acceptable, and the full migration error context
-            // is essential for diagnosing schema application failures.
-            Self::DoneLedgerAutoMigrate(source) => {
-                write!(f, "done-ledger PostgreSQL auto-migrate failed: {source}")
-            }
-            Self::FindingsAutoMigrate(source) => {
-                write!(f, "findings PostgreSQL auto-migrate failed: {source}")
-            }
-            Self::ThreadPanicked { backend } => {
-                write!(f, "{backend} connection thread panicked unexpectedly")
-            }
-        }
-    }
-}
-
-impl Error for ProductionBootstrapError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            // Connection variants return `None` to prevent DSN fragment leakage
-            // through error chain formatters (anyhow, eyre, tracing-error).
-            // Display already redacts the inner source for these variants;
-            // returning it here would let `.source()` walkers bypass that.
-            Self::DoneLedgerConnect(_) => None,
-            Self::FindingsConnect(_) => None,
-            Self::EtcdConnect(_) => None,
-            Self::DoneLedgerSchemaReadiness(source) => Some(source),
-            Self::FindingsSchemaReadiness(source) => Some(source),
-            Self::DoneLedgerAutoMigrate(source) => Some(source),
-            Self::FindingsAutoMigrate(source) => Some(source),
-            Self::ThreadPanicked { .. } => None,
-        }
-    }
 }
 
 impl fmt::Debug for ProductionBootstrapError {
@@ -304,29 +216,14 @@ impl fmt::Debug for ProductionBootstrapError {
 }
 
 /// Error returned by the real worker entrypoint.
+#[derive(thiserror::Error)]
 pub enum ProductionWorkerError {
     /// Backend construction failed before any shard work started.
-    Startup(ProductionBootstrapError),
+    #[error("worker startup failed: {0}")]
+    Startup(#[source] ProductionBootstrapError),
     /// The generic distributed runtime failed after startup succeeded.
-    Runtime(DistributedRuntimeError),
-}
-
-impl fmt::Display for ProductionWorkerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Startup(source) => write!(f, "worker startup failed: {source}"),
-            Self::Runtime(source) => write!(f, "worker runtime failed: {source}"),
-        }
-    }
-}
-
-impl Error for ProductionWorkerError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Startup(source) => Some(source),
-            Self::Runtime(source) => Some(source),
-        }
-    }
+    #[error("worker runtime failed: {0}")]
+    Runtime(#[source] DistributedRuntimeError),
 }
 
 impl fmt::Debug for ProductionWorkerError {
@@ -889,6 +786,7 @@ fn ensure_migration_history_ready(
 mod tests {
     use super::*;
 
+    use std::error::Error as _;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1154,7 +1052,7 @@ mod tests {
     #[test]
     fn worker_error_from_runtime_preserves_source_chain() {
         let scan_err = ScanRuntimeError::InvalidPath {
-            source: "test",
+            origin: "test",
             path: PathBuf::from("/nonexistent"),
             message: "synthetic runtime failure".into(),
         };

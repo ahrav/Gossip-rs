@@ -16,7 +16,6 @@
 //! - The pack trailer hash is ignored; integrity checks happen elsewhere.
 
 use std::cell::RefCell;
-use std::fmt;
 
 use super::object_id::OidBytes;
 use flate2::Decompress;
@@ -107,133 +106,71 @@ pub enum EntryKind {
 }
 
 /// Pack parse error taxonomy (covers both file header and entry header parsing).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PackParseError {
+    #[error("pack too small")]
     TooSmall,
+    #[error("bad pack signature")]
     BadSignature,
+    #[error("unsupported pack version {0}")]
     UnsupportedVersion(u32),
+    #[error("offset {0} out of range")]
     OffsetOutOfRange(u64),
+    #[error("header exceeded safety bound")]
     HeaderTooLong,
+    #[error("truncated pack data")]
     Truncated,
+    #[error("bad object type {0}")]
     BadObjType(u8),
+    #[error("bad OFS_DELTA encoding")]
     BadOfsEncoding,
+    #[error("OFS_DELTA base underflow")]
     OfsUnderflow,
+    #[error("invalid OID length {0}")]
     BadOidLen(usize),
 }
 
-impl fmt::Display for PackParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooSmall => write!(f, "pack too small"),
-            Self::BadSignature => write!(f, "bad pack signature"),
-            Self::UnsupportedVersion(v) => write!(f, "unsupported pack version {v}"),
-            Self::OffsetOutOfRange(o) => write!(f, "offset {o} out of range"),
-            Self::HeaderTooLong => write!(f, "header exceeded safety bound"),
-            Self::Truncated => write!(f, "truncated pack data"),
-            Self::BadObjType(t) => write!(f, "bad object type {t}"),
-            Self::BadOfsEncoding => write!(f, "bad OFS_DELTA encoding"),
-            Self::OfsUnderflow => write!(f, "OFS_DELTA base underflow"),
-            Self::BadOidLen(n) => write!(f, "invalid OID length {n}"),
-        }
-    }
-}
-
-impl std::error::Error for PackParseError {}
-
 /// Inflate error taxonomy.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InflateError {
+    #[error("inflate limit exceeded")]
     LimitExceeded,
+    #[error("truncated input")]
     TruncatedInput,
+    #[error("inflate stalled")]
     Stalled,
+    #[error("inflate backend error")]
     Backend,
 }
 
-impl fmt::Display for InflateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LimitExceeded => write!(f, "inflate limit exceeded"),
-            Self::TruncatedInput => write!(f, "truncated input"),
-            Self::Stalled => write!(f, "inflate stalled"),
-            Self::Backend => write!(f, "inflate backend error"),
-        }
-    }
-}
-
-impl std::error::Error for InflateError {}
-
 /// Delta apply error taxonomy.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DeltaError {
+    #[error("delta truncated")]
     Truncated,
+    #[error("delta varint overflow")]
     VarintOverflow,
+    #[error("delta base size mismatch")]
     BaseSizeMismatch,
+    #[error("delta result size mismatch")]
     ResultSizeMismatch,
+    #[error("delta command zero")]
     BadCommandZero,
+    #[error("delta copy out of range")]
     CopyOutOfRange,
+    #[error("delta output overrun")]
     OutputOverrun,
 }
 
-impl fmt::Display for DeltaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Truncated => write!(f, "delta truncated"),
-            Self::VarintOverflow => write!(f, "delta varint overflow"),
-            Self::BaseSizeMismatch => write!(f, "delta base size mismatch"),
-            Self::ResultSizeMismatch => write!(f, "delta result size mismatch"),
-            Self::BadCommandZero => write!(f, "delta command zero"),
-            Self::CopyOutOfRange => write!(f, "delta copy out of range"),
-            Self::OutputOverrun => write!(f, "delta output overrun"),
-        }
-    }
-}
-
-impl std::error::Error for DeltaError {}
-
 /// Errors from pack object decoding.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PackObjectError {
-    PackParse(PackParseError),
-    Inflate(InflateError),
-    Delta(DeltaError),
-}
-
-impl fmt::Display for PackObjectError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PackParse(err) => write!(f, "{err}"),
-            Self::Inflate(err) => write!(f, "{err}"),
-            Self::Delta(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for PackObjectError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PackParse(err) => Some(err),
-            Self::Inflate(err) => Some(err),
-            Self::Delta(err) => Some(err),
-        }
-    }
-}
-
-impl From<PackParseError> for PackObjectError {
-    fn from(err: PackParseError) -> Self {
-        Self::PackParse(err)
-    }
-}
-
-impl From<InflateError> for PackObjectError {
-    fn from(err: InflateError) -> Self {
-        Self::Inflate(err)
-    }
-}
-
-impl From<DeltaError> for PackObjectError {
-    fn from(err: DeltaError) -> Self {
-        Self::Delta(err)
-    }
+    #[error("{0}")]
+    PackParse(#[from] PackParseError),
+    #[error("{0}")]
+    Inflate(#[from] InflateError),
+    #[error("{0}")]
+    Delta(#[from] DeltaError),
 }
 
 /// Entry header parsed from a pack file.

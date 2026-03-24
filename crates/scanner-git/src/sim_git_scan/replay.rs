@@ -17,37 +17,12 @@ use std::path::Path;
 
 /// Errors returned while loading replay artifacts.
 #[cfg(feature = "sim-harness")]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
-    Io(io::Error),
-    Json(serde_json::Error),
-}
-
-#[cfg(feature = "sim-harness")]
-impl std::fmt::Display for ReplayError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "replay I/O error: {err}"),
-            Self::Json(err) => write!(f, "replay JSON error: {err}"),
-        }
-    }
-}
-
-#[cfg(feature = "sim-harness")]
-impl std::error::Error for ReplayError {}
-
-#[cfg(feature = "sim-harness")]
-impl From<io::Error> for ReplayError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-#[cfg(feature = "sim-harness")]
-impl From<serde_json::Error> for ReplayError {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Json(err)
-    }
+    #[error("replay I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("replay JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Load a replay artifact from JSON bytes.

@@ -154,13 +154,18 @@ impl<'a> FilesystemRunSetupInput<'a> {
 /// Error messages include filesystem paths for operator diagnostics.
 /// Callers that surface errors to untrusted consumers must redact
 /// path details before returning.
+#[derive(thiserror::Error)]
 pub enum FilesystemRunSetupError {
     /// The typed payload mode disagrees with the normalized request.
+    #[error(
+        "filesystem payload mode '{payload}' does not match normalized request mode '{request}'"
+    )]
     PayloadModeMismatch {
         request: FilesystemSourceMode,
         payload: FilesystemSourceMode,
     },
     /// The typed payload root disagrees with the normalized request.
+    #[error("filesystem payload root does not match normalized request root")]
     PayloadRootMismatch {
         /// Canonical root from the normalized request.
         request_root: PathBuf,
@@ -168,11 +173,14 @@ pub enum FilesystemRunSetupError {
         payload_root: PathBuf,
     },
     /// Payload encoding failed before manifest construction.
-    PayloadEncode(FilesystemShardPayloadEncodeError),
+    #[error("filesystem payload encode failed: {0}")]
+    PayloadEncode(#[source] FilesystemShardPayloadEncodeError),
     /// Manifest lowering or validation failed before coordinator mutation.
-    ManifestBuild(PreallocShardBuilderError),
+    #[error("filesystem manifest build failed: {0}")]
+    ManifestBuild(#[source] PreallocShardBuilderError),
     /// Run creation or registration failed in the coordination backend.
-    CreateRun(CreateRunError),
+    #[error("filesystem run setup failed: {0}")]
+    CreateRun(#[source] CreateRunError),
 }
 
 // Custom Debug: redacts PathBuf fields in PayloadRootMismatch to prevent
@@ -193,35 +201,6 @@ impl fmt::Debug for FilesystemRunSetupError {
             Self::PayloadEncode(err) => f.debug_tuple("PayloadEncode").field(err).finish(),
             Self::ManifestBuild(err) => f.debug_tuple("ManifestBuild").field(err).finish(),
             Self::CreateRun(err) => f.debug_tuple("CreateRun").field(err).finish(),
-        }
-    }
-}
-
-impl fmt::Display for FilesystemRunSetupError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PayloadModeMismatch { request, payload } => write!(
-                f,
-                "filesystem payload mode '{payload}' does not match normalized request mode '{request}'"
-            ),
-            Self::PayloadRootMismatch { .. } => write!(
-                f,
-                "filesystem payload root does not match normalized request root"
-            ),
-            Self::PayloadEncode(err) => write!(f, "filesystem payload encode failed: {err}"),
-            Self::ManifestBuild(err) => write!(f, "filesystem manifest build failed: {err}"),
-            Self::CreateRun(err) => write!(f, "filesystem run setup failed: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for FilesystemRunSetupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PayloadEncode(err) => Some(err),
-            Self::ManifestBuild(err) => Some(err),
-            Self::CreateRun(err) => Some(err),
-            Self::PayloadModeMismatch { .. } | Self::PayloadRootMismatch { .. } => None,
         }
     }
 }

@@ -16,7 +16,6 @@
 
 pub(crate) mod yaml;
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -58,61 +57,30 @@ pub(crate) fn build_regex(pattern: &str) -> Result<Regex, String> {
 }
 
 /// Errors that can occur when loading rules from an external file.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RulesError {
     /// I/O error reading the rules file.
-    Io(std::io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[source] std::io::Error),
     /// YAML parsing error.
-    Yaml(serde_norway::Error),
+    #[error("YAML parse error: {0}")]
+    Yaml(#[source] serde_norway::Error),
     /// Regex compilation failure for a specific rule.
+    #[error("regex error in rule '{rule_name}': {error} (pattern: {pattern})")]
     Regex {
         rule_name: String,
         pattern: String,
         error: String,
     },
     /// Rule validation failure (e.g., invalid invariants).
+    #[error("validation error in rule '{rule_name}': {message}")]
     Validation { rule_name: String, message: String },
     /// Offline validation configuration error (unknown type, missing params).
+    #[error("offline_validation error in rule '{rule_name}': {message}")]
     OfflineValidation { rule_name: String, message: String },
     /// The rules file contained no rules.
+    #[error("rules file contains no rules")]
     NoRules,
-}
-
-impl fmt::Display for RulesError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RulesError::Io(e) => write!(f, "I/O error: {e}"),
-            RulesError::Yaml(e) => write!(f, "YAML parse error: {e}"),
-            RulesError::Regex {
-                rule_name,
-                pattern,
-                error,
-            } => write!(
-                f,
-                "regex error in rule '{rule_name}': {error} (pattern: {pattern})"
-            ),
-            RulesError::Validation { rule_name, message } => {
-                write!(f, "validation error in rule '{rule_name}': {message}")
-            }
-            RulesError::OfflineValidation { rule_name, message } => {
-                write!(
-                    f,
-                    "offline_validation error in rule '{rule_name}': {message}"
-                )
-            }
-            RulesError::NoRules => write!(f, "rules file contains no rules"),
-        }
-    }
-}
-
-impl std::error::Error for RulesError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            RulesError::Io(e) => Some(e),
-            RulesError::Yaml(e) => Some(e),
-            _ => None,
-        }
-    }
 }
 
 /// Read rule YAML text from `path`.

@@ -80,75 +80,38 @@ impl fmt::Display for EtcdOperation {
 /// from the [`CoordinationBackend`] trait.
 ///
 /// [`CoordinationBackend`]: gossip_coordination::CoordinationBackend
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EtcdCoordinatorError {
     /// Invalid [`EtcdCoordinatorConfig`](crate::EtcdCoordinatorConfig) parameters.
-    Config(EtcdCoordinatorConfigError),
+    #[error("invalid etcd coordinator config: {0}")]
+    Config(#[from] EtcdCoordinatorConfigError),
     /// Invalid [`EtcdKeyspace`](crate::EtcdKeyspace) prefix.
-    Keyspace(EtcdKeyspaceError),
+    #[error("invalid etcd keyspace: {0}")]
+    Keyspace(#[from] EtcdKeyspaceError),
     /// Failed to build the internal single-threaded Tokio runtime.
-    RuntimeBuild(std::io::Error),
+    #[error("failed to build tokio runtime: {0}")]
+    RuntimeBuild(#[source] std::io::Error),
     /// A v1 blob failed to encode or decode during the given operation.
+    #[error("etcd {operation} codec operation failed: {source}")]
     Codec {
         operation: EtcdOperation,
+        #[source]
         source: EtcdCodecError,
     },
     /// An etcd gRPC call failed during the given operation.
+    #[error("etcd {operation} operation failed: {source}")]
     Etcd {
         operation: EtcdOperation,
+        #[source]
         source: etcd_client::Error,
     },
     /// A simulated etcd operation failed during the given operation.
     #[cfg(any(test, feature = "test-support"))]
+    #[error("simulated etcd {operation} operation failed: {source}")]
     Simulated {
         operation: EtcdOperation,
+        #[source]
         source: SimEtcdError,
     },
-}
-
-impl fmt::Display for EtcdCoordinatorError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(err) => write!(f, "invalid etcd coordinator config: {err}"),
-            Self::Keyspace(err) => write!(f, "invalid etcd keyspace: {err}"),
-            Self::RuntimeBuild(err) => write!(f, "failed to build tokio runtime: {err}"),
-            Self::Codec { operation, source } => {
-                write!(f, "etcd {operation} codec operation failed: {source}")
-            }
-            Self::Etcd { operation, source } => {
-                write!(f, "etcd {operation} operation failed: {source}")
-            }
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Simulated { operation, source } => {
-                write!(f, "simulated etcd {operation} operation failed: {source}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for EtcdCoordinatorError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Config(err) => Some(err),
-            Self::Keyspace(err) => Some(err),
-            Self::RuntimeBuild(err) => Some(err),
-            Self::Codec { source, .. } => Some(source),
-            Self::Etcd { source, .. } => Some(source),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Simulated { source, .. } => Some(source),
-        }
-    }
-}
-
-impl From<EtcdCoordinatorConfigError> for EtcdCoordinatorError {
-    fn from(value: EtcdCoordinatorConfigError) -> Self {
-        Self::Config(value)
-    }
-}
-
-impl From<EtcdKeyspaceError> for EtcdCoordinatorError {
-    fn from(value: EtcdKeyspaceError) -> Self {
-        Self::Keyspace(value)
-    }
 }

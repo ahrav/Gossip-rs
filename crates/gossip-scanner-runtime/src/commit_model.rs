@@ -27,8 +27,6 @@
 //! the runtime durability model family-neutral without
 //! guessing ahead about family-specific execution loops.
 
-use std::fmt;
-
 use gossip_contracts::{
     connector::Cursor,
     persistence::{
@@ -223,23 +221,16 @@ impl<'a> CommitRequest<'a> {
 }
 
 /// Boundary mismatch between a completed unit and its durable receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "completed unit boundary {} does not match receipt boundary {}",
+    unit_boundary,
+    receipt_boundary
+)]
 pub struct BoundaryMismatchError {
     unit_boundary: CheckpointBoundary,
     receipt_boundary: CheckpointBoundary,
 }
-
-impl fmt::Display for BoundaryMismatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "completed unit boundary {} does not match receipt boundary {}",
-            self.unit_boundary, self.receipt_boundary
-        )
-    }
-}
-
-impl std::error::Error for BoundaryMismatchError {}
 
 /// Durable per-unit runtime receipt.
 ///
@@ -306,23 +297,12 @@ impl UnitCommitReceipt {
 }
 
 /// Mismatch between a stream's declared boundary kind and a receipt's actual kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("checkpoint aggregator expected {expected:?} receipts but got {actual:?}")]
 pub struct KindMismatchError {
     expected: CheckpointBoundaryKind,
     actual: CheckpointBoundaryKind,
 }
-
-impl fmt::Display for KindMismatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "checkpoint aggregator expected {:?} receipts but got {:?}",
-            self.expected, self.actual
-        )
-    }
-}
-
-impl std::error::Error for KindMismatchError {}
 
 impl KindMismatchError {
     /// Boundary kind declared by the owning shard stream.

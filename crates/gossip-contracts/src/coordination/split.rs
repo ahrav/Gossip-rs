@@ -42,8 +42,6 @@
 //! heap allocation, consistent with the project's tiered allocation
 //! policy (HOT path = allocation-silent where practical).
 
-use std::fmt;
-
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, key_successor_into};
 use crate::coordination::limits::MAX_SPLIT_CHILDREN;
 use crate::coordination::shard_spec::{
@@ -127,34 +125,18 @@ pub struct SplitReplacePlan<'a> {
 
 /// Error returned when a [`SplitReplacePlan`] is constructed with an
 /// invalid number of children.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SplitReplacePlanError {
     /// Fewer than 2 children — not a split.
+    #[error("split-replace requires >= 2 children, got {count}")]
     TooFewChildren { count: usize },
     /// More than [`MAX_SPLIT_CHILDREN`] children.
     ///
     /// `count` is a lower bound: the iterator is not fully consumed once
     /// the limit is exceeded, so the actual count may be higher.
+    #[error("split-replace exceeds max children ({count} > {MAX_SPLIT_CHILDREN})")]
     TooManyChildren { count: usize },
 }
-
-impl fmt::Display for SplitReplacePlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooFewChildren { count } => {
-                write!(f, "split-replace requires >= 2 children, got {count}")
-            }
-            Self::TooManyChildren { count } => {
-                write!(
-                    f,
-                    "split-replace exceeds max children ({count} > {MAX_SPLIT_CHILDREN})"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SplitReplacePlanError {}
 
 impl<'a> SplitReplacePlan<'a> {
     /// Construct a validated split-replace plan.
@@ -218,30 +200,14 @@ impl CanonicalBytes for SplitReplacePlan<'_> {
 ///
 /// Distinguishes shape errors (invalid child count) from semantic errors
 /// (children do not form a valid partition of the parent range).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SplitReplacePlanningError {
     /// Plan child-count invariants failed (`< 2` or `> MAX_SPLIT_CHILDREN`).
-    InvalidChildCount(SplitReplacePlanError),
+    #[error("{0}")]
+    InvalidChildCount(#[source] SplitReplacePlanError),
     /// Child ranges failed split coverage validation against the parent.
-    InvalidCoverage(SplitValidationError),
-}
-
-impl fmt::Display for SplitReplacePlanningError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidChildCount(err) => err.fmt(f),
-            Self::InvalidCoverage(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SplitReplacePlanningError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidChildCount(err) => Some(err),
-            Self::InvalidCoverage(err) => Some(err),
-        }
-    }
+    #[error("{0}")]
+    InvalidCoverage(#[source] SplitValidationError),
 }
 
 /// Build and validate a split-replace plan against a parent shard.
@@ -394,27 +360,13 @@ pub struct SplitResidualPlan<'a> {
 
 /// Error returned when a [`SplitResidualPlan`] is constructed with
 /// identical specs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SplitResidualPlanError {
     /// `parent_new_spec` and `residual_spec` are identical — a residual
     /// split must shrink the parent and produce a distinct range.
+    #[error("split-residual requires parent_new_spec and residual_spec to differ")]
     IdenticalSpecs,
 }
-
-impl fmt::Display for SplitResidualPlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IdenticalSpecs => {
-                write!(
-                    f,
-                    "split-residual requires parent_new_spec and residual_spec to differ"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SplitResidualPlanError {}
 
 impl<'a> SplitResidualPlan<'a> {
     /// Construct a residual plan with a minimal structural guard.
@@ -475,49 +427,28 @@ impl CanonicalBytes for SplitResidualPlan<'_> {
 /// general (downstream coverage validation). The first three variants
 /// are exclusive to [`plan_split_residual_from_cursor`]; the last two
 /// can arise from any residual planning path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SplitResidualPlanningError {
     /// Cursor-derived planning requires `cursor.last_key` to be present.
     /// A cursor with no `last_key` has not yet made forward progress, so
     /// there is no meaningful point at which to split.
+    #[error("split-residual cursor planning requires cursor.last_key")]
     MissingCursor,
     /// `cursor.last_key` has no representable successor within the
     /// keyspace. This occurs when the key is all-`0xFF` at `MAX_KEY_SIZE`
     /// (the absolute maximum of the byte-ordered keyspace) or when the
     /// key exceeds `MAX_KEY_SIZE`.
+    #[error("cursor key has no representable successor")]
     NoSuccessor,
     /// Cursor-derived split point falls outside the parent range.
+    #[error("cursor successor falls outside parent range")]
     SplitPointOutOfBounds,
     /// Residual plan shape invariants failed.
-    InvalidPlan(SplitResidualPlanError),
+    #[error("{0}")]
+    InvalidPlan(#[source] SplitResidualPlanError),
     /// Residual partition validation failed against the parent range.
-    InvalidCoverage(SplitValidationError),
-}
-
-impl fmt::Display for SplitResidualPlanningError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingCursor => {
-                write!(f, "split-residual cursor planning requires cursor.last_key")
-            }
-            Self::NoSuccessor => write!(f, "cursor key has no representable successor"),
-            Self::SplitPointOutOfBounds => {
-                write!(f, "cursor successor falls outside parent range")
-            }
-            Self::InvalidPlan(err) => err.fmt(f),
-            Self::InvalidCoverage(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SplitResidualPlanningError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidPlan(err) => Some(err),
-            Self::InvalidCoverage(err) => Some(err),
-            _ => None,
-        }
-    }
+    #[error("{0}")]
+    InvalidCoverage(#[source] SplitValidationError),
 }
 
 /// Build and validate a split-residual plan against a parent shard.

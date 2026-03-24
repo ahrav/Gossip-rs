@@ -203,18 +203,22 @@ impl FilesystemShardPayload {
 /// Error messages include filesystem paths for operator diagnostics.
 /// Callers that surface errors to untrusted consumers must redact
 /// path details before returning.
+#[derive(thiserror::Error)]
 pub enum FilesystemShardPayloadEncodeError {
     /// The payload path was empty.
+    #[error("filesystem shard payload mode '{mode}' requires a non-empty canonical path")]
     EmptyPath {
         /// Source mode being encoded.
         mode: FilesystemSourceMode,
     },
     /// The canonical path could not be represented as UTF-8.
+    #[error("filesystem shard payload path '{}' is not valid UTF-8", path.display())]
     NonUtf8Path {
         /// The offending path.
         path: PathBuf,
     },
     /// The payload path is relative; canonical paths must be absolute.
+    #[error("filesystem shard payload mode '{mode}' path must be absolute")]
     RelativePath {
         /// Source mode being encoded.
         mode: FilesystemSourceMode,
@@ -240,45 +244,27 @@ impl fmt::Debug for FilesystemShardPayloadEncodeError {
     }
 }
 
-impl fmt::Display for FilesystemShardPayloadEncodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPath { mode } => write!(
-                f,
-                "filesystem shard payload mode '{mode}' requires a non-empty canonical path"
-            ),
-            Self::NonUtf8Path { path } => write!(
-                f,
-                "filesystem shard payload path '{}' is not valid UTF-8",
-                path.display()
-            ),
-            Self::RelativePath { mode } => write!(
-                f,
-                "filesystem shard payload mode '{mode}' path must be absolute"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FilesystemShardPayloadEncodeError {}
-
 /// Errors from [`FilesystemShardPayload::decode`].
 ///
 /// Variants are ordered by the validation sequence: empty input is checked
 /// first, then the mode tag, then path presence, then path UTF-8 validity,
 /// then absolute-path verification.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FilesystemShardPayloadDecodeError {
     /// No payload bytes were present.
+    #[error("filesystem shard payload is empty")]
     EmptyPayload,
     /// The leading mode tag is not recognized.
+    #[error("filesystem shard payload mode tag '{0}' is unknown")]
     UnknownModeTag(u8),
     /// The payload omitted the canonical path bytes.
+    #[error("filesystem shard payload mode '{mode}' requires canonical path bytes")]
     MissingPath {
         /// Decoded source mode tag.
         mode: FilesystemSourceMode,
     },
     /// The payload path bytes were not valid UTF-8.
+    #[error("filesystem shard payload mode '{mode}' path is not valid UTF-8: {source}")]
     InvalidUtf8Path {
         /// Decoded source mode tag.
         mode: FilesystemSourceMode,
@@ -286,45 +272,11 @@ pub enum FilesystemShardPayloadDecodeError {
         source: std::str::Utf8Error,
     },
     /// The payload path is relative; canonical paths must be absolute.
+    #[error("filesystem shard payload mode '{mode}' path must be absolute")]
     RelativePath {
         /// Decoded source mode tag.
         mode: FilesystemSourceMode,
     },
-}
-
-impl fmt::Display for FilesystemShardPayloadDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPayload => f.write_str("filesystem shard payload is empty"),
-            Self::UnknownModeTag(tag) => {
-                write!(f, "filesystem shard payload mode tag '{tag}' is unknown")
-            }
-            Self::MissingPath { mode } => write!(
-                f,
-                "filesystem shard payload mode '{mode}' requires canonical path bytes"
-            ),
-            Self::InvalidUtf8Path { mode, source } => write!(
-                f,
-                "filesystem shard payload mode '{mode}' path is not valid UTF-8: {source}"
-            ),
-            Self::RelativePath { mode } => write!(
-                f,
-                "filesystem shard payload mode '{mode}' path must be absolute"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FilesystemShardPayloadDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidUtf8Path { source, .. } => Some(source),
-            Self::EmptyPayload
-            | Self::UnknownModeTag(_)
-            | Self::MissingPath { .. }
-            | Self::RelativePath { .. } => None,
-        }
-    }
 }
 
 /// Map a source mode to its wire-format tag byte.
