@@ -408,6 +408,12 @@ impl OrderedContentClassifiedItem {
     pub fn disposition(&self) -> OrderedContentPrefilterDisposition {
         self.disposition
     }
+
+    /// Consume the classified item and return its owned parts.
+    #[must_use]
+    pub fn into_parts(self) -> (ScanItem, OrderedContentPrefilterDisposition) {
+        (self.item, self.disposition)
+    }
 }
 
 /// Validated ordered page after done-ledger classification.
