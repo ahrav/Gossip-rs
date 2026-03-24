@@ -3267,8 +3267,8 @@ mod tests {
         fs::write(&file_path, "fixture").expect("write fixture");
         let mut payload = filesystem_payload(&file_path, FilesystemSourceMode::SingleFile);
         // Wire format: byte 0 = mode tag, bytes 1.. = UTF-8 path.
-        // Overwriting byte 1 injects an invalid UTF-8 byte into the path portion.
-        payload[1] = 0xFF;
+        // Overwriting byte 2 injects an invalid UTF-8 byte into the path portion.
+        payload[2] = 0xFF;
         let mut coordinator = setup_coordinator_with_connector_extra(&[payload], 30_000);
         let mut scratch = AcquireScratch::new();
         let acquired = coordinator
