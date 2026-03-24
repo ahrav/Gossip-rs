@@ -224,10 +224,14 @@ fn seed_filesystem_run(
         .expect("test run creation should succeed");
 
     let mut scratch = ShardSpecScratch::new();
-    let connector_extra =
-        FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, scan_root)
-            .encode()
-            .expect("test payload should encode");
+    let connector_extra = FilesystemShardPayload::new(
+        FilesystemSourceMode::DirectoryRoot,
+        scan_root
+            .canonicalize()
+            .expect("test path must canonicalize"),
+    )
+    .encode()
+    .expect("test payload should encode");
     let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
         .expect("range shard spec should build");
     let shard_id = ShardId::from_raw(SHARD_ID_RAW);

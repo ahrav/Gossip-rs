@@ -49,10 +49,21 @@ const DIRECTORY_ROOT_TAG: u8 = 1;
 /// The payload round-trips deterministically through [`encode`](Self::encode)
 /// / [`decode`](Self::decode).  Coordination and frontier code treat the
 /// encoded bytes as opaque; only the filesystem connector interprets them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FilesystemShardPayload {
     mode: FilesystemSourceMode,
     canonical_root: PathBuf,
+}
+
+// Custom Debug: redacts `canonical_root` to prevent filesystem path leakage
+// through error chains (`anyhow`, `tracing`, `{:?}` formatting).
+impl fmt::Debug for FilesystemShardPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilesystemShardPayload")
+            .field("mode", &self.mode)
+            .field("canonical_root", &"<redacted>")
+            .finish()
+    }
 }
 
 impl FilesystemShardPayload {
@@ -145,6 +156,9 @@ impl FilesystemShardPayload {
     ///   the tag byte is present but no path bytes follow.
     /// - [`InvalidUtf8Path`](FilesystemShardPayloadDecodeError::InvalidUtf8Path)
     ///   — path bytes are present but not valid UTF-8.
+    /// - [`RelativePath`](FilesystemShardPayloadDecodeError::RelativePath)
+    ///   — path is valid UTF-8 but not absolute (canonical paths must be
+    ///   absolute).
     pub fn decode(bytes: &[u8]) -> Result<Self, FilesystemShardPayloadDecodeError> {
         let Some((&tag, canonical_root)) = bytes.split_first() else {
             return Err(FilesystemShardPayloadDecodeError::EmptyPayload);
@@ -159,6 +173,11 @@ impl FilesystemShardPayload {
             FilesystemShardPayloadDecodeError::InvalidUtf8Path { mode, source }
         })?;
 
+        let path = Path::new(canonical_root);
+        if !path.is_absolute() {
+            return Err(FilesystemShardPayloadDecodeError::RelativePath { mode });
+        }
+
         Ok(Self::new(mode, canonical_root))
     }
 }
@@ -169,7 +188,12 @@ impl FilesystemShardPayload {
 /// wire format cannot represent.  Normal operation through
 /// [`from_normalized_request`](FilesystemShardPayload::from_normalized_request)
 /// avoids these because request normalization canonicalizes the path first.
-#[derive(Debug)]
+///
+/// # Security note
+///
+/// Error messages include filesystem paths for operator diagnostics.
+/// Callers that surface errors to untrusted consumers must redact
+/// path details before returning.
 pub enum FilesystemShardPayloadEncodeError {
     /// The payload path was empty.
     EmptyPath {
@@ -181,6 +205,22 @@ pub enum FilesystemShardPayloadEncodeError {
         /// The offending path.
         path: PathBuf,
     },
+}
+
+// Custom Debug: redacts `PathBuf` fields to prevent filesystem path leakage
+// through error chains (`anyhow`, `tracing`, `{:?}` formatting).
+// Display already includes paths for operator diagnostics behind explicit
+// `.display()` calls; Debug must not duplicate that exposure.
+impl fmt::Debug for FilesystemShardPayloadEncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPath { mode } => f.debug_struct("EmptyPath").field("mode", mode).finish(),
+            Self::NonUtf8Path { .. } => f
+                .debug_struct("NonUtf8Path")
+                .field("path", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Display for FilesystemShardPayloadEncodeError {
@@ -223,6 +263,11 @@ pub enum FilesystemShardPayloadDecodeError {
         /// Underlying UTF-8 decode failure.
         source: std::str::Utf8Error,
     },
+    /// The payload path is relative; canonical paths must be absolute.
+    RelativePath {
+        /// Decoded source mode tag.
+        mode: FilesystemSourceMode,
+    },
 }
 
 impl fmt::Display for FilesystemShardPayloadDecodeError {
@@ -240,6 +285,10 @@ impl fmt::Display for FilesystemShardPayloadDecodeError {
                 f,
                 "filesystem shard payload mode '{mode}' path is not valid UTF-8: {source}"
             ),
+            Self::RelativePath { mode } => write!(
+                f,
+                "filesystem shard payload mode '{mode}' path must be absolute"
+            ),
         }
     }
 }
@@ -248,7 +297,10 @@ impl std::error::Error for FilesystemShardPayloadDecodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidUtf8Path { source, .. } => Some(source),
-            Self::EmptyPayload | Self::UnknownModeTag(_) | Self::MissingPath { .. } => None,
+            Self::EmptyPayload
+            | Self::UnknownModeTag(_)
+            | Self::MissingPath { .. }
+            | Self::RelativePath { .. } => None,
         }
     }
 }
@@ -344,6 +396,49 @@ mod tests {
         assert!(matches!(
             err,
             FilesystemShardPayloadDecodeError::MissingPath {
+                mode: FilesystemSourceMode::SingleFile,
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_relative_path() {
+        let bytes = [SINGLE_FILE_TAG, b'r', b'e', b'l', b'/', b'f', b'o', b'o'];
+        let err =
+            FilesystemShardPayload::decode(&bytes).expect_err("relative path must be rejected");
+        assert!(matches!(
+            err,
+            FilesystemShardPayloadDecodeError::RelativePath {
+                mode: FilesystemSourceMode::SingleFile,
+            }
+        ));
+        assert!(
+            err.to_string().contains("must be absolute"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_invalid_utf8_path() {
+        let err = FilesystemShardPayload::decode(&[SINGLE_FILE_TAG, 0xFF, 0xFE])
+            .expect_err("invalid UTF-8 path must fail");
+        assert!(matches!(
+            err,
+            FilesystemShardPayloadDecodeError::InvalidUtf8Path {
+                mode: FilesystemSourceMode::SingleFile,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_empty_path() {
+        let err = FilesystemShardPayload::new(FilesystemSourceMode::SingleFile, PathBuf::new())
+            .encode()
+            .expect_err("empty path must fail");
+        assert!(matches!(
+            err,
+            FilesystemShardPayloadEncodeError::EmptyPath {
                 mode: FilesystemSourceMode::SingleFile,
             }
         ));

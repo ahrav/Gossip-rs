@@ -360,10 +360,12 @@ mod tests {
             .expect("test run creation should succeed");
 
         let mut scratch = ShardSpecScratch::new();
-        let connector_extra =
-            FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, path)
-                .encode()
-                .expect("test payload should encode");
+        let connector_extra = FilesystemShardPayload::new(
+            FilesystemSourceMode::DirectoryRoot,
+            path.canonicalize().expect("test path must canonicalize"),
+        )
+        .encode()
+        .expect("test payload should encode");
         let spec_ref = range_shard_ref(start, end, &connector_extra, &mut scratch)
             .expect("range shard spec should build");
         let spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec should build");

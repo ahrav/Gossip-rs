@@ -162,36 +162,7 @@ impl WorkerIdentity {
     }
 }
 
-/// Lease payload consumed by the distributed runtime.
-///
-/// One lease corresponds to one shard from the coordination layer. It carries
-/// everything needed to scan and commit that shard without additional lookups:
-///
-/// - **`shard_id`** — string label for telemetry routing.
-/// - **`lease`** — authoritative coordination lease used for terminal completion.
-/// - **`state`** — shard bounds, resume cursor, and cursor semantics restored
-///   from the acquire/restore coordination payload.
-/// - **`filesystem_source`** — filesystem scan configuration for this shard,
-///   derived from the worker template and hydrated from typed shard payload
-///   bytes, plus the explicit source mode that the control plane registered.
-/// - **`write_context`** — numeric shard identity plus fencing epoch for all
-///   persistence writes.
-/// - **`tenant_secret_key`** — key material for secret-hash derivation.
-///
-/// # Lifecycle
-///
-/// 1. **Claim** — the coordination facade's acquire/restore call returns a
-///    [`Lease`] and restored state.
-/// 2. **Prepare** — `ShardLease::new` bundles the lease, restored state, scan
-///    config, and write context together.
-/// 3. **Execute** — the distributed worker loop scans the shard and commits
-///    findings using the bundled write context.
-/// 4. **Complete** — terminal completion uses the bundled [`Lease`] to emit
-///    a receipt-driven checkpoint cursor.
-///
-/// The coordination lease and restored shard state stay together so later
-/// runtime helpers can execute ordered-content work without a second acquire
-/// payload or side-map.
+/// Hydrated filesystem scan config bundled with the explicit source mode decoded from shard metadata.
 #[derive(Clone, Debug)]
 struct HydratedFilesystemSource {
     scan_config: FsScanConfig,
@@ -215,6 +186,36 @@ impl HydratedFilesystemSource {
     }
 }
 
+/// Lease payload consumed by the distributed runtime.
+///
+/// One lease corresponds to one shard from the coordination layer. It carries
+/// everything needed to scan and commit that shard without additional lookups:
+///
+/// - **`shard_id`** — string label for telemetry routing.
+/// - **`lease`** — authoritative coordination lease used for terminal completion.
+/// - **`state`** — shard bounds, resume cursor, and cursor semantics restored
+///   from the acquire/restore coordination payload.
+/// - **`filesystem_source`** — filesystem scan configuration for this shard,
+///   derived from the worker template and hydrated from typed shard payload
+///   bytes, plus the explicit source mode that the control plane registered.
+/// - **`write_context`** — numeric shard identity plus fencing epoch for all
+///   persistence writes.
+/// - **`tenant_secret_key`** — key material for secret-hash derivation.
+///
+/// # Lifecycle
+///
+/// 1. **Claim** — the coordination facade's acquire/restore call returns a
+///    [`Lease`] and restored state.
+/// 2. **Prepare** — `ShardLease::new` bundles the lease, restored state,
+///    hydrated filesystem source, and write context together.
+/// 3. **Execute** — the distributed worker loop scans the shard and commits
+///    findings using the bundled write context.
+/// 4. **Complete** — terminal completion uses the bundled [`Lease`] to emit
+///    a receipt-driven checkpoint cursor.
+///
+/// The coordination lease and restored shard state stay together so later
+/// runtime helpers can execute ordered-content work without a second acquire
+/// payload or side-map.
 #[derive(Clone, Debug)]
 pub struct ShardLease {
     /// String shard label used for routing recorder events.
@@ -1079,36 +1080,21 @@ fn hydrate_filesystem_source_from_spec(
     scan_template: &FsScanConfig,
 ) -> Result<HydratedFilesystemSource> {
     fn validate_payload_path_kind(payload: &FilesystemShardPayload) -> Result<()> {
-        let metadata = fs::symlink_metadata(payload.canonical_root()).with_context(|| {
-            format!(
-                "failed to inspect filesystem shard payload path '{}'",
-                payload.canonical_root().display()
-            )
-        })?;
+        let metadata = fs::symlink_metadata(payload.canonical_root())
+            .context("failed to inspect filesystem shard payload path")?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
-            anyhow::bail!(
-                "filesystem shard payload path '{}' is a symlink; expected a canonical path",
-                payload.canonical_root().display()
-            );
+            anyhow::bail!("filesystem shard payload path is a symlink; expected a canonical path");
         }
-        let actual_kind = if file_type.is_file() {
-            FilesystemPathKind::File
-        } else if file_type.is_dir() {
-            FilesystemPathKind::Directory
-        } else {
-            return Err(anyhow!(
-                "filesystem shard payload path '{}' must be a regular file or directory",
-                payload.canonical_root().display()
-            ));
-        };
+        let actual_kind = FilesystemPathKind::from_file_type(&file_type).ok_or_else(|| {
+            anyhow!("filesystem shard payload path must be a regular file or directory")
+        })?;
         let expected_kind = payload.mode().expected_path_kind();
         if actual_kind != expected_kind {
             return Err(anyhow!(
-                "filesystem shard payload mode '{}' requires a {}, but '{}' is a {}",
+                "filesystem shard payload mode '{}' requires a {}, but the path is a {}",
                 payload.mode(),
                 expected_kind,
-                payload.canonical_root().display(),
                 actual_kind
             ));
         }
@@ -3280,6 +3266,8 @@ mod tests {
         let file_path = dir.path().join("target.txt");
         fs::write(&file_path, "fixture").expect("write fixture");
         let mut payload = filesystem_payload(&file_path, FilesystemSourceMode::SingleFile);
+        // Wire format: byte 0 = mode tag, bytes 1.. = UTF-8 path.
+        // Overwriting byte 1 injects an invalid UTF-8 byte into the path portion.
         payload[1] = 0xFF;
         let mut coordinator = setup_coordinator_with_connector_extra(&[payload], 30_000);
         let mut scratch = AcquireScratch::new();
@@ -3315,6 +3303,35 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("filesystem shard payload mode 'single_file' requires a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_lease_from_acquire_rejects_symlink_payload_path() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("real.txt");
+        fs::write(&target, "fixture").expect("write target");
+        let link = dir.path().join("link.txt");
+        unix_fs::symlink(&target, &link).expect("create symlink");
+
+        let payload = FilesystemShardPayload::new(FilesystemSourceMode::SingleFile, &link)
+            .encode()
+            .expect("symlink payload should encode");
+        let mut coordinator = setup_coordinator_with_connector_extra(&[payload], 30_000);
+        let mut scratch = AcquireScratch::new();
+        let acquired = coordinator
+            .claim_next_available(wall_clock_now(), tenant(), run(), worker(1), &mut scratch)
+            .expect("claim next available");
+        let identity = worker_identity(Path::new("/fallback"));
+
+        let err = build_lease_from_acquire(acquired, &identity)
+            .expect_err("symlink payload path must be rejected");
+        assert!(
+            err.to_string().contains("is a symlink"),
             "unexpected error: {err}"
         );
     }

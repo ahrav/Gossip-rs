@@ -58,6 +58,22 @@ pub enum FilesystemPathKind {
     Directory,
 }
 
+impl FilesystemPathKind {
+    /// Classify a [`std::fs::FileType`] as file or directory.
+    ///
+    /// Returns `None` for symlinks, FIFOs, sockets, and other non-regular types.
+    #[must_use]
+    pub fn from_file_type(file_type: &std::fs::FileType) -> Option<Self> {
+        if file_type.is_file() {
+            Some(Self::File)
+        } else if file_type.is_dir() {
+            Some(Self::Directory)
+        } else {
+            None
+        }
+    }
+}
+
 impl fmt::Display for FilesystemPathKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -242,8 +258,10 @@ impl FilesystemRequest {
 ///
 /// # Safety contract
 ///
-/// The canonical path stored here was validated against an allowed root at
-/// a point in time. Callers must not open this path directly with
+/// The canonical path stored here was produced by [`std::fs::canonicalize`]
+/// and may or may not have been validated against an allowed root —
+/// only [`FilesystemRequest::normalize_within`] performs containment
+/// checks. Callers must not open this path directly with
 /// `std::fs::File::open` or equivalent. All reads must go through a
 /// connector that enforces `O_NOFOLLOW`/`openat` at every path component
 /// to close the TOCTOU gap between canonicalization and open.
@@ -468,19 +486,23 @@ impl std::error::Error for FilesystemRequestError {
 }
 
 fn detect_path_kind(path: &Path) -> Result<FilesystemPathKind, FilesystemRequestError> {
-    let metadata = fs::metadata(path).map_err(|source| FilesystemRequestError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let file_type = metadata.file_type();
-    if file_type.is_file() {
-        return Ok(FilesystemPathKind::File);
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| FilesystemRequestError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    // Defense-in-depth: after `fs::canonicalize`, canonical paths should never
+    // be symlinks. Reject them explicitly so this code path stays symmetric
+    // with the hydration path in `distributed.rs`.
+    if metadata.file_type().is_symlink() {
+        return Err(FilesystemRequestError::UnsupportedPathKind {
+            path: path.to_path_buf(),
+        });
     }
-    if file_type.is_dir() {
-        return Ok(FilesystemPathKind::Directory);
-    }
-    Err(FilesystemRequestError::UnsupportedPathKind {
-        path: path.to_path_buf(),
+    FilesystemPathKind::from_file_type(&metadata.file_type()).ok_or_else(|| {
+        FilesystemRequestError::UnsupportedPathKind {
+            path: path.to_path_buf(),
+        }
     })
 }
 
@@ -900,5 +922,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Guards the custom `Debug` impl on `FilesystemRequestError` against
+    /// accidental replacement by `#[derive(Debug)]`. All `PathBuf` fields
+    /// must render as `"<redacted>"` in `{:?}` output.
+    #[test]
+    fn debug_format_redacts_filesystem_paths() {
+        let err = FilesystemRequestError::PathConfinementViolation {
+            mode: FilesystemSourceMode::SingleFile,
+            path: PathBuf::from("/secret/location/file.txt"),
+            allowed_root: PathBuf::from("/allowed/root"),
+        };
+        let debug = format!("{:?}", err);
+        assert!(
+            debug.contains("<redacted>"),
+            "Debug must redact paths: {debug}"
+        );
+        assert!(
+            !debug.contains("/secret"),
+            "Debug must not contain actual path: {debug}"
+        );
+        assert!(
+            !debug.contains("/allowed"),
+            "Debug must not contain allowed root: {debug}"
+        );
     }
 }

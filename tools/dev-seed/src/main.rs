@@ -155,7 +155,7 @@ fn cmd_seed(
     let connector_extra =
         FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, &canonical)
             .encode()
-            .context("scan path is not valid UTF-8")?;
+            .context("failed to encode filesystem shard payload")?;
     let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
         .context("failed to build shard spec")?;
     let spec = gossip_coordination::ShardSpec::try_from_ref(spec_ref)
