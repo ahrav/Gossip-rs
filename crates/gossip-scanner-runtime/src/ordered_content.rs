@@ -951,6 +951,55 @@ mod tests {
         }
     }
 
+    /// Done ledger that always fails `batch_get` with an I/O error.
+    struct FailingDoneLedger;
+
+    impl DoneLedger for FailingDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            _tenant_id: gossip_contracts::identity::TenantId,
+            _policy_hash: gossip_contracts::identity::PolicyHash,
+            _ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            Err(io::Error::other("injected ledger failure"))
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+    }
+
+    /// Done ledger whose `batch_get` returns an empty Vec regardless of input,
+    /// violating the positional contract that requires one result per lookup key.
+    struct MismatchLenDoneLedger;
+
+    impl DoneLedger for MismatchLenDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            _tenant_id: gossip_contracts::identity::TenantId,
+            _policy_hash: gossip_contracts::identity::PolicyHash,
+            _ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+    }
+
     #[test]
     fn execute_source_returns_finished_for_exhausted_source() {
         let mut source = ScriptedSource::returning(Ok(None));
@@ -1417,6 +1466,47 @@ mod tests {
                 RECOMMENDED_MAX_BATCH_SIZE - 1,
                 RECOMMENDED_MAX_BATCH_SIZE
             ]
+        );
+    }
+
+    #[test]
+    fn prefilter_done_ledger_propagates_batch_get_io_error() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5)];
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+        let ledger = FailingDoneLedger;
+
+        let err = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect_err("I/O failure must propagate");
+
+        assert!(
+            err.to_string()
+                .contains("ordered-content done-ledger prefilter failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn prefilter_done_ledger_rejects_batch_length_mismatch() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5)];
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+        let ledger = MismatchLenDoneLedger;
+
+        let err = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect_err("length mismatch must be rejected");
+
+        assert!(
+            err.to_string().contains("result(s) for"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("lookup key(s)"),
+            "unexpected error: {err}"
         );
     }
 }
