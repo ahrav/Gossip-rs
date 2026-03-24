@@ -714,9 +714,13 @@ impl CanonicalBytes for ShardSpec {
 // ============================================================================
 
 /// Error returned by fallible [`ShardSpec`] constructors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ShardSpecInputError {
     /// The key range is inverted: `start >= end` when both are non-empty.
+    #[error(
+        "ShardSpec: start must be strictly less than end \
+             (start: {start_len} bytes, end: {end_len} bytes)"
+    )]
     InvertedRange {
         /// Length of the start key in bytes.
         start_len: usize,
@@ -725,6 +729,7 @@ pub enum ShardSpecInputError {
     },
 
     /// A key (start or end) exceeds [`MAX_KEY_SIZE`].
+    #[error("ShardSpec: key too large ({size} bytes, max {max})")]
     KeyTooLarge {
         /// Actual size of the key in bytes.
         size: usize,
@@ -733,6 +738,7 @@ pub enum ShardSpecInputError {
     },
 
     /// The metadata exceeds [`MAX_METADATA_SIZE`].
+    #[error("ShardSpec: metadata too large ({size} bytes, max {max})")]
     MetadataTooLarge {
         /// Actual size of the metadata in bytes.
         size: usize,
@@ -740,26 +746,6 @@ pub enum ShardSpecInputError {
         max: usize,
     },
 }
-
-impl fmt::Display for ShardSpecInputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvertedRange { start_len, end_len } => write!(
-                f,
-                "ShardSpec: start must be strictly less than end \
-                 (start: {start_len} bytes, end: {end_len} bytes)"
-            ),
-            Self::KeyTooLarge { size, max } => {
-                write!(f, "ShardSpec: key too large ({size} bytes, max {max})")
-            }
-            Self::MetadataTooLarge { size, max } => {
-                write!(f, "ShardSpec: metadata too large ({size} bytes, max {max})")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ShardSpecInputError {}
 
 // ============================================================================
 // ShardArena
@@ -1070,14 +1056,19 @@ impl fmt::Display for ShardLimitScope {
 ///
 /// Byte field lengths are shown instead of raw content in `Display` output,
 /// consistent with the cursor redaction policy in `CoordError` (in `gossip-coordination`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SplitValidationError {
     /// No children were provided (need at least 2).
+    #[error("split requires at least 2 children")]
     NoChildren,
     /// A single child is not a split.
+    #[error("a single child is not a split")]
     SingleChild,
     /// First child's start doesn't match parent's start.
+    #[error(
+        "first child start ({first_child_start} bytes) does not match parent start ({parent_start} bytes)"
+    )]
     StartMismatch {
         /// Length of the parent's start key in bytes.
         parent_start: usize,
@@ -1085,6 +1076,9 @@ pub enum SplitValidationError {
         first_child_start: usize,
     },
     /// Last child's end doesn't match parent's end.
+    #[error(
+        "last child end ({last_child_end} bytes) does not match parent end ({parent_end} bytes)"
+    )]
     EndMismatch {
         /// Length of the parent's end key in bytes.
         parent_end: usize,
@@ -1092,6 +1086,10 @@ pub enum SplitValidationError {
         last_child_end: usize,
     },
     /// Boundary mismatch (gap or overlap) between adjacent children.
+    #[error(
+        "boundary mismatch between child {child_index} end ({child_end} bytes) \
+             and child {next_child_index} start ({next_child_start} bytes)"
+    )]
     BoundaryMismatch {
         /// Index of the child in the caller-provided children slice.
         child_index: usize,
@@ -1103,6 +1101,7 @@ pub enum SplitValidationError {
         next_child_start: usize,
     },
     /// Child has inverted key range (start >= end).
+    #[error("child {child_index} has inverted key range (start >= end)")]
     InvertedChild {
         /// Index of the child in the caller-provided children slice.
         child_index: usize,
@@ -1110,6 +1109,7 @@ pub enum SplitValidationError {
 
     /// A non-last child has an unbounded end, causing it to overlap with
     /// subsequent children.
+    #[error("child {child_index} has unbounded end, overlapping with child {next_child_index}")]
     OverlappingChild {
         /// Index of the child in the caller-provided children slice.
         child_index: usize,
@@ -1121,6 +1121,10 @@ pub enum SplitValidationError {
     /// parent spec after a residual split. Accepting this split would
     /// strand the cursor outside the parent's key range, violating
     /// cursor bounds (D2.4).
+    #[error(
+        "parent cursor ({cursor} bytes) falls outside new parent range \
+             (start: {new_parent_start} bytes, end: {new_parent_end} bytes)"
+    )]
     ParentCursorOutOfBounds {
         /// Length of the parent's cursor `last_key` in bytes.
         cursor: usize,
@@ -1136,6 +1140,7 @@ pub enum SplitValidationError {
     /// Production backends would surface this as a constraint violation;
     /// the in-memory reference spec matches by returning this error
     /// instead of panicking at `assert_invariants`.
+    #[error("spawn limit exceeded: {current} existing + {additional} new > {max} max")]
     SpawnLimitExceeded {
         /// Number of children already spawned by the parent.
         current: usize,
@@ -1152,6 +1157,7 @@ pub enum SplitValidationError {
     /// global contract limit bounds plan shape, while a concrete backend
     /// may choose a stricter cap for a single atomic publication
     /// operation.
+    #[error("backend child fanout exceeded: requested {requested} children, max {backend_max}")]
     BackendChildLimitExceeded {
         /// Number of children requested by the split plan.
         requested: usize,
@@ -1162,6 +1168,7 @@ pub enum SplitValidationError {
     /// The split would exceed a shard count limit (per-tenant or global).
     ///
     /// Prevents unbounded resource growth from split-flooding (CWE-400).
+    #[error("shard limit exceeded ({scope}): {current} existing + {additional} new > {max} max")]
     ShardLimitExceeded {
         /// Current number of shards in the scope.
         current: usize,
@@ -1177,6 +1184,7 @@ pub enum SplitValidationError {
     ///
     /// With BLAKE3 + domain separation this is astronomically unlikely,
     /// but returning an error is safer than panicking on external input.
+    #[error("derived shard id collision: {derived_id:?}")]
     DerivedIdCollision {
         derived_id: crate::identity::ShardId,
     },
@@ -1186,103 +1194,12 @@ pub enum SplitValidationError {
     /// `ShardSpecRef` is intentionally unvalidated at construction time;
     /// this variant surfaces when the coordinator's precondition check
     /// detects oversized fields before they reach `AcquireScratch::write_spec`.
+    #[error(
+        "child {child_index} spec exceeds size limits \
+             (MAX_KEY_SIZE or MAX_METADATA_SIZE)"
+    )]
     InvalidChildSpec { child_index: usize },
 }
-
-impl fmt::Display for SplitValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoChildren => write!(f, "split requires at least 2 children"),
-            Self::SingleChild => write!(f, "a single child is not a split"),
-            Self::StartMismatch {
-                parent_start,
-                first_child_start,
-            } => write!(
-                f,
-                "first child start ({} bytes) does not match parent start ({} bytes)",
-                first_child_start, parent_start,
-            ),
-            Self::EndMismatch {
-                parent_end,
-                last_child_end,
-            } => write!(
-                f,
-                "last child end ({} bytes) does not match parent end ({} bytes)",
-                last_child_end, parent_end,
-            ),
-            Self::BoundaryMismatch {
-                child_index,
-                next_child_index,
-                child_end,
-                next_child_start,
-            } => write!(
-                f,
-                "boundary mismatch between child {child_index} end ({} bytes) \
-                 and child {next_child_index} start ({} bytes)",
-                child_end, next_child_start,
-            ),
-            Self::InvertedChild { child_index } => {
-                write!(
-                    f,
-                    "child {child_index} has inverted key range (start >= end)"
-                )
-            }
-            Self::OverlappingChild {
-                child_index,
-                next_child_index,
-            } => write!(
-                f,
-                "child {child_index} has unbounded end, overlapping with child {next_child_index}"
-            ),
-            Self::ParentCursorOutOfBounds {
-                cursor,
-                new_parent_start,
-                new_parent_end,
-            } => write!(
-                f,
-                "parent cursor ({} bytes) falls outside new parent range \
-                 (start: {} bytes, end: {} bytes)",
-                cursor, new_parent_start, new_parent_end,
-            ),
-            Self::SpawnLimitExceeded {
-                current,
-                additional,
-                max,
-            } => write!(
-                f,
-                "spawn limit exceeded: {current} existing + {additional} new > {max} max",
-            ),
-            Self::BackendChildLimitExceeded {
-                requested,
-                backend_max,
-            } => write!(
-                f,
-                "backend child fanout exceeded: requested {requested} children, max {backend_max}",
-            ),
-            Self::ShardLimitExceeded {
-                current,
-                additional,
-                max,
-                scope,
-            } => write!(
-                f,
-                "shard limit exceeded ({scope}): {current} existing + {additional} new > {max} max",
-            ),
-            Self::DerivedIdCollision { derived_id } => {
-                write!(f, "derived shard id collision: {derived_id:?}")
-            }
-            Self::InvalidChildSpec { child_index } => {
-                write!(
-                    f,
-                    "child {child_index} spec exceeds size limits \
-                     (MAX_KEY_SIZE or MAX_METADATA_SIZE)",
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SplitValidationError {}
 
 /// Validate that a proposed split produces children whose key ranges
 /// exactly cover the parent's range without gaps or overlaps.

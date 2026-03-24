@@ -546,28 +546,15 @@ impl fmt::Debug for ProductionBackendConfig {
 }
 
 /// Validation errors for [`ProductionBackendConfig`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProductionBackendConfigError {
     /// The done-ledger PostgreSQL DSN was empty after trimming whitespace.
+    #[error("done-ledger PostgreSQL DSN must not be empty")]
     EmptyDoneLedgerPostgresDsn,
     /// The findings PostgreSQL DSN was empty after trimming whitespace.
+    #[error("findings PostgreSQL DSN must not be empty")]
     EmptyFindingsPostgresDsn,
 }
-
-impl fmt::Display for ProductionBackendConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyDoneLedgerPostgresDsn => {
-                f.write_str("done-ledger PostgreSQL DSN must not be empty")
-            }
-            Self::EmptyFindingsPostgresDsn => {
-                f.write_str("findings PostgreSQL DSN must not be empty")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProductionBackendConfigError {}
 
 /// Distributed runtime tuning parsed from worker config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -877,29 +864,36 @@ pub enum ResolvedWorkerConfig {
 }
 
 /// Error returned when parsing or validating worker configuration.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WorkerConfigError {
     /// Invalid CLI usage or unknown flags.
+    #[error("{0}")]
     Usage(String),
     /// A required field was missing.
+    #[error("missing required value for {field} (set {flag}=... or {env}=...)")]
     MissingRequiredValue {
         field: &'static str,
         flag: &'static str,
         env: &'static str,
     },
     /// A field value was present but invalid.
+    #[error("invalid value for {field}: {value} ({reason})")]
     InvalidValue {
         field: &'static str,
         value: String,
         reason: String,
     },
     /// The etcd configuration was syntactically invalid.
-    InvalidEtcdConfig(EtcdCoordinatorConfigError),
+    #[error("invalid etcd worker configuration: {0}")]
+    InvalidEtcdConfig(#[source] EtcdCoordinatorConfigError),
     /// The production backend configuration was invalid.
-    InvalidBackendConfig(ProductionBackendConfigError),
+    #[error("invalid production backend configuration: {0}")]
+    InvalidBackendConfig(#[source] ProductionBackendConfigError),
     /// The provided combination of mode, backend, and source is unsupported.
+    #[error("{message}")]
     UnsupportedCombination { message: String },
     /// An environment variable is set but contains invalid UTF-8.
+    #[error("environment variable {key} is set but contains invalid UTF-8")]
     InvalidEncoding { key: &'static str },
 }
 
@@ -921,44 +915,6 @@ impl WorkerConfigError {
             field,
             value: "[redacted]".to_owned(),
             reason: reason.into(),
-        }
-    }
-}
-
-impl fmt::Display for WorkerConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Usage(message) => f.write_str(message),
-            Self::MissingRequiredValue { field, flag, env } => write!(
-                f,
-                "missing required value for {field} (set {flag}=... or {env}=...)"
-            ),
-            Self::InvalidValue {
-                field,
-                value,
-                reason,
-            } => write!(f, "invalid value for {field}: {value} ({reason})"),
-            Self::InvalidEtcdConfig(source) => {
-                write!(f, "invalid etcd worker configuration: {source}")
-            }
-            Self::InvalidBackendConfig(source) => {
-                write!(f, "invalid production backend configuration: {source}")
-            }
-            Self::UnsupportedCombination { message } => f.write_str(message),
-            Self::InvalidEncoding { key } => write!(
-                f,
-                "environment variable {key} is set but contains invalid UTF-8"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WorkerConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidEtcdConfig(source) => Some(source),
-            Self::InvalidBackendConfig(source) => Some(source),
-            _ => None,
         }
     }
 }

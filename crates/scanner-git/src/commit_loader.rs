@@ -81,43 +81,57 @@ use super::repo_paths::{find_pack_path, pack_data_file_name};
 const LOOSE_HEADER_MAX_BYTES: usize = 64;
 
 /// Errors from commit loading.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommitLoadError {
     /// I/O error during pack access.
-    Io(io::Error),
+    #[error("commit load I/O error: {0}")]
+    Io(#[from] io::Error),
     /// MIDX lookup failed.
-    MidxError(MidxError),
+    #[error("MIDX error: {0}")]
+    MidxError(#[from] MidxError),
     /// Pack parsing failed.
+    #[error("pack {pack_id} error: {source}")]
     PackError {
         pack_id: u16,
+        #[source]
         source: PackParseError,
     },
     /// Object inflate failed.
+    #[error("pack {pack_id} offset {offset} inflate: {source}")]
     InflateError {
         pack_id: u16,
         offset: u64,
+        #[source]
         source: InflateError,
     },
     /// Delta resolution failed.
+    #[error("pack {pack_id} delta error: {detail}")]
     DeltaError { pack_id: u16, detail: String },
     /// Commit parsing failed.
+    #[error("commit {oid} parse error: {detail}")]
     ParseError { oid: OidBytes, detail: String },
     /// Object is not a commit.
+    #[error("object {oid} is {kind:?}, not a commit")]
     NotACommit { oid: OidBytes, kind: ObjectKind },
     /// Loose object decode/validation failed.
+    #[error("loose object {oid} error: {detail}")]
     LooseObjectError { oid: OidBytes, detail: String },
     /// Commit not found in packs or loose-object directories.
+    #[error("commit {oid} not found in MIDX packs or loose objects")]
     CommitNotFound { oid: OidBytes },
     /// Too many commits.
+    #[error("too many commits: {count} (limit: {limit})")]
     TooManyCommits { count: u32, limit: u32 },
     /// Shallow file exceeds configured byte cap.
+    #[error("shallow file too large: {} (size: {size}, limit: {limit})", path.display())]
     ShallowFileTooLarge {
         path: PathBuf,
         size: u64,
         limit: u32,
     },
     /// Too many unique shallow roots were ingested.
+    #[error("too many shallow roots in {} at line {line}: {count} (limit: {limit})", path.display())]
     TooManyShallowRoots {
         path: PathBuf,
         line: u32,
@@ -125,113 +139,19 @@ pub enum CommitLoadError {
         limit: u32,
     },
     /// Delta chain too deep.
+    #[error("pack {pack_id} offset {offset}: delta chain depth {depth} exceeded")]
     DeltaChainTooDeep {
         pack_id: u16,
         offset: u64,
         depth: u8,
     },
     /// Identity parsed successfully but could not be interned.
+    #[error("commit {oid} identity interning failed for {field}: {reason}")]
     IdentityInternError {
         oid: OidBytes,
         field: &'static str,
         reason: &'static str,
     },
-}
-
-impl std::fmt::Display for CommitLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "commit load I/O error: {err}"),
-            Self::MidxError(err) => write!(f, "MIDX error: {err}"),
-            Self::PackError { pack_id, source } => {
-                write!(f, "pack {pack_id} error: {source}")
-            }
-            Self::InflateError {
-                pack_id,
-                offset,
-                source,
-            } => {
-                write!(f, "pack {pack_id} offset {offset} inflate: {source}")
-            }
-            Self::DeltaError { pack_id, detail } => {
-                write!(f, "pack {pack_id} delta error: {detail}")
-            }
-            Self::ParseError { oid, detail } => {
-                write!(f, "commit {oid} parse error: {detail}")
-            }
-            Self::NotACommit { oid, kind } => {
-                write!(f, "object {oid} is {kind:?}, not a commit")
-            }
-            Self::LooseObjectError { oid, detail } => {
-                write!(f, "loose object {oid} error: {detail}")
-            }
-            Self::CommitNotFound { oid } => {
-                write!(f, "commit {oid} not found in MIDX packs or loose objects")
-            }
-            Self::TooManyCommits { count, limit } => {
-                write!(f, "too many commits: {count} (limit: {limit})")
-            }
-            Self::ShallowFileTooLarge { path, size, limit } => {
-                write!(
-                    f,
-                    "shallow file too large: {} (size: {size}, limit: {limit})",
-                    path.display()
-                )
-            }
-            Self::TooManyShallowRoots {
-                path,
-                line,
-                count,
-                limit,
-            } => {
-                write!(
-                    f,
-                    "too many shallow roots in {} at line {line}: {count} (limit: {limit})",
-                    path.display()
-                )
-            }
-            Self::DeltaChainTooDeep {
-                pack_id,
-                offset,
-                depth,
-            } => {
-                write!(
-                    f,
-                    "pack {pack_id} offset {offset}: delta chain depth {depth} exceeded"
-                )
-            }
-            Self::IdentityInternError { oid, field, reason } => {
-                write!(
-                    f,
-                    "commit {oid} identity interning failed for {field}: {reason}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for CommitLoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            Self::MidxError(err) => Some(err),
-            Self::PackError { source, .. } => Some(source),
-            Self::InflateError { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for CommitLoadError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<MidxError> for CommitLoadError {
-    fn from(err: MidxError) -> Self {
-        Self::MidxError(err)
-    }
 }
 
 /// Loaded commit with all fields needed for graph construction.

@@ -14,6 +14,7 @@ test-support = ["gossip-contracts/test-support", "dep:rand", "dep:rand_chacha", 
 [dependencies]
 gossip-contracts.workspace = true
 gossip-stdx.workspace = true
+thiserror.workspace = true
 ahash = "0.8"
 blake3 = "1.8"
 rand = { version = "0.9", optional = true }

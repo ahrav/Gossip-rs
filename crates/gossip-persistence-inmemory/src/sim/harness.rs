@@ -345,7 +345,7 @@ impl DoneLedgerSim {
             fail_release[pass_idx] = false;
         }
 
-        for (op_id, should_fail) in pending_ids.into_iter().zip(fail_release.into_iter()) {
+        for (op_id, should_fail) in pending_ids.into_iter().zip(fail_release) {
             if should_fail {
                 let (event, violations) =
                     self.step(DoneLedgerSimOp::InjectCommitFailure { count: 1 });

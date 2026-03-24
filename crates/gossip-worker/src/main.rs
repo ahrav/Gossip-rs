@@ -9,8 +9,6 @@
 //! Connector-mode filesystem scans route through the distributed worker loop.
 //! They do not silently downgrade to the local scan path.
 
-use std::fmt;
-
 use gossip_scanner_runtime::{
     ScanReport, ScanRuntimeError, distributed::DistributedRunReport, scan_fs, scan_git,
 };
@@ -23,31 +21,14 @@ use tracing_subscriber::EnvFilter;
 
 /// Worker-level error distinguishing configuration errors from runtime
 /// failures.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum WorkerError {
-    Config(gossip_worker::config::WorkerConfigError),
-    LocalRuntime(ScanRuntimeError),
-    ProductionRuntime(ProductionWorkerError),
-}
-
-impl fmt::Display for WorkerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(error) => write!(f, "{error}"),
-            Self::LocalRuntime(error) => write!(f, "scan failed: {error}"),
-            Self::ProductionRuntime(error) => write!(f, "scan failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for WorkerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Config(error) => Some(error),
-            Self::LocalRuntime(error) => Some(error),
-            Self::ProductionRuntime(error) => Some(error),
-        }
-    }
+    #[error("{0}")]
+    Config(#[source] gossip_worker::config::WorkerConfigError),
+    #[error("scan failed: {0}")]
+    LocalRuntime(#[source] ScanRuntimeError),
+    #[error("scan failed: {0}")]
+    ProductionRuntime(#[source] ProductionWorkerError),
 }
 
 impl From<gossip_worker::config::WorkerConfigError> for WorkerError {

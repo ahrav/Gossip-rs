@@ -23,7 +23,7 @@
 //! coordination's `ShardSpec` model. Empty bounds mean "unbounded", so callers
 //! can pass `shard.key_range_start()` / `shard.key_range_end()` directly.
 
-use std::{fmt, slice};
+use std::slice;
 
 use super::{Cursor, ItemKey, ScanItem};
 
@@ -205,52 +205,28 @@ impl KeyedPageItem for ScanItem {
 }
 
 /// Page validation failures for filled connector pages.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PageShapeError {
     /// Filled pages must contain at least one item.
+    #[error("page must contain at least one item")]
     EmptyPage,
     /// A key regressed relative to the previous item.
+    #[error("page item keys must be strictly increasing (index {index})")]
     UnsortedKeys { index: usize },
     /// Two adjacent keys were identical.
+    #[error("page item keys must be unique (index {index})")]
     DuplicateKeys { index: usize },
     /// An item key fell outside the shard's half-open `[start, end)` bounds.
+    #[error("{}", if *below_start {
+        format!("page item key is below shard start bound (index {index})")
+    } else {
+        format!("page item key is at or above shard end bound (index {index})")
+    })]
     KeyOutsideShardBounds { index: usize, below_start: bool },
     /// Both shard bounds are present but start >= end.
+    #[error("shard bounds are inverted (start >= end)")]
     InvertedBounds,
 }
-
-impl fmt::Display for PageShapeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPage => f.write_str("page must contain at least one item"),
-            Self::UnsortedKeys { index } => {
-                write!(
-                    f,
-                    "page item keys must be strictly increasing (index {index})"
-                )
-            }
-            Self::DuplicateKeys { index } => {
-                write!(f, "page item keys must be unique (index {index})")
-            }
-            Self::KeyOutsideShardBounds { index, below_start } => {
-                if *below_start {
-                    write!(
-                        f,
-                        "page item key is below shard start bound (index {index})"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "page item key is at or above shard end bound (index {index})"
-                    )
-                }
-            }
-            Self::InvertedBounds => f.write_str("shard bounds are inverted (start >= end)"),
-        }
-    }
-}
-
-impl std::error::Error for PageShapeError {}
 
 /// Validate a non-empty ordered page against shard bounds.
 ///
@@ -315,64 +291,34 @@ pub fn validate_filled_page<T: KeyedPageItem>(
 /// Violation detected by [`validate_page_sequence`] when a page breaks one of
 /// the four page-sequence invariants: shape, cursor advance, HasMore last-key
 /// presence, or cursor-page alignment.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PageSequenceViolation {
     /// The page failed intra-page shape validation (ordering, bounds, non-empty).
-    Shape(PageShapeError),
+    #[error("page shape: {0}")]
+    Shape(#[from] PageShapeError),
     /// The first key on this page did not strictly advance past the previous
     /// page's (or initial cursor's) last key.
+    #[error(
+        "page did not advance past previous last key \
+             (previous_last={previous_last:?}, first_key={first_key:?})"
+    )]
     CursorDidNotAdvance {
         previous_last: Vec<u8>,
         first_key: Vec<u8>,
     },
     /// A `HasMore` page returned a cursor without a `last_key`.
+    #[error("HasMore cursor is missing a last_key")]
     HasMoreWithoutLastKey,
     /// A `HasMore` cursor's `last_key` does not match the page's actual last
     /// emitted key.
+    #[error(
+        "HasMore cursor last_key does not match page's last emitted key \
+             (cursor_last={cursor_last:?}, page_last={page_last:?})"
+    )]
     CursorPageMismatch {
         cursor_last: Vec<u8>,
         page_last: Vec<u8>,
     },
-}
-
-impl fmt::Display for PageSequenceViolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Shape(inner) => write!(f, "page shape: {inner}"),
-            Self::CursorDidNotAdvance {
-                previous_last,
-                first_key,
-            } => write!(
-                f,
-                "page did not advance past previous last key \
-                 (previous_last={previous_last:?}, first_key={first_key:?})"
-            ),
-            Self::HasMoreWithoutLastKey => f.write_str("HasMore cursor is missing a last_key"),
-            Self::CursorPageMismatch {
-                cursor_last,
-                page_last,
-            } => write!(
-                f,
-                "HasMore cursor last_key does not match page's last emitted key \
-                 (cursor_last={cursor_last:?}, page_last={page_last:?})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PageSequenceViolation {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Shape(inner) => Some(inner),
-            _ => None,
-        }
-    }
-}
-
-impl From<PageShapeError> for PageSequenceViolation {
-    fn from(err: PageShapeError) -> Self {
-        Self::Shape(err)
-    }
 }
 
 /// Validate a page against both intra-page shape rules and inter-page sequence

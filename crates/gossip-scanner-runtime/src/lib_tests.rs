@@ -420,7 +420,7 @@ fn scan_fs_direct_rejects_nonexistent_path() {
         matches!(
             error,
             ScanRuntimeError::InvalidPath {
-                source: "filesystem",
+                origin: "filesystem",
                 ..
             }
         ),
@@ -673,7 +673,7 @@ fn scan_git_direct_rejects_missing_repo() {
         .expect_err("missing path should fail");
     assert!(matches!(
         error,
-        ScanRuntimeError::InvalidPath { source: "git", .. }
+        ScanRuntimeError::InvalidPath { origin: "git", .. }
     ));
 }
 
@@ -694,7 +694,7 @@ fn scan_git_rejects_subdirectory_of_repo() {
     let error = scan_git_direct(&GitScanConfig::new(&subdir)).expect_err("subdirectory");
     assert!(matches!(
         error,
-        ScanRuntimeError::InvalidPath { source: "git", .. }
+        ScanRuntimeError::InvalidPath { origin: "git", .. }
     ));
 }
 

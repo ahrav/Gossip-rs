@@ -34,7 +34,6 @@
 //!   probabilistically via [`SimEtcdFaultConfig`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt;
 
 use etcd_client::proto::{
     PbCompare, PbCompareTarget, PbDeleteRequest, PbDeleteResponse, PbKeyValue,
@@ -1209,48 +1208,31 @@ pub enum SimEtcdOperation {
 }
 
 /// Errors returned by the in-memory etcd model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SimEtcdError {
+    #[error("fault injected while handling {operation:?}")]
     FaultInjected { operation: SimEtcdOperation },
+    #[error("transaction committed but the client observed an uncertain outcome")]
     UncertainCommit,
+    #[error("lease TTL must be positive, got {ttl}")]
     InvalidLeaseTtl { ttl: i64 },
+    #[error("lease {lease_id} was not found")]
     LeaseNotFound { lease_id: i64 },
+    #[error("lease id space exhausted")]
     LeaseIdExhausted,
+    #[error("transaction mutates the same key twice: {key:?}")]
     DuplicateMutation { key: Vec<u8> },
+    #[error("{detail}")]
     UnsupportedGetOption { detail: &'static str },
+    #[error("{detail}")]
     UnsupportedCompare { detail: &'static str },
+    #[error("{detail}")]
     UnsupportedTxnOp { detail: &'static str },
+    #[error("{detail}")]
     MalformedCompare { detail: &'static str },
+    #[error("{detail}")]
     MalformedTxn { detail: &'static str },
 }
-
-impl fmt::Display for SimEtcdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FaultInjected { operation } => {
-                write!(f, "fault injected while handling {:?}", operation)
-            }
-            Self::UncertainCommit => {
-                f.write_str("transaction committed but the client observed an uncertain outcome")
-            }
-            Self::InvalidLeaseTtl { ttl } => {
-                write!(f, "lease TTL must be positive, got {ttl}")
-            }
-            Self::LeaseNotFound { lease_id } => write!(f, "lease {lease_id} was not found"),
-            Self::LeaseIdExhausted => f.write_str("lease id space exhausted"),
-            Self::DuplicateMutation { key } => {
-                write!(f, "transaction mutates the same key twice: {:?}", key)
-            }
-            Self::UnsupportedGetOption { detail }
-            | Self::UnsupportedCompare { detail }
-            | Self::UnsupportedTxnOp { detail }
-            | Self::MalformedCompare { detail }
-            | Self::MalformedTxn { detail } => f.write_str(detail),
-        }
-    }
-}
-
-impl std::error::Error for SimEtcdError {}
 
 fn build_get_response(
     revision: i64,

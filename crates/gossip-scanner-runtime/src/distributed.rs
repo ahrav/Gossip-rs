@@ -69,7 +69,6 @@
 //! [`CommitPipeline`]: crate::commit_pipeline::CommitPipeline
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -440,34 +439,17 @@ impl DistributedRunReport {
 /// connectivity issues from local scan crashes from durability pipeline
 /// stalls. The variant determines whether the error is retryable (e.g.,
 /// coordinator transient failures) or terminal (e.g., scan panics).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DistributedRuntimeError {
     /// The coordinator returned an error.
-    Coordinator(AnyError),
+    #[error("coordinator error: {0}")]
+    Coordinator(#[source] AnyError),
     /// The scan runtime failed while executing an assignment.
-    Runtime(ScanRuntimeError),
+    #[error("runtime error: {0}")]
+    Runtime(#[source] ScanRuntimeError),
     /// The local durability pipeline failed.
-    Durability(AnyError),
-}
-
-impl fmt::Display for DistributedRuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Coordinator(error) => write!(f, "coordinator error: {error}"),
-            Self::Runtime(error) => write!(f, "runtime error: {error}"),
-            Self::Durability(error) => write!(f, "durability pipeline error: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for DistributedRuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Coordinator(error) => Some(error.as_ref()),
-            Self::Runtime(error) => Some(error),
-            Self::Durability(error) => Some(error.as_ref()),
-        }
-    }
+    #[error("durability pipeline error: {0}")]
+    Durability(#[source] AnyError),
 }
 
 impl From<ScanRuntimeError> for DistributedRuntimeError {

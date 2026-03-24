@@ -15,6 +15,7 @@ test-support = ["gossip-contracts/test-support", "dep:rand", "dep:rand_chacha"]
 
 [dependencies]
 gossip-contracts = { workspace = true }
+thiserror.workspace = true
 rand = { version = "0.9", optional = true }
 rand_chacha = { version = "0.9", optional = true }
 

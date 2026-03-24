@@ -20,7 +20,7 @@
 //! [`FsFindingRecord::span_end`]. Root-hint fields remain scanner-local
 //! metadata and never participate in persistence identity derivation.
 
-use std::{collections::HashSet, error::Error, fmt, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use gossip_contracts::{
     connector::ScanItem,
@@ -240,60 +240,26 @@ impl PersistenceTranslation {
 }
 
 /// Errors returned while translating runtime scan output into persistence rows.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ResultTranslationError {
     /// A finding span was empty or inverted before persistence-layer validation.
+    #[error("finding at index {index} has invalid span [{start}, {end})")]
     InvalidFindingSpan { index: usize, start: u64, end: u64 },
     /// Distinct findings exceeded the `u32` capacity used by done-ledger rows.
+    #[error("distinct finding count {count} exceeds done-ledger u32 capacity")]
     TooManyDistinctFindings { count: usize },
     /// Scan timing was inverted: `started_at` exceeded `finished_at`.
+    #[error("scan timing inverted: started_at ({started_at}) > finished_at ({finished_at})")]
     InvalidScanTiming { started_at: u64, finished_at: u64 },
     /// A persistence constructor or validator rejected the translated rows.
-    Persistence(PersistenceInputError),
+    #[error("persistence translation error: {0}")]
+    Persistence(#[source] PersistenceInputError),
     /// A persistence constructor rejected a finding at a known index.
+    #[error("persistence error at finding index {index}: {source}")]
     PersistenceAtIndex {
         index: usize,
         source: PersistenceInputError,
     },
-}
-
-impl fmt::Display for ResultTranslationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidFindingSpan { index, start, end } => {
-                write!(
-                    f,
-                    "finding at index {index} has invalid span [{start}, {end})"
-                )
-            }
-            Self::TooManyDistinctFindings { count } => write!(
-                f,
-                "distinct finding count {count} exceeds done-ledger u32 capacity",
-            ),
-            Self::InvalidScanTiming {
-                started_at,
-                finished_at,
-            } => write!(
-                f,
-                "scan timing inverted: started_at ({started_at}) > finished_at ({finished_at})",
-            ),
-            Self::Persistence(err) => write!(f, "persistence translation error: {err}"),
-            Self::PersistenceAtIndex { index, source } => {
-                write!(f, "persistence error at finding index {index}: {source}")
-            }
-        }
-    }
-}
-
-impl Error for ResultTranslationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Persistence(err) | Self::PersistenceAtIndex { source: err, .. } => Some(err),
-            Self::InvalidFindingSpan { .. }
-            | Self::TooManyDistinctFindings { .. }
-            | Self::InvalidScanTiming { .. } => None,
-        }
-    }
 }
 
 impl From<PersistenceInputError> for ResultTranslationError {
