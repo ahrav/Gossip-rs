@@ -35,7 +35,9 @@ use crate::request::{FilesystemSourceMode, NormalizedFilesystemRequest};
 ///
 /// Filesystem shard keys are root-relative UTF-8 paths, which are always
 /// non-empty.  `0x00` sorts below every valid path byte, so it serves as
-/// an exclusive lower sentinel that manifest registration accepts.
+/// an inclusive lower sentinel that manifest registration accepts; because
+/// no valid path equals `\x00`, it effectively excludes nothing real from
+/// the shard range.
 const FILESYSTEM_KEYSPACE_FLOOR: &[u8] = b"\x00";
 
 /// Highest byte value in the filesystem keyspace.
@@ -97,6 +99,13 @@ impl fmt::Debug for FilesystemRunSetupInput<'_> {
 
 impl<'a> FilesystemRunSetupInput<'a> {
     /// Bundle a normalized request, planned geometry, and typed payload.
+    ///
+    /// # Caller invariant
+    ///
+    /// `geometry` and `payload` must both originate from the same `request`.
+    /// Today the planner always emits full-keyspace geometry, so a mismatch
+    /// is harmless.  If bounded per-request geometry is introduced later,
+    /// this constructor should validate the relationship.
     #[must_use]
     pub fn new(
         request: &'a NormalizedFilesystemRequest,
@@ -180,14 +189,9 @@ impl fmt::Display for FilesystemRunSetupError {
                 f,
                 "filesystem payload mode '{payload}' does not match normalized request mode '{request}'"
             ),
-            Self::PayloadRootMismatch {
-                request_root,
-                payload_root,
-            } => write!(
+            Self::PayloadRootMismatch { .. } => write!(
                 f,
-                "filesystem payload root '{}' does not match normalized request root '{}'",
-                payload_root.display(),
-                request_root.display()
+                "filesystem payload root does not match normalized request root"
             ),
             Self::PayloadEncode(err) => write!(f, "filesystem payload encode failed: {err}"),
             Self::ManifestBuild(err) => write!(f, "filesystem manifest build failed: {err}"),
@@ -271,13 +275,21 @@ where
     let encoded_payload = payload.encode()?;
     let (start, end) = lower_geometry_bounds(&geometry);
 
-    // The arena stores three byte slices: start bound, end bound, and the
-    // encoded shard metadata (which wraps the payload in a ShardMetadata
-    // envelope with a 5-byte header).  A generous flat padding avoids
-    // coupling to ByteSlab's internal bucket-rounding strategy.
-    let byte_capacity = start.len() + end.len() + encoded_payload.len() + 128;
+    // The arena makes three individual ByteSlab allocations: start bound,
+    // end bound, and encoded shard metadata.  ByteSlab rounds each to
+    // `max(n, 16).next_power_of_two()`, so the capacity must account for
+    // per-allocation rounding, not just the raw byte total.
+    //
+    // The metadata envelope wraps the encoded payload in a ShardMetadata
+    // frame: 4-byte hint-length prefix + 1-byte Range hint + payload bytes.
+    let metadata_raw = 5 + encoded_payload.len();
+    let byte_capacity = slab_alloc_bound(start.len())
+        + slab_alloc_bound(end.len())
+        + slab_alloc_bound(metadata_raw);
     let mut arena = ShardArena::with_capacity(1, byte_capacity);
     let mut builder = PreallocShardBuilder::<1>::new(&mut arena, 1)?;
+    // Builder-assigned ShardId is not needed here: authoritative shard IDs
+    // are available via RunRecord::root_shards() after registration.
     let _ = builder.add_range(start, end, &encoded_payload)?;
     let manifest = builder.build_inputs()?;
 
@@ -333,6 +345,18 @@ fn lower_geometry_bounds(geometry: &InitialShardGeometry) -> (&[u8], &[u8]) {
         geometry.key_range_end()
     };
     (start, end)
+}
+
+/// Upper-bound a single ByteSlab allocation.
+///
+/// ByteSlab rounds each allocation to `max(n, 16).next_power_of_two()`.
+/// Zero-length inputs allocate zero bytes.
+#[inline]
+fn slab_alloc_bound(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    n.max(16).next_power_of_two()
 }
 
 #[cfg(test)]
@@ -705,6 +729,43 @@ mod tests {
     }
 
     #[test]
+    fn setup_succeeds_with_deep_directory_path() {
+        // Construct a path whose canonical form exceeds 130 characters,
+        // past the threshold where metadata bytes (6 + path.len()) cross a
+        // power-of-2 boundary and ByteSlab rounds to a much larger bucket.
+        let dir = tempdir().expect("tempdir");
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..20 {
+            deep = deep.join(format!("level_{i:03}"));
+        }
+        fs::create_dir_all(&deep).expect("create deep tree");
+        let canonical = deep.canonicalize().expect("canonicalize");
+        assert!(
+            canonical.to_str().unwrap().len() >= 130,
+            "canonical path too short to exercise rounding: {}",
+            canonical.display()
+        );
+        let request = normalize_directory(&canonical, run_config());
+        let plan = plan_filesystem_initial_shards(request.clone());
+        let payload = plan.shard_payload();
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let outcome = setup_filesystem_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            OpId::from_raw(30),
+        )
+        .expect("deep-path run setup must not fail with SlabFull");
+
+        assert!(outcome.is_executed());
+        let result = outcome.into_inner();
+        assert_eq!(result.run().status(), RunStatus::Active);
+    }
+
+    #[test]
     fn debug_redacts_root_mismatch_error_paths() {
         let err = FilesystemRunSetupError::PayloadRootMismatch {
             request_root: PathBuf::from("/sensitive/request"),
@@ -723,6 +784,24 @@ mod tests {
         assert!(
             !rendered.contains("/sensitive/payload"),
             "Debug output must not leak the payload root: {rendered}"
+        );
+    }
+
+    #[test]
+    fn display_redacts_root_mismatch_error_paths() {
+        let err = FilesystemRunSetupError::PayloadRootMismatch {
+            request_root: PathBuf::from("/sensitive/request"),
+            payload_root: PathBuf::from("/sensitive/payload"),
+        };
+        let rendered = format!("{err}");
+
+        assert!(
+            !rendered.contains("/sensitive/request"),
+            "Display output must not leak the request root: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/sensitive/payload"),
+            "Display output must not leak the payload root: {rendered}"
         );
     }
 }

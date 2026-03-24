@@ -19,7 +19,10 @@
 //!    geometry, and typed payloads into a validated initial manifest, then
 //!    creates and registers the run through the coordination lifecycle.
 //!
-//! All stages are stateless and synchronous.
+//! Stages 1-3 are stateless and synchronous.  Stage 4 is synchronous but
+//! coordination-backed: it calls into
+//! [`RunManagement`](gossip_coordination::RunManagement) and mutates
+//! run/shard state.
 
 pub mod payload;
 pub mod planner;
@@ -33,13 +36,13 @@ pub use payload::{
     FilesystemShardPayload, FilesystemShardPayloadDecodeError, FilesystemShardPayloadEncodeError,
 };
 pub use planner::{
-    FilesystemInitialShardPlan, InitialShardGeometry, plan_filesystem_initial_shards,
+    plan_filesystem_initial_shards, FilesystemInitialShardPlan, InitialShardGeometry,
 };
 pub use request::{
     FilesystemPathKind, FilesystemRequest, FilesystemRequestError, FilesystemSourceMode,
     NormalizedFilesystemRequest,
 };
 pub use setup::{
-    FilesystemRunSetupError, FilesystemRunSetupInput, FilesystemRunSetupResult,
-    setup_filesystem_run,
+    setup_filesystem_run, FilesystemRunSetupError, FilesystemRunSetupInput,
+    FilesystemRunSetupResult,
 };
