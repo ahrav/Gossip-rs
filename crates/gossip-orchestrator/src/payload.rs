@@ -463,6 +463,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn encode_rejects_relative_path() {
+        let err = FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, "rel/path")
+            .encode()
+            .expect_err("relative path must be rejected by encode");
+        assert!(matches!(
+            err,
+            FilesystemShardPayloadEncodeError::RelativePath {
+                mode: FilesystemSourceMode::DirectoryRoot,
+            }
+        ));
+        assert!(
+            err.to_string().contains("must be absolute"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn encode_rejects_non_utf8_path() {
