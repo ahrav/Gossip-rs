@@ -62,28 +62,28 @@
 //! [`ShardLease`](crate::distributed::ShardLease).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use gossip_contracts::{
     connector::{
-        Budgets, Cursor, EnumerateError, ErrorClass, PageBuf, PageState, ScanItem,
-        ordered::OrderedContentSource, validate_page_sequence,
+        ordered::OrderedContentSource, validate_page_sequence, Budgets, Cursor, EnumerateError,
+        ErrorClass, PageBuf, PageState, ScanItem,
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
     persistence::{
-        DoneLedger, DoneLedgerStatus, OvidHashInputs, RECOMMENDED_MAX_BATCH_SIZE, WriteContext,
-        derive_ovid_hash,
+        derive_ovid_hash, DoneLedger, DoneLedgerStatus, OvidHashInputs, WriteContext,
+        RECOMMENDED_MAX_BATCH_SIZE,
     },
 };
 use scanner_scheduler::events::EventOutput;
-use scanner_scheduler::scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
+use scanner_scheduler::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
 
 use crate::{
-    AssignmentOutcome, COMMIT_CHANNEL_CAP, CancellationToken, ChannelEventOutput,
-    ChannelStoreProducer, EVENT_CHANNEL_CAP, FsScanConfig, ScanReport, ScanRuntimeError,
-    build_runtime_engine, forward_commits, forward_core_events, join_scoped,
+    build_runtime_engine, forward_commits, forward_core_events, join_scoped, AssignmentOutcome,
+    CancellationToken, ChannelEventOutput, ChannelStoreProducer, FsScanConfig, ScanReport,
+    ScanRuntimeError, COMMIT_CHANNEL_CAP, EVENT_CHANNEL_CAP,
 };
 
 /// Inputs required to acquire and validate one ordered connector page.
@@ -939,16 +939,30 @@ mod tests {
         record
     }
 
-    #[derive(Default)]
     struct TrackingDoneLedger {
         done: HashSet<OvidHash>,
+        expected_tenant: gossip_contracts::identity::TenantId,
+        expected_policy: gossip_contracts::identity::PolicyHash,
         request_lengths: Mutex<Vec<usize>>,
     }
 
     impl TrackingDoneLedger {
+        fn empty() -> Self {
+            let wc = write_context();
+            Self {
+                done: HashSet::new(),
+                expected_tenant: wc.tenant_id(),
+                expected_policy: wc.policy_hash(),
+                request_lengths: Mutex::new(Vec::new()),
+            }
+        }
+
         fn with_done(done: impl IntoIterator<Item = OvidHash>) -> Self {
+            let wc = write_context();
             Self {
                 done: done.into_iter().collect(),
+                expected_tenant: wc.tenant_id(),
+                expected_policy: wc.policy_hash(),
                 request_lengths: Mutex::new(Vec::new()),
             }
         }
@@ -971,6 +985,11 @@ mod tests {
             policy_hash: gossip_contracts::identity::PolicyHash,
             ovid_hashes: &[OvidHash],
         ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            assert_eq!(tenant_id, self.expected_tenant, "batch_get tenant mismatch");
+            assert_eq!(
+                policy_hash, self.expected_policy,
+                "batch_get policy mismatch"
+            );
             if ovid_hashes.len() > RECOMMENDED_MAX_BATCH_SIZE {
                 return Err(io::Error::other(
                     "batch_get exceeded recommended batch size",
@@ -1052,12 +1071,17 @@ mod tests {
     /// exercise non-ScannedClean done-ledger states (e.g. FailedRetryable).
     struct StatusAwareDoneLedger {
         statuses: HashMap<OvidHash, DoneLedgerStatus>,
+        expected_tenant: gossip_contracts::identity::TenantId,
+        expected_policy: gossip_contracts::identity::PolicyHash,
     }
 
     impl StatusAwareDoneLedger {
         fn new(statuses: impl IntoIterator<Item = (OvidHash, DoneLedgerStatus)>) -> Self {
+            let wc = write_context();
             Self {
                 statuses: statuses.into_iter().collect(),
+                expected_tenant: wc.tenant_id(),
+                expected_policy: wc.policy_hash(),
             }
         }
     }
@@ -1072,6 +1096,11 @@ mod tests {
             policy_hash: gossip_contracts::identity::PolicyHash,
             ovid_hashes: &[OvidHash],
         ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            assert_eq!(tenant_id, self.expected_tenant, "batch_get tenant mismatch");
+            assert_eq!(
+                policy_hash, self.expected_policy,
+                "batch_get policy mismatch"
+            );
             Ok(ovid_hashes
                 .iter()
                 .map(|ovid_hash| {
@@ -1383,7 +1412,7 @@ mod tests {
         let page = OrderedContentPage::from_validated_page(
             PageBuf::try_new(items, PageState::Complete).expect("page"),
         );
-        let ledger = TrackingDoneLedger::default();
+        let ledger = TrackingDoneLedger::empty();
 
         let filtered = page
             .prefilter_done_ledger(write_context(), &ledger)
