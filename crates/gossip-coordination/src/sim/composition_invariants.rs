@@ -54,8 +54,8 @@ use gossip_contracts::identity::{FenceEpoch, RunId, ShardId, ShardKey, TenantId}
 use gossip_contracts::persistence::DoneLedgerKey;
 use gossip_persistence_inmemory::sim::DoneLedgerOracle;
 
-use super::SimIntrospection;
 use super::composition::ProvenanceEntry;
+use super::SimIntrospection;
 
 // ---------------------------------------------------------------------------
 // CrossComponentViolation
@@ -233,12 +233,19 @@ impl CompositionInvariantChecker {
     /// The check-then-update ordering for C3 ensures that the lifecycle
     /// that both writes and completes a shard is not falsely flagged —
     /// only subsequent writes for the same triple trigger a violation.
+    ///
+    /// # Panics (debug builds)
+    ///
+    /// Debug-asserts that `write_log.len() >= self.last_write_log_len`,
+    /// i.e. the log is append-only. A violation indicates a harness bug
+    /// (the simulation shrank or replaced the log), not a cross-component
+    /// invariant failure.
     fn check_write_log(
         &mut self,
         write_log: &[ProvenanceEntry],
         violations: &mut Vec<CrossComponentViolation>,
     ) {
-        assert!(
+        debug_assert!(
             write_log.len() >= self.last_write_log_len,
             "write_log must be append-only; got len {} but expected >= {}",
             write_log.len(),

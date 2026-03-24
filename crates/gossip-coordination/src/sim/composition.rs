@@ -47,14 +47,13 @@ use gossip_contracts::identity::{
     FenceEpoch, OpId, PolicyHash, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
 use gossip_contracts::persistence::{CommitHandle, DoneLedger, DoneLedgerRecord, OvidHash};
-use gossip_persistence_inmemory::CompletionOrder;
-use gossip_persistence_inmemory::InMemoryDoneLedger;
 use gossip_persistence_inmemory::sim::{
     DoneLedgerFaultConfig, DoneLedgerInvariantChecker, DoneLedgerInvariantViolation,
     DoneLedgerOracle,
 };
+use gossip_persistence_inmemory::CompletionOrder;
+use gossip_persistence_inmemory::InMemoryDoneLedger;
 
-use crate::Lease;
 use crate::error::{AcquireScratch, CheckpointError, CompleteError, IdempotentOutcome, SplitError};
 use crate::facade::{ClaimError, ShardClaiming};
 use crate::in_memory::InMemoryCoordinator;
@@ -62,12 +61,13 @@ use crate::record::ParkReason;
 use crate::run::{RunConfig, RunManagement};
 use crate::session::WorkerSession;
 use crate::traits::CoordinationBackend;
+use crate::Lease;
 
 use super::composition_invariants::{CompositionInvariantChecker, CrossComponentViolation};
 use super::scan_driver_sim::generate_scan_outcome;
 use super::shared::{
-    CheckpointOpMap, DEFAULT_LEASE_DURATION, MAX_STALE_LEASES, SessionTerminalAction,
-    SplitInputCopy, random_midpoint, require_lease_and_op,
+    random_midpoint, require_lease_and_op, CheckpointOpMap, SessionTerminalAction, SplitInputCopy,
+    DEFAULT_LEASE_DURATION, MAX_STALE_LEASES,
 };
 use super::worker::SimWorker;
 use super::{
@@ -324,8 +324,8 @@ impl fmt::Display for CompositionSimViolation {
 /// Composition simulation harness: coordinator + done-ledger.
 ///
 /// Drives a deterministic claim-scan-complete loop with a single PRNG stream,
-/// running all three invariant checker suites (S1–S9, I1–I10, C1–C4) after
-/// every step.
+/// running S1–S9 and C1–C4 after every step, with I1–I10 checked inline
+/// during done-ledger writes.
 ///
 /// # Ownership model
 ///

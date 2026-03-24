@@ -95,6 +95,23 @@ pub enum SplitCoverageDetail {
     WrongParent { children: Vec<ShardId> },
 }
 
+impl fmt::Display for SplitCoverageDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySpawned => write!(f, "split shard has no children (empty spawned list)"),
+            Self::MissingChildren { children } => {
+                write!(f, "child shard(s) {children:?} not found in coordinator")
+            }
+            Self::WrongParent { children } => {
+                write!(
+                    f,
+                    "child shard(s) {children:?} do not reference this parent"
+                )
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InvariantViolation
 // ---------------------------------------------------------------------------
@@ -254,7 +271,7 @@ impl fmt::Display for InvariantViolation {
             ),
             Self::SplitCoverage { run, shard, detail } => write!(
                 f,
-                "S7 SplitCoverage: shard (run={run:?}, shard={shard:?}) {detail:?}"
+                "S7 SplitCoverage: shard (run={run:?}, shard={shard:?}) {detail}"
             ),
             Self::UnparkWithoutFenceBump {
                 run,
@@ -263,7 +280,7 @@ impl fmt::Display for InvariantViolation {
                 fence_at_unpark,
             } => write!(
                 f,
-                "S3 UnparkWithoutFenceBump: shard (run={run:?}, shard={shard:?}) \
+                "S3b UnparkWithoutFenceBump: shard (run={run:?}, shard={shard:?}) \
                  unparked with fence {fence_at_unpark:?}, same as park fence {fence_at_park:?}"
             ),
             Self::RunTerminalIrreversibility { run, was, now } => write!(
