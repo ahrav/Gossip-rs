@@ -58,6 +58,12 @@ struct Cli {
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Commands {
     /// Submit a filesystem request and register its initial shard set.
+    ///
+    /// Uses a fixed tenant ID (`1111…1111`) that must match the worker's
+    /// `GOSSIP_TENANT_ID` environment variable (set in the Justfile).
+    /// The setup op-id is also fixed, so re-seeding the same `--run-id`
+    /// with a different path triggers an `OpIdConflict` — run `just reset`
+    /// first to clear coordination state.
     Seed {
         /// Filesystem request mode (`single_file` or `directory_root`).
         source_mode: FilesystemSourceModeArg,
@@ -212,16 +218,32 @@ where
 
 /// Collapse setup failures into operator-facing categories while preserving
 /// the original coordination error in the chain.
+///
+/// The top-level match is exhaustive over [`FilesystemRunSetupError`] variants
+/// so that adding a new variant forces this mapping to be revisited.  The
+/// inner `CreateRun` match still requires a catch-all because
+/// [`CreateRunError`] is `#[non_exhaustive]`.
 fn classify_submission_error(run_id_raw: u64, error: FilesystemRunSetupError) -> anyhow::Error {
     match error {
-        FilesystemRunSetupError::CreateRun(err @ CreateRunError::ConfigMismatch { .. }) => {
-            anyhow::Error::new(err).context(format!(
+        // ── pre-coordinator validation failures ──────────────────────
+        error @ FilesystemRunSetupError::PayloadModeMismatch { .. }
+        | error @ FilesystemRunSetupError::PayloadRootMismatch { .. } => {
+            anyhow::Error::new(error)
+                .context("filesystem submission produced an inconsistent request/payload pair")
+        }
+        error @ FilesystemRunSetupError::PayloadEncode(_)
+        | error @ FilesystemRunSetupError::ManifestBuild(_) => anyhow::Error::new(error)
+            .context("filesystem submission manifest construction failed"),
+
+        // ── coordinator-level failures ───────────────────────────────
+        error @ FilesystemRunSetupError::CreateRun(CreateRunError::ConfigMismatch { .. }) => {
+            anyhow::Error::new(error).context(format!(
                 "filesystem submission run {run_id_raw} already exists with a different run configuration"
             ))
         }
-        FilesystemRunSetupError::CreateRun(CreateRunError::RegisterShardsFailed(
-            err @ RegisterShardsError::OpIdConflict(_),
-        )) => anyhow::Error::new(err).context(format!(
+        error @ FilesystemRunSetupError::CreateRun(CreateRunError::RegisterShardsFailed(
+            RegisterShardsError::OpIdConflict(_),
+        )) => anyhow::Error::new(error).context(format!(
             "filesystem submission run {run_id_raw} already exists with a different shard registration payload"
         )),
         error @ FilesystemRunSetupError::CreateRun(CreateRunError::BackendError(_))
@@ -232,7 +254,12 @@ fn classify_submission_error(run_id_raw: u64, error: FilesystemRunSetupError) ->
             GetRunError::BackendError(_),
         )) => anyhow::Error::new(error)
             .context("coordination backend error during filesystem submission"),
-        error => anyhow::Error::new(error).context("filesystem submission failed"),
+        // CreateRunError is #[non_exhaustive], so a catch-all is needed
+        // for variants that create_run_with_shards does not propagate in
+        // the current implementation (e.g. RunAlreadyExists, InvalidConfig).
+        error @ FilesystemRunSetupError::CreateRun(_) => {
+            anyhow::Error::new(error).context("filesystem submission failed")
+        }
     }
 }
 
@@ -359,7 +386,7 @@ fn cmd_migrate(done_ledger_dsn: &str, findings_dsn: &str) -> Result<()> {
         }
     })?;
 
-    eprintln!("migrations applied to both databases");
+    println!("migrations applied to both databases");
     Ok(())
 }
 
