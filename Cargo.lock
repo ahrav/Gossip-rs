@@ -1463,6 +1463,7 @@ name = "gossip-orchestrator"
 version = "0.1.0"
 dependencies = [
  "gossip-coordination",
+ "gossip-frontier",
  "tempfile",
 ]
 

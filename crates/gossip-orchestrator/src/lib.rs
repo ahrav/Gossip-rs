@@ -15,12 +15,16 @@
 //!    handle fan-out after the worker makes progress.
 //! 3. **Shard payload encoding** ([`payload`]): defines the typed filesystem
 //!    metadata bytes carried through shard registration and lease hydration.
+//! 4. **Run setup** ([`setup`]): lowers normalized requests, planned
+//!    geometry, and typed payloads into a validated initial manifest, then
+//!    creates and registers the run through the coordination lifecycle.
 //!
-//! All three stages are stateless and synchronous.
+//! All stages are stateless and synchronous.
 
 pub mod payload;
 pub mod planner;
 pub mod request;
+pub mod setup;
 
 #[cfg(test)]
 mod test_support;
@@ -34,4 +38,8 @@ pub use planner::{
 pub use request::{
     FilesystemPathKind, FilesystemRequest, FilesystemRequestError, FilesystemSourceMode,
     NormalizedFilesystemRequest,
+};
+pub use setup::{
+    FilesystemRunSetupError, FilesystemRunSetupInput, FilesystemRunSetupResult,
+    setup_filesystem_run,
 };
