@@ -128,6 +128,7 @@ and `types.rs`.
 | `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem request normalization and planning |
 | `crates/gossip-orchestrator/src/request.rs` | Canonical filesystem submission request normalization |
 | `crates/gossip-orchestrator/src/planner.rs` | Deterministic filesystem initial shard geometry planner |
+| `crates/gossip-orchestrator/src/payload.rs` | Typed filesystem shard payload wire format (encode/decode) |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |

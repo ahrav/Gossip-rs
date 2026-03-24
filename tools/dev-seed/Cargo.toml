@@ -11,6 +11,7 @@ gossip-contracts = { workspace = true }
 gossip-coordination = { workspace = true }
 gossip-coordination-etcd = { workspace = true }
 gossip-frontier = { workspace = true }
+gossip-orchestrator = { workspace = true }
 gossip-stdx = { workspace = true }
 gossip-done-ledger-postgres = { workspace = true }
 gossip-findings-postgres = { workspace = true }

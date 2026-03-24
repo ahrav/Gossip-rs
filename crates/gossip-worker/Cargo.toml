@@ -27,6 +27,7 @@ gossip-coordination.workspace = true
 gossip-stdx.workspace = true
 gossip-coordination-etcd = { workspace = true, features = ["test-support"] }
 gossip-frontier.workspace = true
+gossip-orchestrator.workspace = true
 gossip-persistence-inmemory.workspace = true
 gossip-pg-common = { workspace = true, features = ["test-support"] }
 gossip-scanner-runtime = { workspace = true, features = ["test-support"] }

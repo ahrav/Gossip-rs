@@ -4,6 +4,7 @@
 //! Any later fan-out comes from coordination split flows after the worker
 //! makes progress, not from submission-time pre-sharding.
 
+use crate::payload::FilesystemShardPayload;
 use crate::request::NormalizedFilesystemRequest;
 
 /// Geometry-only bounds for one planned initial shard.
@@ -89,6 +90,15 @@ impl FilesystemInitialShardPlan {
     #[must_use]
     pub fn initial_shard(&self) -> InitialShardGeometry {
         self.initial_shard
+    }
+
+    /// Build the typed shard payload from the underlying normalized request.
+    ///
+    /// Enforces the documented stage ordering: request normalization,
+    /// geometry planning, then payload encoding.
+    #[must_use]
+    pub fn shard_payload(&self) -> FilesystemShardPayload {
+        FilesystemShardPayload::from_normalized_request(&self.request)
     }
 
     /// Slice view of the planned startup geometries.
