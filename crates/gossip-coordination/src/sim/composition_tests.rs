@@ -50,7 +50,10 @@ use super::composition::{
 };
 use super::composition_invariants::CrossComponentViolation;
 use super::harness::{RunTerminalKind, SimOp};
-use super::test_util::{arb_fault_level, arb_sim_op};
+use super::test_util::{
+    arb_fault_level, arb_sim_op, fault_level_name, parse_env_fault_level, parse_env_seed_count,
+    parse_env_single_seed,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,12 +76,7 @@ const DEFAULT_SAFETY_OPS: usize = 500;
 /// Liveness ops per seed in the sweep: biased toward forward-progress ops.
 const DEFAULT_LIVENESS_OPS: usize = 200;
 
-/// Lease duration constant mirroring `shared::DEFAULT_LEASE_DURATION`.
-///
-/// Duplicated here to keep the large time-jump arm in [`random_sim_op`]
-/// self-contained. The `const` assertion below enforces synchronization
-/// at compile time.
-const LEASE_DUR: u64 = 100;
+use super::test_util::LEASE_DUR;
 const _: () = assert!(LEASE_DUR == super::shared::DEFAULT_LEASE_DURATION);
 
 // ---------------------------------------------------------------------------
@@ -137,7 +135,7 @@ impl CompositionEventKind {
 /// Cross-boundary events that must appear at least once across the full
 /// seed sweep to prove composition coverage is not hollow.
 ///
-/// Covers five cross-boundary categories: normal lifecycle completion,
+/// Covers six cross-boundary categories: normal lifecycle completion,
 /// crash injection, stale-fence write, coordinator-complete rejection
 /// (ledger write succeeds but coordinator rejects), ledger write failure
 /// (submit/commit failure during scan), and fault injection. If any is
@@ -207,9 +205,9 @@ fn unexpected_violations<'a>(
 /// | Stale lease write | 2 | ~4% |
 /// | Ledger fault injection | 2 | ~4% |
 ///
-/// `AdvanceTime` is not a separate arm — `arb_sim_op` already generates it
-/// at ~15% of coordination ops, providing ~10% of composition ops via
-/// pass-through.
+/// `AdvanceTime` is not a separate arm in this strategy — `arb_sim_op`
+/// already generates it at ~15% of coordination ops, providing ~10% of
+/// composition ops via the Coord pass-through.
 ///
 /// `InjectDelay` is excluded because it blocks `CommitHandle::wait()`
 /// until a subsequent `ReleasePendingWrites` — in random sequences the
@@ -256,10 +254,14 @@ fn arb_composition_op(n_workers: u64, n_shards: u64) -> impl Strategy<Value = Co
 /// is required and shrinking is unnecessary.
 ///
 /// The weights must be maintained in sync with `arb_sim_op` manually —
-/// the compile-time exhaustiveness guard at `_check_strategy_exhaustive`
-/// covers [`CompositionSimOp`] variants only, not individual [`SimOp`] arms.
+/// the compile-time exhaustiveness guards (`_check_strategy_exhaustive` and
+/// `_check_sim_op_exhaustive`) ensure new variants are not silently omitted,
+/// but weight correspondence between `arb_sim_op` and `random_sim_op` must
+/// be maintained manually.
 /// Weight categories:
-/// - Acquire/Checkpoint/AdvanceTime/Complete: high frequency (~15% each)
+/// - Acquire/AdvanceTime: high frequency (~15% each)
+/// - Checkpoint: medium-high (~12.5%)
+/// - Complete: medium (~10%)
 /// - Renew/SessionLifecycle/ClaimNext/Pause/Resume: moderate (~5% each)
 /// - Large time-jump/ZombieCheckpoint/Park/Split/Replay/Conflict/Unpark/TerminateRun: rare (~2.5% each)
 fn random_sim_op(rng: &mut ChaCha8Rng, n_workers: u64, n_shards: u64) -> SimOp {
@@ -375,69 +377,6 @@ fn random_composition_op(rng: &mut ChaCha8Rng, n_workers: u64, n_shards: u64) ->
 }
 
 // ---------------------------------------------------------------------------
-// Environment variable parsers (Tier 3 seed sweep)
-// ---------------------------------------------------------------------------
-
-/// Read `GOSSIP_COMP_SEEDS` from the environment, defaulting to 50.
-fn parse_seed_count() -> usize {
-    match std::env::var("GOSSIP_COMP_SEEDS") {
-        Ok(s) => match s.parse() {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!(
-                    "warning: GOSSIP_COMP_SEEDS={s:?} is not a valid number ({e}), \
-                     falling back to default {DEFAULT_SEEDS}"
-                );
-                DEFAULT_SEEDS
-            }
-        },
-        Err(_) => DEFAULT_SEEDS,
-    }
-}
-
-/// Read `GOSSIP_COMP_SEED` for single-seed reproduction mode.
-fn parse_single_seed() -> Option<u64> {
-    match std::env::var("GOSSIP_COMP_SEED") {
-        Ok(s) => match s.parse() {
-            Ok(n) => Some(n),
-            Err(e) => {
-                eprintln!("warning: GOSSIP_COMP_SEED={s:?} is not a valid number ({e}), ignoring");
-                None
-            }
-        },
-        Err(_) => None,
-    }
-}
-
-/// Read `GOSSIP_COMP_FAULT` to override the default fault level.
-fn parse_fault_level() -> FaultLevel {
-    match std::env::var("GOSSIP_COMP_FAULT") {
-        Ok(s) => match s.to_lowercase().as_str() {
-            "sunny" | "sunnyday" => FaultLevel::SunnyDay,
-            "radioactive" => FaultLevel::Radioactive,
-            "stormy" => FaultLevel::Stormy,
-            _ => {
-                eprintln!(
-                    "warning: GOSSIP_COMP_FAULT={s:?} is not recognized \
-                     (expected sunny|stormy|radioactive), falling back to Stormy"
-                );
-                FaultLevel::Stormy
-            }
-        },
-        Err(_) => FaultLevel::Stormy,
-    }
-}
-
-/// Human-readable fault level name for reproduction commands in assertion messages.
-fn fault_level_name(level: FaultLevel) -> &'static str {
-    match level {
-        FaultLevel::SunnyDay => "sunny",
-        FaultLevel::Stormy => "stormy",
-        FaultLevel::Radioactive => "radioactive",
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Seed sweep infrastructure
 // ---------------------------------------------------------------------------
 
@@ -527,12 +466,12 @@ fn run_composition_seed(
 
     // Liveness phase: drive toward terminal state.
     for step in 0..liveness_ops {
-        let worker = WorkerId::from_raw(rng.random_range(1..=N_WORKERS));
         let op = if rng.random_bool(0.3) {
             CompositionSimOp::Coord(SimOp::AdvanceTime {
                 ticks: rng.random_range(1..=50),
             })
         } else {
+            let worker = WorkerId::from_raw(rng.random_range(1..=N_WORKERS));
             CompositionSimOp::ScanLifecycle { worker }
         };
         let (event, viols) = sim.step(op);
@@ -589,11 +528,11 @@ fn run_composition_sweep(level: FaultLevel) {
     // otherwise inherit the caller's fault level so `composition_sweep_sunny_day`
     // reproduces at SunnyDay without requiring the env var.
     let repro_level = match std::env::var("GOSSIP_COMP_FAULT") {
-        Ok(_) => parse_fault_level(),
+        Ok(_) => parse_env_fault_level("GOSSIP_COMP"),
         Err(_) => level,
     };
 
-    if let Some(seed) = parse_single_seed() {
+    if let Some(seed) = parse_env_single_seed("GOSSIP_COMP") {
         let result =
             run_composition_seed(seed, repro_level, DEFAULT_SAFETY_OPS, DEFAULT_LIVENESS_OPS);
         let fault_name = fault_level_name(repro_level);
@@ -608,10 +547,12 @@ fn run_composition_sweep(level: FaultLevel) {
         return;
     }
 
-    let seed_count = parse_seed_count();
-    if seed_count == 0 {
-        return;
-    }
+    let seed_count = parse_env_seed_count("GOSSIP_COMP", DEFAULT_SEEDS);
+    assert!(
+        seed_count > 0,
+        "GOSSIP_COMP_SEEDS=0 produces a vacuous pass — \
+         set to at least 1, or unset to use the default ({DEFAULT_SEEDS})"
+    );
 
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -994,7 +935,8 @@ fn ledger_commit_failure_after_coordinator_complete() {
         .with_workers_and_shards(2, 4)
         .expect("setup should succeed");
 
-    sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    let (_, viols) = sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    assert!(viols.is_empty(), "initial time advance: {viols:?}");
 
     // Establish baseline: one successful scan lifecycle.
     let (event, violations) = sim.step(CompositionSimOp::ScanLifecycle {
@@ -1035,22 +977,25 @@ fn ledger_commit_failure_after_coordinator_complete() {
         CompositionSimEvent::ScanLedgerWriteFailed { .. }
         | CompositionSimEvent::ScanCoordinatorCompleteFailed { .. } => {
             // Provenance entry must reflect uncommitted state.
-            if sim.write_log().len() > baseline_log_len {
-                let entry = sim.write_log().last().unwrap();
-                assert!(
-                    !entry.committed,
-                    "provenance should record uncommitted after commit failure"
-                );
-            }
+            assert!(
+                sim.write_log().len() > baseline_log_len,
+                "failure event must produce a provenance entry"
+            );
+            let entry = sim.write_log().last().unwrap();
+            assert!(
+                !entry.committed,
+                "provenance should record uncommitted after commit failure"
+            );
         }
         CompositionSimEvent::ScanClaimFailed { .. } => {
-            // No shard available after baseline — acceptable.
+            panic!(
+                "ScanClaimFailed with 2 workers, 4 shards, and only 1 consumed — \
+                 3 shards should be available. This indicates a harness bug. \
+                 Event: {event:?}"
+            );
         }
         _ => {
-            panic!(
-                "expected failure or claim-failed event after commit failure injection, \
-                 got {event:?}"
-            );
+            panic!("expected failure event after commit failure injection, got {event:?}");
         }
     }
 }
@@ -1076,7 +1021,8 @@ fn stale_fence_coordinator_rejects_operations() {
         .with_workers_and_shards(2, 4)
         .expect("setup should succeed");
 
-    sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    let (_, viols) = sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    assert!(viols.is_empty(), "initial time advance: {viols:?}");
 
     // Worker 1 acquires a shard.
     let key = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(1));
@@ -1175,7 +1121,8 @@ fn crash_between_complete_and_ledger_write() {
         .with_workers_and_shards(2, 4)
         .expect("setup should succeed");
 
-    sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    let (_, viols) = sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    assert!(viols.is_empty(), "initial time advance: {viols:?}");
 
     // Inject crash: coordinator complete() runs but done-ledger write is skipped.
     let (event, violations) = sim.step(CompositionSimOp::ScanLifecycleCrashAfterComplete {
@@ -1242,7 +1189,8 @@ fn ledger_submit_failure_prevents_coordinator_complete() {
         .with_workers_and_shards(2, 4)
         .expect("setup should succeed");
 
-    sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    let (_, viols) = sim.step(CompositionSimOp::Coord(SimOp::AdvanceTime { ticks: 10 }));
+    assert!(viols.is_empty(), "initial time advance: {viols:?}");
 
     // Establish baseline: one successful scan lifecycle.
     let (event, violations) = sim.step(CompositionSimOp::ScanLifecycle {
@@ -1277,30 +1225,33 @@ fn ledger_submit_failure_prevents_coordinator_complete() {
         CompositionSimEvent::ScanLedgerWriteFailed { .. } => {
             // Submit rejected — provenance must show uncommitted,
             // coordinator_completed must be false (complete never called).
-            if sim.write_log().len() > baseline_log_len {
-                let entry = sim.write_log().last().unwrap();
-                assert!(
-                    !entry.committed,
-                    "submit failure: provenance must be uncommitted"
-                );
-                assert!(
-                    !entry.coordinator_completed,
-                    "submit failure: coordinator complete() must not have been called"
-                );
-            }
-        }
-        CompositionSimEvent::ScanClaimFailed { .. } => {
-            // No shards available after baseline — acceptable.
-        }
-        CompositionSimEvent::ScanCompleted { .. } => {
-            // Fault consumed by another path before this scan's write.
+            assert!(
+                sim.write_log().len() > baseline_log_len,
+                "failure event must produce a provenance entry"
+            );
             let entry = sim.write_log().last().unwrap();
             assert!(
-                entry.committed,
-                "ScanCompleted provenance should be committed"
+                !entry.committed,
+                "submit failure: provenance must be uncommitted"
+            );
+            assert!(
+                !entry.coordinator_completed,
+                "submit failure: coordinator complete() must not have been called"
             );
         }
-        _ => panic!("unexpected event after submit failure injection: {event:?}"),
+        CompositionSimEvent::ScanClaimFailed { .. } => {
+            panic!(
+                "ScanClaimFailed with 2 workers, 4 shards, and only 1 consumed — \
+                 3 shards should be available. This indicates a harness bug. \
+                 Event: {event:?}"
+            );
+        }
+        _ => {
+            panic!(
+                "expected ScanLedgerWriteFailed after submit failure injection \
+                 in sequential test (no intervening ops to consume fault), got {event:?}"
+            );
+        }
     }
 
     // Post-failure scans: verify invariant checkers remain clean.
