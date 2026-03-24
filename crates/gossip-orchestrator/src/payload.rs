@@ -486,7 +486,8 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let path = PathBuf::from(OsString::from_vec(vec![0x66, 0x6f, 0x80]));
+        // Absolute path with an invalid UTF-8 byte in the filename portion.
+        let path = PathBuf::from(OsString::from_vec(vec![b'/', 0x66, 0x6f, 0x80]));
         let err = FilesystemShardPayload::new(FilesystemSourceMode::SingleFile, path)
             .encode()
             .expect_err("non-UTF-8 path must fail");
