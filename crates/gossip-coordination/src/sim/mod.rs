@@ -71,6 +71,8 @@ pub use fault_injector::FaultInjectingIntrospector;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod composition;
+#[cfg(any(test, feature = "test-support"))]
+pub mod composition_invariants;
 #[cfg(test)]
 mod mega_sim_tests;
 #[cfg(test)]
@@ -81,6 +83,8 @@ pub mod scan_driver_sim;
 mod sim_behavioral_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_util;
+#[cfg(any(test, feature = "test-support"))]
+pub use composition_invariants::{CompositionInvariantChecker, CrossComponentViolation};
 pub use harness::{
     CoordinationSim, RejectionKind, RunTerminalKind, SimEvent, SimEventKind, SimOp, SimReport,
 };
