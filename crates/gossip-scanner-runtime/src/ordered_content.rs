@@ -11,8 +11,10 @@
 //! 2. **Done-ledger prefilter** — [`OrderedContentPage::prefilter_done_ledger`]
 //!    classifies each validated item as `AlreadyDone` or `ScanMiss` by
 //!    looking up its object-version identity (OvidHash) in the done ledger.
-//!    Items that already have a durable done-ledger row are skipped before
-//!    any content is opened, saving I/O and scan budget.
+//!    Items whose done-ledger row has a terminal status (scanned, permanently
+//!    failed, or skipped) are skipped before any content is opened, saving
+//!    I/O and scan budget. Items with `FailedRetryable` status are treated
+//!    as scan misses so they can be retried on the next pass.
 //! 3. **Local filesystem scan** — `scan_local_filesystem` runs the direct
 //!    scheduler-based parallel filesystem scan and forwards events and
 //!    persistence batches through bounded channels.
@@ -71,7 +73,8 @@ use gossip_contracts::{
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
     persistence::{
-        DoneLedger, OvidHashInputs, RECOMMENDED_MAX_BATCH_SIZE, WriteContext, derive_ovid_hash,
+        DoneLedger, DoneLedgerStatus, OvidHashInputs, RECOMMENDED_MAX_BATCH_SIZE, WriteContext,
+        derive_ovid_hash,
     },
 };
 use scanner_scheduler::events::EventOutput;
@@ -332,7 +335,13 @@ impl OrderedContentPage {
                     item_chunk.len()
                 )));
             }
-            present.extend(batch.into_iter().map(|record| record.is_some()));
+            // FailedRetryable records represent transient failures that should
+            // be retried on the next scan pass. Only terminal statuses
+            // (FailedPermanent, Skipped, ScannedClean, ScannedWithFindings)
+            // count as "already done".
+            present.extend(batch.into_iter().map(|record| {
+                record.is_some_and(|r| r.status() != DoneLedgerStatus::FailedRetryable)
+            }));
         }
 
         debug_assert_eq!(
@@ -372,9 +381,11 @@ impl OrderedContentPage {
 /// already exists in the done ledger for the current tenant and policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderedContentPrefilterDisposition {
-    /// The item already has a durable done-ledger row for this exact
-    /// stable-item + version pair. No scan work is needed; the runtime
-    /// can skip content open entirely.
+    /// The item has a done-ledger row with a terminal status (scanned,
+    /// permanently failed, or skipped) for this exact stable-item + version
+    /// pair. No scan work is needed; the runtime can skip content open
+    /// entirely. `FailedRetryable` rows are excluded from this disposition
+    /// so those items remain eligible for retry.
     AlreadyDone,
     /// The item has no done-ledger entry and still needs content scan.
     ScanMiss,
@@ -775,7 +786,7 @@ pub(crate) fn scan_local_filesystem_with_engine(
 mod tests {
     use super::*;
 
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io;
     use std::sync::Mutex;
 
@@ -783,8 +794,8 @@ mod tests {
         connector::{ItemKey, ItemRef, TokenBytes, VersionId},
         identity::{LogicalTime, ObjectVersionId, StableItemId},
         persistence::{
-            DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
-            DoneLedgerStatus, OvidHash, ReadyCommitHandle,
+            DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
+            DoneLedgerRecord, DoneLedgerStatus, OvidHash, ReadyCommitHandle,
         },
     };
 
@@ -882,19 +893,50 @@ mod tests {
         policy_hash: gossip_contracts::identity::PolicyHash,
         ovid_hash: OvidHash,
     ) -> DoneLedgerRecord {
-        DoneLedgerRecord::try_new(
-            DoneLedgerKey::new(tenant_id, policy_hash, ovid_hash),
+        done_record_with_status(
+            tenant_id,
+            policy_hash,
+            ovid_hash,
             DoneLedgerStatus::ScannedClean,
+        )
+    }
+
+    /// Build a done-ledger record with the given status, supplying the
+    /// error-code and findings-count values that `validate()` requires for
+    /// each status variant.
+    fn done_record_with_status(
+        tenant_id: gossip_contracts::identity::TenantId,
+        policy_hash: gossip_contracts::identity::PolicyHash,
+        ovid_hash: OvidHash,
+        status: DoneLedgerStatus,
+    ) -> DoneLedgerRecord {
+        let (findings_count, error_code) = match status {
+            DoneLedgerStatus::ScannedClean => (0, None),
+            DoneLedgerStatus::ScannedWithFindings => (1, None),
+            DoneLedgerStatus::FailedRetryable
+            | DoneLedgerStatus::FailedPermanent
+            | DoneLedgerStatus::Skipped => (
+                0,
+                Some(DoneLedgerErrorCode::try_new("TEST_ERROR").expect("error code")),
+            ),
+        };
+        let record = DoneLedgerRecord::try_new(
+            DoneLedgerKey::new(tenant_id, policy_hash, ovid_hash),
+            status,
             0,
-            0,
+            findings_count,
             DoneLedgerProvenance::from_write_context(
                 write_context(),
                 LogicalTime::from_raw(10),
                 LogicalTime::from_raw(20),
             ),
-            None,
+            error_code,
         )
-        .expect("done-ledger record")
+        .expect("done-ledger record");
+        record
+            .validate()
+            .expect("done-ledger record cross-field invariants");
+        record
     }
 
     #[derive(Default)]
@@ -996,6 +1038,48 @@ mod tests {
             _ovid_hashes: &[OvidHash],
         ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
             Ok(Vec::new())
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+    }
+
+    /// Done ledger that returns per-item status values, allowing tests to
+    /// exercise non-ScannedClean done-ledger states (e.g. FailedRetryable).
+    struct StatusAwareDoneLedger {
+        statuses: HashMap<OvidHash, DoneLedgerStatus>,
+    }
+
+    impl StatusAwareDoneLedger {
+        fn new(statuses: impl IntoIterator<Item = (OvidHash, DoneLedgerStatus)>) -> Self {
+            Self {
+                statuses: statuses.into_iter().collect(),
+            }
+        }
+    }
+
+    impl DoneLedger for StatusAwareDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            tenant_id: gossip_contracts::identity::TenantId,
+            policy_hash: gossip_contracts::identity::PolicyHash,
+            ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            Ok(ovid_hashes
+                .iter()
+                .map(|ovid_hash| {
+                    self.statuses.get(ovid_hash).map(|&status| {
+                        done_record_with_status(tenant_id, policy_hash, *ovid_hash, status)
+                    })
+                })
+                .collect())
         }
 
         fn batch_upsert(
@@ -1514,5 +1598,51 @@ mod tests {
             err.to_string().contains("lookup key(s)"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn prefilter_treats_failed_retryable_as_scan_miss() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5), item(b"c.txt", 7)];
+
+        // Item 0: ScannedClean    → AlreadyDone (terminal success)
+        // Item 1: FailedRetryable → ScanMiss    (transient failure, must retry)
+        // Item 2: absent          → ScanMiss    (never seen)
+        let ledger = StatusAwareDoneLedger::new([
+            (item_ovid(&items[0]), DoneLedgerStatus::ScannedClean),
+            (item_ovid(&items[1]), DoneLedgerStatus::FailedRetryable),
+        ]);
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        assert_eq!(
+            filtered
+                .items()
+                .iter()
+                .map(|ci| (ci.item().item_key().as_bytes().to_vec(), ci.disposition()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    b"a.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    b"b.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    b"c.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            "FailedRetryable done-ledger rows represent transient failures \
+             and must be classified as ScanMiss so the item is retried"
+        );
+        assert_eq!(filtered.already_done_len(), 1);
+        assert_eq!(filtered.scan_miss_len(), 2);
     }
 }
