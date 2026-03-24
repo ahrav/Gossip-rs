@@ -69,10 +69,10 @@ impl fmt::Debug for FilesystemShardPayload {
 impl FilesystemShardPayload {
     /// Construct a payload from an explicit source mode and canonical root.
     ///
-    /// Does not validate the path. Validation is deferred to [`Self::encode`],
-    /// which rejects empty and non-UTF-8 paths. Prefer
-    /// [`Self::from_normalized_request`] for production use — it guarantees a
-    /// canonical, non-empty path.
+    /// Does not validate the path. Validation is deferred to
+    /// [`Self::encode`], which rejects empty, relative, and non-UTF-8
+    /// paths. Prefer [`Self::from_normalized_request`] for production
+    /// use — it guarantees a canonical, non-empty, absolute path.
     #[must_use]
     pub fn new(mode: FilesystemSourceMode, canonical_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -123,9 +123,15 @@ impl FilesystemShardPayload {
     /// - [`NonUtf8Path`](FilesystemShardPayloadEncodeError::NonUtf8Path) —
     ///   the canonical root contains bytes that are not valid UTF-8 (possible
     ///   on Unix with non-UTF-8 filenames).
+    /// - [`RelativePath`](FilesystemShardPayloadEncodeError::RelativePath) —
+    ///   the canonical root is not an absolute path.
     pub fn encode(&self) -> Result<Vec<u8>, FilesystemShardPayloadEncodeError> {
         if self.canonical_root.as_os_str().is_empty() {
             return Err(FilesystemShardPayloadEncodeError::EmptyPath { mode: self.mode });
+        }
+
+        if !self.canonical_root.is_absolute() {
+            return Err(FilesystemShardPayloadEncodeError::RelativePath { mode: self.mode });
         }
 
         let canonical_root = self.canonical_root.to_str().ok_or_else(|| {
@@ -184,7 +190,7 @@ impl FilesystemShardPayload {
 
 /// Errors from [`FilesystemShardPayload::encode`].
 ///
-/// Both variants indicate a payload that was constructed with a path the
+/// Variants indicate a payload that was constructed with a path the
 /// wire format cannot represent.  Normal operation through
 /// [`from_normalized_request`](FilesystemShardPayload::from_normalized_request)
 /// avoids these because request normalization canonicalizes the path first.
@@ -205,6 +211,11 @@ pub enum FilesystemShardPayloadEncodeError {
         /// The offending path.
         path: PathBuf,
     },
+    /// The canonical path is relative; the wire format requires absolute paths.
+    RelativePath {
+        /// Source mode being encoded.
+        mode: FilesystemSourceMode,
+    },
 }
 
 // Custom Debug: redacts `PathBuf` fields to prevent filesystem path leakage
@@ -219,6 +230,9 @@ impl fmt::Debug for FilesystemShardPayloadEncodeError {
                 .debug_struct("NonUtf8Path")
                 .field("path", &"<redacted>")
                 .finish(),
+            Self::RelativePath { mode } => {
+                f.debug_struct("RelativePath").field("mode", mode).finish()
+            }
         }
     }
 }
@@ -234,6 +248,10 @@ impl fmt::Display for FilesystemShardPayloadEncodeError {
                 f,
                 "filesystem shard payload path '{}' is not valid UTF-8",
                 path.display()
+            ),
+            Self::RelativePath { mode } => write!(
+                f,
+                "filesystem shard payload mode '{mode}' path must be absolute"
             ),
         }
     }
