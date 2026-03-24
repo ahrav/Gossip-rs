@@ -344,6 +344,60 @@ fn split_error_source_propagates() {
     assert!(err.source().is_none());
 }
 
+#[test]
+fn resource_exhausted_has_no_source() {
+    use gossip_stdx::SlabFull;
+
+    let checkpoint_err = CheckpointError::ResourceExhausted(SlabFull {
+        requested: 1024,
+        available: 512,
+    });
+    assert!(
+        checkpoint_err.source().is_none(),
+        "CheckpointError::ResourceExhausted should not return a source"
+    );
+
+    let complete_err = CompleteError::ResourceExhausted(SlabFull {
+        requested: 1024,
+        available: 512,
+    });
+    assert!(
+        complete_err.source().is_none(),
+        "CompleteError::ResourceExhausted should not return a source"
+    );
+
+    let split_err = SplitError::ResourceExhausted(SlabFull {
+        requested: 1024,
+        available: 512,
+    });
+    assert!(
+        split_err.source().is_none(),
+        "SplitError::ResourceExhausted should not return a source"
+    );
+}
+
+#[test]
+fn backend_error_has_source() {
+    let infra_err = InfraError::transient("test", "message");
+    let checkpoint_err = CheckpointError::BackendError(infra_err.clone());
+    assert!(
+        checkpoint_err.source().is_some(),
+        "CheckpointError::BackendError should return a source"
+    );
+
+    let complete_err = CompleteError::BackendError(infra_err.clone());
+    assert!(
+        complete_err.source().is_some(),
+        "CompleteError::BackendError should return a source"
+    );
+
+    let split_err = SplitError::BackendError(infra_err);
+    assert!(
+        split_err.source().is_some(),
+        "SplitError::BackendError should return a source"
+    );
+}
+
 // -- PartialEq value-equality tests ----------------------------------
 
 #[test]

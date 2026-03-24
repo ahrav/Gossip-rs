@@ -582,11 +582,17 @@ pub enum CheckpointError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     #[error("slab full: {0}")]
-    ResourceExhausted(#[from] SlabFull),
+    ResourceExhausted(SlabFull),
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
     #[error("coordination backend error: {0}")]
     BackendError(#[source] InfraError),
+}
+
+impl From<SlabFull> for CheckpointError {
+    fn from(e: SlabFull) -> Self {
+        Self::ResourceExhausted(e)
+    }
 }
 
 impl fmt::Debug for CheckpointError {
@@ -711,11 +717,17 @@ pub enum CompleteError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     #[error("slab full: {0}")]
-    ResourceExhausted(#[from] SlabFull),
+    ResourceExhausted(SlabFull),
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
     #[error("coordination backend error: {0}")]
     BackendError(#[source] InfraError),
+}
+
+impl From<SlabFull> for CompleteError {
+    fn from(e: SlabFull) -> Self {
+        Self::ResourceExhausted(e)
+    }
 }
 
 impl fmt::Debug for CompleteError {
@@ -907,11 +919,17 @@ pub enum SplitError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     #[error("slab full: {0}")]
-    ResourceExhausted(#[from] SlabFull),
+    ResourceExhausted(SlabFull),
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
     #[error("coordination backend error: {0}")]
     BackendError(#[source] InfraError),
+}
+
+impl From<SlabFull> for SplitError {
+    fn from(e: SlabFull) -> Self {
+        Self::ResourceExhausted(e)
+    }
 }
 
 impl fmt::Debug for SplitError {
