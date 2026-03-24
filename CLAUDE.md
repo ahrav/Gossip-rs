@@ -382,6 +382,39 @@ shims, or parallel old/new code paths will be rejected. No exceptions.
 
 <!-- zero-alloc-hot-path-v1 -->
 
+## Error Type Policy — MANDATORY
+
+Error types follow a standard pattern to minimize boilerplate duplication.
+
+### Rules
+
+1. **New error types MUST use `#[derive(thiserror::Error)]`** with `#[error("...")]`
+   attributes on every variant. Hand-written `Display` and `Error` impls are
+   prohibited unless the `#[error("...")]` attribute cannot express the required
+   formatting logic (e.g., conditional formatting with `if`/`match`).
+2. **Custom `Debug` impls for redaction are separate from thiserror.** Types that
+   redact hash values, keys, or worker identities in Debug output keep their
+   hand-written `impl fmt::Debug` alongside `#[derive(thiserror::Error)]`.
+   thiserror v2 does not auto-derive Debug.
+3. **New `From<CoordError>` routing impls MUST use `impl_from_coord_error!`**
+   (defined in `gossip-coordination/src/error.rs`). The macro preserves
+   compile-time exhaustiveness: adding a new `CoordError` variant forces a
+   conscious routing decision in every operation error type.
+4. **New `From<XxxError> for RejectionKind` impls MUST use `impl_rejection_from!`**
+   (defined in `gossip-coordination/src/sim/harness.rs`).
+5. **Test code is exempt from duplication thresholds.** Test clarity outweighs
+   deduplication for assertions, fixtures, and setup code.
+
+### Existing Infrastructure
+
+| Macro / Tool | Location | Purpose |
+|-------------|----------|---------|
+| `impl_from_coord_error!` | `gossip-coordination/src/error.rs` | CoordError -> operation error routing |
+| `impl_from_run_op_id_conflict!` | `gossip-coordination/src/run_errors.rs` | RunOpIdConflict From impls |
+| `impl_rejection_from!` | `gossip-coordination/src/sim/harness.rs` | Error -> RejectionKind in sim |
+| `define_connector_error!` | `gossip-contracts/src/connector/api.rs` | Connector error types |
+| `define_id_32!` / `define_id_64!` | `gossip-contracts/src/identity/macros.rs` | Identity newtypes |
+
 ## Allocation Policy (Tiered) — MANDATORY
 
 Use an operationally tiered policy instead of blanket no-allocation rules.

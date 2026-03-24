@@ -48,7 +48,6 @@
 //! - Path refs in results point into the mapping arena supplied by the caller.
 //! - When the debug allocation guard is enabled, scanning must not allocate.
 
-use std::fmt;
 use std::sync::Arc;
 
 use gix_commitgraph::Position;
@@ -287,34 +286,21 @@ impl GitScanCommonMetrics {
 /// Both variants arise from `u32` bounds checking — a deliberate
 /// constraint that keeps `FindingKey` and `FindingSpan` compact
 /// (4 bytes per offset field vs 8 for `u64`).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum EngineAdapterError {
     /// A finding's byte offsets within the blob exceeded `u32::MAX`.
     ///
     /// This can only happen for blobs larger than 4 GiB, which are
     /// exotic in Git repositories.
+    #[error("finding offsets exceed u32: {start}..{end}")]
     FindingOffsetOverflow { start: u64, end: u64 },
     /// The cumulative findings arena grew past `u32::MAX` entries.
     ///
     /// This would require billions of findings across all blobs in
     /// a single adapter lifetime — practically unreachable.
+    #[error("findings arena index {end} exceeds max {max}")]
     FindingArenaOverflow { end: usize, max: u32 },
 }
-
-impl fmt::Display for EngineAdapterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FindingOffsetOverflow { start, end } => {
-                write!(f, "finding offsets exceed u32: {start}..{end}")
-            }
-            Self::FindingArenaOverflow { end, max } => {
-                write!(f, "findings arena index {end} exceeds max {max}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for EngineAdapterError {}
 
 impl From<EngineAdapterError> for PackExecError {
     fn from(err: EngineAdapterError) -> Self {

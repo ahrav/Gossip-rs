@@ -5,8 +5,6 @@
 //! structural constraints (uniqueness, bounded ranges, cursor bounds) before
 //! any records are created in the coordination layer.
 
-use std::fmt;
-
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::shard_spec::{ShardSpec, ShardSpecInputError, ShardSpecRef};
 use crate::identity::ShardId;
@@ -84,25 +82,32 @@ impl<'a> InitialShardInput<'a> {
 // ============================================================================
 
 /// Error from `validate_manifest`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ManifestValidationError {
     /// The manifest is empty — at least one shard is required.
+    #[error("manifest is empty")]
     Empty,
     /// Two shards have the same `ShardId`.
+    #[error("duplicate shard id: {shard_id:?}")]
     DuplicateIds { shard_id: ShardId },
     /// Two shards have overlapping key ranges.
+    #[error("overlapping ranges: shard {shard_a:?} and {shard_b:?}")]
     OverlappingRanges { shard_a: ShardId, shard_b: ShardId },
     /// A shard's spec is internally invalid.
+    #[error("invalid spec for shard {shard_id:?}: {reason}")]
     InvalidSpec {
         shard_id: ShardId,
         reason: ShardSpecInputError,
     },
     /// Too many shards (SEC-3).
+    #[error("too many shards: {count} exceeds max {max}")]
     TooManyShards { count: usize, max: usize },
     /// A non-initial cursor falls outside the shard's key range.
+    #[error("cursor out of bounds for shard {shard_id:?}")]
     CursorOutOfBounds { shard_id: ShardId },
     /// A cursor's `last_key` exceeds [`MAX_KEY_SIZE`] bytes.
+    #[error("cursor key too large for shard {shard_id:?}: {size} bytes exceeds max {max}")]
     CursorKeyTooLarge {
         shard_id: ShardId,
         size: usize,
@@ -113,51 +118,9 @@ pub enum ManifestValidationError {
     /// Unbounded specs are test-only constructs. Production manifests must
     /// have finite, bounded key ranges so that overlap detection and shard
     /// coordination operate on well-defined intervals.
+    #[error("unbounded range for shard {shard_id:?}")]
     UnboundedRange { shard_id: ShardId },
 }
-
-impl fmt::Display for ManifestValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("manifest is empty"),
-            Self::DuplicateIds { shard_id } => {
-                write!(f, "duplicate shard id: {:?}", shard_id)
-            }
-            Self::OverlappingRanges { shard_a, shard_b } => {
-                write!(
-                    f,
-                    "overlapping ranges: shard {:?} and {:?}",
-                    shard_a, shard_b,
-                )
-            }
-            Self::InvalidSpec { shard_id, reason } => {
-                write!(f, "invalid spec for shard {:?}: {}", shard_id, reason)
-            }
-            Self::TooManyShards { count, max } => {
-                write!(f, "too many shards: {count} exceeds max {max}")
-            }
-            Self::CursorOutOfBounds { shard_id } => {
-                write!(f, "cursor out of bounds for shard {:?}", shard_id)
-            }
-            Self::CursorKeyTooLarge {
-                shard_id,
-                size,
-                max,
-            } => {
-                write!(
-                    f,
-                    "cursor key too large for shard {:?}: {size} bytes exceeds max {max}",
-                    shard_id,
-                )
-            }
-            Self::UnboundedRange { shard_id } => {
-                write!(f, "unbounded range for shard {:?}", shard_id)
-            }
-        }
-    }
-}
-
-impl std::error::Error for ManifestValidationError {}
 
 // ============================================================================
 // validate_manifest

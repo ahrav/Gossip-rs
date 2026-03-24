@@ -151,22 +151,13 @@ const _: () = assert!(core::mem::size_of::<RunStatus>() == 1);
 // ============================================================================
 
 /// Error returned by [`RunConfig::try_new`] when validation fails.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RunConfigError {
     /// Lease duration must be strictly positive.
+    #[error("lease_duration must be > 0")]
     ZeroLeaseDuration,
 }
-
-impl fmt::Display for RunConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroLeaseDuration => f.write_str("lease_duration must be > 0"),
-        }
-    }
-}
-
-impl std::error::Error for RunConfigError {}
 
 // ============================================================================
 // RunConfig
@@ -437,7 +428,8 @@ impl RunOpLogEntry {
 /// OpId reuse detected with a different payload hash.
 ///
 /// Used as an intermediate type for `From` impls on operation-specific errors.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[error("run op-id conflict: {:?} reused with different payload", self.op_id)]
 pub struct RunOpIdConflict {
     pub op_id: OpId,
     pub expected_hash: u64,
@@ -454,18 +446,6 @@ impl fmt::Debug for RunOpIdConflict {
             .finish()
     }
 }
-
-impl fmt::Display for RunOpIdConflict {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "run op-id conflict: {:?} reused with different payload",
-            self.op_id
-        )
-    }
-}
-
-impl std::error::Error for RunOpIdConflict {}
 
 // ============================================================================
 // RunRecord

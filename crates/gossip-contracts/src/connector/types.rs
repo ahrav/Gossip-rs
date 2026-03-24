@@ -199,11 +199,13 @@ pub const MAX_LOCATION_URL_SIZE: usize = 4_096;
 ///   borrowed [`CursorUpdate`] into owned [`Cursor`].
 /// - [`ZeroBudget`](ConnectorInputError::ZeroBudget) rejects zero-valued
 ///   budget fields in [`Budgets::try_new`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectorInputError {
     /// A required field was empty (zero-length byte slice).
+    #[error("{field} must not be empty")]
     Empty { field: &'static str },
     /// A field exceeded its hard size limit.
+    #[error("{field} too large ({size} bytes, max {max})")]
     TooLarge {
         field: &'static str,
         /// Actual byte length of the rejected input.
@@ -212,25 +214,12 @@ pub enum ConnectorInputError {
         max: usize,
     },
     /// Cursor update had `token` without `last_key`.
+    #[error("token must not be present without last_key")]
     TokenWithoutLastKey,
     /// A budget field was zero, which would make the budget vacuous.
+    #[error("{field} must be non-zero")]
     ZeroBudget { field: &'static str },
 }
-
-impl fmt::Display for ConnectorInputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty { field } => write!(f, "{field} must not be empty"),
-            Self::TooLarge { field, size, max } => {
-                write!(f, "{field} too large ({size} bytes, max {max})")
-            }
-            Self::TokenWithoutLastKey => write!(f, "token must not be present without last_key"),
-            Self::ZeroBudget { field } => write!(f, "{field} must be non-zero"),
-        }
-    }
-}
-
-impl std::error::Error for ConnectorInputError {}
 
 /// Returns the first 4 bytes of the BLAKE3 digest of `bytes`.
 ///

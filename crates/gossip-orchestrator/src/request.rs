@@ -311,13 +311,16 @@ impl NormalizedFilesystemRequest {
 /// Error messages include filesystem paths for operator diagnostics.
 /// Callers that surface errors to untrusted consumers must redact
 /// path details before returning.
+#[derive(thiserror::Error)]
 pub enum FilesystemRequestError {
     /// The request path was empty.
+    #[error("filesystem request mode '{mode}' requires a non-empty path")]
     EmptyPath {
         /// Requested source mode.
         mode: FilesystemSourceMode,
     },
     /// The request path could not be canonicalized.
+    #[error("failed to canonicalize filesystem request path '{}': {source}", path.display())]
     Canonicalize {
         /// Raw request path.
         path: PathBuf,
@@ -325,6 +328,7 @@ pub enum FilesystemRequestError {
         source: io::Error,
     },
     /// Metadata lookup failed after canonicalization.
+    #[error("failed to inspect canonical filesystem request path '{}': {source}", path.display())]
     Metadata {
         /// Canonical path.
         path: PathBuf,
@@ -332,6 +336,11 @@ pub enum FilesystemRequestError {
         source: io::Error,
     },
     /// The canonical path kind does not match the requested source mode.
+    #[error(
+        "filesystem request mode '{mode}' requires a {}, but '{}' canonicalized to a {actual}",
+        mode.expected_path_kind(),
+        path.display()
+    )]
     PathKindMismatch {
         /// Requested source mode.
         mode: FilesystemSourceMode,
@@ -341,16 +350,23 @@ pub enum FilesystemRequestError {
         actual: FilesystemPathKind,
     },
     /// The canonical path is neither a regular file nor a directory.
+    #[error("filesystem request path '{}' must be a regular file or directory", path.display())]
     UnsupportedPathKind {
         /// Canonical path.
         path: PathBuf,
     },
     /// A canonical single-file target did not expose a file name component.
+    #[error("single-file request path '{}' does not have a file name", path.display())]
     SingleFileMissingName {
         /// Canonical path.
         path: PathBuf,
     },
     /// The canonical path falls outside the allowed root directory.
+    #[error(
+        "filesystem request mode '{mode}' path '{}' is not contained within allowed root '{}'",
+        path.display(),
+        allowed_root.display()
+    )]
     PathConfinementViolation {
         /// Requested source mode.
         mode: FilesystemSourceMode,
@@ -360,67 +376,13 @@ pub enum FilesystemRequestError {
         allowed_root: PathBuf,
     },
     /// The allowed root directory path could not be canonicalized.
+    #[error("failed to canonicalize allowed root directory '{}': {source}", path.display())]
     AllowedRootCanonicalize {
         /// Server-configured allowed root path.
         path: PathBuf,
         /// I/O error from canonicalization.
         source: io::Error,
     },
-}
-
-impl fmt::Display for FilesystemRequestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPath { mode } => {
-                write!(
-                    f,
-                    "filesystem request mode '{mode}' requires a non-empty path"
-                )
-            }
-            Self::Canonicalize { path, source } => write!(
-                f,
-                "failed to canonicalize filesystem request path '{}': {source}",
-                path.display()
-            ),
-            Self::Metadata { path, source } => write!(
-                f,
-                "failed to inspect canonical filesystem request path '{}': {source}",
-                path.display()
-            ),
-            Self::PathKindMismatch { mode, path, actual } => write!(
-                f,
-                "filesystem request mode '{mode}' requires a {}, but '{}' canonicalized to a {}",
-                mode.expected_path_kind(),
-                path.display(),
-                actual
-            ),
-            Self::UnsupportedPathKind { path } => write!(
-                f,
-                "filesystem request path '{}' must be a regular file or directory",
-                path.display()
-            ),
-            Self::SingleFileMissingName { path } => write!(
-                f,
-                "single-file request path '{}' does not have a file name",
-                path.display()
-            ),
-            Self::PathConfinementViolation {
-                mode,
-                path,
-                allowed_root,
-            } => write!(
-                f,
-                "filesystem request mode '{mode}' path '{}' is not contained within allowed root '{}'",
-                path.display(),
-                allowed_root.display()
-            ),
-            Self::AllowedRootCanonicalize { path, source } => write!(
-                f,
-                "failed to canonicalize allowed root directory '{}': {source}",
-                path.display()
-            ),
-        }
-    }
 }
 
 // Custom Debug: redacts all `PathBuf` fields to prevent filesystem path
@@ -466,21 +428,6 @@ impl fmt::Debug for FilesystemRequestError {
                 .field("path", &"<redacted>")
                 .field("source", source)
                 .finish(),
-        }
-    }
-}
-
-impl std::error::Error for FilesystemRequestError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Canonicalize { source, .. }
-            | Self::Metadata { source, .. }
-            | Self::AllowedRootCanonicalize { source, .. } => Some(source),
-            Self::EmptyPath { .. }
-            | Self::PathKindMismatch { .. }
-            | Self::UnsupportedPathKind { .. }
-            | Self::SingleFileMissingName { .. }
-            | Self::PathConfinementViolation { .. } => None,
         }
     }
 }

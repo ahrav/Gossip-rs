@@ -28,8 +28,6 @@
 //! while export (`connector::Cursor::as_update`) projects borrowed slices
 //! allocation-free so coordination paths stay lean.
 
-use std::fmt;
-
 use blake3::Hasher;
 
 use super::shard_spec::ShardSpecRef;
@@ -279,12 +277,14 @@ impl CanonicalBytes for CursorUpdate<'_> {
 /// This type captures local field validation only. There is intentionally no
 /// `TokenWithoutLastKey` variant because that state is unrepresentable through
 /// the public constructors on [`CursorUpdate`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CursorInputError {
     /// The `last_key` was empty.
+    #[error("last_key must not be empty when present")]
     EmptyLastKey,
 
     /// The `last_key` exceeds [`MAX_KEY_SIZE`].
+    #[error("last_key too large ({size} bytes, max {max})")]
     KeyTooLarge {
         /// Actual size of the key in bytes.
         size: usize,
@@ -293,6 +293,7 @@ pub enum CursorInputError {
     },
 
     /// The `token` exceeds [`MAX_TOKEN_SIZE`].
+    #[error("token too large ({size} bytes, max {max})")]
     TokenTooLarge {
         /// Actual size of the token in bytes.
         size: usize,
@@ -300,22 +301,6 @@ pub enum CursorInputError {
         max: usize,
     },
 }
-
-impl fmt::Display for CursorInputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyLastKey => write!(f, "last_key must not be empty when present"),
-            Self::KeyTooLarge { size, max } => {
-                write!(f, "last_key too large ({size} bytes, max {max})")
-            }
-            Self::TokenTooLarge { size, max } => {
-                write!(f, "token too large ({size} bytes, max {max})")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CursorInputError {}
 
 /// Result of comparing two cursor updates for monotonic forward progress.
 ///

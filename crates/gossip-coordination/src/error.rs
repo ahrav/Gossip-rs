@@ -109,13 +109,14 @@ use gossip_contracts::identity::{
 /// Backend-agnostic: contains no etcd-specific or backend-specific types.
 /// The `operation` field identifies the failing step as a human-readable
 /// label (e.g., `"acquire.load_shard"`, `"renew.txn"`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InfraError {
     /// Transient infrastructure failure — the operation may succeed on retry
     /// after backoff.
     ///
     /// Covers network timeouts, gRPC failures, unavailable storage nodes,
     /// and CAS retry budget exhaustion.
+    #[error("[transient] {operation}: {message}")]
     Transient {
         /// What was being attempted (e.g., `"acquire.load_shard"`).
         operation: String,
@@ -129,6 +130,7 @@ pub enum InfraError {
     /// Covers codec decode failures, op-log invariant violations (e.g.,
     /// kind mismatches on idempotent replay), and missing records that
     /// the protocol requires to exist.
+    #[error("[corruption] {operation}: {message}")]
     Corruption {
         /// What was being attempted when corruption was detected.
         operation: String,
@@ -175,21 +177,6 @@ impl InfraError {
     }
 }
 
-impl fmt::Display for InfraError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transient { operation, message } => {
-                write!(f, "[transient] {operation}: {message}")
-            }
-            Self::Corruption { operation, message } => {
-                write!(f, "[corruption] {operation}: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for InfraError {}
-
 // ============================================================================
 // CoordError -- shared error building blocks
 // ============================================================================
@@ -212,10 +199,11 @@ impl std::error::Error for InfraError {}
 /// In both cases, the worker MUST stop processing and re-acquire.
 ///
 /// Reference: Kleppmann, "How to do distributed locking" (2016).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CoordError {
     /// The shard does not exist in the coordination store.
+    #[error("shard not found: {shard:?}")]
     ShardNotFound { shard: ShardKey },
 
     /// Tenant isolation violation: the request's tenant does not match
@@ -223,6 +211,7 @@ pub enum CoordError {
     ///
     /// Only `expected` (the caller's tenant) is exposed. The actual
     /// tenant is deliberately omitted to prevent cross-tenant enumeration.
+    #[error("tenant mismatch (expected {expected:?})")]
     TenantMismatch { expected: TenantId },
 
     /// The lease's fence epoch does not match the record's current epoch
@@ -231,6 +220,7 @@ pub enum CoordError {
     ///
     /// Reference: Kleppmann fencing tokens -- monotonic epoch rejects
     /// zombie writes.
+    #[error("stale fence epoch: presented {presented:?}, current {current:?}")]
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
@@ -238,6 +228,7 @@ pub enum CoordError {
 
     /// The lease's fence epoch matches but the lease has expired.
     /// The worker must re-acquire before continuing.
+    #[error("lease expired: deadline {deadline:?}, now {now:?}")]
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
@@ -245,6 +236,7 @@ pub enum CoordError {
 
     /// The shard is in a terminal state and cannot accept mutations.
     /// Terminal states: Done, Split, Parked.
+    #[error("shard {shard:?} is terminal ({status})")]
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
@@ -258,6 +250,7 @@ pub enum CoordError {
     /// counter to prevent collisions.
     ///
     /// Reference: Stripe idempotency key pattern (Brandur Leach, 2017).
+    #[error("op-id conflict: {op_id:?} reused with different payload")]
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
@@ -268,6 +261,7 @@ pub enum CoordError {
     /// lexicographically less than the current cursor's `last_key`.
     ///
     /// Cursor monotonicity is a hard safety invariant.
+    #[error("cursor regression: new key < old key")]
     CursorRegression {
         /// Byte length of the old cursor's `last_key`, or `None` if the
         /// old cursor had no key. Raw key bytes are redacted to prevent
@@ -282,24 +276,29 @@ pub enum CoordError {
     /// the shard's key range.
     ///
     /// Cursor bounds checking is a hard safety invariant.
+    #[error("cursor out of bounds: key ({} bytes) outside shard range", .0.last_key)]
     CursorOutOfBounds(CursorOutOfBoundsDetail),
 
     /// Cursor key exceeds the maximum allowed length.
     ///
     /// Emitted by `validate_cursor_update_pooled` before monotonicity/bounds checks.
+    #[error("cursor key too large ({size} bytes, max {max})")]
     CursorKeyTooLarge { size: usize, max: usize },
 
     /// Cursor token exceeds the maximum allowed length.
     ///
     /// Emitted by `validate_cursor_update_pooled` before storing the token in the slab.
+    #[error("cursor token too large ({size} bytes, max {max})")]
     CursorTokenTooLarge { size: usize, max: usize },
 
     /// Split validation failed. Wraps the detailed error from
     /// `validate_split_coverage` / `validate_residual_split`.
     ///
-    SplitInvalid(SplitValidationError),
+    #[error("split invalid: {0}")]
+    SplitInvalid(#[source] SplitValidationError),
 
     /// Checkpoint requires a `last_key` but the provided cursor has none.
+    #[error("checkpoint requires a last_key")]
     CheckpointMissingKey,
 }
 
@@ -402,53 +401,6 @@ impl fmt::Debug for CoordError {
     }
 }
 
-impl fmt::Display for CoordError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::StaleFence { presented, current } => write!(
-                f,
-                "stale fence epoch: presented {presented:?}, current {current:?}"
-            ),
-            Self::LeaseExpired { deadline, now } => {
-                write!(f, "lease expired: deadline {deadline:?}, now {now:?}")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            Self::OpIdConflict { op_id, .. } => {
-                write!(f, "op-id conflict: {op_id:?} reused with different payload")
-            }
-            Self::CursorRegression { .. } => write!(f, "cursor regression: new key < old key"),
-            Self::CursorOutOfBounds(detail) => write!(
-                f,
-                "cursor out of bounds: key ({} bytes) outside shard range",
-                detail.last_key
-            ),
-            Self::CursorKeyTooLarge { size, max } => {
-                write!(f, "cursor key too large ({size} bytes, max {max})")
-            }
-            Self::CursorTokenTooLarge { size, max } => {
-                write!(f, "cursor token too large ({size} bytes, max {max})")
-            }
-            Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
-            Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
-        }
-    }
-}
-
-impl std::error::Error for CoordError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SplitInvalid(inner) => Some(inner),
-            _ => None,
-        }
-    }
-}
-
 // ============================================================================
 // Operation-specific error types
 // ============================================================================
@@ -458,18 +410,21 @@ impl std::error::Error for CoordError {
 /// Acquire is special: it does NOT require a pre-existing lease, so
 /// it cannot produce `StaleFence` or `LeaseExpired`. It can fail if
 /// the shard is terminal, or if another worker holds a live lease.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AcquireError {
     /// The shard does not exist.
+    #[error("shard not found: {shard:?}")]
     ShardNotFound { shard: ShardKey },
 
     /// Tenant isolation violation.
     ///
     /// Only `expected` (the caller's tenant) is exposed.
+    #[error("tenant mismatch (expected {expected:?})")]
     TenantMismatch { expected: TenantId },
 
     /// The shard is terminal -- cannot be acquired.
+    #[error("shard {shard:?} is terminal ({status})")]
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
@@ -480,6 +435,7 @@ pub enum AcquireError {
     ///
     /// **Security note:** `current_owner` exposes worker identity.
     /// Redact this field before surfacing to external clients.
+    #[error("shard already leased (deadline {lease_deadline:?})")]
     AlreadyLeased {
         current_owner: WorkerId,
         lease_deadline: LogicalTime,
@@ -487,7 +443,8 @@ pub enum AcquireError {
 
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
-    BackendError(InfraError),
+    #[error("coordination backend error: {0}")]
+    BackendError(#[source] InfraError),
 }
 
 // Custom Debug: redacts `current_owner` to prevent worker identity
@@ -518,36 +475,6 @@ impl fmt::Debug for AcquireError {
     }
 }
 
-impl fmt::Display for AcquireError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            // Omit current_owner in Display output (redact worker identity).
-            Self::AlreadyLeased { lease_deadline, .. } => {
-                write!(f, "shard already leased (deadline {lease_deadline:?})")
-            }
-            Self::BackendError(infra) => {
-                write!(f, "coordination backend error: {infra}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for AcquireError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BackendError(infra) => Some(infra),
-            _ => None,
-        }
-    }
-}
-
 /// Error from `renew`.
 ///
 /// Renew extends a lease deadline without modifying shard progress, so it
@@ -555,64 +482,37 @@ impl std::error::Error for AcquireError {
 /// isolation, fencing, terminal state). It excludes `OpIdConflict`,
 /// cursor, and split variants because renew is not an idempotent
 /// progress-advancing operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RenewError {
     /// See [`CoordError::ShardNotFound`].
+    #[error("shard not found: {shard:?}")]
     ShardNotFound { shard: ShardKey },
     /// See [`CoordError::TenantMismatch`].
+    #[error("tenant mismatch (expected {expected:?})")]
     TenantMismatch { expected: TenantId },
     /// See [`CoordError::StaleFence`].
+    #[error("stale fence epoch: presented {presented:?}, current {current:?}")]
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
     /// See [`CoordError::LeaseExpired`].
+    #[error("lease expired: deadline {deadline:?}, now {now:?}")]
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
     /// See [`CoordError::ShardTerminal`].
+    #[error("shard {shard:?} is terminal ({status})")]
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
-    BackendError(InfraError),
-}
-
-impl fmt::Display for RenewError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::StaleFence { presented, current } => write!(
-                f,
-                "stale fence epoch: presented {presented:?}, current {current:?}"
-            ),
-            Self::LeaseExpired { deadline, now } => {
-                write!(f, "lease expired: deadline {deadline:?}, now {now:?}")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            Self::BackendError(infra) => {
-                write!(f, "coordination backend error: {infra}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RenewError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BackendError(infra) => Some(infra),
-            _ => None,
-        }
-    }
+    #[error("coordination backend error: {0}")]
+    BackendError(#[source] InfraError),
 }
 
 /// Error from `checkpoint`.
@@ -626,54 +526,67 @@ impl std::error::Error for RenewError {
 /// It excludes only `SplitInvalid`.
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CheckpointError {
     /// See [`CoordError::ShardNotFound`].
+    #[error("shard not found: {shard:?}")]
     ShardNotFound { shard: ShardKey },
     /// See [`CoordError::TenantMismatch`].
+    #[error("tenant mismatch (expected {expected:?})")]
     TenantMismatch { expected: TenantId },
     /// See [`CoordError::StaleFence`].
+    #[error("stale fence epoch: presented {presented:?}, current {current:?}")]
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
     /// See [`CoordError::LeaseExpired`].
+    #[error("lease expired: deadline {deadline:?}, now {now:?}")]
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
     /// See [`CoordError::ShardTerminal`].
+    #[error("shard {shard:?} is terminal ({status})")]
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
     /// See [`CoordError::OpIdConflict`].
+    #[error("op-id conflict: {op_id:?} reused with different payload")]
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
         actual_hash: u64,
     },
     /// See [`CoordError::CursorRegression`].
+    #[error("cursor regression: new key < old key")]
     CursorRegression {
         old_key: Option<usize>,
         new_key: Option<usize>,
     },
     /// See [`CoordError::CursorOutOfBounds`].
+    #[error("cursor out of bounds: key ({} bytes) outside shard range", .0.last_key)]
     CursorOutOfBounds(CursorOutOfBoundsDetail),
     /// See [`CoordError::CursorKeyTooLarge`].
+    #[error("cursor key too large ({size} bytes, max {max})")]
     CursorKeyTooLarge { size: usize, max: usize },
     /// See [`CoordError::CursorTokenTooLarge`].
+    #[error("cursor token too large ({size} bytes, max {max})")]
     CursorTokenTooLarge { size: usize, max: usize },
     /// The checkpoint cursor did not contain a `last_key`, which is required
     /// to track scan progress.
+    #[error("checkpoint requires a last_key")]
     CheckpointMissingKey,
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
-    ResourceExhausted(SlabFull),
+    #[error("slab full: {0}")]
+    ResourceExhausted(#[from] SlabFull),
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
-    BackendError(InfraError),
+    #[error("coordination backend error: {0}")]
+    BackendError(#[source] InfraError),
 }
 
 impl fmt::Debug for CheckpointError {
@@ -733,62 +646,6 @@ impl fmt::Debug for CheckpointError {
     }
 }
 
-impl fmt::Display for CheckpointError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::StaleFence { presented, current } => write!(
-                f,
-                "stale fence epoch: presented {presented:?}, current {current:?}"
-            ),
-            Self::LeaseExpired { deadline, now } => {
-                write!(f, "lease expired: deadline {deadline:?}, now {now:?}")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            Self::OpIdConflict { op_id, .. } => {
-                write!(f, "op-id conflict: {op_id:?} reused with different payload")
-            }
-            Self::CursorRegression { .. } => write!(f, "cursor regression: new key < old key"),
-            Self::CursorOutOfBounds(detail) => write!(
-                f,
-                "cursor out of bounds: key ({} bytes) outside shard range",
-                detail.last_key
-            ),
-            Self::CursorKeyTooLarge { size, max } => {
-                write!(f, "cursor key too large ({size} bytes, max {max})")
-            }
-            Self::CursorTokenTooLarge { size, max } => {
-                write!(f, "cursor token too large ({size} bytes, max {max})")
-            }
-            Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
-            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
-            Self::BackendError(infra) => {
-                write!(f, "coordination backend error: {infra}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CheckpointError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BackendError(infra) => Some(infra),
-            _ => None,
-        }
-    }
-}
-
-impl From<SlabFull> for CheckpointError {
-    fn from(e: SlabFull) -> Self {
-        Self::ResourceExhausted(e)
-    }
-}
-
 /// Error from `complete`.
 ///
 /// Complete shares most variants with [`CheckpointError`] (idempotency,
@@ -798,54 +655,67 @@ impl From<SlabFull> for CheckpointError {
 /// the end of its assigned range.
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CompleteError {
     /// See [`CoordError::ShardNotFound`].
+    #[error("shard not found: {shard:?}")]
     ShardNotFound { shard: ShardKey },
     /// See [`CoordError::TenantMismatch`].
+    #[error("tenant mismatch (expected {expected:?})")]
     TenantMismatch { expected: TenantId },
     /// See [`CoordError::StaleFence`].
+    #[error("stale fence epoch: presented {presented:?}, current {current:?}")]
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
     /// See [`CoordError::LeaseExpired`].
+    #[error("lease expired: deadline {deadline:?}, now {now:?}")]
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
     /// See [`CoordError::ShardTerminal`].
+    #[error("shard {shard:?} is terminal ({status})")]
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
     /// See [`CoordError::OpIdConflict`].
+    #[error("op-id conflict: {op_id:?} reused with different payload")]
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
         actual_hash: u64,
     },
     /// See [`CoordError::CursorRegression`].
+    #[error("cursor regression: new key < old key")]
     CursorRegression {
         old_key: Option<usize>,
         new_key: Option<usize>,
     },
     /// See [`CoordError::CursorOutOfBounds`].
+    #[error("cursor out of bounds: key ({} bytes) outside shard range", .0.last_key)]
     CursorOutOfBounds(CursorOutOfBoundsDetail),
     /// See [`CoordError::CursorKeyTooLarge`].
+    #[error("cursor key too large ({size} bytes, max {max})")]
     CursorKeyTooLarge { size: usize, max: usize },
     /// See [`CoordError::CursorTokenTooLarge`].
+    #[error("cursor token too large ({size} bytes, max {max})")]
     CursorTokenTooLarge { size: usize, max: usize },
     /// Complete requires a final cursor with a `last_key` to confirm
     /// the worker reached the end of its assigned range.
+    #[error("complete requires a last_key")]
     CheckpointMissingKey,
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
-    ResourceExhausted(SlabFull),
+    #[error("slab full: {0}")]
+    ResourceExhausted(#[from] SlabFull),
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
-    BackendError(InfraError),
+    #[error("coordination backend error: {0}")]
+    BackendError(#[source] InfraError),
 }
 
 impl fmt::Debug for CompleteError {
@@ -905,62 +775,6 @@ impl fmt::Debug for CompleteError {
     }
 }
 
-impl fmt::Display for CompleteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::StaleFence { presented, current } => write!(
-                f,
-                "stale fence epoch: presented {presented:?}, current {current:?}"
-            ),
-            Self::LeaseExpired { deadline, now } => {
-                write!(f, "lease expired: deadline {deadline:?}, now {now:?}")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            Self::OpIdConflict { op_id, .. } => {
-                write!(f, "op-id conflict: {op_id:?} reused with different payload")
-            }
-            Self::CursorRegression { .. } => write!(f, "cursor regression: new key < old key"),
-            Self::CursorOutOfBounds(detail) => write!(
-                f,
-                "cursor out of bounds: key ({} bytes) outside shard range",
-                detail.last_key
-            ),
-            Self::CursorKeyTooLarge { size, max } => {
-                write!(f, "cursor key too large ({size} bytes, max {max})")
-            }
-            Self::CursorTokenTooLarge { size, max } => {
-                write!(f, "cursor token too large ({size} bytes, max {max})")
-            }
-            Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
-            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
-            Self::BackendError(infra) => {
-                write!(f, "coordination backend error: {infra}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CompleteError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BackendError(infra) => Some(infra),
-            _ => None,
-        }
-    }
-}
-
-impl From<SlabFull> for CompleteError {
-    fn from(e: SlabFull) -> Self {
-        Self::ResourceExhausted(e)
-    }
-}
-
 /// Error from `park_shard`.
 ///
 /// Park transitions a shard to the `Parked` terminal state. It is
@@ -968,29 +782,35 @@ impl From<SlabFull> for CompleteError {
 /// so it excludes all cursor variants and `CheckpointMissingKey`.
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParkError {
     /// See [`CoordError::ShardNotFound`].
+    #[error("shard not found: {shard:?}")]
     ShardNotFound { shard: ShardKey },
     /// See [`CoordError::TenantMismatch`].
+    #[error("tenant mismatch (expected {expected:?})")]
     TenantMismatch { expected: TenantId },
     /// See [`CoordError::StaleFence`].
+    #[error("stale fence epoch: presented {presented:?}, current {current:?}")]
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
     /// See [`CoordError::LeaseExpired`].
+    #[error("lease expired: deadline {deadline:?}, now {now:?}")]
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
     /// See [`CoordError::ShardTerminal`].
+    #[error("shard {shard:?} is terminal ({status})")]
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
     /// See [`CoordError::OpIdConflict`].
+    #[error("op-id conflict: {op_id:?} reused with different payload")]
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
@@ -998,7 +818,8 @@ pub enum ParkError {
     },
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
-    BackendError(InfraError),
+    #[error("coordination backend error: {0}")]
+    BackendError(#[source] InfraError),
 }
 
 impl fmt::Debug for ParkError {
@@ -1038,42 +859,6 @@ impl fmt::Debug for ParkError {
     }
 }
 
-impl fmt::Display for ParkError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::StaleFence { presented, current } => write!(
-                f,
-                "stale fence epoch: presented {presented:?}, current {current:?}"
-            ),
-            Self::LeaseExpired { deadline, now } => {
-                write!(f, "lease expired: deadline {deadline:?}, now {now:?}")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            Self::OpIdConflict { op_id, .. } => {
-                write!(f, "op-id conflict: {op_id:?} reused with different payload")
-            }
-            Self::BackendError(infra) => {
-                write!(f, "coordination backend error: {infra}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ParkError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BackendError(infra) => Some(infra),
-            _ => None,
-        }
-    }
-}
-
 /// Error from split operations (`split_replace` and `split_residual`).
 ///
 /// Both split operations share identical error surfaces: common
@@ -1082,42 +867,51 @@ impl std::error::Error for ParkError {
 /// cursor).
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SplitError {
     /// See [`CoordError::ShardNotFound`].
+    #[error("shard not found: {shard:?}")]
     ShardNotFound { shard: ShardKey },
     /// See [`CoordError::TenantMismatch`].
+    #[error("tenant mismatch (expected {expected:?})")]
     TenantMismatch { expected: TenantId },
     /// See [`CoordError::StaleFence`].
+    #[error("stale fence epoch: presented {presented:?}, current {current:?}")]
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
     /// See [`CoordError::LeaseExpired`].
+    #[error("lease expired: deadline {deadline:?}, now {now:?}")]
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
     /// See [`CoordError::ShardTerminal`].
+    #[error("shard {shard:?} is terminal ({status})")]
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
     /// See [`CoordError::OpIdConflict`].
+    #[error("op-id conflict: {op_id:?} reused with different payload")]
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
         actual_hash: u64,
     },
     /// See [`CoordError::SplitInvalid`].
-    SplitInvalid(SplitValidationError),
+    #[error("split invalid: {0}")]
+    SplitInvalid(#[source] SplitValidationError),
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
-    ResourceExhausted(SlabFull),
+    #[error("slab full: {0}")]
+    ResourceExhausted(#[from] SlabFull),
     /// The coordination backend encountered an infrastructure error.
     /// See [`InfraError`] for transient vs. corruption classification.
-    BackendError(InfraError),
+    #[error("coordination backend error: {0}")]
+    BackendError(#[source] InfraError),
 }
 
 impl fmt::Debug for SplitError {
@@ -1171,51 +965,6 @@ pub type SplitReplaceError = SplitError;
 /// a type alias rather than a distinct enum.
 pub type SplitResidualError = SplitError;
 
-impl fmt::Display for SplitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::StaleFence { presented, current } => write!(
-                f,
-                "stale fence epoch: presented {presented:?}, current {current:?}"
-            ),
-            Self::LeaseExpired { deadline, now } => {
-                write!(f, "lease expired: deadline {deadline:?}, now {now:?}")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            Self::OpIdConflict { op_id, .. } => {
-                write!(f, "op-id conflict: {op_id:?} reused with different payload")
-            }
-            Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
-            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
-            Self::BackendError(infra) => {
-                write!(f, "coordination backend error: {infra}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SplitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SplitInvalid(inner) => Some(inner),
-            Self::BackendError(infra) => Some(infra),
-            _ => None,
-        }
-    }
-}
-
-impl From<SlabFull> for SplitError {
-    fn from(e: SlabFull) -> Self {
-        Self::ResourceExhausted(e)
-    }
-}
-
 // ============================================================================
 // From<CoordError> impls -- explicit rejection arms
 // ============================================================================
@@ -1230,114 +979,236 @@ impl From<SlabFull> for SplitError {
 // compile-time exhaustiveness strategy documented in the module-level docs:
 // adding a new `CoordError` variant triggers a compile error in every impl,
 // forcing a conscious routing decision for the new variant.
+//
+// The `impl_from_coord_error!` macro generates the mechanical impls below.
+// The UnparkError impl is hand-written because it transforms OpIdConflict
+// into a different type (RunOpIdConflict) rather than forwarding fields.
 
-impl From<CoordError> for CheckpointError {
-    fn from(e: CoordError) -> Self {
-        match e {
-            CoordError::ShardNotFound { shard } => Self::ShardNotFound { shard },
-            CoordError::TenantMismatch { expected } => Self::TenantMismatch { expected },
-            CoordError::StaleFence { presented, current } => {
-                Self::StaleFence { presented, current }
-            }
-            CoordError::LeaseExpired { deadline, now } => Self::LeaseExpired { deadline, now },
-            CoordError::ShardTerminal { shard, status } => Self::ShardTerminal { shard, status },
-            CoordError::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            } => Self::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            },
-            CoordError::CursorRegression { old_key, new_key } => {
-                Self::CursorRegression { old_key, new_key }
-            }
-            CoordError::CursorOutOfBounds(detail) => Self::CursorOutOfBounds(detail),
-            CoordError::CursorKeyTooLarge { size, max } => Self::CursorKeyTooLarge { size, max },
-            CoordError::CursorTokenTooLarge { size, max } => {
-                Self::CursorTokenTooLarge { size, max }
-            }
-            CoordError::CheckpointMissingKey => Self::CheckpointMissingKey,
-            // Explicitly reject all variants CheckpointError does not cover.
-            // Adding a new CoordError variant triggers a compile error here.
-            CoordError::SplitInvalid(_) => {
-                unreachable!("CoordError::{e} is not valid for CheckpointError")
+/// Generates a `From<CoordError>` impl that routes accepted `CoordError`
+/// variants to identically-named variants on `$target`, and marks rejected
+/// variants as `unreachable!()`.
+///
+/// Three variant shapes are supported in both accept and reject lists:
+///
+/// - **Struct**: `VariantName { field1, field2 }` -- destructures and
+///   reconstructs named fields (accept) or matches with `{ .. }` (reject).
+/// - **Tuple**: `VariantName(binding)` -- destructures a single positional
+///   field (accept) or matches with `(_)` (reject).
+/// - **Unit**: `VariantName` -- fieldless variant, forwarded directly.
+///
+/// All rejected arms panic via `unreachable!()`, preserving compile-time
+/// exhaustiveness: adding a new `CoordError` variant forces a conscious
+/// routing decision in every invocation.
+macro_rules! impl_from_coord_error {
+    // Entry point: delegates to @build which peels variants one at a time,
+    // accumulating fully-formed match arms. This avoids the Rust limitation
+    // that macros cannot expand to match arms via sub-macro calls.
+    (
+        $target:ident,
+        accept: [ $($acc:tt),* $(,)? ],
+        reject: [ $($rej:tt),* $(,)? ]
+    ) => {
+        impl_from_coord_error!(
+            @build $target,
+            arms: [],
+            accept: [ $($acc),* ],
+            reject: [ $($rej),* ]
+        );
+    };
+
+    // ---- @build: peel one accepted struct variant ----
+    (
+        @build $target:ident,
+        arms: [ $($arms:tt)* ],
+        accept: [ { $variant:ident { $($field:ident),* $(,)? } } $(, $rest_acc:tt)* ],
+        reject: [ $($rej:tt),* ]
+    ) => {
+        impl_from_coord_error!(
+            @build $target,
+            arms: [
+                $($arms)*
+                CoordError::$variant { $($field),* } => Self::$variant { $($field),* },
+            ],
+            accept: [ $($rest_acc),* ],
+            reject: [ $($rej),* ]
+        );
+    };
+
+    // ---- @build: peel one accepted tuple variant ----
+    (
+        @build $target:ident,
+        arms: [ $($arms:tt)* ],
+        accept: [ { $variant:ident ( $binding:ident ) } $(, $rest_acc:tt)* ],
+        reject: [ $($rej:tt),* ]
+    ) => {
+        impl_from_coord_error!(
+            @build $target,
+            arms: [
+                $($arms)*
+                CoordError::$variant($binding) => Self::$variant($binding),
+            ],
+            accept: [ $($rest_acc),* ],
+            reject: [ $($rej),* ]
+        );
+    };
+
+    // ---- @build: peel one accepted unit variant ----
+    (
+        @build $target:ident,
+        arms: [ $($arms:tt)* ],
+        accept: [ { $variant:ident } $(, $rest_acc:tt)* ],
+        reject: [ $($rej:tt),* ]
+    ) => {
+        impl_from_coord_error!(
+            @build $target,
+            arms: [
+                $($arms)*
+                CoordError::$variant => Self::$variant,
+            ],
+            accept: [ $($rest_acc),* ],
+            reject: [ $($rej),* ]
+        );
+    };
+
+    // ---- @build: accept list exhausted, peel rejected struct { .. } ----
+    (
+        @build $target:ident,
+        arms: [ $($arms:tt)* ],
+        accept: [],
+        reject: [ { $variant:ident { .. } } $(, $rest_rej:tt)* ]
+    ) => {
+        impl_from_coord_error!(
+            @build $target,
+            arms: [
+                $($arms)*
+                CoordError::$variant { .. } => {
+                    unreachable!(concat!("CoordError variant is not valid for ", stringify!($target)))
+                },
+            ],
+            accept: [],
+            reject: [ $($rest_rej),* ]
+        );
+    };
+
+    // ---- @build: accept list exhausted, peel rejected tuple (_) ----
+    (
+        @build $target:ident,
+        arms: [ $($arms:tt)* ],
+        accept: [],
+        reject: [ { $variant:ident (_) } $(, $rest_rej:tt)* ]
+    ) => {
+        impl_from_coord_error!(
+            @build $target,
+            arms: [
+                $($arms)*
+                CoordError::$variant(_) => {
+                    unreachable!(concat!("CoordError variant is not valid for ", stringify!($target)))
+                },
+            ],
+            accept: [],
+            reject: [ $($rest_rej),* ]
+        );
+    };
+
+    // ---- @build: accept list exhausted, peel rejected unit ----
+    (
+        @build $target:ident,
+        arms: [ $($arms:tt)* ],
+        accept: [],
+        reject: [ { $variant:ident } $(, $rest_rej:tt)* ]
+    ) => {
+        impl_from_coord_error!(
+            @build $target,
+            arms: [
+                $($arms)*
+                CoordError::$variant => {
+                    unreachable!(concat!("CoordError variant is not valid for ", stringify!($target)))
+                },
+            ],
+            accept: [],
+            reject: [ $($rest_rej),* ]
+        );
+    };
+
+    // ---- @build: terminal -- both lists exhausted, emit the impl ----
+    (
+        @build $target:ident,
+        arms: [ $($arms:tt)* ],
+        accept: [],
+        reject: []
+    ) => {
+        impl From<CoordError> for $target {
+            fn from(e: CoordError) -> Self {
+                match e {
+                    $($arms)*
+                }
             }
         }
-    }
+    };
 }
 
-impl From<CoordError> for CompleteError {
-    fn from(e: CoordError) -> Self {
-        match e {
-            CoordError::ShardNotFound { shard } => Self::ShardNotFound { shard },
-            CoordError::TenantMismatch { expected } => Self::TenantMismatch { expected },
-            CoordError::StaleFence { presented, current } => {
-                Self::StaleFence { presented, current }
-            }
-            CoordError::LeaseExpired { deadline, now } => Self::LeaseExpired { deadline, now },
-            CoordError::ShardTerminal { shard, status } => Self::ShardTerminal { shard, status },
-            CoordError::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            } => Self::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            },
-            CoordError::CursorRegression { old_key, new_key } => {
-                Self::CursorRegression { old_key, new_key }
-            }
-            CoordError::CursorOutOfBounds(detail) => Self::CursorOutOfBounds(detail),
-            CoordError::CursorKeyTooLarge { size, max } => Self::CursorKeyTooLarge { size, max },
-            CoordError::CursorTokenTooLarge { size, max } => {
-                Self::CursorTokenTooLarge { size, max }
-            }
-            CoordError::CheckpointMissingKey => Self::CheckpointMissingKey,
-            // Explicitly reject all variants CompleteError does not cover.
-            CoordError::SplitInvalid(_) => {
-                unreachable!("CoordError::{e} is not valid for CompleteError")
-            }
-        }
-    }
-}
+impl_from_coord_error!(
+    CheckpointError,
+    accept: [
+        { ShardNotFound { shard } },
+        { TenantMismatch { expected } },
+        { StaleFence { presented, current } },
+        { LeaseExpired { deadline, now } },
+        { ShardTerminal { shard, status } },
+        { OpIdConflict { op_id, expected_hash, actual_hash } },
+        { CursorRegression { old_key, new_key } },
+        { CursorOutOfBounds(detail) },
+        { CursorKeyTooLarge { size, max } },
+        { CursorTokenTooLarge { size, max } },
+        { CheckpointMissingKey },
+    ],
+    reject: [
+        { SplitInvalid(_) },
+    ]
+);
 
-impl From<CoordError> for ParkError {
-    fn from(e: CoordError) -> Self {
-        match e {
-            CoordError::ShardNotFound { shard } => Self::ShardNotFound { shard },
-            CoordError::TenantMismatch { expected } => Self::TenantMismatch { expected },
-            CoordError::StaleFence { presented, current } => {
-                Self::StaleFence { presented, current }
-            }
-            CoordError::LeaseExpired { deadline, now } => Self::LeaseExpired { deadline, now },
-            CoordError::ShardTerminal { shard, status } => Self::ShardTerminal { shard, status },
-            CoordError::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            } => Self::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            },
-            // Explicitly reject all variants ParkError does not cover.
-            CoordError::CursorRegression { .. }
-            | CoordError::CursorOutOfBounds(_)
-            | CoordError::CursorKeyTooLarge { .. }
-            | CoordError::CursorTokenTooLarge { .. }
-            | CoordError::SplitInvalid(_)
-            | CoordError::CheckpointMissingKey => {
-                unreachable!("CoordError::{e} is not valid for ParkError")
-            }
-        }
-    }
-}
+impl_from_coord_error!(
+    CompleteError,
+    accept: [
+        { ShardNotFound { shard } },
+        { TenantMismatch { expected } },
+        { StaleFence { presented, current } },
+        { LeaseExpired { deadline, now } },
+        { ShardTerminal { shard, status } },
+        { OpIdConflict { op_id, expected_hash, actual_hash } },
+        { CursorRegression { old_key, new_key } },
+        { CursorOutOfBounds(detail) },
+        { CursorKeyTooLarge { size, max } },
+        { CursorTokenTooLarge { size, max } },
+        { CheckpointMissingKey },
+    ],
+    reject: [
+        { SplitInvalid(_) },
+    ]
+);
+
+impl_from_coord_error!(
+    ParkError,
+    accept: [
+        { ShardNotFound { shard } },
+        { TenantMismatch { expected } },
+        { StaleFence { presented, current } },
+        { LeaseExpired { deadline, now } },
+        { ShardTerminal { shard, status } },
+        { OpIdConflict { op_id, expected_hash, actual_hash } },
+    ],
+    reject: [
+        { CursorRegression { .. } },
+        { CursorOutOfBounds(_) },
+        { CursorKeyTooLarge { .. } },
+        { CursorTokenTooLarge { .. } },
+        { SplitInvalid(_) },
+        { CheckpointMissingKey },
+    ]
+);
 
 // ============================================================================
-// TerminalTransitionError — shared error shape for complete/park
+// TerminalTransitionError -- shared error shape for complete/park
 // ============================================================================
 
 /// Error constructors shared by terminal shard transitions (`complete`, `park_shard`).
@@ -1387,62 +1258,48 @@ impl TerminalTransitionError for ParkError {
     }
 }
 
-impl From<CoordError> for SplitError {
-    fn from(e: CoordError) -> Self {
-        match e {
-            CoordError::ShardNotFound { shard } => Self::ShardNotFound { shard },
-            CoordError::TenantMismatch { expected } => Self::TenantMismatch { expected },
-            CoordError::StaleFence { presented, current } => {
-                Self::StaleFence { presented, current }
-            }
-            CoordError::LeaseExpired { deadline, now } => Self::LeaseExpired { deadline, now },
-            CoordError::ShardTerminal { shard, status } => Self::ShardTerminal { shard, status },
-            CoordError::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            } => Self::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            },
-            CoordError::SplitInvalid(e) => Self::SplitInvalid(e),
-            // Explicitly reject all variants SplitError does not cover.
-            CoordError::CursorRegression { .. }
-            | CoordError::CursorOutOfBounds(_)
-            | CoordError::CursorKeyTooLarge { .. }
-            | CoordError::CursorTokenTooLarge { .. }
-            | CoordError::CheckpointMissingKey => {
-                unreachable!("CoordError::{e} is not valid for SplitError")
-            }
-        }
-    }
-}
+impl_from_coord_error!(
+    SplitError,
+    accept: [
+        { ShardNotFound { shard } },
+        { TenantMismatch { expected } },
+        { StaleFence { presented, current } },
+        { LeaseExpired { deadline, now } },
+        { ShardTerminal { shard, status } },
+        { OpIdConflict { op_id, expected_hash, actual_hash } },
+        { SplitInvalid(inner) },
+    ],
+    reject: [
+        { CursorRegression { .. } },
+        { CursorOutOfBounds(_) },
+        { CursorKeyTooLarge { .. } },
+        { CursorTokenTooLarge { .. } },
+        { CheckpointMissingKey },
+    ]
+);
 
-impl From<CoordError> for RenewError {
-    fn from(e: CoordError) -> Self {
-        match e {
-            CoordError::ShardNotFound { shard } => Self::ShardNotFound { shard },
-            CoordError::TenantMismatch { expected } => Self::TenantMismatch { expected },
-            CoordError::StaleFence { presented, current } => {
-                Self::StaleFence { presented, current }
-            }
-            CoordError::LeaseExpired { deadline, now } => Self::LeaseExpired { deadline, now },
-            CoordError::ShardTerminal { shard, status } => Self::ShardTerminal { shard, status },
-            // Explicitly reject all variants RenewError does not cover.
-            CoordError::OpIdConflict { .. }
-            | CoordError::CursorRegression { .. }
-            | CoordError::CursorOutOfBounds(_)
-            | CoordError::CursorKeyTooLarge { .. }
-            | CoordError::CursorTokenTooLarge { .. }
-            | CoordError::SplitInvalid(_)
-            | CoordError::CheckpointMissingKey => {
-                unreachable!("CoordError::{e} is not valid for RenewError")
-            }
-        }
-    }
-}
+impl_from_coord_error!(
+    RenewError,
+    accept: [
+        { ShardNotFound { shard } },
+        { TenantMismatch { expected } },
+        { StaleFence { presented, current } },
+        { LeaseExpired { deadline, now } },
+        { ShardTerminal { shard, status } },
+    ],
+    reject: [
+        { OpIdConflict { .. } },
+        { CursorRegression { .. } },
+        { CursorOutOfBounds(_) },
+        { CursorKeyTooLarge { .. } },
+        { CursorTokenTooLarge { .. } },
+        { SplitInvalid(_) },
+        { CheckpointMissingKey },
+    ]
+);
 
+// UnparkError is hand-written because it transforms OpIdConflict into
+// RunOpIdConflict rather than forwarding fields to an identically-named variant.
 impl From<CoordError> for UnparkError {
     fn from(e: CoordError) -> Self {
         match e {

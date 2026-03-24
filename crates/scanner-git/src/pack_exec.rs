@@ -119,107 +119,56 @@ pub trait PackObjectSink {
 /// Pack executor error taxonomy (fatal only).
 ///
 /// Decode errors do not appear here; they are tracked as `SkipReason`s.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PackExecError {
     /// Pack header or index parsing failed.
-    PackParse(PackParseError),
+    #[error("{0}")]
+    PackParse(#[from] PackParseError),
     /// Pack bytes could not be read.
+    #[error("pack read error: {0}")]
     PackRead(String),
     /// Scheduler task referenced a plan index outside the plan list.
+    #[error("scheduler plan index out of range: index={index}, plan_count={plan_count}")]
     SchedulerPlanIndexOutOfRange { index: usize, plan_count: usize },
     /// Scheduler shard task referenced a plan index outside the plan list.
+    #[error(
+        "scheduler shard plan index out of range: plan_idx={plan_idx}, plan_count={plan_count}"
+    )]
     SchedulerShardPlanIndexOutOfRange { plan_idx: usize, plan_count: usize },
     /// Scheduler shard metadata was unexpectedly missing for a plan.
+    #[error("scheduler shard metadata missing: plan_idx={plan_idx}")]
     SchedulerShardMetadataMissing { plan_idx: usize },
     /// Scheduler shard metadata container was unavailable after execution.
+    #[error("scheduler shard metadata unavailable")]
     SchedulerShardMetadataUnavailable,
     /// Scheduler shard task referenced a shard index outside the shard range list.
+    #[error("scheduler shard index out of range: plan_idx={plan_idx}, shard_idx={shard_idx}, shard_count={shard_count}")]
     SchedulerShardIndexOutOfRange {
         plan_idx: usize,
         shard_idx: usize,
         shard_count: usize,
     },
     /// Scheduler finished but did not produce a plan output slot.
+    #[error("scheduler plan output missing: plan_idx={plan_idx}")]
     SchedulerPlanOutputMissing { plan_idx: usize },
     /// Scheduler finished but did not produce a shard output slot.
+    #[error("scheduler shard output missing: plan_idx={plan_idx}, shard_idx={shard_idx}")]
     SchedulerShardOutputMissing { plan_idx: usize, shard_idx: usize },
     /// Scheduler rejected enqueuing pack-plan tasks.
+    #[error("scheduler task queue rejected work")]
     SchedulerTaskQueueRejected,
     /// Scheduler rejected enqueuing pack-shard tasks.
+    #[error("scheduler shard queue rejected work")]
     SchedulerShardQueueRejected,
     /// The sink rejected an emitted blob.
+    #[error("sink error: {0}")]
     Sink(String),
     /// External base provider returned a fatal error.
+    #[error("external base error: {0}")]
     ExternalBase(String),
     /// Spill file creation or write failed.
-    Spill(std::io::Error),
-}
-
-impl fmt::Display for PackExecError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PackParse(err) => write!(f, "{err}"),
-            Self::PackRead(msg) => write!(f, "pack read error: {msg}"),
-            Self::SchedulerPlanIndexOutOfRange { index, plan_count } => write!(
-                f,
-                "scheduler plan index out of range: index={index}, plan_count={plan_count}"
-            ),
-            Self::SchedulerShardPlanIndexOutOfRange {
-                plan_idx,
-                plan_count,
-            } => write!(
-                f,
-                "scheduler shard plan index out of range: plan_idx={plan_idx}, plan_count={plan_count}"
-            ),
-            Self::SchedulerShardMetadataMissing { plan_idx } => write!(
-                f,
-                "scheduler shard metadata missing: plan_idx={plan_idx}"
-            ),
-            Self::SchedulerShardMetadataUnavailable => {
-                write!(f, "scheduler shard metadata unavailable")
-            }
-            Self::SchedulerShardIndexOutOfRange {
-                plan_idx,
-                shard_idx,
-                shard_count,
-            } => write!(
-                f,
-                "scheduler shard index out of range: plan_idx={plan_idx}, shard_idx={shard_idx}, shard_count={shard_count}"
-            ),
-            Self::SchedulerPlanOutputMissing { plan_idx } => {
-                write!(f, "scheduler plan output missing: plan_idx={plan_idx}")
-            }
-            Self::SchedulerShardOutputMissing {
-                plan_idx,
-                shard_idx,
-            } => write!(
-                f,
-                "scheduler shard output missing: plan_idx={plan_idx}, shard_idx={shard_idx}"
-            ),
-            Self::SchedulerTaskQueueRejected => write!(f, "scheduler task queue rejected work"),
-            Self::SchedulerShardQueueRejected => {
-                write!(f, "scheduler shard queue rejected work")
-            }
-            Self::Sink(msg) => write!(f, "sink error: {msg}"),
-            Self::ExternalBase(msg) => write!(f, "external base error: {msg}"),
-            Self::Spill(err) => write!(f, "spill error: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for PackExecError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PackParse(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<PackParseError> for PackExecError {
-    fn from(err: PackParseError) -> Self {
-        Self::PackParse(err)
-    }
+    #[error("spill error: {0}")]
+    Spill(#[source] std::io::Error),
 }
 
 /// Skip reason for a candidate offset.

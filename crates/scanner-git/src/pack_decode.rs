@@ -11,8 +11,6 @@
 //! The helpers here do not verify pack checksums; they operate on already
 //! loaded pack bytes and return precise errors for size and parsing issues.
 
-use std::fmt;
-
 use super::pack_inflate::{
     inflate_exact, inflate_exact_with, inflate_limited, inflate_limited_with, EntryHeader,
     EntryKind, PackFile,
@@ -55,53 +53,20 @@ impl PackDecodeLimits {
 }
 
 /// Pack decode error taxonomy.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PackDecodeError {
     /// Pack header parsing failed.
-    PackParse(PackParseError),
+    #[error("{0}")]
+    PackParse(#[from] PackParseError),
     /// Zlib inflation failed or exceeded a limit.
-    Inflate(InflateError),
+    #[error("{0}")]
+    Inflate(#[from] InflateError),
     /// Object size exceeds the configured cap.
+    #[error("object size {size} exceeds cap {max}")]
     ObjectTooLarge { size: u64, max: usize },
     /// Delta payload size exceeds the configured cap (delta stream size).
+    #[error("delta payload size {size} exceeds cap {max}")]
     DeltaTooLarge { size: u64, max: usize },
-}
-
-impl fmt::Display for PackDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PackParse(err) => write!(f, "{err}"),
-            Self::Inflate(err) => write!(f, "{err}"),
-            Self::ObjectTooLarge { size, max } => {
-                write!(f, "object size {size} exceeds cap {max}")
-            }
-            Self::DeltaTooLarge { size, max } => {
-                write!(f, "delta payload size {size} exceeds cap {max}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PackDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PackParse(err) => Some(err),
-            Self::Inflate(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<PackParseError> for PackDecodeError {
-    fn from(err: PackParseError) -> Self {
-        Self::PackParse(err)
-    }
-}
-
-impl From<InflateError> for PackDecodeError {
-    fn from(err: InflateError) -> Self {
-        Self::Inflate(err)
-    }
 }
 
 /// Parses an entry header and enforces the object size cap.

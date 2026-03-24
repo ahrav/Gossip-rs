@@ -19,7 +19,6 @@
 //! and to set fingerprints to the `PackSet` variant. Callers should re-check
 //! `artifacts_unchanged` before starting any pack scans.
 
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
@@ -51,92 +50,36 @@ pub struct ArtifactBuildLimits {
 }
 
 /// Errors from artifact acquisition.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArtifactAcquireError {
     /// I/O error during artifact access.
-    Io(io::Error),
+    #[error("artifact I/O error: {0}")]
+    Io(#[from] io::Error),
     /// MIDX build failed.
-    MidxBuild(MidxBuildError),
+    #[error("MIDX build failed: {0}")]
+    MidxBuild(#[from] MidxBuildError),
     /// MIDX parsing failed.
-    MidxParse(MidxError),
+    #[error("MIDX parse failed: {0}")]
+    MidxParse(#[from] MidxError),
     /// Commit loading failed during in-memory graph build.
-    CommitLoad(CommitLoadError),
+    #[error("commit loading failed: {0}")]
+    CommitLoad(#[from] CommitLoadError),
     /// In-memory commit graph construction failed.
-    CommitGraphBuild(CommitPlanError),
+    #[error("commit graph build failed: {0}")]
+    CommitGraphBuild(#[source] CommitPlanError),
     /// Repo open error (e.g., fingerprint computation).
-    RepoOpen(RepoOpenError),
+    #[error("repo open error: {0}")]
+    RepoOpen(#[from] RepoOpenError),
     /// Start set resolved to zero tips while repository refs are present.
     ///
     /// This is treated as an explicit error so scans cannot silently become
     /// no-ops on repositories that still advertise reachable refs.
+    #[error("empty start set while repository refs exist (refusing silent no-op scan)")]
     EmptyStartSetWithRefs,
     /// Concurrent maintenance detected.
+    #[error("concurrent maintenance detected")]
     ConcurrentMaintenance,
-}
-
-impl fmt::Display for ArtifactAcquireError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "artifact I/O error: {err}"),
-            Self::MidxBuild(err) => write!(f, "MIDX build failed: {err}"),
-            Self::MidxParse(err) => write!(f, "MIDX parse failed: {err}"),
-            Self::CommitLoad(err) => write!(f, "commit loading failed: {err}"),
-            Self::CommitGraphBuild(err) => write!(f, "commit graph build failed: {err}"),
-            Self::RepoOpen(err) => write!(f, "repo open error: {err}"),
-            Self::EmptyStartSetWithRefs => {
-                write!(
-                    f,
-                    "empty start set while repository refs exist (refusing silent no-op scan)"
-                )
-            }
-            Self::ConcurrentMaintenance => write!(f, "concurrent maintenance detected"),
-        }
-    }
-}
-
-impl std::error::Error for ArtifactAcquireError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            Self::MidxBuild(err) => Some(err),
-            Self::MidxParse(err) => Some(err),
-            Self::CommitLoad(err) => Some(err),
-            Self::CommitGraphBuild(err) => Some(err),
-            Self::RepoOpen(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for ArtifactAcquireError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<MidxBuildError> for ArtifactAcquireError {
-    fn from(err: MidxBuildError) -> Self {
-        Self::MidxBuild(err)
-    }
-}
-
-impl From<MidxError> for ArtifactAcquireError {
-    fn from(err: MidxError) -> Self {
-        Self::MidxParse(err)
-    }
-}
-
-impl From<CommitLoadError> for ArtifactAcquireError {
-    fn from(err: CommitLoadError) -> Self {
-        Self::CommitLoad(err)
-    }
-}
-
-impl From<RepoOpenError> for ArtifactAcquireError {
-    fn from(err: RepoOpenError) -> Self {
-        Self::RepoOpen(err)
-    }
 }
 
 /// Output of MIDX acquisition, carrying the MIDX bytes and resolved
