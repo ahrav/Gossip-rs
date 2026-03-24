@@ -52,16 +52,16 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use super::{
-    derive_ovid_hash, CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode,
-    DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, FindingRecord,
-    FindingsCommitReceipt, FindingsSink, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
-    OvidHash, OvidHashInputs,
+    CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey,
+    DoneLedgerProvenance, DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsCommitReceipt,
+    FindingsSink, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord, OvidHash,
+    OvidHashInputs, derive_ovid_hash,
 };
 use crate::{
     connector::{Location, VersionId},
     identity::{
-        key_secret_hash, FenceEpoch, LogicalTime, NormHash, ObjectVersionId, PolicyHash,
-        RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
+        FenceEpoch, LogicalTime, NormHash, ObjectVersionId, PolicyHash, RuleFingerprint, RunId,
+        ShardId, StableItemId, TenantId, TenantSecretKey, key_secret_hash,
     },
 };
 

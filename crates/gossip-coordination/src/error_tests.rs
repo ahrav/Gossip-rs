@@ -70,6 +70,10 @@ fn cursor_variants() -> Vec<CoordError> {
             size: MAX_KEY_SIZE + 1,
             max: MAX_KEY_SIZE,
         },
+        CoordError::CursorTokenTooLarge {
+            size: MAX_TOKEN_SIZE + 1,
+            max: MAX_TOKEN_SIZE,
+        },
     ]
 }
 
@@ -81,7 +85,7 @@ fn checkpoint_missing_key_variant() -> CoordError {
     CoordError::CheckpointMissingKey
 }
 
-/// All 11 `CoordError` variants. Used by the display-determinism test.
+/// All 12 `CoordError` variants. Used by the display-determinism test.
 fn all_coord_error_variants() -> Vec<CoordError> {
     let mut v = common_precondition_variants();
     v.push(op_id_conflict_variant());
