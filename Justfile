@@ -30,9 +30,9 @@ migrate:
 
 # ── Scan workflow ─────────────────────────────────────────────────────
 
-# Seed a run with one full-range shard pointing at PATH
-seed PATH:
-    cargo run -p dev-seed -- seed "{{PATH}}"
+# Submit a filesystem request for PATH (`single_file` or `directory_root`)
+seed MODE PATH:
+    cargo run -p dev-seed -- seed "{{MODE}}" "{{PATH}}"
 
 # Run the distributed worker against local backends
 run-worker PATH:
@@ -54,7 +54,7 @@ run-worker PATH:
     cargo run -p gossip-worker -- --mode=connector fs "{{PATH}}"
 
 # Seed + run worker in one step (full distributed scan of PATH)
-scan PATH: (seed PATH) (run-worker PATH)
+scan PATH: (seed "directory_root" PATH) (run-worker PATH)
 
 # Show row counts from findings + done-ledger databases
 inspect:
