@@ -3713,14 +3713,6 @@ mod tests {
         }
     }
 
-    fn assert_perf_u64(actual: u64, expected: u64) {
-        if cfg!(all(feature = "perf-stats", debug_assertions)) {
-            assert_eq!(actual, expected);
-        } else {
-            assert_eq!(actual, 0);
-        }
-    }
-
     #[test]
     fn candidate_range_from_bounds_preserves_values() {
         let range = CandidateRange::from_bounds(7, 11);
@@ -3944,7 +3936,7 @@ mod tests {
 
         assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_perf_u32(report.stats.large_blob_spilled_count, 1);
-        assert_perf_u64(report.stats.large_blob_bytes, data.len() as u64);
+        crate::test_utils::assert_perf_u64(report.stats.large_blob_bytes, data.len() as u64);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(data.as_slice())
@@ -4035,7 +4027,10 @@ mod tests {
 
         assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_perf_u32(report.stats.large_blob_spilled_count, 1);
-        assert_perf_u64(report.stats.large_blob_bytes, result_bytes.len() as u64);
+        crate::test_utils::assert_perf_u64(
+            report.stats.large_blob_bytes,
+            result_bytes.len() as u64,
+        );
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
