@@ -7,15 +7,19 @@
 //!
 //! The helper keeps the existing coordination lifecycle intact:
 //!
-//! 1. Encode the typed filesystem payload into shard metadata bytes.
-//! 2. Lower the planned startup geometry into bounded shard-spec ranges.
-//! 3. Build a validated manifest with [`gossip_frontier::builder::PreallocShardBuilder`].
-//! 4. Call [`gossip_coordination::RunManagement::create_run_with_shards`].
+//! 1. Validate that the typed payload agrees with the normalized request
+//!    (mode and canonical root must match). This runs before any coordinator
+//!    mutation so a mismatch never leaves partial state.
+//! 2. Encode the typed filesystem payload into shard metadata bytes.
+//! 3. Lower the planned startup geometry into bounded shard-spec ranges.
+//! 4. Build a validated manifest with [`gossip_frontier::builder::PreallocShardBuilder`].
+//! 5. Call [`gossip_coordination::RunManagement::create_run_with_shards`].
 //!
 //! The returned [`IdempotentOutcome`] preserves whether this was the first
 //! execution or a safe replay after an earlier partial attempt.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use gossip_coordination::{
     CreateRunError, IdempotentOutcome, LogicalTime, OpId, RunId, RunManagement, RunRecord,
@@ -27,24 +31,31 @@ use crate::payload::{FilesystemShardPayload, FilesystemShardPayloadEncodeError};
 use crate::planner::InitialShardGeometry;
 use crate::request::{FilesystemSourceMode, NormalizedFilesystemRequest};
 
+/// Lowest byte value in the filesystem keyspace.
+///
+/// Filesystem shard keys are root-relative UTF-8 paths, which are always
+/// non-empty.  `0x00` sorts below every valid path byte, so it serves as
+/// an exclusive lower sentinel that manifest registration accepts.
 const FILESYSTEM_KEYSPACE_FLOOR: &[u8] = b"\x00";
+
+/// Highest byte value in the filesystem keyspace.
+///
+/// Valid UTF-8 never produces the byte `0xFF`, so it sorts above every
+/// valid path key and provides a finite exclusive upper bound for
+/// manifest registration.
 const FILESYSTEM_KEYSPACE_CEILING: &[u8] = b"\xFF";
 
 /// Result of a successful filesystem run setup.
 ///
-/// The run record is coordination-authoritative. `root_shards` is copied out
-/// explicitly so later submission entrypoints can forward the registered
-/// startup shard IDs without re-reading the record.
+/// The run record is coordination-authoritative and owns the root shard list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilesystemRunSetupResult {
     run: RunRecord,
-    root_shards: Box<[ShardId]>,
 }
 
 impl FilesystemRunSetupResult {
     fn from_run(run: RunRecord) -> Self {
-        let root_shards = run.root_shards().to_vec().into_boxed_slice();
-        Self { run, root_shards }
+        Self { run }
     }
 
     /// Coordination-authoritative run record after setup.
@@ -56,7 +67,7 @@ impl FilesystemRunSetupResult {
     /// Registered root shard IDs for the startup manifest.
     #[must_use]
     pub fn root_shards(&self) -> &[ShardId] {
-        &self.root_shards
+        self.run.root_shards()
     }
 }
 
@@ -64,11 +75,24 @@ impl FilesystemRunSetupResult {
 ///
 /// Bundles the three orchestrator stages that precede coordination writes so
 /// callers pass one typed value instead of parallel positional arguments.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct FilesystemRunSetupInput<'a> {
     request: &'a NormalizedFilesystemRequest,
     geometry: InitialShardGeometry,
     payload: &'a FilesystemShardPayload,
+}
+
+// Custom Debug: redacts the request's canonical root to prevent filesystem
+// path leakage.  The payload field delegates to its own redacting Debug impl.
+impl fmt::Debug for FilesystemRunSetupInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilesystemRunSetupInput")
+            .field("mode", &self.request.mode())
+            .field("canonical_root", &"<redacted>")
+            .field("geometry", &self.geometry)
+            .field("payload", &self.payload)
+            .finish()
+    }
 }
 
 impl<'a> FilesystemRunSetupInput<'a> {
@@ -106,8 +130,6 @@ impl<'a> FilesystemRunSetupInput<'a> {
 }
 
 /// Errors from [`setup_filesystem_run`].
-#[derive(Debug)]
-#[non_exhaustive]
 pub enum FilesystemRunSetupError {
     /// The typed payload mode disagrees with the normalized request.
     PayloadModeMismatch {
@@ -115,13 +137,40 @@ pub enum FilesystemRunSetupError {
         payload: FilesystemSourceMode,
     },
     /// The typed payload root disagrees with the normalized request.
-    PayloadRootMismatch,
+    PayloadRootMismatch {
+        /// Canonical root from the normalized request.
+        request_root: PathBuf,
+        /// Canonical root carried by the payload.
+        payload_root: PathBuf,
+    },
     /// Payload encoding failed before manifest construction.
     PayloadEncode(FilesystemShardPayloadEncodeError),
     /// Manifest lowering or validation failed before coordinator mutation.
     ManifestBuild(PreallocShardBuilderError),
     /// Run creation or registration failed in the coordination backend.
     CreateRun(CreateRunError),
+}
+
+// Custom Debug: redacts PathBuf fields in PayloadRootMismatch to prevent
+// filesystem path leakage through error chains.
+impl fmt::Debug for FilesystemRunSetupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadModeMismatch { request, payload } => f
+                .debug_struct("PayloadModeMismatch")
+                .field("request", request)
+                .field("payload", payload)
+                .finish(),
+            Self::PayloadRootMismatch { .. } => f
+                .debug_struct("PayloadRootMismatch")
+                .field("request_root", &"<redacted>")
+                .field("payload_root", &"<redacted>")
+                .finish(),
+            Self::PayloadEncode(err) => f.debug_tuple("PayloadEncode").field(err).finish(),
+            Self::ManifestBuild(err) => f.debug_tuple("ManifestBuild").field(err).finish(),
+            Self::CreateRun(err) => f.debug_tuple("CreateRun").field(err).finish(),
+        }
+    }
 }
 
 impl fmt::Display for FilesystemRunSetupError {
@@ -131,9 +180,15 @@ impl fmt::Display for FilesystemRunSetupError {
                 f,
                 "filesystem payload mode '{payload}' does not match normalized request mode '{request}'"
             ),
-            Self::PayloadRootMismatch => {
-                f.write_str("filesystem payload root does not match normalized request root")
-            }
+            Self::PayloadRootMismatch {
+                request_root,
+                payload_root,
+            } => write!(
+                f,
+                "filesystem payload root '{}' does not match normalized request root '{}'",
+                payload_root.display(),
+                request_root.display()
+            ),
             Self::PayloadEncode(err) => write!(f, "filesystem payload encode failed: {err}"),
             Self::ManifestBuild(err) => write!(f, "filesystem manifest build failed: {err}"),
             Self::CreateRun(err) => write!(f, "filesystem run setup failed: {err}"),
@@ -147,7 +202,7 @@ impl std::error::Error for FilesystemRunSetupError {
             Self::PayloadEncode(err) => Some(err),
             Self::ManifestBuild(err) => Some(err),
             Self::CreateRun(err) => Some(err),
-            Self::PayloadModeMismatch { .. } | Self::PayloadRootMismatch => None,
+            Self::PayloadModeMismatch { .. } | Self::PayloadRootMismatch { .. } => None,
         }
     }
 }
@@ -215,12 +270,14 @@ where
 
     let encoded_payload = payload.encode()?;
     let (start, end) = lower_geometry_bounds(&geometry);
-    let byte_capacity = slab_allocation_bytes(start.len())
-        + slab_allocation_bytes(end.len())
-        + slab_allocation_bytes(encoded_payload.len());
+
+    // The arena stores three byte slices: start bound, end bound, and the
+    // encoded shard metadata (which wraps the payload in a ShardMetadata
+    // envelope with a 5-byte header).  A generous flat padding avoids
+    // coupling to ByteSlab's internal bucket-rounding strategy.
+    let byte_capacity = start.len() + end.len() + encoded_payload.len() + 128;
     let mut arena = ShardArena::with_capacity(1, byte_capacity);
-    let mut builder =
-        PreallocShardBuilder::<1>::new(&mut arena, 1).expect("fixed one-entry builder is valid");
+    let mut builder = PreallocShardBuilder::<1>::new(&mut arena, 1)?;
     let _ = builder.add_range(start, end, &encoded_payload)?;
     let manifest = builder.build_inputs()?;
 
@@ -236,6 +293,10 @@ where
     Ok(outcome.map(FilesystemRunSetupResult::from_run))
 }
 
+/// Verify that the payload's mode and canonical root agree with the request.
+///
+/// This check runs before any coordinator mutation so that a mismatched
+/// request/payload pair never leaves a half-created run in the coordinator.
 fn validate_request_payload(
     request: &NormalizedFilesystemRequest,
     payload: &FilesystemShardPayload,
@@ -247,16 +308,20 @@ fn validate_request_payload(
         });
     }
     if request.canonical_root() != payload.canonical_root() {
-        return Err(FilesystemRunSetupError::PayloadRootMismatch);
+        return Err(FilesystemRunSetupError::PayloadRootMismatch {
+            request_root: request.canonical_root().to_path_buf(),
+            payload_root: payload.canonical_root().to_path_buf(),
+        });
     }
     Ok(())
 }
 
+/// Replace unbounded geometry endpoints with the keyspace sentinels.
+///
+/// Manifest registration requires finite byte-slice bounds, so unbounded
+/// start maps to [`FILESYSTEM_KEYSPACE_FLOOR`] and unbounded end maps to
+/// [`FILESYSTEM_KEYSPACE_CEILING`].  Bounded endpoints pass through as-is.
 fn lower_geometry_bounds(geometry: &InitialShardGeometry) -> (&[u8], &[u8]) {
-    // Filesystem startup shards cover root-relative UTF-8 path keys.
-    // Those keys are non-empty, so `0x00` sorts below every valid item key.
-    // Valid UTF-8 never uses `0xFF`, so `0xFF` sorts above every valid item
-    // key and gives a finite upper bound that manifest registration accepts.
     let start = if geometry.is_start_unbounded() {
         FILESYSTEM_KEYSPACE_FLOOR
     } else {
@@ -268,14 +333,6 @@ fn lower_geometry_bounds(geometry: &InitialShardGeometry) -> (&[u8], &[u8]) {
         geometry.key_range_end()
     };
     (start, end)
-}
-
-fn slab_allocation_bytes(len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        len.checked_next_power_of_two().unwrap_or(len).max(16)
-    }
 }
 
 #[cfg(test)]
@@ -324,6 +381,12 @@ mod tests {
             .expect("directory request should normalize")
     }
 
+    fn normalize_single_file(path: &Path, config: RunConfig) -> NormalizedFilesystemRequest {
+        FilesystemRequest::single_file(path, config)
+            .normalize()
+            .expect("single-file request should normalize")
+    }
+
     #[test]
     fn setup_filesystem_run_creates_active_claimable_root_shard() {
         let dir = tempdir().expect("tempdir");
@@ -348,12 +411,41 @@ mod tests {
         let result = outcome.into_inner();
         assert_eq!(result.run().status(), RunStatus::Active);
         assert_eq!(result.root_shards().len(), 1);
-        assert_eq!(result.run().root_shards(), result.root_shards());
-
         let mut scratch = AcquireScratch::new();
         let claimed = coordinator
             .claim_next_available(now(2), tenant(), run(), worker(), &mut scratch)
             .expect("registered root shard should be claimable");
+        assert_eq!(claimed.lease.shard(), result.root_shards()[0]);
+    }
+
+    #[test]
+    fn setup_filesystem_run_single_file_creates_active_claimable_root_shard() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("target.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+        let request = normalize_single_file(&file_path, run_config());
+        let plan = plan_filesystem_initial_shards(request.clone());
+        let payload = plan.shard_payload();
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let outcome = setup_filesystem_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            OpId::from_raw(20),
+        )
+        .expect("single-file run setup should succeed");
+
+        assert!(outcome.is_executed());
+        let result = outcome.into_inner();
+        assert_eq!(result.run().status(), RunStatus::Active);
+        assert_eq!(result.root_shards().len(), 1);
+        let mut scratch = AcquireScratch::new();
+        let claimed = coordinator
+            .claim_next_available(now(2), tenant(), run(), worker(), &mut scratch)
+            .expect("single-file root shard should be claimable");
         assert_eq!(claimed.lease.shard(), result.root_shards()[0]);
     }
 
@@ -516,10 +608,121 @@ mod tests {
         )
         .expect_err("request/payload mismatch should be rejected before mutation");
 
-        assert!(matches!(err, FilesystemRunSetupError::PayloadRootMismatch));
+        assert!(matches!(
+            err,
+            FilesystemRunSetupError::PayloadRootMismatch { .. }
+        ));
         let mut scratch = AcquireScratch::new();
         let claim =
             coordinator.claim_next_available(now(2), tenant(), run(), worker(), &mut scratch);
         assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    #[test]
+    fn setup_filesystem_run_succeeds_with_short_directory_name() {
+        let dir = tempdir().expect("tempdir");
+        // Use a single-char directory name so the encoded payload is short.
+        // This exercises the arena capacity path for small payloads where the
+        // ShardMetadata encoding overhead could push the allocation into a
+        // larger slab bucket.
+        let scan_root = dir.path().join("r");
+        fs::create_dir(&scan_root).expect("create root");
+        let request = normalize_directory(&scan_root, run_config());
+        let plan = plan_filesystem_initial_shards(request.clone());
+        let payload = plan.shard_payload();
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let outcome = setup_filesystem_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            OpId::from_raw(17),
+        )
+        .expect("short-name setup should succeed");
+
+        assert!(outcome.is_executed());
+        assert_eq!(outcome.into_inner().run().status(), RunStatus::Active);
+    }
+
+    #[test]
+    fn setup_filesystem_run_rejects_payload_mode_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let scan_root = dir.path().join("scan-root");
+        fs::create_dir(&scan_root).expect("create root");
+        let request = normalize_directory(&scan_root, run_config());
+        let plan = plan_filesystem_initial_shards(request.clone());
+        // Build a payload with the correct root but wrong mode.
+        let mismatched_payload =
+            FilesystemShardPayload::new(FilesystemSourceMode::SingleFile, request.canonical_root());
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let err = setup_filesystem_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &mismatched_payload),
+            OpId::from_raw(18),
+        )
+        .expect_err("mode mismatch should be rejected before mutation");
+
+        assert!(matches!(
+            err,
+            FilesystemRunSetupError::PayloadModeMismatch {
+                request: FilesystemSourceMode::DirectoryRoot,
+                payload: FilesystemSourceMode::SingleFile,
+            }
+        ));
+        // Verify no coordinator state was left behind.
+        let mut scratch = AcquireScratch::new();
+        let claim =
+            coordinator.claim_next_available(now(2), tenant(), run(), worker(), &mut scratch);
+        assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    #[test]
+    fn debug_redacts_setup_input_path() {
+        let dir = tempdir().expect("tempdir");
+        let scan_root = dir.path().join("secret-root");
+        fs::create_dir(&scan_root).expect("create root");
+        let request = normalize_directory(&scan_root, run_config());
+        let plan = plan_filesystem_initial_shards(request.clone());
+        let payload = plan.shard_payload();
+        let input = FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload);
+
+        let rendered = format!("{input:?}");
+
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must include redaction placeholder: {rendered}"
+        );
+        assert!(
+            !rendered.contains("secret-root"),
+            "Debug output must not leak the directory name: {rendered}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_root_mismatch_error_paths() {
+        let err = FilesystemRunSetupError::PayloadRootMismatch {
+            request_root: PathBuf::from("/sensitive/request"),
+            payload_root: PathBuf::from("/sensitive/payload"),
+        };
+        let rendered = format!("{err:?}");
+
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must include redaction placeholder: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/sensitive/request"),
+            "Debug output must not leak the request root: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/sensitive/payload"),
+            "Debug output must not leak the payload root: {rendered}"
+        );
     }
 }
