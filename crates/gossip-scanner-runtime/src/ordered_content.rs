@@ -374,9 +374,11 @@ impl OrderedContentPage {
 
 /// Done-ledger classification for a single ordered-content page item.
 ///
-/// Assigned by [`OrderedContentPage::prefilter_done_ledger`] based on whether
-/// the item's `OvidHash` (derived from its stable identity and version claim)
-/// already exists in the done ledger for the current tenant and policy.
+/// Assigned by [`OrderedContentPage::prefilter_done_ledger`] from the
+/// done-ledger status for the item's `OvidHash` (derived from its stable
+/// identity and version claim) within the current tenant and policy scope.
+/// Items with no row or a `FailedRetryable` row map to `ScanMiss`;
+/// terminal statuses map to `AlreadyDone`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderedContentPrefilterDisposition {
     /// The item has a done-ledger row with a terminal status (scanned,
