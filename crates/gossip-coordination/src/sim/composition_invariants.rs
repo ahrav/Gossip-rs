@@ -54,8 +54,8 @@ use gossip_contracts::identity::{FenceEpoch, RunId, ShardId, ShardKey, TenantId}
 use gossip_contracts::persistence::DoneLedgerKey;
 use gossip_persistence_inmemory::sim::DoneLedgerOracle;
 
-use super::composition::ProvenanceEntry;
 use super::SimIntrospection;
+use super::composition::ProvenanceEntry;
 
 // ---------------------------------------------------------------------------
 // CrossComponentViolation
