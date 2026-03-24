@@ -384,6 +384,7 @@ mod tests {
         RegisterShardsError, RunConfig, RunManagement, RunStatus, ShardClaiming, TenantId,
         WorkerId,
     };
+    use gossip_frontier::decode_connector_extra;
     use tempfile::tempdir;
 
     use super::*;
@@ -426,8 +427,53 @@ mod tests {
             .expect("single-file request should normalize")
     }
 
+    fn assert_claim_preserves_request_semantics(
+        coordinator: &mut InMemoryCoordinator,
+        request: &NormalizedFilesystemRequest,
+        expected_shard: ShardId,
+    ) {
+        let mut scratch = AcquireScratch::new();
+        let claimed = coordinator
+            .claim_next_available(now(2), tenant(), run(), worker(), &mut scratch)
+            .expect("registered root shard should be claimable");
+
+        assert_eq!(claimed.lease.shard(), expected_shard);
+        assert_eq!(
+            claimed.snapshot.spec().key_range_start(),
+            FILESYSTEM_KEYSPACE_FLOOR
+        );
+        assert_eq!(
+            claimed.snapshot.spec().key_range_end(),
+            FILESYSTEM_KEYSPACE_CEILING
+        );
+
+        let connector_extra = decode_connector_extra(claimed.snapshot.spec())
+            .expect("claim snapshot should decode shard metadata");
+        let decoded = FilesystemShardPayload::decode(connector_extra)
+            .expect("claim snapshot should round-trip filesystem payload");
+        assert_eq!(decoded.mode(), request.mode());
+        assert_eq!(decoded.canonical_root(), request.canonical_root());
+
+        let metadata = fs::metadata(decoded.canonical_root())
+            .expect("decoded canonical root should remain accessible");
+        match decoded.mode() {
+            FilesystemSourceMode::SingleFile => {
+                assert!(
+                    metadata.is_file(),
+                    "single-file payload must hydrate to a file"
+                )
+            }
+            FilesystemSourceMode::DirectoryRoot => {
+                assert!(
+                    metadata.is_dir(),
+                    "directory-root payload must hydrate to a directory"
+                )
+            }
+        }
+    }
+
     #[test]
-    fn setup_filesystem_run_creates_active_claimable_root_shard() {
+    fn setup_filesystem_run_directory_claim_round_trips_payload_and_bounds() {
         let dir = tempdir().expect("tempdir");
         let scan_root = dir.path().join("scan-root");
         fs::create_dir(&scan_root).expect("create root");
@@ -450,15 +496,15 @@ mod tests {
         let result = outcome.into_inner();
         assert_eq!(result.run().status(), RunStatus::Active);
         assert_eq!(result.root_shards().len(), 1);
-        let mut scratch = AcquireScratch::new();
-        let claimed = coordinator
-            .claim_next_available(now(2), tenant(), run(), worker(), &mut scratch)
-            .expect("registered root shard should be claimable");
-        assert_eq!(claimed.lease.shard(), result.root_shards()[0]);
+        assert_claim_preserves_request_semantics(
+            &mut coordinator,
+            &request,
+            result.root_shards()[0],
+        );
     }
 
     #[test]
-    fn setup_filesystem_run_single_file_creates_active_claimable_root_shard() {
+    fn setup_filesystem_run_single_file_claim_round_trips_payload_and_bounds() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("target.txt");
         fs::write(&file_path, "fixture").expect("write fixture");
@@ -481,11 +527,11 @@ mod tests {
         let result = outcome.into_inner();
         assert_eq!(result.run().status(), RunStatus::Active);
         assert_eq!(result.root_shards().len(), 1);
-        let mut scratch = AcquireScratch::new();
-        let claimed = coordinator
-            .claim_next_available(now(2), tenant(), run(), worker(), &mut scratch)
-            .expect("single-file root shard should be claimable");
-        assert_eq!(claimed.lease.shard(), result.root_shards()[0]);
+        assert_claim_preserves_request_semantics(
+            &mut coordinator,
+            &request,
+            result.root_shards()[0],
+        );
     }
 
     #[test]
