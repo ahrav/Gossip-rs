@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use gossip_coordination::RunConfig;
 
+use crate::payload::FilesystemShardPayload;
+
 /// Explicit source mode for filesystem submissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilesystemSourceMode {
@@ -263,6 +265,13 @@ impl NormalizedFilesystemRequest {
     #[must_use]
     pub fn run_config(&self) -> RunConfig {
         self.run_config
+    }
+
+    /// Build the typed shard payload that preserves this request's canonical
+    /// root and explicit source mode through coordination metadata.
+    #[must_use]
+    pub fn shard_payload(&self) -> FilesystemShardPayload {
+        FilesystemShardPayload::from_normalized_request(self)
     }
 
     /// Basename-rooted relative namespace for single-file scans.

@@ -19,6 +19,7 @@ use gossip_coordination::{
     RunConfig, RunManagement,
 };
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
 use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
 use serde_json::Value;
 use tempfile::{NamedTempFile, tempdir};
@@ -236,6 +237,16 @@ fn distributed_now() -> LogicalTime {
     LogicalTime::from_raw(1)
 }
 
+fn distributed_filesystem_payload(path: &Path, mode: FilesystemSourceMode) -> Vec<u8> {
+    FilesystemShardPayload::new(
+        mode,
+        path.canonicalize()
+            .expect("distributed payload path must canonicalize"),
+    )
+    .encode()
+    .expect("distributed payload must encode")
+}
+
 fn setup_distributed_coordinator(
     path: &Path,
     lease_duration_ms: u64,
@@ -251,13 +262,10 @@ fn setup_distributed_coordinator(
         )
         .expect("create run");
 
-    let connector_extra = path
-        .to_str()
-        .expect("test path must be valid UTF-8")
-        .as_bytes();
+    let connector_extra = distributed_filesystem_payload(path, FilesystemSourceMode::DirectoryRoot);
     let mut scratch = ShardSpecScratch::new();
-    let spec_ref =
-        range_shard_ref(b"\x00", b"\xFF", connector_extra, &mut scratch).expect("range shard spec");
+    let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
+        .expect("range shard spec");
     let spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec");
     let shard_id = ShardId::from_raw(1);
     let shards = [InitialShardInput::new(

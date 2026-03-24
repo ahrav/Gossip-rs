@@ -1498,6 +1498,7 @@ dependencies = [
  "gossip-contracts",
  "gossip-coordination",
  "gossip-frontier",
+ "gossip-orchestrator",
  "gossip-persistence-inmemory",
  "gossip-stdx",
  "regex",
