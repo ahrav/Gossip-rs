@@ -233,6 +233,7 @@ mod tests {
     };
     use gossip_coordination_etcd::EtcdCoordinatorConfig;
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+    use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
     use gossip_scanner_runtime::{
         ScanBudgets,
@@ -359,11 +360,11 @@ mod tests {
             .expect("test run creation should succeed");
 
         let mut scratch = ShardSpecScratch::new();
-        let connector_extra = path
-            .to_str()
-            .expect("test paths must be valid UTF-8")
-            .as_bytes();
-        let spec_ref = range_shard_ref(start, end, connector_extra, &mut scratch)
+        let connector_extra =
+            FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, path)
+                .encode()
+                .expect("test payload should encode");
+        let spec_ref = range_shard_ref(start, end, &connector_extra, &mut scratch)
             .expect("range shard spec should build");
         let spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec should build");
         let shard_id = ShardId::from_raw(1);

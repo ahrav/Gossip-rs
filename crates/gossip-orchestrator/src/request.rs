@@ -294,7 +294,6 @@ impl NormalizedFilesystemRequest {
 /// Error messages include filesystem paths for operator diagnostics.
 /// Callers that surface errors to untrusted consumers must redact
 /// path details before returning.
-#[derive(Debug)]
 pub enum FilesystemRequestError {
     /// The request path was empty.
     EmptyPath {
@@ -403,6 +402,53 @@ impl fmt::Display for FilesystemRequestError {
                 "failed to canonicalize allowed root directory '{}': {source}",
                 path.display()
             ),
+        }
+    }
+}
+
+// Custom Debug: redacts all `PathBuf` fields to prevent filesystem path
+// leakage through error chains (`anyhow`, `tracing`, `{:?}` formatting).
+// Display already includes paths for operator diagnostics behind explicit
+// `.display()` calls; Debug must not duplicate that exposure.
+impl fmt::Debug for FilesystemRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPath { mode } => f.debug_struct("EmptyPath").field("mode", mode).finish(),
+            Self::Canonicalize { source, .. } => f
+                .debug_struct("Canonicalize")
+                .field("path", &"<redacted>")
+                .field("source", source)
+                .finish(),
+            Self::Metadata { source, .. } => f
+                .debug_struct("Metadata")
+                .field("path", &"<redacted>")
+                .field("source", source)
+                .finish(),
+            Self::PathKindMismatch { mode, actual, .. } => f
+                .debug_struct("PathKindMismatch")
+                .field("mode", mode)
+                .field("path", &"<redacted>")
+                .field("actual", actual)
+                .finish(),
+            Self::UnsupportedPathKind { .. } => f
+                .debug_struct("UnsupportedPathKind")
+                .field("path", &"<redacted>")
+                .finish(),
+            Self::SingleFileMissingName { .. } => f
+                .debug_struct("SingleFileMissingName")
+                .field("path", &"<redacted>")
+                .finish(),
+            Self::PathConfinementViolation { mode, .. } => f
+                .debug_struct("PathConfinementViolation")
+                .field("mode", mode)
+                .field("path", &"<redacted>")
+                .field("allowed_root", &"<redacted>")
+                .finish(),
+            Self::AllowedRootCanonicalize { source, .. } => f
+                .debug_struct("AllowedRootCanonicalize")
+                .field("path", &"<redacted>")
+                .field("source", source)
+                .finish(),
         }
     }
 }

@@ -16,7 +16,7 @@
 //! 3. **Shard payload encoding** ([`payload`]): defines the typed filesystem
 //!    metadata bytes carried through shard registration and lease hydration.
 //!
-//! Both stages are stateless and synchronous.
+//! All three stages are stateless and synchronous.
 
 pub mod payload;
 pub mod planner;

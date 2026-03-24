@@ -1065,11 +1065,13 @@ const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
 ///
 /// The `connector_extra` metadata originates from a trusted coordination backend,
 /// so no path-containment check is performed here. If the coordination backend
-/// ever accepts untrusted shard metadata, a containment check (for example,
-/// verifying the canonical path falls within allowed roots) must be added at
-/// or before registration. Downstream, the filesystem runtime still validates
-/// the hydrated path and the connector's `openat`/`O_NOFOLLOW` enforcement
-/// prevents symlink traversal during reads.
+/// ever accepts untrusted shard metadata, apply
+/// [`FilesystemRequest::normalize_within`] at submission time to verify the
+/// canonical path falls within allowed roots before registration. Downstream,
+/// the filesystem runtime still validates the hydrated path and the connector's
+/// `openat`/`O_NOFOLLOW` enforcement prevents symlink traversal during reads.
+///
+/// [`FilesystemRequest::normalize_within`]: gossip_orchestrator::FilesystemRequest::normalize_within
 fn hydrate_filesystem_source_from_spec(
     spec: gossip_coordination::ShardSpecRef<'_>,
     scan_template: &FsScanConfig,

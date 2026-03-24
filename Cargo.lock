@@ -793,6 +793,7 @@ dependencies = [
  "gossip-done-ledger-postgres",
  "gossip-findings-postgres",
  "gossip-frontier",
+ "gossip-orchestrator",
  "gossip-stdx",
  "postgres",
 ]
@@ -1532,6 +1533,7 @@ dependencies = [
  "gossip-done-ledger-postgres",
  "gossip-findings-postgres",
  "gossip-frontier",
+ "gossip-orchestrator",
  "gossip-persistence-inmemory",
  "gossip-pg-common",
  "gossip-scanner-runtime",

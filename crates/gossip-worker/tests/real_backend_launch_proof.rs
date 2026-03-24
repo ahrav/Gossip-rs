@@ -33,6 +33,7 @@ use gossip_findings_postgres::{
     apply_all_migrations as apply_findings_migrations, schema as findings_schema,
 };
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
 use gossip_pg_common::test_support::create_test_db;
 use gossip_stdx::hex_encode;
 use gossip_worker::config::{
@@ -223,11 +224,11 @@ fn seed_filesystem_run(
         .expect("test run creation should succeed");
 
     let mut scratch = ShardSpecScratch::new();
-    let connector_extra = scan_root
-        .to_str()
-        .expect("test scan path must be valid UTF-8")
-        .as_bytes();
-    let spec_ref = range_shard_ref(b"\x00", b"\xFF", connector_extra, &mut scratch)
+    let connector_extra =
+        FilesystemShardPayload::new(FilesystemSourceMode::DirectoryRoot, scan_root)
+            .encode()
+            .expect("test payload should encode");
+    let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
         .expect("range shard spec should build");
     let shard_id = ShardId::from_raw(SHARD_ID_RAW);
     let manifest = [InitialShardInput::new(

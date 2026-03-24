@@ -1,23 +1,54 @@
 //! Typed filesystem shard payload carried through shard metadata.
 //!
-//! The payload owns the filesystem-specific shard identity that the generic
-//! frontier metadata envelope transports opaquely:
+//! The coordination layer transports shard metadata as an opaque byte slice
+//! (`connector_extra` in `ShardMetadata` from `gossip-frontier`).  This
+//! module gives that byte slice a typed interpretation specific to
+//! filesystem scans: the **source mode** (single file vs. directory root)
+//! and the **canonical path** that identifies what to scan.
 //!
-//! - the canonical filesystem root or file path to scan
-//! - the explicit source mode (`single_file` or `directory_root`)
+//! # Wire format
 //!
-//! Range bounds remain in the shard spec itself. They are intentionally not
-//! duplicated here.
+//! ```text
+//! ┌──────────┬────────────────────────────┐
+//! │ tag (1B) │  canonical UTF-8 path (nB) │
+//! └──────────┴────────────────────────────┘
+//!   0x00 = single file
+//!   0x01 = directory root
+//! ```
+//!
+//! The format is intentionally minimal and fixed-width-tag: a single leading
+//! byte discriminates the source mode, followed by the canonical path as raw
+//! UTF-8.  No length prefix is needed because the `connector_extra` envelope
+//! already carries the total byte count.
+//!
+//! # Scope boundary
+//!
+//! Key-range bounds live in the shard spec itself and are deliberately
+//! **not** duplicated here.  The payload captures _what_ to scan; the shard
+//! spec captures _which slice_ of that scan space the shard owns.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::request::{FilesystemSourceMode, NormalizedFilesystemRequest};
 
+// Wire-format discriminant bytes.  Adding a new mode means adding a new
+// constant here and extending `mode_tag` / `decode_mode`.
 const SINGLE_FILE_TAG: u8 = 0;
 const DIRECTORY_ROOT_TAG: u8 = 1;
 
 /// Filesystem-specific shard payload encoded into `connector_extra`.
+///
+/// Bundles the two pieces of connector-private identity that the generic
+/// coordination envelope cannot represent on its own:
+///
+/// - [`FilesystemSourceMode`] — whether the scan target is a single file or
+///   a directory tree.
+/// - `canonical_root` — the absolute, canonicalized filesystem path.
+///
+/// The payload round-trips deterministically through [`encode`](Self::encode)
+/// / [`decode`](Self::decode).  Coordination and frontier code treat the
+/// encoded bytes as opaque; only the filesystem connector interprets them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilesystemShardPayload {
     mode: FilesystemSourceMode,
@@ -26,6 +57,11 @@ pub struct FilesystemShardPayload {
 
 impl FilesystemShardPayload {
     /// Construct a payload from an explicit source mode and canonical root.
+    ///
+    /// Does not validate the path. Validation is deferred to [`Self::encode`],
+    /// which rejects empty and non-UTF-8 paths. Prefer
+    /// [`Self::from_normalized_request`] for production use — it guarantees a
+    /// canonical, non-empty path.
     #[must_use]
     pub fn new(mode: FilesystemSourceMode, canonical_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -34,7 +70,11 @@ impl FilesystemShardPayload {
         }
     }
 
-    /// Construct the payload that corresponds to one normalized filesystem request.
+    /// Construct the payload from a [`NormalizedFilesystemRequest`].
+    ///
+    /// Extracts the already-canonicalized root and validated source mode,
+    /// so the resulting payload is guaranteed to encode successfully on
+    /// platforms where canonical paths are UTF-8.
     #[must_use]
     pub fn from_normalized_request(request: &NormalizedFilesystemRequest) -> Self {
         Self::new(request.mode(), request.canonical_root())
@@ -52,16 +92,26 @@ impl FilesystemShardPayload {
         &self.canonical_root
     }
 
-    /// Encode the payload into deterministic connector metadata bytes.
+    /// Encode the payload into deterministic `connector_extra` bytes.
     ///
-    /// The wire format is:
+    /// Wire layout:
     ///
-    /// - byte `0`: source-mode tag (`0` = single file, `1` = directory root)
-    /// - bytes `1..`: canonical UTF-8 path bytes
+    /// | offset | content                                          |
+    /// |--------|--------------------------------------------------|
+    /// | `0`    | source-mode tag (`0` = single file, `1` = dir)   |
+    /// | `1..`  | canonical path as UTF-8 bytes (no NUL terminator)|
+    ///
+    /// The output is deterministic: the same `(mode, path)` pair always
+    /// produces the same byte sequence, which is important for shard identity
+    /// comparisons downstream.
     ///
     /// # Errors
     ///
-    /// Returns an error when the canonical path is empty or not valid UTF-8.
+    /// - [`EmptyPath`](FilesystemShardPayloadEncodeError::EmptyPath) — the
+    ///   canonical root is the empty string.
+    /// - [`NonUtf8Path`](FilesystemShardPayloadEncodeError::NonUtf8Path) —
+    ///   the canonical root contains bytes that are not valid UTF-8 (possible
+    ///   on Unix with non-UTF-8 filenames).
     pub fn encode(&self) -> Result<Vec<u8>, FilesystemShardPayloadEncodeError> {
         if self.canonical_root.as_os_str().is_empty() {
             return Err(FilesystemShardPayloadEncodeError::EmptyPath { mode: self.mode });
@@ -79,12 +129,22 @@ impl FilesystemShardPayload {
         Ok(encoded)
     }
 
-    /// Decode filesystem payload bytes from `connector_extra`.
+    /// Decode filesystem payload bytes previously stored in `connector_extra`.
+    ///
+    /// Validates the mode tag, path presence, and UTF-8 well-formedness
+    /// in that order.  On success the returned payload is structurally
+    /// identical to the one that produced `bytes` via [`encode`](Self::encode).
     ///
     /// # Errors
     ///
-    /// Returns an error when the payload is empty, carries an unknown mode tag,
-    /// omits the canonical path bytes, or stores a path that is not valid UTF-8.
+    /// - [`EmptyPayload`](FilesystemShardPayloadDecodeError::EmptyPayload) —
+    ///   zero-length input (no mode tag).
+    /// - [`UnknownModeTag`](FilesystemShardPayloadDecodeError::UnknownModeTag)
+    ///   — the leading byte is not a recognized source-mode discriminant.
+    /// - [`MissingPath`](FilesystemShardPayloadDecodeError::MissingPath) —
+    ///   the tag byte is present but no path bytes follow.
+    /// - [`InvalidUtf8Path`](FilesystemShardPayloadDecodeError::InvalidUtf8Path)
+    ///   — path bytes are present but not valid UTF-8.
     pub fn decode(bytes: &[u8]) -> Result<Self, FilesystemShardPayloadDecodeError> {
         let Some((&tag, canonical_root)) = bytes.split_first() else {
             return Err(FilesystemShardPayloadDecodeError::EmptyPayload);
@@ -103,7 +163,12 @@ impl FilesystemShardPayload {
     }
 }
 
-/// Payload-encoding failures.
+/// Errors from [`FilesystemShardPayload::encode`].
+///
+/// Both variants indicate a payload that was constructed with a path the
+/// wire format cannot represent.  Normal operation through
+/// [`from_normalized_request`](FilesystemShardPayload::from_normalized_request)
+/// avoids these because request normalization canonicalizes the path first.
 #[derive(Debug)]
 pub enum FilesystemShardPayloadEncodeError {
     /// The payload path was empty.
@@ -136,7 +201,10 @@ impl fmt::Display for FilesystemShardPayloadEncodeError {
 
 impl std::error::Error for FilesystemShardPayloadEncodeError {}
 
-/// Payload-decoding failures.
+/// Errors from [`FilesystemShardPayload::decode`].
+///
+/// Variants are ordered by the validation sequence: empty input is checked
+/// first, then the mode tag, then path presence, then path UTF-8 validity.
 #[derive(Debug)]
 pub enum FilesystemShardPayloadDecodeError {
     /// No payload bytes were present.
@@ -185,6 +253,7 @@ impl std::error::Error for FilesystemShardPayloadDecodeError {
     }
 }
 
+/// Map a source mode to its wire-format tag byte.
 fn mode_tag(mode: FilesystemSourceMode) -> u8 {
     match mode {
         FilesystemSourceMode::SingleFile => SINGLE_FILE_TAG,
@@ -192,6 +261,7 @@ fn mode_tag(mode: FilesystemSourceMode) -> u8 {
     }
 }
 
+/// Reverse-map a wire-format tag byte to a source mode.
 fn decode_mode(tag: u8) -> Result<FilesystemSourceMode, FilesystemShardPayloadDecodeError> {
     match tag {
         SINGLE_FILE_TAG => Ok(FilesystemSourceMode::SingleFile),
@@ -202,7 +272,6 @@ fn decode_mode(tag: u8) -> Result<FilesystemSourceMode, FilesystemShardPayloadDe
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
     use std::fs;
 
     use tempfile::tempdir;
@@ -280,6 +349,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn encode_rejects_non_utf8_path() {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
         let path = PathBuf::from(OsString::from_vec(vec![0x66, 0x6f, 0x80]));
