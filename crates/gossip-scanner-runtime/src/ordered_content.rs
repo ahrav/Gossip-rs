@@ -307,12 +307,18 @@ impl OrderedContentPage {
         let (items, page_state) = page.into_parts();
         let tenant_id = write_context.tenant_id();
         let policy_hash = write_context.policy_hash();
-        let mut present = Vec::with_capacity(items.len());
+        let total = items.len();
+        let mut classified = Vec::with_capacity(total);
+        let mut item_iter = items.into_iter();
 
-        // Respect backend batch ceilings without losing positional alignment
-        // across the original page.
-        for item_chunk in items.chunks(RECOMMENDED_MAX_BATCH_SIZE) {
-            let ovid_hashes: Vec<_> = item_chunk
+        // Classify items in backend-sized chunks, building the final
+        // classified list directly to avoid an intermediate boolean buffer.
+        while classified.len() < total {
+            let chunk: Vec<_> = item_iter
+                .by_ref()
+                .take(RECOMMENDED_MAX_BATCH_SIZE)
+                .collect();
+            let ovid_hashes: Vec<_> = chunk
                 .iter()
                 .map(|item| {
                     derive_ovid_hash(&OvidHashInputs {
@@ -324,49 +330,41 @@ impl OrderedContentPage {
             let batch = done_ledger
                 .batch_get(tenant_id, policy_hash, &ovid_hashes)
                 .map_err(|error| {
-                    ScanRuntimeError::Driver(anyhow!(
-                        "ordered-content done-ledger prefilter failed: {error}"
-                    ))
+                    ScanRuntimeError::Driver(
+                        anyhow::Error::new(error)
+                            .context("ordered-content done-ledger prefilter failed"),
+                    )
                 })?;
-            if batch.len() != item_chunk.len() {
+            if batch.len() != chunk.len() {
                 return Err(ScanRuntimeError::Driver(anyhow!(
                     "ordered-content done-ledger prefilter returned {} result(s) for {} lookup key(s)",
                     batch.len(),
-                    item_chunk.len()
+                    chunk.len()
                 )));
             }
-            // FailedRetryable records represent transient failures that should
-            // be retried on the next scan pass. Only terminal statuses
-            // (FailedPermanent, Skipped, ScannedClean, ScannedWithFindings)
-            // count as "already done".
-            present.extend(batch.into_iter().map(|record| {
-                record.is_some_and(|r| r.status() != DoneLedgerStatus::FailedRetryable)
+            // Exhaustive match so adding a new DoneLedgerStatus variant
+            // forces a conscious classification decision here.
+            classified.extend(chunk.into_iter().zip(batch).map(|(item, record)| {
+                let disposition = match record {
+                    Some(r) => match r.status() {
+                        DoneLedgerStatus::ScannedClean
+                        | DoneLedgerStatus::ScannedWithFindings
+                        | DoneLedgerStatus::FailedPermanent
+                        | DoneLedgerStatus::Skipped => {
+                            OrderedContentPrefilterDisposition::AlreadyDone
+                        }
+                        DoneLedgerStatus::FailedRetryable => {
+                            OrderedContentPrefilterDisposition::ScanMiss
+                        }
+                    },
+                    None => OrderedContentPrefilterDisposition::ScanMiss,
+                };
+                OrderedContentClassifiedItem::new(item, disposition)
             }));
         }
 
-        debug_assert_eq!(
-            present.len(),
-            items.len(),
-            "done-ledger presence flags must align with the original page",
-        );
-
-        let items = items
-            .into_iter()
-            .zip(present)
-            .map(|(item, already_done)| {
-                OrderedContentClassifiedItem::new(
-                    item,
-                    if already_done {
-                        OrderedContentPrefilterDisposition::AlreadyDone
-                    } else {
-                        OrderedContentPrefilterDisposition::ScanMiss
-                    },
-                )
-            })
-            .collect();
-
         Ok(OrderedContentPrefilteredPage {
-            items,
+            items: classified,
             page_state,
             report,
             resume_cursor,
@@ -387,7 +385,9 @@ pub enum OrderedContentPrefilterDisposition {
     /// entirely. `FailedRetryable` rows are excluded from this disposition
     /// so those items remain eligible for retry.
     AlreadyDone,
-    /// The item has no done-ledger entry and still needs content scan.
+    /// The item either has no done-ledger entry or has a `FailedRetryable`
+    /// row (transient failure eligible for retry). Content scan is still
+    /// required.
     ScanMiss,
 }
 
