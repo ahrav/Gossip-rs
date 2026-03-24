@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 
 use gossip_coordination::RunConfig;
 
-use crate::payload::FilesystemShardPayload;
-
 /// Explicit source mode for filesystem submissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilesystemSourceMode {
@@ -241,6 +239,14 @@ impl FilesystemRequest {
 /// Produced by [`FilesystemRequest::normalize`]. Downstream control-plane stages
 /// consume the canonical root and explicit mode for shard planning, payload
 /// encoding, and run setup.
+///
+/// # Safety contract
+///
+/// The canonical path stored here was validated against an allowed root at
+/// a point in time. Callers must not open this path directly with
+/// `std::fs::File::open` or equivalent. All reads must go through a
+/// connector that enforces `O_NOFOLLOW`/`openat` at every path component
+/// to close the TOCTOU gap between canonicalization and open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizedFilesystemRequest {
     mode: FilesystemSourceMode,
@@ -265,13 +271,6 @@ impl NormalizedFilesystemRequest {
     #[must_use]
     pub fn run_config(&self) -> RunConfig {
         self.run_config
-    }
-
-    /// Build the typed shard payload that preserves this request's canonical
-    /// root and explicit source mode through coordination metadata.
-    #[must_use]
-    pub fn shard_payload(&self) -> FilesystemShardPayload {
-        FilesystemShardPayload::from_normalized_request(self)
     }
 
     /// Basename-rooted relative namespace for single-file scans.
@@ -861,5 +860,45 @@ mod tests {
             !err_msg.contains("request path"),
             "error message should not say 'request path', got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn normalize_within_rejects_dotdot_traversal_escaping_allowed_root() {
+        let outer = tempdir().expect("outer tempdir");
+        let allowed = outer.path().join("allowed");
+        let sibling = outer.path().join("sibling");
+        fs::create_dir_all(&allowed).expect("create allowed");
+        fs::create_dir_all(&sibling).expect("create sibling");
+        let target = sibling.join("escaped.txt");
+        fs::write(&target, "fixture").expect("write fixture");
+
+        let escaped_path = allowed.join("../sibling/escaped.txt");
+        let request = FilesystemRequest::single_file(escaped_path, run_config());
+        let err = request
+            .normalize_within(&allowed)
+            .expect_err("dotdot traversal must be rejected");
+        assert!(matches!(
+            err,
+            FilesystemRequestError::PathConfinementViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn normalize_within_rejects_directory_root_outside_allowed_root() {
+        let allowed_dir = tempdir().expect("allowed tempdir");
+        let outside_dir = tempdir().expect("outside tempdir");
+
+        let request = FilesystemRequest::directory_root(outside_dir.path(), run_config());
+        let err = request
+            .normalize_within(allowed_dir.path())
+            .expect_err("directory outside allowed root must be rejected");
+
+        assert!(matches!(
+            err,
+            FilesystemRequestError::PathConfinementViolation {
+                mode: FilesystemSourceMode::DirectoryRoot,
+                ..
+            }
+        ));
     }
 }

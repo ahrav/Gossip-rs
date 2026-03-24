@@ -1070,6 +1070,8 @@ const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
 /// canonical path falls within allowed roots before registration. Downstream,
 /// the filesystem runtime still validates the hydrated path and the connector's
 /// `openat`/`O_NOFOLLOW` enforcement prevents symlink traversal during reads.
+/// Hydration uses `symlink_metadata` to reject symlinks before they reach the
+/// connector layer.
 ///
 /// [`FilesystemRequest::normalize_within`]: gossip_orchestrator::FilesystemRequest::normalize_within
 fn hydrate_filesystem_source_from_spec(
@@ -1077,13 +1079,19 @@ fn hydrate_filesystem_source_from_spec(
     scan_template: &FsScanConfig,
 ) -> Result<HydratedFilesystemSource> {
     fn validate_payload_path_kind(payload: &FilesystemShardPayload) -> Result<()> {
-        let metadata = fs::metadata(payload.canonical_root()).with_context(|| {
+        let metadata = fs::symlink_metadata(payload.canonical_root()).with_context(|| {
             format!(
                 "failed to inspect filesystem shard payload path '{}'",
                 payload.canonical_root().display()
             )
         })?;
         let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            anyhow::bail!(
+                "filesystem shard payload path '{}' is a symlink; expected a canonical path",
+                payload.canonical_root().display()
+            );
+        }
         let actual_kind = if file_type.is_file() {
             FilesystemPathKind::File
         } else if file_type.is_dir() {

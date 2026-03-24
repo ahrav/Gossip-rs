@@ -277,6 +277,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::planner::plan_filesystem_initial_shards;
     use crate::test_support::run_config;
 
     #[test]
@@ -287,7 +288,8 @@ mod tests {
         let normalized = crate::request::FilesystemRequest::single_file(&file_path, run_config())
             .normalize()
             .expect("normalize request");
-        let payload = normalized.shard_payload();
+        let plan = plan_filesystem_initial_shards(normalized.clone());
+        let payload = plan.shard_payload();
 
         let decoded = FilesystemShardPayload::decode(&payload.encode().expect("encode payload"))
             .expect("decode payload");
@@ -305,7 +307,8 @@ mod tests {
         let normalized = crate::request::FilesystemRequest::directory_root(&root, run_config())
             .normalize()
             .expect("normalize request");
-        let payload = normalized.shard_payload();
+        let plan = plan_filesystem_initial_shards(normalized.clone());
+        let payload = plan.shard_payload();
 
         let decoded = FilesystemShardPayload::decode(&payload.encode().expect("encode payload"))
             .expect("decode payload");
