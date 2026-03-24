@@ -19,6 +19,7 @@ gossip-done-ledger-postgres.workspace = true
 gossip-findings-postgres.workspace = true
 gossip-scanner-runtime.workspace = true
 postgres.workspace = true
+thiserror = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

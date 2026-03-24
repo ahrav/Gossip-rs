@@ -11,7 +11,7 @@
 //! factory passed to [`run_ordered_content_conformance`] produces fresh sources
 //! over the same fixed source view.
 
-use std::{error::Error, fmt};
+use std::fmt;
 
 use crate::{
     connector::{
@@ -175,10 +175,10 @@ pub struct DrainDivergence {
 }
 
 /// Failure reported by the ordered-content conformance harness.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OrderedContentConformanceError {
     /// The caller passed an invalid zero budget.
-    InvalidBudgets(ConnectorInputError),
+    InvalidBudgets(#[source] ConnectorInputError),
     /// The source returned an enumeration error while the harness was probing
     /// conformance.
     Enumerate {
@@ -314,17 +314,6 @@ impl fmt::Display for OrderedContentConformanceError {
                 f,
                 "ordered-content conformance {field} leak at item {item_index}: {field} ({content}) contained forbidden fragment ({fragment})"
             ),
-        }
-    }
-}
-
-impl Error for OrderedContentConformanceError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidBudgets(err) => Some(err),
-            Self::Enumerate { source, .. } => Some(source),
-            Self::InvalidPage { source, .. } => Some(source),
-            _ => None,
         }
     }
 }

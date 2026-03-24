@@ -1388,6 +1388,7 @@ dependencies = [
  "proptest",
  "rstest",
  "subtle",
+ "thiserror",
 ]
 
 [[package]]
@@ -1404,6 +1405,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rstest",
+ "thiserror",
 ]
 
 [[package]]
@@ -1419,6 +1421,7 @@ dependencies = [
  "rand_chacha",
  "rstest",
  "testcontainers",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -1433,6 +1436,7 @@ dependencies = [
  "gossip-stdx",
  "postgres",
  "proptest",
+ "thiserror",
 ]
 
 [[package]]
@@ -1445,6 +1449,7 @@ dependencies = [
  "gossip-stdx",
  "postgres",
  "proptest",
+ "thiserror",
 ]
 
 [[package]]
@@ -1455,6 +1460,7 @@ dependencies = [
  "gossip-stdx",
  "proptest",
  "rstest",
+ "thiserror",
 ]
 
 [[package]]
@@ -1464,6 +1470,7 @@ dependencies = [
  "gossip-coordination",
  "gossip-frontier",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -1477,6 +1484,7 @@ dependencies = [
  "proptest",
  "rand",
  "rand_chacha",
+ "thiserror",
 ]
 
 [[package]]
@@ -1488,6 +1496,7 @@ dependencies = [
  "postgres",
  "proptest",
  "testcontainers",
+ "thiserror",
 ]
 
 [[package]]
@@ -1509,6 +1518,7 @@ dependencies = [
  "scanner-scheduler",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tracing",
 ]
 
@@ -1541,6 +1551,7 @@ dependencies = [
  "postgres",
  "scanner-scheduler",
  "tempfile",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
  "wait-timeout",
@@ -3153,6 +3164,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "tempfile",
+ "thiserror",
  "vectorscan-rs-sys",
  "zip 0.6.6",
 ]
@@ -3208,6 +3220,7 @@ dependencies = [
  "sha1",
  "sha2",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -3247,6 +3260,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
  "zip 0.6.6",
 ]
 

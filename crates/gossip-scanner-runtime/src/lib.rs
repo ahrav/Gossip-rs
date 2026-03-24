@@ -54,7 +54,6 @@
 //! Owned event types (`OwnedCoreEvent`, `OwnedGitEvent`) carry the
 //! channel payloads without borrowing into the scan's lifetime.
 
-use std::fmt;
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -142,22 +141,11 @@ impl std::str::FromStr for ExecutionMode {
 }
 
 /// Error returned when parsing [`ExecutionMode`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid execution mode '{}' (expected 'direct' or 'connector')", raw)]
 pub struct ParseExecutionModeError {
     raw: String,
 }
-
-impl fmt::Display for ParseExecutionModeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid execution mode '{}' (expected 'direct' or 'connector')",
-            self.raw
-        )
-    }
-}
-
-impl std::error::Error for ParseExecutionModeError {}
 
 /// Anchor extraction mode for rule planning.
 ///
@@ -623,18 +611,20 @@ pub struct ScanCheckpoint {
 /// Covers the full lifecycle from path validation through engine construction
 /// and scan dispatch. Each variant carries enough context for a human-readable
 /// error message without requiring access to the original inputs.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ScanRuntimeError {
     /// A scan target path failed validation.
+    #[error("{origin} path '{}' invalid: {message}", path.display())]
     InvalidPath {
         /// Which subsystem originated the path.
-        source: &'static str,
+        origin: &'static str,
         /// The path that failed validation.
         path: PathBuf,
         /// Human-readable reason for the failure.
         message: String,
     },
     /// A `git` subprocess exited with a non-zero status.
+    #[error("git command failed for '{}' (status={status_code:?}): {stderr}", repo.display())]
     GitCommandFailed {
         /// Repository path the command was invoked against.
         repo: PathBuf,
@@ -644,15 +634,18 @@ pub enum ScanRuntimeError {
         stderr: String,
     },
     /// An I/O operation failed during runtime setup.
+    #[error("{}", fmt_io_error(.op, .path.as_ref(), .error))]
     Io {
         /// Short description of the operation.
         op: &'static str,
         /// Associated file path, when applicable.
         path: Option<PathBuf>,
         /// Underlying I/O error.
+        #[source]
         error: std::io::Error,
     },
     /// The external rules configuration file could not be loaded or parsed.
+    #[error("{}", fmt_rules_config_error(.path.as_ref(), .message))]
     RulesConfig {
         /// Path to the rules file, if one was specified.
         path: Option<PathBuf>,
@@ -660,50 +653,24 @@ pub enum ScanRuntimeError {
         message: String,
     },
     /// A connector input parameter was invalid.
-    ConnectorInput(ConnectorInputError),
+    #[error("{0}")]
+    ConnectorInput(#[source] ConnectorInputError),
     /// The family runtime returned an execution error.
-    Driver(anyhow::Error),
+    #[error("runtime execution failed: {0}")]
+    Driver(#[source] anyhow::Error),
 }
 
-impl fmt::Display for ScanRuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPath {
-                source,
-                path,
-                message,
-            } => write!(f, "{source} path '{}' invalid: {message}", path.display()),
-            Self::GitCommandFailed {
-                repo,
-                status_code,
-                stderr,
-            } => write!(
-                f,
-                "git command failed for '{}' (status={status_code:?}): {stderr}",
-                repo.display()
-            ),
-            Self::Io { op, path, error } => match path {
-                Some(path) => write!(f, "{op} failed for '{}': {error}", path.display()),
-                None => write!(f, "{op} failed: {error}"),
-            },
-            Self::RulesConfig { path, message } => match path {
-                Some(path) => write!(f, "rules config error for '{}': {message}", path.display()),
-                None => write!(f, "rules config error: {message}"),
-            },
-            Self::ConnectorInput(error) => write!(f, "{error}"),
-            Self::Driver(error) => write!(f, "runtime execution failed: {error}"),
-        }
+fn fmt_io_error(op: &str, path: Option<&PathBuf>, error: &std::io::Error) -> String {
+    match path {
+        Some(path) => format!("{op} failed for '{}': {error}", path.display()),
+        None => format!("{op} failed: {error}"),
     }
 }
 
-impl std::error::Error for ScanRuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { error, .. } => Some(error),
-            Self::ConnectorInput(error) => Some(error),
-            Self::Driver(error) => Some(error.as_ref()),
-            _ => None,
-        }
+fn fmt_rules_config_error(path: Option<&PathBuf>, message: &str) -> String {
+    match path {
+        Some(path) => format!("rules config error for '{}': {message}", path.display()),
+        None => format!("rules config error: {message}"),
     }
 }
 
@@ -1902,7 +1869,7 @@ pub(crate) fn join_scoped<T>(
 fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     let meta = fs::metadata(path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => ScanRuntimeError::InvalidPath {
-            source: "filesystem",
+            origin: "filesystem",
             path: path.to_path_buf(),
             message: "path does not exist".to_owned(),
         },
@@ -1914,7 +1881,7 @@ fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     })?;
     if !meta.is_file() && !meta.is_dir() {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "filesystem",
+            origin: "filesystem",
             path: path.to_path_buf(),
             message: "path must be a regular file or directory".to_owned(),
         });
@@ -1935,14 +1902,14 @@ fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
 fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "git",
+            origin: "git",
             path: path.to_path_buf(),
             message: "path does not exist".to_owned(),
         });
     }
     if !path.is_dir() {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "git",
+            origin: "git",
             path: path.to_path_buf(),
             message: "path must be a directory".to_owned(),
         });
@@ -1982,7 +1949,7 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
 
     if canonical_input != canonical_toplevel {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "git",
+            origin: "git",
             path: path.to_path_buf(),
             message: format!(
                 "path is inside a git repository but is not the repository root (root is '{}')",

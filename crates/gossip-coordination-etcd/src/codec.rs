@@ -56,8 +56,6 @@
 //! second is defense-in-depth against the owned intermediate reaching
 //! materialization in an inconsistent state.
 
-use std::fmt;
-
 use gossip_contracts::coordination::{
     CursorSemantics, CursorUpdate, MAX_SPAWNED_PER_SHARD, PooledCursor, PooledShardSpec,
     PooledSpawned, ShardSpecRef,
@@ -136,109 +134,51 @@ pub struct OwnerLeaseValue {
 /// Every variant is `Eq + Clone`, so callers can pattern-match in tests and
 /// propagate errors without losing information. The `#[non_exhaustive]`
 /// attribute allows adding new failure modes without a breaking change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum EtcdCodecError {
     /// The blob ended before the decoder could read the requested bytes.
+    #[error("truncated blob: needed {needed} bytes, only {remaining} remaining")]
     Truncated { needed: usize, remaining: usize },
     /// The leading version tag was not `b"v1"`.
+    #[error("invalid version prefix: expected {VERSION_PREFIX_V1:?}, got {actual:?}")]
     InvalidVersionPrefix { actual: [u8; 2] },
     /// The blob kind byte did not map to a known [`BlobKind`].
+    #[error("invalid blob kind tag: {actual}")]
     InvalidBlobKind { actual: u8 },
     /// The blob header identifies a different record kind than expected.
+    #[error("unexpected blob kind: expected {expected:?}, got {actual:?}")]
     UnexpectedBlobKind {
         expected: BlobKind,
         actual: BlobKind,
     },
     /// A bool field carried a non-`0/1` tag.
+    #[error("invalid bool tag: {actual}")]
     InvalidBool { actual: u8 },
     /// A persisted enum tag does not match the target type.
+    #[error("invalid {ty} discriminant: {actual}")]
     InvalidEnum { ty: &'static str, actual: u8 },
     /// Decoded shard spec bytes violated shard-spec validation rules.
+    #[error("invalid shard spec in blob: {message}")]
     InvalidSpec { message: String },
     /// Decoded cursor bytes violated cursor validation rules.
+    #[error("invalid cursor in blob: {message}")]
     InvalidCursor { message: String },
     /// Allocating pooled shard fields exhausted the caller-provided slab.
-    SlabFull(SlabFull),
+    #[error("insufficient slab capacity while decoding shard record: {0}")]
+    SlabFull(#[from] SlabFull),
     /// Extra bytes remained after a full record decode.
+    #[error("blob has {remaining} trailing bytes after decode")]
     TrailingBytes { remaining: usize },
     /// The decoded record was structurally inconsistent.
+    #[error("decoded {kind} violates invariant: {detail}")]
     InvariantViolation {
         kind: &'static str,
         detail: &'static str,
     },
     /// A variable-length field exceeded the maximum allowed size.
+    #[error("variable-length field too large: {actual} exceeds limit of {max}")]
     FieldTooLarge { actual: usize, max: usize },
-}
-
-impl fmt::Display for EtcdCodecError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Truncated { needed, remaining } => {
-                write!(
-                    f,
-                    "truncated blob: needed {needed} bytes, only {remaining} remaining"
-                )
-            }
-            Self::InvalidVersionPrefix { actual } => {
-                write!(
-                    f,
-                    "invalid version prefix: expected {:?}, got {:?}",
-                    VERSION_PREFIX_V1, actual
-                )
-            }
-            Self::InvalidBlobKind { actual } => {
-                write!(f, "invalid blob kind tag: {actual}")
-            }
-            Self::UnexpectedBlobKind { expected, actual } => {
-                write!(
-                    f,
-                    "unexpected blob kind: expected {expected:?}, got {actual:?}"
-                )
-            }
-            Self::InvalidBool { actual } => write!(f, "invalid bool tag: {actual}"),
-            Self::InvalidEnum { ty, actual } => {
-                write!(f, "invalid {ty} discriminant: {actual}")
-            }
-            Self::InvalidSpec { message } => {
-                write!(f, "invalid shard spec in blob: {message}")
-            }
-            Self::InvalidCursor { message } => {
-                write!(f, "invalid cursor in blob: {message}")
-            }
-            Self::SlabFull(source) => write!(
-                f,
-                "insufficient slab capacity while decoding shard record: {source}"
-            ),
-            Self::TrailingBytes { remaining } => {
-                write!(f, "blob has {remaining} trailing bytes after decode")
-            }
-            Self::InvariantViolation { kind, detail } => {
-                write!(f, "decoded {kind} violates invariant: {detail}")
-            }
-            Self::FieldTooLarge { actual, max } => {
-                write!(
-                    f,
-                    "variable-length field too large: {actual} exceeds limit of {max}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for EtcdCodecError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SlabFull(source) => Some(source),
-            _ => None,
-        }
-    }
-}
-
-impl From<SlabFull> for EtcdCodecError {
-    fn from(value: SlabFull) -> Self {
-        Self::SlabFull(value)
-    }
 }
 
 /// Encode a [`RunRecord`] into a self-describing v1 blob.

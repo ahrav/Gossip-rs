@@ -13,7 +13,6 @@
 //! - Output findings are sorted to keep parity assertions deterministic.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::path::Path;
 
 /// Canonical finding identity used for deterministic parity comparison.
@@ -58,60 +57,31 @@ struct PendingFinding {
 }
 
 /// Errors emitted while canonicalizing JSONL output into parity tuples.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CanonicalizeError {
     /// One JSONL record could not be parsed.
+    #[error("failed to parse JSONL line {line}: {source}")]
     Json {
         line: usize,
         source: serde_json::Error,
     },
     /// A required field is not present on a record.
+    #[error("line {line} is missing required field '{field}'")]
     MissingField { line: usize, field: &'static str },
     /// A field exists but does not match the expected JSON type.
+    #[error("line {line} has invalid type for '{field}'; expected {expected}")]
     InvalidFieldType {
         line: usize,
         field: &'static str,
         expected: &'static str,
     },
     /// A git finding referenced `commit_id` without a matching `commit_meta`.
+    #[error("finding references commit_id {commit_id} but no commit_meta event was emitted")]
     MissingCommitMeta { commit_id: u32 },
     /// No summary record exposed `throughput_mib_s`.
+    #[error("scan output did not include a summary throughput value")]
     MissingSummaryThroughput,
 }
-
-impl fmt::Display for CanonicalizeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Json { line, source } => {
-                write!(f, "failed to parse JSONL line {}: {}", line, source)
-            }
-            Self::MissingField { line, field } => {
-                write!(f, "line {} is missing required field '{}'", line, field)
-            }
-            Self::InvalidFieldType {
-                line,
-                field,
-                expected,
-            } => write!(
-                f,
-                "line {} has invalid type for '{}'; expected {}",
-                line, field, expected
-            ),
-            Self::MissingCommitMeta { commit_id } => {
-                write!(
-                    f,
-                    "finding references commit_id {} but no commit_meta event was emitted",
-                    commit_id
-                )
-            }
-            Self::MissingSummaryThroughput => {
-                write!(f, "scan output did not include a summary throughput value")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CanonicalizeError {}
 
 fn required_str(
     value: &serde_json::Value,

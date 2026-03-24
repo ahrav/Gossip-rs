@@ -38,8 +38,6 @@
 //!   escalation ladder (skip -> fail archive -> fail run) so operators can
 //!   tune severity without code changes.
 
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
 
 /// Default wall-clock deadline (seconds) per root-level archive scan.
@@ -206,104 +204,53 @@ pub struct ArchiveConfig {
 /// The `*Zero` variants catch obviously invalid caps (you cannot scan zero
 /// bytes or zero entries). The compound variants (`*TooSmall`) enforce the
 /// nesting order: inner caps must not exceed their enclosing scope.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ArchiveConfigError {
+    #[error("max_archive_depth must be > 0")]
     MaxArchiveDepthZero,
+    #[error("max_entries_per_archive must be > 0")]
     MaxEntriesPerArchiveZero,
+    #[error("max_uncompressed_bytes_per_entry must be > 0")]
     MaxUncompressedBytesPerEntryZero,
+    #[error("max_total_uncompressed_bytes_per_archive must be > 0")]
     MaxTotalUncompressedBytesPerArchiveZero,
+    #[error("max_total_uncompressed_bytes_per_root must be > 0")]
     MaxTotalUncompressedBytesPerRootZero,
     /// Per-archive byte cap is smaller than the per-entry cap, which would
     /// make it impossible for any single entry to use its full allowance.
-    ArchiveBytesCapTooSmall {
-        per_entry: u64,
-        per_archive: u64,
-    },
+    #[error(
+        "per-archive byte cap must be >= per-entry byte cap (entry={per_entry}, archive={per_archive})"
+    )]
+    ArchiveBytesCapTooSmall { per_entry: u64, per_archive: u64 },
     /// Per-root byte cap is smaller than the per-archive cap, violating the
     /// `entry <= archive <= root` nesting invariant.
-    RootBytesCapTooSmall {
-        per_archive: u64,
-        per_root: u64,
-    },
+    #[error(
+        "per-root byte cap must be >= per-archive byte cap (archive={per_archive}, root={per_root})"
+    )]
+    RootBytesCapTooSmall { per_archive: u64, per_root: u64 },
+    #[error("max_archive_metadata_bytes must be > 0")]
     MaxArchiveMetadataBytesZero,
+    #[error("max_inflation_ratio must be > 0")]
     MaxInflationRatioZero,
+    #[error("max_virtual_path_len_per_entry must be > 0")]
     MaxVirtualPathLenPerEntryZero,
+    #[error("max_virtual_path_bytes_per_archive must be > 0")]
     MaxVirtualPathBytesPerArchiveZero,
     /// Per-archive path budget is smaller than the max path length for a
     /// single entry, meaning even one entry could never store its full path.
+    #[error(
+        "per-archive path budget must be >= per-entry max length (entry={per_entry}, archive={per_archive})"
+    )]
     PathBudgetTooSmall {
         per_entry: usize,
         per_archive: usize,
     },
+    #[error("max_wall_clock_secs_per_root must be > 0 when set")]
     MaxWallClockSecsPerRootZero,
     /// Wall-clock deadline is so large that `Instant::now().checked_add()`
     /// could return `None`, silently disabling the deadline.
-    MaxWallClockSecsPerRootTooLarge {
-        value: u64,
-        max: u64,
-    },
-}
-
-impl fmt::Display for ArchiveConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ArchiveConfigError::MaxArchiveDepthZero => {
-                write!(f, "max_archive_depth must be > 0")
-            }
-            ArchiveConfigError::MaxEntriesPerArchiveZero => {
-                write!(f, "max_entries_per_archive must be > 0")
-            }
-            ArchiveConfigError::MaxUncompressedBytesPerEntryZero => {
-                write!(f, "max_uncompressed_bytes_per_entry must be > 0")
-            }
-            ArchiveConfigError::MaxTotalUncompressedBytesPerArchiveZero => {
-                write!(f, "max_total_uncompressed_bytes_per_archive must be > 0")
-            }
-            ArchiveConfigError::MaxTotalUncompressedBytesPerRootZero => {
-                write!(f, "max_total_uncompressed_bytes_per_root must be > 0")
-            }
-            ArchiveConfigError::ArchiveBytesCapTooSmall {
-                per_entry,
-                per_archive,
-            } => write!(
-                f,
-                "per-archive byte cap must be >= per-entry byte cap (entry={per_entry}, archive={per_archive})"
-            ),
-            ArchiveConfigError::RootBytesCapTooSmall {
-                per_archive,
-                per_root,
-            } => write!(
-                f,
-                "per-root byte cap must be >= per-archive byte cap (archive={per_archive}, root={per_root})"
-            ),
-            ArchiveConfigError::MaxArchiveMetadataBytesZero => {
-                write!(f, "max_archive_metadata_bytes must be > 0")
-            }
-            ArchiveConfigError::MaxInflationRatioZero => {
-                write!(f, "max_inflation_ratio must be > 0")
-            }
-            ArchiveConfigError::MaxVirtualPathLenPerEntryZero => {
-                write!(f, "max_virtual_path_len_per_entry must be > 0")
-            }
-            ArchiveConfigError::MaxVirtualPathBytesPerArchiveZero => {
-                write!(f, "max_virtual_path_bytes_per_archive must be > 0")
-            }
-            ArchiveConfigError::PathBudgetTooSmall {
-                per_entry,
-                per_archive,
-            } => write!(
-                f,
-                "per-archive path budget must be >= per-entry max length (entry={per_entry}, archive={per_archive})"
-            ),
-            ArchiveConfigError::MaxWallClockSecsPerRootZero => {
-                write!(f, "max_wall_clock_secs_per_root must be > 0 when set")
-            }
-            ArchiveConfigError::MaxWallClockSecsPerRootTooLarge { value, max } => write!(
-                f,
-                "max_wall_clock_secs_per_root ({value}) exceeds maximum ({max})"
-            ),
-        }
-    }
+    #[error("max_wall_clock_secs_per_root ({value}) exceeds maximum ({max})")]
+    MaxWallClockSecsPerRootTooLarge { value: u64, max: u64 },
 }
 
 /// Defaults are conservative and optimized for safety over throughput.

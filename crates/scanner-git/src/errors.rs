@@ -22,38 +22,53 @@ use super::midx_error::MidxError;
 ///
 /// These errors occur before any object scanning begins and typically
 /// indicate repository layout, configuration, or limit violations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RepoOpenError {
     /// I/O error during file operations.
-    Io(io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[source] io::Error),
     /// Path canonicalization failed.
-    Canonicalization(io::Error),
+    #[error("path canonicalization failed: {0}")]
+    Canonicalization(#[source] io::Error),
     /// Not a Git repository (no .git dir/file, not bare).
+    #[error("not a Git repository")]
     NotARepository,
     /// The .git file is malformed (bad gitdir pointer).
+    #[error("malformed .git file (expected 'gitdir: <path>')")]
     MalformedGitdirFile,
     /// The gitdir target doesn't exist or isn't a directory.
+    #[error("gitdir target is not a directory")]
     GitdirTargetNotDir,
     /// The commondir file is malformed.
+    #[error("malformed commondir file")]
     MalformedCommondirFile,
     /// The common directory doesn't exist or isn't a directory.
+    #[error("common directory is not a directory")]
     CommonDirNotDir,
     /// The objects directory doesn't exist or isn't a directory.
+    #[error("objects directory is not a directory")]
     ObjectsDirNotDir,
     /// An alternate object directory doesn't exist or isn't a directory.
+    #[error("alternate object directory is not a directory")]
     AlternateNotDir,
     /// File exceeds size limit.
+    #[error("file too large: {size} bytes (limit: {limit})")]
     FileTooLarge { size: u64, limit: u32 },
     /// Start set has too many refs.
+    #[error("start set too large: {count} refs (max: {max})")]
     StartSetTooLarge { count: usize, max: usize },
     /// Ref name exceeds length limit.
+    #[error("ref name too long: {len} bytes (max: {max})")]
     RefNameTooLong { len: usize, max: usize },
     /// Arena capacity exceeded.
+    #[error("arena overflow")]
     ArenaOverflow,
     /// Watermark store returned wrong number of results.
+    #[error("watermark count mismatch: got {got}, expected {expected}")]
     WatermarkCountMismatch { got: usize, expected: usize },
     /// Config file contains invalid UTF-8.
+    #[error("config file contains invalid UTF-8")]
     InvalidUtf8Config,
 }
 
@@ -73,197 +88,94 @@ impl RepoOpenError {
     }
 }
 
-impl fmt::Display for RepoOpenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "I/O error: {err}"),
-            Self::Canonicalization(err) => write!(f, "path canonicalization failed: {err}"),
-            Self::NotARepository => write!(f, "not a Git repository"),
-            Self::MalformedGitdirFile => {
-                write!(f, "malformed .git file (expected 'gitdir: <path>')")
-            }
-            Self::GitdirTargetNotDir => write!(f, "gitdir target is not a directory"),
-            Self::MalformedCommondirFile => write!(f, "malformed commondir file"),
-            Self::CommonDirNotDir => write!(f, "common directory is not a directory"),
-            Self::ObjectsDirNotDir => write!(f, "objects directory is not a directory"),
-            Self::AlternateNotDir => write!(f, "alternate object directory is not a directory"),
-            Self::FileTooLarge { size, limit } => {
-                write!(f, "file too large: {size} bytes (limit: {limit})")
-            }
-            Self::StartSetTooLarge { count, max } => {
-                write!(f, "start set too large: {count} refs (max: {max})")
-            }
-            Self::RefNameTooLong { len, max } => {
-                write!(f, "ref name too long: {len} bytes (max: {max})")
-            }
-            Self::ArenaOverflow => write!(f, "arena overflow"),
-            Self::WatermarkCountMismatch { got, expected } => {
-                write!(
-                    f,
-                    "watermark count mismatch: got {got}, expected {expected}"
-                )
-            }
-            Self::InvalidUtf8Config => write!(f, "config file contains invalid UTF-8"),
-        }
-    }
-}
-
-impl std::error::Error for RepoOpenError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) | Self::Canonicalization(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
 /// Errors from commit selection (commit-graph traversal and ordering).
 ///
 /// These errors occur before tree diffing starts and typically indicate
 /// commit-graph corruption, missing tips, or violated traversal limits.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommitPlanError {
     /// Commit-graph could not be opened or parsed.
+    #[error("commit-graph open failed: {reason}")]
     CommitGraphOpen { reason: String },
     /// OID has invalid length.
+    #[error("invalid OID length: {len} (expected {expected})")]
     InvalidOidLength { len: usize, expected: usize },
     /// Commit-graph exceeds the configured limit.
+    #[error("commit-graph too large: {commits} commits (max: {max})")]
     CommitGraphTooLarge { commits: u32, max: u32 },
     /// Tip commit not found in the commit-graph.
+    #[error("tip commit not found in commit-graph")]
     TipNotFound,
     /// Heap frontier exceeded the configured limit.
+    #[error("heap limit exceeded: {entries} entries (max: {max})")]
     HeapLimitExceeded { entries: u32, max: u32 },
     /// Commit-graph parent list entry is corrupt.
+    #[error("commit-graph parent decode failed")]
     ParentDecodeFailed,
     /// Commit has more parents than allowed.
+    #[error("too many parents: {count} (max: {max})")]
     TooManyParents { count: usize, max: usize },
     /// Topological ordering could not process all commits (cycle or corruption).
+    #[error("topological ordering failed: {remaining} commits unresolved")]
     TopoSortCycle { remaining: u32 },
     /// Identity-ID vector length does not match commit count.
+    #[error("identity_ids length ({identity_ids}) does not match commits ({commits})")]
     IdentityLengthMismatch { commits: usize, identity_ids: usize },
 }
-
-impl fmt::Display for CommitPlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CommitGraphOpen { reason } => {
-                write!(f, "commit-graph open failed: {reason}")
-            }
-            Self::InvalidOidLength { len, expected } => {
-                write!(f, "invalid OID length: {len} (expected {expected})")
-            }
-            Self::CommitGraphTooLarge { commits, max } => {
-                write!(f, "commit-graph too large: {commits} commits (max: {max})")
-            }
-            Self::TipNotFound => write!(f, "tip commit not found in commit-graph"),
-            Self::HeapLimitExceeded { entries, max } => {
-                write!(f, "heap limit exceeded: {entries} entries (max: {max})")
-            }
-            Self::ParentDecodeFailed => write!(f, "commit-graph parent decode failed"),
-            Self::TooManyParents { count, max } => {
-                write!(f, "too many parents: {count} (max: {max})")
-            }
-            Self::TopoSortCycle { remaining } => {
-                write!(
-                    f,
-                    "topological ordering failed: {remaining} commits unresolved"
-                )
-            }
-            Self::IdentityLengthMismatch {
-                commits,
-                identity_ids,
-            } => {
-                write!(
-                    f,
-                    "identity_ids length ({identity_ids}) does not match commits ({commits})"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for CommitPlanError {}
 
 /// Errors from tree diff and candidate collection.
 ///
 /// These errors occur after the commit plan is built, while loading trees
 /// and extracting candidate paths. Many are recoverable by maintenance or
 /// increasing limits (tree depth, bytes, or buffer capacity).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TreeDiffError {
     /// Tree object not found.
+    #[error("tree not found")]
     TreeNotFound,
     /// Object exists but is not a tree.
+    #[error("object is not a tree")]
     NotATree,
     /// Tree object is corrupt or malformed.
+    #[error("corrupt tree: {detail}")]
     CorruptTree { detail: &'static str },
     /// OID has invalid length.
+    #[error("invalid OID length: {len} (expected {expected})")]
     InvalidOidLength { len: usize, expected: usize },
     /// Maximum tree recursion depth exceeded.
+    #[error("max tree depth exceeded: {max_depth}")]
     MaxTreeDepthExceeded { max_depth: u16 },
     /// In-flight tree bytes budget exceeded.
+    #[error("tree bytes in-flight budget exceeded: loaded {loaded}, budget {budget}")]
     TreeBytesBudgetExceeded { loaded: u64, budget: u64 },
     /// Path exceeds length limit.
+    #[error("path too long: {len} bytes (max: {max})")]
     PathTooLong { len: usize, max: usize },
     /// Candidate buffer is full.
+    #[error("candidate buffer full")]
     CandidateBufferFull,
     /// Path arena capacity exceeded.
+    #[error("path arena full")]
     PathArenaFull,
     /// Candidate cap exceeded.
+    #[error("candidate limit exceeded: kind={kind} observed={observed} max={max}")]
     CandidateLimitExceeded {
         kind: MappingCandidateKind,
         max: u32,
         observed: u32,
     },
     /// Candidate sink failed.
+    #[error("candidate sink error: {detail}")]
     CandidateSinkError { detail: String },
     /// Object store failure (MIDX, pack, or loose object decode).
+    #[error("object store error: {detail}")]
     ObjectStoreError { detail: String },
     /// Cooperative abort signalled by another worker.
+    #[error("aborted by cooperative cancellation")]
     Aborted,
 }
-
-impl fmt::Display for TreeDiffError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TreeNotFound => write!(f, "tree not found"),
-            Self::NotATree => write!(f, "object is not a tree"),
-            Self::CorruptTree { detail } => write!(f, "corrupt tree: {detail}"),
-            Self::InvalidOidLength { len, expected } => {
-                write!(f, "invalid OID length: {len} (expected {expected})")
-            }
-            Self::MaxTreeDepthExceeded { max_depth } => {
-                write!(f, "max tree depth exceeded: {max_depth}")
-            }
-            Self::TreeBytesBudgetExceeded { loaded, budget } => {
-                write!(
-                    f,
-                    "tree bytes in-flight budget exceeded: loaded {loaded}, budget {budget}"
-                )
-            }
-            Self::PathTooLong { len, max } => {
-                write!(f, "path too long: {len} bytes (max: {max})")
-            }
-            Self::CandidateBufferFull => write!(f, "candidate buffer full"),
-            Self::PathArenaFull => write!(f, "path arena full"),
-            Self::CandidateLimitExceeded {
-                kind,
-                max,
-                observed,
-            } => write!(
-                f,
-                "candidate limit exceeded: kind={kind} observed={observed} max={max}"
-            ),
-            Self::CandidateSinkError { detail } => write!(f, "candidate sink error: {detail}"),
-            Self::ObjectStoreError { detail } => write!(f, "object store error: {detail}"),
-            Self::Aborted => write!(f, "aborted by cooperative cancellation"),
-        }
-    }
-}
-
-impl std::error::Error for TreeDiffError {}
 
 /// Mapping candidate kind for cap enforcement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,32 +199,44 @@ impl fmt::Display for MappingCandidateKind {
 ///
 /// These errors occur after candidate extraction, when spilling and
 /// de-duplicating large result sets on disk.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SpillError {
     /// I/O error during spill file operations.
-    Io(io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
     /// Maximum number of spill run files exceeded.
+    #[error("spill run limit exceeded: {runs} runs (max: {max})")]
     SpillRunLimitExceeded { runs: usize, max: usize },
     /// Total spill bytes exceeded budget.
+    #[error("spill bytes exceeded: {bytes} bytes (max: {max})")]
     SpillBytesExceeded { bytes: u64, max: u64 },
     /// Spill run file has invalid header.
+    #[error("invalid run file header")]
     InvalidRunHeader,
     /// Spill run file is corrupt.
+    #[error("corrupt run file: {detail}")]
     CorruptRunFile { detail: &'static str },
     /// OID length in run file doesn't match expected.
+    #[error("OID length mismatch in run: got {got}, expected {expected}")]
     OidLengthMismatch { got: u8, expected: u8 },
     /// MIDX mapping or lookup error.
-    MidxError(MidxError),
+    #[error("{0}")]
+    MidxError(#[from] MidxError),
     /// Path in run file exceeds safety limit.
+    #[error("path in run file too long: {len} bytes (max: {max})")]
     RunPathTooLong { len: usize, max: usize },
     /// Seen-blob store returned wrong number of results.
+    #[error("seen-blob response length mismatch: got {got}, expected {expected}")]
     SeenResponseMismatch { got: usize, expected: usize },
     /// Arena capacity exceeded.
+    #[error("arena overflow")]
     ArenaOverflow,
     /// Path exceeds length limit.
+    #[error("path too long: {len} bytes (max: {max})")]
     PathTooLong { len: usize, max: usize },
     /// Mapping candidate cap exceeded.
+    #[error("mapping candidate cap exceeded for {kind}: saw {observed} (max: {max})")]
     MappingCandidateLimitExceeded {
         /// Candidate kind that exceeded the cap.
         kind: MappingCandidateKind,
@@ -323,84 +247,18 @@ pub enum SpillError {
     },
 }
 
-impl fmt::Display for SpillError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "I/O error: {err}"),
-            Self::SpillRunLimitExceeded { runs, max } => {
-                write!(f, "spill run limit exceeded: {runs} runs (max: {max})")
-            }
-            Self::SpillBytesExceeded { bytes, max } => {
-                write!(f, "spill bytes exceeded: {bytes} bytes (max: {max})")
-            }
-            Self::InvalidRunHeader => write!(f, "invalid run file header"),
-            Self::CorruptRunFile { detail } => write!(f, "corrupt run file: {detail}"),
-            Self::OidLengthMismatch { got, expected } => {
-                write!(
-                    f,
-                    "OID length mismatch in run: got {got}, expected {expected}"
-                )
-            }
-            Self::MidxError(err) => write!(f, "{err}"),
-            Self::RunPathTooLong { len, max } => {
-                write!(f, "path in run file too long: {len} bytes (max: {max})")
-            }
-            Self::SeenResponseMismatch { got, expected } => {
-                write!(
-                    f,
-                    "seen-blob response length mismatch: got {got}, expected {expected}"
-                )
-            }
-            Self::ArenaOverflow => write!(f, "arena overflow"),
-            Self::PathTooLong { len, max } => {
-                write!(f, "path too long: {len} bytes (max: {max})")
-            }
-            Self::MappingCandidateLimitExceeded {
-                kind,
-                max,
-                observed,
-            } => {
-                write!(
-                    f,
-                    "mapping candidate cap exceeded for {kind}: saw {observed} (max: {max})"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SpillError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            Self::MidxError(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for SpillError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<MidxError> for SpillError {
-    fn from(err: MidxError) -> Self {
-        Self::MidxError(err)
-    }
-}
-
 /// Errors from persistence operations.
 ///
 /// These errors represent failures after scanning has completed; in-memory
 /// results may still be available even if persistence fails.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PersistError {
     /// I/O error during persistence operations.
-    Io(io::Error),
+    #[error("persistence I/O error: {0}")]
+    Io(#[from] io::Error),
     /// Backend-specific error string.
+    #[error("persistence backend error: {detail}")]
     Backend { detail: String },
 }
 
@@ -417,30 +275,6 @@ impl PersistError {
         Self::Backend {
             detail: detail.into(),
         }
-    }
-}
-
-impl fmt::Display for PersistError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "persistence I/O error: {err}"),
-            Self::Backend { detail } => write!(f, "persistence backend error: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for PersistError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for PersistError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
     }
 }
 

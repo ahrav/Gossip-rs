@@ -363,142 +363,108 @@ pub enum RejectionKind {
 // every error variant is covered, and adding a new variant triggers a
 // compile error here (thanks to non-wildcard matches).
 
-impl From<AcquireError> for RejectionKind {
-    fn from(e: AcquireError) -> Self {
-        match e {
-            AcquireError::ShardTerminal { .. } => Self::TerminalState,
-            AcquireError::ShardNotFound { .. } => Self::ShardNotFound,
-            AcquireError::TenantMismatch { .. } => Self::TenantMismatch,
-            AcquireError::AlreadyLeased { .. } => Self::AlreadyLeased,
-            AcquireError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
+/// Generates `impl From<$error_ty> for RejectionKind`.
+///
+/// Each arm maps an error variant pattern to a `RejectionKind` variant.
+/// A `BackendError` arm is appended automatically and panics, since the
+/// in-memory simulation backend never produces infrastructure errors.
+macro_rules! impl_rejection_from {
+    ($error_ty:ident, $($variant:pat => $kind:expr),+ $(,)?) => {
+        impl From<$error_ty> for RejectionKind {
+            fn from(e: $error_ty) -> Self {
+                match e {
+                    $($variant => $kind,)+
+                    $error_ty::BackendError(infra) => {
+                        panic!(
+                            "simulation backend produced unexpected infrastructure error: {infra}"
+                        )
+                    }
+                }
             }
         }
-    }
+    };
 }
 
-impl From<RenewError> for RejectionKind {
-    fn from(e: RenewError) -> Self {
-        match e {
-            RenewError::StaleFence { .. } => Self::StaleFence,
-            RenewError::LeaseExpired { .. } => Self::LeaseExpired,
-            RenewError::ShardTerminal { .. } => Self::TerminalState,
-            RenewError::ShardNotFound { .. } => Self::ShardNotFound,
-            RenewError::TenantMismatch { .. } => Self::TenantMismatch,
-            RenewError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(AcquireError,
+    AcquireError::ShardTerminal { .. } => Self::TerminalState,
+    AcquireError::ShardNotFound { .. } => Self::ShardNotFound,
+    AcquireError::TenantMismatch { .. } => Self::TenantMismatch,
+    AcquireError::AlreadyLeased { .. } => Self::AlreadyLeased,
+);
 
-impl From<CheckpointError> for RejectionKind {
-    fn from(e: CheckpointError) -> Self {
-        match e {
-            CheckpointError::StaleFence { .. } => Self::StaleFence,
-            CheckpointError::LeaseExpired { .. } => Self::LeaseExpired,
-            CheckpointError::ShardTerminal { .. } => Self::TerminalState,
-            CheckpointError::OpIdConflict { .. } => Self::OpIdConflict,
-            CheckpointError::CursorRegression { .. } => Self::CursorRegression,
-            CheckpointError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
-            CheckpointError::CursorKeyTooLarge { .. } => Self::CursorKeyTooLarge,
-            CheckpointError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
-            CheckpointError::ShardNotFound { .. } => Self::ShardNotFound,
-            CheckpointError::TenantMismatch { .. } => Self::TenantMismatch,
-            CheckpointError::CheckpointMissingKey => Self::CheckpointMissingKey,
-            CheckpointError::ResourceExhausted(_) => Self::ResourceExhausted,
-            CheckpointError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(RenewError,
+    RenewError::StaleFence { .. }      => Self::StaleFence,
+    RenewError::LeaseExpired { .. }    => Self::LeaseExpired,
+    RenewError::ShardTerminal { .. }   => Self::TerminalState,
+    RenewError::ShardNotFound { .. }   => Self::ShardNotFound,
+    RenewError::TenantMismatch { .. }  => Self::TenantMismatch,
+);
 
-impl From<CompleteError> for RejectionKind {
-    fn from(e: CompleteError) -> Self {
-        match e {
-            CompleteError::StaleFence { .. } => Self::StaleFence,
-            CompleteError::LeaseExpired { .. } => Self::LeaseExpired,
-            CompleteError::ShardTerminal { .. } => Self::TerminalState,
-            CompleteError::OpIdConflict { .. } => Self::OpIdConflict,
-            CompleteError::CursorRegression { .. } => Self::CursorRegression,
-            CompleteError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
-            CompleteError::CursorKeyTooLarge { .. } => Self::CursorKeyTooLarge,
-            CompleteError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
-            CompleteError::ShardNotFound { .. } => Self::ShardNotFound,
-            CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
-            CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,
-            CompleteError::ResourceExhausted(_) => Self::ResourceExhausted,
-            CompleteError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(CheckpointError,
+    CheckpointError::StaleFence { .. }         => Self::StaleFence,
+    CheckpointError::LeaseExpired { .. }       => Self::LeaseExpired,
+    CheckpointError::ShardTerminal { .. }      => Self::TerminalState,
+    CheckpointError::OpIdConflict { .. }       => Self::OpIdConflict,
+    CheckpointError::CursorRegression { .. }   => Self::CursorRegression,
+    CheckpointError::CursorOutOfBounds(_)      => Self::CursorOutOfBounds,
+    CheckpointError::CursorKeyTooLarge { .. }  => Self::CursorKeyTooLarge,
+    CheckpointError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
+    CheckpointError::ShardNotFound { .. }      => Self::ShardNotFound,
+    CheckpointError::TenantMismatch { .. }     => Self::TenantMismatch,
+    CheckpointError::CheckpointMissingKey      => Self::CheckpointMissingKey,
+    CheckpointError::ResourceExhausted(_)      => Self::ResourceExhausted,
+);
 
-impl From<ParkError> for RejectionKind {
-    fn from(e: ParkError) -> Self {
-        match e {
-            ParkError::StaleFence { .. } => Self::StaleFence,
-            ParkError::LeaseExpired { .. } => Self::LeaseExpired,
-            ParkError::ShardTerminal { .. } => Self::TerminalState,
-            ParkError::OpIdConflict { .. } => Self::OpIdConflict,
-            ParkError::ShardNotFound { .. } => Self::ShardNotFound,
-            ParkError::TenantMismatch { .. } => Self::TenantMismatch,
-            ParkError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(CompleteError,
+    CompleteError::StaleFence { .. }         => Self::StaleFence,
+    CompleteError::LeaseExpired { .. }       => Self::LeaseExpired,
+    CompleteError::ShardTerminal { .. }      => Self::TerminalState,
+    CompleteError::OpIdConflict { .. }       => Self::OpIdConflict,
+    CompleteError::CursorRegression { .. }   => Self::CursorRegression,
+    CompleteError::CursorOutOfBounds(_)      => Self::CursorOutOfBounds,
+    CompleteError::CursorKeyTooLarge { .. }  => Self::CursorKeyTooLarge,
+    CompleteError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
+    CompleteError::ShardNotFound { .. }      => Self::ShardNotFound,
+    CompleteError::TenantMismatch { .. }     => Self::TenantMismatch,
+    CompleteError::CheckpointMissingKey      => Self::CheckpointMissingKey,
+    CompleteError::ResourceExhausted(_)      => Self::ResourceExhausted,
+);
 
-impl From<SplitError> for RejectionKind {
-    fn from(e: SplitError) -> Self {
-        match e {
-            SplitError::StaleFence { .. } => Self::StaleFence,
-            SplitError::LeaseExpired { .. } => Self::LeaseExpired,
-            SplitError::ShardTerminal { .. } => Self::TerminalState,
-            SplitError::OpIdConflict { .. } => Self::OpIdConflict,
-            SplitError::SplitInvalid(_) => Self::SplitValidation,
-            SplitError::ShardNotFound { .. } => Self::ShardNotFound,
-            SplitError::TenantMismatch { .. } => Self::TenantMismatch,
-            SplitError::ResourceExhausted(_) => Self::ResourceExhausted,
-            SplitError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(ParkError,
+    ParkError::StaleFence { .. }      => Self::StaleFence,
+    ParkError::LeaseExpired { .. }    => Self::LeaseExpired,
+    ParkError::ShardTerminal { .. }   => Self::TerminalState,
+    ParkError::OpIdConflict { .. }    => Self::OpIdConflict,
+    ParkError::ShardNotFound { .. }   => Self::ShardNotFound,
+    ParkError::TenantMismatch { .. }  => Self::TenantMismatch,
+);
 
-impl From<UnparkError> for RejectionKind {
-    fn from(e: UnparkError) -> Self {
-        match e {
-            UnparkError::ShardNotFound => Self::ShardNotFound,
-            UnparkError::TenantMismatch { .. } => Self::TenantMismatch,
-            UnparkError::RunTerminal { .. } => Self::TerminalState,
-            UnparkError::NotParked { .. } => Self::NotParked,
-            UnparkError::OpIdConflict(_) => Self::OpIdConflict,
-            UnparkError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(SplitError,
+    SplitError::StaleFence { .. }      => Self::StaleFence,
+    SplitError::LeaseExpired { .. }    => Self::LeaseExpired,
+    SplitError::ShardTerminal { .. }   => Self::TerminalState,
+    SplitError::OpIdConflict { .. }    => Self::OpIdConflict,
+    SplitError::SplitInvalid(_)        => Self::SplitValidation,
+    SplitError::ShardNotFound { .. }   => Self::ShardNotFound,
+    SplitError::TenantMismatch { .. }  => Self::TenantMismatch,
+    SplitError::ResourceExhausted(_)   => Self::ResourceExhausted,
+);
 
-impl From<RunTransitionError> for RejectionKind {
-    fn from(e: RunTransitionError) -> Self {
-        match e {
-            RunTransitionError::RunNotFound => Self::RunNotFound,
-            RunTransitionError::TenantMismatch { .. } => Self::TenantMismatch,
-            RunTransitionError::RunTerminal { .. } => Self::TerminalState,
-            RunTransitionError::WrongStatus { .. } => Self::WrongRunStatus,
-            RunTransitionError::OpIdConflict(_) => Self::OpIdConflict,
-            RunTransitionError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(UnparkError,
+    UnparkError::ShardNotFound         => Self::ShardNotFound,
+    UnparkError::TenantMismatch { .. } => Self::TenantMismatch,
+    UnparkError::RunTerminal { .. }    => Self::TerminalState,
+    UnparkError::NotParked { .. }      => Self::NotParked,
+    UnparkError::OpIdConflict(_)       => Self::OpIdConflict,
+);
+
+impl_rejection_from!(RunTransitionError,
+    RunTransitionError::RunNotFound          => Self::RunNotFound,
+    RunTransitionError::TenantMismatch { .. } => Self::TenantMismatch,
+    RunTransitionError::RunTerminal { .. }   => Self::TerminalState,
+    RunTransitionError::WrongStatus { .. }   => Self::WrongRunStatus,
+    RunTransitionError::OpIdConflict(_)      => Self::OpIdConflict,
+);
 
 /// Payload-free event discriminant for histogram counting.
 ///

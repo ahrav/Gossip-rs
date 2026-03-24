@@ -677,12 +677,14 @@ pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
 ///    bounded.
 /// 4. [`InvalidShardSpec`](Self::InvalidShardSpec) -- the derived range failed
 ///    downstream validation in [`ShardSpec`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PrefixShardError {
     /// Prefix cannot be empty for prefix-only shard operations.
+    #[error("prefix shard requires a non-empty prefix")]
     EmptyPrefix,
     /// Prefix exceeds the shard-key size ceiling ([`MAX_KEY_SIZE`]).
+    #[error("prefix too large ({size} bytes, max {max})")]
     PrefixTooLarge {
         /// Actual prefix size in bytes.
         size: usize,
@@ -691,43 +693,12 @@ pub enum PrefixShardError {
     },
     /// Prefix has no lexicographic successor (all bytes are `0xFF`), so the
     /// exclusive end-bound of the half-open range cannot be computed.
+    #[error("prefix has no lexicographic successor (all bytes are 0xFF)")]
     NoSuccessor,
     /// The derived key range passed local validation but failed downstream
     /// [`ShardSpec`] construction.
-    InvalidShardSpec(ShardSpecInputError),
-}
-
-impl fmt::Display for PrefixShardError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPrefix => write!(f, "prefix shard requires a non-empty prefix"),
-            Self::PrefixTooLarge { size, max } => {
-                write!(f, "prefix too large ({size} bytes, max {max})")
-            }
-            Self::NoSuccessor => {
-                write!(
-                    f,
-                    "prefix has no lexicographic successor (all bytes are 0xFF)"
-                )
-            }
-            Self::InvalidShardSpec(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for PrefixShardError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidShardSpec(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<ShardSpecInputError> for PrefixShardError {
-    fn from(value: ShardSpecInputError) -> Self {
-        Self::InvalidShardSpec(value)
-    }
+    #[error("{0}")]
+    InvalidShardSpec(#[from] ShardSpecInputError),
 }
 
 #[cfg(test)]

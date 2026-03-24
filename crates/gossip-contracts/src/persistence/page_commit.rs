@@ -341,7 +341,7 @@ impl CommitScope {
 /// does not match the [`CommitScope`] of the page being committed. This
 /// is a programming error or a backend mis-routing bug, never a transient
 /// failure — callers should treat it as fatal for the affected page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PageCommitValidationError {
     /// The done-ledger receipt covers a different number of units than the page.
     LedgerUnitCountMismatch { expected: u64, actual: u64 },
@@ -384,8 +384,6 @@ impl fmt::Display for PageCommitValidationError {
         }
     }
 }
-
-impl Error for PageCommitValidationError {}
 
 /// Combined wait or validation error for `wait_*` state transitions.
 ///

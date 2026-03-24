@@ -202,7 +202,7 @@ impl fmt::Display for PersistenceConformanceReport {
 /// - **Invariant violations** (`*Invariant`, `RedactionLeak`) — the backend
 ///   succeeded but the observable result violated a persistence contract.
 ///   These carry a human-readable message describing the violation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PersistenceConformanceError {
     /// Internal sample-data construction failed.
     FixtureConstruction {
@@ -295,23 +295,6 @@ impl fmt::Display for PersistenceConformanceError {
                      leaked fragment `{truncated}` (full output redacted)"
                 )
             }
-        }
-    }
-}
-
-impl Error for PersistenceConformanceError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::FixtureConstruction { source, .. }
-            | Self::DoneLedgerSubmit { source, .. }
-            | Self::DoneLedgerWait { source, .. }
-            | Self::DoneLedgerGet { source, .. }
-            | Self::FindingsSubmit { source, .. }
-            | Self::FindingsWait { source, .. }
-            | Self::Probe { source, .. } => Some(source.as_ref()),
-            Self::DoneLedgerInvariant { .. }
-            | Self::FindingsInvariant { .. }
-            | Self::RedactionLeak { .. } => None,
         }
     }
 }

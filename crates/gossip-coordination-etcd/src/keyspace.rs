@@ -62,39 +62,24 @@ use gossip_contracts::identity::{RunId, ShardId, TenantId};
 /// The prefix rules exist to guarantee that every generated key is an
 /// absolute etcd path and that no key contains accidental double slashes
 /// (which would create invisible empty path segments in the etcd keyspace).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum EtcdKeyspaceError {
     /// Prefix is empty after surrounding whitespace is trimmed.
+    #[error("etcd keyspace prefix must not be empty")]
     EmptyPrefix,
     /// Prefix must start with `/` to form absolute etcd paths.
+    #[error("etcd keyspace prefix must start with '/'")]
     PrefixMustStartWithSlash,
     /// Prefix must not end with `/` (unless it is exactly `"/"`), because
     /// path joins would produce double slashes.
+    #[error("etcd keyspace prefix must not end with '/' unless it is exactly '/'")]
     PrefixMustNotEndWithSlash,
     /// Prefix contains consecutive slashes (`//`), which would create
     /// invisible empty path segments in the etcd keyspace.
+    #[error("etcd keyspace prefix must not contain consecutive slashes '//'")]
     PrefixContainsDoubleSlash,
 }
-
-impl fmt::Display for EtcdKeyspaceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPrefix => f.write_str("etcd keyspace prefix must not be empty"),
-            Self::PrefixMustStartWithSlash => {
-                f.write_str("etcd keyspace prefix must start with '/'")
-            }
-            Self::PrefixMustNotEndWithSlash => {
-                f.write_str("etcd keyspace prefix must not end with '/' unless it is exactly '/'")
-            }
-            Self::PrefixContainsDoubleSlash => {
-                f.write_str("etcd keyspace prefix must not contain consecutive slashes '//'")
-            }
-        }
-    }
-}
-
-impl std::error::Error for EtcdKeyspaceError {}
 
 mod private {
     pub trait Sealed {}

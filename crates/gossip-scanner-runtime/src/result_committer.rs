@@ -14,7 +14,7 @@
 //! done-ledger ordering in one typestate machine and preserves the same
 //! durable receipt model a future checkpoint stage can consume.
 
-use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
+use std::{collections::HashSet, num::NonZeroU64};
 
 use gossip_contracts::{
     identity::TenantId,
@@ -35,21 +35,25 @@ use crate::{
 ///
 /// These are programming errors, not transient storage failures. Retrying the
 /// exact same invalid request will produce the same result.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ResultCommitRequestError {
     /// A per-item commit request must carry exactly one done-ledger row.
+    #[error("per-item commit requests must carry exactly one done-ledger row; got {actual}")]
     DoneLedgerRecordCount {
         /// Number of rows present in the request.
         actual: usize,
     },
     /// The findings batch violated a persistence-layer invariant before any
     /// write was submitted.
-    FindingsBatch(PersistenceInputError),
+    #[error("invalid findings batch: {0}")]
+    FindingsBatch(#[source] PersistenceInputError),
     /// The done-ledger record violated a cross-field invariant (e.g.
     /// `ScannedClean` with a non-`None` error code).
-    DoneLedgerRecord(PersistenceInputError),
+    #[error("invalid done-ledger record: {0}")]
+    DoneLedgerRecord(#[source] PersistenceInputError),
     /// A finding or occurrence row belonged to a different tenant than the
     /// shared write context.
+    #[error("{layer} tenant mismatch: expected {expected:?}, got {actual:?}")]
     TenantMismatch {
         /// Which layer contained the mismatched tenant.
         layer: &'static str,
@@ -58,12 +62,14 @@ pub enum ResultCommitRequestError {
     },
     /// An observation row carried different write-context metadata than the
     /// request-level write context.
+    #[error("observation at index {index} does not match the shared write context")]
     ObservationWriteContextMismatch {
         /// Zero-based observation index within the batch.
         index: usize,
     },
     /// An observation row pointed at a different object-version than the
     /// done-ledger row.
+    #[error("observation at index {index} targets a different OVID than expected ({expected:?})")]
     ObservationOvidMismatch {
         /// Zero-based observation index within the batch.
         index: usize,
@@ -74,17 +80,20 @@ pub enum ResultCommitRequestError {
     },
     /// The done-ledger row carried different write-context metadata than the
     /// request-level write context.
+    #[error("done-ledger write context does not match the request-level write context")]
     DoneLedgerWriteContextMismatch {
         expected: Box<WriteContext>,
         actual: Box<WriteContext>,
     },
     /// The request carried findings for a non-scanned terminal status.
+    #[error("done-ledger status {status:?} cannot be committed with findings payload")]
     FindingsPresentForUnscannedStatus {
         /// Terminal status on the done-ledger row.
         status: DoneLedgerStatus,
     },
     /// The done-ledger findings count disagreed with the distinct stable
     /// findings in the batch.
+    #[error("done-ledger findings_count mismatch: expected {expected}, got {actual}")]
     FindingsCountMismatch {
         /// Count stored on the done-ledger row.
         expected: u32,
@@ -93,89 +102,24 @@ pub enum ResultCommitRequestError {
     },
     /// A scanned request carried a finding that was not bound to any
     /// version-specific occurrence in the same batch.
+    #[error("finding at index {index} is missing occurrence evidence for this scanned request")]
     FindingWithoutOccurrence {
         /// Zero-based finding index within the batch.
         index: usize,
     },
     /// A scanned request carried an occurrence that was not bound to any
     /// observation in the same batch.
+    #[error("occurrence at index {index} is missing observation evidence for this scanned request")]
     OccurrenceWithoutObservation {
         /// Zero-based occurrence index within the batch.
         index: usize,
     },
     /// Distinct stable findings exceeded the current `u32` done-ledger field.
+    #[error("distinct findings count {count} exceeds done-ledger u32 capacity")]
     DistinctFindingsOverflow {
         /// Number of distinct stable findings observed in the request.
         count: usize,
     },
-}
-
-impl fmt::Display for ResultCommitRequestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DoneLedgerRecordCount { actual } => write!(
-                f,
-                "per-item commit requests must carry exactly one done-ledger row; got {actual}"
-            ),
-            Self::FindingsBatch(err) => write!(f, "invalid findings batch: {err}"),
-            Self::DoneLedgerRecord(err) => {
-                write!(f, "invalid done-ledger record: {err}")
-            }
-            Self::TenantMismatch {
-                layer,
-                expected,
-                actual,
-            } => {
-                write!(
-                    f,
-                    "{layer} tenant mismatch: expected {expected:?}, got {actual:?}"
-                )
-            }
-            Self::ObservationWriteContextMismatch { index } => write!(
-                f,
-                "observation at index {index} does not match the shared write context"
-            ),
-            Self::ObservationOvidMismatch {
-                index, expected, ..
-            } => write!(
-                f,
-                "observation at index {index} targets a different OVID than expected ({expected:?})"
-            ),
-            Self::DoneLedgerWriteContextMismatch { .. } => write!(
-                f,
-                "done-ledger write context does not match the request-level write context"
-            ),
-            Self::FindingsPresentForUnscannedStatus { status } => write!(
-                f,
-                "done-ledger status {status:?} cannot be committed with findings payload"
-            ),
-            Self::FindingsCountMismatch { expected, actual } => write!(
-                f,
-                "done-ledger findings_count mismatch: expected {expected}, got {actual}"
-            ),
-            Self::FindingWithoutOccurrence { index } => write!(
-                f,
-                "finding at index {index} is missing occurrence evidence for this scanned request"
-            ),
-            Self::OccurrenceWithoutObservation { index } => write!(
-                f,
-                "occurrence at index {index} is missing observation evidence for this scanned request"
-            ),
-            Self::DistinctFindingsOverflow { count } => write!(
-                f,
-                "distinct findings count {count} exceeds done-ledger u32 capacity"
-            ),
-        }
-    }
-}
-
-impl Error for ResultCommitRequestError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::FindingsBatch(err) | Self::DoneLedgerRecord(err) => Some(err),
-            _ => None,
-        }
-    }
 }
 
 impl From<PersistenceInputError> for ResultCommitRequestError {
@@ -194,76 +138,41 @@ pub type TranslationCommitResult<F, D> = Result<UnitCommitReceipt, ResultCommitE
 
 /// Immediate submit, wait, or validation failure while committing one runtime
 /// unit through findings -> done-ledger.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ResultCommitError<FindingsError, DoneLedgerError> {
     /// The request itself was inconsistent.
-    InvalidRequest(ResultCommitRequestError),
+    #[error("invalid commit request: {0}")]
+    InvalidRequest(#[source] ResultCommitRequestError),
     /// The findings sink rejected the submission before returning a handle.
-    FindingsSubmit(FindingsError),
+    #[error("findings submission failed: {0}")]
+    FindingsSubmit(#[source] FindingsError),
     /// Findings durability wait failed. The findings batch may or may not
     /// be durable. Retrying the full `commit_item` call is safe because
     /// `FindingsSink::upsert` has upsert (idempotent) semantics.
-    FindingsWait(FindingsError),
+    #[error("findings durability wait failed: {0}")]
+    FindingsWait(#[source] FindingsError),
     /// Done-ledger submission failed. Findings are already durable at this
     /// point. Retrying the full `commit_item` call is safe.
-    DoneLedgerSubmit(DoneLedgerError),
+    #[error("done-ledger submission failed: {0}")]
+    DoneLedgerSubmit(#[source] DoneLedgerError),
     /// Done-ledger durability wait failed, or the receipt did not match the
     /// expected commit scope. Findings are already durable. Retrying the
     /// full `commit_item` call is safe.
-    DoneLedgerAdvance(CommitAdvanceError<DoneLedgerError>),
+    #[error("done-ledger durability failed: {0}")]
+    DoneLedgerAdvance(#[source] CommitAdvanceError<DoneLedgerError>),
     /// The durable receipt's checkpoint boundary did not match the completed
     /// unit's boundary.
-    BoundaryMismatch(Box<BoundaryMismatchError>),
+    #[error("boundary mismatch between completed unit and receipt: {0}")]
+    BoundaryMismatch(#[source] Box<BoundaryMismatchError>),
     /// The durable receipt's checkpoint boundary kind did not match the
     /// expected kind for this shard stream.
-    KindMismatch(KindMismatchError),
+    #[error("checkpoint boundary kind mismatch: {0}")]
+    KindMismatch(#[source] KindMismatchError),
     /// The commit was not attempted because the pipeline was cancelled after
     /// the item was dequeued but before the durable write began. No data was
     /// written for this item.
+    #[error("commit cancelled before durable write")]
     Cancelled,
-}
-
-impl<FindingsError, DoneLedgerError> fmt::Display
-    for ResultCommitError<FindingsError, DoneLedgerError>
-where
-    FindingsError: fmt::Display,
-    DoneLedgerError: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidRequest(err) => write!(f, "invalid commit request: {err}"),
-            Self::FindingsSubmit(err) => write!(f, "findings submission failed: {err}"),
-            Self::FindingsWait(err) => write!(f, "findings durability wait failed: {err}"),
-            Self::DoneLedgerSubmit(err) => write!(f, "done-ledger submission failed: {err}"),
-            Self::DoneLedgerAdvance(err) => write!(f, "done-ledger durability failed: {err}"),
-            Self::BoundaryMismatch(err) => write!(
-                f,
-                "boundary mismatch between completed unit and receipt: {err}"
-            ),
-            Self::KindMismatch(err) => {
-                write!(f, "checkpoint boundary kind mismatch: {err}")
-            }
-            Self::Cancelled => write!(f, "commit cancelled before durable write"),
-        }
-    }
-}
-
-impl<FindingsError, DoneLedgerError> Error for ResultCommitError<FindingsError, DoneLedgerError>
-where
-    FindingsError: Error + Send + Sync + 'static,
-    DoneLedgerError: Error + Send + Sync + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidRequest(err) => Some(err),
-            Self::FindingsSubmit(err) | Self::FindingsWait(err) => Some(err),
-            Self::DoneLedgerSubmit(err) => Some(err),
-            Self::DoneLedgerAdvance(err) => Some(err),
-            Self::BoundaryMismatch(err) => Some(err.as_ref()),
-            Self::KindMismatch(err) => Some(err),
-            Self::Cancelled => None,
-        }
-    }
 }
 
 impl<F, D> From<ResultCommitRequestError> for ResultCommitError<F, D> {

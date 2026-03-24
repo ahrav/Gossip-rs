@@ -48,6 +48,7 @@ gossip-frontier = { path = "crates/gossip-frontier" }
 gossip-orchestrator = { path = "crates/gossip-orchestrator" }
 
 # External dependencies
+thiserror = "2"
 postgres = "0.19"
 
 # External dev/test dependencies

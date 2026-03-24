@@ -10,6 +10,7 @@ description = "Shard algebra: key encoding, hints, and builder for gossip-rs"
 [dependencies]
 gossip-contracts.workspace = true
 gossip-stdx.workspace = true
+thiserror = { workspace = true }
 
 [dev-dependencies]
 gossip-contracts = { workspace = true, features = ["test-support"] }

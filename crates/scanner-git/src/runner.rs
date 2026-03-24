@@ -810,138 +810,51 @@ pub(super) struct ScanModeOutput {
 ///
 /// All variants implement `Display` and `Error`. The `source()` chain
 /// preserves the inner error for diagnostic logging.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum GitScanError {
     /// Repo open phase failed (bad metadata, missing refs, etc.).
-    RepoOpen(RepoOpenError),
+    #[error("{0}")]
+    RepoOpen(#[from] RepoOpenError),
     /// Commit plan construction failed (e.g. missing commit-graph entries).
-    CommitPlan(CommitPlanError),
+    #[error("{0}")]
+    CommitPlan(#[from] CommitPlanError),
     /// Tree diff walker encountered an error (corrupt trees, depth exceeded).
-    TreeDiff(TreeDiffError),
+    #[error("{0}")]
+    TreeDiff(#[from] TreeDiffError),
     /// Spill/dedupe pipeline error (I/O failure on spill files).
-    Spill(SpillError),
+    #[error("{0}")]
+    Spill(#[from] SpillError),
     /// MIDX parsing or validation error (corrupt header, missing packs).
-    Midx(MidxError),
+    #[error("{0}")]
+    Midx(#[from] MidxError),
     /// Pack plan construction error (out-of-range pack IDs, corrupt headers).
-    PackPlan(PackPlanError),
+    #[error("{0}")]
+    PackPlan(#[from] PackPlanError),
     /// Fatal pack execution error (decode failure that aborted a plan).
-    PackExec(PackExecError),
+    #[error("{0}")]
+    PackExec(#[from] PackExecError),
     /// Pack I/O error during loose object or cross-pack base resolution.
-    PackIo(PackIoError),
+    #[error("{0}")]
+    PackIo(#[from] PackIoError),
     /// Persistence store write failed.
-    Persist(PersistError),
+    #[error("{0}")]
+    Persist(#[from] PersistError),
     /// Underlying I/O error not covered by a more specific variant.
-    Io(io::Error),
+    #[error("{0}")]
+    Io(#[from] io::Error),
     /// Resource limit exceeded (pack mmap counts or cumulative bytes).
+    #[error("resource limit exceeded: {0}")]
     ResourceLimit(String),
     /// Scan mode not yet implemented.
+    #[error("scan mode not implemented: {0}")]
     UnsupportedMode(GitScanMode),
     /// In-memory artifact construction failed (MIDX or commit-graph build).
-    ArtifactAcquire(ArtifactAcquireError),
+    #[error("artifact acquisition failed: {0}")]
+    ArtifactAcquire(#[from] ArtifactAcquireError),
     /// Pack files or indices changed during the scan — a concurrent `git gc`
     /// or `git repack` invalidated the planned offsets. Callers should retry.
+    #[error("concurrent git maintenance detected; artifacts changed during scan")]
     ConcurrentMaintenance,
-}
-
-impl std::fmt::Display for GitScanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RepoOpen(err) => write!(f, "{err}"),
-            Self::CommitPlan(err) => write!(f, "{err}"),
-            Self::TreeDiff(err) => write!(f, "{err}"),
-            Self::Spill(err) => write!(f, "{err}"),
-            Self::Midx(err) => write!(f, "{err}"),
-            Self::PackPlan(err) => write!(f, "{err}"),
-            Self::PackExec(err) => write!(f, "{err}"),
-            Self::PackIo(err) => write!(f, "{err}"),
-            Self::Persist(err) => write!(f, "{err}"),
-            Self::Io(err) => write!(f, "{err}"),
-            Self::ResourceLimit(msg) => write!(f, "resource limit exceeded: {msg}"),
-            Self::UnsupportedMode(mode) => write!(f, "scan mode not implemented: {mode}"),
-            Self::ArtifactAcquire(err) => write!(f, "artifact acquisition failed: {err}"),
-            Self::ConcurrentMaintenance => {
-                write!(
-                    f,
-                    "concurrent git maintenance detected; artifacts changed during scan"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for GitScanError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::RepoOpen(err) => Some(err),
-            Self::CommitPlan(err) => Some(err),
-            Self::TreeDiff(err) => Some(err),
-            Self::Spill(err) => Some(err),
-            Self::Midx(err) => Some(err),
-            Self::PackPlan(err) => Some(err),
-            Self::PackExec(err) => Some(err),
-            Self::PackIo(err) => Some(err),
-            Self::Persist(err) => Some(err),
-            Self::Io(err) => Some(err),
-            Self::ArtifactAcquire(err) => Some(err),
-            Self::ResourceLimit(_) | Self::UnsupportedMode(_) | Self::ConcurrentMaintenance => None,
-        }
-    }
-}
-
-impl From<RepoOpenError> for GitScanError {
-    fn from(err: RepoOpenError) -> Self {
-        Self::RepoOpen(err)
-    }
-}
-impl From<CommitPlanError> for GitScanError {
-    fn from(err: CommitPlanError) -> Self {
-        Self::CommitPlan(err)
-    }
-}
-impl From<TreeDiffError> for GitScanError {
-    fn from(err: TreeDiffError) -> Self {
-        Self::TreeDiff(err)
-    }
-}
-impl From<SpillError> for GitScanError {
-    fn from(err: SpillError) -> Self {
-        Self::Spill(err)
-    }
-}
-impl From<MidxError> for GitScanError {
-    fn from(err: MidxError) -> Self {
-        Self::Midx(err)
-    }
-}
-impl From<PackPlanError> for GitScanError {
-    fn from(err: PackPlanError) -> Self {
-        Self::PackPlan(err)
-    }
-}
-impl From<PackExecError> for GitScanError {
-    fn from(err: PackExecError) -> Self {
-        Self::PackExec(err)
-    }
-}
-impl From<PackIoError> for GitScanError {
-    fn from(err: PackIoError) -> Self {
-        Self::PackIo(err)
-    }
-}
-impl From<PersistError> for GitScanError {
-    fn from(err: PersistError) -> Self {
-        Self::Persist(err)
-    }
-}
-impl From<io::Error> for GitScanError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-impl From<ArtifactAcquireError> for GitScanError {
-    fn from(err: ArtifactAcquireError) -> Self {
-        Self::ArtifactAcquire(err)
-    }
 }
 
 /// Runs a full Git scan with the provided configuration and stores.

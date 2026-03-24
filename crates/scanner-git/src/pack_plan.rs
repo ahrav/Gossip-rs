@@ -20,7 +20,6 @@
 //! - `exec_order` indices refer to `need_offsets`.
 
 use std::collections::VecDeque;
-use std::fmt;
 
 use ahash::{AHashMap, AHashSet};
 
@@ -72,86 +71,29 @@ impl Default for PackPlanConfig {
 /// Errors from pack planning.
 ///
 /// Planning failures are fatal for the pack: no partial plan is emitted.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PackPlanError {
     /// Pack parsing failed.
-    PackParse(PackParseError),
+    #[error("{0}")]
+    PackParse(#[from] PackParseError),
     /// A candidate offset points outside the pack.
+    #[error("candidate offset {offset} out of range for pack {pack_id}")]
     CandidateOffsetOutOfRange { pack_id: u16, offset: u64 },
     /// `pack_id` does not exist in the provided pack list.
+    #[error("pack id {pack_id} out of range (pack count {pack_count})")]
     PackIdOutOfRange { pack_id: u16, pack_count: usize },
     /// Unique offsets exceeded the configured worklist limit.
+    #[error("pack plan worklist exceeded limit {limit} (saw {observed})")]
     WorklistLimitExceeded { limit: usize, observed: usize },
     /// REF base lookups exceeded the configured limit.
+    #[error("pack plan base lookups exceeded limit {limit} (saw {observed})")]
     BaseLookupLimitExceeded { limit: usize, observed: usize },
     /// Delta dependency graph contains a cycle.
+    #[error("delta cycle detected in pack {pack_id} at offset {offset}")]
     DeltaCycleDetected { pack_id: u16, offset: u64 },
     /// MIDX lookup or ordering error.
-    MidxError(MidxError),
-}
-
-impl fmt::Display for PackPlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PackParse(err) => write!(f, "{err}"),
-            Self::CandidateOffsetOutOfRange { pack_id, offset } => {
-                write!(
-                    f,
-                    "candidate offset {offset} out of range for pack {pack_id}"
-                )
-            }
-            Self::PackIdOutOfRange {
-                pack_id,
-                pack_count,
-            } => {
-                write!(
-                    f,
-                    "pack id {pack_id} out of range (pack count {pack_count})"
-                )
-            }
-            Self::WorklistLimitExceeded { limit, observed } => {
-                write!(
-                    f,
-                    "pack plan worklist exceeded limit {limit} (saw {observed})"
-                )
-            }
-            Self::BaseLookupLimitExceeded { limit, observed } => {
-                write!(
-                    f,
-                    "pack plan base lookups exceeded limit {limit} (saw {observed})"
-                )
-            }
-            Self::DeltaCycleDetected { pack_id, offset } => {
-                write!(
-                    f,
-                    "delta cycle detected in pack {pack_id} at offset {offset}"
-                )
-            }
-            Self::MidxError(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for PackPlanError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PackParse(err) => Some(err),
-            Self::MidxError(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<PackParseError> for PackPlanError {
-    fn from(err: PackParseError) -> Self {
-        Self::PackParse(err)
-    }
-}
-
-impl From<MidxError> for PackPlanError {
-    fn from(err: MidxError) -> Self {
-        Self::MidxError(err)
-    }
+    #[error("{0}")]
+    MidxError(#[from] MidxError),
 }
 
 /// Resolves OIDs to pack offsets.

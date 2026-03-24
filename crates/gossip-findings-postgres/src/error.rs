@@ -8,7 +8,7 @@
 //! [`FindingsPgError`] to unify schema, migration, SQL-driver, and identity
 //! conflict failures behind a single `FindingsSink` error surface.
 
-use std::{error::Error, fmt};
+use std::fmt;
 
 use gossip_contracts::{
     identity::{FindingId, ObservationId, OccurrenceId, TenantId},
@@ -21,16 +21,23 @@ pub use gossip_pg_common::migration::{
 use crate::types::{PgByteDecodeError, PgU64ConversionError};
 
 /// Schema validation and row-projection failures for findings persistence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FindingsPgSchemaError {
     /// Contracts-layer validation rejected the input batch.
-    Persistence(PersistenceInputError),
+    #[error("{0}")]
+    Persistence(#[from] PersistenceInputError),
     /// A `u64` field could not be represented as a PostgreSQL `BIGINT`
     /// according to its storage mode.
-    PgU64Conversion(PgU64ConversionError),
+    #[error("{0}")]
+    PgU64Conversion(#[from] PgU64ConversionError),
     /// The combined occurrence span (`byte_offset + byte_length`) exceeds
     /// the PostgreSQL signed `BIGINT` maximum, matching the SQL
     /// `occurrences_span_no_overflow_ck` constraint.
+    #[error(
+        "occurrence span overflow: byte_offset ({byte_offset}) + byte_length ({byte_length}) \
+         exceeds i64::MAX ({max})",
+        max = i64::MAX
+    )]
     SpanOverflow {
         /// The non-negative `byte_offset` that individually fits in `i64`.
         byte_offset: i64,
@@ -39,61 +46,21 @@ pub enum FindingsPgSchemaError {
     },
 }
 
-impl fmt::Display for FindingsPgSchemaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Persistence(source) => write!(f, "{source}"),
-            Self::PgU64Conversion(source) => write!(f, "{source}"),
-            Self::SpanOverflow {
-                byte_offset,
-                byte_length,
-            } => write!(
-                f,
-                "occurrence span overflow: byte_offset ({byte_offset}) + byte_length ({byte_length}) \
-                 exceeds i64::MAX ({max})",
-                max = i64::MAX
-            ),
-        }
-    }
-}
-
-impl Error for FindingsPgSchemaError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Persistence(source) => Some(source),
-            Self::PgU64Conversion(source) => Some(source),
-            Self::SpanOverflow { .. } => None,
-        }
-    }
-}
-
-impl From<PersistenceInputError> for FindingsPgSchemaError {
-    fn from(value: PersistenceInputError) -> Self {
-        Self::Persistence(value)
-    }
-}
-
-impl From<PgU64ConversionError> for FindingsPgSchemaError {
-    fn from(value: PgU64ConversionError) -> Self {
-        Self::PgU64Conversion(value)
-    }
-}
-
 /// Unified backend error for the PostgreSQL findings implementation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FindingsPgError {
     /// PostgreSQL client failure.
-    Postgres(postgres::Error),
+    Postgres(#[from] postgres::Error),
     /// Embedded migration application failed.
-    Migration(FindingsPgMigrationError),
+    Migration(#[from] FindingsPgMigrationError),
     /// Internal client mutex was poisoned by a panic.
     MutexPoisoned,
     /// Input batch exceeded the recommended maximum.
     BatchTooLarge { len: usize, max: usize },
     /// Batch validation or row projection failed before SQL mutation.
-    Schema(FindingsPgSchemaError),
+    Schema(#[from] FindingsPgSchemaError),
     /// BYTEA column decode: unexpected byte length.
-    ByteDecode(PgByteDecodeError),
+    ByteDecode(#[from] PgByteDecodeError),
     /// Query limit exceeds the non-negative `BIGINT` bound (`i64::MAX`).
     LimitOutOfRange { limit: usize },
     /// Non-negative `BIGINT` decode failed while reading SQL results.
@@ -102,7 +69,7 @@ pub enum FindingsPgError {
     /// write-path equivalent flows through
     /// [`Schema(FindingsPgSchemaError::PgU64Conversion(..))`](FindingsPgError::Schema)
     /// during batch projection.
-    PgU64Conversion(PgU64ConversionError),
+    PgU64Conversion(#[from] PgU64ConversionError),
     /// A finding primary key mapped to a different immutable natural key.
     FindingConflict {
         tenant_id: TenantId,
@@ -196,57 +163,10 @@ impl fmt::Display for FindingsPgError {
     }
 }
 
-impl Error for FindingsPgError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Postgres(source) => Some(source),
-            Self::Migration(source) => Some(source),
-            Self::Schema(source) => Some(source),
-            Self::PgU64Conversion(source) => Some(source),
-            Self::ByteDecode(source) => Some(source),
-            Self::MutexPoisoned
-            | Self::BatchTooLarge { .. }
-            | Self::LimitOutOfRange { .. }
-            | Self::FindingConflict { .. }
-            | Self::OccurrenceConflict { .. }
-            | Self::ObservationConflict { .. }
-            | Self::ReferentialIntegrityViolation { .. } => None,
-        }
-    }
-}
-
-impl From<postgres::Error> for FindingsPgError {
-    fn from(value: postgres::Error) -> Self {
-        Self::Postgres(value)
-    }
-}
-
-impl From<FindingsPgMigrationError> for FindingsPgError {
-    fn from(value: FindingsPgMigrationError) -> Self {
-        Self::Migration(value)
-    }
-}
-
-impl From<FindingsPgSchemaError> for FindingsPgError {
-    fn from(value: FindingsPgSchemaError) -> Self {
-        Self::Schema(value)
-    }
-}
-
-impl From<PgU64ConversionError> for FindingsPgError {
-    fn from(value: PgU64ConversionError) -> Self {
-        Self::PgU64Conversion(value)
-    }
-}
-
-impl From<PgByteDecodeError> for FindingsPgError {
-    fn from(value: PgByteDecodeError) -> Self {
-        Self::ByteDecode(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
     use crate::types::PgByteDecodeError;
     use gossip_contracts::{

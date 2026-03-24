@@ -27,26 +27,30 @@
 //! - Parsing is O(header size), not O(commit size).
 //! - Memory allocation is bounded by parent count.
 
-use std::fmt;
-
 use super::object_id::{ObjectFormat, OidBytes};
 use super::repo_paths;
 
 /// Errors from commit parsing.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommitParseError {
     /// Commit data is corrupt or malformed.
+    #[error("corrupt commit: {detail}")]
     Corrupt { detail: &'static str },
     /// Commit exceeds size limit.
+    #[error("commit too large: {size} bytes (max: {max})")]
     TooLarge { size: usize, max: usize },
     /// Too many parent commits.
+    #[error("too many parents: {count} (max: {max})")]
     TooManyParents { count: usize, max: usize },
     /// Invalid hex character in OID.
+    #[error("invalid hex byte in OID: 0x{byte:02x}")]
     InvalidHex { byte: u8 },
     /// OID has wrong length.
+    #[error("OID length mismatch: found {found}, expected {expected}")]
     InvalidOidLength { found: usize, expected: usize },
     /// Invalid timestamp value.
+    #[error("invalid timestamp: {detail}")]
     InvalidTimestamp { detail: &'static str },
 }
 
@@ -57,31 +61,6 @@ impl CommitParseError {
         Self::Corrupt { detail }
     }
 }
-
-impl fmt::Display for CommitParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Corrupt { detail } => write!(f, "corrupt commit: {detail}"),
-            Self::TooLarge { size, max } => {
-                write!(f, "commit too large: {size} bytes (max: {max})")
-            }
-            Self::TooManyParents { count, max } => {
-                write!(f, "too many parents: {count} (max: {max})")
-            }
-            Self::InvalidHex { byte } => {
-                write!(f, "invalid hex byte in OID: 0x{byte:02x}")
-            }
-            Self::InvalidOidLength { found, expected } => {
-                write!(f, "OID length mismatch: found {found}, expected {expected}")
-            }
-            Self::InvalidTimestamp { detail } => {
-                write!(f, "invalid timestamp: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CommitParseError {}
 
 /// Parsed commit data.
 ///

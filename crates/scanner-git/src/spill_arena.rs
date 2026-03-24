@@ -22,7 +22,6 @@
 //! deleted by this type. The caller (usually the spill directory cleanup)
 //! is responsible for removing the file or directory after the scan.
 
-use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -74,42 +73,14 @@ impl SpillSlice {
 }
 
 /// Errors returned by the spill arena.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SpillArenaError {
     /// IO error while creating or mapping the spill file.
-    Io(io::Error),
+    #[error("spill arena IO error: {0}")]
+    Io(#[from] io::Error),
     /// Arena is out of space.
+    #[error("spill arena out of space: requested {requested}, remaining {remaining}")]
     OutOfSpace { requested: u64, remaining: u64 },
-}
-
-impl fmt::Display for SpillArenaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "spill arena IO error: {err}"),
-            Self::OutOfSpace {
-                requested,
-                remaining,
-            } => write!(
-                f,
-                "spill arena out of space: requested {requested}, remaining {remaining}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SpillArenaError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for SpillArenaError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
 }
 
 /// Append-only spill arena backed by a memory-mapped file.
