@@ -793,7 +793,6 @@ dependencies = [
  "gossip-done-ledger-postgres",
  "gossip-findings-postgres",
  "gossip-orchestrator",
- "gossip-stdx",
  "postgres",
  "tempfile",
 ]

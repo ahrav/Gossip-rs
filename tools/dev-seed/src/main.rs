@@ -214,16 +214,16 @@ where
 /// the original coordination error in the chain.
 fn classify_submission_error(run_id_raw: u64, error: FilesystemRunSetupError) -> anyhow::Error {
     match error {
-        FilesystemRunSetupError::CreateRun(CreateRunError::ConfigMismatch { .. }) => {
-            anyhow::anyhow!(
+        FilesystemRunSetupError::CreateRun(err @ CreateRunError::ConfigMismatch { .. }) => {
+            anyhow::Error::new(err).context(format!(
                 "filesystem submission run {run_id_raw} already exists with a different run configuration"
-            )
+            ))
         }
         FilesystemRunSetupError::CreateRun(CreateRunError::RegisterShardsFailed(
-            RegisterShardsError::OpIdConflict(_),
-        )) => anyhow::anyhow!(
+            err @ RegisterShardsError::OpIdConflict(_),
+        )) => anyhow::Error::new(err).context(format!(
             "filesystem submission run {run_id_raw} already exists with a different shard registration payload"
-        ),
+        )),
         error @ FilesystemRunSetupError::CreateRun(CreateRunError::BackendError(_))
         | error @ FilesystemRunSetupError::CreateRun(CreateRunError::RegisterShardsFailed(
             RegisterShardsError::BackendError(_),
@@ -368,7 +368,9 @@ mod tests {
     use std::fs;
 
     use clap::Parser;
-    use gossip_coordination::{InMemoryCoordinator, RunStatus};
+    use gossip_contracts::identity::OpId;
+    use gossip_coordination::{InMemoryCoordinator, RunOpIdConflict, RunStatus};
+    use gossip_orchestrator::FilesystemRunSetupError;
     use tempfile::tempdir;
 
     use super::*;
@@ -463,6 +465,39 @@ mod tests {
     }
 
     #[test]
+    fn submit_filesystem_request_registers_single_file_shard() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("scan-target.txt");
+        fs::write(&file_path, "fixture").expect("write fixture");
+        let canonical_target = file_path.canonicalize().expect("canonical target");
+
+        let mut coordinator = InMemoryCoordinator::new(DEFAULT_LEASE_DURATION_MS);
+        let submission = submit_filesystem_request(
+            &mut coordinator,
+            FilesystemSourceMode::SingleFile,
+            &file_path,
+            DEFAULT_RUN_ID,
+            DEFAULT_LEASE_DURATION_MS,
+        )
+        .expect("submission should succeed");
+
+        assert_eq!(submission.source_mode, FilesystemSourceMode::SingleFile);
+        assert_eq!(submission.canonical_target, canonical_target);
+        assert_eq!(submission.run_id, RunId::from_raw(DEFAULT_RUN_ID));
+        assert_eq!(submission.root_shards.len(), 1);
+        assert!(!submission.replayed);
+
+        let run = coordinator
+            .get_run(
+                TenantId::from_bytes(DEFAULT_TENANT_ID),
+                RunId::from_raw(DEFAULT_RUN_ID),
+            )
+            .expect("run should exist");
+        assert_eq!(run.status(), RunStatus::Active);
+        assert_eq!(run.root_shards(), submission.root_shards.as_slice());
+    }
+
+    #[test]
     fn submit_filesystem_request_rejects_mode_path_mismatch() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("scan-target.txt");
@@ -481,5 +516,29 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("invalid filesystem submission request"));
         assert!(message.contains("requires a directory"));
+    }
+
+    #[test]
+    fn classify_config_mismatch_preserves_error_chain() {
+        let error = FilesystemRunSetupError::CreateRun(CreateRunError::ConfigMismatch {
+            run: RunId::from_raw(99),
+        });
+        let classified = classify_submission_error(99, error);
+        let msg = format!("{classified:#}");
+        assert!(msg.contains("different run configuration"));
+    }
+
+    #[test]
+    fn classify_opid_conflict_preserves_error_chain() {
+        let error = FilesystemRunSetupError::CreateRun(CreateRunError::RegisterShardsFailed(
+            RegisterShardsError::OpIdConflict(RunOpIdConflict {
+                op_id: OpId::from_raw(1),
+                expected_hash: 0xDEAD,
+                actual_hash: 0xBEEF,
+            }),
+        ));
+        let classified = classify_submission_error(42, error);
+        let msg = format!("{classified:#}");
+        assert!(msg.contains("different shard registration payload"));
     }
 }
