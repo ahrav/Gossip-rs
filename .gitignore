@@ -44,3 +44,5 @@ specs/tla2tools.jar
 **/fuzz/artifacts/
 .bench/
 .osgrep
+
+.env
