@@ -226,12 +226,13 @@ impl CancellationToken {
 
 /// Runtime budgets for source scans.
 ///
-/// Both fields must be non-zero; validation enforces this constraint
-/// before distributed scan dispatch and in the filesystem connector-mode
-/// local path (which constructs [`Budgets`] from these values). Direct
-/// local scan paths (`scan_fs_with_runtime`, `scan_git_with_runtime`) do
-/// not validate or consume budgets. Both fields are validated (non-zero)
-/// before dispatch but are not enforced at execution time.
+/// Both fields must be non-zero. Validation enforces this constraint in
+/// three places: before distributed scan dispatch, during connector-mode
+/// page acquisition (where `scan_fs_connector` converts these values into
+/// connector [`Budgets`] via `Budgets::try_new`), and before ordered-content miss execution. The
+/// ordered-content executor consumes these values as real item-count and
+/// byte limits; direct local scan paths (`scan_fs_with_runtime`,
+/// `scan_git_with_runtime`) still do not use them.
 ///
 /// Defaults are intentionally conservative (256 items, 1 MB) to bound
 /// memory pressure in distributed workers.
@@ -253,6 +254,12 @@ impl Default for ScanBudgets {
 }
 
 impl ScanBudgets {
+    /// Reject zero-valued runtime budgets before execution starts.
+    ///
+    /// Ordered-content miss execution treats both fields as hard admission
+    /// limits, so a zero value would make progress impossible while looking
+    /// like a valid configuration. Returns
+    /// [`ScanRuntimeError::ConnectorInput`] naming the offending field.
     pub fn validate(self) -> Result<(), ScanRuntimeError> {
         if self.max_items == 0 {
             return Err(ScanRuntimeError::ConnectorInput(

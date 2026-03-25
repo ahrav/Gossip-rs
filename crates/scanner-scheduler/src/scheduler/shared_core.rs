@@ -42,7 +42,7 @@ use crate::api::FileId;
 /// - `have` is the number of valid bytes currently in `buf`.
 /// - `carry <= have` (the overlap cannot exceed the data available).
 #[inline(always)]
-pub(super) fn carry_overlap_prefix(buf: &mut [u8], have: usize, carry: usize) {
+pub fn carry_overlap_prefix(buf: &mut [u8], have: usize, carry: usize) {
     if carry == 0 || have == 0 {
         return;
     }
@@ -81,7 +81,7 @@ pub(super) fn carry_overlap_prefix(buf: &mut [u8], have: usize, carry: usize) {
 /// around the engine scan only (excluding post-processing).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)] // Hot-path helper; split parameters avoid temporary structs.
-pub(super) fn scan_chunk_postprocess<E: ScanEngine>(
+pub fn scan_chunk_postprocess<E: ScanEngine>(
     engine: &E,
     scratch: &mut E::Scratch,
     pending: &mut Vec<<E::Scratch as EngineScratch>::Finding>,
