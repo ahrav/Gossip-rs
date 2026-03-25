@@ -1,0 +1,24 @@
+{
+  "threshold": 6,
+  "reporters": ["json", "consoleFull"],
+  "ignore": [
+    "target/**",
+    "fuzz/**",
+    "tmp/**",
+    ".beads/**",
+    "docs/**",
+    "diagrams/**"
+  ],
+  "minTokens": 50,
+  "minLines": 5,
+  "absolute": true,
+  "skipLocal": false,
+  "format": ["rust"],
+  "overrides": [
+    {
+      "paths": ["**/*test*", "**/*tests*", "**/benches/**"],
+      "minTokens": 100,
+      "minLines": 10
+    }
+  ]
+}
