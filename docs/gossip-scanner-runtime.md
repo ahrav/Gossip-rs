@@ -110,7 +110,7 @@ report without performing content reads. Done-ledger prefiltering and
 `ScanBudgets` into connector read budgets, scans each item through
 the shared chunked engine path, preserves retryable versus permanent
 read failures, and returns ordered non-durable outcomes) are available
-as tested library APIs but are not yet wired into the live dispatcher.
+as library APIs but are not yet wired into the live dispatcher.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
