@@ -1306,7 +1306,8 @@ fn execute_item_via_open<S: OrderedContentSource>(
         pending,
         metrics,
         // Sequential io::Read — offset tracking is implicit, no seek support.
-        // The byte budget is enforced once at open time via `take()`.
+        // The byte budget is enforced by scan_item_chunks, which sizes each
+        // read slice to the remaining item budget.
         move |_offset, dst, _remaining_item_bytes| {
             reader
                 .read(dst)
