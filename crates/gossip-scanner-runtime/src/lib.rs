@@ -232,21 +232,26 @@ impl CancellationToken {
 /// item-count and byte limits; direct local scan paths
 /// (`scan_fs_with_runtime`, `scan_git_with_runtime`) still do not use them.
 ///
-/// Defaults are intentionally conservative (256 items, 1 MB) to bound
-/// memory pressure in distributed workers.
+/// Defaults target a work-to-overhead ratio where the scan engine is
+/// active for tens of milliseconds per page — long enough to amortize
+/// coordination round-trips (typically 10–20 ms) and connector I/O
+/// setup. At 1–2 GB/s engine throughput, 64 MiB yields ~32–64 ms of
+/// scan work per page.  Memory pressure stays bounded because only one
+/// 256 KiB scan buffer is live at a time; the byte budget controls how
+/// many bytes are *read from the source*, not how much RAM is resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudgets {
     /// Maximum items processed between checkpoints.
     pub max_items: usize,
-    /// Runtime-level byte budget knob.
+    /// Total bytes the executor may read from the source per page pass.
     pub max_bytes: u64,
 }
 
 impl Default for ScanBudgets {
     fn default() -> Self {
         Self {
-            max_items: 256,
-            max_bytes: 1_000_000,
+            max_items: 4_096,
+            max_bytes: 64 * 1024 * 1024, // 64 MiB
         }
     }
 }

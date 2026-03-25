@@ -1047,16 +1047,36 @@ struct OrderedContentItemResult {
     connector_bytes_consumed: u64,
 }
 
-/// Clamp an item's declared size (or the full remaining budget when absent)
-/// to the remaining byte budget, treating a zero hint as 1 to guarantee progress.
+/// Clamp an item's declared size to the remaining byte budget.
+///
+/// When the item carries a `size_hint`, that value (floored to 1) is
+/// clamped to `remaining_bytes`.  When no hint is available the item's
+/// true size is unknown, so a fixed cap ([`DEFAULT_UNKNOWN_ITEM_BYTE_CAP`])
+/// prevents a single unbounded item from consuming the entire page
+/// budget, which would otherwise cause a perpetual truncation loop: the
+/// item gets the full budget, is truncated, is retried, gets the full
+/// budget again, and so on.
 fn item_byte_budget(item: &ScanItem, remaining_bytes: u64) -> u64 {
     item.size_hint()
         .map(|hint| hint.max(1))
-        .unwrap_or(remaining_bytes)
+        .unwrap_or(DEFAULT_UNKNOWN_ITEM_BYTE_CAP)
         .min(remaining_bytes)
 }
 
-/// Default chunk size for ordered-content scanning, matching `ParallelScanConfig::default().chunk_size`.
+/// Per-item byte cap applied when the connector does not provide a
+/// `size_hint`.  16 MiB covers >99 % of source-code files while leaving
+/// the majority of a 64 MiB page budget available for subsequent items.
+const DEFAULT_UNKNOWN_ITEM_BYTE_CAP: u64 = 16 * 1024 * 1024;
+
+/// Default chunk size for ordered-content scanning (256 KiB).
+///
+/// This value is validated by the engine's buffer-scaling benchmarks
+/// (`scanner_throughput.rs`) and sits in the L2-cache sweet spot
+/// (256 KiB–1 MiB on modern CPUs).  At 2 GB/s engine throughput each
+/// chunk scans in ~128 µs with ~1.5 % per-call overhead — negligible
+/// for Tiers 2–4.  Hyperscan/Vectorscan has no buffer-size preference
+/// beyond "not tiny", so the value is driven by cache residency and
+/// I/O amortization, not by the engine.
 const DEFAULT_ORDERED_CHUNK_SIZE: usize = 256 * 1024;
 
 fn connector_read_budgets(max_bytes: u64) -> Result<Budgets, ScanRuntimeError> {
@@ -1129,6 +1149,13 @@ fn scan_item_chunks(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
+    /// When true, the `read_next` closure supports offset-based stateless reads
+    /// (e.g. `read_range`), so a one-byte EOF probe after budget exhaustion can
+    /// reliably distinguish real EOF from budget-limit EOF. When false (open-
+    /// based sequential readers that may be budget-capped at creation), the
+    /// probe would query the same budget-limited reader and cannot detect
+    /// trailing content — budget exhaustion is always treated as truncation.
+    stateless_reads: bool,
     mut read_next: impl FnMut(u64, &mut [u8], u64) -> Result<usize, OrderedContentReadStop>,
 ) -> OrderedContentItemResult {
     let overlap = <scanner_engine::Engine as ScanEngine>::required_overlap(engine);
@@ -1149,20 +1176,21 @@ fn scan_item_chunks(
 
         let remaining_item_bytes = item_byte_budget.saturating_sub(connector_bytes_consumed);
         if remaining_item_bytes == 0 {
-            // Budget exhausted. Probe one more byte to distinguish "connector
-            // has no more data" (complete scan) from "connector still has data
-            // beyond the budget" (truncated). size_hint is an estimate and
-            // cannot be relied upon as proof of EOF.
-            let mut probe = [0u8; 1];
-            let eof = match read_next(offset, &mut probe, 1) {
-                Ok(0) => true,
-                Ok(_) => false,
-                // Read error during the probe — treat as truncated rather
-                // than masking a possible connector failure.
-                Err(_) => false,
-            };
-            if eof {
-                break OrderedContentItemOutcome::Scanned { findings };
+            // Budget exhausted. For stateless read paths (range-read), probe
+            // one more byte to distinguish real EOF from budget-limit EOF.
+            // For stateful readers (open-based), the reader may be budget-
+            // capped at creation, so the probe would see the wrapper's EOF
+            // rather than the underlying content's — treat as truncated.
+            if stateless_reads {
+                let mut probe = [0u8; 1];
+                let eof = match read_next(offset, &mut probe, 1) {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    Err(_) => false,
+                };
+                if eof {
+                    break OrderedContentItemOutcome::Scanned { findings };
+                }
             }
             break OrderedContentItemOutcome::Truncated { findings };
         }
@@ -1288,6 +1316,7 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
+        true, // range-read: each call is offset-based and stateless
         move |offset, dst, remaining_item_bytes| {
             let budgets = connector_read_budgets(remaining_item_bytes).map_err(|error| {
                 OrderedContentReadStop {
@@ -1346,6 +1375,7 @@ fn execute_item_via_open<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
+        false, // open: reader may be budget-capped, EOF probe unreliable
         // Sequential io::Read — offset tracking is implicit, no seek support.
         // The byte budget is enforced by scan_item_chunks, which sizes each
         // read slice to the remaining item budget.
@@ -2448,10 +2478,11 @@ mod tests {
         };
         assert!(!findings.is_empty(), "rule should match TOK_BBBBBBBB");
         assert_eq!(execution.execution_report().items_scanned, 2);
-        // Without size_hint, the connector budget defaults to remaining_bytes.
+        // Without size_hint, item_byte_budget is min(DEFAULT_UNKNOWN_ITEM_BYTE_CAP,
+        // remaining_bytes). Here 1_024 < 16 MiB, so remaining_bytes wins.
         assert_eq!(
             source.range_calls[0].max_bytes, 1_024,
-            "first item gets full remaining budget when size_hint is None"
+            "capped budget still clamps to remaining_bytes when smaller"
         );
     }
 
@@ -2501,6 +2532,56 @@ mod tests {
             ),
             "budget-exhausted item must be Truncated, got {:?}",
             execution.outcomes()[0].outcome()
+        );
+    }
+
+    #[test]
+    fn unknown_size_item_is_capped_and_does_not_consume_entire_budget() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // Item a has no size_hint and is small — fits under the cap.
+        // Item b has no size_hint and is small too.
+        // With a large page budget (32 MiB) and two small no-hint items,
+        // both should be admitted. The per-item connector budget must be
+        // capped at DEFAULT_UNKNOWN_ITEM_BYTE_CAP (16 MiB), NOT the full
+        // remaining page budget (32 MiB).
+        let content_a = b"prefix TOK_AAAAAAAA suffix";
+        let content_b = b"prefix TOK_BBBBBBBB suffix";
+        source.insert(b"a.txt", content_a);
+        source.insert(b"b.txt", content_b);
+        let page = prefiltered_page(
+            vec![
+                (
+                    item_no_hint(b"a.txt"),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item_no_hint(b"b.txt"),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 32 * 1024 * 1024, // 32 MiB — well above the cap
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 2, "both items admitted");
+        assert!(execution.deferred().is_empty());
+
+        // The connector byte budget for the first no-hint item must be
+        // capped at DEFAULT_UNKNOWN_ITEM_BYTE_CAP, not the full 32 MiB
+        // remaining budget.
+        assert_eq!(
+            source.range_calls[0].max_bytes,
+            super::DEFAULT_UNKNOWN_ITEM_BYTE_CAP,
+            "first no-hint item budget must be capped at DEFAULT_UNKNOWN_ITEM_BYTE_CAP"
         );
     }
 
