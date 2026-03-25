@@ -675,18 +675,24 @@ pub enum OrderedContentSkipReason {
     /// Item content was classified as binary and `scan_binary` was disabled.
     Binary,
     /// Item is a known extractable binary format (`.ipynb`, `.class`, `.jar`,
-    /// `.pyc`, `.env`); extraction is not yet wired for the ordered-content path.
+    /// `.pyc`, `.env`); the extraction pipeline requires full-item buffering
+    /// that the ordered-content chunked-read path does not support.
     BinaryExtractable,
 }
 
 /// Non-durable outcome for one ordered-content item execution attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentItemOutcome {
-    /// Scanning completed within the item's byte budget and produced the listed
-    /// findings. When `size_hint` is absent the budget may be smaller than the
-    /// actual item; downstream translation stages compare `bytes_scanned` against
-    /// the declared size before persisting a done-ledger entry.
+    /// The connector returned EOF before the per-item byte budget was exhausted,
+    /// meaning the full item content was read and scanned. Any findings
+    /// discovered during scanning are included.
     Scanned { findings: Vec<FsFindingRecord> },
+    /// The per-item byte budget was exhausted before the connector signaled EOF.
+    /// Only a prefix of the item was scanned, so findings past the truncation
+    /// point may have been missed. Downstream translation stages must NOT
+    /// persist a terminal done-ledger status for truncated items so they are
+    /// retried on the next pass.
+    Truncated { findings: Vec<FsFindingRecord> },
     /// Connector open/read failed for this item.
     Failed(OrderedContentReadStop),
     /// The runtime intentionally skipped this item without treating it as an error.
@@ -902,7 +908,7 @@ impl OrderedContentRuntime {
 
     /// Execute one prefiltered page's `ScanMiss` items with a caller-supplied engine.
     ///
-    /// `AlreadyDone` entries are counted but never opened. The first cut keeps
+    /// `AlreadyDone` entries are counted but never opened. Execution keeps
     /// at most one miss in flight at a time. Item-count and byte limits are
     /// enforced before admitting an item, then bridged into per-item connector
     /// read budgets. If the next miss cannot fit inside the remaining budget,
@@ -1126,13 +1132,23 @@ fn scan_item_chunks(
 
         let remaining_item_bytes = item_byte_budget.saturating_sub(connector_bytes_consumed);
         if remaining_item_bytes == 0 {
-            break OrderedContentItemOutcome::Scanned { findings };
+            // Budget exhausted before the connector returned EOF. When the
+            // item declared a size_hint the budget equals the declared size,
+            // so exhaustion means the declared content was fully consumed.
+            // Without a size_hint the budget is the remaining page allowance
+            // and the actual item may extend beyond what was read.
+            if item.size_hint().is_some() {
+                break OrderedContentItemOutcome::Scanned { findings };
+            }
+            break OrderedContentItemOutcome::Truncated { findings };
         }
         let read_max = chunk_size
             .min(buf.len().saturating_sub(carry))
             .min(usize::try_from(remaining_item_bytes).unwrap_or(usize::MAX));
         if read_max == 0 {
-            break OrderedContentItemOutcome::Scanned { findings };
+            // Buffer too small to make progress; unreachable after the
+            // chunk_size > 0 guard, but safe to treat as truncated.
+            break OrderedContentItemOutcome::Truncated { findings };
         }
 
         let n = match read_next(
@@ -1165,8 +1181,8 @@ fn scan_item_chunks(
                 }
                 ContentVerdict::BinaryExtractable(_) => {
                     // Extractable formats (.class, .jar, .pyc, .ipynb, .env)
-                    // require a dedicated extraction pipeline that is not yet
-                    // wired for connector-backed ordered-content items.
+                    // require full-item buffering for `extract_content`, which
+                    // the ordered-content chunked-read path does not provide.
                     connector_bytes_consumed = 0;
                     break OrderedContentItemOutcome::Skipped(
                         OrderedContentSkipReason::BinaryExtractable,
@@ -1201,7 +1217,8 @@ fn scan_item_chunks(
 
     let wall_clock_scan_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let (findings_emitted, errors, binary_skipped) = match &outcome {
-        OrderedContentItemOutcome::Scanned { findings } => (findings.len() as u64, 0, 0),
+        OrderedContentItemOutcome::Scanned { findings }
+        | OrderedContentItemOutcome::Truncated { findings } => (findings.len() as u64, 0, 0),
         OrderedContentItemOutcome::Failed(_stop) => (0, 1, 0),
         OrderedContentItemOutcome::Skipped(
             OrderedContentSkipReason::Binary | OrderedContentSkipReason::BinaryExtractable,
@@ -2393,6 +2410,55 @@ mod tests {
         assert_eq!(
             source.range_calls[0].max_bytes, 1_024,
             "first item gets full remaining budget when size_hint is None"
+        );
+    }
+
+    #[test]
+    fn budget_exhaustion_before_eof_produces_truncated_outcome() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // Content is 100 bytes, but the page byte budget is only 32.
+        // The item has no size_hint, so it is admitted with
+        // item_byte_budget = remaining_bytes = 32. After reading 32 bytes
+        // the budget is exhausted while the connector still has 68 bytes
+        // remaining — the outcome must be Truncated, not Scanned.
+        let content = vec![b'x'; 100];
+        source.insert(b"big.txt", &content);
+        let page = prefiltered_page(
+            vec![(
+                item_no_hint(b"big.txt"),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let engine = build_runtime_engine(
+            Some(rules.path()),
+            &TransformFilter::default(),
+            None,
+            AnchorMode::default(),
+        )
+        .expect("engine builds");
+        let execution = OrderedContentRuntime::execute_scan_misses_with_engine(
+            &mut source,
+            page,
+            ScanBudgets {
+                max_items: 8,
+                max_bytes: 32,
+            },
+            false,
+            engine,
+            DEFAULT_ORDERED_CHUNK_SIZE,
+        )
+        .expect("execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1);
+        assert!(
+            matches!(
+                execution.outcomes()[0].outcome(),
+                OrderedContentItemOutcome::Truncated { .. }
+            ),
+            "budget-exhausted item must be Truncated, got {:?}",
+            execution.outcomes()[0].outcome()
         );
     }
 

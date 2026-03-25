@@ -106,8 +106,9 @@ monotonicity, classifies enumerate failures from the connector error
 taxonomy, and returns the page-level `ScanReport`. It does not have a
 `WriteContext` or done-ledger handle, so it performs neither done-ledger
 prefiltering nor scan-miss execution. The full pipeline (prefilter →
-`execute_scan_misses` → translation → commit) is wired by the
-distributed worker loop, not by this local entry point.
+`execute_scan_misses` → translation → commit) is designed for the
+distributed worker loop; this local entry point performs only the
+boundary validation step.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
