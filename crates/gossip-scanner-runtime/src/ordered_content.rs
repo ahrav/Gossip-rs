@@ -24,7 +24,7 @@
 //!    scheduler-based parallel filesystem scan and forwards events and
 //!    persistence batches through bounded channels.
 //!
-//! The ordered-content entrypoints handle page validation and bounded
+//! The ordered-content entrypoints own page validation plus bounded
 //! `scan_miss` execution. Durable translation, receipt emission, and
 //! checkpoint advancement occur in later runtime stages.
 //!
@@ -600,7 +600,9 @@ pub enum OrderedContentExecutionOutcome {
 ///
 /// Mirrors [`OrderedContentStop`] but for item-content access. Retryability
 /// and optional backoff hints come directly from the connector's
-/// [`ReadError`] when available.
+/// [`ReadError`] when available. When the fallback `open` path is already
+/// holding a `std::io::Read`, plain reader failures are classified locally so
+/// downstream stages can keep using a structured retry/permanent distinction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentReadStop {
     class: ErrorClass,
@@ -670,6 +672,9 @@ impl std::fmt::Display for OrderedContentReadStop {
 }
 
 /// Non-failure item skip reasons during ordered-content execution.
+///
+/// These reasons are counted in [`ScanReport`] but do not increment the
+/// runtime error counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderedContentSkipReason {
     /// Item content was classified as binary and `scan_binary` was disabled.
@@ -681,11 +686,17 @@ pub enum OrderedContentSkipReason {
 }
 
 /// Non-durable outcome for one ordered-content item execution attempt.
+///
+/// Each `ScanMiss` admitted for execution produces exactly one of these
+/// terminal states. Later translation and commit stages decide whether the
+/// outcome becomes a durable done-ledger row or receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentItemOutcome {
-    /// The connector returned EOF before the per-item byte budget was exhausted,
-    /// meaning the full item content was read and scanned. Any findings
-    /// discovered during scanning are included.
+    /// Item content was scanned under the admitted connector byte budget and
+    /// produced the listed findings.
+    ///
+    /// Findings are already post-processed through the shared chunk pipeline
+    /// (overlap pruning, cross-rule dedupe, and dropped-finding accounting).
     Scanned { findings: Vec<FsFindingRecord> },
     /// The per-item byte budget was exhausted before the connector signaled EOF.
     /// Only a prefix of the item was scanned, so findings past the truncation
@@ -694,12 +705,19 @@ pub enum OrderedContentItemOutcome {
     /// retried on the next pass.
     Truncated { findings: Vec<FsFindingRecord> },
     /// Connector open/read failed for this item.
+    ///
+    /// The failure is captured in-band so the page-level execution can still
+    /// return ordered results for the remaining admitted misses.
     Failed(OrderedContentReadStop),
     /// The runtime intentionally skipped this item without treating it as an error.
     Skipped(OrderedContentSkipReason),
 }
 
 /// One executed ordered-content item plus its runtime-local scan report.
+///
+/// Instances preserve original page order for the admitted `ScanMiss` subset.
+/// `report` describes only this item attempt; page-level enumeration counters
+/// stay on [`OrderedContentScanMissExecution::page_report`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentItemExecution {
     item: ScanItem,
@@ -750,6 +768,16 @@ impl OrderedContentItemExecution {
 /// the page, not only a contiguous suffix.
 /// The page-level `page_state`, `page_report`, and `resume_cursor` values are
 /// carried through unchanged from the input prefiltered page.
+///
+/// # Invariants preserved
+///
+/// - `already_done_len` counts the prefiltered items that never reached the
+///   open/read stage.
+/// - `outcomes` contains one entry per admitted `ScanMiss`.
+/// - `deferred` contains the untouched miss suffix that could not be admitted
+///   under the remaining runtime budget.
+/// - `page_report` still describes the original validated page, while
+///   `execution_report` aggregates only the admitted miss attempts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentScanMissExecution {
     outcomes: Vec<OrderedContentItemExecution>,
@@ -889,6 +917,11 @@ impl OrderedContentRuntime {
 
     /// Build the runtime engine from [`FsScanConfig`] and execute the page's
     /// `ScanMiss` subset under the runtime budgets.
+    ///
+    /// This is the convenience entry point used by runtime callers that do
+    /// not already own a shared engine instance. Engine-construction failures
+    /// still surface as [`ScanRuntimeError`] because they prevent any item
+    /// execution from starting.
     pub fn execute_scan_misses<S: OrderedContentSource>(
         source: &mut S,
         page: OrderedContentPrefilteredPage,
@@ -912,15 +945,47 @@ impl OrderedContentRuntime {
 
     /// Execute one prefiltered page's `ScanMiss` items with a caller-supplied engine.
     ///
-    /// `AlreadyDone` entries are counted but never opened. Execution keeps
-    /// at most one miss in flight at a time. Item-count and byte limits are
+    /// `AlreadyDone` entries are counted but never opened. At most one miss
+    /// is in flight at a time. Item-count and byte limits are
     /// enforced before admitting an item, then bridged into per-item connector
     /// read budgets. A miss whose `size_hint` exceeds the remaining byte
-    /// budget is individually deferred (skipped ahead) so that smaller items
-    /// behind it can still be processed; when the budget is fully exhausted
-    /// the remaining miss suffix is drained into `deferred`. The returned
-    /// outcomes are non-durable: this stage does not emit receipts, advance
-    /// checkpoints, or write the done ledger.
+    /// budget is individually deferred so that smaller items behind it can
+    /// still be processed; when the budget is fully exhausted the remaining
+    /// miss suffix is drained into `deferred`. The returned outcomes are
+    /// non-durable: this stage does not emit receipts, advance checkpoints,
+    /// or write the done ledger.
+    ///
+    /// # Read strategy
+    ///
+    /// Connectors that advertise `range_read` are driven through repeated
+    /// `read_range` calls so the runtime can reuse the scheduler's chunking
+    /// helpers without forcing a whole-item buffer. Other connectors use
+    /// `open` and stream bytes from the returned reader.
+    ///
+    /// # Byte-budget admission
+    ///
+    /// If an item exposes `size_hint`, that hint is treated as the minimum
+    /// byte budget needed to admit the item. When the hint exceeds the
+    /// remaining page budget, only that item is deferred — the loop
+    /// continues to try smaller items behind it. Items without a `size_hint`
+    /// are assigned a fixed cap ([`DEFAULT_UNKNOWN_ITEM_BYTE_CAP`]) to
+    /// prevent a single unbounded item from consuming the entire page budget.
+    ///
+    /// After admission, `size_hint` also serves as the per-item read cap
+    /// (clamped to the remaining page budget). This prevents a single item
+    /// whose actual content exceeds the hint from consuming the entire
+    /// remaining page budget and starving later items. For connectors
+    /// whose `size_hint` is exact (e.g. S3 `Content-Length`), the cap
+    /// matches the real content length; for connectors with unreliable
+    /// size metadata, content beyond the hint is not scanned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only for configuration or runtime invariant failures
+    /// (for example invalid budgets or file-id exhaustion). Connector
+    /// open/read failures are recorded as
+    /// [`OrderedContentItemOutcome::Failed`] entries so page execution can
+    /// continue in order.
     pub fn execute_scan_misses_with_engine<S: OrderedContentSource>(
         source: &mut S,
         page: OrderedContentPrefilteredPage,
@@ -961,10 +1026,8 @@ impl OrderedContentRuntime {
                     already_done_len += 1;
                 }
                 OrderedContentPrefilterDisposition::ScanMiss => {
-                    let budget_exhausted = remaining_items == 0 || remaining_bytes == 0;
-
-                    if budget_exhausted {
-                        drain_remaining_misses(
+                    if remaining_items == 0 || remaining_bytes == 0 {
+                        defer_remaining_misses(
                             item,
                             &mut classified_iter,
                             &mut deferred,
@@ -1079,31 +1142,42 @@ const DEFAULT_UNKNOWN_ITEM_BYTE_CAP: u64 = 16 * 1024 * 1024;
 /// I/O amortization, not by the engine.
 const DEFAULT_ORDERED_CHUNK_SIZE: usize = 256 * 1024;
 
+/// Convert a per-item byte allowance into connector budgets.
+///
+/// Ordered-content miss execution keeps at most one item in flight, so each
+/// connector read/open call uses `max_items = 1` plus the remaining byte
+/// allowance for the current item attempt.
 fn connector_read_budgets(max_bytes: u64) -> Result<Budgets, ScanRuntimeError> {
     Budgets::try_new(1, max_bytes, None).map_err(ScanRuntimeError::ConnectorInput)
 }
 
-/// Push `first` into `deferred`, then drain the remaining iterator, collecting
-/// `ScanMiss` items into `deferred` and counting `AlreadyDone` entries.
-fn drain_remaining_misses(
-    first: ScanItem,
+/// Drain `item` and every remaining `ScanMiss` entry from `iter` into
+/// `deferred`, counting any `AlreadyDone` entries encountered along the way.
+///
+/// Called when the page budget is exhausted or when a size hint proves the
+/// next item cannot fit. The `already_done_len` counter is incremented for
+/// every `AlreadyDone` item consumed from the iterator tail so the caller's
+/// total count remains accurate.
+fn defer_remaining_misses(
+    item: ScanItem,
     iter: &mut impl Iterator<Item = OrderedContentClassifiedItem>,
     deferred: &mut Vec<ScanItem>,
     already_done_len: &mut usize,
 ) {
-    deferred.push(first);
+    deferred.push(item);
     deferred.extend(iter.filter_map(|classified_item| {
         let (item, disposition) = classified_item.into_parts();
-        match disposition {
-            OrderedContentPrefilterDisposition::AlreadyDone => {
-                *already_done_len += 1;
-                None
-            }
-            OrderedContentPrefilterDisposition::ScanMiss => Some(item),
+        if disposition == OrderedContentPrefilterDisposition::ScanMiss {
+            Some(item)
+        } else {
+            *already_done_len += 1;
+            None
         }
     }));
 }
 
+/// Translate scheduler-local metrics plus terminal outcome counters into the
+/// runtime's public [`ScanReport`] shape for one item attempt.
 fn build_item_report(
     metrics: &WorkerMetricsLocal,
     findings_emitted: u64,
@@ -1125,6 +1199,7 @@ fn build_item_report(
     }
 }
 
+/// Copy engine findings into the runtime's persistence-oriented record type.
 fn append_findings<F: FindingWithHashRecord>(src: &[F], dst: &mut Vec<FsFindingRecord>) {
     dst.extend(src.iter().map(|finding| FsFindingRecord {
         rule_id: finding.rule_id(),
@@ -1137,7 +1212,11 @@ fn append_findings<F: FindingWithHashRecord>(src: &[F], dst: &mut Vec<FsFindingR
     }));
 }
 
-/// Scan an item's content in chunks, enforcing the per-item byte budget.
+/// Stream one item's bytes through the shared chunk scan pipeline.
+///
+/// The callback supplies bytes either via `read_range` or a streaming reader.
+/// Execution stops on the first classified read failure, on EOF, or once the
+/// admitted `item_byte_budget` has been consumed.
 ///
 /// `stateless_reads` indicates whether the `read_next` closure supports
 /// offset-based stateless reads (e.g. `read_range`). When true, a one-byte
@@ -1220,7 +1299,11 @@ fn scan_item_chunks(
 
         connector_bytes_consumed = connector_bytes_consumed.saturating_add(n as u64);
 
-        if std::mem::take(&mut first_chunk) && !scan_binary {
+        if first_chunk && !scan_binary {
+            first_chunk = false;
+            // Binary classification happens before the first chunk enters the
+            // shared scan pipeline so we can skip opaque content without
+            // spending overlap/dedupe work on it.
             let verdict = classify_content(
                 &buf[carry..carry + n],
                 item.item_key().as_bytes(),
@@ -1292,6 +1375,10 @@ fn scan_item_chunks(
     }
 }
 
+/// Execute one item through the connector's `read_range` capability.
+///
+/// Range reads can honor the remaining item budget on every chunk request, so
+/// the runtime does not need to trust the connector to stop at EOF.
 #[allow(clippy::too_many_arguments)]
 fn execute_item_via_range_read<S: OrderedContentSource>(
     source: &mut S,
@@ -1335,6 +1422,12 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
     ))
 }
 
+/// Execute one item through the connector's streaming `open` fallback.
+///
+/// The returned reader is opened under the admitted per-item budget. Any
+/// subsequent `std::io::Read` failure is classified locally because the
+/// connector's structured [`ReadError`] is no longer available after `open`
+/// succeeds.
 #[allow(clippy::too_many_arguments)]
 fn execute_item_via_open<S: OrderedContentSource>(
     source: &mut S,
@@ -2206,6 +2299,63 @@ mod tests {
         assert!(touched.contains(b"a.txt".as_slice()));
         assert!(touched.contains(b"b.txt".as_slice()));
         assert!(!touched.contains(b"c.txt".as_slice()));
+    }
+
+    #[test]
+    fn execute_scan_misses_counts_already_done_after_budget_exhaustion() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"b.txt", b"bbb");
+        // Page layout: [AlreadyDone_1, ScanMiss_1, ScanMiss_2, AlreadyDone_2, ScanMiss_3]
+        //
+        // With max_items=1:
+        //   - AlreadyDone_1 is counted in the loop (already_done_len = 1)
+        //   - ScanMiss_1 is admitted and processed, remaining_items → 0
+        //   - ScanMiss_2 triggers defer_remaining_misses because budget is 0
+        //   - Inside defer_remaining_misses, the iterator tail contains
+        //     AlreadyDone_2 and ScanMiss_3. AlreadyDone_2 MUST be counted.
+        let page = prefiltered_page(
+            vec![
+                (
+                    item(b"a.txt", 3),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"b.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"c.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"d.txt", 3),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"e.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 1,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1, "one miss item admitted");
+        assert_eq!(execution.deferred().len(), 2, "two misses deferred");
+        assert_eq!(
+            execution.already_done_len(),
+            2,
+            "both AlreadyDone items must be counted, including the one after budget exhaustion"
+        );
     }
 
     #[test]
