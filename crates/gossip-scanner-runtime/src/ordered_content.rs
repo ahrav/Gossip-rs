@@ -968,7 +968,7 @@ impl OrderedContentRuntime {
     /// byte budget needed to admit the item. When the hint exceeds the
     /// remaining page budget, only that item is deferred — the loop
     /// continues to try smaller items behind it. Items without a `size_hint`
-    /// are assigned a fixed cap ([`DEFAULT_UNKNOWN_ITEM_BYTE_CAP`]) to
+    /// are assigned a fixed cap (16 MiB) to
     /// prevent a single unbounded item from consuming the entire page budget.
     ///
     /// After admission, `size_hint` also serves as the per-item read cap
@@ -1218,13 +1218,12 @@ fn append_findings<F: FindingWithHashRecord>(src: &[F], dst: &mut Vec<FsFindingR
 /// Execution stops on the first classified read failure, on EOF, or once the
 /// admitted `item_byte_budget` has been consumed.
 ///
-/// `stateless_reads` indicates whether the `read_next` closure supports
-/// offset-based stateless reads (e.g. `read_range`). When true, a one-byte
-/// EOF probe after budget exhaustion reliably distinguishes real EOF from
-/// budget-limit EOF. When false (open-based sequential readers that may be
-/// budget-capped at creation), the probe would query the same budget-limited
-/// reader and cannot detect trailing content, so budget exhaustion is always
-/// treated as truncation.
+/// After the per-item budget is exhausted, a one-byte EOF probe
+/// distinguishes "connector has no more data" (`Scanned`) from "content
+/// extends beyond the budget" (`Truncated`). Callers that use a budget-
+/// capped reader (the `open` path) must open it with at least one byte of
+/// headroom beyond `item_byte_budget` so the probe can read past the scan
+/// budget and observe real EOF.
 #[allow(clippy::too_many_arguments)]
 fn scan_item_chunks(
     engine: &scanner_engine::Engine,
@@ -1237,7 +1236,6 @@ fn scan_item_chunks(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
-    stateless_reads: bool,
     mut read_next: impl FnMut(u64, &mut [u8], u64) -> Result<usize, OrderedContentReadStop>,
 ) -> OrderedContentItemResult {
     let overlap = <scanner_engine::Engine as ScanEngine>::required_overlap(engine);
@@ -1258,21 +1256,17 @@ fn scan_item_chunks(
 
         let remaining_item_bytes = item_byte_budget.saturating_sub(connector_bytes_consumed);
         if remaining_item_bytes == 0 {
-            // Budget exhausted. For stateless read paths (range-read), probe
-            // one more byte to distinguish real EOF from budget-limit EOF.
-            // For stateful readers (open-based), the reader may be budget-
-            // capped at creation, so the probe would see the wrapper's EOF
-            // rather than the underlying content's — treat as truncated.
-            if stateless_reads {
-                let mut probe = [0u8; 1];
-                let eof = match read_next(offset, &mut probe, 1) {
-                    Ok(0) => true,
-                    Ok(_) => false,
-                    Err(_) => false,
-                };
-                if eof {
-                    break OrderedContentItemOutcome::Scanned { findings };
-                }
+            // Budget exhausted. Probe one more byte to distinguish real EOF
+            // from budget-limit EOF. The open path opens the reader with one
+            // byte of headroom beyond the scan budget so this probe can read
+            // past the budget and observe real EOF.
+            let mut probe = [0u8; 1];
+            let eof = match read_next(offset, &mut probe, 1) {
+                Ok(0) => true,
+                Ok(_) | Err(_) => false,
+            };
+            if eof {
+                break OrderedContentItemOutcome::Scanned { findings };
             }
             break OrderedContentItemOutcome::Truncated { findings };
         }
@@ -1406,7 +1400,6 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
-        true, // range-read: each call is offset-based and stateless
         move |offset, dst, remaining_item_bytes| {
             let budgets = connector_read_budgets(remaining_item_bytes).map_err(|error| {
                 OrderedContentReadStop {
@@ -1424,10 +1417,12 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
 
 /// Execute one item through the connector's streaming `open` fallback.
 ///
-/// The returned reader is opened under the admitted per-item budget. Any
-/// subsequent `std::io::Read` failure is classified locally because the
-/// connector's structured [`ReadError`] is no longer available after `open`
-/// succeeds.
+/// The returned reader is opened with one byte of headroom beyond the
+/// per-item scan budget. This allows the EOF probe in `scan_item_chunks`
+/// to read past the scan budget and distinguish real EOF from the reader's
+/// budget cap. Any subsequent `std::io::Read` failure is classified
+/// locally because the connector's structured [`ReadError`] is no longer
+/// available after `open` succeeds.
 #[allow(clippy::too_many_arguments)]
 fn execute_item_via_open<S: OrderedContentSource>(
     source: &mut S,
@@ -1443,7 +1438,10 @@ fn execute_item_via_open<S: OrderedContentSource>(
     metrics: &mut WorkerMetricsLocal,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
     let item_byte_budget = item_byte_budget(&item, remaining_bytes);
-    let reader_budgets = connector_read_budgets(item_byte_budget)?;
+    // Open the reader with one byte of headroom beyond the scan budget so the
+    // EOF probe in scan_item_chunks can read past the budget and distinguish
+    // real EOF from the reader's budget cap.
+    let reader_budgets = connector_read_budgets(item_byte_budget.saturating_add(1))?;
     let mut reader = match source.open(item.item_ref(), reader_budgets) {
         Ok(reader) => reader,
         Err(error) => {
@@ -1471,7 +1469,6 @@ fn execute_item_via_open<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
-        false, // open: reader may be budget-capped, EOF probe unreliable
         // Sequential io::Read — offset tracking is implicit, no seek support.
         // The byte budget is enforced by scan_item_chunks, which sizes each
         // read slice to the remaining item budget.
@@ -2576,8 +2573,14 @@ mod tests {
         assert_eq!(stop.class(), ErrorClass::Permanent);
         assert_eq!(execution.execution_report().binary_skipped, 1);
         assert_eq!(execution.execution_report().errors, 1);
-        assert_eq!(source.open_calls[0].max_bytes, 4);
-        assert_eq!(source.open_calls[1].max_bytes, 4);
+        assert_eq!(
+            source.open_calls[0].max_bytes, 5,
+            "item_byte_budget(4) + 1 probe headroom"
+        );
+        assert_eq!(
+            source.open_calls[1].max_bytes, 5,
+            "item_byte_budget(4) + 1 probe headroom"
+        );
         assert!(
             source.range_calls.is_empty(),
             "open-fallback path should not call read_range"
