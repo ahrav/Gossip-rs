@@ -59,75 +59,12 @@ use std::collections::BTreeMap;
 
 use super::FaultLevel;
 use super::harness::{CoordinationSim, SimEventKind};
+use super::test_util::{
+    fault_level_name, parse_env_fault_level, parse_env_seed_count, parse_env_single_seed,
+};
 
-/// Map a [`FaultLevel`] to the string accepted by `GOSSIP_SIM_FAULT`.
-fn fault_level_name(level: FaultLevel) -> &'static str {
-    match level {
-        FaultLevel::SunnyDay => "sunny",
-        FaultLevel::Stormy => "stormy",
-        FaultLevel::Radioactive => "radioactive",
-    }
-}
-
-/// Read `GOSSIP_SIM_SEEDS` from the environment, defaulting to 100.
-///
-/// Warns on parse errors so that accidentally malformed values are
-/// visible in test output rather than silently ignored.
-fn parse_seed_count() -> usize {
-    match std::env::var("GOSSIP_SIM_SEEDS") {
-        Ok(s) => match s.parse() {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!(
-                    "warning: GOSSIP_SIM_SEEDS={s:?} is not a valid number ({e}), \
-                     falling back to default 100"
-                );
-                100
-            }
-        },
-        Err(_) => 100,
-    }
-}
-
-/// Read `GOSSIP_SIM_SEED` to enter single-seed reproduction mode.
-///
-/// When set, the mega sim skips the parallel sweep and runs only the
-/// specified seed, making failure investigation fast and deterministic.
-/// Warns on parse errors so typos are visible.
-fn parse_single_seed() -> Option<u64> {
-    match std::env::var("GOSSIP_SIM_SEED") {
-        Ok(s) => match s.parse() {
-            Ok(n) => Some(n),
-            Err(e) => {
-                eprintln!("warning: GOSSIP_SIM_SEED={s:?} is not a valid number ({e}), ignoring");
-                None
-            }
-        },
-        Err(_) => None,
-    }
-}
-
-/// Read `GOSSIP_SIM_FAULT` to override the default fault level.
-///
-/// Defaults to `Stormy` when unset, which provides a good balance between
-/// fault pressure and convergence probability. Warns on unrecognized values.
-fn parse_fault_level() -> FaultLevel {
-    match std::env::var("GOSSIP_SIM_FAULT") {
-        Ok(s) => match s.to_lowercase().as_str() {
-            "sunny" | "sunnyday" => FaultLevel::SunnyDay,
-            "radioactive" => FaultLevel::Radioactive,
-            "stormy" => FaultLevel::Stormy,
-            _ => {
-                eprintln!(
-                    "warning: GOSSIP_SIM_FAULT={s:?} is not recognized \
-                     (expected sunny|stormy|radioactive), falling back to Stormy"
-                );
-                FaultLevel::Stormy
-            }
-        },
-        Err(_) => FaultLevel::Stormy,
-    }
-}
+/// Default seed count for the mega sim sweep.
+const DEFAULT_SEEDS: usize = 100;
 
 /// Thread-parallel seed sweep over the full coordination simulation.
 ///
@@ -165,10 +102,10 @@ fn mega_sim_10k_steps() {
         return;
     }
 
-    let fault_level = parse_fault_level();
+    let fault_level = parse_env_fault_level("GOSSIP_SIM");
 
     // Single-seed repro mode.
-    if let Some(seed) = parse_single_seed() {
+    if let Some(seed) = parse_env_single_seed("GOSSIP_SIM") {
         let report = CoordinationSim::new(seed, fault_level)
             .with_workers_and_shards(4, 15)
             .run(10_000, 2_000);
@@ -183,7 +120,7 @@ fn mega_sim_10k_steps() {
         return;
     }
 
-    let seed_count = parse_seed_count();
+    let seed_count = parse_env_seed_count("GOSSIP_SIM", DEFAULT_SEEDS);
     if seed_count == 0 {
         return;
     }
