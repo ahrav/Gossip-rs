@@ -2151,7 +2151,11 @@ mod tests {
             .expect("scan-miss execution succeeds");
 
         assert_eq!(execution.outcomes().len(), 1, "only a.txt fits the budget");
-        assert_eq!(execution.deferred().len(), 2, "b.txt and e.txt are deferred");
+        assert_eq!(
+            execution.deferred().len(),
+            2,
+            "b.txt and e.txt are deferred"
+        );
         assert_eq!(execution.deferred()[0].item_key().as_bytes(), b"b.txt");
         assert_eq!(execution.deferred()[1].item_key().as_bytes(), b"e.txt");
         assert_eq!(
