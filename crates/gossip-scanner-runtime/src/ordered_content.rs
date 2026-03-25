@@ -644,6 +644,9 @@ impl std::fmt::Display for OrderedContentReadStop {
 pub enum OrderedContentSkipReason {
     /// Item content was classified as binary and `scan_binary` was disabled.
     Binary,
+    /// Item is a known extractable binary format (`.ipynb`, `.class`, `.jar`,
+    /// `.pyc`, `.env`); extraction is not yet wired for the ordered-content path.
+    BinaryExtractable,
 }
 
 /// Non-durable outcome for one ordered-content item execution attempt.
@@ -1028,17 +1031,15 @@ fn build_item_report(
 }
 
 fn append_findings<F: FindingWithHashRecord>(src: &[F], dst: &mut Vec<FsFindingRecord>) {
-    for finding in src {
-        dst.push(FsFindingRecord {
-            rule_id: finding.rule_id(),
-            root_hint_start: finding.root_hint_start(),
-            root_hint_end: finding.root_hint_end(),
-            span_start: finding.span_start(),
-            span_end: finding.span_end(),
-            norm_hash: *finding.norm_hash(),
-            confidence_score: finding.confidence_score(),
-        });
-    }
+    dst.extend(src.iter().map(|finding| FsFindingRecord {
+        rule_id: finding.rule_id(),
+        root_hint_start: finding.root_hint_start(),
+        root_hint_end: finding.root_hint_end(),
+        span_start: finding.span_start(),
+        span_end: finding.span_end(),
+        norm_hash: *finding.norm_hash(),
+        confidence_score: finding.confidence_score(),
+    }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1103,12 +1104,21 @@ fn scan_item_chunks(
                 CHECK_LEN,
             );
             match verdict {
-                ContentVerdict::Binary | ContentVerdict::BinaryExtractable(_) => {
-                    // BinaryExtractable formats (.class, .jar, .pyc, .ipynb, .env)
-                    // require a dedicated extraction pipeline that is not yet wired
-                    // for connector-backed ordered-content items. Skip them the same
-                    // as opaque binary until extraction support is added.
+                ContentVerdict::Binary => {
+                    // Probe bytes are not charged to the byte budget so that
+                    // binary items are free from a budget perspective, matching
+                    // the filesystem scan path semantics.
+                    connector_bytes_consumed = 0;
                     break OrderedContentItemOutcome::Skipped(OrderedContentSkipReason::Binary);
+                }
+                ContentVerdict::BinaryExtractable(_) => {
+                    // Extractable formats (.class, .jar, .pyc, .ipynb, .env)
+                    // require a dedicated extraction pipeline that is not yet
+                    // wired for connector-backed ordered-content items.
+                    connector_bytes_consumed = 0;
+                    break OrderedContentItemOutcome::Skipped(
+                        OrderedContentSkipReason::BinaryExtractable,
+                    );
                 }
                 ContentVerdict::Text => {}
             }
@@ -1141,7 +1151,9 @@ fn scan_item_chunks(
     let (findings_emitted, errors, binary_skipped) = match &outcome {
         OrderedContentItemOutcome::Scanned { findings } => (findings.len() as u64, 0, 0),
         OrderedContentItemOutcome::Failed(_stop) => (0, 1, 0),
-        OrderedContentItemOutcome::Skipped(OrderedContentSkipReason::Binary) => (0, 0, 1),
+        OrderedContentItemOutcome::Skipped(
+            OrderedContentSkipReason::Binary | OrderedContentSkipReason::BinaryExtractable,
+        ) => (0, 0, 1),
     };
     let report = build_item_report(
         metrics,
