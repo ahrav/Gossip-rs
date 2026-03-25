@@ -874,6 +874,11 @@ impl OrderedContentRuntime {
         chunk_size: usize,
     ) -> Result<OrderedContentScanMissExecution, ScanRuntimeError> {
         budgets.validate()?;
+        if chunk_size == 0 {
+            return Err(ScanRuntimeError::Driver(anyhow!(
+                "ordered-content chunk_size must be greater than 0"
+            )));
+        }
         let overlap = <scanner_engine::Engine as ScanEngine>::required_overlap(&engine);
         let mut scan_buf = vec![0u8; chunk_size.saturating_add(overlap)];
         let mut scan_scratch = <scanner_engine::Engine as ScanEngine>::new_scratch(&engine);
@@ -2027,6 +2032,10 @@ mod tests {
             "per-item size_hint should become the connector byte budget"
         );
         assert_eq!(source.range_calls[0].max_items, 1);
+        assert!(
+            source.open_calls.is_empty(),
+            "range-read path should not call open"
+        );
     }
 
     #[test]
@@ -2278,6 +2287,10 @@ mod tests {
         assert_eq!(execution.execution_report().errors, 1);
         assert_eq!(source.open_calls[0].max_bytes, 4);
         assert_eq!(source.open_calls[1].max_bytes, 4);
+        assert!(
+            source.range_calls.is_empty(),
+            "open-fallback path should not call read_range"
+        );
     }
 
     #[test]
