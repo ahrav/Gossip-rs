@@ -915,10 +915,12 @@ impl OrderedContentRuntime {
     /// `AlreadyDone` entries are counted but never opened. Execution keeps
     /// at most one miss in flight at a time. Item-count and byte limits are
     /// enforced before admitting an item, then bridged into per-item connector
-    /// read budgets. If the next miss cannot fit inside the remaining budget,
-    /// that miss and the remaining miss suffix are returned in `deferred`
-    /// without opening them. The returned outcomes are non-durable: this stage
-    /// does not emit receipts, advance checkpoints, or write the done ledger.
+    /// read budgets. A miss whose `size_hint` exceeds the remaining byte
+    /// budget is individually deferred (skipped ahead) so that smaller items
+    /// behind it can still be processed; when the budget is fully exhausted
+    /// the remaining miss suffix is drained into `deferred`. The returned
+    /// outcomes are non-durable: this stage does not emit receipts, advance
+    /// checkpoints, or write the done ledger.
     pub fn execute_scan_misses_with_engine<S: OrderedContentSource>(
         source: &mut S,
         page: OrderedContentPrefilteredPage,
@@ -1147,12 +1149,19 @@ fn scan_item_chunks(
 
         let remaining_item_bytes = item_byte_budget.saturating_sub(connector_bytes_consumed);
         if remaining_item_bytes == 0 {
-            // Budget exhausted before the connector returned EOF. When the
-            // item declared a size_hint the budget equals the declared size,
-            // so exhaustion means the declared content was fully consumed.
-            // Without a size_hint the budget is the remaining page allowance
-            // and the actual item may extend beyond what was read.
-            if item.size_hint().is_some() {
+            // Budget exhausted. Probe one more byte to distinguish "connector
+            // has no more data" (complete scan) from "connector still has data
+            // beyond the budget" (truncated). size_hint is an estimate and
+            // cannot be relied upon as proof of EOF.
+            let mut probe = [0u8; 1];
+            let eof = match read_next(offset, &mut probe, 1) {
+                Ok(0) => true,
+                Ok(_) => false,
+                // Read error during the probe — treat as truncated rather
+                // than masking a possible connector failure.
+                Err(_) => false,
+            };
+            if eof {
                 break OrderedContentItemOutcome::Scanned { findings };
             }
             break OrderedContentItemOutcome::Truncated { findings };
