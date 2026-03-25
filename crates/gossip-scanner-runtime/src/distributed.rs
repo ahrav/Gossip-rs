@@ -76,6 +76,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
+use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
     connector::{Budgets, Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     coordination::{RestoredShardState, ShardSpec},
@@ -84,7 +85,9 @@ use gossip_contracts::{
         RuleFingerprint, RunId, ShardKey, TenantId, TenantSecretKey, WorkerId, domain_hasher,
         finalize_64,
     },
-    persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
+    persistence::{
+        CheckpointCommitReceipt, DoneLedger, DoneLedgerErrorCode, FindingsSink, WriteContext,
+    },
 };
 use gossip_coordination::{
     AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, CursorSemantics, Lease,
@@ -93,6 +96,10 @@ use gossip_coordination::{
 use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode};
 use scanner_scheduler::store::FsFindingRecord;
+use scanner_scheduler::{
+    events::{CoreEvent, EventOutput, FindingEvent, SummaryEvent},
+    source_kind::SourceKind,
+};
 
 use crate::{
     AssignmentOutcome, CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
@@ -106,8 +113,12 @@ use crate::{
     commit_sink::{CommitSink, FindingsBatch, ItemMeta},
     coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink},
     join_scoped,
+    ordered_content::{
+        OrderedContentExecutionOutcome, OrderedContentItemExecution, OrderedContentItemOutcome,
+        OrderedContentRuntime, OrderedContentRuntimeInput, OrderedContentScanMissExecution,
+        OrderedContentSkipReason,
+    },
     result_translation::{ItemResult, ScanTiming, translate_item_result},
-    scan_fs_with_prebuilt_engine,
 };
 
 /// Immutable worker identity threaded through shard claiming and completion.
@@ -475,18 +486,20 @@ struct InFlightItem {
     findings: Vec<FsFindingRecord>,
 }
 
-/// Compatibility adapter that bridges scan-loop `CommitSink` callbacks into the
+/// Compatibility adapter that bridges runtime item execution into the
 /// receipt-driven commit pipeline.
 ///
-/// # Problem
+/// Supports two submission surfaces:
 ///
-/// The scan scheduler emits compact `ItemMeta` + `FindingRecord` batches via
-/// the `CommitSink` trait. The downstream commit pipeline expects richer
-/// `QueuedCommit` work items containing full persistence translations
-/// (findings, occurrences, observations, done-ledger rows). This adapter
-/// reconstructs those deterministic translations in `finish_item` so
-/// ordered-content execution can produce durable receipts without changing
-/// the scheduler callback surface.
+/// - The legacy scan-loop `CommitSink` lifecycle (`begin_item` /
+///   `upsert_findings` / `finish_item`), and
+/// - direct ordered-content item outcomes submitted through
+///   [`submit_ordered_item`](Self::submit_ordered_item).
+///
+/// Both surfaces converge on `QueuedCommit` work items containing full
+/// persistence translations (findings, occurrences, observations, and
+/// done-ledger rows) so the downstream commit pipeline retains one
+/// receipt-driven durability path.
 ///
 /// # Item lifecycle
 ///
@@ -642,6 +655,87 @@ impl ReceiptCommitSink {
             write_context: self.write_context,
             item_key: item_key.clone(),
         });
+    }
+
+    fn submit_queued_commit(
+        &self,
+        item_key: &ItemKey,
+        sequence_no: u64,
+        work: QueuedCommit,
+    ) -> Result<()> {
+        self.submitter
+            .submit(work)
+            .map_err(|error| anyhow!("execution to commit submission failed: {error}"))?;
+
+        // The commit is in the pipeline. The submitted vec is bookkeeping
+        // for ordering assertions, not the durability path — recover
+        // through a poisoned mutex rather than returning an error that
+        // would mislead the caller into thinking the commit was lost.
+        self.submitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sequence_no);
+
+        self.record_finish(item_key);
+        Ok(())
+    }
+
+    fn ordered_item_meta(execution: &OrderedContentItemExecution) -> ItemMeta {
+        let item = execution.item();
+        ItemMeta {
+            stable_item_id: item.stable_item_id(),
+            version: Some(item.version()),
+            size_hint: item.size_hint(),
+        }
+    }
+
+    fn translate_ordered_item(
+        &self,
+        sequence_no: u64,
+        execution: &OrderedContentItemExecution,
+    ) -> Result<QueuedCommit> {
+        let item = execution.item();
+        let timing = Self::logical_timing_for(sequence_no)?;
+        let checkpoint_cursor = Cursor::with_last_key(item.item_key().clone());
+        let result = match execution.outcome() {
+            OrderedContentItemOutcome::Scanned { findings } => ItemResult::Scanned { findings },
+            OrderedContentItemOutcome::Failed(stop) => {
+                let error_code = ordered_content_failure_code();
+                if stop.class().is_retryable() {
+                    ItemResult::FailedRetryable { error_code }
+                } else {
+                    ItemResult::FailedPermanent { error_code }
+                }
+            }
+            OrderedContentItemOutcome::Skipped(reason) => ItemResult::Skipped {
+                error_code: ordered_content_skip_code(*reason),
+            },
+        };
+        let translation = translate_item_result(
+            self.write_context,
+            &self.tenant_secret_key,
+            item,
+            execution.report().bytes_scanned,
+            timing,
+            result,
+            &*self.rule_fingerprint,
+        )?;
+
+        Ok(QueuedCommit::new(
+            self.write_context,
+            CompletedUnit::ordered_content(sequence_no, checkpoint_cursor),
+            translation,
+        ))
+    }
+
+    fn submit_ordered_item(&self, execution: &OrderedContentItemExecution) -> Result<()> {
+        let item_key = execution.item().item_key().clone();
+        let meta = Self::ordered_item_meta(execution);
+        let sequence_no = self.next_sequence_no();
+
+        self.record_begin(&item_key, &meta);
+        let work = self.translate_ordered_item(sequence_no, execution)?;
+        self.submit_queued_commit(&item_key, sequence_no, work)
     }
 
     /// Reconstruct the deterministic translation inputs from an in-flight
@@ -808,25 +902,75 @@ impl CommitSink for ReceiptCommitSink {
             }
         };
 
-        if let Err(error) = self.submitter.submit(work) {
+        if let Err(error) = self.submit_queued_commit(&removed_key, sequence_no, work) {
             self.rollback_in_flight(removed_key, item);
-            return Err(anyhow::anyhow!(
-                "execution to commit submission failed: {error}"
-            ));
+            return Err(error);
         }
 
-        // The commit is in the pipeline. The submitted vec is bookkeeping
-        // for ordering assertions, not the durability path — recover
-        // through a poisoned mutex rather than returning an error that
-        // would mislead the caller into thinking the commit was lost.
-        self.submitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(sequence_no);
-
-        self.record_finish(item_key);
         Ok(())
     }
+}
+
+fn ordered_content_failure_code() -> DoneLedgerErrorCode {
+    DoneLedgerErrorCode::try_new("READ_FAILED").expect("hardcoded ordered-content error code")
+}
+
+fn ordered_content_skip_code(reason: OrderedContentSkipReason) -> DoneLedgerErrorCode {
+    let code = match reason {
+        OrderedContentSkipReason::Binary => "BINARY",
+        OrderedContentSkipReason::BinaryExtractable => "BINARY_EXTRACTABLE",
+    };
+    DoneLedgerErrorCode::try_new(code).expect("hardcoded ordered-content error code")
+}
+
+fn ordered_content_assignment_report(execution: &OrderedContentScanMissExecution) -> ScanReport {
+    let mut report = execution.execution_report();
+    report.items_scanned = execution.already_done_len() as u64 + execution.outcomes().len() as u64;
+    report
+}
+
+fn emit_ordered_item_findings(
+    out: &dyn EventOutput,
+    engine: &scanner_engine::Engine,
+    execution: &OrderedContentItemExecution,
+) {
+    let OrderedContentItemOutcome::Scanned { findings } = execution.outcome() else {
+        return;
+    };
+
+    for finding in findings {
+        out.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: execution.item().item_key().as_bytes(),
+            start: finding.root_hint_start,
+            end: finding.root_hint_end,
+            rule_id: finding.rule_id,
+            rule_name: engine.rule_name(finding.rule_id),
+            commit_id: None,
+            change_kind: None,
+            confidence_score: finding.confidence_score,
+        }));
+    }
+}
+
+fn emit_ordered_summary(out: &dyn EventOutput, report: ScanReport) {
+    let elapsed_ms = report.scan_ns / 1_000_000;
+    let throughput_mib_s = if report.scan_ns == 0 {
+        0.0
+    } else {
+        (report.bytes_scanned as f64 / (1024.0 * 1024.0))
+            / (report.scan_ns as f64 / 1_000_000_000.0)
+    };
+    out.emit_core(CoreEvent::Summary(SummaryEvent {
+        source: SourceKind::Fs,
+        status: "ok",
+        elapsed_ms,
+        bytes_scanned: report.bytes_scanned,
+        findings_emitted: report.findings_emitted,
+        errors: report.errors,
+        throughput_mib_s,
+    }));
+    out.flush();
 }
 
 /// Accumulated state from draining the commit-stage outcome stream.
@@ -1288,6 +1432,69 @@ where
     Ok(())
 }
 
+fn scan_ordered_filesystem_lease_with_engine<D>(
+    lease: &ShardLease,
+    config: &FsScanConfig,
+    done_ledger: &D,
+    engine: Arc<scanner_engine::Engine>,
+    out: &dyn EventOutput,
+    commit: &ReceiptCommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError>
+where
+    D: DoneLedger,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    if cancel.is_cancelled() {
+        return Ok(AssignmentOutcome {
+            report: ScanReport::default(),
+            checkpoint_hint: None,
+            debug_output: None,
+        });
+    }
+
+    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
+    let runtime_input = OrderedContentRuntimeInput::new(lease.restored_state().clone(), budgets);
+    let mut source = FilesystemConnector::new(config.path.clone());
+
+    let page = match OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
+        OrderedContentExecutionOutcome::Finished => {
+            return Ok(AssignmentOutcome {
+                report: ScanReport::default(),
+                checkpoint_hint: None,
+                debug_output: None,
+            });
+        }
+        OrderedContentExecutionOutcome::Stopped(stop) => {
+            return Err(ScanRuntimeError::Driver(anyhow!("{stop}")));
+        }
+        OrderedContentExecutionOutcome::Page(page) => page,
+    };
+
+    let page = page.prefilter_done_ledger(lease.write_context(), done_ledger)?;
+    let execution = OrderedContentRuntime::execute_scan_misses_with_prebuilt_engine(
+        &mut source,
+        page,
+        config.budgets,
+        config.scan_binary,
+        Arc::clone(&engine),
+    )?;
+    let report = ordered_content_assignment_report(&execution);
+    for item in execution.outcomes() {
+        emit_ordered_item_findings(out, &engine, item);
+        commit
+            .submit_ordered_item(item)
+            .map_err(ScanRuntimeError::Driver)?;
+    }
+    emit_ordered_summary(out, report);
+
+    Ok(AssignmentOutcome {
+        report,
+        checkpoint_hint: None,
+        debug_output: None,
+    })
+}
+
 /// Execute one filesystem lease under the receipt-driven durability model.
 ///
 /// This is the per-shard work function called by [`run_worker`]. It
@@ -1296,8 +1503,8 @@ where
 /// 1. **Setup**: validates budgets, builds the scan engine, creates the
 ///    commit pipeline and `ReceiptCommitSink`.
 /// 2. **Concurrent execution**: spawns a scoped thread to drain the commit
-///    pipeline's outcome stream while the main thread runs the filesystem
-///    scan through `scan_fs_with_prebuilt_engine`.
+///    pipeline's outcome stream while the main thread executes one bounded
+///    ordered-content page through the filesystem connector runtime.
 /// 3. **Post-scan verification**: checks that every submitted sequence
 ///    number produced exactly one durable outcome (via
 ///    [`wait_for_submitted_commits`]).
@@ -1388,7 +1595,15 @@ where
         let stage_handle =
             scope.spawn(move || drain_commit_stage(drainer, write_context, max_buffered));
 
-        let outcome = scan_fs_with_prebuilt_engine(&scan_config, engine, &sink, &commit, &cancel);
+        let outcome = scan_ordered_filesystem_lease_with_engine(
+            lease,
+            &scan_config,
+            &persistence.done_ledger,
+            engine,
+            &sink,
+            &commit,
+            &cancel,
+        );
         let submitted = commit.finish();
         let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread");
 
@@ -1719,6 +1934,10 @@ mod tests {
         "ordinary sample text for scanner tests"
     }
 
+    fn binary_fixture() -> [u8; 8] {
+        [0x7F, b'E', b'L', b'F', 0, 1, 2, 3]
+    }
+
     fn setup_coordinator_with_connector_extra(
         connector_extra: &[Vec<u8>],
         lease_duration_ms: u64,
@@ -1755,17 +1974,6 @@ mod tests {
             .expect("register shards");
 
         coordinator
-    }
-
-    fn setup_coordinator(
-        paths: &[&Path],
-        lease_duration_ms: u64,
-    ) -> CoordinationInMemoryCoordinator {
-        let connector_extra: Vec<Vec<u8>> = paths
-            .iter()
-            .map(|path| filesystem_payload(path, FilesystemSourceMode::DirectoryRoot))
-            .collect();
-        setup_coordinator_with_connector_extra(&connector_extra, lease_duration_ms)
     }
 
     fn setup_coordinator_with_ranges(
@@ -1888,7 +2096,8 @@ mod tests {
     #[test]
     fn shard_lease_preserves_claimed_coordination_metadata() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
 
@@ -2751,7 +2960,13 @@ mod tests {
     #[test]
     fn build_lease_from_acquire_hydrates_directory_root_payload() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator = setup_coordinator_with_connector_extra(
+            &[filesystem_payload(
+                dir.path(),
+                FilesystemSourceMode::DirectoryRoot,
+            )],
+            30_000,
+        );
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let canonical_dir = dir.path().canonicalize().expect("canonicalize directory");
@@ -2900,7 +3115,8 @@ mod tests {
     #[test]
     fn complete_shard_without_checkpoint_uses_range_start_under_completed_semantics() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
 
@@ -3011,7 +3227,8 @@ mod tests {
     #[test]
     fn run_filesystem_lease_zero_item_shard_returns_no_checkpoint() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let done_ledger = InMemoryDoneLedger::new();
@@ -3037,11 +3254,106 @@ mod tests {
     }
 
     #[test]
+    fn run_filesystem_lease_honors_ordered_item_budget() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("a-secret.txt"), secret_fixture()).expect("write fixture a");
+        fs::write(dir.path().join("b-secret.txt"), secret_fixture()).expect("write fixture b");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig {
+                budgets: ScanBudgets {
+                    max_items: 1,
+                    max_bytes: 1_000_000,
+                },
+                ..DistributedRuntimeConfig::default()
+            },
+        )
+        .expect("budgeted filesystem lease should succeed");
+
+        assert_eq!(
+            report.items_scanned, 1,
+            "ordered-content lease should stop after one item when max_items=1"
+        );
+        let checkpoint = checkpoint.expect("first committed item should produce a checkpoint");
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"a-secret.txt"
+        );
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(rows.len(), 1, "only the first ordered item should commit");
+        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
+        assert!(
+            !findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "the committed ordered item should still emit durable findings"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_binary_skip_produces_skipped_done_ledger_row() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("sample.bin"), binary_fixture()).expect("write binary fixture");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("binary filesystem lease should succeed");
+
+        assert_eq!(report.binary_skipped, 1);
+        let checkpoint = checkpoint.expect("skipped item should still produce a checkpoint");
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"sample.bin"
+        );
+        assert!(
+            findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "binary skip should not emit findings observations"
+        );
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status(), DoneLedgerStatus::Skipped);
+    }
+
+    #[test]
     fn run_filesystem_lease_clean_only_shard_produces_checkpoint_and_done_ledger_entry() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();
@@ -3082,7 +3394,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();

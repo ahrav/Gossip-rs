@@ -817,29 +817,6 @@ pub(crate) fn scan_fs_with_runtime(
     ordered_content::scan_local_filesystem(config, canonical_path, out, commit, cancel)
 }
 
-/// Internal filesystem entrypoint that reuses a caller-provided detection
-/// engine.
-///
-/// Distributed scans use this to share one engine instance between file
-/// scanning and rule-fingerprint lookup for receipt-driven commit translation.
-pub(crate) fn scan_fs_with_prebuilt_engine(
-    config: &FsScanConfig,
-    engine: Arc<scanner_engine::Engine>,
-    out: &dyn EventOutput,
-    commit: &dyn commit_sink::CommitSink,
-    cancel: &CancellationToken,
-) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    let canonical_path = validate_fs_path(&config.path)?;
-    ordered_content::scan_local_filesystem_with_engine(
-        config,
-        canonical_path,
-        engine,
-        out,
-        commit,
-        cancel,
-    )
-}
-
 /// Internal Git entrypoint that accepts a caller-provided event sink.
 ///
 /// Validates the path (must be a directory at the repository root), then

@@ -890,11 +890,31 @@ impl OrderedContentRuntime {
             config.decode_depth,
             config.anchor_mode,
         )?;
-        Self::execute_scan_misses_with_engine(
+        Self::execute_scan_misses_with_prebuilt_engine(
             source,
             page,
             config.budgets,
             config.scan_binary,
+            engine,
+        )
+    }
+
+    /// Execute one prefiltered page's `ScanMiss` items with a caller-supplied engine.
+    ///
+    /// Uses the runtime's default chunk size so callers can reuse a prebuilt
+    /// engine without also choosing scan-buffer sizing.
+    pub(crate) fn execute_scan_misses_with_prebuilt_engine<S: OrderedContentSource>(
+        source: &mut S,
+        page: OrderedContentPrefilteredPage,
+        budgets: ScanBudgets,
+        scan_binary: bool,
+        engine: Arc<scanner_engine::Engine>,
+    ) -> Result<OrderedContentScanMissExecution, ScanRuntimeError> {
+        Self::execute_scan_misses_with_engine(
+            source,
+            page,
+            budgets,
+            scan_binary,
             engine,
             DEFAULT_ORDERED_CHUNK_SIZE,
         )
