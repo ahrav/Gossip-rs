@@ -970,12 +970,7 @@ impl OrderedContentRuntime {
                 }
                 OrderedContentPrefilterDisposition::ScanMiss => {
                     if remaining_items == 0 || remaining_bytes == 0 {
-                        deferred.push(item);
-                        deferred.extend(classified_iter.filter_map(|classified_item| {
-                            let (item, disposition) = classified_item.into_parts();
-                            (disposition == OrderedContentPrefilterDisposition::ScanMiss)
-                                .then_some(item)
-                        }));
+                        defer_remaining_misses(item, &mut classified_iter, &mut deferred);
                         break;
                     }
 
@@ -985,12 +980,7 @@ impl OrderedContentRuntime {
                     if let Some(size_hint) = item.size_hint()
                         && size_hint > remaining_bytes
                     {
-                        deferred.push(item);
-                        deferred.extend(classified_iter.filter_map(|classified_item| {
-                            let (item, disposition) = classified_item.into_parts();
-                            (disposition == OrderedContentPrefilterDisposition::ScanMiss)
-                                .then_some(item)
-                        }));
+                        defer_remaining_misses(item, &mut classified_iter, &mut deferred);
                         break;
                     }
 
@@ -1095,6 +1085,21 @@ fn accumulate_scan_report(total: &mut ScanReport, report: ScanReport) {
     total.persist_incomplete |= report.persist_incomplete;
     total.scan_ns = total.scan_ns.saturating_add(report.scan_ns);
     total.persist_ns = total.persist_ns.saturating_add(report.persist_ns);
+}
+
+/// Drain `item` and every remaining `ScanMiss` entry from `iter` into
+/// `deferred`. Called when the page budget is exhausted or when a size hint
+/// proves the next item cannot fit.
+fn defer_remaining_misses(
+    item: ScanItem,
+    iter: &mut impl Iterator<Item = OrderedContentClassifiedItem>,
+    deferred: &mut Vec<ScanItem>,
+) {
+    deferred.push(item);
+    deferred.extend(iter.filter_map(|classified_item| {
+        let (item, disposition) = classified_item.into_parts();
+        (disposition == OrderedContentPrefilterDisposition::ScanMiss).then_some(item)
+    }));
 }
 
 /// Translate scheduler-local metrics plus terminal outcome counters into the
