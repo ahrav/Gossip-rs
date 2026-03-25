@@ -102,13 +102,14 @@ files.
 Connector-mode filesystem scans acquire one ordered page through
 `OrderedContentRuntime::execute_source` from the real
 `FilesystemConnector`, validate shard bounds and cursor monotonicity,
-classify enumerate failures from the connector error taxonomy, prefilter
-the page against the done ledger, and execute the remaining `ScanMiss`
-suffix through `OrderedContentRuntime::execute_scan_misses`. That stage
-bridges runtime `ScanBudgets` into connector read budgets, scans each
-item through the shared chunked engine path, preserves retryable versus
-permanent read failures, and returns ordered non-durable outcomes for
-later translation and commit stages.
+and classify enumerate failures from the connector error taxonomy. The
+current `scan_fs_connector` entry point returns the validated page
+report without performing content reads. Done-ledger prefiltering and
+`OrderedContentRuntime::execute_scan_misses` (which bridges runtime
+`ScanBudgets` into connector read budgets, scans each item through
+the shared chunked engine path, preserves retryable versus permanent
+read failures, and returns ordered non-durable outcomes) are available
+as tested library APIs but are not yet wired into the live dispatcher.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the

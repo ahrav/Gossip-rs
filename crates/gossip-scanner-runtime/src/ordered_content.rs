@@ -970,7 +970,12 @@ impl OrderedContentRuntime {
                 }
                 OrderedContentPrefilterDisposition::ScanMiss => {
                     if remaining_items == 0 || remaining_bytes == 0 {
-                        defer_remaining_misses(item, &mut classified_iter, &mut deferred);
+                        defer_remaining_misses(
+                            item,
+                            &mut classified_iter,
+                            &mut deferred,
+                            &mut already_done_len,
+                        );
                         break;
                     }
 
@@ -980,7 +985,12 @@ impl OrderedContentRuntime {
                     if let Some(size_hint) = item.size_hint()
                         && size_hint > remaining_bytes
                     {
-                        defer_remaining_misses(item, &mut classified_iter, &mut deferred);
+                        defer_remaining_misses(
+                            item,
+                            &mut classified_iter,
+                            &mut deferred,
+                            &mut already_done_len,
+                        );
                         break;
                     }
 
@@ -1088,17 +1098,27 @@ fn accumulate_scan_report(total: &mut ScanReport, report: ScanReport) {
 }
 
 /// Drain `item` and every remaining `ScanMiss` entry from `iter` into
-/// `deferred`. Called when the page budget is exhausted or when a size hint
-/// proves the next item cannot fit.
+/// `deferred`, counting any `AlreadyDone` entries encountered along the way.
+///
+/// Called when the page budget is exhausted or when a size hint proves the
+/// next item cannot fit. The `already_done_len` counter is incremented for
+/// every `AlreadyDone` item consumed from the iterator tail so the caller's
+/// total count remains accurate.
 fn defer_remaining_misses(
     item: ScanItem,
     iter: &mut impl Iterator<Item = OrderedContentClassifiedItem>,
     deferred: &mut Vec<ScanItem>,
+    already_done_len: &mut usize,
 ) {
     deferred.push(item);
     deferred.extend(iter.filter_map(|classified_item| {
         let (item, disposition) = classified_item.into_parts();
-        (disposition == OrderedContentPrefilterDisposition::ScanMiss).then_some(item)
+        if disposition == OrderedContentPrefilterDisposition::ScanMiss {
+            Some(item)
+        } else {
+            *already_done_len += 1;
+            None
+        }
     }));
 }
 
@@ -2150,6 +2170,63 @@ mod tests {
         assert!(touched.contains(b"a.txt".as_slice()));
         assert!(touched.contains(b"b.txt".as_slice()));
         assert!(!touched.contains(b"c.txt".as_slice()));
+    }
+
+    #[test]
+    fn execute_scan_misses_counts_already_done_after_budget_exhaustion() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"b.txt", b"bbb");
+        // Page layout: [AlreadyDone_1, ScanMiss_1, ScanMiss_2, AlreadyDone_2, ScanMiss_3]
+        //
+        // With max_items=1:
+        //   - AlreadyDone_1 is counted in the loop (already_done_len = 1)
+        //   - ScanMiss_1 is admitted and processed, remaining_items → 0
+        //   - ScanMiss_2 triggers defer_remaining_misses because budget is 0
+        //   - Inside defer_remaining_misses, the iterator tail contains
+        //     AlreadyDone_2 and ScanMiss_3. AlreadyDone_2 MUST be counted.
+        let page = prefiltered_page(
+            vec![
+                (
+                    item(b"a.txt", 3),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"b.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"c.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"d.txt", 3),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"e.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 1,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1, "one miss item admitted");
+        assert_eq!(execution.deferred().len(), 2, "two misses deferred");
+        assert_eq!(
+            execution.already_done_len(),
+            2,
+            "both AlreadyDone items must be counted, including the one after budget exhaustion"
+        );
     }
 
     #[test]
