@@ -297,6 +297,7 @@ pub use engine_trait::{
     EngineScratch, FindingRecord, FindingWithHash, FindingWithHashRecord, ScanEngine,
 };
 pub use findings::{GlobalFindingsCollector, SecretHash, WorkerFindingsBuffer};
+pub use shared_core::{carry_overlap_prefix, scan_chunk_postprocess};
 pub use ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 pub use ts_chunk::TsChunk;
 pub use worker_id::{current_worker_id, set_current_worker_id};

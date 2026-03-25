@@ -37,7 +37,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
-| `src/ordered_content.rs` | Ordered-content page-fill runtime plus direct local filesystem execution helpers |
+| `src/ordered_content.rs` | Ordered-content page validation, scan-miss execution, and direct local filesystem execution helpers |
 | `src/result_translation.rs` | Deterministic translation from completed item results into persistence rows (findings, occurrences, observations, done-ledger) |
 | `src/result_committer.rs` | Authoritative findings -> done-ledger durability stage for one completed unit, with request validation and `UnitCommitReceipt` construction |
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
@@ -79,7 +79,8 @@ Current behavior after validation:
 
 - direct filesystem scans route to `ordered_content::scan_local_filesystem`
 - connector-mode filesystem scans instantiate `FilesystemConnector` and route
-  through `OrderedContentRuntime::execute_source`
+  through ordered-content page validation, done-ledger prefiltering, and
+  bounded scan-miss execution
 - git scans route to `git_repo::scan_local_repo`
 - distributed worker assembly uses the foundational types in `distributed.rs`
 
@@ -101,9 +102,13 @@ files.
 Connector-mode filesystem scans acquire one ordered page through
 `OrderedContentRuntime::execute_source` from the real
 `FilesystemConnector`, validate shard bounds and cursor monotonicity,
-classify enumerate failures from the connector error taxonomy, and
-summarize the validated page into a `ScanReport`. Item reads, rule
-execution, and durability are handled by the direct scan path.
+classify enumerate failures from the connector error taxonomy, prefilter
+the page against the done ledger, and execute the remaining `ScanMiss`
+suffix through `OrderedContentRuntime::execute_scan_misses`. That stage
+bridges runtime `ScanBudgets` into connector read budgets, scans each
+item through the shared chunked engine path, preserves retryable versus
+permanent read failures, and returns ordered non-durable outcomes for
+later translation and commit stages.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the

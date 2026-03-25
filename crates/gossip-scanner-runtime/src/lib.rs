@@ -227,11 +227,10 @@ impl CancellationToken {
 /// Runtime budgets for source scans.
 ///
 /// Both fields must be non-zero; validation enforces this constraint
-/// before distributed scan dispatch and in the filesystem connector-mode
-/// local path (which constructs [`Budgets`] from these values). Direct
-/// local scan paths (`scan_fs_with_runtime`, `scan_git_with_runtime`) do
-/// not validate or consume budgets. Both fields are validated (non-zero)
-/// before dispatch but are not enforced at execution time.
+/// before distributed scan dispatch and before ordered-content miss
+/// execution. The ordered-content executor consumes these values as real
+/// item-count and byte limits; direct local scan paths
+/// (`scan_fs_with_runtime`, `scan_git_with_runtime`) still do not use them.
 ///
 /// Defaults are intentionally conservative (256 items, 1 MB) to bound
 /// memory pressure in distributed workers.
