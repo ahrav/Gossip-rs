@@ -86,6 +86,9 @@ impl FilesystemRunSetupResult {
 ///
 /// Bundles the three orchestrator stages that precede coordination writes so
 /// callers pass one typed value instead of parallel positional arguments.
+///
+/// Its custom [`fmt::Debug`] implementation redacts the canonical root so tracing
+/// and test failures do not leak filesystem paths by default.
 #[derive(Clone, Copy)]
 pub struct FilesystemRunSetupInput<'a> {
     request: &'a NormalizedFilesystemRequest,
