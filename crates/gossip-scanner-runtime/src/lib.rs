@@ -596,6 +596,28 @@ pub struct ScanReport {
     pub persist_ns: u64,
 }
 
+impl std::ops::AddAssign for ScanReport {
+    #[allow(clippy::suspicious_op_assign_impl)] // |= for persist_incomplete is intentional (any-incomplete flag)
+    fn add_assign(&mut self, rhs: Self) {
+        self.items_scanned = self.items_scanned.saturating_add(rhs.items_scanned);
+        self.bytes_scanned = self.bytes_scanned.saturating_add(rhs.bytes_scanned);
+        self.chunks_scanned = self.chunks_scanned.saturating_add(rhs.chunks_scanned);
+        self.findings_emitted = self.findings_emitted.saturating_add(rhs.findings_emitted);
+        self.errors = self.errors.saturating_add(rhs.errors);
+        self.binary_skipped = self.binary_skipped.saturating_add(rhs.binary_skipped);
+        self.ext_skipped = self.ext_skipped.saturating_add(rhs.ext_skipped);
+        self.lock_skipped = self.lock_skipped.saturating_add(rhs.lock_skipped);
+        self.binary_extracted = self.binary_extracted.saturating_add(rhs.binary_extracted);
+        self.dropped_findings = self.dropped_findings.saturating_add(rhs.dropped_findings);
+        self.persist_emit_failures = self
+            .persist_emit_failures
+            .saturating_add(rhs.persist_emit_failures);
+        self.persist_incomplete |= rhs.persist_incomplete;
+        self.scan_ns = self.scan_ns.saturating_add(rhs.scan_ns);
+        self.persist_ns = self.persist_ns.saturating_add(rhs.persist_ns);
+    }
+}
+
 /// Incremental progress checkpoint produced by the runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanCheckpoint {
