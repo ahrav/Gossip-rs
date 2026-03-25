@@ -268,15 +268,17 @@ Create `.jscpd.json` at workspace root:
 {
   "threshold": 6,
   "reporters": ["json", "consoleFull"],
-  "ignore": ["target/**", "fuzz/**", "tmp/**"],
+  "ignore": [
+    "target/**",
+    "fuzz/**",
+    "tmp/**",
+    "**/*test*",
+    "**/*tests*",
+    "**/benches/**"
+  ],
   "minTokens": 50,
   "minLines": 5,
-  "format": ["rust"],
-  "overrides": [{
-    "paths": ["**/*test*", "**/*tests*", "**/benches/**"],
-    "minTokens": 100,
-    "minLines": 10
-  }]
+  "format": ["rust"]
 }
 ```
 

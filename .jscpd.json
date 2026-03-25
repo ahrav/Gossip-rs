@@ -7,18 +7,14 @@
     "tmp/**",
     ".beads/**",
     "docs/**",
-    "diagrams/**"
+    "diagrams/**",
+    "**/*test*",
+    "**/*tests*",
+    "**/benches/**"
   ],
   "minTokens": 50,
   "minLines": 5,
   "absolute": true,
   "skipLocal": false,
-  "format": ["rust"],
-  "overrides": [
-    {
-      "paths": ["**/*test*", "**/*tests*", "**/benches/**"],
-      "minTokens": 100,
-      "minLines": 10
-    }
-  ]
+  "format": ["rust"]
 }
