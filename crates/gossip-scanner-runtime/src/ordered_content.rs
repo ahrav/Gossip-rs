@@ -1,18 +1,41 @@
 //! Ordered-content runtime boundary.
 //!
-//! This module owns two related ordered-content execution paths:
+//! This module owns two related ordered-content execution paths and a
+//! done-ledger prefilter stage that sits between page acquisition and
+//! item-level scan work:
 //!
-//! 1. `OrderedContentRuntime::execute_source`, which performs one
-//!    connector-driven ordered page acquisition and validates the page against
-//!    the shard/cursor contract before any downstream read or scan work uses it.
-//! 2. `scan_local_filesystem`, which runs the existing direct scheduler-based
-//!    local filesystem scan and forwards events and persistence batches through
-//!    bounded channels.
+//! 1. **Page acquisition** — [`OrderedContentRuntime::execute_source`]
+//!    performs one connector-driven ordered page fill and validates the page
+//!    against the shard/cursor contract before any downstream read or scan
+//!    work uses it.
+//! 2. **Done-ledger prefilter** — [`OrderedContentPage::prefilter_done_ledger`]
+//!    classifies each validated item as `AlreadyDone` or `ScanMiss` by
+//!    looking up its object-version identity (OvidHash) in the done ledger.
+//!    Items whose done-ledger row has a terminal status (scanned, permanently
+//!    failed, or skipped) are skipped before any content is opened, saving
+//!    I/O and scan budget. Items with `FailedRetryable` status are treated
+//!    as scan misses so they can be retried on the next pass.
+//! 3. **Local filesystem scan** — `scan_local_filesystem` runs the direct
+//!    scheduler-based parallel filesystem scan and forwards events and
+//!    persistence batches through bounded channels.
 //!
 //! The connector-facing entrypoint is intentionally narrower than the direct
 //! scan path. It validates authoritative shard bounds, resume cursor progress,
 //! and enumerate error classification without yet taking ownership of
 //! item-open, byte-read, findings, or durability orchestration.
+//!
+//! # Done-ledger prefilter
+//!
+//! The prefilter derives an [`OvidHash`](gossip_contracts::persistence::OvidHash)
+//! from each item's [`StableItemId`](gossip_contracts::identity::StableItemId)
+//! and [`VersionId`](gossip_contracts::connector::VersionId), then issues
+//! positional [`DoneLedger::batch_get`]
+//! calls scoped by the claim's `WriteContext` (tenant + policy). Lookups are
+//! chunked at [`RECOMMENDED_MAX_BATCH_SIZE`]
+//! to respect backend batch ceilings while preserving positional alignment
+//! with the original page order. Because the hash includes version strength
+//! (strong vs. weak), the same stable item under a different version claim
+//! is correctly treated as a miss.
 //!
 //! # Threading model
 //!
@@ -49,6 +72,10 @@ use gossip_contracts::{
         ordered::OrderedContentSource, validate_page_sequence,
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
+    persistence::{
+        DoneLedger, DoneLedgerStatus, OvidHashInputs, RECOMMENDED_MAX_BATCH_SIZE, WriteContext,
+        derive_ovid_hash,
+    },
 };
 use scanner_scheduler::events::EventOutput;
 use scanner_scheduler::scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
@@ -236,6 +263,285 @@ impl OrderedContentPage {
     pub fn into_parts(self) -> (PageBuf<ScanItem>, ScanReport, Cursor) {
         (self.page, self.report, self.resume_cursor)
     }
+
+    /// Classify the validated page against the done ledger before any item
+    /// content is opened or scanned.
+    ///
+    /// Each item's [`StableItemId`](gossip_contracts::identity::StableItemId)
+    /// and [`VersionId`](gossip_contracts::connector::VersionId) are hashed
+    /// into an `OvidHash`, then looked up via
+    /// [`DoneLedger::batch_get`]
+    /// under the supplied `write_context`'s tenant and policy scope.
+    ///
+    /// # Batching
+    ///
+    /// Lookups are chunked at
+    /// [`RECOMMENDED_MAX_BATCH_SIZE`]
+    /// to stay within backend batch limits. Chunks are issued sequentially and
+    /// their results are concatenated, preserving positional alignment with
+    /// the original page items.
+    ///
+    /// # Invariants preserved
+    ///
+    /// - Original page item order is maintained in the returned
+    ///   [`OrderedContentPrefilteredPage`].
+    /// - The `report`, `resume_cursor`, and `page_state` are carried through
+    ///   unmodified so downstream checkpoint logic remains correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScanRuntimeError::Driver`] if:
+    /// - The done-ledger `batch_get` call fails (I/O, timeout, etc.).
+    /// - The backend returns a result vector whose length does not match the
+    ///   number of lookup keys (violated positional contract).
+    pub fn prefilter_done_ledger<D>(
+        self,
+        write_context: WriteContext,
+        done_ledger: &D,
+    ) -> Result<OrderedContentPrefilteredPage, ScanRuntimeError>
+    where
+        D: DoneLedger,
+        D::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let (page, report, resume_cursor) = self.into_parts();
+        let (items, page_state) = page.into_parts();
+        let tenant_id = write_context.tenant_id();
+        let policy_hash = write_context.policy_hash();
+        let total = items.len();
+        let mut classified = Vec::with_capacity(total);
+        let mut item_iter = items.into_iter();
+
+        // Classify items in backend-sized chunks, building the final
+        // classified list directly to avoid an intermediate boolean buffer.
+        while classified.len() < total {
+            let chunk: Vec<_> = item_iter
+                .by_ref()
+                .take(RECOMMENDED_MAX_BATCH_SIZE)
+                .collect();
+            let ovid_hashes: Vec<_> = chunk
+                .iter()
+                .map(|item| {
+                    derive_ovid_hash(&OvidHashInputs {
+                        stable_item_id: item.stable_item_id(),
+                        version: item.version(),
+                    })
+                })
+                .collect();
+            let batch = done_ledger
+                .batch_get(tenant_id, policy_hash, &ovid_hashes)
+                .map_err(|error| {
+                    ScanRuntimeError::Driver(
+                        anyhow::Error::new(error)
+                            .context("ordered-content done-ledger prefilter failed"),
+                    )
+                })?;
+            if batch.len() != chunk.len() {
+                return Err(ScanRuntimeError::Driver(anyhow!(
+                    "ordered-content done-ledger prefilter returned {} result(s) for {} lookup key(s)",
+                    batch.len(),
+                    chunk.len()
+                )));
+            }
+            // Exhaustive match so adding a new DoneLedgerStatus variant
+            // forces a conscious classification decision here.
+            classified.extend(chunk.into_iter().zip(batch).map(|(item, record)| {
+                let disposition = match record {
+                    Some(r) => match r.status() {
+                        DoneLedgerStatus::ScannedClean
+                        | DoneLedgerStatus::ScannedWithFindings
+                        | DoneLedgerStatus::FailedPermanent
+                        | DoneLedgerStatus::Skipped => {
+                            OrderedContentPrefilterDisposition::AlreadyDone
+                        }
+                        DoneLedgerStatus::FailedRetryable => {
+                            OrderedContentPrefilterDisposition::ScanMiss
+                        }
+                    },
+                    None => OrderedContentPrefilterDisposition::ScanMiss,
+                };
+                OrderedContentClassifiedItem::new(item, disposition)
+            }));
+        }
+
+        Ok(OrderedContentPrefilteredPage {
+            items: classified,
+            page_state,
+            report,
+            resume_cursor,
+        })
+    }
+}
+
+/// Done-ledger classification for a single ordered-content page item.
+///
+/// Assigned by [`OrderedContentPage::prefilter_done_ledger`] from the
+/// done-ledger status for the item's `OvidHash` (derived from its stable
+/// identity and version claim) within the current tenant and policy scope.
+/// Items with no row or a `FailedRetryable` row map to `ScanMiss`;
+/// terminal statuses map to `AlreadyDone`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderedContentPrefilterDisposition {
+    /// The item has a done-ledger row with a terminal status (scanned,
+    /// permanently failed, or skipped) for this exact stable-item + version
+    /// pair. No scan work is needed; the runtime can skip content open
+    /// entirely. `FailedRetryable` rows are excluded from this disposition
+    /// so those items remain eligible for retry.
+    AlreadyDone,
+    /// The item either has no done-ledger entry or has a `FailedRetryable`
+    /// row (transient failure eligible for retry). Content scan is still
+    /// required.
+    ScanMiss,
+}
+
+/// A validated ordered-content item paired with its done-ledger disposition.
+///
+/// The disposition is assigned once during prefiltering and is immutable
+/// thereafter. Downstream stages use it to decide whether to open the item's
+/// content (`ScanMiss`) or skip it (`AlreadyDone`) without re-querying the
+/// done ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderedContentClassifiedItem {
+    item: ScanItem,
+    disposition: OrderedContentPrefilterDisposition,
+}
+
+impl OrderedContentClassifiedItem {
+    fn new(item: ScanItem, disposition: OrderedContentPrefilterDisposition) -> Self {
+        Self { item, disposition }
+    }
+
+    /// The underlying connector scan item.
+    #[must_use]
+    pub fn item(&self) -> &ScanItem {
+        &self.item
+    }
+
+    /// Prefilter classification: `AlreadyDone` or `ScanMiss`.
+    #[must_use]
+    pub fn disposition(&self) -> OrderedContentPrefilterDisposition {
+        self.disposition
+    }
+
+    /// Consume the classified item and return its owned parts.
+    #[must_use]
+    pub fn into_parts(self) -> (ScanItem, OrderedContentPrefilterDisposition) {
+        (self.item, self.disposition)
+    }
+}
+
+/// Validated ordered page after done-ledger classification.
+///
+/// Items remain in their original page order so downstream runtime stages
+/// preserve checkpoint-relevant sequencing. The `report`, `resume_cursor`,
+/// and `page_state` are the same values produced by the pre-classification
+/// [`OrderedContentPage`]; prefiltering does not alter them.
+///
+/// Callers typically iterate `scan_miss()` to drive content-open and scan
+/// work, and count `already_done_len()` for metrics reporting. The full
+/// classified item list is available via [`items()`](Self::items) for stages
+/// that need per-item disposition regardless of classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderedContentPrefilteredPage {
+    items: Vec<OrderedContentClassifiedItem>,
+    page_state: PageState,
+    report: ScanReport,
+    resume_cursor: Cursor,
+}
+
+impl OrderedContentPrefilteredPage {
+    /// Classified items in their original page order.
+    ///
+    /// The slice length equals the number of items in the source page.
+    #[must_use]
+    pub fn items(&self) -> &[OrderedContentClassifiedItem] {
+        &self.items
+    }
+
+    /// Page completion state from the connector (`HasMore` or `Complete`).
+    ///
+    /// Carried through unchanged from the source page; prefiltering does not
+    /// alter pagination state.
+    #[must_use]
+    pub fn page_state(&self) -> &PageState {
+        &self.page_state
+    }
+
+    /// Runtime-local summary counters from the validated page.
+    ///
+    /// These reflect the full page (both done and miss items); prefiltering
+    /// does not adjust the counts.
+    #[must_use]
+    pub fn report(&self) -> ScanReport {
+        self.report
+    }
+
+    /// Resume cursor for checkpoint advancement.
+    ///
+    /// Carried through unchanged from the source page. Whether this cursor is
+    /// actually committed depends on downstream checkpoint logic, not on
+    /// prefilter results.
+    #[must_use]
+    pub fn resume_cursor(&self) -> &Cursor {
+        &self.resume_cursor
+    }
+
+    /// Number of page items classified as `AlreadyDone`.
+    ///
+    /// O(n) linear scan; prefer caching the result if called in a loop.
+    #[must_use]
+    pub fn already_done_len(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.disposition() == OrderedContentPrefilterDisposition::AlreadyDone)
+            .count()
+    }
+
+    /// Number of page items classified as `ScanMiss`.
+    ///
+    /// O(n) linear scan; prefer caching the result if called in a loop.
+    #[must_use]
+    pub fn scan_miss_len(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.disposition() == OrderedContentPrefilterDisposition::ScanMiss)
+            .count()
+    }
+
+    /// Iterator over items with `AlreadyDone` disposition, in page order.
+    ///
+    /// Yields only the underlying [`ScanItem`] references; the disposition is
+    /// implicit. Items classified as `ScanMiss` are skipped.
+    pub fn already_done(&self) -> impl Iterator<Item = &ScanItem> + '_ {
+        self.items.iter().filter_map(|item| {
+            (item.disposition() == OrderedContentPrefilterDisposition::AlreadyDone)
+                .then_some(item.item())
+        })
+    }
+
+    /// Iterator over items with `ScanMiss` disposition, in page order.
+    ///
+    /// Yields only the underlying [`ScanItem`] references; the disposition is
+    /// implicit. Items classified as `AlreadyDone` are skipped. This is the
+    /// primary iterator for driving downstream content-open and scan work.
+    pub fn scan_miss(&self) -> impl Iterator<Item = &ScanItem> + '_ {
+        self.items.iter().filter_map(|item| {
+            (item.disposition() == OrderedContentPrefilterDisposition::ScanMiss)
+                .then_some(item.item())
+        })
+    }
+
+    /// Consume the classified page and return its owned parts.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<OrderedContentClassifiedItem>,
+        PageState,
+        ScanReport,
+        Cursor,
+    ) {
+        (self.items, self.page_state, self.report, self.resume_cursor)
+    }
 }
 
 /// Result of one ordered-content page acquisition attempt.
@@ -264,7 +570,8 @@ impl OrderedContentRuntime {
     ///
     /// - the runtime is operating under `Completed` cursor semantics;
     /// - page shape rules (non-empty, in bounds, strictly increasing keys);
-    /// - progress monotonicity relative to the restored resume cursor; and
+    /// - progress monotonicity relative to the restored resume cursor;
+    /// - `HasMore` cursor presence (must carry a `last_key`); and
     /// - `HasMore` cursor agreement with the page's final emitted key.
     ///
     /// Connector enumerate failures surface as [`OrderedContentExecutionOutcome::Stopped`]
@@ -297,12 +604,13 @@ impl OrderedContentRuntime {
     }
 }
 
-/// Validate three page-level invariants after a successful `fill_page`:
+/// Validate four page-level invariants after a successful `fill_page`:
 ///
 /// 1. **Shape** — page is non-empty, keys are in-bounds, and strictly increasing.
 /// 2. **Monotonicity** — the first emitted key is strictly after the restored
 ///    resume cursor's `last_key`, preventing duplicate processing on resume.
-/// 3. **Cursor agreement** — a `HasMore` cursor's `last_key` matches the page's
+/// 3. **HasMore presence** — a `HasMore` cursor must carry a `last_key`.
+/// 4. **Cursor agreement** — a `HasMore` cursor's `last_key` matches the page's
 ///    final emitted key, so the next `fill_page` call starts from the right point.
 fn validate_page_contract(
     input: &OrderedContentRuntimeInput,
@@ -480,10 +788,20 @@ pub(crate) fn scan_local_filesystem_with_engine(
 mod tests {
     use super::*;
 
+    use std::collections::{HashMap, HashSet};
+    use std::io;
+    use std::sync::Mutex;
+
     use gossip_contracts::{
         connector::{ItemKey, ItemRef, TokenBytes, VersionId},
-        identity::{ObjectVersionId, StableItemId},
+        identity::{LogicalTime, ObjectVersionId, StableItemId},
+        persistence::{
+            DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
+            DoneLedgerRecord, DoneLedgerStatus, OvidHash, ReadyCommitHandle,
+        },
     };
+
+    use crate::test_fixtures::write_context;
 
     struct ScriptedSource {
         next: Option<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
@@ -535,6 +853,272 @@ mod tests {
     ) -> OrderedContentRuntimeInput {
         let state = RestoredShardState::new(shard, cursor, cursor_semantics);
         OrderedContentRuntimeInput::new(state, Budgets::try_new(8, 1_024, None).expect("budgets"))
+    }
+
+    fn item_with_identity(
+        key: &str,
+        stable_item_id: StableItemId,
+        version_id: ObjectVersionId,
+    ) -> ScanItem {
+        ScanItem::new(
+            ItemKey::try_from_slice(key.as_bytes()).expect("item key"),
+            ItemRef::try_from_slice(key.as_bytes()).expect("item ref"),
+            stable_item_id,
+            VersionId::Strong(version_id),
+        )
+        .with_size_hint(1)
+    }
+
+    fn indexed_item(index: usize) -> ScanItem {
+        let key = format!("item-{index:05}");
+        let mut stable_bytes = [0u8; 32];
+        stable_bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        let mut version_bytes = [0u8; 32];
+        version_bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        version_bytes[31] = 1;
+        item_with_identity(
+            &key,
+            StableItemId::from_bytes(stable_bytes),
+            ObjectVersionId::from_bytes(version_bytes),
+        )
+    }
+
+    fn item_ovid(item: &ScanItem) -> OvidHash {
+        derive_ovid_hash(&OvidHashInputs {
+            stable_item_id: item.stable_item_id(),
+            version: item.version(),
+        })
+    }
+
+    fn done_record_for(
+        tenant_id: gossip_contracts::identity::TenantId,
+        policy_hash: gossip_contracts::identity::PolicyHash,
+        ovid_hash: OvidHash,
+    ) -> DoneLedgerRecord {
+        done_record_with_status(
+            tenant_id,
+            policy_hash,
+            ovid_hash,
+            DoneLedgerStatus::ScannedClean,
+        )
+    }
+
+    /// Build a done-ledger record with the given status, supplying the
+    /// error-code and findings-count values that `validate()` requires for
+    /// each status variant.
+    fn done_record_with_status(
+        tenant_id: gossip_contracts::identity::TenantId,
+        policy_hash: gossip_contracts::identity::PolicyHash,
+        ovid_hash: OvidHash,
+        status: DoneLedgerStatus,
+    ) -> DoneLedgerRecord {
+        let (findings_count, error_code) = match status {
+            DoneLedgerStatus::ScannedClean => (0, None),
+            DoneLedgerStatus::ScannedWithFindings => (1, None),
+            DoneLedgerStatus::FailedRetryable
+            | DoneLedgerStatus::FailedPermanent
+            | DoneLedgerStatus::Skipped => (
+                0,
+                Some(DoneLedgerErrorCode::try_new("TEST_ERROR").expect("error code")),
+            ),
+        };
+        let record = DoneLedgerRecord::try_new(
+            DoneLedgerKey::new(tenant_id, policy_hash, ovid_hash),
+            status,
+            0,
+            findings_count,
+            DoneLedgerProvenance::from_write_context(
+                write_context(),
+                LogicalTime::from_raw(10),
+                LogicalTime::from_raw(20),
+            ),
+            error_code,
+        )
+        .expect("done-ledger record");
+        record
+            .validate()
+            .expect("done-ledger record cross-field invariants");
+        record
+    }
+
+    struct TrackingDoneLedger {
+        done: HashSet<OvidHash>,
+        expected_tenant: gossip_contracts::identity::TenantId,
+        expected_policy: gossip_contracts::identity::PolicyHash,
+        request_lengths: Mutex<Vec<usize>>,
+    }
+
+    impl TrackingDoneLedger {
+        fn empty() -> Self {
+            let wc = write_context();
+            Self {
+                done: HashSet::new(),
+                expected_tenant: wc.tenant_id(),
+                expected_policy: wc.policy_hash(),
+                request_lengths: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_done(done: impl IntoIterator<Item = OvidHash>) -> Self {
+            let wc = write_context();
+            Self {
+                done: done.into_iter().collect(),
+                expected_tenant: wc.tenant_id(),
+                expected_policy: wc.policy_hash(),
+                request_lengths: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn request_lengths(&self) -> Vec<usize> {
+            self.request_lengths
+                .lock()
+                .expect("request lengths lock")
+                .clone()
+        }
+    }
+
+    impl DoneLedger for TrackingDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            tenant_id: gossip_contracts::identity::TenantId,
+            policy_hash: gossip_contracts::identity::PolicyHash,
+            ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            assert_eq!(tenant_id, self.expected_tenant, "batch_get tenant mismatch");
+            assert_eq!(
+                policy_hash, self.expected_policy,
+                "batch_get policy mismatch"
+            );
+            if ovid_hashes.len() > RECOMMENDED_MAX_BATCH_SIZE {
+                return Err(io::Error::other(
+                    "batch_get exceeded recommended batch size",
+                ));
+            }
+            self.request_lengths
+                .lock()
+                .expect("request lengths lock")
+                .push(ovid_hashes.len());
+
+            Ok(ovid_hashes
+                .iter()
+                .map(|ovid_hash| {
+                    self.done
+                        .contains(ovid_hash)
+                        .then(|| done_record_for(tenant_id, policy_hash, *ovid_hash))
+                })
+                .collect())
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+    }
+
+    /// Done ledger that always fails `batch_get` with an I/O error.
+    struct FailingDoneLedger;
+
+    impl DoneLedger for FailingDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            _tenant_id: gossip_contracts::identity::TenantId,
+            _policy_hash: gossip_contracts::identity::PolicyHash,
+            _ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            Err(io::Error::other("injected ledger failure"))
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+    }
+
+    /// Done ledger whose `batch_get` returns an empty Vec regardless of input,
+    /// violating the positional contract that requires one result per lookup key.
+    struct MismatchLenDoneLedger;
+
+    impl DoneLedger for MismatchLenDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            _tenant_id: gossip_contracts::identity::TenantId,
+            _policy_hash: gossip_contracts::identity::PolicyHash,
+            _ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
+    }
+
+    /// Done ledger that returns per-item status values, allowing tests to
+    /// exercise non-ScannedClean done-ledger states (e.g. FailedRetryable).
+    struct StatusAwareDoneLedger {
+        statuses: HashMap<OvidHash, DoneLedgerStatus>,
+        expected_tenant: gossip_contracts::identity::TenantId,
+        expected_policy: gossip_contracts::identity::PolicyHash,
+    }
+
+    impl StatusAwareDoneLedger {
+        fn new(statuses: impl IntoIterator<Item = (OvidHash, DoneLedgerStatus)>) -> Self {
+            let wc = write_context();
+            Self {
+                statuses: statuses.into_iter().collect(),
+                expected_tenant: wc.tenant_id(),
+                expected_policy: wc.policy_hash(),
+            }
+        }
+    }
+
+    impl DoneLedger for StatusAwareDoneLedger {
+        type Error = io::Error;
+        type CommitHandle = ReadyCommitHandle<DoneLedgerCommitReceipt, io::Error>;
+
+        fn batch_get(
+            &self,
+            tenant_id: gossip_contracts::identity::TenantId,
+            policy_hash: gossip_contracts::identity::PolicyHash,
+            ovid_hashes: &[OvidHash],
+        ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
+            assert_eq!(tenant_id, self.expected_tenant, "batch_get tenant mismatch");
+            assert_eq!(
+                policy_hash, self.expected_policy,
+                "batch_get policy mismatch"
+            );
+            Ok(ovid_hashes
+                .iter()
+                .map(|ovid_hash| {
+                    self.statuses.get(ovid_hash).map(|&status| {
+                        done_record_with_status(tenant_id, policy_hash, *ovid_hash, status)
+                    })
+                })
+                .collect())
+        }
+
+        fn batch_upsert(
+            &self,
+            _records: &[DoneLedgerRecord],
+        ) -> Result<Self::CommitHandle, Self::Error> {
+            Ok(ReadyCommitHandle::ok(DoneLedgerCommitReceipt::new(0, 0, 0)))
+        }
     }
 
     #[test]
@@ -822,5 +1406,274 @@ mod tests {
             10,
             "only the item with a size_hint contributes to bytes_scanned"
         );
+    }
+
+    #[test]
+    fn prefilter_done_ledger_classifies_all_miss_page() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5)];
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+        let ledger = TrackingDoneLedger::empty();
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        assert_eq!(filtered.page_state(), &PageState::Complete);
+        assert_eq!(filtered.report().items_scanned, 2);
+        assert_eq!(filtered.already_done_len(), 0);
+        assert_eq!(filtered.scan_miss_len(), 2);
+        assert_eq!(
+            filtered
+                .scan_miss()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"a.txt".to_vec(), b"b.txt".to_vec()]
+        );
+        assert_eq!(ledger.request_lengths(), vec![2]);
+    }
+
+    #[test]
+    fn prefilter_done_ledger_classifies_all_done_page() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5)];
+        let ledger = TrackingDoneLedger::with_done(items.iter().map(item_ovid));
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        assert_eq!(filtered.already_done_len(), 2);
+        assert_eq!(filtered.scan_miss_len(), 0);
+        assert_eq!(
+            filtered
+                .already_done()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"a.txt".to_vec(), b"b.txt".to_vec()]
+        );
+    }
+
+    #[test]
+    fn prefilter_done_ledger_preserves_mixed_page_order_and_resume_state() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5), item(b"c.txt", 7)];
+        let ledger = TrackingDoneLedger::with_done([item_ovid(&items[0]), item_ovid(&items[2])]);
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(
+                items,
+                PageState::HasMore {
+                    cursor: Cursor::with_token(
+                        ItemKey::try_from_slice(b"c.txt").expect("cursor key"),
+                        TokenBytes::try_from_slice(b"token").expect("token"),
+                    ),
+                },
+            )
+            .expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        assert_eq!(
+            filtered
+                .items()
+                .iter()
+                .map(|item| (
+                    item.item().item_key().as_bytes().to_vec(),
+                    item.disposition()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    b"a.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::AlreadyDone
+                ),
+                (
+                    b"b.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::ScanMiss
+                ),
+                (
+                    b"c.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::AlreadyDone
+                ),
+            ]
+        );
+        assert_eq!(filtered.already_done_len(), 2);
+        assert_eq!(filtered.scan_miss_len(), 1);
+        assert_eq!(
+            filtered
+                .resume_cursor()
+                .token()
+                .expect("resume token")
+                .as_bytes(),
+            b"token"
+        );
+        assert!(!filtered.page_state().is_complete());
+    }
+
+    #[test]
+    fn prefilter_done_ledger_is_version_sensitive_for_same_stable_item() {
+        let stable_item = StableItemId::from_bytes([0xAB; 32]);
+        let v1 = ObjectVersionId::from_bytes([0x01; 32]);
+        let v2 = ObjectVersionId::from_bytes([0x02; 32]);
+        let item_v1 = item_with_identity("a.txt", stable_item, v1);
+        let item_v2 = item_with_identity("b.txt", stable_item, v2);
+        let ledger = TrackingDoneLedger::with_done([item_ovid(&item_v1)]);
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(vec![item_v1, item_v2], PageState::Complete).expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        assert_eq!(
+            filtered
+                .items()
+                .iter()
+                .map(|item| item.disposition())
+                .collect::<Vec<_>>(),
+            vec![
+                OrderedContentPrefilterDisposition::AlreadyDone,
+                OrderedContentPrefilterDisposition::ScanMiss,
+            ]
+        );
+    }
+
+    #[test]
+    fn prefilter_done_ledger_chunks_large_pages_without_losing_alignment() {
+        let total = RECOMMENDED_MAX_BATCH_SIZE + 2;
+        let items = (0..total).map(indexed_item).collect::<Vec<_>>();
+        let done_indexes = [
+            0usize,
+            RECOMMENDED_MAX_BATCH_SIZE - 1,
+            RECOMMENDED_MAX_BATCH_SIZE,
+        ];
+        let ledger =
+            TrackingDoneLedger::with_done(done_indexes.into_iter().map(|i| item_ovid(&items[i])));
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        assert_eq!(
+            ledger.request_lengths(),
+            vec![RECOMMENDED_MAX_BATCH_SIZE, 2],
+            "lookups must honor the shared batch-size ceiling"
+        );
+        assert_eq!(filtered.already_done_len(), 3);
+        assert_eq!(filtered.scan_miss_len(), total - 3);
+        assert_eq!(
+            filtered
+                .items()
+                .iter()
+                .map(|item| item.disposition())
+                .take(RECOMMENDED_MAX_BATCH_SIZE + 1)
+                .enumerate()
+                .filter_map(|(index, disposition)| {
+                    (disposition == OrderedContentPrefilterDisposition::AlreadyDone)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                0,
+                RECOMMENDED_MAX_BATCH_SIZE - 1,
+                RECOMMENDED_MAX_BATCH_SIZE
+            ]
+        );
+    }
+
+    #[test]
+    fn prefilter_done_ledger_propagates_batch_get_io_error() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5)];
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+        let ledger = FailingDoneLedger;
+
+        let err = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect_err("I/O failure must propagate");
+
+        assert!(
+            err.to_string()
+                .contains("ordered-content done-ledger prefilter failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn prefilter_done_ledger_rejects_batch_length_mismatch() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5)];
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+        let ledger = MismatchLenDoneLedger;
+
+        let err = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect_err("length mismatch must be rejected");
+
+        assert!(
+            err.to_string().contains("result(s) for"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("lookup key(s)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn prefilter_treats_failed_retryable_as_scan_miss() {
+        let items = vec![item(b"a.txt", 3), item(b"b.txt", 5), item(b"c.txt", 7)];
+
+        // Item 0: ScannedClean    → AlreadyDone (terminal success)
+        // Item 1: FailedRetryable → ScanMiss    (transient failure, must retry)
+        // Item 2: absent          → ScanMiss    (never seen)
+        let ledger = StatusAwareDoneLedger::new([
+            (item_ovid(&items[0]), DoneLedgerStatus::ScannedClean),
+            (item_ovid(&items[1]), DoneLedgerStatus::FailedRetryable),
+        ]);
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        assert_eq!(
+            filtered
+                .items()
+                .iter()
+                .map(|ci| (ci.item().item_key().as_bytes().to_vec(), ci.disposition()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    b"a.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    b"b.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    b"c.txt".to_vec(),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            "FailedRetryable done-ledger rows represent transient failures \
+             and must be classified as ScanMiss so the item is retried"
+        );
+        assert_eq!(filtered.already_done_len(), 1);
+        assert_eq!(filtered.scan_miss_len(), 2);
     }
 }
