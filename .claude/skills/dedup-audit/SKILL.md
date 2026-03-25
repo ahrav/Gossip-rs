@@ -284,6 +284,14 @@ Create `.jscpd.json` at workspace root:
 
 Start threshold at current baseline + 1% margin. Ratchet down after each pass.
 
+Wire jscpd into CI. The `.jscpd.json` config is inert without an invocation step:
+
+```yaml
+# GitHub Actions example
+- name: Check code duplication
+  run: npx jscpd --config .jscpd.json crates/
+```
+
 ### 4b. CLAUDE.md / Project Policy
 
 Add to project instructions:
