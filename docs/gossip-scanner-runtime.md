@@ -79,8 +79,8 @@ Current behavior after validation:
 
 - direct filesystem scans route to `ordered_content::scan_local_filesystem`
 - connector-mode filesystem scans instantiate `FilesystemConnector` and route
-  through ordered-content page validation, done-ledger prefiltering, and
-  bounded scan-miss execution
+  through ordered-content page validation (single-page boundary probe; does not
+  perform done-ledger prefiltering or scan-miss execution)
 - git scans route to `git_repo::scan_local_repo`
 - distributed worker assembly uses the foundational types in `distributed.rs`
 
@@ -99,16 +99,15 @@ with `ItemKey` ordering, preventing `BoundaryRegression` errors in the
 prefix checkpoint aggregator for ordered-content shards with multiple
 files.
 
-Connector-mode filesystem scans acquire one ordered page through
-`OrderedContentRuntime::execute_source` from the real
-`FilesystemConnector`, validate shard bounds and cursor monotonicity,
-classify enumerate failures from the connector error taxonomy, prefilter
-the page against the done ledger, and execute the remaining `ScanMiss`
-suffix through `OrderedContentRuntime::execute_scan_misses`. That stage
-bridges runtime `ScanBudgets` into connector read budgets, scans each
-item through the shared chunked engine path, preserves retryable versus
-permanent read failures, and returns ordered non-durable outcomes for
-later translation and commit stages.
+`scan_fs_connector` is a single-page boundary validation probe: it
+acquires one ordered page through `OrderedContentRuntime::execute_source`
+from the real `FilesystemConnector`, validates shard bounds and cursor
+monotonicity, classifies enumerate failures from the connector error
+taxonomy, and returns the page-level `ScanReport`. It does not have a
+`WriteContext` or done-ledger handle, so it performs neither done-ledger
+prefiltering nor scan-miss execution. The full pipeline (prefilter →
+`execute_scan_misses` → translation → commit) is wired by the
+distributed worker loop, not by this local entry point.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the

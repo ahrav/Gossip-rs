@@ -24,9 +24,9 @@
 //!    scheduler-based parallel filesystem scan and forwards events and
 //!    persistence batches through bounded channels.
 //!
-//! The ordered-content entrypoints now own page validation plus bounded
+//! The ordered-content entrypoints handle page validation and bounded
 //! `scan_miss` execution. Durable translation, receipt emission, and
-//! checkpoint advancement remain in later runtime stages.
+//! checkpoint advancement occur in later runtime stages.
 //!
 //! # Done-ledger prefilter
 //!
@@ -652,7 +652,10 @@ pub enum OrderedContentSkipReason {
 /// Non-durable outcome for one ordered-content item execution attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentItemOutcome {
-    /// Item content was fully scanned and produced the listed findings.
+    /// Scanning completed within the item's byte budget and produced the listed
+    /// findings. When `size_hint` is absent the budget may be smaller than the
+    /// actual item; downstream translation stages compare `bytes_scanned` against
+    /// the declared size before persisting a done-ledger entry.
     Scanned { findings: Vec<FsFindingRecord> },
     /// Connector open/read failed for this item.
     Failed(OrderedContentReadStop),
