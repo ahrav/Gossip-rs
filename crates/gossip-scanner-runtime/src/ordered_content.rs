@@ -309,8 +309,9 @@ impl OrderedContentPage {
     ///
     /// # Complexity
     ///
-    /// O(n) done-ledger lookups and O(n) additional memory for the returned
-    /// classified page, where `n` is the number of items in the source page.
+    /// O(n) total items submitted to the done-ledger (in O(n / batch) backend
+    /// calls) and O(n) additional memory for the returned classified page,
+    /// where `n` is the number of items in the source page.
     ///
     /// # Errors
     ///
