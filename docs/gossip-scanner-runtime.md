@@ -79,8 +79,9 @@ Current behavior after validation:
 
 - direct filesystem scans route to `ordered_content::scan_local_filesystem`
 - connector-mode filesystem scans instantiate `FilesystemConnector` and route
-  through ordered-content page validation, done-ledger prefiltering, and
-  bounded scan-miss execution
+  through ordered-content page validation (done-ledger prefiltering and bounded
+  scan-miss execution are available as library APIs but not yet wired into the
+  live dispatcher)
 - git scans route to `git_repo::scan_local_repo`
 - distributed worker assembly uses the foundational types in `distributed.rs`
 

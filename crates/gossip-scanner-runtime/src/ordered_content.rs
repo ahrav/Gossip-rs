@@ -24,7 +24,7 @@
 //!    scheduler-based parallel filesystem scan and forwards events and
 //!    persistence batches through bounded channels.
 //!
-//! The ordered-content entrypoints now own page validation plus bounded
+//! The ordered-content entrypoints own page validation plus bounded
 //! `scan_miss` execution. Durable translation, receipt emission, and
 //! checkpoint advancement remain in later runtime stages.
 //!
@@ -910,8 +910,8 @@ impl OrderedContentRuntime {
 
     /// Execute one prefiltered page's `ScanMiss` items with a caller-supplied engine.
     ///
-    /// `AlreadyDone` entries are counted but never opened. The first cut keeps
-    /// at most one miss in flight at a time. Item-count and byte limits are
+    /// `AlreadyDone` entries are counted but never opened. At most one miss
+    /// is in flight at a time. Item-count and byte limits are
     /// enforced before admitting an item, then bridged into per-item connector
     /// read budgets. If the next miss cannot fit inside the remaining budget,
     /// that miss and the remaining miss suffix are returned in `deferred`
@@ -933,6 +933,14 @@ impl OrderedContentRuntime {
     /// miss suffix without opening them. Items without a `size_hint` inherit
     /// the remaining page budget because the runtime has no pre-open size
     /// bound to enforce.
+    ///
+    /// After admission, `size_hint` also serves as the per-item read cap
+    /// (clamped to the remaining page budget). This prevents a single item
+    /// whose actual content exceeds the hint from consuming the entire
+    /// remaining page budget and starving later items. For connectors
+    /// whose `size_hint` is exact (e.g. S3 `Content-Length`), the cap
+    /// matches the real content length; for connectors with unreliable
+    /// size metadata, content beyond the hint is not scanned.
     ///
     /// # Errors
     ///
