@@ -1137,6 +1137,15 @@ fn append_findings<F: FindingWithHashRecord>(src: &[F], dst: &mut Vec<FsFindingR
     }));
 }
 
+/// Scan an item's content in chunks, enforcing the per-item byte budget.
+///
+/// `stateless_reads` indicates whether the `read_next` closure supports
+/// offset-based stateless reads (e.g. `read_range`). When true, a one-byte
+/// EOF probe after budget exhaustion reliably distinguishes real EOF from
+/// budget-limit EOF. When false (open-based sequential readers that may be
+/// budget-capped at creation), the probe would query the same budget-limited
+/// reader and cannot detect trailing content, so budget exhaustion is always
+/// treated as truncation.
 #[allow(clippy::too_many_arguments)]
 fn scan_item_chunks(
     engine: &scanner_engine::Engine,
@@ -1149,12 +1158,6 @@ fn scan_item_chunks(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
-    /// When true, the `read_next` closure supports offset-based stateless reads
-    /// (e.g. `read_range`), so a one-byte EOF probe after budget exhaustion can
-    /// reliably distinguish real EOF from budget-limit EOF. When false (open-
-    /// based sequential readers that may be budget-capped at creation), the
-    /// probe would query the same budget-limited reader and cannot detect
-    /// trailing content — budget exhaustion is always treated as truncation.
     stateless_reads: bool,
     mut read_next: impl FnMut(u64, &mut [u8], u64) -> Result<usize, OrderedContentReadStop>,
 ) -> OrderedContentItemResult {
