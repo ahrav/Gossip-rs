@@ -252,6 +252,12 @@ impl Default for ScanBudgets {
 }
 
 impl ScanBudgets {
+    /// Reject zero-valued runtime budgets before execution starts.
+    ///
+    /// Ordered-content miss execution treats both fields as hard admission
+    /// limits, so a zero value would make progress impossible while looking
+    /// like a valid configuration. Returns
+    /// [`ScanRuntimeError::ConnectorInput`] naming the offending field.
     pub fn validate(self) -> Result<(), ScanRuntimeError> {
         if self.max_items == 0 {
             return Err(ScanRuntimeError::ConnectorInput(
