@@ -505,10 +505,14 @@ fn run_composition_seed(
 ///
 /// Divides seeds across OS threads with static chunking (one chunk per
 /// available hardware thread), runs each seed independently, then merges
-/// results and asserts two properties:
+/// results and asserts three properties:
 ///
 /// 1. **Zero unexpected violations** across all seeds.
-/// 2. **Cross-boundary event coverage**: every kind in
+/// 2. **Aggregate convergence**: at least one `ScanCompleted` per seed
+///    on average across the full sweep. Some seeds legitimately produce
+///    zero completions (e.g., `TerminateRun` fires early), so this is
+///    an aggregate check rather than per-seed.
+/// 3. **Cross-boundary event coverage**: every kind in
 ///    [`REQUIRED_CROSS_BOUNDARY`] must appear at least once in the
 ///    aggregate event counts.
 ///
@@ -518,8 +522,12 @@ fn run_composition_seed(
 ///   reproduction command on failure, and returns.
 /// - **Full sweep**: runs `GOSSIP_COMP_SEEDS` seeds (default 50) in parallel.
 ///
+/// `test_filter` is the exact `#[test]` function name that called this
+/// helper, embedded into reproduction commands so `cargo test ... <filter>`
+/// reruns only the failing sweep wrapper.
+///
 /// Skipped entirely under Miri (too slow for an interpreter).
-fn run_composition_sweep(level: FaultLevel) {
+fn run_composition_sweep(level: FaultLevel, test_filter: &str) {
     if cfg!(miri) {
         return;
     }
@@ -540,7 +548,7 @@ fn run_composition_sweep(level: FaultLevel) {
             result.violations.is_empty(),
             "Invariant violation at seed {seed}.\n\
              Reproduce: GOSSIP_COMP_SEED={seed} GOSSIP_COMP_FAULT={fault_name} \
-             cargo test -p gossip-coordination composition_tests -- --ignored --nocapture\n\
+             cargo test -p gossip-coordination {test_filter} -- --ignored --nocapture\n\
              Violations: {:#?}",
             result.violations
         );
@@ -615,14 +623,14 @@ fn run_composition_sweep(level: FaultLevel) {
     let fault_name = fault_level_name(level);
     assert!(
         all_failures.is_empty(),
-        "Invariant violations in {}/{seed_count} seeds:\n{}",
+        "Failures in {}/{seed_count} seeds:\n{}",
         all_failures.len(),
         all_failures
             .iter()
             .map(|(seed, v)| format!(
                 "  seed {seed}: {v}\n  \
                  Reproduce: GOSSIP_COMP_SEED={seed} GOSSIP_COMP_FAULT={fault_name} \
-                 cargo test -p gossip-coordination composition_tests -- --ignored --nocapture"
+                 cargo test -p gossip-coordination {test_filter} -- --ignored --nocapture"
             ))
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -637,9 +645,11 @@ fn run_composition_sweep(level: FaultLevel) {
         );
     }
 
-    // Convergence: the liveness phase must drive at least one scan to
-    // completion per seed on average, proving the system makes forward
-    // progress and does not livelock.
+    // Convergence: the aggregate must include at least one ScanCompleted per
+    // seed on average, proving the system makes forward progress overall.
+    // This is intentionally an aggregate check, not per-seed: some seeds
+    // legitimately produce zero completions (e.g., when TerminateRun fires
+    // early in the random op stream, ending the run before any scan finishes).
     let scan_completed = aggregate_counts
         .get(&CompositionEventKind::ScanCompleted)
         .copied()
@@ -892,7 +902,7 @@ mod fault_sweep {
 #[test]
 #[ignore]
 fn composition_sweep_sunny_day() {
-    run_composition_sweep(FaultLevel::SunnyDay);
+    run_composition_sweep(FaultLevel::SunnyDay, "composition_sweep_sunny_day");
 }
 
 /// Composition seed sweep at Stormy: ambient coordination faults (lease expiry,
@@ -901,7 +911,7 @@ fn composition_sweep_sunny_day() {
 #[test]
 #[ignore]
 fn composition_sweep_stormy() {
-    run_composition_sweep(FaultLevel::Stormy);
+    run_composition_sweep(FaultLevel::Stormy, "composition_sweep_stormy");
 }
 
 // ===========================================================================
