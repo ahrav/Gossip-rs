@@ -74,6 +74,8 @@ pub mod composition;
 #[cfg(any(test, feature = "test-support"))]
 pub mod composition_invariants;
 #[cfg(test)]
+mod composition_tests;
+#[cfg(test)]
 mod mega_sim_tests;
 #[cfg(test)]
 mod proptest_state_machine_tests;
