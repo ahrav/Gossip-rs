@@ -743,7 +743,11 @@ impl OrderedContentItemExecution {
 
 /// Ordered execution results for one prefiltered page's `ScanMiss` subset.
 ///
-/// `outcomes` and `deferred` preserve the original page order of miss items.
+/// `outcomes` and `deferred` each preserve the original page order of their
+/// miss items. Items whose `size_hint` exceeds the remaining byte budget are
+/// individually deferred (skipped ahead) so smaller items behind them can still
+/// be processed; this means `deferred` may contain items from the interior of
+/// the page, not only a contiguous suffix.
 /// The page-level `page_state`, `page_report`, and `resume_cursor` values are
 /// carried through unchanged from the input prefiltered page.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -956,10 +960,8 @@ impl OrderedContentRuntime {
                 }
                 OrderedContentPrefilterDisposition::ScanMiss => {
                     let budget_exhausted = remaining_items == 0 || remaining_bytes == 0;
-                    let exceeds_budget = !budget_exhausted
-                        && item.size_hint().is_some_and(|hint| hint > remaining_bytes);
 
-                    if budget_exhausted || exceeds_budget {
+                    if budget_exhausted {
                         drain_remaining_misses(
                             item,
                             &mut classified_iter,
@@ -967,6 +969,19 @@ impl OrderedContentRuntime {
                             &mut already_done_len,
                         );
                         break;
+                    }
+
+                    // Skip ahead past oversized items instead of deferring the
+                    // entire remaining suffix. The item may be binary or
+                    // extractable, and classification (which skips for free)
+                    // requires reading content. By deferring only this item,
+                    // smaller items behind it still get a chance to be
+                    // processed in the current pass.
+                    let exceeds_budget =
+                        item.size_hint().is_some_and(|hint| hint > remaining_bytes);
+                    if exceeds_budget {
+                        deferred.push(item);
+                        continue;
                     }
 
                     let file_id = FileId(next_file_id);
@@ -2152,7 +2167,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_scan_misses_defers_item_that_would_exceed_remaining_byte_budget() {
+    fn execute_scan_misses_skips_oversized_item_and_scans_smaller_items_behind_it() {
         let rules = write_runtime_rules();
         let mut source = ContentSource::with_range_read();
         source.insert(b"a.txt", b"aaa");
@@ -2185,18 +2200,35 @@ mod tests {
         let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
             .expect("scan-miss execution succeeds");
 
-        assert_eq!(execution.outcomes().len(), 1);
-        assert_eq!(execution.deferred().len(), 2);
+        // a.txt (3 bytes) is admitted and scanned.
+        // b.txt (4 bytes) exceeds remaining budget (5-3=2) — deferred, NOT
+        // draining the entire suffix.
+        // c.txt (2 bytes) fits remaining budget (2) — admitted and scanned.
+        assert_eq!(execution.outcomes().len(), 2, "a.txt and c.txt are scanned");
+        assert_eq!(
+            execution.outcomes()[0].item().item_key().as_bytes(),
+            b"a.txt"
+        );
+        assert_eq!(
+            execution.outcomes()[1].item().item_key().as_bytes(),
+            b"c.txt"
+        );
+        assert_eq!(execution.deferred().len(), 1, "only b.txt is deferred");
         assert_eq!(execution.deferred()[0].item_key().as_bytes(), b"b.txt");
-        assert_eq!(execution.deferred()[1].item_key().as_bytes(), b"c.txt");
         let touched = source
             .range_calls
             .iter()
             .map(|call| call.item_ref.clone())
             .collect::<HashSet<_>>();
         assert!(touched.contains(b"a.txt".as_slice()));
-        assert!(!touched.contains(b"b.txt".as_slice()));
-        assert!(!touched.contains(b"c.txt".as_slice()));
+        assert!(
+            !touched.contains(b"b.txt".as_slice()),
+            "oversized item is not opened"
+        );
+        assert!(
+            touched.contains(b"c.txt".as_slice()),
+            "smaller item behind oversized is scanned"
+        );
     }
 
     #[test]
@@ -2204,7 +2236,11 @@ mod tests {
         let rules = write_runtime_rules();
         let mut source = ContentSource::with_range_read();
         source.insert(b"a.txt", b"aaa");
-        // Page: ScanMiss(a, fits), ScanMiss(b, over budget), AlreadyDone(c), AlreadyDone(d), ScanMiss(e)
+        source.insert(b"e.txt", b"ee");
+        // Page: ScanMiss(a, fits), ScanMiss(b, over budget), AlreadyDone(c),
+        // AlreadyDone(d), ScanMiss(e, fits remaining).
+        // With skip-ahead admission: b.txt is deferred (oversized), then c/d
+        // are counted as AlreadyDone, then e.txt fits the remaining budget.
         let page = prefiltered_page(
             vec![
                 (
@@ -2240,18 +2276,15 @@ mod tests {
         let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
             .expect("scan-miss execution succeeds");
 
-        assert_eq!(execution.outcomes().len(), 1, "only a.txt fits the budget");
-        assert_eq!(
-            execution.deferred().len(),
-            2,
-            "b.txt and e.txt are deferred"
-        );
+        // a.txt (3 bytes) scanned, b.txt deferred (oversized), e.txt (2 bytes)
+        // scanned after skipping past the oversized item.
+        assert_eq!(execution.outcomes().len(), 2, "a.txt and e.txt are scanned");
+        assert_eq!(execution.deferred().len(), 1, "only b.txt is deferred");
         assert_eq!(execution.deferred()[0].item_key().as_bytes(), b"b.txt");
-        assert_eq!(execution.deferred()[1].item_key().as_bytes(), b"e.txt");
         assert_eq!(
             execution.already_done_len(),
             2,
-            "c.txt and d.txt after the deferral point must still be counted"
+            "c.txt and d.txt are counted as AlreadyDone"
         );
     }
 
