@@ -95,6 +95,10 @@ use crate::{
 /// This bundle is self-contained: it carries everything needed to validate a
 /// page against the coordination contract. The runtime never mutates these
 /// fields; downstream execution decides checkpoint advancement.
+///
+/// `budgets` are forwarded verbatim to the connector's `fill_page` call, so
+/// callers should derive them from the same scheduling decision that restored
+/// `state`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderedContentRuntimeInput {
     state: RestoredShardState,
@@ -105,7 +109,9 @@ impl OrderedContentRuntimeInput {
     /// Construct one ordered-content execution input bundle.
     ///
     /// `state` must carry [`CursorSemantics::Completed`] — the runtime
-    /// rejects other semantics at execution time.
+    /// rejects other semantics at execution time. `budgets` are copied into
+    /// the bundle unchanged and later forwarded to
+    /// [`OrderedContentSource::fill_page`].
     #[must_use]
     pub fn new(state: RestoredShardState, budgets: Budgets) -> Self {
         Self { state, budgets }
@@ -273,6 +279,19 @@ impl OrderedContentPage {
     /// [`DoneLedger::batch_get`]
     /// under the supplied `write_context`'s tenant and policy scope.
     ///
+    /// # Classification rules
+    ///
+    /// - [`DoneLedgerStatus::ScannedClean`],
+    ///   [`DoneLedgerStatus::ScannedWithFindings`],
+    ///   [`DoneLedgerStatus::FailedPermanent`], and
+    ///   [`DoneLedgerStatus::Skipped`] map to
+    ///   [`OrderedContentPrefilterDisposition::AlreadyDone`].
+    /// - [`DoneLedgerStatus::FailedRetryable`] and missing rows map to
+    ///   [`OrderedContentPrefilterDisposition::ScanMiss`], keeping the item
+    ///   eligible for a later retry.
+    /// - The lookup key includes both stable-item identity and version claim,
+    ///   so a done row for one version does not suppress scanning for another.
+    ///
     /// # Batching
     ///
     /// Lookups are chunked at
@@ -287,6 +306,11 @@ impl OrderedContentPage {
     ///   [`OrderedContentPrefilteredPage`].
     /// - The `report`, `resume_cursor`, and `page_state` are carried through
     ///   unmodified so downstream checkpoint logic remains correct.
+    ///
+    /// # Complexity
+    ///
+    /// O(n) done-ledger lookups and O(n) additional memory for the returned
+    /// classified page, where `n` is the number of items in the source page.
     ///
     /// # Errors
     ///
@@ -545,6 +569,11 @@ impl OrderedContentPrefilteredPage {
 }
 
 /// Result of one ordered-content page acquisition attempt.
+///
+/// The variants separate three boundary conditions for one `fill_page` call:
+/// source exhaustion (`Finished`), connector-reported enumerate failure with
+/// retry classification preserved (`Stopped`), and a validated non-empty page
+/// that downstream stages may inspect (`Page`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentExecutionOutcome {
     /// The source reported no in-scope items for the current cursor position.
@@ -574,8 +603,22 @@ impl OrderedContentRuntime {
     /// - `HasMore` cursor presence (must carry a `last_key`); and
     /// - `HasMore` cursor agreement with the page's final emitted key.
     ///
-    /// Connector enumerate failures surface as [`OrderedContentExecutionOutcome::Stopped`]
-    /// so callers can preserve retry classification without message parsing.
+    /// Returns:
+    ///
+    /// - [`OrderedContentExecutionOutcome::Finished`] when the source reports
+    ///   no more in-scope items for the current cursor,
+    /// - [`OrderedContentExecutionOutcome::Stopped`] when `fill_page` returns
+    ///   an [`EnumerateError`], preserving the connector's retry
+    ///   classification and optional backoff hint, and
+    /// - [`OrderedContentExecutionOutcome::Page`] only after the returned page
+    ///   satisfies the ordered-page contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScanRuntimeError::Driver`] when the restored shard state is
+    /// internally inconsistent for this runtime boundary (for example,
+    /// non-`Completed` cursor semantics) or when the connector returns a page
+    /// that violates the ordered-page contract.
     pub fn execute_source<S: OrderedContentSource>(
         source: &mut S,
         input: &OrderedContentRuntimeInput,
@@ -686,6 +729,10 @@ pub(crate) fn scan_local_filesystem(
 /// already been requested. Otherwise spawns two scoped forwarder threads
 /// (event and commit), runs the parallel scanner, and joins both forwarders
 /// before returning.
+///
+/// The forwarder threads are part of the function's correctness contract:
+/// all senders are dropped before the joins so buffered events and commit
+/// batches are fully drained before the caller observes the returned report.
 ///
 /// # Errors
 ///
