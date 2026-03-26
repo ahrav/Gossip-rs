@@ -9,21 +9,26 @@ Launch runbooks from `runbooks/` via Jetty using `run-runbook.sh`.
 
 ## Workflow
 
-1. Update `runbook-params.json` with any parameter overrides the user requested
+1. Create or update `runbook-params.json` with any parameter overrides the user requested
 2. Run `./run-runbook.sh <task-name>`
 3. Report the trajectory ID and workflow ID
 
 ## Parameters File
 
-Edit `runbook-params.json` at repo root before launching:
+If `runbook-params.json` is missing, create it locally at repo root before
+launching. The repo `.gitignore` excludes both `runbook-params.json` and
+`run-runbook.sh`, so these runbook helper files may exist only in your local
+checkout.
+
+Use concrete values in the JSON file instead of shell expressions:
 
 ```json
 {
   "repository": "ahrav/gossip-rs",
   "pr_number": "312",
   "base_branch": "main",
-  "GITHUB_TOKEN": "$(gh auth token)",
-  "CARGO_HOME": "~/.cargo",
+  "GITHUB_TOKEN": "<output of gh auth token>",
+  "CARGO_HOME": "/Users/<you>/.cargo",
   "timeout_sec": 3600
 }
 ```
@@ -51,14 +56,18 @@ The `<task-name>` matches the filename in `runbooks/` without the `.md` extensio
 ### List Available Runbooks
 
 ```bash
-ls runbooks/*.md | sed 's|runbooks/||;s|\.md$||'
+if [ -d runbooks ] && ls runbooks/*.md >/dev/null 2>&1; then
+  ls runbooks/*.md | sed 's|runbooks/||;s|\.md$||'
+else
+  echo "No local runbooks found. Ensure local runbook assets are provisioned."
+fi
 ```
 
 ## Output
 
 The script prints trajectory and workflow IDs on success:
 
-```
+```text
 Run launched successfully:
   Task:          <task-name>
   Trajectory ID: <id>
@@ -75,4 +84,4 @@ Report these to the user so they can track progress in Jetty.
 | Forgetting to update timeout for long tasks | User-requested timeout goes in `runbook-params.json` `timeout_sec` |
 | Passing wrong task name | Name must match a file in `runbooks/` without `.md`. The script lists available names on error. |
 | Not reporting trajectory ID | Always show the trajectory and workflow IDs in your response |
-| Not knowing which runbook to run | List available runbooks with `ls runbooks/*.md` and ask the user to pick one |
+| Not knowing which runbook to run | Use the guarded runbook-listing command above and ask the user to pick one |

@@ -104,16 +104,22 @@ Connector-mode filesystem scans acquire one ordered page through
 `OrderedContentRuntime::execute_source` from the real
 `FilesystemConnector`, validate shard bounds and cursor monotonicity,
 and classify enumerate failures from the connector error taxonomy. The
-runtime now distinguishes exhausted-empty completion from terminal
-non-empty pages so distributed callers can require the final
-exhausted-empty suffix call before they treat the shard as fully
-enumerated. The current `scan_fs_connector` entry point returns the
-validated page report without performing content reads. Done-ledger
-prefiltering and `OrderedContentRuntime::execute_scan_misses` (which
-bridges runtime `ScanBudgets` into connector read budgets, scans each
-item through the shared chunked engine path, preserves retryable versus
-permanent read failures, and returns ordered non-durable outcomes) are
-available as library APIs but are not wired into the live dispatcher.
+runtime maps the ordered filesystem path onto explicit
+`FilesystemShardCompletionOutcome` variants: `ExhaustedEmpty` only after
+the connector confirms exhausted-empty (`Ok(None)` at the page-fill
+boundary), `Complete { checkpoint }` after a terminal non-empty page is
+followed by that exhausted-empty suffix call, and `Checkpoint {
+checkpoint }` when the scan stops early after receipt-backed progress
+exists. This lets distributed callers require the exhausted-empty suffix
+before they treat a shard as fully enumerated, while still preserving
+checkpointable progress on retryable stops. The current
+`scan_fs_connector` entry point returns the validated page report without
+performing content reads. Done-ledger prefiltering and
+`OrderedContentRuntime::execute_scan_misses` (which bridges runtime
+`ScanBudgets` into connector read budgets, scans each item through the
+shared chunked engine path, preserves retryable versus permanent read
+failures, and returns ordered non-durable outcomes) are available as
+library APIs but are not wired into the live dispatcher.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
@@ -129,15 +135,17 @@ execution starts a lease-deadline watchdog that drives the shared
 `CancellationToken` when the claimed lease is no longer trustworthy.
 The ordered page loop polls that token between page acquisitions and
 before queueing new commit work so expiry stops the shard before more
-items are enqueued. Successful filesystem lease execution still returns
-an explicit terminal completion outcome: receipt-backed progress uses
-the committed-prefix checkpoint cursor, while exhausted-empty
-completion derives a range-safe fallback cursor validated against shard
-bounds before the final coordination `complete`. If the deadline
-elapses first, or if `complete` rejects a stale or expired lease, the
-worker surfaces `DistributedRuntimeError::LeaseUncertain` and leaves
-the shard for a higher-fence reassignment to resume from durable
-receipt and done-ledger state.
+items are enqueued. Successful filesystem lease execution returns an
+explicit `ShardCompletionOutcome`: `Complete { checkpoint }` uses the
+committed-prefix cursor for terminal completion,
+`Checkpoint { checkpoint }` preserves non-terminal progress through
+coordination `checkpoint`, and `ExhaustedEmpty` derives a range-safe
+fallback cursor only when the scan truly observed exhausted-empty
+before any durable committed unit existed. If the deadline elapses
+first, or if `complete` rejects a stale or expired lease, the worker
+surfaces `DistributedRuntimeError::LeaseUncertain` and leaves the
+shard for a higher-fence reassignment to resume from durable receipt
+and done-ledger state.
 
 ### Family split
 
