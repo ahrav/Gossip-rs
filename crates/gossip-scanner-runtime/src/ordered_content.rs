@@ -934,9 +934,10 @@ impl OrderedContentRuntime {
     /// - [`OrderedContentExecutionOutcome::Stopped`] when `fill_page` returns
     ///   an [`EnumerateError`], preserving the connector's retry
     ///   classification and optional backoff hint, and
-    /// - [`OrderedContentExecutionOutcome::Page`] or
-    ///   [`OrderedContentExecutionOutcome::TerminalPage`] only after the
-    ///   returned page satisfies the ordered-page contract.
+    /// - [`OrderedContentExecutionOutcome::Page`] only after the returned
+    ///   page satisfies the ordered-page contract. Callers can inspect
+    ///   `page.page().state()` to distinguish terminal (`Complete`) from
+    ///   continuation (`HasMore`) pages.
     ///
     /// # Errors
     ///
