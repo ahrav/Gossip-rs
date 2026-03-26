@@ -92,8 +92,8 @@ use gossip_contracts::{
     persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
 };
 use gossip_coordination::{
-    AcquireResultView, AcquireScratch, ClaimError, CompleteError, CoordinationFacade,
-    CursorSemantics, Lease, OpKind,
+    AcquireResultView, AcquireScratch, CheckpointError, ClaimError, CompleteError,
+    CoordinationFacade, CursorSemantics, Lease, OpKind,
 };
 use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode};
@@ -1569,7 +1569,9 @@ where
 /// The operation uses a deterministic [`OpId`] so replayed calls are
 /// idempotent. If the coordination backend reports the update was already
 /// applied (idempotent replay), the function logs an info message but
-/// succeeds.
+/// succeeds. Coordinator-side lease loss (`StaleFence` / `LeaseExpired`)
+/// surfaces as [`DistributedRuntimeError::LeaseUncertain`] for both
+/// checkpoint and completion paths.
 fn advance_shard<C>(
     coordinator: &mut C,
     identity: &WorkerIdentity,
@@ -1640,7 +1642,19 @@ where
                 &cursor,
                 op_id,
             )
-            .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?,
+            .map_err(|error| match error {
+                CheckpointError::StaleFence { presented, current } => {
+                    DistributedRuntimeError::LeaseUncertain(
+                        LeaseUncertainty::CompletionStaleFence { presented, current },
+                    )
+                }
+                CheckpointError::LeaseExpired { deadline, now } => {
+                    DistributedRuntimeError::LeaseUncertain(
+                        LeaseUncertainty::CompletionLeaseExpired { deadline, now },
+                    )
+                }
+                other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
+            })?,
         ShardCompletionOutcome::Complete { .. } | ShardCompletionOutcome::ExhaustedEmpty => {
             coordinator
                 .complete(
@@ -4872,6 +4886,69 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_shard_reports_lease_uncertainty_when_lease_is_fenced() {
+        let dir = tempdir().expect("tempdir");
+
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 50);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let checkpoint =
+            Cursor::try_from_update(CoordCursorUpdate::new(b"\x05")).expect("checkpoint cursor");
+
+        std::thread::sleep(Duration::from_millis(100));
+        let _rival_lease = claim_coordination_lease(&mut coordinator, worker(99));
+
+        let err = advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &ShardCompletionOutcome::Checkpoint {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .expect_err("checkpoint with stale fence should fail");
+        assert!(
+            matches!(
+                err,
+                DistributedRuntimeError::LeaseUncertain(
+                    LeaseUncertainty::CompletionStaleFence { .. }
+                )
+            ),
+            "expected LeaseUncertain stale-fence variant, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_shard_reports_lease_uncertainty_when_lease_has_expired() {
+        let dir = tempdir().expect("tempdir");
+
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 50);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let checkpoint =
+            Cursor::try_from_update(CoordCursorUpdate::new(b"\x05")).expect("checkpoint cursor");
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        let err = advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &ShardCompletionOutcome::Checkpoint { checkpoint },
+        )
+        .expect_err("checkpoint after lease expiry should fail");
+        assert!(
+            matches!(
+                err,
+                DistributedRuntimeError::LeaseUncertain(
+                    LeaseUncertainty::CompletionLeaseExpired { .. }
+                )
+            ),
+            "expected LeaseUncertain lease-expired variant, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn advance_shard_maps_terminal_shard_to_coordinator_error() {
         let dir = tempdir().expect("tempdir");
         let mut coordinator =
@@ -4888,18 +4965,18 @@ mod tests {
         )
         .expect("first completion should succeed");
 
-        // A second completion with a different outcome produces a different
-        // deterministic OpId, so the coordinator treats it as a new operation
-        // on a terminal shard rather than an idempotent replay.
+        // Use the checkpoint path on the terminal shard so the deterministic
+        // OpId differs from the first completion and reaches terminal-state
+        // validation rather than idempotent replay handling.
         let err = advance_shard(
             &mut coordinator,
             &identity,
             &lease,
-            &ShardCompletionOutcome::Complete {
+            &ShardCompletionOutcome::Checkpoint {
                 checkpoint: Cursor::with_last_key(item_key("z.txt")),
             },
         )
-        .expect_err("completing an already-done shard should fail");
+        .expect_err("checkpointing an already-done shard should fail");
 
         assert!(
             matches!(err, DistributedRuntimeError::Coordinator(_)),

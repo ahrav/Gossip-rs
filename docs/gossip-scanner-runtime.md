@@ -141,9 +141,13 @@ watchdog uses `std::thread::park_timeout` instead of `thread::sleep`
 so the main thread can wake it immediately via `unpark()` when shard
 execution finishes, avoiding up to one polling interval of exit
 latency. Successful receipt-drain completion seals the local deadline
-signal before the watchdog joins, so any lease rejection after durable
-local completion is decided by the coordinator `complete`/`checkpoint`
-call rather than by a late local watchdog tick.
+signal before the watchdog joins. This ensures any lease rejection
+after durable local completion is decided by the coordinator
+`complete`/`checkpoint` call rather than by a late local watchdog tick.
+Coordinator-side `StaleFence` and `LeaseExpired` rejections from both
+`checkpoint` and `complete` are normalized to
+`DistributedRuntimeError::LeaseUncertain`, preserving the lease-loss
+classification after local durable progress exists.
 The ordered page loop polls that token between page acquisitions and
 before queueing new commit work so expiry stops the shard before more
 items are enqueued. Claim retry delays apply full jitter via a BLAKE3
