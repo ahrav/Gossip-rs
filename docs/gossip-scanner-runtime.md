@@ -125,10 +125,19 @@ The distributed module exports the concrete worker-loop types and helpers:
 `DistributedRuntimeError`. The runtime depends directly on
 `gossip-coordination` for claim and completion operations and on
 `gossip-frontier` for shard metadata decoding. Filesystem lease
-execution returns an explicit terminal completion outcome:
-receipt-backed progress uses the committed-prefix checkpoint cursor,
-while exhausted-empty completion derives a range-safe fallback cursor
-validated against shard bounds before the final coordination `complete`.
+execution starts a lease-deadline watchdog that drives the shared
+`CancellationToken` when the claimed lease is no longer trustworthy.
+The ordered page loop polls that token between page acquisitions and
+before queueing new commit work so expiry stops the shard before more
+items are enqueued. Successful filesystem lease execution still returns
+an explicit terminal completion outcome: receipt-backed progress uses
+the committed-prefix checkpoint cursor, while exhausted-empty
+completion derives a range-safe fallback cursor validated against shard
+bounds before the final coordination `complete`. If the deadline
+elapses first, or if `complete` rejects a stale or expired lease, the
+worker surfaces `DistributedRuntimeError::LeaseUncertain` and leaves
+the shard for a higher-fence reassignment to resume from durable
+receipt and done-ledger state.
 
 ### Family split
 

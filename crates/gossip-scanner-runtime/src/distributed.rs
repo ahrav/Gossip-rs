@@ -53,9 +53,9 @@
 //! 3. **At-least-once delivery.** The commit pipeline tolerates duplicate writes
 //!    for the same `(write_context, item_key)` pair. Persistence backends must
 //!    be idempotent.
-//! 4. **Fail-fast after claim.** Once a shard is claimed, any scan, commit, or
-//!    completion error terminates the worker loop. Uncompleted leases expire
-//!    via coordination-layer deadlines.
+//! 4. **Fail-fast after claim.** Once a shard is claimed, any scan, commit,
+//!    completion, or explicit lease-uncertainty stop terminates the worker
+//!    loop. Uncompleted leases expire via coordination-layer deadlines.
 //!
 //! # Internal adapter: `ReceiptCommitSink`
 //!
@@ -91,8 +91,8 @@ use gossip_contracts::{
     persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
 };
 use gossip_coordination::{
-    AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, CursorSemantics, Lease,
-    OpKind,
+    AcquireResultView, AcquireScratch, ClaimError, CompleteError, CoordinationFacade,
+    CursorSemantics, Lease, OpKind,
 };
 use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode};
@@ -444,6 +444,60 @@ impl DistributedRunReport {
     }
 }
 
+/// Explicit reason the worker can no longer trust a claimed lease.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LeaseUncertainty {
+    /// The local worker reached or passed the lease deadline before the shard
+    /// finished its scan and commit pipeline.
+    #[error(
+        "lease deadline elapsed during shard execution (deadline {deadline:?}, observed {observed:?})"
+    )]
+    DeadlineElapsed {
+        deadline: LogicalTime,
+        observed: LogicalTime,
+    },
+    /// The coordinator rejected completion because another worker already owns
+    /// a newer fence epoch.
+    #[error(
+        "shard completion rejected by a stale fence (presented {presented:?}, current {current:?})"
+    )]
+    CompletionStaleFence {
+        presented: FenceEpoch,
+        current: FenceEpoch,
+    },
+    /// The coordinator rejected completion because the lease already expired.
+    #[error("shard completion rejected after lease expiry (deadline {deadline:?}, now {now:?})")]
+    CompletionLeaseExpired {
+        deadline: LogicalTime,
+        now: LogicalTime,
+    },
+}
+
+/// Shared lease-uncertainty signal written by the deadline watcher.
+#[derive(Clone, Debug, Default)]
+struct LeaseUncertaintySignal {
+    reason: Arc<Mutex<Option<LeaseUncertainty>>>,
+}
+
+impl LeaseUncertaintySignal {
+    fn note(&self, reason: LeaseUncertainty) {
+        let mut guard = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            *guard = Some(reason);
+        }
+    }
+
+    fn current(&self) -> Option<LeaseUncertainty> {
+        self.reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 /// Layered error from the distributed runtime.
 ///
 /// Classifies failures by origin so callers can distinguish coordinator
@@ -455,6 +509,9 @@ pub enum DistributedRuntimeError {
     /// The coordinator returned an error.
     #[error("coordinator error: {0}")]
     Coordinator(#[source] AnyError),
+    /// The worker intentionally stopped because the lease is no longer trusted.
+    #[error("lease uncertainty: {0}")]
+    LeaseUncertain(#[source] LeaseUncertainty),
     /// The scan runtime failed while executing an assignment.
     #[error("runtime error: {0}")]
     Runtime(#[source] ScanRuntimeError),
@@ -991,8 +1048,12 @@ fn resolve_filesystem_lease_results(
     outcome: Result<AssignmentOutcome, ScanRuntimeError>,
     submitted: Result<Vec<u64>>,
     stage_result: anyhow::Result<anyhow::Result<CommitStageDrainResult>>,
+    lease_uncertainty: Option<LeaseUncertainty>,
 ) -> Result<(AssignmentOutcome, Vec<u64>, CommitStageDrainResult), DistributedRuntimeError> {
     let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
+    if let Some(reason) = lease_uncertainty {
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
     let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let stage_result = stage_result
         .map_err(DistributedRuntimeError::Durability)?
@@ -1015,9 +1076,9 @@ fn resolve_filesystem_lease_results(
 /// disconnected at that moment, the outcome is silently dropped. This is safe
 /// because `drain_error` is always set before `drainer.cancel()` is called,
 /// so the function returns the original error without reaching the downstream
-/// sequence-number cross-check. If external cancellation were introduced,
-/// callers would need to distinguish cancellation-induced outcome gaps from
-/// genuine durability failures.
+/// sequence-number cross-check. Callers that cancel for lease uncertainty must
+/// branch on that signal before treating submission or drain gaps as
+/// durability failures.
 fn drain_commit_stage<F, D>(
     drainer: CommitPipelineDrainer<F, D>,
     write_context: WriteContext,
@@ -1313,6 +1374,36 @@ fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -
         .unwrap_or(CLAIM_RACE_RETRY_DELAY)
 }
 
+/// Poll a lease deadline until shard execution finishes or the deadline elapses.
+///
+/// The watcher reuses [`claim_retry_delay`] and clamps it to
+/// [`CLAIM_RACE_RETRY_DELAY`] so expiry detection stays responsive without
+/// introducing a separate busy-spin interval.
+fn watch_lease_deadline(
+    deadline: LogicalTime,
+    cancel: CancellationToken,
+    done: Arc<AtomicBool>,
+    signal: LeaseUncertaintySignal,
+) {
+    loop {
+        if done.load(Ordering::Acquire) {
+            return;
+        }
+
+        let now = wall_clock_now();
+        if now.as_raw() >= deadline.as_raw() {
+            signal.note(LeaseUncertainty::DeadlineElapsed {
+                deadline,
+                observed: now,
+            });
+            cancel.cancel();
+            return;
+        }
+
+        std::thread::sleep(claim_retry_delay(now, Some(deadline)).min(CLAIM_RACE_RETRY_DELAY));
+    }
+}
+
 /// Derive a deterministic [`OpId`] from shard identity, fence epoch, and kind.
 ///
 /// Idempotent: the same `(key, fence, op_kind)` triple always produces the
@@ -1431,15 +1522,28 @@ where
         lease.lease().fence(),
         OpKind::Complete,
     );
-    let completion_result = coordinator
-        .complete(
-            wall_clock_now(),
-            identity.tenant,
-            &lease.lease(),
-            &final_cursor,
-            op_id,
-        )
-        .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
+    let completion_result =
+        coordinator
+            .complete(
+                wall_clock_now(),
+                identity.tenant,
+                &lease.lease(),
+                &final_cursor,
+                op_id,
+            )
+            .map_err(|error| match error {
+                CompleteError::StaleFence { presented, current } => {
+                    DistributedRuntimeError::LeaseUncertain(
+                        LeaseUncertainty::CompletionStaleFence { presented, current },
+                    )
+                }
+                CompleteError::LeaseExpired { deadline, now } => {
+                    DistributedRuntimeError::LeaseUncertain(
+                        LeaseUncertainty::CompletionLeaseExpired { deadline, now },
+                    )
+                }
+                other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
+            })?;
 
     if !completion_result.is_executed() {
         tracing::info!(
@@ -1589,6 +1693,10 @@ where
         let mut submitted_report = ScanReport::default();
         let mut items_submitted: u64 = 0;
         for item in execution.outcomes() {
+            if cancel.is_cancelled() {
+                hit_non_terminal = true;
+                break;
+            }
             // A deferred item with a key before this outcome means the
             // checkpoint would skip past the deferred item if we commit
             // this outcome. Stop here so the checkpoint stays before the
@@ -1728,6 +1836,18 @@ where
 
     let sink = CoordinationEventSink::new(recorder.clone(), Arc::clone(lease.shard_id_arc()));
     let cancel = CancellationToken::new();
+    let lease_deadline = lease.lease().deadline();
+    let start_time = wall_clock_now();
+    if start_time.as_raw() >= lease_deadline.as_raw() {
+        return Err(DistributedRuntimeError::LeaseUncertain(
+            LeaseUncertainty::DeadlineElapsed {
+                deadline: lease_deadline,
+                observed: start_time,
+            },
+        ));
+    }
+    let lease_uncertainty = LeaseUncertaintySignal::default();
+    let lease_watch_done = Arc::new(AtomicBool::new(false));
     let pipeline = CommitPipeline::start(
         persistence.findings_sink.clone(),
         persistence.done_ledger.clone(),
@@ -1753,11 +1873,17 @@ where
     // aggregator. When the scan completes, `commit.finish()` consumes the
     // sink (verifying no items remain in-flight) and the drain thread exits
     // once the submission channel closes.
-    let (outcome, submitted, stage_result) = std::thread::scope(|scope| {
+    let (outcome, submitted, stage_result, watch_result) = std::thread::scope(|scope| {
         let write_context = lease.write_context();
         let max_buffered = config.commit_queue_capacity.get();
         let stage_handle =
             scope.spawn(move || drain_commit_stage(drainer, write_context, max_buffered));
+        let deadline_handle = scope.spawn({
+            let cancel = cancel.clone();
+            let done = Arc::clone(&lease_watch_done);
+            let signal = lease_uncertainty.clone();
+            move || watch_lease_deadline(lease_deadline, cancel, done, signal)
+        });
 
         let outcome = scan_ordered_filesystem_lease_with_engine(
             lease,
@@ -1770,12 +1896,20 @@ where
         );
         let submitted = commit.finish();
         let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread");
+        lease_watch_done.store(true, Ordering::Release);
+        let watch_result = join_scoped(deadline_handle, "lease deadline watchdog");
 
-        (outcome, submitted, stage_result)
+        (outcome, submitted, stage_result, watch_result)
     });
+    watch_result
+        .map_err(|error| DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(error)))?;
 
-    let (outcome, submitted, stage_result) =
-        resolve_filesystem_lease_results(outcome, submitted, stage_result)?;
+    let (outcome, submitted, stage_result) = resolve_filesystem_lease_results(
+        outcome,
+        submitted,
+        stage_result,
+        lease_uncertainty.current(),
+    )?;
     let CommitStageDrainResult {
         mut aggregator,
         committed_sequence_nos,
@@ -1849,14 +1983,16 @@ where
 ///
 /// # Fail-fast semantics
 ///
-/// The loop terminates on the first claim, scan, or completion error.
-/// Uncompleted leases are not explicitly released; the coordination backend
-/// reclaims them when their deadlines expire.
+/// The loop terminates on the first claim, scan, completion, or lease-uncertainty
+/// stop. Uncompleted leases are not explicitly released; the coordination
+/// backend reclaims them when their deadlines expire.
 ///
 /// # Errors
 ///
 /// - [`DistributedRuntimeError::Coordinator`] — shard claiming, progress
 ///   lookup, or completion failed.
+/// - [`DistributedRuntimeError::LeaseUncertain`] — the worker can no longer
+///   trust the claimed lease and must stop before terminal completion.
 /// - [`DistributedRuntimeError::Runtime`] — scan execution failed.
 /// - [`DistributedRuntimeError::Durability`] — the receipt-driven commit
 ///   pipeline could not confirm durable progress.
@@ -1899,6 +2035,16 @@ where
             config,
         ) {
             Ok(result) => result,
+            Err(error @ DistributedRuntimeError::LeaseUncertain(_)) => {
+                tracing::warn!(
+                    error = %error,
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shard_id = %lease.shard_id(),
+                    "worker loop terminating: lease became uncertain during filesystem lease execution",
+                );
+                return Err(error);
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -1920,6 +2066,16 @@ where
         );
 
         if let Err(error) = complete_shard(coordinator, &identity, &lease, &completion) {
+            if matches!(error, DistributedRuntimeError::LeaseUncertain(_)) {
+                tracing::warn!(
+                    error = %error,
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shard_id = %lease.shard_id(),
+                    "worker loop terminating: lease became uncertain during shard completion",
+                );
+                return Err(error);
+            }
             tracing::warn!(
                 error = %error,
                 leases_seen = report.leases_seen,
@@ -2357,6 +2513,17 @@ mod tests {
         assert_eq!(coordinator.to_string(), "coordinator error: coord boom");
         assert!(std::error::Error::source(&coordinator).is_some());
 
+        let lease_uncertain =
+            DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::DeadlineElapsed {
+                deadline: LogicalTime::from_raw(10),
+                observed: LogicalTime::from_raw(11),
+            });
+        assert_eq!(
+            lease_uncertain.to_string(),
+            "lease uncertainty: lease deadline elapsed during shard execution (deadline LogicalTime(10), observed LogicalTime(11))"
+        );
+        assert!(std::error::Error::source(&lease_uncertain).is_some());
+
         let runtime =
             DistributedRuntimeError::from(ScanRuntimeError::Driver(AnyError::msg("scan")));
         assert_eq!(
@@ -2403,6 +2570,7 @@ mod tests {
             Err(scan_error),
             Err(submitted_error),
             Ok(Err(stage_error)),
+            None,
         )
         .expect_err("scan failure should win when all three paths fail");
 
@@ -2428,6 +2596,7 @@ mod tests {
             }),
             Ok(Vec::new()),
             Ok(Err(stage_error)),
+            None,
         )
         .expect_err("drain failure should surface after a successful scan");
 
@@ -2454,6 +2623,7 @@ mod tests {
             Err(submitted_error),
             // stage_result is never reached because submitted fails first.
             Err(anyhow!("unused")),
+            None,
         )
         .expect_err("submitted failure should surface as Durability");
 
@@ -2479,6 +2649,7 @@ mod tests {
             }),
             Ok(Vec::new()),
             Err(panic_error),
+            None,
         )
         .expect_err("thread panic should be a durability error");
 
@@ -2490,6 +2661,32 @@ mod tests {
             error.to_string().contains("drain thread panicked"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn resolve_filesystem_lease_results_prefers_lease_uncertainty_over_cancellation_gaps() {
+        let reason = LeaseUncertainty::DeadlineElapsed {
+            deadline: LogicalTime::from_raw(20),
+            observed: LogicalTime::from_raw(21),
+        };
+
+        let error = resolve_filesystem_lease_results(
+            Ok(AssignmentOutcome {
+                report: ScanReport::default(),
+                checkpoint_hint: None,
+                debug_output: None,
+            }),
+            Err(anyhow!("submit cancelled after lease expiry")),
+            Err(anyhow!("unused")),
+            Some(reason.clone()),
+        )
+        .expect_err("lease uncertainty should win over cancellation-induced submission gaps");
+
+        assert_eq!(error.to_string(), format!("lease uncertainty: {reason}"));
+        assert!(matches!(
+            error,
+            DistributedRuntimeError::LeaseUncertain(actual) if actual == reason
+        ));
     }
 
     #[test]
@@ -4177,7 +4374,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_shard_fails_when_lease_is_fenced() {
+    fn complete_shard_reports_lease_uncertainty_when_lease_is_fenced() {
         let dir = tempdir().expect("tempdir");
 
         // Use a very short TTL so our lease expires quickly.
@@ -4198,8 +4395,112 @@ mod tests {
         )
         .expect_err("completion with stale fence should fail");
         assert!(
-            matches!(err, DistributedRuntimeError::Coordinator(_)),
-            "expected Coordinator error variant, got: {err:?}"
+            matches!(
+                err,
+                DistributedRuntimeError::LeaseUncertain(
+                    LeaseUncertainty::CompletionStaleFence { .. }
+                )
+            ),
+            "expected LeaseUncertain stale-fence variant, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_reports_deadline_expiry_before_completion() {
+        const POLL_ITERATIONS: usize = 2_000;
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 500);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        done_ledger
+            .set_auto_complete(false)
+            .expect("disable done-ledger auto-complete");
+
+        let recorder = Arc::clone(&identity.recorder);
+        let lease_for_thread = lease.clone();
+        let findings_for_thread = findings_sink.clone();
+        let done_for_thread = done_ledger.clone();
+        let handle = std::thread::spawn(move || {
+            let persistence = DistributedPersistence::new(findings_for_thread, done_for_thread);
+            run_filesystem_lease(
+                recorder,
+                &persistence,
+                &lease_for_thread,
+                DistributedRuntimeConfig {
+                    commit_queue_capacity: NonZeroUsize::new(1)
+                        .expect("non-zero commit queue capacity"),
+                    ..DistributedRuntimeConfig::default()
+                },
+            )
+        });
+
+        let pending_op = loop {
+            let pending = done_ledger.pending_ids().expect("pending done-ledger ids");
+            match pending.as_slice() {
+                [op_id] => break *op_id,
+                [] => std::thread::sleep(POLL_INTERVAL),
+                _ => panic!(
+                    "expected one pending done-ledger commit, got {}",
+                    pending.len()
+                ),
+            }
+        };
+
+        std::thread::sleep(Duration::from_millis(650));
+        assert!(
+            done_ledger
+                .release_specific(pending_op)
+                .expect("release blocked done-ledger commit"),
+            "pending done-ledger op should release"
+        );
+
+        for _ in 0..POLL_ITERATIONS {
+            if handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(
+            handle.is_finished(),
+            "filesystem lease thread did not terminate within 10s after the blocked commit released"
+        );
+
+        let error = handle
+            .join()
+            .expect("filesystem lease thread should not panic")
+            .expect_err("deadline expiry should stop the lease before completion");
+        assert!(
+            matches!(
+                error,
+                DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::DeadlineElapsed { .. })
+            ),
+            "expected deadline-based lease uncertainty, got: {error:?}"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the in-flight commit may still finish durably before the worker aborts"
+        );
+
+        let progress = run_progress(&coordinator);
+        assert_eq!(progress.active(), 1);
+        assert_eq!(progress.done(), 0);
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status(), ShardStatus::Active);
+        assert!(
+            summaries[0].last_key().is_none(),
+            "lease uncertainty must not attempt terminal completion"
         );
     }
 
