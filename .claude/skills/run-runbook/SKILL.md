@@ -9,21 +9,26 @@ Launch runbooks from `runbooks/` via Jetty using `run-runbook.sh`.
 
 ## Workflow
 
-1. Update `runbook-params.json` with any parameter overrides the user requested
+1. Create or update `runbook-params.json` with any parameter overrides the user requested
 2. Run `./run-runbook.sh <task-name>`
 3. Report the trajectory ID and workflow ID
 
 ## Parameters File
 
-Edit `runbook-params.json` at repo root before launching:
+If `runbook-params.json` is missing, create it locally at repo root before
+launching. The repo `.gitignore` excludes both `runbook-params.json` and
+`run-runbook.sh`, so these runbook helper files may exist only in your local
+checkout.
+
+Use concrete values in the JSON file instead of shell expressions:
 
 ```json
 {
   "repository": "ahrav/gossip-rs",
   "pr_number": "312",
   "base_branch": "main",
-  "GITHUB_TOKEN": "$(gh auth token)",
-  "CARGO_HOME": "~/.cargo",
+  "GITHUB_TOKEN": "<output of gh auth token>",
+  "CARGO_HOME": "/Users/<you>/.cargo",
   "timeout_sec": 3600
 }
 ```
@@ -58,7 +63,7 @@ ls runbooks/*.md | sed 's|runbooks/||;s|\.md$||'
 
 The script prints trajectory and workflow IDs on success:
 
-```
+```text
 Run launched successfully:
   Task:          <task-name>
   Trajectory ID: <id>
