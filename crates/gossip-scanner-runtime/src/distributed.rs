@@ -1512,12 +1512,15 @@ where
         }
         report += execution.assignment_report();
 
-        // When non-terminal items (retryable or deferred) block further
-        // progress, stop scanning additional pages. The checkpoint will
-        // only cover items committed before the non-terminal boundary.
-        // On the next shard claim, the page listing resumes from the
-        // checkpoint and re-lists the non-terminal items for retry.
-        if hit_non_terminal {
+        // When non-terminal items (retryable or deferred) exist on this
+        // page, stop scanning additional pages. The checkpoint will only
+        // cover items committed before the non-terminal boundary. On the
+        // next shard claim, the page listing resumes from the checkpoint
+        // and re-lists the non-terminal items for retry. Deferred items
+        // may land on a separate page from subsequent outcomes (the page
+        // byte budget can split them), so check deferred() even when the
+        // outcomes loop ran to completion.
+        if hit_non_terminal || !execution.deferred().is_empty() {
             break;
         }
 
