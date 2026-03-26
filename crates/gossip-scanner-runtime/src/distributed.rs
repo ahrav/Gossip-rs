@@ -78,7 +78,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
-    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId},
     coordination::{RestoredShardState, ShardSpec},
     identity::{
         CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
@@ -1435,48 +1435,60 @@ where
     D: DoneLedger,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    if cancel.is_cancelled() {
-        return Ok(AssignmentOutcome {
-            report: ScanReport::default(),
-            checkpoint_hint: None,
-            debug_output: None,
-        });
-    }
-
     let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
-    let runtime_input = OrderedContentRuntimeInput::new(lease.restored_state().clone(), budgets);
     let mut source = FilesystemConnector::new(config.path.clone());
+    let shard_spec = lease.restored_state().shard_spec().clone();
+    let cursor_semantics = lease.restored_state().cursor_semantics();
+    let mut restored_state = lease.restored_state().clone();
+    let mut report = ScanReport::default();
+    let mut executed_any_page = false;
 
-    let page = match OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
-        OrderedContentExecutionOutcome::Finished => {
-            return Ok(AssignmentOutcome {
-                report: ScanReport::default(),
-                checkpoint_hint: None,
-                debug_output: None,
-            });
+    loop {
+        if cancel.is_cancelled() {
+            break;
         }
-        OrderedContentExecutionOutcome::Stopped(stop) => {
-            return Err(ScanRuntimeError::Driver(anyhow!("{stop}")));
-        }
-        OrderedContentExecutionOutcome::Page(page) => page,
-    };
 
-    let page = page.prefilter_done_ledger(lease.write_context(), done_ledger)?;
-    let execution = OrderedContentRuntime::execute_scan_misses_with_prebuilt_engine(
-        &mut source,
-        page,
-        config.budgets,
-        config.scan_binary,
-        Arc::clone(&engine),
-    )?;
-    let report = execution.assignment_report();
-    for item in execution.outcomes() {
-        commit
-            .submit_ordered_item(item)
-            .map_err(ScanRuntimeError::Driver)?;
-        emit_ordered_item_findings(out, &engine, item);
+        let runtime_input = OrderedContentRuntimeInput::new(restored_state.clone(), budgets);
+        let page = match OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
+            OrderedContentExecutionOutcome::Finished => break,
+            OrderedContentExecutionOutcome::Stopped(stop) => {
+                return Err(ScanRuntimeError::Driver(anyhow!("{stop}")));
+            }
+            OrderedContentExecutionOutcome::Page(page) => page,
+        };
+
+        let page = page.prefilter_done_ledger(lease.write_context(), done_ledger)?;
+        let execution = OrderedContentRuntime::execute_scan_misses_with_prebuilt_engine(
+            &mut source,
+            page,
+            config.budgets,
+            config.scan_binary,
+            Arc::clone(&engine),
+        )?;
+        report += execution.assignment_report();
+        executed_any_page = true;
+
+        for item in execution.outcomes() {
+            commit
+                .submit_ordered_item(item)
+                .map_err(ScanRuntimeError::Driver)?;
+            emit_ordered_item_findings(out, &engine, item);
+        }
+
+        if matches!(execution.page_state(), PageState::Complete) {
+            break;
+        }
+
+        restored_state = RestoredShardState::new(
+            shard_spec.clone(),
+            execution.resume_cursor().clone(),
+            cursor_semantics,
+        );
     }
-    emit_ordered_summary(out, report);
+
+    if executed_any_page {
+        emit_ordered_summary(out, report);
+    }
 
     Ok(AssignmentOutcome {
         report,
@@ -1493,8 +1505,9 @@ where
 /// 1. **Setup**: validates budgets, builds the scan engine, creates the
 ///    commit pipeline and `ReceiptCommitSink`.
 /// 2. **Concurrent execution**: spawns a scoped thread to drain the commit
-///    pipeline's outcome stream while the main thread executes one bounded
-///    ordered-content page through the filesystem connector runtime.
+///    pipeline's outcome stream while the main thread executes bounded
+///    ordered-content pages through the filesystem connector runtime until
+///    the shard is exhausted.
 /// 3. **Post-scan verification**: checks that every submitted sequence
 ///    number produced exactly one durable outcome (via
 ///    [`wait_for_submitted_commits`]).
@@ -3245,7 +3258,7 @@ mod tests {
     }
 
     #[test]
-    fn run_filesystem_lease_honors_ordered_item_budget() {
+    fn run_filesystem_lease_processes_all_pages_under_ordered_item_budget() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("a-secret.txt"), secret_fixture()).expect("write fixture a");
         fs::write(dir.path().join("b-secret.txt"), secret_fixture()).expect("write fixture b");
@@ -3273,26 +3286,34 @@ mod tests {
         .expect("budgeted filesystem lease should succeed");
 
         assert_eq!(
-            report.items_scanned, 1,
-            "ordered-content lease should stop after one item when max_items=1"
+            report.items_scanned, 2,
+            "ordered-content lease should keep paging until the shard is exhausted"
         );
-        let checkpoint = checkpoint.expect("first committed item should produce a checkpoint");
+        let checkpoint = checkpoint.expect("final committed item should produce a checkpoint");
         assert_eq!(
             checkpoint
                 .last_key()
                 .expect("checkpoint last_key")
                 .as_bytes(),
-            b"a-secret.txt"
+            b"b-secret.txt"
         );
         let rows = done_ledger.snapshot().expect("done-ledger snapshot");
-        assert_eq!(rows.len(), 1, "only the first ordered item should commit");
-        assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
+        assert_eq!(
+            rows.len(),
+            2,
+            "both ordered items should commit across pages"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.status() == DoneLedgerStatus::ScannedWithFindings),
+            "each secret fixture should produce a findings-bearing done-ledger row"
+        );
         assert!(
             !findings_sink
                 .observations_snapshot()
                 .expect("observations snapshot")
                 .is_empty(),
-            "the committed ordered item should still emit durable findings"
+            "the committed ordered items should still emit durable findings"
         );
     }
 
