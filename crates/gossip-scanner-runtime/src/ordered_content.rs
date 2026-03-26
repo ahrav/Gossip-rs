@@ -79,8 +79,8 @@ use gossip_contracts::{
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
     persistence::{
-        DoneLedger, DoneLedgerStatus, OvidHashInputs, RECOMMENDED_MAX_BATCH_SIZE, WriteContext,
-        derive_ovid_hash,
+        DoneLedger, DoneLedgerErrorCode, DoneLedgerStatus, OvidHashInputs,
+        RECOMMENDED_MAX_BATCH_SIZE, WriteContext, derive_ovid_hash,
     },
 };
 use scanner_engine::content_policy::{CHECK_LEN, ContentVerdict, classify_content};
@@ -652,6 +652,16 @@ impl OrderedContentReadStop {
     pub fn retry_after_ms(&self) -> Option<u64> {
         self.retry_after_ms
     }
+
+    /// Done-ledger error code for read failures.
+    pub fn failure_code() -> DoneLedgerErrorCode {
+        DoneLedgerErrorCode::try_new("READ_FAILED").expect("hardcoded read-failure error code")
+    }
+
+    /// Done-ledger error code for budget-truncated items.
+    pub fn truncation_code() -> DoneLedgerErrorCode {
+        DoneLedgerErrorCode::try_new("TRUNCATED").expect("hardcoded truncation error code")
+    }
 }
 
 impl std::fmt::Display for OrderedContentReadStop {
@@ -683,6 +693,17 @@ pub enum OrderedContentSkipReason {
     /// `.pyc`, `.env`); the extraction pipeline requires full-item buffering
     /// that the ordered-content chunked-read path does not support.
     BinaryExtractable,
+}
+
+impl OrderedContentSkipReason {
+    /// Done-ledger error code for this skip reason.
+    pub fn done_ledger_code(&self) -> DoneLedgerErrorCode {
+        let code = match self {
+            Self::Binary => "BINARY",
+            Self::BinaryExtractable => "BINARY_EXTRACTABLE",
+        };
+        DoneLedgerErrorCode::try_new(code).expect("hardcoded skip error code")
+    }
 }
 
 /// Non-durable outcome for one ordered-content item execution attempt.
@@ -851,6 +872,18 @@ impl OrderedContentScanMissExecution {
     pub fn resume_cursor(&self) -> &Cursor {
         &self.resume_cursor
     }
+
+    /// Aggregate report including already-done items and executed outcomes.
+    ///
+    /// Overrides `items_scanned` to count both already-done items (skipped by
+    /// the done-ledger prefilter) and executed outcomes. The execution report's
+    /// own `items_scanned` only counts items that were opened/read/scanned.
+    #[must_use]
+    pub fn assignment_report(&self) -> ScanReport {
+        let mut report = self.execution_report();
+        report.items_scanned = self.already_done_len() as u64 + self.outcomes().len() as u64;
+        report
+    }
 }
 
 /// Marker type for the ordered-content (filesystem) source family.
@@ -1006,7 +1039,7 @@ impl OrderedContentRuntime {
     /// open/read failures are recorded as
     /// [`OrderedContentItemOutcome::Failed`] entries so page execution can
     /// continue in order.
-    pub fn execute_scan_misses_with_engine<S: OrderedContentSource>(
+    pub(crate) fn execute_scan_misses_with_engine<S: OrderedContentSource>(
         source: &mut S,
         page: OrderedContentPrefilteredPage,
         budgets: ScanBudgets,
@@ -3731,8 +3764,14 @@ mod tests {
             execution.deferred().is_empty(),
             "zero size_hint should not cause deferral"
         );
-        let OrderedContentItemOutcome::Scanned { .. } = execution.outcomes()[0].outcome() else {
-            panic!("expected item with zero size_hint to scan successfully");
+        // size_hint=0 → item_byte_budget returns 1 (via .max(1) guard). The
+        // content is 5 bytes, so the budget is exhausted before all content is
+        // read, producing Truncated rather than Scanned.
+        let OrderedContentItemOutcome::Truncated { .. } = execution.outcomes()[0].outcome() else {
+            panic!(
+                "expected Truncated for zero-hint item with content exceeding 1-byte budget, got {:?}",
+                execution.outcomes()[0].outcome()
+            );
         };
     }
 }

@@ -115,8 +115,8 @@ use crate::{
     join_scoped,
     ordered_content::{
         OrderedContentExecutionOutcome, OrderedContentItemExecution, OrderedContentItemOutcome,
-        OrderedContentRuntime, OrderedContentRuntimeInput, OrderedContentScanMissExecution,
-        OrderedContentSkipReason,
+        OrderedContentReadStop, OrderedContentRuntime, OrderedContentRuntimeInput,
+        OrderedContentScanMissExecution, OrderedContentSkipReason,
     },
     result_translation::{ItemResult, ScanTiming, translate_item_result},
 };
@@ -699,8 +699,11 @@ impl ReceiptCommitSink {
         let checkpoint_cursor = Cursor::with_last_key(item.item_key().clone());
         let result = match execution.outcome() {
             OrderedContentItemOutcome::Scanned { findings } => ItemResult::Scanned { findings },
+            OrderedContentItemOutcome::Truncated { .. } => ItemResult::FailedRetryable {
+                error_code: OrderedContentReadStop::truncation_code(),
+            },
             OrderedContentItemOutcome::Failed(stop) => {
-                let error_code = ordered_content_failure_code();
+                let error_code = OrderedContentReadStop::failure_code();
                 if stop.class().is_retryable() {
                     ItemResult::FailedRetryable { error_code }
                 } else {
@@ -708,7 +711,7 @@ impl ReceiptCommitSink {
                 }
             }
             OrderedContentItemOutcome::Skipped(reason) => ItemResult::Skipped {
-                error_code: ordered_content_skip_code(*reason),
+                error_code: reason.done_ledger_code(),
             },
         };
         let translation = translate_item_result(
@@ -911,29 +914,6 @@ impl CommitSink for ReceiptCommitSink {
 
         Ok(())
     }
-}
-
-fn ordered_content_failure_code() -> DoneLedgerErrorCode {
-    DoneLedgerErrorCode::try_new("READ_FAILED").expect("hardcoded ordered-content error code")
-}
-
-fn ordered_content_skip_code(reason: OrderedContentSkipReason) -> DoneLedgerErrorCode {
-    let code = match reason {
-        OrderedContentSkipReason::Binary => "BINARY",
-        OrderedContentSkipReason::BinaryExtractable => "BINARY_EXTRACTABLE",
-    };
-    DoneLedgerErrorCode::try_new(code).expect("hardcoded ordered-content error code")
-}
-
-/// Build a shard-level report from a scan-miss execution.
-///
-/// Overrides `items_scanned` to count both already-done items (skipped by the
-/// done-ledger prefilter) and executed outcomes. The execution report's own
-/// `items_scanned` only counts items that were opened/read/scanned.
-fn ordered_content_assignment_report(execution: &OrderedContentScanMissExecution) -> ScanReport {
-    let mut report = execution.execution_report();
-    report.items_scanned = execution.already_done_len() as u64 + execution.outcomes().len() as u64;
-    report
 }
 
 fn emit_ordered_item_findings(
@@ -1486,7 +1466,7 @@ where
         config.scan_binary,
         Arc::clone(&engine),
     )?;
-    let report = ordered_content_assignment_report(&execution);
+    let report = execution.assignment_report();
     for item in execution.outcomes() {
         commit
             .submit_ordered_item(item)
@@ -3705,6 +3685,90 @@ mod tests {
         assert!(
             matches!(err, DistributedRuntimeError::Coordinator(_)),
             "expected Coordinator error variant, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_content_error_codes_are_valid_and_match_expected_values() {
+        let failure = ordered_content_failure_code();
+        assert_eq!(failure.as_str(), "READ_FAILED");
+
+        let truncation = ordered_content_truncation_code();
+        assert_eq!(truncation.as_str(), "TRUNCATED");
+
+        let binary = ordered_content_skip_code(OrderedContentSkipReason::Binary);
+        assert_eq!(binary.as_str(), "BINARY");
+
+        let extractable = ordered_content_skip_code(OrderedContentSkipReason::BinaryExtractable);
+        assert_eq!(extractable.as_str(), "BINARY_EXTRACTABLE");
+    }
+
+    /// Capturing event sink that converts borrowed `CoreEvent`s into owned
+    /// snapshots so tests can assert on structured fields after the call.
+    #[derive(Default)]
+    struct CapturingEventOutput {
+        events: Mutex<Vec<OwnedCoreEvent>>,
+    }
+
+    impl EventOutput for CapturingEventOutput {
+        fn emit_core(&self, event: CoreEvent<'_>) {
+            self.events
+                .lock()
+                .expect("capturing sink lock")
+                .push(OwnedCoreEvent::from_core(event));
+        }
+
+        fn flush(&self) {}
+    }
+
+    impl CapturingEventOutput {
+        fn take(&self) -> Vec<OwnedCoreEvent> {
+            std::mem::take(&mut *self.events.lock().expect("capturing sink lock"))
+        }
+    }
+
+    #[test]
+    fn emit_ordered_summary_emits_summary_event_with_correct_metrics() {
+        let report = ScanReport {
+            items_scanned: 42,
+            bytes_scanned: 10 * 1024 * 1024,
+            chunks_scanned: 100,
+            findings_emitted: 3,
+            errors: 1,
+            scan_ns: 2_000_000_000,
+            ..ScanReport::default()
+        };
+
+        let sink = CapturingEventOutput::default();
+        emit_ordered_summary(&sink, report);
+
+        let events = sink.take();
+        assert_eq!(events.len(), 1, "exactly one summary event expected");
+
+        let OwnedCoreEvent::Summary {
+            source,
+            status,
+            elapsed_ms,
+            bytes_scanned,
+            findings_emitted,
+            errors,
+            throughput_mib_s,
+        } = &events[0]
+        else {
+            panic!("expected Summary event, got: {:?}", events[0]);
+        };
+
+        assert_eq!(*source, SourceKind::Fs);
+        assert_eq!(*status, "ok");
+        // 2_000_000_000 ns = 2000 ms
+        assert_eq!(*elapsed_ms, 2000);
+        assert_eq!(*bytes_scanned, 10 * 1024 * 1024);
+        assert_eq!(*findings_emitted, 3);
+        assert_eq!(*errors, 1);
+        // 10 MiB / 2s = 5.0 MiB/s
+        assert!(
+            (*throughput_mib_s - 5.0).abs() < 0.001,
+            "expected ~5.0 MiB/s, got {throughput_mib_s}"
         );
     }
 }
