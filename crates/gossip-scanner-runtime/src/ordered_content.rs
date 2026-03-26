@@ -1454,6 +1454,11 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
     findings_scratch: &mut Vec<FsFindingRecord>,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
     let item_byte_budget = item_byte_budget(&item, remaining_bytes);
+    // Clone required: `item` is moved into `scan_item_chunks` (which returns it
+    // in the result), but the read closure also needs the `item_ref` on every
+    // `read_range` call. Splitting ownership would require `ScanItem::into_parts`
+    // or taking `item` by reference in `scan_item_chunks` and reconstructing the
+    // result externally.
     let item_ref = item.item_ref().clone();
     Ok(scan_item_chunks(
         engine,
