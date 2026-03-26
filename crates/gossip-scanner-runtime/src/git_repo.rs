@@ -244,6 +244,7 @@ fn git_report_to_scan_report(
 
     ScanReport {
         items_scanned: metrics.objects_scanned,
+        items_deferred: 0,
         bytes_scanned: metrics.bytes_scanned,
         chunks_scanned: metrics.chunks_scanned,
         findings_emitted: metrics.findings_emitted,

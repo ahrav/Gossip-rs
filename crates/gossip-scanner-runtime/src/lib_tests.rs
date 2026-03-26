@@ -1765,3 +1765,99 @@ fn scan_fs_connector_handles_single_file_path() {
 
     assert_eq!(report.items_scanned, 1, "single file produces one item");
 }
+
+#[test]
+fn scan_report_add_assign_accumulates_all_fields() {
+    let a = ScanReport {
+        items_scanned: 10,
+        items_deferred: 1,
+        bytes_scanned: 2000,
+        chunks_scanned: 50,
+        findings_emitted: 3,
+        errors: 1,
+        binary_skipped: 4,
+        ext_skipped: 5,
+        lock_skipped: 6,
+        binary_extracted: 7,
+        dropped_findings: 2,
+        persist_emit_failures: 8,
+        persist_incomplete: false,
+        scan_ns: 100_000,
+        persist_ns: 200_000,
+    };
+    let b = ScanReport {
+        items_scanned: 20,
+        items_deferred: 3,
+        bytes_scanned: 3000,
+        chunks_scanned: 70,
+        findings_emitted: 5,
+        errors: 2,
+        binary_skipped: 10,
+        ext_skipped: 11,
+        lock_skipped: 12,
+        binary_extracted: 13,
+        dropped_findings: 4,
+        persist_emit_failures: 9,
+        persist_incomplete: true,
+        scan_ns: 300_000,
+        persist_ns: 400_000,
+    };
+
+    // false |= true => true
+    let mut result = a;
+    result += b;
+
+    assert_eq!(result.items_scanned, 30);
+    assert_eq!(result.items_deferred, 4);
+    assert_eq!(result.bytes_scanned, 5000);
+    assert_eq!(result.chunks_scanned, 120);
+    assert_eq!(result.findings_emitted, 8);
+    assert_eq!(result.errors, 3);
+    assert_eq!(result.binary_skipped, 14);
+    assert_eq!(result.ext_skipped, 16);
+    assert_eq!(result.lock_skipped, 18);
+    assert_eq!(result.binary_extracted, 20);
+    assert_eq!(result.dropped_findings, 6);
+    assert_eq!(result.persist_emit_failures, 17);
+    assert!(
+        result.persist_incomplete,
+        "any-incomplete flag: false |= true must be true"
+    );
+    assert_eq!(result.scan_ns, 400_000);
+    assert_eq!(result.persist_ns, 600_000);
+
+    // true |= false => true (assignment must use |=, not plain =)
+    let mut lhs_true = ScanReport {
+        persist_incomplete: true,
+        ..ScanReport::default()
+    };
+    lhs_true += ScanReport::default();
+    assert!(
+        lhs_true.persist_incomplete,
+        "any-incomplete flag: true |= false must stay true"
+    );
+
+    // false |= false => false
+    let mut both_complete = a;
+    let a2 = a;
+    both_complete += a2;
+    assert!(
+        !both_complete.persist_incomplete,
+        "any-incomplete flag: false |= false must be false"
+    );
+
+    // saturating addition must not wrap
+    let mut near_max = ScanReport {
+        bytes_scanned: u64::MAX,
+        ..ScanReport::default()
+    };
+    near_max += ScanReport {
+        bytes_scanned: 1,
+        ..ScanReport::default()
+    };
+    assert_eq!(
+        near_max.bytes_scanned,
+        u64::MAX,
+        "saturating_add must clamp at u64::MAX"
+    );
+}

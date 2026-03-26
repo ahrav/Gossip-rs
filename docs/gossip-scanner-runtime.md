@@ -27,14 +27,14 @@ and validation, and Git connector mode uses the direct path.
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, mode-specific dispatchers (`scan_fs_direct`, `scan_fs_connector`, `scan_git_direct`, `scan_git_connector`), and crate-internal `scan_fs_with_runtime`, `scan_git_with_runtime`, `scan_fs_with_prebuilt_engine` |
+| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, mode-specific dispatchers (`scan_fs_direct`, `scan_fs_connector`, `scan_git_direct`, `scan_git_connector`), and crate-internal `scan_fs_with_runtime`, `scan_git_with_runtime` |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
 | `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
-| `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), direct `CoordinationFacade` claim/complete helpers |
+| `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), ordered-content filesystem lease execution, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content page validation, scan-miss execution, and direct local filesystem execution helpers |
@@ -357,9 +357,10 @@ decomposition.
 
 #### `ReceiptCommitSink`
 
-`ReceiptCommitSink` implements the `CommitSink` trait to bridge scan-driver
-item lifecycle callbacks into the receipt-driven commit pipeline. It tracks
-in-flight items in a `BTreeMap<ItemKey, InFlightItem>`:
+`ReceiptCommitSink` bridges runtime item execution into the receipt-driven
+commit pipeline. It supports both the scan-loop `CommitSink` lifecycle and
+direct ordered-content item submission. The scan-loop path tracks in-flight
+items in a `BTreeMap<ItemKey, InFlightItem>`:
 
 - `begin_item` assigns a monotonically increasing sequence number and
   inserts an `InFlightItem` into the in-flight map.
@@ -370,6 +371,12 @@ in-flight items in a `BTreeMap<ItemKey, InFlightItem>`:
   rows, wraps them in a `QueuedCommit`, and submits to the pipeline through
   `CommitPipelineSender`. On translation or submission failure, the item is
   re-inserted into the in-flight map so the caller can retry.
+
+For ordered-content execution, `submit_ordered_item` derives `ItemMeta`,
+translates the `OrderedContentItemOutcome` into the same persistence rows,
+and submits the resulting `QueuedCommit` directly. Both surfaces converge on
+the same bounded commit pipeline, so durable receipt handling and checkpoint
+aggregation stay identical regardless of how the runtime discovered the item.
 
 The sink derives logical timing from sequence numbers (`2n, 2n+1` intervals)
 and uses a weak object-version derived from item-key bytes when the source
@@ -406,8 +413,11 @@ the receipt-driven durability model:
 3. Starts a `CommitPipeline` and splits it into sender and drainer.
 4. Constructs a `ReceiptCommitSink` with the sender handle.
 5. Uses `std::thread::scope` to run scan execution and commit-stage draining
-   concurrently: scan execution calls `scan_fs_with_prebuilt_engine` with
-   the `ReceiptCommitSink`, while a second thread calls
+   concurrently: scan execution instantiates a `FilesystemConnector`,
+   loops through ordered pages (each prefiltered against the done ledger),
+   executes the remaining scan-miss items with the shared engine, emits
+   scheduler-compatible finding and summary events, and submits each ordered
+   item outcome to `ReceiptCommitSink`. A second thread calls
    `drain_commit_stage` with the drainer.
 6. After both threads complete, resolves the scan, submission, and drain
    outcomes in diagnostic order. Scan-runtime failures surface
@@ -466,10 +476,11 @@ runtime:
 - `CliNoOpCommitSink`
 
 Distributed receipt-driven execution implements that surface with
-`ReceiptCommitSink` in `src/distributed.rs`. The adapter accumulates compact
-finding batches, reconstructs the richer translation inputs expected by
-`translate_item_result`, and submits the resulting persistence work to the
-bounded commit pipeline. That translation path computes:
+`ReceiptCommitSink` in `src/distributed.rs`. The adapter accepts either
+compact scan-loop finding batches or direct ordered-content item outcomes,
+reconstructs the richer translation inputs expected by `translate_item_result`,
+and submits the resulting persistence work to the bounded commit pipeline.
+That translation path computes:
 
 - tenant-scoped secret hash (derived from the bridge batch's `norm_hash`)
 - finding ID (using the rule-fingerprint resolver for position-independent rule identity)

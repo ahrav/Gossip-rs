@@ -76,8 +76,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
+use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
-    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId},
     coordination::{RestoredShardState, ShardSpec},
     identity::{
         CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
@@ -93,6 +94,10 @@ use gossip_coordination::{
 use gossip_frontier::decode_connector_extra;
 use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode};
 use scanner_scheduler::store::FsFindingRecord;
+use scanner_scheduler::{
+    events::{CoreEvent, EventOutput, FindingEvent, SummaryEvent},
+    source_kind::SourceKind,
+};
 
 use crate::{
     AssignmentOutcome, CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
@@ -106,8 +111,11 @@ use crate::{
     commit_sink::{CommitSink, FindingsBatch, ItemMeta},
     coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink},
     join_scoped,
+    ordered_content::{
+        OrderedContentExecutionOutcome, OrderedContentItemExecution, OrderedContentItemOutcome,
+        OrderedContentReadStop, OrderedContentRuntime, OrderedContentRuntimeInput,
+    },
     result_translation::{ItemResult, ScanTiming, translate_item_result},
-    scan_fs_with_prebuilt_engine,
 };
 
 /// Immutable worker identity threaded through shard claiming and completion.
@@ -475,18 +483,20 @@ struct InFlightItem {
     findings: Vec<FsFindingRecord>,
 }
 
-/// Compatibility adapter that bridges scan-loop `CommitSink` callbacks into the
+/// Compatibility adapter that bridges runtime item execution into the
 /// receipt-driven commit pipeline.
 ///
-/// # Problem
+/// Supports two submission surfaces:
 ///
-/// The scan scheduler emits compact `ItemMeta` + `FindingRecord` batches via
-/// the `CommitSink` trait. The downstream commit pipeline expects richer
-/// `QueuedCommit` work items containing full persistence translations
-/// (findings, occurrences, observations, done-ledger rows). This adapter
-/// reconstructs those deterministic translations in `finish_item` so
-/// ordered-content execution can produce durable receipts without changing
-/// the scheduler callback surface.
+/// - The legacy scan-loop `CommitSink` lifecycle (`begin_item` /
+///   `upsert_findings` / `finish_item`), and
+/// - direct ordered-content item outcomes submitted through
+///   [`submit_ordered_item`](Self::submit_ordered_item).
+///
+/// Both surfaces converge on `QueuedCommit` work items containing full
+/// persistence translations (findings, occurrences, observations, and
+/// done-ledger rows) so the downstream commit pipeline retains one
+/// receipt-driven durability path.
 ///
 /// # Item lifecycle
 ///
@@ -642,6 +652,98 @@ impl ReceiptCommitSink {
             write_context: self.write_context,
             item_key: item_key.clone(),
         });
+    }
+
+    fn submit_queued_commit(
+        &self,
+        item_key: &ItemKey,
+        sequence_no: u64,
+        work: QueuedCommit,
+    ) -> Result<()> {
+        self.submitter
+            .submit(work)
+            .map_err(|error| anyhow!("execution to commit submission failed: {error}"))?;
+
+        // The commit is in the pipeline. The submitted vec is bookkeeping
+        // for ordering assertions, not the durability path — recover
+        // through a poisoned mutex rather than returning an error that
+        // would mislead the caller into thinking the commit was lost.
+        self.submitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sequence_no);
+
+        self.record_finish(item_key);
+        Ok(())
+    }
+
+    fn ordered_item_meta(execution: &OrderedContentItemExecution) -> ItemMeta {
+        let item = execution.item();
+        ItemMeta {
+            stable_item_id: item.stable_item_id(),
+            version: Some(item.version()),
+            size_hint: item.size_hint(),
+        }
+    }
+
+    fn translate_ordered_item(
+        &self,
+        sequence_no: u64,
+        execution: &OrderedContentItemExecution,
+    ) -> Result<QueuedCommit> {
+        let item = execution.item();
+        let timing = Self::logical_timing_for(sequence_no)?;
+        let checkpoint_cursor = Cursor::with_last_key(item.item_key().clone());
+        let result = match execution.outcome() {
+            OrderedContentItemOutcome::Scanned { findings } => ItemResult::Scanned { findings },
+            OrderedContentItemOutcome::Truncated { .. } => ItemResult::FailedRetryable {
+                error_code: OrderedContentReadStop::truncation_code(),
+            },
+            OrderedContentItemOutcome::Failed(stop) => {
+                let error_code = OrderedContentReadStop::failure_code();
+                if stop.class().is_retryable() {
+                    ItemResult::FailedRetryable { error_code }
+                } else {
+                    ItemResult::FailedPermanent { error_code }
+                }
+            }
+            OrderedContentItemOutcome::Skipped(reason) => ItemResult::Skipped {
+                error_code: reason.done_ledger_code(),
+            },
+        };
+        let translation = translate_item_result(
+            self.write_context,
+            &self.tenant_secret_key,
+            item,
+            execution.report().bytes_scanned,
+            timing,
+            result,
+            &*self.rule_fingerprint,
+        )?;
+
+        Ok(QueuedCommit::new(
+            self.write_context,
+            CompletedUnit::ordered_content(sequence_no, checkpoint_cursor),
+            translation,
+        ))
+    }
+
+    fn submit_ordered_item(&self, execution: &OrderedContentItemExecution) -> Result<()> {
+        let item_key = execution.item().item_key().clone();
+        let meta = Self::ordered_item_meta(execution);
+        // Sequence gap on translation failure is tolerated — the shard terminates
+        // on error, so the gap never reaches wait_for_submitted_commits.
+        let sequence_no = self.next_sequence_no();
+
+        self.record_begin(&item_key, &meta);
+        let work = match self.translate_ordered_item(sequence_no, execution) {
+            Ok(work) => work,
+            Err(error) => {
+                self.record_finish(&item_key);
+                return Err(error);
+            }
+        };
+        self.submit_queued_commit(&item_key, sequence_no, work)
     }
 
     /// Reconstruct the deterministic translation inputs from an in-flight
@@ -808,25 +910,57 @@ impl CommitSink for ReceiptCommitSink {
             }
         };
 
-        if let Err(error) = self.submitter.submit(work) {
+        if let Err(error) = self.submit_queued_commit(&removed_key, sequence_no, work) {
             self.rollback_in_flight(removed_key, item);
-            return Err(anyhow::anyhow!(
-                "execution to commit submission failed: {error}"
-            ));
+            return Err(error);
         }
 
-        // The commit is in the pipeline. The submitted vec is bookkeeping
-        // for ordering assertions, not the durability path — recover
-        // through a poisoned mutex rather than returning an error that
-        // would mislead the caller into thinking the commit was lost.
-        self.submitted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(sequence_no);
-
-        self.record_finish(item_key);
         Ok(())
     }
+}
+
+fn emit_ordered_item_findings(
+    out: &dyn EventOutput,
+    engine: &scanner_engine::Engine,
+    execution: &OrderedContentItemExecution,
+) {
+    let OrderedContentItemOutcome::Scanned { findings } = execution.outcome() else {
+        return;
+    };
+
+    for finding in findings {
+        out.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: execution.item().item_key().as_bytes(),
+            start: finding.root_hint_start,
+            end: finding.root_hint_end,
+            rule_id: finding.rule_id,
+            rule_name: engine.rule_name(finding.rule_id),
+            commit_id: None,
+            change_kind: None,
+            confidence_score: finding.confidence_score,
+        }));
+    }
+}
+
+fn emit_ordered_summary(out: &dyn EventOutput, report: ScanReport) {
+    let elapsed_ms = report.scan_ns / 1_000_000;
+    let throughput_mib_s = if report.scan_ns == 0 {
+        0.0
+    } else {
+        (report.bytes_scanned as f64 / (1024.0 * 1024.0))
+            / (report.scan_ns as f64 / 1_000_000_000.0)
+    };
+    out.emit_core(CoreEvent::Summary(SummaryEvent {
+        source: SourceKind::Fs,
+        status: if report.errors == 0 { "ok" } else { "error" },
+        elapsed_ms,
+        bytes_scanned: report.bytes_scanned,
+        findings_emitted: report.findings_emitted,
+        errors: report.errors,
+        throughput_mib_s,
+    }));
+    out.flush();
 }
 
 /// Accumulated state from draining the commit-stage outcome stream.
@@ -1288,6 +1422,141 @@ where
     Ok(())
 }
 
+fn scan_ordered_filesystem_lease_with_engine<D>(
+    lease: &ShardLease,
+    config: &FsScanConfig,
+    done_ledger: &D,
+    engine: Arc<scanner_engine::Engine>,
+    out: &dyn EventOutput,
+    commit: &ReceiptCommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError>
+where
+    D: DoneLedger,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
+    let mut source = FilesystemConnector::new(config.path.clone());
+    let shard_spec = lease.restored_state().shard_spec().clone();
+    let cursor_semantics = lease.restored_state().cursor_semantics();
+    let mut restored_state = lease.restored_state().clone();
+    let mut report = ScanReport::default();
+    let mut executed_any_page = false;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        let runtime_input = OrderedContentRuntimeInput::new(restored_state.clone(), budgets);
+        let page = match OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
+            OrderedContentExecutionOutcome::Finished => break,
+            OrderedContentExecutionOutcome::Stopped(stop) => {
+                if stop.class().is_retryable() {
+                    // Retryable enumerate failure — preserve partial progress
+                    // by breaking instead of returning an error. The shard is
+                    // completed with a checkpoint at the last committed item,
+                    // and the next claim resumes from there.
+                    tracing::warn!(
+                        message = stop.message(),
+                        retry_after_ms = stop.retry_after_ms(),
+                        "retryable enumerate stop, preserving partial progress",
+                    );
+                    break;
+                }
+                return Err(ScanRuntimeError::Driver(anyhow!("{stop}")));
+            }
+            OrderedContentExecutionOutcome::Page(page) => page,
+        };
+
+        let page = page.prefilter_done_ledger(lease.write_context(), done_ledger)?;
+        let execution = OrderedContentRuntime::execute_scan_misses_with_prebuilt_engine(
+            &mut source,
+            page,
+            config.budgets,
+            config.scan_binary,
+            Arc::clone(&engine),
+        )?;
+        executed_any_page = true;
+
+        // Determine the earliest deferred key so we can stop submitting
+        // before the checkpoint advances past a budget-deferred item.
+        let min_deferred_key = execution
+            .deferred()
+            .iter()
+            .map(|item| item.item_key())
+            .min();
+
+        let mut hit_non_terminal = false;
+        let mut submitted_report = ScanReport::default();
+        let mut items_submitted: u64 = 0;
+        for item in execution.outcomes() {
+            // A deferred item with a key before this outcome means the
+            // checkpoint would skip past the deferred item if we commit
+            // this outcome. Stop here so the checkpoint stays before the
+            // deferred item's key position.
+            if let Some(dk) = min_deferred_key
+                && dk < item.item().item_key()
+            {
+                hit_non_terminal = true;
+                break;
+            }
+            // Retryable outcomes (truncated / transient-failure) must not
+            // advance the checkpoint — they need to be re-scanned.
+            if item.outcome().is_retryable() {
+                hit_non_terminal = true;
+                break;
+            }
+            commit
+                .submit_ordered_item(item)
+                .map_err(ScanRuntimeError::Driver)?;
+            emit_ordered_item_findings(out, &engine, item);
+            submitted_report += item.report();
+            items_submitted += 1;
+        }
+
+        // Build the page report from only submitted items so that
+        // findings_emitted and other counters reflect what was actually
+        // sent to the event stream. Items past the non-terminal break
+        // point will be re-scanned on the next claim.
+        submitted_report.items_scanned = execution.already_done_len() as u64 + items_submitted;
+        submitted_report.items_deferred = execution.deferred().len() as u64;
+        report += submitted_report;
+
+        // When non-terminal items (retryable or deferred) exist on this
+        // page, stop scanning additional pages. The checkpoint will only
+        // cover items committed before the non-terminal boundary. On the
+        // next shard claim, the page listing resumes from the checkpoint
+        // and re-lists the non-terminal items for retry. Deferred items
+        // may land on a separate page from subsequent outcomes (the page
+        // byte budget can split them), so check deferred() even when the
+        // outcomes loop ran to completion.
+        if hit_non_terminal || !execution.deferred().is_empty() {
+            break;
+        }
+
+        if matches!(execution.page_state(), PageState::Complete) {
+            break;
+        }
+
+        restored_state = RestoredShardState::new(
+            shard_spec.clone(),
+            execution.resume_cursor().clone(),
+            cursor_semantics,
+        );
+    }
+
+    if executed_any_page {
+        emit_ordered_summary(out, report);
+    }
+
+    Ok(AssignmentOutcome {
+        report,
+        checkpoint_hint: None,
+        debug_output: None,
+    })
+}
+
 /// Execute one filesystem lease under the receipt-driven durability model.
 ///
 /// This is the per-shard work function called by [`run_worker`]. It
@@ -1296,8 +1565,9 @@ where
 /// 1. **Setup**: validates budgets, builds the scan engine, creates the
 ///    commit pipeline and `ReceiptCommitSink`.
 /// 2. **Concurrent execution**: spawns a scoped thread to drain the commit
-///    pipeline's outcome stream while the main thread runs the filesystem
-///    scan through `scan_fs_with_prebuilt_engine`.
+///    pipeline's outcome stream while the main thread executes bounded
+///    ordered-content pages through the filesystem connector runtime until
+///    the shard is exhausted.
 /// 3. **Post-scan verification**: checks that every submitted sequence
 ///    number produced exactly one durable outcome (via
 ///    [`wait_for_submitted_commits`]).
@@ -1388,7 +1658,15 @@ where
         let stage_handle =
             scope.spawn(move || drain_commit_stage(drainer, write_context, max_buffered));
 
-        let outcome = scan_fs_with_prebuilt_engine(&scan_config, engine, &sink, &commit, &cancel);
+        let outcome = scan_ordered_filesystem_lease_with_engine(
+            lease,
+            &scan_config,
+            &persistence.done_ledger,
+            engine,
+            &sink,
+            &commit,
+            &cancel,
+        );
         let submitted = commit.finish();
         let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread");
 
@@ -1593,6 +1871,7 @@ mod tests {
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
         coordination_sink::{CommitProgressRecord, StoredGitEvent},
+        ordered_content::OrderedContentSkipReason,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1720,6 +1999,10 @@ mod tests {
         "ordinary sample text for scanner tests"
     }
 
+    fn binary_fixture() -> [u8; 8] {
+        [0x7F, b'E', b'L', b'F', 0, 1, 2, 3]
+    }
+
     fn setup_coordinator_with_connector_extra(
         connector_extra: &[Vec<u8>],
         lease_duration_ms: u64,
@@ -1756,17 +2039,6 @@ mod tests {
             .expect("register shards");
 
         coordinator
-    }
-
-    fn setup_coordinator(
-        paths: &[&Path],
-        lease_duration_ms: u64,
-    ) -> CoordinationInMemoryCoordinator {
-        let connector_extra: Vec<Vec<u8>> = paths
-            .iter()
-            .map(|path| filesystem_payload(path, FilesystemSourceMode::DirectoryRoot))
-            .collect();
-        setup_coordinator_with_connector_extra(&connector_extra, lease_duration_ms)
     }
 
     fn setup_coordinator_with_ranges(
@@ -1929,7 +2201,8 @@ mod tests {
     #[test]
     fn shard_lease_preserves_claimed_coordination_metadata() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
 
@@ -2792,7 +3065,13 @@ mod tests {
     #[test]
     fn build_lease_from_acquire_hydrates_directory_root_payload() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator = setup_coordinator_with_connector_extra(
+            &[filesystem_payload(
+                dir.path(),
+                FilesystemSourceMode::DirectoryRoot,
+            )],
+            30_000,
+        );
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let canonical_dir = dir.path().canonicalize().expect("canonicalize directory");
@@ -2941,7 +3220,8 @@ mod tests {
     #[test]
     fn complete_shard_without_checkpoint_uses_range_start_under_completed_semantics() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
 
@@ -3052,7 +3332,8 @@ mod tests {
     #[test]
     fn run_filesystem_lease_zero_item_shard_returns_no_checkpoint() {
         let dir = tempdir().expect("tempdir");
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let done_ledger = InMemoryDoneLedger::new();
@@ -3078,11 +3359,114 @@ mod tests {
     }
 
     #[test]
+    fn run_filesystem_lease_processes_all_pages_under_ordered_item_budget() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("a-secret.txt"), secret_fixture()).expect("write fixture a");
+        fs::write(dir.path().join("b-secret.txt"), secret_fixture()).expect("write fixture b");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig {
+                budgets: ScanBudgets {
+                    max_items: 1,
+                    max_bytes: 1_000_000,
+                },
+                ..DistributedRuntimeConfig::default()
+            },
+        )
+        .expect("budgeted filesystem lease should succeed");
+
+        assert_eq!(
+            report.items_scanned, 2,
+            "ordered-content lease should keep paging until the shard is exhausted"
+        );
+        let checkpoint = checkpoint.expect("final committed item should produce a checkpoint");
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"b-secret.txt"
+        );
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both ordered items should commit across pages"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.status() == DoneLedgerStatus::ScannedWithFindings),
+            "each secret fixture should produce a findings-bearing done-ledger row"
+        );
+        assert!(
+            !findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "the committed ordered items should still emit durable findings"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_binary_skip_produces_skipped_done_ledger_row() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("sample.bin"), binary_fixture()).expect("write binary fixture");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+
+        let (report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("binary filesystem lease should succeed");
+
+        assert_eq!(report.binary_skipped, 1);
+        let checkpoint = checkpoint.expect("skipped item should still produce a checkpoint");
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"sample.bin"
+        );
+        assert!(
+            findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "binary skip should not emit findings observations"
+        );
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status(), DoneLedgerStatus::Skipped);
+    }
+
+    #[test]
     fn run_filesystem_lease_clean_only_shard_produces_checkpoint_and_done_ledger_entry() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("readme.txt"), clean_fixture()).expect("write clean fixture");
 
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();
@@ -3123,7 +3507,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
 
-        let mut coordinator = setup_coordinator(&[dir.path()], 30_000);
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let findings_sink = InMemoryFindingsSink::new();
@@ -3666,6 +4051,169 @@ mod tests {
         assert!(
             matches!(err, DistributedRuntimeError::Coordinator(_)),
             "expected Coordinator error variant, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_content_error_codes_are_valid_and_match_expected_values() {
+        let failure = OrderedContentReadStop::failure_code();
+        assert_eq!(failure.as_str(), "READ_FAILED");
+
+        let truncation = OrderedContentReadStop::truncation_code();
+        assert_eq!(truncation.as_str(), "TRUNCATED");
+
+        let binary = OrderedContentSkipReason::Binary.done_ledger_code();
+        assert_eq!(binary.as_str(), "BINARY");
+
+        let extractable = OrderedContentSkipReason::BinaryExtractable.done_ledger_code();
+        assert_eq!(extractable.as_str(), "BINARY_EXTRACTABLE");
+    }
+
+    /// Capturing event sink that converts borrowed `CoreEvent`s into owned
+    /// snapshots so tests can assert on structured fields after the call.
+    #[derive(Default)]
+    struct CapturingEventOutput {
+        events: Mutex<Vec<OwnedCoreEvent>>,
+    }
+
+    impl EventOutput for CapturingEventOutput {
+        fn emit_core(&self, event: CoreEvent<'_>) {
+            self.events
+                .lock()
+                .expect("capturing sink lock")
+                .push(OwnedCoreEvent::from_core(event));
+        }
+
+        fn flush(&self) {}
+    }
+
+    impl CapturingEventOutput {
+        fn take(&self) -> Vec<OwnedCoreEvent> {
+            std::mem::take(&mut *self.events.lock().expect("capturing sink lock"))
+        }
+    }
+
+    #[test]
+    fn emit_ordered_summary_emits_summary_event_with_correct_metrics() {
+        let report = ScanReport {
+            items_scanned: 42,
+            bytes_scanned: 10 * 1024 * 1024,
+            chunks_scanned: 100,
+            findings_emitted: 3,
+            errors: 1,
+            scan_ns: 2_000_000_000,
+            ..ScanReport::default()
+        };
+
+        let sink = CapturingEventOutput::default();
+        emit_ordered_summary(&sink, report);
+
+        let events = sink.take();
+        assert_eq!(events.len(), 1, "exactly one summary event expected");
+
+        let OwnedCoreEvent::Summary {
+            source,
+            status,
+            elapsed_ms,
+            bytes_scanned,
+            findings_emitted,
+            errors,
+            throughput_mib_s,
+        } = &events[0]
+        else {
+            panic!("expected Summary event, got: {:?}", events[0]);
+        };
+
+        assert_eq!(*source, SourceKind::Fs);
+        assert_eq!(
+            *status, "error",
+            "non-zero errors must produce status=error"
+        );
+        // 2_000_000_000 ns = 2000 ms
+        assert_eq!(*elapsed_ms, 2000);
+        assert_eq!(*bytes_scanned, 10 * 1024 * 1024);
+        assert_eq!(*findings_emitted, 3);
+        assert_eq!(*errors, 1);
+        // 10 MiB / 2s = 5.0 MiB/s
+        assert!(
+            (*throughput_mib_s - 5.0).abs() < 0.001,
+            "expected ~5.0 MiB/s, got {throughput_mib_s}"
+        );
+    }
+
+    #[test]
+    fn emit_ordered_summary_reports_ok_when_no_errors() {
+        let report = ScanReport {
+            items_scanned: 10,
+            bytes_scanned: 500,
+            errors: 0,
+            scan_ns: 1_000_000,
+            ..ScanReport::default()
+        };
+
+        let sink = CapturingEventOutput::default();
+        emit_ordered_summary(&sink, report);
+
+        let events = sink.take();
+        let OwnedCoreEvent::Summary { status, .. } = &events[0] else {
+            panic!("expected Summary event");
+        };
+        assert_eq!(*status, "ok", "zero errors must produce status=ok");
+    }
+
+    /// Deferred items (too large for the byte budget) must not advance the
+    /// checkpoint past their key positions. If they did, the next shard claim
+    /// would start after the deferred key and permanently lose the item.
+    #[test]
+    fn run_filesystem_lease_stops_checkpoint_before_deferred_item() {
+        let dir = tempdir().expect("tempdir");
+        // a-small.txt will be admitted (key order: first)
+        fs::write(dir.path().join("a-small.txt"), clean_fixture()).expect("write a");
+        // b-large.txt exceeds the byte budget and will be deferred
+        fs::write(dir.path().join("b-large.txt"), vec![b'x'; 100_000]).expect("write b");
+        // c-small.txt is admitted but comes after b-large.txt in key order
+        fs::write(dir.path().join("c-small.txt"), clean_fixture()).expect("write c");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+
+        let (_report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig {
+                budgets: ScanBudgets {
+                    max_items: 100,
+                    // b-large.txt (100 KB) exceeds this budget, triggering deferral.
+                    max_bytes: 1_000,
+                },
+                ..DistributedRuntimeConfig::default()
+            },
+        )
+        .expect("lease with deferred item should succeed");
+
+        let checkpoint =
+            checkpoint.expect("at least one terminal item was committed before the deferral");
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"a-small.txt",
+            "checkpoint must not advance past the deferred item (b-large.txt)"
+        );
+
+        // Only a-small.txt should have a done-ledger entry.
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only items committed before the deferred boundary get done-ledger entries"
         );
     }
 }

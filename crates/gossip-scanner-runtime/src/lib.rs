@@ -581,6 +581,9 @@ impl GitScanConfig {
 pub struct ScanReport {
     /// Total items (files / blobs) processed.
     pub items_scanned: u64,
+    /// Items deferred by the skip-ahead admission check because they
+    /// exceeded the remaining runtime byte budget.
+    pub items_deferred: u64,
     /// Total payload bytes scanned.
     pub bytes_scanned: u64,
     /// Total chunk windows scanned across all items.
@@ -613,6 +616,7 @@ impl std::ops::AddAssign for ScanReport {
     #[allow(clippy::suspicious_op_assign_impl)] // |= for persist_incomplete is intentional (any-incomplete flag)
     fn add_assign(&mut self, rhs: Self) {
         self.items_scanned = self.items_scanned.saturating_add(rhs.items_scanned);
+        self.items_deferred = self.items_deferred.saturating_add(rhs.items_deferred);
         self.bytes_scanned = self.bytes_scanned.saturating_add(rhs.bytes_scanned);
         self.chunks_scanned = self.chunks_scanned.saturating_add(rhs.chunks_scanned);
         self.findings_emitted = self.findings_emitted.saturating_add(rhs.findings_emitted);
@@ -828,29 +832,6 @@ pub(crate) fn scan_fs_with_runtime(
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     ordered_content::scan_local_filesystem(config, canonical_path, out, commit, cancel)
-}
-
-/// Internal filesystem entrypoint that reuses a caller-provided detection
-/// engine.
-///
-/// Distributed scans use this to share one engine instance between file
-/// scanning and rule-fingerprint lookup for receipt-driven commit translation.
-pub(crate) fn scan_fs_with_prebuilt_engine(
-    config: &FsScanConfig,
-    engine: Arc<scanner_engine::Engine>,
-    out: &dyn EventOutput,
-    commit: &dyn commit_sink::CommitSink,
-    cancel: &CancellationToken,
-) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    let canonical_path = validate_fs_path(&config.path)?;
-    ordered_content::scan_local_filesystem_with_engine(
-        config,
-        canonical_path,
-        engine,
-        out,
-        commit,
-        cancel,
-    )
 }
 
 /// Internal Git entrypoint that accepts a caller-provided event sink.

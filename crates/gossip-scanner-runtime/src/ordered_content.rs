@@ -79,8 +79,8 @@ use gossip_contracts::{
     },
     coordination::{CursorSemantics, RestoredShardState, ShardSpec},
     persistence::{
-        DoneLedger, DoneLedgerStatus, OvidHashInputs, RECOMMENDED_MAX_BATCH_SIZE, WriteContext,
-        derive_ovid_hash,
+        DoneLedger, DoneLedgerErrorCode, DoneLedgerStatus, OvidHashInputs,
+        RECOMMENDED_MAX_BATCH_SIZE, WriteContext, derive_ovid_hash,
     },
 };
 use scanner_engine::content_policy::{CHECK_LEN, ContentVerdict, classify_content};
@@ -652,6 +652,16 @@ impl OrderedContentReadStop {
     pub fn retry_after_ms(&self) -> Option<u64> {
         self.retry_after_ms
     }
+
+    /// Done-ledger error code for read failures.
+    pub fn failure_code() -> DoneLedgerErrorCode {
+        DoneLedgerErrorCode::try_new("READ_FAILED").expect("hardcoded read-failure error code")
+    }
+
+    /// Done-ledger error code for budget-truncated items.
+    pub fn truncation_code() -> DoneLedgerErrorCode {
+        DoneLedgerErrorCode::try_new("TRUNCATED").expect("hardcoded truncation error code")
+    }
 }
 
 impl std::fmt::Display for OrderedContentReadStop {
@@ -685,6 +695,17 @@ pub enum OrderedContentSkipReason {
     BinaryExtractable,
 }
 
+impl OrderedContentSkipReason {
+    /// Done-ledger error code for this skip reason.
+    pub fn done_ledger_code(&self) -> DoneLedgerErrorCode {
+        let code = match self {
+            Self::Binary => "BINARY",
+            Self::BinaryExtractable => "BINARY_EXTRACTABLE",
+        };
+        DoneLedgerErrorCode::try_new(code).expect("hardcoded skip error code")
+    }
+}
+
 /// Non-durable outcome for one ordered-content item execution attempt.
 ///
 /// Each `ScanMiss` admitted for execution produces exactly one of these
@@ -711,6 +732,23 @@ pub enum OrderedContentItemOutcome {
     Failed(OrderedContentReadStop),
     /// The runtime intentionally skipped this item without treating it as an error.
     Skipped(OrderedContentSkipReason),
+}
+
+impl OrderedContentItemOutcome {
+    /// Whether this outcome represents a non-terminal condition.
+    ///
+    /// Retryable outcomes must not advance the checkpoint cursor because the
+    /// item needs to be re-scanned on the next shard claim. The checkpoint
+    /// aggregator uses strictly-greater-than cursor semantics, so advancing
+    /// past a retryable item makes it permanently unreachable.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Truncated { .. } => true,
+            Self::Failed(stop) => stop.class().is_retryable(),
+            Self::Scanned { .. } | Self::Skipped(_) => false,
+        }
+    }
 }
 
 /// One executed ordered-content item plus its runtime-local scan report.
@@ -851,6 +889,19 @@ impl OrderedContentScanMissExecution {
     pub fn resume_cursor(&self) -> &Cursor {
         &self.resume_cursor
     }
+
+    /// Aggregate report including already-done items and executed outcomes.
+    ///
+    /// Overrides `items_scanned` to count both already-done items (skipped by
+    /// the done-ledger prefilter) and executed outcomes. The execution report's
+    /// own `items_scanned` only counts items that were opened/read/scanned.
+    #[must_use]
+    pub fn assignment_report(&self) -> ScanReport {
+        let mut report = self.execution_report();
+        report.items_scanned = self.already_done_len() as u64 + self.outcomes().len() as u64;
+        report.items_deferred = self.deferred().len() as u64;
+        report
+    }
 }
 
 /// Marker type for the ordered-content (filesystem) source family.
@@ -933,11 +984,31 @@ impl OrderedContentRuntime {
             config.decode_depth,
             config.anchor_mode,
         )?;
-        Self::execute_scan_misses_with_engine(
+        Self::execute_scan_misses_with_prebuilt_engine(
             source,
             page,
             config.budgets,
             config.scan_binary,
+            engine,
+        )
+    }
+
+    /// Execute one prefiltered page's `ScanMiss` items with a caller-supplied engine.
+    ///
+    /// Uses the runtime's default chunk size so callers can reuse a prebuilt
+    /// engine without also choosing scan-buffer sizing.
+    pub(crate) fn execute_scan_misses_with_prebuilt_engine<S: OrderedContentSource>(
+        source: &mut S,
+        page: OrderedContentPrefilteredPage,
+        budgets: ScanBudgets,
+        scan_binary: bool,
+        engine: Arc<scanner_engine::Engine>,
+    ) -> Result<OrderedContentScanMissExecution, ScanRuntimeError> {
+        Self::execute_scan_misses_with_engine(
+            source,
+            page,
+            budgets,
+            scan_binary,
             engine,
             DEFAULT_ORDERED_CHUNK_SIZE,
         )
@@ -986,7 +1057,7 @@ impl OrderedContentRuntime {
     /// open/read failures are recorded as
     /// [`OrderedContentItemOutcome::Failed`] entries so page execution can
     /// continue in order.
-    pub fn execute_scan_misses_with_engine<S: OrderedContentSource>(
+    pub(crate) fn execute_scan_misses_with_engine<S: OrderedContentSource>(
         source: &mut S,
         page: OrderedContentPrefilteredPage,
         budgets: ScanBudgets,
@@ -1007,6 +1078,7 @@ impl OrderedContentRuntime {
             <scanner_engine::Engine as ScanEngine>::max_findings_per_chunk(&engine),
         );
         let mut scan_metrics = WorkerMetricsLocal::new();
+        let mut findings_scratch: Vec<FsFindingRecord> = Vec::new();
 
         let (classified, page_state, page_report, resume_cursor) = page.into_parts();
         let mut outcomes = Vec::new();
@@ -1067,6 +1139,7 @@ impl OrderedContentRuntime {
                             &mut scan_scratch,
                             &mut scan_pending,
                             &mut scan_metrics,
+                            &mut findings_scratch,
                         )?
                     } else {
                         execute_item_via_open(
@@ -1081,6 +1154,7 @@ impl OrderedContentRuntime {
                             &mut scan_scratch,
                             &mut scan_pending,
                             &mut scan_metrics,
+                            &mut findings_scratch,
                         )?
                     };
 
@@ -1236,12 +1310,13 @@ fn scan_item_chunks(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
+    findings_scratch: &mut Vec<FsFindingRecord>,
     mut read_next: impl FnMut(u64, &mut [u8], u64) -> Result<usize, OrderedContentReadStop>,
 ) -> OrderedContentItemResult {
     let overlap = <scanner_engine::Engine as ScanEngine>::required_overlap(engine);
     pending.clear();
     *metrics = WorkerMetricsLocal::new();
-    let mut findings = Vec::new();
+    findings_scratch.clear();
     let started_at = Instant::now();
     let mut connector_bytes_consumed = 0u64;
     let mut offset = 0u64;
@@ -1266,9 +1341,13 @@ fn scan_item_chunks(
                 Ok(_) | Err(_) => false,
             };
             if eof {
-                break OrderedContentItemOutcome::Scanned { findings };
+                break OrderedContentItemOutcome::Scanned {
+                    findings: std::mem::take(findings_scratch),
+                };
             }
-            break OrderedContentItemOutcome::Truncated { findings };
+            break OrderedContentItemOutcome::Truncated {
+                findings: std::mem::take(findings_scratch),
+            };
         }
         let read_max = chunk_size
             .min(buf.len().saturating_sub(carry))
@@ -1276,7 +1355,9 @@ fn scan_item_chunks(
         if read_max == 0 {
             // Buffer too small to make progress; unreachable after the
             // chunk_size > 0 guard, but safe to treat as truncated.
-            break OrderedContentItemOutcome::Truncated { findings };
+            break OrderedContentItemOutcome::Truncated {
+                findings: std::mem::take(findings_scratch),
+            };
         }
 
         let n = match read_next(
@@ -1288,7 +1369,9 @@ fn scan_item_chunks(
             Err(stop) => break OrderedContentItemOutcome::Failed(stop),
         };
         if n == 0 {
-            break OrderedContentItemOutcome::Scanned { findings };
+            break OrderedContentItemOutcome::Scanned {
+                findings: std::mem::take(findings_scratch),
+            };
         }
 
         connector_bytes_consumed = connector_bytes_consumed.saturating_add(n as u64);
@@ -1340,7 +1423,7 @@ fn scan_item_chunks(
             &buf[..total_len],
             metrics,
         );
-        append_findings(pending, &mut findings);
+        append_findings(pending, findings_scratch);
 
         offset = offset.saturating_add(n as u64);
         have = total_len;
@@ -1349,8 +1432,11 @@ fn scan_item_chunks(
 
     let wall_clock_scan_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let (findings_emitted, errors, binary_skipped) = match &outcome {
-        OrderedContentItemOutcome::Scanned { findings }
-        | OrderedContentItemOutcome::Truncated { findings } => (findings.len() as u64, 0, 0),
+        OrderedContentItemOutcome::Scanned { findings } => (findings.len() as u64, 0, 0),
+        // Truncated items are retryable — their prefix findings are not emitted
+        // or persisted, so counting them would inflate the summary relative to
+        // the actual event stream.
+        OrderedContentItemOutcome::Truncated { .. } => (0, 0, 0),
         OrderedContentItemOutcome::Failed(_stop) => (0, 1, 0),
         OrderedContentItemOutcome::Skipped(
             OrderedContentSkipReason::Binary | OrderedContentSkipReason::BinaryExtractable,
@@ -1386,8 +1472,14 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
+    findings_scratch: &mut Vec<FsFindingRecord>,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
     let item_byte_budget = item_byte_budget(&item, remaining_bytes);
+    // Clone required: `item` is moved into `scan_item_chunks` (which returns it
+    // in the result), but the read closure also needs the `item_ref` on every
+    // `read_range` call. Splitting ownership would require `ScanItem::into_parts`
+    // or taking `item` by reference in `scan_item_chunks` and reconstructing the
+    // result externally.
     let item_ref = item.item_ref().clone();
     Ok(scan_item_chunks(
         engine,
@@ -1400,6 +1492,7 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
+        findings_scratch,
         move |offset, dst, remaining_item_bytes| {
             let budgets = connector_read_budgets(remaining_item_bytes).map_err(|error| {
                 OrderedContentReadStop {
@@ -1436,6 +1529,7 @@ fn execute_item_via_open<S: OrderedContentSource>(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
+    findings_scratch: &mut Vec<FsFindingRecord>,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
     let item_byte_budget = item_byte_budget(&item, remaining_bytes);
     // Open the reader with one byte of headroom beyond the scan budget so the
@@ -1469,6 +1563,7 @@ fn execute_item_via_open<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
+        findings_scratch,
         // Sequential io::Read — offset tracking is implicit, no seek support.
         // The byte budget is enforced by scan_item_chunks, which sizes each
         // read slice to the remaining item budget.
@@ -1555,8 +1650,8 @@ pub(crate) fn scan_local_filesystem(
 /// Run a parallel filesystem scan against a local directory or single file
 /// using a caller-provided detection engine.
 ///
-/// Distributed execution uses this to share one engine instance between the
-/// scan workers and the receipt commit sink's rule-fingerprint lookup.
+/// Reuses a prebuilt engine instance, avoiding redundant rule compilation for
+/// the local filesystem scan path.
 ///
 /// Returns early with a default (zero-count) report if cancellation has
 /// already been requested. Otherwise spawns two scoped forwarder threads
@@ -1641,6 +1736,7 @@ pub(crate) fn scan_local_filesystem_with_engine(
 
         Ok(ScanReport {
             items_scanned: report.stats.files_enqueued,
+            items_deferred: 0,
             bytes_scanned: report.metrics.bytes_scanned,
             chunks_scanned: report.metrics.chunks_scanned,
             findings_emitted: report.metrics.findings_emitted,
@@ -2588,6 +2684,39 @@ mod tests {
     }
 
     #[test]
+    fn execute_scan_misses_skips_binary_extractable_items() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::default();
+        // NUL-free content with .ipynb extension triggers BinaryExtractable
+        // in the content classifier (extractable extension, no NUL bytes).
+        source.insert(b"notebook.ipynb", b"{}");
+        let page = prefiltered_page(
+            vec![(
+                item(b"notebook.ipynb", 2),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_scan_binary(false)
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1);
+        assert_eq!(
+            execution.outcomes()[0].outcome(),
+            &OrderedContentItemOutcome::Skipped(OrderedContentSkipReason::BinaryExtractable)
+        );
+        assert_eq!(execution.execution_report().binary_skipped, 1);
+    }
+
+    #[test]
     fn execute_scan_misses_admits_items_without_size_hint() {
         let rules = write_runtime_rules();
         let mut source = ContentSource::with_range_read();
@@ -2854,6 +2983,130 @@ mod tests {
         assert!(
             execution.execution_report().chunks_scanned >= 2,
             "content should span at least 2 chunks with chunk_size=32"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_rejects_zero_max_items() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"aaa");
+        let page = prefiltered_page(
+            vec![(
+                item(b"a.txt", 3),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 0,
+                max_bytes: 1_024,
+            });
+
+        let err = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect_err("zero max_items must be rejected");
+
+        assert!(
+            matches!(err, ScanRuntimeError::ConnectorInput(_)),
+            "expected ConnectorInput variant, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("max_items"),
+            "error should name the invalid field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_rejects_zero_max_bytes() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"aaa");
+        let page = prefiltered_page(
+            vec![(
+                item(b"a.txt", 3),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 0,
+            });
+
+        let err = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect_err("zero max_bytes must be rejected");
+
+        assert!(
+            matches!(err, ScanRuntimeError::ConnectorInput(_)),
+            "expected ConnectorInput variant, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("max_bytes"),
+            "error should name the invalid field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_byte_budget_exhaustion_defers_after_consumption() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"0123456789"); // 10 bytes of content
+        source.insert(b"b.txt", b"01234"); // 5 bytes of content
+        let page = prefiltered_page(
+            vec![
+                (
+                    item(b"a.txt", 10),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"b.txt", 5),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        // Budget: 12 bytes total, 8 items.
+        // A consumes 10 bytes -> remaining = 2. B's size_hint(5) > 2 -> deferred.
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 12,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(
+            execution.outcomes().len(),
+            1,
+            "only item A should be scanned"
+        );
+        assert_eq!(
+            execution.outcomes()[0].item().item_key().as_bytes(),
+            b"a.txt",
+            "scanned item must be A"
+        );
+        assert!(
+            matches!(
+                execution.outcomes()[0].outcome(),
+                OrderedContentItemOutcome::Scanned { .. }
+            ),
+            "A should have a Scanned outcome"
+        );
+        assert_eq!(
+            execution.deferred().len(),
+            1,
+            "item B should be deferred because its hint exceeds remaining bytes"
+        );
+        assert_eq!(
+            execution.deferred()[0].item_key().as_bytes(),
+            b"b.txt",
+            "deferred item must be B"
         );
     }
 
@@ -3411,5 +3664,157 @@ mod tests {
         );
         assert_eq!(filtered.already_done_len(), 1);
         assert_eq!(filtered.scan_miss_len(), 2);
+    }
+
+    #[test]
+    fn prefilter_done_ledger_classifies_all_terminal_statuses_as_already_done() {
+        // One item per done-ledger status variant to verify exhaustive classification.
+        let items: Vec<ScanItem> = (0..5).map(indexed_item).collect();
+
+        let ledger = StatusAwareDoneLedger::new([
+            (item_ovid(&items[0]), DoneLedgerStatus::ScannedClean),
+            (item_ovid(&items[1]), DoneLedgerStatus::ScannedWithFindings),
+            (item_ovid(&items[2]), DoneLedgerStatus::FailedPermanent),
+            (item_ovid(&items[3]), DoneLedgerStatus::Skipped),
+            (item_ovid(&items[4]), DoneLedgerStatus::FailedRetryable),
+        ]);
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        let classifications: Vec<_> = filtered
+            .items()
+            .iter()
+            .map(|ci| (ci.item().item_key().as_bytes().to_vec(), ci.disposition()))
+            .collect();
+
+        // Terminal statuses map to AlreadyDone; transient failure maps to ScanMiss.
+        assert_eq!(
+            classifications[0].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "ScannedClean is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[1].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "ScannedWithFindings is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[2].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "FailedPermanent is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[3].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "Skipped is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[4].1,
+            OrderedContentPrefilterDisposition::ScanMiss,
+            "FailedRetryable is a transient failure and must be classified ScanMiss"
+        );
+        assert_eq!(filtered.already_done_len(), 4);
+        assert_eq!(filtered.scan_miss_len(), 1);
+    }
+
+    #[test]
+    fn execute_scan_misses_range_error_on_second_chunk_returns_failed_outcome() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // Content larger than chunk_size=32 forces a multi-chunk scan.
+        // The first 32-byte chunk succeeds; the second chunk at offset 32 fails.
+        let content = vec![b'x'; 64];
+        source.insert(b"mid-fail.txt", &content);
+        source.set_range_error(
+            b"mid-fail.txt",
+            32,
+            ReadError::rate_limited("throttled mid-stream", 42),
+        );
+
+        let page = prefiltered_page(
+            vec![(
+                item(b"mid-fail.txt", content.len() as u64),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+
+        let engine = build_runtime_engine(
+            Some(rules.path()),
+            &TransformFilter::default(),
+            None,
+            AnchorMode::default(),
+        )
+        .expect("engine builds");
+        let execution = OrderedContentRuntime::execute_scan_misses_with_engine(
+            &mut source,
+            page,
+            ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            },
+            false,
+            engine,
+            32, // small chunk_size forces multi-chunk scanning
+        )
+        .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1);
+        let OrderedContentItemOutcome::Failed(stop) = execution.outcomes()[0].outcome() else {
+            panic!("expected retryable failure on second chunk");
+        };
+        assert_eq!(stop.class(), ErrorClass::Retryable);
+        assert_eq!(stop.retry_after_ms(), Some(42));
+        assert_eq!(
+            execution.execution_report().errors,
+            1,
+            "mid-stream read failure counts as one error"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_admits_item_with_zero_size_hint() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // size_hint=Some(0) exercises the .max(1) guard in item_byte_budget,
+        // which converts 0 to 1 so that Budgets::try_new does not reject
+        // max_bytes=0. The item is still admitted because 0 <= remaining_bytes.
+        source.insert(b"zero.txt", b"hello");
+        let page = prefiltered_page(
+            vec![(
+                item(b"zero.txt", 0),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1, "item must not be deferred");
+        assert!(
+            execution.deferred().is_empty(),
+            "zero size_hint should not cause deferral"
+        );
+        // size_hint=0 → item_byte_budget returns 1 (via .max(1) guard). The
+        // content is 5 bytes, so the budget is exhausted before all content is
+        // read, producing Truncated rather than Scanned.
+        let OrderedContentItemOutcome::Truncated { .. } = execution.outcomes()[0].outcome() else {
+            panic!(
+                "expected Truncated for zero-hint item with content exceeding 1-byte budget, got {:?}",
+                execution.outcomes()[0].outcome()
+            );
+        };
     }
 }
