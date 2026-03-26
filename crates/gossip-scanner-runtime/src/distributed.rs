@@ -1692,6 +1692,7 @@ enum PageLoopTermination {
 struct OrderedSourceAssignmentOutcome {
     report: ScanReport,
     termination: PageLoopTermination,
+    resume_cursor: Cursor,
 }
 
 fn scan_ordered_filesystem_lease_with_engine<D>(
@@ -1910,6 +1911,7 @@ where
     Ok(OrderedSourceAssignmentOutcome {
         report,
         termination,
+        resume_cursor: restored_state.resume_cursor().clone(),
     })
 }
 
@@ -1977,6 +1979,17 @@ where
         "receipt-driven execution requires single-threaded scanning"
     );
 
+    let lease_deadline = lease.lease().deadline();
+    let start_time = wall_clock_now();
+    if start_time.as_raw() >= lease_deadline.as_raw() {
+        return Err(DistributedRuntimeError::LeaseUncertain(
+            LeaseUncertainty::DeadlineElapsed {
+                deadline: lease_deadline,
+                observed: start_time,
+            },
+        ));
+    }
+
     let engine = build_runtime_engine(
         scan_config.rules_file.as_deref(),
         &scan_config.transform_filter,
@@ -1991,16 +2004,6 @@ where
 
     let sink = CoordinationEventSink::new(recorder.clone(), Arc::clone(lease.shard_id_arc()));
     let cancel = CancellationToken::new();
-    let lease_deadline = lease.lease().deadline();
-    let start_time = wall_clock_now();
-    if start_time.as_raw() >= lease_deadline.as_raw() {
-        return Err(DistributedRuntimeError::LeaseUncertain(
-            LeaseUncertainty::DeadlineElapsed {
-                deadline: lease_deadline,
-                observed: start_time,
-            },
-        ));
-    }
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
     let monotonic_deadline = Instant::now()
@@ -2125,17 +2128,26 @@ where
         Some(checkpoint_cursor)
     };
 
-    let completion = match (outcome.termination, checkpoint_cursor) {
-        (PageLoopTermination::ExhaustedEmptyConfirmed, None) => {
+    let OrderedSourceAssignmentOutcome {
+        report,
+        termination,
+        resume_cursor,
+    } = outcome;
+    let recovered_checkpoint =
+        (resume_cursor != *lease.resume_cursor()).then_some(resume_cursor.clone());
+
+    let completion = match (termination, checkpoint_cursor, recovered_checkpoint) {
+        (PageLoopTermination::ExhaustedEmptyConfirmed, None, None) => {
             ShardCompletionOutcome::ExhaustedEmpty
         }
-        (PageLoopTermination::ExhaustedEmptyConfirmed, Some(checkpoint)) => {
+        (PageLoopTermination::ExhaustedEmptyConfirmed, Some(checkpoint), _)
+        | (PageLoopTermination::ExhaustedEmptyConfirmed, None, Some(checkpoint)) => {
             ShardCompletionOutcome::Complete { checkpoint }
         }
-        (PageLoopTermination::Partial, Some(checkpoint)) => {
+        (PageLoopTermination::Partial, Some(checkpoint), _) => {
             ShardCompletionOutcome::Checkpoint { checkpoint }
         }
-        (PageLoopTermination::Partial, None) => {
+        (PageLoopTermination::Partial, None, _) => {
             return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
                 anyhow!(
                     "filesystem shard '{}' stopped before confirming exhaustion and produced no receipt-backed progress",
@@ -2145,7 +2157,7 @@ where
         }
     };
 
-    Ok((outcome.report, completion))
+    Ok((report, completion))
 }
 
 /// Run the distributed worker loop until the coordinator has no more leases.
@@ -2802,6 +2814,7 @@ mod tests {
             Ok(OrderedSourceAssignmentOutcome {
                 report: ScanReport::default(),
                 termination: PageLoopTermination::Partial,
+                resume_cursor: Cursor::initial(),
             }),
             Ok(Vec::new()),
             Ok(Err(stage_error)),
@@ -2827,6 +2840,7 @@ mod tests {
             Ok(OrderedSourceAssignmentOutcome {
                 report: ScanReport::default(),
                 termination: PageLoopTermination::Partial,
+                resume_cursor: Cursor::initial(),
             }),
             Err(submitted_error),
             // stage_result is never reached because submitted fails first.
@@ -2853,6 +2867,7 @@ mod tests {
             Ok(OrderedSourceAssignmentOutcome {
                 report: ScanReport::default(),
                 termination: PageLoopTermination::Partial,
+                resume_cursor: Cursor::initial(),
             }),
             Ok(Vec::new()),
             Err(panic_error),
@@ -2881,6 +2896,7 @@ mod tests {
             Ok(OrderedSourceAssignmentOutcome {
                 report: ScanReport::default(),
                 termination: PageLoopTermination::ExhaustedEmptyConfirmed,
+                resume_cursor: Cursor::initial(),
             }),
             Err(anyhow!("submit cancelled after lease expiry")),
             Err(anyhow!("unused")),
@@ -5077,6 +5093,59 @@ mod tests {
     }
 
     #[test]
+    fn run_filesystem_lease_rejects_expired_lease_before_engine_setup() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 1);
+        let identity = worker_identity(Path::new("/fallback"));
+        let claimed = claim_lease(&mut coordinator, &identity);
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let lease = ShardLease::new(
+            Arc::clone(claimed.shard_id_arc()),
+            claimed.lease(),
+            claimed.restored_state().clone(),
+            HydratedFilesystemSource::new(
+                claimed
+                    .scan_config()
+                    .clone()
+                    .with_rules_file(Some(dir.path().join("missing-rules.toml"))),
+                claimed.source_mode(),
+            ),
+            claimed.write_context(),
+            claimed.tenant_secret_key(),
+        );
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+
+        let error = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("expired lease should abort before engine setup");
+
+        assert!(
+            matches!(
+                error,
+                DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::DeadlineElapsed { .. })
+            ),
+            "expected immediate deadline-elapsed rejection, got: {error:?}"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "no done-ledger entries should exist because engine setup never ran"
+        );
+    }
+
+    #[test]
     fn ordered_content_error_codes_are_valid_and_match_expected_values() {
         let failure = OrderedContentReadStop::failure_code();
         assert_eq!(failure.as_str(), "READ_FAILED");
@@ -5424,6 +5493,63 @@ mod tests {
                 .expect("checkpoint last_key")
                 .as_bytes(),
             b"only.txt"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_all_already_done_terminal_recovery_returns_complete_cursor() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("only.txt"), clean_fixture()).expect("write clean fixture");
+
+        let done_ledger = InMemoryDoneLedger::new();
+        let seed_persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+        let seed_identity = worker_identity(Path::new("/fallback"));
+        let mut seed_coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let seed_lease = claim_lease(&mut seed_coordinator, &seed_identity);
+
+        let (_seed_report, seed_completion) = run_filesystem_lease(
+            Arc::clone(&seed_identity.recorder),
+            &seed_persistence,
+            &seed_lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("seed pass should durably populate the done ledger");
+        let ShardCompletionOutcome::Complete { checkpoint } = seed_completion else {
+            panic!("seed pass should finish with a terminal checkpoint");
+        };
+        let expected_last_key = checkpoint
+            .last_key()
+            .expect("seed checkpoint last_key")
+            .as_bytes()
+            .to_vec();
+
+        let recovery_persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+        let recovery_identity = worker_identity(Path::new("/fallback"));
+        let mut recovery_coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let recovery_lease = claim_lease(&mut recovery_coordinator, &recovery_identity);
+
+        let (report, completion) = run_filesystem_lease(
+            Arc::clone(&recovery_identity.recorder),
+            &recovery_persistence,
+            &recovery_lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("recovery pass should reuse already-done coverage");
+
+        assert_eq!(report.items_scanned, 1);
+        let ShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("all-already-done terminal replay should preserve the terminal cursor");
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("recovery checkpoint last_key")
+                .as_bytes(),
+            expected_last_key.as_slice()
         );
     }
 
