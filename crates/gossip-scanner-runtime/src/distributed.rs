@@ -3249,6 +3249,8 @@ mod tests {
     fn run_worker_recovers_from_partial_done_ledger_failure_without_duplicate_rows() {
         const SECRET_FILE_COUNT: usize = 12;
         const SUCCESSFUL_COMMITS_BEFORE_CRASH: usize = 4;
+        const POLL_ITERATIONS: usize = 2_000;
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
         let dir = tempdir().expect("tempdir");
         for index in 0..SECRET_FILE_COUNT {
@@ -3306,11 +3308,11 @@ mod tests {
         });
 
         let next_pending_done_commit = || {
-            for _ in 0..2_000 {
+            for _ in 0..POLL_ITERATIONS {
                 let pending = done_ledger.pending_ids().expect("pending done-ledger ids");
                 match pending.as_slice() {
                     [op_id] => return *op_id,
-                    [] => std::thread::sleep(Duration::from_millis(5)),
+                    [] => std::thread::sleep(POLL_INTERVAL),
                     _ => panic!(
                         "expected one pending done-ledger commit with queue capacity 1, got {}",
                         pending.len()
@@ -3329,12 +3331,12 @@ mod tests {
                 "pending done-ledger op should release"
             );
 
-            for _ in 0..2_000 {
+            for _ in 0..POLL_ITERATIONS {
                 let durable_rows = done_ledger.snapshot().expect("done-ledger snapshot");
                 if durable_rows.len() == committed + 1 {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(POLL_INTERVAL);
             }
             assert_eq!(
                 done_ledger.snapshot().expect("done-ledger snapshot").len(),
@@ -3380,7 +3382,7 @@ mod tests {
         done_ledger
             .set_auto_complete(true)
             .expect("re-enable done-ledger auto-complete");
-        for _ in 0..2_000 {
+        for _ in 0..POLL_ITERATIONS {
             if first_run.is_finished() {
                 break;
             }
@@ -3392,7 +3394,7 @@ mod tests {
                     "pending done-ledger op should release"
                 );
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(POLL_INTERVAL);
         }
         assert!(
             first_run.is_finished(),
