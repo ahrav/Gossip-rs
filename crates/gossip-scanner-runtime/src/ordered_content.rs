@@ -585,19 +585,17 @@ impl OrderedContentPrefilteredPage {
 /// The variants separate three boundary conditions for one `fill_page` call:
 /// exhausted-empty completion (`ExhaustedEmpty`), connector-reported
 /// enumerate failure with retry classification preserved (`Stopped`), and
-/// validated non-empty pages that downstream stages may inspect
-/// (`Page` / `TerminalPage`).
+/// a validated non-empty page that downstream stages may inspect (`Page`).
+///
+/// Callers that need to distinguish terminal pages (`PageState::Complete`)
+/// from continuation pages (`PageState::HasMore`) should inspect
+/// `page.page().state()` after matching `Page`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentExecutionOutcome {
     /// The source reported no in-scope items for the current cursor position.
     ExhaustedEmpty,
     /// The source returned one validated page.
     Page(Box<OrderedContentPage>),
-    /// The source returned a validated terminal non-empty page.
-    ///
-    /// Callers must still perform one exhausted-empty suffix call before they
-    /// can treat the shard as fully exhausted.
-    TerminalPage(Box<OrderedContentPage>),
     /// The source stopped with a classified enumerate failure.
     Stopped(OrderedContentStop),
 }
@@ -968,12 +966,9 @@ impl OrderedContentRuntime {
         };
 
         validate_page_contract(input, &page)?;
-        let page = OrderedContentPage::from_validated_page(page);
-        if matches!(page.page().state(), PageState::Complete) {
-            return Ok(OrderedContentExecutionOutcome::TerminalPage(Box::new(page)));
-        }
-
-        Ok(OrderedContentExecutionOutcome::Page(Box::new(page)))
+        Ok(OrderedContentExecutionOutcome::Page(Box::new(
+            OrderedContentPage::from_validated_page(page),
+        )))
     }
 
     /// Build the runtime engine from [`FsScanConfig`] and execute the page's
@@ -3247,7 +3242,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_source_returns_terminal_page_for_validated_single_item_complete_page() {
+    fn execute_source_returns_page_with_complete_state_for_single_item() {
         let page =
             PageBuf::try_new(vec![item(b"only.txt", 42)], PageState::Complete).expect("page");
         let mut source = ScriptedSource::returning(Ok(Some(page)));
@@ -3262,9 +3257,10 @@ mod tests {
         )
         .expect("single-item complete page");
 
-        let OrderedContentExecutionOutcome::TerminalPage(page) = outcome else {
-            panic!("expected terminal page outcome");
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome");
         };
+        assert!(matches!(page.page().state(), PageState::Complete));
         assert_eq!(page.report().items_scanned, 1);
         assert_eq!(page.report().bytes_scanned, 42);
         assert_eq!(
@@ -3337,7 +3333,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_source_returns_terminal_page_for_complete_state() {
+    fn execute_source_returns_page_with_complete_state() {
         let page = PageBuf::try_new(
             vec![item(b"a.txt", 3), item(b"b.txt", 5)],
             PageState::Complete,
@@ -3355,9 +3351,10 @@ mod tests {
         )
         .expect("complete page");
 
-        let OrderedContentExecutionOutcome::TerminalPage(page) = outcome else {
-            panic!("expected terminal page outcome");
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome");
         };
+        assert!(matches!(page.page().state(), PageState::Complete));
         assert_eq!(page.report().items_scanned, 2);
         assert_eq!(page.report().bytes_scanned, 8);
         assert_eq!(
@@ -3396,10 +3393,8 @@ mod tests {
         )
         .expect("mixed size_hint page");
 
-        let page = match outcome {
-            OrderedContentExecutionOutcome::Page(page)
-            | OrderedContentExecutionOutcome::TerminalPage(page) => page,
-            other => panic!("expected page outcome, got {other:?}"),
+        let OrderedContentExecutionOutcome::Page(page) = outcome else {
+            panic!("expected page outcome, got {outcome:?}");
         };
         assert_eq!(page.report().items_scanned, 2);
         assert_eq!(

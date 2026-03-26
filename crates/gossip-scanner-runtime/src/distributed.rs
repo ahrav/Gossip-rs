@@ -78,7 +78,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
-    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
+    connector::{
+        Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId,
+        ordered::OrderedContentSource,
+    },
     coordination::{CursorBoundsCheck, RestoredShardState, ShardSpec, check_cursor_bounds},
     identity::{
         CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
@@ -1448,6 +1451,17 @@ where
     Ok(())
 }
 
+/// Phase of the ordered-content page loop.
+///
+/// After processing a terminal non-empty page (`PageState::Complete`),
+/// the loop transitions to `AwaitingExhaustedEmpty` and expects one
+/// more `ExhaustedEmpty` outcome before the shard is fully enumerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageLoopPhase {
+    Paging,
+    AwaitingExhaustedEmpty,
+}
+
 fn scan_ordered_filesystem_lease_with_engine<D>(
     lease: &ShardLease,
     config: &FsScanConfig,
@@ -1461,30 +1475,70 @@ where
     D: DoneLedger,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
     let mut source = FilesystemConnector::new(config.path.clone());
+    scan_ordered_source_with_engine(
+        &mut source,
+        lease,
+        config,
+        done_ledger,
+        engine,
+        out,
+        commit,
+        cancel,
+    )
+}
+
+/// Source-generic ordered-content page loop.
+///
+/// Identical to [`scan_ordered_filesystem_lease_with_engine`] but accepts any
+/// [`OrderedContentSource`], enabling injection of scripted test doubles for
+/// suffix-protocol verification.
+#[allow(clippy::too_many_arguments)]
+fn scan_ordered_source_with_engine<S, D>(
+    source: &mut S,
+    lease: &ShardLease,
+    config: &FsScanConfig,
+    done_ledger: &D,
+    engine: Arc<scanner_engine::Engine>,
+    out: &dyn EventOutput,
+    commit: &ReceiptCommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError>
+where
+    S: OrderedContentSource,
+    D: DoneLedger,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
     let shard_spec = lease.restored_state().shard_spec().clone();
     let cursor_semantics = lease.restored_state().cursor_semantics();
     let mut restored_state = lease.restored_state().clone();
     let mut report = ScanReport::default();
-    let mut awaiting_exhausted_empty_suffix = false;
+    let mut phase = PageLoopPhase::Paging;
     let mut executed_any_page = false;
 
     loop {
         if cancel.is_cancelled() {
+            if phase == PageLoopPhase::AwaitingExhaustedEmpty {
+                tracing::debug!(
+                    shard_id = %lease.shard_id(),
+                    "cancellation during exhausted-empty suffix wait; \
+                     partial progress preserved for re-claim",
+                );
+            }
             break;
         }
 
         let runtime_input = OrderedContentRuntimeInput::new(restored_state.clone(), budgets);
-        let (page, terminal_page) = match OrderedContentRuntime::execute_source(
-            &mut source,
-            &runtime_input,
-        )? {
+        let (page, terminal) = match OrderedContentRuntime::execute_source(source, &runtime_input)?
+        {
             OrderedContentExecutionOutcome::ExhaustedEmpty => break,
             OrderedContentExecutionOutcome::Stopped(stop) => {
-                if awaiting_exhausted_empty_suffix {
+                if phase == PageLoopPhase::AwaitingExhaustedEmpty {
                     return Err(ScanRuntimeError::Driver(anyhow!(
-                        "ordered-content source stopped before confirming exhausted-empty suffix after a terminal non-empty page: {stop}"
+                        "ordered-content source stopped before confirming \
+                         exhausted-empty suffix after a terminal non-empty \
+                         page: {stop}"
                     )));
                 }
                 if stop.class().is_retryable() {
@@ -1502,26 +1556,20 @@ where
                 return Err(ScanRuntimeError::Driver(anyhow!("{stop}")));
             }
             OrderedContentExecutionOutcome::Page(page) => {
-                if awaiting_exhausted_empty_suffix {
+                if phase == PageLoopPhase::AwaitingExhaustedEmpty {
                     return Err(ScanRuntimeError::Driver(anyhow!(
-                        "ordered-content source emitted a non-empty page after a terminal non-empty page"
+                        "ordered-content source emitted a non-empty page \
+                         after a terminal non-empty page"
                     )));
                 }
-                (page, false)
-            }
-            OrderedContentExecutionOutcome::TerminalPage(page) => {
-                if awaiting_exhausted_empty_suffix {
-                    return Err(ScanRuntimeError::Driver(anyhow!(
-                        "ordered-content source emitted multiple terminal non-empty pages without an exhausted-empty suffix call"
-                    )));
-                }
-                (page, true)
+                let terminal = matches!(page.page().state(), PageState::Complete);
+                (page, terminal)
             }
         };
 
         let page = page.prefilter_done_ledger(lease.write_context(), done_ledger)?;
         let execution = OrderedContentRuntime::execute_scan_misses_with_prebuilt_engine(
-            &mut source,
+            source,
             page,
             config.budgets,
             config.scan_binary,
@@ -1573,14 +1621,17 @@ where
         submitted_report.items_deferred = execution.deferred().len() as u64;
         report += submitted_report;
 
-        // When non-terminal items (retryable or deferred) exist on this
-        // page, stop scanning additional pages. The checkpoint will only
-        // cover items committed before the non-terminal boundary. On the
-        // next shard claim, the page listing resumes from the checkpoint
-        // and re-lists the non-terminal items for retry. Deferred items
+        // Non-terminal or deferred items take priority over terminal-page
+        // status: if a page was terminal (`PageState::Complete`) but also
+        // contained a deferred item, the checkpoint must stop before that
+        // item's key. The next claim resumes from the checkpoint and
+        // re-discovers the terminal boundary at that time.
+        //
+        // When neither condition holds, the checkpoint covers all page
+        // items committed before the non-terminal boundary. Deferred items
         // may land on a separate page from subsequent outcomes (the page
-        // byte budget can split them), so check deferred() even when the
-        // outcomes loop ran to completion.
+        // byte budget can split them), so check `deferred()` even when
+        // the outcomes loop ran to completion.
         if hit_non_terminal || !execution.deferred().is_empty() {
             break;
         }
@@ -1590,8 +1641,8 @@ where
             execution.resume_cursor().clone(),
             cursor_semantics,
         );
-        if terminal_page {
-            awaiting_exhausted_empty_suffix = true;
+        if terminal {
+            phase = PageLoopPhase::AwaitingExhaustedEmpty;
             continue;
         }
     }
@@ -1905,11 +1956,14 @@ mod tests {
 
     use super::*;
     use gossip_contracts::{
-        connector::{Cursor, ItemKey},
+        connector::{
+            Cursor, EnumerateError, ItemKey, ItemRef, PageBuf, ReadError,
+            ordered::OrderedContentCapabilities,
+        },
         coordination::ShardSpec,
         identity::{
-            FenceEpoch, FindingId, ObservationId, OccurrenceId, OpId, PolicyHash, RuleFingerprint,
-            RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
+            FenceEpoch, FindingId, ObjectVersionId, ObservationId, OccurrenceId, OpId, PolicyHash,
+            RuleFingerprint, RunId, ShardId, TenantId, TenantSecretKey, WorkerId,
             derive_rule_fingerprint,
         },
         persistence::{DoneLedgerKey, DoneLedgerStatus, WriteContext},
@@ -1922,6 +1976,7 @@ mod tests {
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
     use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
+    use scanner_scheduler::events::NullEventOutput;
     use tempfile::tempdir;
 
     use crate::{
@@ -3279,7 +3334,7 @@ mod tests {
     fn complete_shard_without_checkpoint_uses_range_start_under_completed_semantics() {
         let dir = tempdir().expect("tempdir");
         let mut coordinator =
-            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x05", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
 
@@ -3298,7 +3353,7 @@ mod tests {
         let summaries = shard_summaries(&coordinator);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status(), ShardStatus::Done);
-        assert_eq!(summaries[0].last_key(), Some(&[0u8][..]));
+        assert_eq!(summaries[0].last_key(), Some(&[0x05u8][..]));
     }
 
     #[test]
@@ -4458,6 +4513,252 @@ mod tests {
                 .expect("checkpoint last_key")
                 .as_bytes(),
             b"only.txt"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_multi_page_terminal_exhausted_empty_sequence() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("a.txt"), clean_fixture()).expect("write a");
+        fs::write(dir.path().join("b.txt"), clean_fixture()).expect("write b");
+        fs::write(dir.path().join("c.txt"), clean_fixture()).expect("write c");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+
+        let (report, completion) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig {
+                budgets: ScanBudgets {
+                    max_items: 1,
+                    max_bytes: 1_000_000,
+                },
+                ..DistributedRuntimeConfig::default()
+            },
+        )
+        .expect("multi-page shard should succeed");
+
+        assert_eq!(
+            report.items_scanned, 3,
+            "all three files should be scanned across multiple pages"
+        );
+        let FilesystemShardCompletionOutcome::Progress { checkpoint } = completion else {
+            panic!("3-item shard should produce progress-bearing completion");
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"c.txt"
+        );
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            3,
+            "all three items should have done-ledger entries"
+        );
+    }
+
+    // ── Suffix-protocol test infrastructure ──────────────────────────
+
+    /// Multi-call scripted source for testing page-loop control flow.
+    ///
+    /// Each `fill_page` call pops the next result from the front of the
+    /// queue. Panics if called more times than scripted.
+    struct MultiStepScriptedSource {
+        pages: std::collections::VecDeque<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
+    }
+
+    impl MultiStepScriptedSource {
+        fn new(pages: Vec<Result<Option<PageBuf<ScanItem>>, EnumerateError>>) -> Self {
+            Self {
+                pages: pages.into(),
+            }
+        }
+    }
+
+    impl OrderedContentSource for MultiStepScriptedSource {
+        fn capabilities(&self) -> OrderedContentCapabilities {
+            OrderedContentCapabilities::default()
+        }
+
+        fn fill_page(
+            &mut self,
+            _shard: &ShardSpec,
+            _cursor: &Cursor,
+            _budgets: Budgets,
+        ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+            self.pages
+                .pop_front()
+                .expect("MultiStepScriptedSource: unexpected extra fill_page call")
+        }
+
+        fn open(
+            &mut self,
+            _item_ref: &ItemRef,
+            _budgets: Budgets,
+        ) -> Result<Box<dyn std::io::Read + Send>, ReadError> {
+            Ok(Box::new(std::io::Cursor::new(
+                b"ordinary clean content for suffix protocol tests".to_vec(),
+            )))
+        }
+    }
+
+    fn suffix_test_item(name: &[u8], size: u64) -> ScanItem {
+        ScanItem::new(
+            ItemKey::try_from_slice(name).expect("item key"),
+            ItemRef::try_from_slice(name).expect("item ref"),
+            StableItemId::from_bytes([name[0]; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(name)),
+        )
+        .with_size_hint(size)
+    }
+
+    /// Run the source-generic page loop with a scripted source and return
+    /// the result. Uses a real engine, commit pipeline, and done-ledger
+    /// so the first page can complete successfully before the second call
+    /// triggers a suffix-protocol violation.
+    fn run_suffix_protocol_test(
+        pages: Vec<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
+    ) -> Result<AssignmentOutcome, ScanRuntimeError> {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/suffix"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        let done_ledger = InMemoryDoneLedger::new();
+        let scan_config = lease
+            .scan_config()
+            .clone()
+            .with_workers(1)
+            .with_persist_findings(true);
+
+        let engine = build_runtime_engine(
+            scan_config.rules_file.as_deref(),
+            &scan_config.transform_filter,
+            scan_config.decode_depth,
+            scan_config.anchor_mode,
+        )
+        .expect("engine");
+
+        let cancel = CancellationToken::new();
+        let pipeline = CommitPipeline::start(
+            InMemoryFindingsSink::new(),
+            done_ledger.clone(),
+            CommitPipelineConfig {
+                execution_queue_capacity: 64,
+                outcome_queue_capacity: 64,
+            },
+            cancel.clone(),
+        )
+        .expect("pipeline");
+
+        let recorder = Arc::new(Recorder::default());
+        let rule_fingerprint = {
+            let engine = Arc::clone(&engine);
+            Arc::new(move |rule_id: u32| {
+                RuleFingerprint::from_bytes(engine.rule_fingerprint_bytes(rule_id))
+            }) as Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>
+        };
+
+        let (submitter, drainer) = pipeline.split();
+        let commit = ReceiptCommitSink::new(
+            recorder,
+            Arc::clone(lease.shard_id_arc()),
+            lease.write_context(),
+            lease.tenant_secret_key(),
+            rule_fingerprint,
+            submitter,
+        );
+
+        let out = NullEventOutput;
+        let mut source = MultiStepScriptedSource::new(pages);
+
+        std::thread::scope(|scope| {
+            let write_context = lease.write_context();
+            let stage_handle = scope.spawn(move || drain_commit_stage(drainer, write_context, 64));
+
+            let result = scan_ordered_source_with_engine(
+                &mut source,
+                &lease,
+                &scan_config,
+                &done_ledger,
+                engine,
+                &out,
+                &commit,
+                &cancel,
+            );
+            let _submitted = commit.finish();
+            let _stage_result = join_scoped(stage_handle, "suffix test drain");
+            result
+        })
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_page_after_terminal_page() {
+        let terminal_page =
+            PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+                .expect("terminal page");
+        let follow_up_page = PageBuf::try_new(
+            vec![suffix_test_item(b"b.txt", 20)],
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(item_key("b.txt")),
+            },
+        )
+        .expect("follow-up page");
+
+        let err = run_suffix_protocol_test(vec![Ok(Some(terminal_page)), Ok(Some(follow_up_page))])
+            .expect_err("page after terminal should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("non-empty page after a terminal non-empty page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_second_terminal_page() {
+        let first = PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+            .expect("first terminal page");
+        let second = PageBuf::try_new(vec![suffix_test_item(b"b.txt", 20)], PageState::Complete)
+            .expect("second terminal page");
+
+        let err = run_suffix_protocol_test(vec![Ok(Some(first)), Ok(Some(second))])
+            .expect_err("second terminal page should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("non-empty page after a terminal non-empty page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_stopped_after_terminal_page() {
+        let terminal_page =
+            PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+                .expect("terminal page");
+
+        let err = run_suffix_protocol_test(vec![
+            Ok(Some(terminal_page)),
+            Err(EnumerateError::rate_limited("simulated rate limit", 100)),
+        ])
+        .expect_err("stopped after terminal should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("stopped before confirming exhausted-empty suffix"),
+            "unexpected error: {err}"
         );
     }
 }

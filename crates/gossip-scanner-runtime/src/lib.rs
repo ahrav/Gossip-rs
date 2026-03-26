@@ -790,8 +790,7 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
         ordered_content::OrderedContentExecutionOutcome::ExhaustedEmpty => {
             Ok(ScanReport::default())
         }
-        ordered_content::OrderedContentExecutionOutcome::Page(page)
-        | ordered_content::OrderedContentExecutionOutcome::TerminalPage(page) => {
+        ordered_content::OrderedContentExecutionOutcome::Page(page) => {
             if page.page().state().next_cursor().is_some() {
                 let items = page.report().items_scanned;
                 tracing::warn!(
