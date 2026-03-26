@@ -1,18 +1,19 @@
 //! Distributed worker runtime for receipt-driven shard execution.
 //!
 //! This module is the entry point for distributed scanning. It implements a
-//! claim-execute-complete loop: the worker claims shards from a
+//! claim-execute-advance loop: the worker claims shards from a
 //! [`CoordinationFacade`], executes each shard's filesystem scan, commits
 //! findings and done-ledger rows through a bounded commit pipeline, and then
-//! completes the shard lease with a receipt-driven checkpoint cursor.
+//! advances the shard lease with either a non-terminal checkpoint cursor or a
+//! terminal completion cursor derived from the committed prefix.
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌──────────────┐    claim     ┌────────────────────┐
-//! │ Coordinator  │ ──────────>  │  run_worker loop   │
-//! │ (CoordFacade)│ <────────── │  (claim/scan/done) │
-//! └──────────────┘   complete   └────────┬───────────┘
+//! ┌──────────────┐    claim        ┌────────────────────┐
+//! │ Coordinator  │ ─────────────>  │  run_worker loop   │
+//! │ (CoordFacade)│ <───────────── │ (claim/scan/advance)│
+//! └──────────────┘ checkpoint/complete └──────┬────────┘
 //!                                        │
 //!                              ┌─────────▼──────────┐
 //!                              │ run_filesystem_lease│
@@ -54,7 +55,7 @@
 //!    for the same `(write_context, item_key)` pair. Persistence backends must
 //!    be idempotent.
 //! 4. **Fail-fast after claim.** Once a shard is claimed, any scan, commit, or
-//!    completion error terminates the worker loop. Uncompleted leases expire
+//!    shard-advance error terminates the worker loop. Uncompleted leases expire
 //!    via coordination-layer deadlines.
 //!
 //! # Internal adapter: `ReceiptCommitSink`
@@ -78,8 +79,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
-    connector::{Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId},
-    coordination::{RestoredShardState, ShardSpec},
+    connector::{
+        Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId,
+        ordered::OrderedContentSource,
+    },
+    coordination::{CursorBoundsCheck, RestoredShardState, ShardSpec, check_cursor_bounds},
     identity::{
         CanonicalBytes, FenceEpoch, LogicalTime, ObjectVersionId, OpId, PolicyHash,
         RuleFingerprint, RunId, ShardKey, TenantId, TenantSecretKey, WorkerId, domain_hasher,
@@ -100,7 +104,7 @@ use scanner_scheduler::{
 };
 
 use crate::{
-    AssignmentOutcome, CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
+    CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
     build_runtime_engine,
     checkpoint_aggregator::PrefixCheckpointAggregator,
     commit_model::CompletedUnit,
@@ -985,10 +989,17 @@ struct CommitStageDrainResult {
 /// often cascades into downstream drain errors. Returning the runtime error
 /// first gives operators the closest cause.
 fn resolve_filesystem_lease_results(
-    outcome: Result<AssignmentOutcome, ScanRuntimeError>,
+    outcome: Result<OrderedSourceAssignmentOutcome, ScanRuntimeError>,
     submitted: Result<Vec<u64>>,
     stage_result: anyhow::Result<anyhow::Result<CommitStageDrainResult>>,
-) -> Result<(AssignmentOutcome, Vec<u64>, CommitStageDrainResult), DistributedRuntimeError> {
+) -> Result<
+    (
+        OrderedSourceAssignmentOutcome,
+        Vec<u64>,
+        CommitStageDrainResult,
+    ),
+    DistributedRuntimeError,
+> {
     let outcome = outcome.map_err(DistributedRuntimeError::Runtime)?;
     let submitted = submitted.map_err(DistributedRuntimeError::Durability)?;
     let stage_result = stage_result
@@ -1169,6 +1180,24 @@ const CLAIM_RACE_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// smallest non-empty byte sequence and passes all bounds checks when the
 /// spec start is empty.
 const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
+
+/// Explicit shard-advance outcome from the ordered filesystem path.
+///
+/// `Complete` means the scan observed the exhausted-empty suffix required for
+/// terminal completion and may transition the shard to `Done` using the
+/// authoritative receipt-backed checkpoint cursor. `Checkpoint` means the scan
+/// stopped early after a checkpointable cursor was available, so the worker
+/// must preserve progress without terminally completing the shard.
+/// `ExhaustedEmpty` means the scan observed exhausted-empty without producing a
+/// new receipt-backed checkpoint in this claim. Completion preserves the
+/// restored resume cursor when the shard already had prior progress and falls
+/// back to a range-safe cursor only for truly initial empty shards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FilesystemShardCompletionOutcome {
+    ExhaustedEmpty,
+    Checkpoint { checkpoint: Cursor },
+    Complete { checkpoint: Cursor },
+}
 
 /// Build hydrated filesystem source state by decoding shard metadata onto a
 /// worker-owned scan template.
@@ -1364,62 +1393,143 @@ where
     }
 }
 
-/// Complete a claimed shard directly against the coordination backend.
+/// Advance a claimed shard directly against the coordination backend.
 ///
-/// The final cursor is chosen as:
-/// - The receipt-driven `checkpoint` cursor when items were committed.
-/// - The shard's `range_start` when the shard produced zero items but has
-///   a non-empty range (ensures forward progress on re-scan).
-/// - A synthetic sentinel key ([`EMPTY_RANGE_SENTINEL_KEY`]) when the shard
-///   has no range start. In practice this branch is unreachable because the
-///   coordination layer rejects unbounded shards at registration time, but
-///   the guard exists to prevent a `CursorUpdate::new` panic on empty input
-///   (and `CursorUpdate::initial()` would fail validation).
+/// `outcome` makes the coordination action explicit:
+/// - [`FilesystemShardCompletionOutcome::Complete`] uses the receipt-driven
+///   checkpoint cursor and transitions the shard to `Done`.
+/// - [`FilesystemShardCompletionOutcome::Checkpoint`] uses the receipt-driven
+///   checkpoint cursor but keeps the shard active for a later claim.
+/// - [`FilesystemShardCompletionOutcome::ExhaustedEmpty`] uses a range-safe
+///   exhausted-empty fallback cursor derived from the shard bounds.
 ///
-/// Completion uses a deterministic [`OpId`] so replayed calls are idempotent.
-/// If the coordination backend reports the completion was already applied
-/// (idempotent replay), the function logs an info message but succeeds.
-fn complete_shard<C>(
+/// The chosen cursor is validated with [`check_cursor_bounds`] before the
+/// coordinator call so checkpoint and completion updates cannot silently
+/// escape the shard's key range.
+///
+/// The operation uses a deterministic [`OpId`] so replayed calls are
+/// idempotent. If the coordination backend reports the update was already
+/// applied (idempotent replay), the function logs an info message but
+/// succeeds.
+fn advance_shard<C>(
     coordinator: &mut C,
     identity: &WorkerIdentity,
     lease: &ShardLease,
-    checkpoint: Option<&Cursor>,
+    outcome: &FilesystemShardCompletionOutcome,
 ) -> Result<(), DistributedRuntimeError>
 where
     C: CoordinationFacade,
 {
     assert_eq!(lease.lease().tenant(), identity.tenant);
 
-    let final_cursor = match checkpoint {
-        Some(cursor) => cursor.as_update(),
-        None if lease.range_start().is_empty() => {
-            gossip_coordination::CursorUpdate::new(EMPTY_RANGE_SENTINEL_KEY)
+    let (cursor, op_kind, operation_name) = match outcome {
+        FilesystemShardCompletionOutcome::Checkpoint { checkpoint } => {
+            (checkpoint.as_update(), OpKind::Checkpoint, "checkpoint")
         }
-        None => gossip_coordination::CursorUpdate::new(lease.range_start()),
+        FilesystemShardCompletionOutcome::Complete { checkpoint } => {
+            (checkpoint.as_update(), OpKind::Complete, "completion")
+        }
+        FilesystemShardCompletionOutcome::ExhaustedEmpty
+            if lease.resume_cursor().last_key().is_some() =>
+        {
+            (
+                lease.resume_cursor().as_update(),
+                OpKind::Complete,
+                "completion",
+            )
+        }
+        FilesystemShardCompletionOutcome::ExhaustedEmpty if lease.range_start().is_empty() => (
+            gossip_coordination::CursorUpdate::new(EMPTY_RANGE_SENTINEL_KEY),
+            OpKind::Complete,
+            "completion",
+        ),
+        FilesystemShardCompletionOutcome::ExhaustedEmpty => (
+            gossip_coordination::CursorUpdate::new(lease.range_start()),
+            OpKind::Complete,
+            "completion",
+        ),
     };
-    let op_id = deterministic_op_id(
-        lease.lease().shard_key(),
-        lease.lease().fence(),
-        OpKind::Complete,
-    );
-    let outcome = coordinator
-        .complete(
-            wall_clock_now(),
-            identity.tenant,
-            &lease.lease(),
-            &final_cursor,
-            op_id,
-        )
-        .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
+    match check_cursor_bounds(cursor, lease.restored_state().shard_spec().as_ref()) {
+        CursorBoundsCheck::InBounds => {}
+        CursorBoundsCheck::NoKey => {
+            return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                anyhow!(
+                    "shard '{}' {} cursor is missing last_key for {:?}",
+                    lease.shard_id(),
+                    operation_name,
+                    lease.restored_state().shard_spec(),
+                ),
+            )));
+        }
+        bounds => {
+            return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                anyhow!(
+                    "shard '{}' {} cursor {:?} is not in bounds for {:?}: {:?}",
+                    lease.shard_id(),
+                    operation_name,
+                    cursor.last_key(),
+                    lease.restored_state().shard_spec(),
+                    bounds,
+                ),
+            )));
+        }
+    }
 
-    if !outcome.is_executed() {
+    let op_id = deterministic_op_id(lease.lease().shard_key(), lease.lease().fence(), op_kind);
+    let applied = match outcome {
+        FilesystemShardCompletionOutcome::Checkpoint { .. } => coordinator
+            .checkpoint(
+                wall_clock_now(),
+                identity.tenant,
+                &lease.lease(),
+                &cursor,
+                op_id,
+            )
+            .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?,
+        FilesystemShardCompletionOutcome::Complete { .. }
+        | FilesystemShardCompletionOutcome::ExhaustedEmpty => coordinator
+            .complete(
+                wall_clock_now(),
+                identity.tenant,
+                &lease.lease(),
+                &cursor,
+                op_id,
+            )
+            .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?,
+    };
+
+    if !applied.is_executed() {
         tracing::info!(
             shard_id = %lease.shard_id(),
-            "completion was an idempotent replay",
+            operation = operation_name,
+            "{operation_name} was an idempotent replay",
         );
     }
 
     Ok(())
+}
+
+/// Phase of the ordered-content page loop.
+///
+/// After processing a terminal non-empty page (`PageState::Complete`),
+/// the loop transitions to `AwaitingExhaustedEmpty` and expects one
+/// more `ExhaustedEmpty` outcome before the shard is fully enumerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageLoopPhase {
+    Paging,
+    AwaitingExhaustedEmpty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageLoopTermination {
+    ExhaustedEmptyConfirmed,
+    Partial,
+}
+
+#[derive(Clone, Debug)]
+struct OrderedSourceAssignmentOutcome {
+    report: ScanReport,
+    termination: PageLoopTermination,
 }
 
 fn scan_ordered_filesystem_lease_with_engine<D>(
@@ -1430,28 +1540,95 @@ fn scan_ordered_filesystem_lease_with_engine<D>(
     out: &dyn EventOutput,
     commit: &ReceiptCommitSink,
     cancel: &CancellationToken,
-) -> Result<AssignmentOutcome, ScanRuntimeError>
+) -> Result<OrderedSourceAssignmentOutcome, ScanRuntimeError>
 where
     D: DoneLedger,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
     let mut source = FilesystemConnector::new(config.path.clone());
+    scan_ordered_source_with_engine(
+        &mut source,
+        lease,
+        config,
+        done_ledger,
+        engine,
+        out,
+        commit,
+        cancel,
+    )
+}
+
+/// Source-generic ordered-content page loop.
+///
+/// Identical to [`scan_ordered_filesystem_lease_with_engine`] but accepts any
+/// [`OrderedContentSource`], enabling injection of scripted test doubles for
+/// suffix-protocol verification.
+#[allow(clippy::too_many_arguments)]
+fn scan_ordered_source_with_engine<S, D>(
+    source: &mut S,
+    lease: &ShardLease,
+    config: &FsScanConfig,
+    done_ledger: &D,
+    engine: Arc<scanner_engine::Engine>,
+    out: &dyn EventOutput,
+    commit: &ReceiptCommitSink,
+    cancel: &CancellationToken,
+) -> Result<OrderedSourceAssignmentOutcome, ScanRuntimeError>
+where
+    S: OrderedContentSource,
+    D: DoneLedger,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
     let shard_spec = lease.restored_state().shard_spec().clone();
     let cursor_semantics = lease.restored_state().cursor_semantics();
     let mut restored_state = lease.restored_state().clone();
     let mut report = ScanReport::default();
+    let mut phase = PageLoopPhase::Paging;
     let mut executed_any_page = false;
+    let mut termination = PageLoopTermination::Partial;
 
     loop {
         if cancel.is_cancelled() {
+            if phase == PageLoopPhase::AwaitingExhaustedEmpty {
+                tracing::debug!(
+                    shard_id = %lease.shard_id(),
+                    "cancellation during exhausted-empty suffix wait; \
+                     partial progress preserved for re-claim",
+                );
+            }
             break;
         }
 
         let runtime_input = OrderedContentRuntimeInput::new(restored_state.clone(), budgets);
-        let page = match OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
-            OrderedContentExecutionOutcome::Finished => break,
+        let (page, terminal) = match OrderedContentRuntime::execute_source(source, &runtime_input)?
+        {
+            OrderedContentExecutionOutcome::ExhaustedEmpty => {
+                if phase == PageLoopPhase::Paging && executed_any_page {
+                    return Err(ScanRuntimeError::Driver(anyhow!(
+                        "ordered-content source reported exhausted-empty \
+                         without first emitting a terminal non-empty page"
+                    )));
+                }
+                termination = PageLoopTermination::ExhaustedEmptyConfirmed;
+                break;
+            }
             OrderedContentExecutionOutcome::Stopped(stop) => {
+                if phase == PageLoopPhase::AwaitingExhaustedEmpty {
+                    if stop.class().is_retryable() {
+                        tracing::warn!(
+                            message = stop.message(),
+                            retry_after_ms = stop.retry_after_ms(),
+                            "retryable enumerate stop while waiting for exhausted-empty suffix, preserving receipt-backed progress",
+                        );
+                        break;
+                    }
+                    return Err(ScanRuntimeError::Driver(anyhow!(
+                        "ordered-content source stopped before confirming \
+                         exhausted-empty suffix after a terminal non-empty \
+                         page: {stop}"
+                    )));
+                }
                 if stop.class().is_retryable() {
                     // Retryable enumerate failure — preserve partial progress
                     // by breaking instead of returning an error. The shard is
@@ -1466,12 +1643,21 @@ where
                 }
                 return Err(ScanRuntimeError::Driver(anyhow!("{stop}")));
             }
-            OrderedContentExecutionOutcome::Page(page) => page,
+            OrderedContentExecutionOutcome::Page(page) => {
+                if phase == PageLoopPhase::AwaitingExhaustedEmpty {
+                    return Err(ScanRuntimeError::Driver(anyhow!(
+                        "ordered-content source emitted a non-empty page \
+                         after a terminal non-empty page"
+                    )));
+                }
+                let terminal = matches!(page.page().state(), PageState::Complete);
+                (page, terminal)
+            }
         };
 
         let page = page.prefilter_done_ledger(lease.write_context(), done_ledger)?;
         let execution = OrderedContentRuntime::execute_scan_misses_with_prebuilt_engine(
-            &mut source,
+            source,
             page,
             config.budgets,
             config.scan_binary,
@@ -1523,19 +1709,18 @@ where
         submitted_report.items_deferred = execution.deferred().len() as u64;
         report += submitted_report;
 
-        // When non-terminal items (retryable or deferred) exist on this
-        // page, stop scanning additional pages. The checkpoint will only
-        // cover items committed before the non-terminal boundary. On the
-        // next shard claim, the page listing resumes from the checkpoint
-        // and re-lists the non-terminal items for retry. Deferred items
+        // Non-terminal or deferred items take priority over terminal-page
+        // status: if a page was terminal (`PageState::Complete`) but also
+        // contained a deferred item, the checkpoint must stop before that
+        // item's key. The next claim resumes from the checkpoint and
+        // re-discovers the terminal boundary at that time.
+        //
+        // When neither condition holds, the checkpoint covers all page
+        // items committed before the non-terminal boundary. Deferred items
         // may land on a separate page from subsequent outcomes (the page
-        // byte budget can split them), so check deferred() even when the
-        // outcomes loop ran to completion.
+        // byte budget can split them), so check `deferred()` even when
+        // the outcomes loop ran to completion.
         if hit_non_terminal || !execution.deferred().is_empty() {
-            break;
-        }
-
-        if matches!(execution.page_state(), PageState::Complete) {
             break;
         }
 
@@ -1544,16 +1729,19 @@ where
             execution.resume_cursor().clone(),
             cursor_semantics,
         );
+        if terminal {
+            phase = PageLoopPhase::AwaitingExhaustedEmpty;
+            continue;
+        }
     }
 
     if executed_any_page {
         emit_ordered_summary(out, report);
     }
 
-    Ok(AssignmentOutcome {
+    Ok(OrderedSourceAssignmentOutcome {
         report,
-        checkpoint_hint: None,
-        debug_output: None,
+        termination,
     })
 }
 
@@ -1574,12 +1762,20 @@ where
 /// 4. **Checkpoint**: prepares and acknowledges the receipt-driven
 ///    checkpoint prefix through [`PrefixCheckpointAggregator`].
 ///
-/// Returns `(ScanReport, None)` when the shard produced zero committed
-/// items (empty directory or all-clean scan). Returns
-/// `(ScanReport, Some(cursor))` when at least one item was committed.
+/// Returns `(ScanReport, ExhaustedEmpty)` only after the scan explicitly
+/// observes exhausted-empty before any durable committed unit exists.
+/// Returns `(ScanReport, Complete { checkpoint })` when the shard observes
+/// exhausted-empty after durably committing at least one unit. Returns
+/// `(ScanReport, Checkpoint { checkpoint })` when the scan stops early after
+/// durably committing at least one new unit, preserving progress without
+/// marking the shard `Done`.
 ///
-/// The caller owns the coordination-layer completion step (calling
-/// [`complete_shard`] with the returned cursor).
+/// If the scan stops early before any new receipt-backed progress exists, the
+/// function returns an error instead of fabricating exhausted-empty
+/// completion or checkpointing the same cursor again.
+///
+/// The caller owns the coordination-layer advance step (calling
+/// [`advance_shard`] with the returned explicit outcome).
 ///
 /// # Design choice: single worker
 ///
@@ -1592,7 +1788,7 @@ fn run_filesystem_lease<F, D>(
     persistence: &DistributedPersistence<F, D>,
     lease: &ShardLease,
     config: DistributedRuntimeConfig,
-) -> Result<(ScanReport, Option<Cursor>), DistributedRuntimeError>
+) -> Result<(ScanReport, FilesystemShardCompletionOutcome), DistributedRuntimeError>
 where
     F: FindingsSink + Clone + Send + Sync + 'static,
     D: DoneLedger + Clone + Send + Sync + 'static,
@@ -1680,48 +1876,69 @@ where
         committed_sequence_nos,
     } = stage_result;
     let committed_units = committed_sequence_nos.len() as u64;
+    let checkpoint_cursor = if committed_units == 0 {
+        None
+    } else {
+        wait_for_submitted_commits(submitted, committed_sequence_nos)
+            .map_err(DistributedRuntimeError::Durability)?;
 
-    if committed_units == 0 {
-        return Ok((outcome.report, None));
-    }
+        let (checkpoint_scope, checkpoint_time, checkpoint_cursor) = {
+            let pending = aggregator
+                .prepare_checkpoint()
+                .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
-    wait_for_submitted_commits(submitted, committed_sequence_nos)
-        .map_err(DistributedRuntimeError::Durability)?;
+            let pending = pending.ok_or_else(|| {
+                DistributedRuntimeError::Durability(anyhow!(
+                    "filesystem shard '{}' committed {} unit(s) but no receipt-driven checkpoint prefix was prepared",
+                    lease.shard_id(),
+                    committed_units
+                ))
+            })?;
+            if pending.committed_units() != committed_units {
+                return Err(DistributedRuntimeError::Durability(anyhow!(
+                    "filesystem shard '{}' prepared checkpoint for {} unit(s), expected {}",
+                    lease.shard_id(),
+                    pending.committed_units(),
+                    committed_units
+                )));
+            }
 
-    let (checkpoint_scope, checkpoint_time, checkpoint_cursor) = {
-        let pending = aggregator
-            .prepare_checkpoint()
+            (
+                pending.scope().clone(),
+                checkpoint_logical_time(pending.last_sequence_no())
+                    .map_err(DistributedRuntimeError::Durability)?,
+                pending.checkpoint_cursor().clone(),
+            )
+        };
+        let checkpoint_receipt = CheckpointCommitReceipt::new(checkpoint_scope, checkpoint_time);
+        aggregator
+            .acknowledge_checkpoint(checkpoint_receipt)
             .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
-        let pending = pending.ok_or_else(|| {
-            DistributedRuntimeError::Durability(anyhow!(
-                "filesystem shard '{}' committed {} unit(s) but no receipt-driven checkpoint prefix was prepared",
-                lease.shard_id(),
-                committed_units
-            ))
-        })?;
-        if pending.committed_units() != committed_units {
-            return Err(DistributedRuntimeError::Durability(anyhow!(
-                "filesystem shard '{}' prepared checkpoint for {} unit(s), expected {}",
-                lease.shard_id(),
-                pending.committed_units(),
-                committed_units
+        Some(checkpoint_cursor)
+    };
+
+    let completion = match (outcome.termination, checkpoint_cursor) {
+        (PageLoopTermination::ExhaustedEmptyConfirmed, None) => {
+            FilesystemShardCompletionOutcome::ExhaustedEmpty
+        }
+        (PageLoopTermination::ExhaustedEmptyConfirmed, Some(checkpoint)) => {
+            FilesystemShardCompletionOutcome::Complete { checkpoint }
+        }
+        (PageLoopTermination::Partial, Some(checkpoint)) => {
+            FilesystemShardCompletionOutcome::Checkpoint { checkpoint }
+        }
+        (PageLoopTermination::Partial, None) => {
+            return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                anyhow!(
+                    "filesystem shard '{}' stopped before confirming exhaustion and produced no receipt-backed progress",
+                    lease.shard_id()
+                ),
             )));
         }
-
-        (
-            pending.scope().clone(),
-            checkpoint_logical_time(pending.last_sequence_no())
-                .map_err(DistributedRuntimeError::Durability)?,
-            pending.checkpoint_cursor().clone(),
-        )
     };
-    let checkpoint_receipt = CheckpointCommitReceipt::new(checkpoint_scope, checkpoint_time);
-    aggregator
-        .acknowledge_checkpoint(checkpoint_receipt)
-        .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
 
-    Ok((outcome.report, Some(checkpoint_cursor)))
+    Ok((outcome.report, completion))
 }
 
 /// Run the distributed worker loop until the coordinator has no more leases.
@@ -1733,21 +1950,22 @@ where
 ///    currently leased or the worker is being throttled.
 /// 2. **Executes** the shard's filesystem scan through the full
 ///    scan-commit-checkpoint pipeline.
-/// 3. **Completes** the shard lease against the coordinator, advancing the
-///    coordination cursor to the receipt-derived checkpoint position.
+/// 3. **Advances** the shard lease against the coordinator, either
+///    checkpointing partial progress or completing the shard with the
+///    receipt-derived cursor.
 /// 4. **Repeats** until no shards remain (returns `Ok(report)`) or an error
 ///    occurs (returns `Err`).
 ///
 /// # Fail-fast semantics
 ///
-/// The loop terminates on the first claim, scan, or completion error.
+/// The loop terminates on the first claim, scan, or shard-advance error.
 /// Uncompleted leases are not explicitly released; the coordination backend
 /// reclaims them when their deadlines expire.
 ///
 /// # Errors
 ///
 /// - [`DistributedRuntimeError::Coordinator`] — shard claiming, progress
-///   lookup, or completion failed.
+///   lookup, checkpoint, or completion failed.
 /// - [`DistributedRuntimeError::Runtime`] — scan execution failed.
 /// - [`DistributedRuntimeError::Durability`] — the receipt-driven commit
 ///   pipeline could not confirm durable progress.
@@ -1783,7 +2001,7 @@ where
         };
         report.leases_seen = report.leases_seen.saturating_add(1);
 
-        let (scan_report, checkpoint) = match run_filesystem_lease(
+        let (scan_report, completion) = match run_filesystem_lease(
             Arc::clone(&identity.recorder),
             &persistence,
             &lease,
@@ -1810,7 +2028,7 @@ where
             "shard scan complete",
         );
 
-        if let Err(error) = complete_shard(coordinator, &identity, &lease, checkpoint.as_ref()) {
+        if let Err(error) = advance_shard(coordinator, &identity, &lease, &completion) {
             tracing::warn!(
                 error = %error,
                 leases_seen = report.leases_seen,
@@ -1847,11 +2065,14 @@ mod tests {
 
     use super::*;
     use gossip_contracts::{
-        connector::{Cursor, ItemKey},
+        connector::{
+            Cursor, EnumerateError, ItemKey, ItemRef, PageBuf, ReadError,
+            ordered::OrderedContentCapabilities,
+        },
         coordination::ShardSpec,
         identity::{
-            FenceEpoch, FindingId, ObservationId, OccurrenceId, OpId, PolicyHash, RuleFingerprint,
-            RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
+            FenceEpoch, FindingId, ObjectVersionId, ObservationId, OccurrenceId, OpId, PolicyHash,
+            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
             derive_rule_fingerprint,
         },
         persistence::{DoneLedgerKey, DoneLedgerStatus, WriteContext},
@@ -1864,6 +2085,7 @@ mod tests {
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
     use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
+    use scanner_scheduler::events::NullEventOutput;
     use tempfile::tempdir;
 
     use crate::{
@@ -2308,10 +2530,9 @@ mod tests {
         let stage_error = anyhow!("drain boom");
 
         let error = resolve_filesystem_lease_results(
-            Ok(AssignmentOutcome {
+            Ok(OrderedSourceAssignmentOutcome {
                 report: ScanReport::default(),
-                checkpoint_hint: None,
-                debug_output: None,
+                termination: PageLoopTermination::Partial,
             }),
             Ok(Vec::new()),
             Ok(Err(stage_error)),
@@ -2333,10 +2554,9 @@ mod tests {
         let submitted_error = anyhow!("submitted boom");
 
         let error = resolve_filesystem_lease_results(
-            Ok(AssignmentOutcome {
+            Ok(OrderedSourceAssignmentOutcome {
                 report: ScanReport::default(),
-                checkpoint_hint: None,
-                debug_output: None,
+                termination: PageLoopTermination::Partial,
             }),
             Err(submitted_error),
             // stage_result is never reached because submitted fails first.
@@ -2359,10 +2579,9 @@ mod tests {
         let panic_error = anyhow!("drain thread panicked");
 
         let error = resolve_filesystem_lease_results(
-            Ok(AssignmentOutcome {
+            Ok(OrderedSourceAssignmentOutcome {
                 report: ScanReport::default(),
-                checkpoint_hint: None,
-                debug_output: None,
+                termination: PageLoopTermination::Partial,
             }),
             Ok(Vec::new()),
             Err(panic_error),
@@ -3218,15 +3437,20 @@ mod tests {
     }
 
     #[test]
-    fn complete_shard_without_checkpoint_uses_range_start_under_completed_semantics() {
+    fn advance_shard_exhausted_empty_uses_range_start_under_completed_semantics() {
         let dir = tempdir().expect("tempdir");
         let mut coordinator =
-            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x05", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
 
-        complete_shard(&mut coordinator, &identity, &lease, None)
-            .expect("zero-finding shard completion must succeed under Completed semantics");
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::ExhaustedEmpty,
+        )
+        .expect("zero-finding shard completion must succeed under Completed semantics");
 
         let progress = run_progress(&coordinator);
         assert_eq!(progress.active(), 0);
@@ -3235,19 +3459,80 @@ mod tests {
         let summaries = shard_summaries(&coordinator);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status(), ShardStatus::Done);
-        assert_eq!(summaries[0].last_key(), Some(&[0u8][..]));
+        assert_eq!(summaries[0].last_key(), Some(&[0x05u8][..]));
     }
 
     #[test]
-    fn complete_shard_with_checkpoint_uses_receipt_cursor_under_completed_semantics() {
+    fn advance_shard_exhausted_empty_preserves_restored_cursor_after_checkpointed_progress() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"a", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let claimed = claim_lease(&mut coordinator, &identity);
+        let checkpoint = Cursor::with_last_key(item_key("resume.txt"));
+
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &claimed,
+            &FilesystemShardCompletionOutcome::Checkpoint {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .expect("checkpoint-backed shard advance must succeed");
+
+        let resumed = ShardLease::new(
+            Arc::clone(claimed.shard_id_arc()),
+            claimed.lease(),
+            RestoredShardState::new(
+                claimed.restored_state().shard_spec().clone(),
+                checkpoint.clone(),
+                claimed.cursor_semantics(),
+            ),
+            claimed.filesystem_source.clone(),
+            claimed.write_context(),
+            claimed.tenant_secret_key(),
+        );
+
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &resumed,
+            &FilesystemShardCompletionOutcome::ExhaustedEmpty,
+        )
+        .expect(
+            "exhausted-empty completion after resumed progress must preserve the restored cursor",
+        );
+
+        let progress = run_progress(&coordinator);
+        assert_eq!(progress.active(), 0);
+        assert_eq!(progress.done(), 1);
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status(), ShardStatus::Done);
+        assert_eq!(
+            summaries[0].last_key(),
+            checkpoint.last_key().map(|key| key.as_bytes())
+        );
+    }
+
+    #[test]
+    fn advance_shard_complete_uses_receipt_cursor_under_completed_semantics() {
         let dir = tempdir().expect("tempdir");
         let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"a", b"\xFF")], 30_000);
         let identity = worker_identity(Path::new("/fallback"));
         let lease = claim_lease(&mut coordinator, &identity);
         let checkpoint = Cursor::with_last_key(item_key("secret.txt"));
 
-        complete_shard(&mut coordinator, &identity, &lease, Some(&checkpoint))
-            .expect("checkpoint-backed shard completion must succeed");
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::Complete {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .expect("checkpoint-backed shard completion must succeed");
 
         let progress = run_progress(&coordinator);
         assert_eq!(progress.active(), 0);
@@ -3273,6 +3558,37 @@ mod tests {
     }
 
     #[test]
+    fn advance_shard_checkpoint_keeps_shard_active() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"a", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let checkpoint = Cursor::with_last_key(item_key("secret.txt"));
+
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::Checkpoint {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .expect("checkpoint-backed shard advance must succeed");
+
+        let progress = run_progress(&coordinator);
+        assert_eq!(progress.active(), 1);
+        assert_eq!(progress.done(), 0);
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status(), ShardStatus::Active);
+        assert_eq!(
+            summaries[0].last_key(),
+            checkpoint.last_key().map(|key| key.as_bytes())
+        );
+    }
+
+    #[test]
     fn run_filesystem_lease_persists_checkpoint_cursor_for_secret_shard() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
@@ -3284,7 +3600,7 @@ mod tests {
         let findings_sink = InMemoryFindingsSink::new();
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
-        let (report, checkpoint) = run_filesystem_lease(
+        let (report, completion) = run_filesystem_lease(
             Arc::clone(&identity.recorder),
             &persistence,
             &lease,
@@ -3296,7 +3612,9 @@ mod tests {
             report.items_scanned >= 1,
             "scan report should record the scanned file"
         );
-        let checkpoint = checkpoint.expect("non-empty shard should checkpoint");
+        let FilesystemShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("non-empty shard should produce a progress-bearing completion");
+        };
         assert!(
             checkpoint.last_key().is_some(),
             "receipt-driven checkpoint should carry a progress key"
@@ -3319,8 +3637,15 @@ mod tests {
         assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedWithFindings);
         assert_eq!(rows[0].write_context(), lease.write_context());
 
-        complete_shard(&mut coordinator, &identity, &lease, Some(&checkpoint))
-            .expect("complete shard");
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::Complete {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .expect("complete shard");
         let summaries = shard_summaries(&coordinator);
         assert_eq!(summaries[0].status(), ShardStatus::Done);
         assert_eq!(
@@ -3330,7 +3655,7 @@ mod tests {
     }
 
     #[test]
-    fn run_filesystem_lease_zero_item_shard_returns_no_checkpoint() {
+    fn run_filesystem_lease_zero_item_shard_returns_exhausted_empty_completion() {
         let dir = tempdir().expect("tempdir");
         let mut coordinator =
             setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
@@ -3340,7 +3665,7 @@ mod tests {
         let persistence =
             DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
 
-        let (report, checkpoint) = run_filesystem_lease(
+        let (report, completion) = run_filesystem_lease(
             Arc::clone(&identity.recorder),
             &persistence,
             &lease,
@@ -3349,7 +3674,7 @@ mod tests {
         .expect("empty filesystem shard should succeed");
 
         assert_eq!(report.items_scanned, 0);
-        assert!(checkpoint.is_none());
+        assert_eq!(completion, FilesystemShardCompletionOutcome::ExhaustedEmpty);
         assert!(
             done_ledger
                 .snapshot()
@@ -3372,7 +3697,7 @@ mod tests {
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
 
-        let (report, checkpoint) = run_filesystem_lease(
+        let (report, completion) = run_filesystem_lease(
             Arc::clone(&identity.recorder),
             &persistence,
             &lease,
@@ -3390,7 +3715,9 @@ mod tests {
             report.items_scanned, 2,
             "ordered-content lease should keep paging until the shard is exhausted"
         );
-        let checkpoint = checkpoint.expect("final committed item should produce a checkpoint");
+        let FilesystemShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("final committed item should produce a progress-bearing completion");
+        };
         assert_eq!(
             checkpoint
                 .last_key()
@@ -3431,7 +3758,7 @@ mod tests {
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
 
-        let (report, checkpoint) = run_filesystem_lease(
+        let (report, completion) = run_filesystem_lease(
             Arc::clone(&identity.recorder),
             &persistence,
             &lease,
@@ -3440,7 +3767,9 @@ mod tests {
         .expect("binary filesystem lease should succeed");
 
         assert_eq!(report.binary_skipped, 1);
-        let checkpoint = checkpoint.expect("skipped item should still produce a checkpoint");
+        let FilesystemShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("skipped item should still produce a progress-bearing completion");
+        };
         assert_eq!(
             checkpoint
                 .last_key()
@@ -3473,7 +3802,7 @@ mod tests {
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
 
-        let (report, checkpoint) = run_filesystem_lease(
+        let (report, completion) = run_filesystem_lease(
             Arc::clone(&identity.recorder),
             &persistence,
             &lease,
@@ -3484,8 +3813,11 @@ mod tests {
         assert_eq!(report.items_scanned, 1);
         // Clean files still produce a done-ledger entry ("scanned, nothing
         // found") and advance the checkpoint cursor so resume skips them.
+        let FilesystemShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("clean file should still produce a progress-bearing completion");
+        };
         assert!(
-            checkpoint.is_some(),
+            checkpoint.last_key().is_some(),
             "clean file should still produce a checkpoint cursor for resume"
         );
         assert!(
@@ -3998,7 +4330,7 @@ mod tests {
         let done_ledger = InMemoryDoneLedger::new();
         let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
 
-        let (report, checkpoint) = run_filesystem_lease(
+        let (report, completion) = run_filesystem_lease(
             Arc::clone(&identity.recorder),
             &persistence,
             &lease,
@@ -4011,8 +4343,11 @@ mod tests {
             "both files should be scanned, got {}",
             report.items_scanned,
         );
+        let FilesystemShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("shard with findings should produce a progress-bearing completion");
+        };
         assert!(
-            checkpoint.is_some(),
+            checkpoint.last_key().is_some(),
             "shard with findings should checkpoint"
         );
 
@@ -4033,7 +4368,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_shard_fails_when_lease_is_fenced() {
+    fn advance_shard_fails_when_lease_is_fenced() {
         let dir = tempdir().expect("tempdir");
 
         // Use a very short TTL so our lease expires quickly.
@@ -4046,8 +4381,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let _rival_lease = claim_coordination_lease(&mut coordinator, worker(99));
 
-        let err = complete_shard(&mut coordinator, &identity, &lease, None)
-            .expect_err("completion with stale fence should fail");
+        let err = advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::ExhaustedEmpty,
+        )
+        .expect_err("completion with stale fence should fail");
         assert!(
             matches!(err, DistributedRuntimeError::Coordinator(_)),
             "expected Coordinator error variant, got: {err:?}"
@@ -4197,8 +4537,9 @@ mod tests {
         )
         .expect("lease with deferred item should succeed");
 
-        let checkpoint =
-            checkpoint.expect("at least one terminal item was committed before the deferral");
+        let FilesystemShardCompletionOutcome::Checkpoint { checkpoint } = checkpoint else {
+            panic!("at least one terminal item should be committed before the deferral");
+        };
         assert_eq!(
             checkpoint
                 .last_key()
@@ -4214,6 +4555,517 @@ mod tests {
             rows.len(),
             1,
             "only items committed before the deferred boundary get done-ledger entries"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_rejects_zero_progress_partial_shard_without_exhaustion() {
+        let dir = tempdir().expect("tempdir");
+        // a-large.txt sorts first and exceeds the byte budget, so execution
+        // stops before any receipt-backed progress is possible.
+        fs::write(dir.path().join("a-large.txt"), vec![b'x'; 100_000]).expect("write a");
+        // b-small.txt comes later in key order and must not be used to infer
+        // exhausted-empty completion for the shard.
+        fs::write(dir.path().join("b-small.txt"), clean_fixture()).expect("write b");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
+
+        let err = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig {
+                budgets: ScanBudgets {
+                    max_items: 100,
+                    max_bytes: 1_000,
+                },
+                ..DistributedRuntimeConfig::default()
+            },
+        )
+        .expect_err("partial shard without durable progress must not complete as exhausted-empty");
+
+        assert!(
+            err.to_string()
+                .contains("stopped before confirming exhaustion"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn advance_shard_exhausted_empty_unbounded_lower_bound_uses_range_safe_sentinel() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let claimed = claim_lease(&mut coordinator, &identity);
+        let lease = ShardLease::new(
+            Arc::clone(claimed.shard_id_arc()),
+            claimed.lease(),
+            RestoredShardState::new(
+                ShardSpec::with_range(vec![], vec![0x01]),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+            claimed.filesystem_source.clone(),
+            claimed.write_context(),
+            claimed.tenant_secret_key(),
+        );
+
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::ExhaustedEmpty,
+        )
+        .expect("unbounded-lower-bound exhausted-empty completion must succeed");
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status(), ShardStatus::Done);
+        assert_eq!(
+            summaries[0].last_key(),
+            Some(EMPTY_RANGE_SENTINEL_KEY),
+            "exhausted-empty completion should use the sentinel key when the shard has no lower bound",
+        );
+    }
+
+    #[test]
+    fn advance_shard_rejects_out_of_range_exhausted_empty_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let claimed = claim_lease(&mut coordinator, &identity);
+        let lease = ShardLease::new(
+            Arc::clone(claimed.shard_id_arc()),
+            claimed.lease(),
+            RestoredShardState::new(
+                ShardSpec::with_range(vec![], vec![0x00]),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+            claimed.filesystem_source.clone(),
+            claimed.write_context(),
+            claimed.tenant_secret_key(),
+        );
+
+        let err = advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::ExhaustedEmpty,
+        )
+        .expect_err("out-of-range exhausted-empty fallback must be rejected");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Runtime(_)),
+            "expected Runtime error for out-of-range completion cursor, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("not in bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn advance_shard_rejects_out_of_range_complete_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let claimed = claim_lease(&mut coordinator, &identity);
+        let lease = ShardLease::new(
+            Arc::clone(claimed.shard_id_arc()),
+            claimed.lease(),
+            RestoredShardState::new(
+                ShardSpec::with_range(vec![0x01], vec![0x0F]),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+            claimed.filesystem_source.clone(),
+            claimed.write_context(),
+            claimed.tenant_secret_key(),
+        );
+
+        let err = advance_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::Complete {
+                checkpoint: Cursor::with_last_key(item_key("\x0F")),
+            },
+        )
+        .expect_err("out-of-range progress checkpoint must be rejected");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Runtime(_)),
+            "expected Runtime error for out-of-range completion cursor, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("not in bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_complete_path_scans_required_exhausted_empty_suffix() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("only.txt"), clean_fixture()).expect("write clean fixture");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new());
+
+        let (report, completion) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("single-page complete shard should succeed");
+
+        assert_eq!(report.items_scanned, 1);
+        let FilesystemShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("single terminal page should still produce progress-bearing completion");
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"only.txt"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_multi_page_terminal_exhausted_empty_sequence() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("a.txt"), clean_fixture()).expect("write a");
+        fs::write(dir.path().join("b.txt"), clean_fixture()).expect("write b");
+        fs::write(dir.path().join("c.txt"), clean_fixture()).expect("write c");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+
+        let (report, completion) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig {
+                budgets: ScanBudgets {
+                    max_items: 1,
+                    max_bytes: 1_000_000,
+                },
+                ..DistributedRuntimeConfig::default()
+            },
+        )
+        .expect("multi-page shard should succeed");
+
+        assert_eq!(
+            report.items_scanned, 3,
+            "all three files should be scanned across multiple pages"
+        );
+        let FilesystemShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("3-item shard should produce progress-bearing completion");
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"c.txt"
+        );
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            3,
+            "all three items should have done-ledger entries"
+        );
+    }
+
+    // ── Suffix-protocol test infrastructure ──────────────────────────
+
+    /// Multi-call scripted source for testing page-loop control flow.
+    ///
+    /// Each `fill_page` call pops the next result from the front of the
+    /// queue, increments a counter for test assertions, and panics if
+    /// called more times than scripted.
+    struct MultiStepScriptedSource {
+        pages: std::collections::VecDeque<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
+        fill_page_calls: Arc<AtomicU64>,
+    }
+
+    impl MultiStepScriptedSource {
+        fn new(
+            pages: Vec<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
+        ) -> (Self, Arc<AtomicU64>) {
+            let fill_page_calls = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    pages: pages.into(),
+                    fill_page_calls: Arc::clone(&fill_page_calls),
+                },
+                fill_page_calls,
+            )
+        }
+    }
+
+    impl OrderedContentSource for MultiStepScriptedSource {
+        fn capabilities(&self) -> OrderedContentCapabilities {
+            OrderedContentCapabilities::default()
+        }
+
+        fn fill_page(
+            &mut self,
+            _shard: &ShardSpec,
+            _cursor: &Cursor,
+            _budgets: Budgets,
+        ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError> {
+            self.fill_page_calls.fetch_add(1, Ordering::Relaxed);
+            self.pages
+                .pop_front()
+                .expect("MultiStepScriptedSource: unexpected extra fill_page call")
+        }
+
+        /// Scripted suffix tests do not care about file bytes; they only
+        /// need a stable clean payload when the scan runtime opens an item.
+        fn open(
+            &mut self,
+            _item_ref: &ItemRef,
+            _budgets: Budgets,
+        ) -> Result<Box<dyn std::io::Read + Send>, ReadError> {
+            Ok(Box::new(std::io::Cursor::new(b"clean".to_vec())))
+        }
+    }
+
+    fn suffix_test_item(name: &[u8], size: u64) -> ScanItem {
+        ScanItem::new(
+            ItemKey::try_from_slice(name).expect("item key"),
+            ItemRef::try_from_slice(name).expect("item ref"),
+            StableItemId::from_bytes([name[0]; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(name)),
+        )
+        .with_size_hint(size)
+    }
+
+    /// Run the source-generic page loop with a scripted source and return
+    /// the result. Uses a real engine, commit pipeline, and done-ledger
+    /// so the first page can complete successfully before the second call
+    /// triggers a suffix-protocol violation.
+    fn run_suffix_protocol_test(
+        pages: Vec<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
+    ) -> Result<(OrderedSourceAssignmentOutcome, u64), ScanRuntimeError> {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/suffix"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        let done_ledger = InMemoryDoneLedger::new();
+        let scan_config = lease
+            .scan_config()
+            .clone()
+            .with_workers(1)
+            .with_persist_findings(true);
+
+        let engine = build_runtime_engine(
+            scan_config.rules_file.as_deref(),
+            &scan_config.transform_filter,
+            scan_config.decode_depth,
+            scan_config.anchor_mode,
+        )
+        .expect("engine");
+
+        let cancel = CancellationToken::new();
+        let pipeline = CommitPipeline::start(
+            InMemoryFindingsSink::new(),
+            done_ledger.clone(),
+            CommitPipelineConfig {
+                execution_queue_capacity: 64,
+                outcome_queue_capacity: 64,
+            },
+            cancel.clone(),
+        )
+        .expect("pipeline");
+
+        let recorder = Arc::new(Recorder::default());
+        let rule_fingerprint = {
+            let engine = Arc::clone(&engine);
+            Arc::new(move |rule_id: u32| {
+                RuleFingerprint::from_bytes(engine.rule_fingerprint_bytes(rule_id))
+            }) as Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>
+        };
+
+        let (submitter, drainer) = pipeline.split();
+        let commit = ReceiptCommitSink::new(
+            recorder,
+            Arc::clone(lease.shard_id_arc()),
+            lease.write_context(),
+            lease.tenant_secret_key(),
+            rule_fingerprint,
+            submitter,
+        );
+
+        let out = NullEventOutput;
+        let (mut source, fill_page_calls) = MultiStepScriptedSource::new(pages);
+
+        std::thread::scope(|scope| {
+            let write_context = lease.write_context();
+            let stage_handle = scope.spawn(move || drain_commit_stage(drainer, write_context, 64));
+
+            let result = scan_ordered_source_with_engine(
+                &mut source,
+                &lease,
+                &scan_config,
+                &done_ledger,
+                engine,
+                &out,
+                &commit,
+                &cancel,
+            );
+            let submitted = commit.finish().expect("suffix test sink finish");
+            let CommitStageDrainResult {
+                committed_sequence_nos,
+                ..
+            } = join_scoped(stage_handle, "suffix test drain")
+                .expect("suffix test drain join")
+                .expect("suffix test drain");
+            wait_for_submitted_commits(submitted, committed_sequence_nos)
+                .expect("suffix test durable outcomes");
+            result.map(|outcome| (outcome, fill_page_calls.load(Ordering::Relaxed)))
+        })
+    }
+
+    #[test]
+    fn suffix_protocol_accepts_terminal_page_followed_by_exhausted_empty() {
+        let terminal_page =
+            PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+                .expect("terminal page");
+
+        let (outcome, fill_page_calls) =
+            run_suffix_protocol_test(vec![Ok(Some(terminal_page)), Ok(None)])
+                .expect("terminal page followed by exhausted-empty should succeed");
+
+        assert_eq!(
+            outcome.termination,
+            PageLoopTermination::ExhaustedEmptyConfirmed
+        );
+        assert_eq!(outcome.report.items_scanned, 1);
+        assert_eq!(
+            fill_page_calls, 2,
+            "suffix protocol must perform a second fill_page call to confirm exhausted-empty"
+        );
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_page_after_terminal_page() {
+        let terminal_page =
+            PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+                .expect("terminal page");
+        let follow_up_page = PageBuf::try_new(
+            vec![suffix_test_item(b"b.txt", 20)],
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(item_key("b.txt")),
+            },
+        )
+        .expect("follow-up page");
+
+        let err = run_suffix_protocol_test(vec![Ok(Some(terminal_page)), Ok(Some(follow_up_page))])
+            .expect_err("page after terminal should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("non-empty page after a terminal non-empty page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_second_terminal_page() {
+        let first = PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+            .expect("first terminal page");
+        let second = PageBuf::try_new(vec![suffix_test_item(b"b.txt", 20)], PageState::Complete)
+            .expect("second terminal page");
+
+        let err = run_suffix_protocol_test(vec![Ok(Some(first)), Ok(Some(second))])
+            .expect_err("second terminal page should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("non-empty page after a terminal non-empty page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_exhausted_empty_after_has_more_page() {
+        let has_more_page = PageBuf::try_new(
+            vec![suffix_test_item(b"a.txt", 10)],
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(item_key("a.txt")),
+            },
+        )
+        .expect("has-more page");
+
+        let err = run_suffix_protocol_test(vec![Ok(Some(has_more_page)), Ok(None)])
+            .expect_err("exhausted-empty after has-more should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("exhausted-empty without first emitting a terminal non-empty page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn suffix_protocol_preserves_progress_on_retryable_stop_after_terminal_page() {
+        let terminal_page =
+            PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+                .expect("terminal page");
+
+        let (outcome, fill_page_calls) = run_suffix_protocol_test(vec![
+            Ok(Some(terminal_page)),
+            Err(EnumerateError::rate_limited("simulated rate limit", 100)),
+        ])
+        .expect("retryable stop after terminal should preserve progress");
+
+        assert!(
+            outcome.report.items_scanned >= 1,
+            "committed work from the terminal page should be preserved"
+        );
+        assert_eq!(outcome.termination, PageLoopTermination::Partial);
+        assert_eq!(fill_page_calls, 2);
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_permanent_stop_after_terminal_page() {
+        let terminal_page =
+            PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
+                .expect("terminal page");
+
+        let err = run_suffix_protocol_test(vec![
+            Ok(Some(terminal_page)),
+            Err(EnumerateError::permanent("simulated permanent failure")),
+        ])
+        .expect_err("permanent stop after terminal should still be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("stopped before confirming exhausted-empty suffix"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -583,13 +583,17 @@ impl OrderedContentPrefilteredPage {
 /// Result of one ordered-content page acquisition attempt.
 ///
 /// The variants separate three boundary conditions for one `fill_page` call:
-/// source exhaustion (`Finished`), connector-reported enumerate failure with
-/// retry classification preserved (`Stopped`), and a validated non-empty page
-/// that downstream stages may inspect (`Page`).
+/// exhausted-empty completion (`ExhaustedEmpty`), connector-reported
+/// enumerate failure with retry classification preserved (`Stopped`), and
+/// a validated non-empty page that downstream stages may inspect (`Page`).
+///
+/// Callers that need to distinguish terminal pages (`PageState::Complete`)
+/// from continuation pages (`PageState::HasMore`) should inspect
+/// `page.page().state()` after matching `Page`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedContentExecutionOutcome {
     /// The source reported no in-scope items for the current cursor position.
-    Finished,
+    ExhaustedEmpty,
     /// The source returned one validated page.
     Page(Box<OrderedContentPage>),
     /// The source stopped with a classified enumerate failure.
@@ -925,13 +929,15 @@ impl OrderedContentRuntime {
     ///
     /// Returns:
     ///
-    /// - [`OrderedContentExecutionOutcome::Finished`] when the source reports
-    ///   no more in-scope items for the current cursor,
+    /// - [`OrderedContentExecutionOutcome::ExhaustedEmpty`] when the source
+    ///   reports no more in-scope items for the current cursor,
     /// - [`OrderedContentExecutionOutcome::Stopped`] when `fill_page` returns
     ///   an [`EnumerateError`], preserving the connector's retry
     ///   classification and optional backoff hint, and
-    /// - [`OrderedContentExecutionOutcome::Page`] only after the returned page
-    ///   satisfies the ordered-page contract.
+    /// - [`OrderedContentExecutionOutcome::Page`] only after the returned
+    ///   page satisfies the ordered-page contract. Callers can inspect
+    ///   `page.page().state()` to distinguish terminal (`Complete`) from
+    ///   continuation (`HasMore`) pages.
     ///
     /// # Errors
     ///
@@ -952,7 +958,7 @@ impl OrderedContentRuntime {
 
         let page = match source.fill_page(input.shard(), input.cursor(), input.budgets()) {
             Ok(Some(page)) => page,
-            Ok(None) => return Ok(OrderedContentExecutionOutcome::Finished),
+            Ok(None) => return Ok(OrderedContentExecutionOutcome::ExhaustedEmpty),
             Err(error) => {
                 return Ok(OrderedContentExecutionOutcome::Stopped(
                     OrderedContentStop::from_enumerate_error(error),
@@ -3111,7 +3117,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_source_returns_finished_for_exhausted_source() {
+    fn execute_source_returns_exhausted_empty_for_exhausted_source() {
         let mut source = ScriptedSource::returning(Ok(None));
         let outcome = OrderedContentRuntime::execute_source(
             &mut source,
@@ -3123,7 +3129,7 @@ mod tests {
         )
         .expect("exhausted source");
 
-        assert_eq!(outcome, OrderedContentExecutionOutcome::Finished);
+        assert_eq!(outcome, OrderedContentExecutionOutcome::ExhaustedEmpty);
     }
 
     #[test]
@@ -3237,7 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_source_returns_validated_single_item_complete_page() {
+    fn execute_source_returns_page_with_complete_state_for_single_item() {
         let page =
             PageBuf::try_new(vec![item(b"only.txt", 42)], PageState::Complete).expect("page");
         let mut source = ScriptedSource::returning(Ok(Some(page)));
@@ -3255,6 +3261,7 @@ mod tests {
         let OrderedContentExecutionOutcome::Page(page) = outcome else {
             panic!("expected page outcome");
         };
+        assert!(matches!(page.page().state(), PageState::Complete));
         assert_eq!(page.report().items_scanned, 1);
         assert_eq!(page.report().bytes_scanned, 42);
         assert_eq!(
@@ -3327,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_source_returns_page_for_complete_state() {
+    fn execute_source_returns_page_with_complete_state() {
         let page = PageBuf::try_new(
             vec![item(b"a.txt", 3), item(b"b.txt", 5)],
             PageState::Complete,
@@ -3348,6 +3355,7 @@ mod tests {
         let OrderedContentExecutionOutcome::Page(page) = outcome else {
             panic!("expected page outcome");
         };
+        assert!(matches!(page.page().state(), PageState::Complete));
         assert_eq!(page.report().items_scanned, 2);
         assert_eq!(page.report().bytes_scanned, 8);
         assert_eq!(
@@ -3387,7 +3395,7 @@ mod tests {
         .expect("mixed size_hint page");
 
         let OrderedContentExecutionOutcome::Page(page) = outcome else {
-            panic!("expected page outcome");
+            panic!("expected page outcome, got {outcome:?}");
         };
         assert_eq!(page.report().items_scanned, 2);
         assert_eq!(
