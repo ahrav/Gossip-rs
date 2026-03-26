@@ -3289,7 +3289,7 @@ mod tests {
             .set_auto_complete(false)
             .expect("disable done-ledger auto-complete");
 
-        let coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 200);
+        let coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 2_000);
         let first_run = std::thread::spawn({
             let findings_sink = findings_sink.clone();
             let done_ledger = done_ledger.clone();
@@ -3354,6 +3354,9 @@ mod tests {
             "failing done-ledger op should release"
         );
 
+        // The findings sink is in auto-complete mode, so observations for the
+        // failing commit are already durable before its done-ledger commit was
+        // submitted. No synchronization wait is needed before snapshotting.
         let partial_done_keys = done_ledger
             .snapshot()
             .expect("partial done-ledger snapshot")
@@ -3393,7 +3396,7 @@ mod tests {
         }
         assert!(
             first_run.is_finished(),
-            "worker thread did not terminate within 10s drain window"
+            "worker thread did not terminate within 10s after releasing all pending commits"
         );
 
         let (mut coordinator, first_result) =
