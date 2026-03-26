@@ -3865,4 +3865,60 @@ mod tests {
         };
         assert_eq!(*status, "ok", "zero errors must produce status=ok");
     }
+
+    /// Deferred items (too large for the byte budget) must not advance the
+    /// checkpoint past their key positions. If they did, the next shard claim
+    /// would start after the deferred key and permanently lose the item.
+    #[test]
+    fn run_filesystem_lease_stops_checkpoint_before_deferred_item() {
+        let dir = tempdir().expect("tempdir");
+        // a-small.txt will be admitted (key order: first)
+        fs::write(dir.path().join("a-small.txt"), clean_fixture()).expect("write a");
+        // b-large.txt exceeds the byte budget and will be deferred
+        fs::write(dir.path().join("b-large.txt"), vec![b'x'; 100_000]).expect("write b");
+        // c-small.txt is admitted but comes after b-large.txt in key order
+        fs::write(dir.path().join("c-small.txt"), clean_fixture()).expect("write c");
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let done_ledger = InMemoryDoneLedger::new();
+        let persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+
+        let (_report, checkpoint) = run_filesystem_lease(
+            Arc::clone(&identity.recorder),
+            &persistence,
+            &lease,
+            DistributedRuntimeConfig {
+                budgets: ScanBudgets {
+                    max_items: 100,
+                    // b-large.txt (100 KB) exceeds this budget, triggering deferral.
+                    max_bytes: 1_000,
+                },
+                ..DistributedRuntimeConfig::default()
+            },
+        )
+        .expect("lease with deferred item should succeed");
+
+        let checkpoint =
+            checkpoint.expect("at least one terminal item was committed before the deferral");
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"a-small.txt",
+            "checkpoint must not advance past the deferred item (b-large.txt)"
+        );
+
+        // Only a-small.txt should have a done-ledger entry.
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only items committed before the deferred boundary get done-ledger entries"
+        );
+    }
 }
