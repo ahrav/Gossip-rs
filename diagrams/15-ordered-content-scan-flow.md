@@ -19,9 +19,9 @@ identity derivation, and grey for cross-cutting runtime glue.
 
 ## 1. End-to-End Shard Lifecycle
 
-A claimed shard flows through six sequential phases inside the distributed
-worker loop. Each phase has a single owner module and a well-defined handoff
-contract.
+A claimed shard flows through six phases (eight numbered steps) inside the
+distributed worker loop. Each phase has a single owner module and a
+well-defined handoff contract.
 
 ```mermaid
 %% Diagram: ordered-content-shard-lifecycle
@@ -46,7 +46,7 @@ graph TD
     subgraph Translation["Cross-cutting: Translation + Commit"]
         XLAT["<b>6a. translate_ordered_item</b><br/>ItemResult mapping<br/>finding identity derivation"]
         SINK["<b>6b. submit_ordered_item</b><br/>ReceiptCommitSink<br/>begin_item + finish_item"]
-        PIPE["<b>6c. Commit pipeline</b><br/>findings_sink.batch_upsert<br/>done_ledger.batch_upsert"]
+        PIPE["<b>6c. Commit pipeline</b><br/>findings_sink.upsert_batch<br/>done_ledger.batch_upsert"]
     end
 
     subgraph Checkpoint["B2: Checkpoint Advancement"]
@@ -139,9 +139,12 @@ sequenceDiagram
 
 **Three-outcome dispatch.** The worker loop matches on `ExhaustedEmpty`
 (terminal), `Stopped` (connector failure with retry classification), or
-`Page` (validated, ready for prefiltering). `ExhaustedEmpty` triggers the
-two-call completion pattern: the first empty return is a terminal signal, and
-the coordinator confirms completion on the second call.
+`Page` (validated, ready for prefiltering). `ExhaustedEmpty` is the
+second half of a two-call completion pattern: the first call returns a
+non-empty terminal page (`PageState::Complete`), transitioning the runtime
+page loop to `AwaitingExhaustedEmpty`; the second `fill_page` call returns
+`Ok(None)`, confirming exhaustion inside the runtime loop before
+`checkpoint`/`complete` is sent to the coordinator.
 
 ---
 
@@ -237,7 +240,7 @@ sequenceDiagram
                 SRC-->>LOOP: Box<dyn Read>
             end
 
-            note right of LOOP: First chunk: classify_content<br/>Binary -> Skipped(Binary)<br/>BinaryExtractable -> Skipped<br/>Text -> continue scanning
+            note right of LOOP: First chunk: classify_content<br/>Binary -> Skipped(Binary)<br/>BinaryExtractable -> Skipped(BinaryExtractable)<br/>Text -> continue scanning
 
             loop Chunked scan until EOF or budget
                 LOOP->>ENG: scan_chunk_postprocess(buf, metrics)
@@ -290,16 +293,16 @@ graph TD
 
     subgraph Sink["ReceiptCommitSink"]
         META["ordered_item_meta(execution)<br/>-> ItemMeta { stable_item_id, version, size_hint }"]
-        XLAT["translate_ordered_item(execution)<br/>-> Scanned | FailedRetryable | FailedPermanent | Skipped"]
         SUB["submit_ordered_item(execution)<br/>begin_item -> translate -> finish_item"]
+        XLAT["translate_ordered_item(execution)<br/>-> Scanned | FailedRetryable | FailedPermanent | Skipped"]
     end
 
     subgraph Translation["result_translation"]
-        TIR["translate_item_result<br/>findings -> FindingId, OccurrenceId<br/>rule_id -> RuleFingerprint<br/>NormHash -> ObservationId"]
+        TIR["translate_item_result<br/>NormHash -> SecretHash -> FindingId<br/>FindingId + version -> OccurrenceId<br/>TenantId + PolicyHash + OccurrenceId -> ObservationId"]
     end
 
     subgraph Pipeline["CommitPipeline"]
-        FIND["FindingsSink::batch_upsert<br/>findings + occurrences + observations"]
+        FIND["FindingsSink::upsert_batch<br/>findings + occurrences + observations"]
         DL["DoneLedger::batch_upsert<br/>done-ledger row per item"]
         REC["UnitCommitReceipt<br/>CompletedUnit + DurableItemReceipt"]
     end
@@ -311,7 +314,7 @@ graph TD
 
     EXEC --> META
     META --> SUB
-    SUB --> XLAT
+    SUB -->|"calls internally"| XLAT
     XLAT --> TIR
     TIR --> FIND
     TIR --> DL
@@ -376,10 +379,11 @@ ensuring the item is re-scanned on the next shard claim.
 | `ReceiptCommitSink` (translate_ordered_item, submit_ordered_item) | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | `translate_item_result` | `crates/gossip-scanner-runtime/src/result_translation.rs` |
 | `PrefixCheckpointAggregator` | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` |
-| `CommitPipeline` | `crates/gossip-scanner-runtime/src/result_committer.rs` |
+| `CommitPipeline` | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | `FilesystemConnector` | `crates/gossip-connectors/src/filesystem.rs` |
 | `InMemoryDeterministicConnector` | `crates/gossip-connectors/src/in_memory.rs` |
 | `derive_ovid_hash` | `crates/gossip-contracts/src/persistence/ovid.rs` |
 | `DoneLedger::batch_get` | `crates/gossip-contracts/src/persistence/done_ledger.rs` |
 | `validate_page_sequence` | `crates/gossip-contracts/src/connector/common.rs` |
-| Page loop (`execute_ordered_content_page_loop`) | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| `validate_page_contract` (wraps `validate_page_sequence`) | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
+| Page loop (`scan_ordered_source_with_engine`) | `crates/gossip-scanner-runtime/src/distributed.rs` |
