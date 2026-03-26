@@ -1188,8 +1188,10 @@ const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
 /// authoritative receipt-backed checkpoint cursor. `Checkpoint` means the scan
 /// stopped early after a checkpointable cursor was available, so the worker
 /// must preserve progress without terminally completing the shard.
-/// `ExhaustedEmpty` means the scan observed exhausted-empty before any durable
-/// committed unit existed, so completion must use a range-safe fallback cursor.
+/// `ExhaustedEmpty` means the scan observed exhausted-empty without producing a
+/// new receipt-backed checkpoint in this claim. Completion preserves the
+/// restored resume cursor when the shard already had prior progress and falls
+/// back to a range-safe cursor only for truly initial empty shards.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FilesystemShardCompletionOutcome {
     ExhaustedEmpty,
@@ -1602,6 +1604,12 @@ where
         let (page, terminal) = match OrderedContentRuntime::execute_source(source, &runtime_input)?
         {
             OrderedContentExecutionOutcome::ExhaustedEmpty => {
+                if phase == PageLoopPhase::Paging && executed_any_page {
+                    return Err(ScanRuntimeError::Driver(anyhow!(
+                        "ordered-content source reported exhausted-empty \
+                         without first emitting a terminal non-empty page"
+                    )));
+                }
                 termination = PageLoopTermination::ExhaustedEmptyConfirmed;
                 break;
             }
@@ -4998,6 +5006,26 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("non-empty page after a terminal non-empty page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn suffix_protocol_rejects_exhausted_empty_after_has_more_page() {
+        let has_more_page = PageBuf::try_new(
+            vec![suffix_test_item(b"a.txt", 10)],
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(item_key("a.txt")),
+            },
+        )
+        .expect("has-more page");
+
+        let err = run_suffix_protocol_test(vec![Ok(Some(has_more_page)), Ok(None)])
+            .expect_err("exhausted-empty after has-more should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("exhausted-empty without first emitting a terminal non-empty page"),
             "unexpected error: {err}"
         );
     }
