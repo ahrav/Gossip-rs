@@ -2566,6 +2566,130 @@ mod tests {
     }
 
     #[test]
+    fn execute_scan_misses_rejects_zero_max_items() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"aaa");
+        let page = prefiltered_page(
+            vec![(
+                item(b"a.txt", 3),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 0,
+                max_bytes: 1_024,
+            });
+
+        let err = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect_err("zero max_items must be rejected");
+
+        assert!(
+            matches!(err, ScanRuntimeError::ConnectorInput(_)),
+            "expected ConnectorInput variant, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("max_items"),
+            "error should name the invalid field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_rejects_zero_max_bytes() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"aaa");
+        let page = prefiltered_page(
+            vec![(
+                item(b"a.txt", 3),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 0,
+            });
+
+        let err = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect_err("zero max_bytes must be rejected");
+
+        assert!(
+            matches!(err, ScanRuntimeError::ConnectorInput(_)),
+            "expected ConnectorInput variant, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("max_bytes"),
+            "error should name the invalid field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_byte_budget_exhaustion_defers_after_consumption() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"0123456789"); // 10 bytes of content
+        source.insert(b"b.txt", b"01234"); // 5 bytes of content
+        let page = prefiltered_page(
+            vec![
+                (
+                    item(b"a.txt", 10),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"b.txt", 5),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        // Budget: 12 bytes total, 8 items.
+        // A consumes 10 bytes -> remaining = 2. B's size_hint(5) > 2 -> deferred.
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 12,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(
+            execution.outcomes().len(),
+            1,
+            "only item A should be scanned"
+        );
+        assert_eq!(
+            execution.outcomes()[0].item().item_key().as_bytes(),
+            b"a.txt",
+            "scanned item must be A"
+        );
+        assert!(
+            matches!(
+                execution.outcomes()[0].outcome(),
+                OrderedContentItemOutcome::Scanned { .. }
+            ),
+            "A should have a Scanned outcome"
+        );
+        assert_eq!(
+            execution.deferred().len(),
+            1,
+            "item B should be deferred because its hint exceeds remaining bytes"
+        );
+        assert_eq!(
+            execution.deferred()[0].item_key().as_bytes(),
+            b"b.txt",
+            "deferred item must be B"
+        );
+    }
+
+    #[test]
     fn execute_source_returns_finished_for_exhausted_source() {
         let mut source = ScriptedSource::returning(Ok(None));
         let outcome = OrderedContentRuntime::execute_source(
@@ -3119,5 +3243,61 @@ mod tests {
         );
         assert_eq!(filtered.already_done_len(), 1);
         assert_eq!(filtered.scan_miss_len(), 2);
+    }
+
+    #[test]
+    fn prefilter_done_ledger_classifies_all_terminal_statuses_as_already_done() {
+        // One item per done-ledger status variant to verify exhaustive classification.
+        let items: Vec<ScanItem> = (0..5).map(indexed_item).collect();
+
+        let ledger = StatusAwareDoneLedger::new([
+            (item_ovid(&items[0]), DoneLedgerStatus::ScannedClean),
+            (item_ovid(&items[1]), DoneLedgerStatus::ScannedWithFindings),
+            (item_ovid(&items[2]), DoneLedgerStatus::FailedPermanent),
+            (item_ovid(&items[3]), DoneLedgerStatus::Skipped),
+            (item_ovid(&items[4]), DoneLedgerStatus::FailedRetryable),
+        ]);
+        let page = OrderedContentPage::from_validated_page(
+            PageBuf::try_new(items, PageState::Complete).expect("page"),
+        );
+
+        let filtered = page
+            .prefilter_done_ledger(write_context(), &ledger)
+            .expect("prefilter succeeds");
+
+        let classifications: Vec<_> = filtered
+            .items()
+            .iter()
+            .map(|ci| (ci.item().item_key().as_bytes().to_vec(), ci.disposition()))
+            .collect();
+
+        // Terminal statuses map to AlreadyDone; transient failure maps to ScanMiss.
+        assert_eq!(
+            classifications[0].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "ScannedClean is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[1].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "ScannedWithFindings is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[2].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "FailedPermanent is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[3].1,
+            OrderedContentPrefilterDisposition::AlreadyDone,
+            "Skipped is terminal and must be classified AlreadyDone"
+        );
+        assert_eq!(
+            classifications[4].1,
+            OrderedContentPrefilterDisposition::ScanMiss,
+            "FailedRetryable is a transient failure and must be classified ScanMiss"
+        );
+        assert_eq!(filtered.already_done_len(), 4);
+        assert_eq!(filtered.scan_miss_len(), 1);
     }
 }
