@@ -1427,6 +1427,15 @@ where
         FilesystemShardCompletionOutcome::Complete { checkpoint } => {
             (checkpoint.as_update(), OpKind::Complete, "completion")
         }
+        FilesystemShardCompletionOutcome::ExhaustedEmpty
+            if lease.resume_cursor().last_key().is_some() =>
+        {
+            (
+                lease.resume_cursor().as_update(),
+                OpKind::Complete,
+                "completion",
+            )
+        }
         FilesystemShardCompletionOutcome::ExhaustedEmpty if lease.range_start().is_empty() => (
             gossip_coordination::CursorUpdate::new(EMPTY_RANGE_SENTINEL_KEY),
             OpKind::Complete,
@@ -3446,6 +3455,60 @@ mod tests {
     }
 
     #[test]
+    fn advance_shard_exhausted_empty_preserves_restored_cursor_after_checkpointed_progress() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"a", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let claimed = claim_lease(&mut coordinator, &identity);
+        let checkpoint = Cursor::with_last_key(item_key("resume.txt"));
+
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &claimed,
+            &FilesystemShardCompletionOutcome::Checkpoint {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .expect("checkpoint-backed shard advance must succeed");
+
+        let resumed = ShardLease::new(
+            Arc::clone(claimed.shard_id_arc()),
+            claimed.lease(),
+            RestoredShardState::new(
+                claimed.restored_state().shard_spec().clone(),
+                checkpoint.clone(),
+                claimed.cursor_semantics(),
+            ),
+            claimed.filesystem_source.clone(),
+            claimed.write_context(),
+            claimed.tenant_secret_key(),
+        );
+
+        advance_shard(
+            &mut coordinator,
+            &identity,
+            &resumed,
+            &FilesystemShardCompletionOutcome::ExhaustedEmpty,
+        )
+        .expect(
+            "exhausted-empty completion after resumed progress must preserve the restored cursor",
+        );
+
+        let progress = run_progress(&coordinator);
+        assert_eq!(progress.active(), 0);
+        assert_eq!(progress.done(), 1);
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status(), ShardStatus::Done);
+        assert_eq!(
+            summaries[0].last_key(),
+            checkpoint.last_key().map(|key| key.as_bytes())
+        );
+    }
+
+    #[test]
     fn advance_shard_complete_uses_receipt_cursor_under_completed_semantics() {
         let dir = tempdir().expect("tempdir");
         let mut coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"a", b"\xFF")], 30_000);
@@ -4865,8 +4928,15 @@ mod tests {
                 &commit,
                 &cancel,
             );
-            let _submitted = commit.finish();
-            let _stage_result = join_scoped(stage_handle, "suffix test drain");
+            let submitted = commit.finish().expect("suffix test sink finish");
+            let CommitStageDrainResult {
+                committed_sequence_nos,
+                ..
+            } = join_scoped(stage_handle, "suffix test drain")
+                .expect("suffix test drain join")
+                .expect("suffix test drain");
+            wait_for_submitted_commits(submitted, committed_sequence_nos)
+                .expect("suffix test durable outcomes");
             result.map(|outcome| (outcome, fill_page_calls.load(Ordering::Relaxed)))
         })
     }

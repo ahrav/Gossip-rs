@@ -56,7 +56,11 @@ The `<task-name>` matches the filename in `runbooks/` without the `.md` extensio
 ### List Available Runbooks
 
 ```bash
-ls runbooks/*.md | sed 's|runbooks/||;s|\.md$||'
+if [ -d runbooks ] && ls runbooks/*.md >/dev/null 2>&1; then
+  ls runbooks/*.md | sed 's|runbooks/||;s|\.md$||'
+else
+  echo "No local runbooks found. Ensure local runbook assets are provisioned."
+fi
 ```
 
 ## Output
@@ -80,4 +84,4 @@ Report these to the user so they can track progress in Jetty.
 | Forgetting to update timeout for long tasks | User-requested timeout goes in `runbook-params.json` `timeout_sec` |
 | Passing wrong task name | Name must match a file in `runbooks/` without `.md`. The script lists available names on error. |
 | Not reporting trajectory ID | Always show the trajectory and workflow IDs in your response |
-| Not knowing which runbook to run | List available runbooks with `ls runbooks/*.md` and ask the user to pick one |
+| Not knowing which runbook to run | Use the guarded runbook-listing command above and ask the user to pick one |

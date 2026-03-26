@@ -104,7 +104,7 @@ Connector-mode filesystem scans acquire one ordered page through
 `OrderedContentRuntime::execute_source` from the real
 `FilesystemConnector`, validate shard bounds and cursor monotonicity,
 and classify enumerate failures from the connector error taxonomy. The
-runtime now maps the ordered filesystem path onto explicit
+runtime maps the ordered filesystem path onto explicit
 `FilesystemShardCompletionOutcome` variants: `ExhaustedEmpty` only after
 the connector confirms exhausted-empty (`Ok(None)` at the page-fill
 boundary), `Complete { checkpoint }` after a terminal non-empty page is
