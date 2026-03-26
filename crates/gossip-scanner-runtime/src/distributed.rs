@@ -1572,8 +1572,8 @@ mod tests {
         connector::{Cursor, ItemKey},
         coordination::ShardSpec,
         identity::{
-            FenceEpoch, FindingId, ObservationId, OccurrenceId, OpId, PolicyHash,
-            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
+            FenceEpoch, FindingId, ObservationId, OccurrenceId, OpId, PolicyHash, RuleFingerprint,
+            RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
             derive_rule_fingerprint,
         },
         persistence::{DoneLedgerKey, DoneLedgerStatus, WriteContext},
