@@ -1963,7 +1963,7 @@ mod tests {
         coordination::ShardSpec,
         identity::{
             FenceEpoch, FindingId, ObjectVersionId, ObservationId, OccurrenceId, OpId, PolicyHash,
-            RuleFingerprint, RunId, ShardId, TenantId, TenantSecretKey, WorkerId,
+            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
             derive_rule_fingerprint,
         },
         persistence::{DoneLedgerKey, DoneLedgerStatus, WriteContext},
