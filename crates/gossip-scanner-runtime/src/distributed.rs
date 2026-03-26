@@ -3407,7 +3407,7 @@ mod tests {
             first_result.expect_err("first worker invocation should fail on done-ledger commit");
         assert!(
             matches!(
-                first_error,
+                &first_error,
                 DistributedRuntimeError::Durability(_) | DistributedRuntimeError::Runtime(_)
             ),
             "expected runtime or durability error, got: {first_error:?}"
