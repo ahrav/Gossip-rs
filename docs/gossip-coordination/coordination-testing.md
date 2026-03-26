@@ -278,7 +278,7 @@ invariant accidentally violates another.
 **Primary files:** `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`, `crates/gossip-coordination/src/sim/mega_sim_tests.rs`, `crates/gossip-coordination/src/sim/overload_tests.rs`, `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs`, `crates/gossip-coordination/src/sim/composition_tests.rs`
 **Declared in:** `crates/gossip-coordination/src/sim/mod.rs` (`#[cfg(test)]`)
 
-Seven sub-tiers exercise the full simulation harness.
+Eight sub-tiers exercise the full simulation harness.
 
 Test-support builds also include a composition harness for the coordination +
 done-ledger boundary. It reuses the same `SimContext` determinism model but
