@@ -1452,6 +1452,18 @@ where
         let page = match OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
             OrderedContentExecutionOutcome::Finished => break,
             OrderedContentExecutionOutcome::Stopped(stop) => {
+                if stop.class().is_retryable() {
+                    // Retryable enumerate failure — preserve partial progress
+                    // by breaking instead of returning an error. The shard is
+                    // completed with a checkpoint at the last committed item,
+                    // and the next claim resumes from there.
+                    tracing::warn!(
+                        message = stop.message(),
+                        retry_after_ms = stop.retry_after_ms(),
+                        "retryable enumerate stop, preserving partial progress",
+                    );
+                    break;
+                }
                 return Err(ScanRuntimeError::Driver(anyhow!("{stop}")));
             }
             OrderedContentExecutionOutcome::Page(page) => page,
@@ -1465,14 +1477,48 @@ where
             config.scan_binary,
             Arc::clone(&engine),
         )?;
-        report += execution.assignment_report();
         executed_any_page = true;
 
+        // Determine the earliest deferred key so we can stop submitting
+        // before the checkpoint advances past a budget-deferred item.
+        let min_deferred_key = execution
+            .deferred()
+            .iter()
+            .map(|item| item.item_key())
+            .min();
+
+        let mut hit_non_terminal = false;
         for item in execution.outcomes() {
+            // A deferred item with a key before this outcome means the
+            // checkpoint would skip past the deferred item if we commit
+            // this outcome. Stop here so the checkpoint stays before the
+            // deferred item's key position.
+            if let Some(dk) = min_deferred_key
+                && dk < item.item().item_key()
+            {
+                hit_non_terminal = true;
+                break;
+            }
+            // Retryable outcomes (truncated / transient-failure) must not
+            // advance the checkpoint — they need to be re-scanned.
+            if item.outcome().is_retryable() {
+                hit_non_terminal = true;
+                break;
+            }
             commit
                 .submit_ordered_item(item)
                 .map_err(ScanRuntimeError::Driver)?;
             emit_ordered_item_findings(out, &engine, item);
+        }
+        report += execution.assignment_report();
+
+        // When non-terminal items (retryable or deferred) block further
+        // progress, stop scanning additional pages. The checkpoint will
+        // only cover items committed before the non-terminal boundary.
+        // On the next shard claim, the page listing resumes from the
+        // checkpoint and re-lists the non-terminal items for retry.
+        if hit_non_terminal {
+            break;
         }
 
         if matches!(execution.page_state(), PageState::Complete) {

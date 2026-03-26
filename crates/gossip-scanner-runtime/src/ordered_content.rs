@@ -734,6 +734,23 @@ pub enum OrderedContentItemOutcome {
     Skipped(OrderedContentSkipReason),
 }
 
+impl OrderedContentItemOutcome {
+    /// Whether this outcome represents a non-terminal condition.
+    ///
+    /// Retryable outcomes must not advance the checkpoint cursor because the
+    /// item needs to be re-scanned on the next shard claim. The checkpoint
+    /// aggregator uses strictly-greater-than cursor semantics, so advancing
+    /// past a retryable item makes it permanently unreachable.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Truncated { .. } => true,
+            Self::Failed(stop) => stop.class().is_retryable(),
+            Self::Scanned { .. } | Self::Skipped(_) => false,
+        }
+    }
+}
+
 /// One executed ordered-content item plus its runtime-local scan report.
 ///
 /// Instances preserve original page order for the admitted `ScanMiss` subset.
@@ -1415,8 +1432,11 @@ fn scan_item_chunks(
 
     let wall_clock_scan_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let (findings_emitted, errors, binary_skipped) = match &outcome {
-        OrderedContentItemOutcome::Scanned { findings }
-        | OrderedContentItemOutcome::Truncated { findings } => (findings.len() as u64, 0, 0),
+        OrderedContentItemOutcome::Scanned { findings } => (findings.len() as u64, 0, 0),
+        // Truncated items are retryable — their prefix findings are not emitted
+        // or persisted, so counting them would inflate the summary relative to
+        // the actual event stream.
+        OrderedContentItemOutcome::Truncated { .. } => (0, 0, 0),
         OrderedContentItemOutcome::Failed(_stop) => (0, 1, 0),
         OrderedContentItemOutcome::Skipped(
             OrderedContentSkipReason::Binary | OrderedContentSkipReason::BinaryExtractable,
