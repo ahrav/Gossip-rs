@@ -4606,9 +4606,7 @@ mod tests {
             _item_ref: &ItemRef,
             _budgets: Budgets,
         ) -> Result<Box<dyn std::io::Read + Send>, ReadError> {
-            Ok(Box::new(std::io::Cursor::new(
-                b"ordinary clean content for suffix protocol tests".to_vec(),
-            )))
+            Ok(Box::new(std::io::Cursor::new(b"clean".to_vec())))
         }
     }
 
