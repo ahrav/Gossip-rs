@@ -150,10 +150,10 @@ Coordinator-side `StaleFence` and `LeaseExpired` rejections from both
 classification after local durable progress exists.
 The ordered page loop polls that token between page acquisitions and
 before queueing new commit work so expiry stops the shard before more
-items are enqueued. Claim retry delays apply full jitter via a BLAKE3
-hash of the current nanosecond timestamp, preventing thundering-herd
-synchronization when multiple workers' leases expire at the same
-time. Successful filesystem lease execution returns an
+items are enqueued. Claim retry delays honor coordinator-provided
+`retry_after` and `earliest_deadline` floors directly, falling back to
+the fixed race-retry delay only when no logical wakeup hint is
+available. Successful filesystem lease execution returns an
 explicit `ShardCompletionOutcome`: `Complete { checkpoint }` uses the
 committed-prefix cursor for terminal completion,
 `Checkpoint { checkpoint }` preserves non-terminal progress through

@@ -457,18 +457,19 @@ pub enum LeaseUncertainty {
         deadline: LogicalTime,
         observed: LogicalTime,
     },
-    /// The coordinator rejected completion because another worker already owns
-    /// a newer fence epoch.
+    /// The coordinator rejected shard advancement because another worker
+    /// already owns a newer fence epoch.
     #[error(
-        "shard completion rejected by a stale fence (presented {presented:?}, current {current:?})"
+        "shard advance rejected by a stale fence (presented {presented:?}, current {current:?})"
     )]
-    CompletionStaleFence {
+    AdvanceStaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
-    /// The coordinator rejected completion because the lease already expired.
-    #[error("shard completion rejected after lease expiry (deadline {deadline:?}, now {now:?})")]
-    CompletionLeaseExpired {
+    /// The coordinator rejected shard advancement because the lease already
+    /// expired.
+    #[error("shard advance rejected after lease expiry (deadline {deadline:?}, now {now:?})")]
+    AdvanceLeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
@@ -1421,28 +1422,6 @@ fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -
         .unwrap_or(CLAIM_RACE_RETRY_DELAY)
 }
 
-/// Apply full jitter to a base delay to prevent thundering-herd
-/// synchronization when multiple workers retry at the same time.
-///
-/// Returns a duration in `[1 ms, base]` using a BLAKE3 hash of the current
-/// nanosecond timestamp as a lightweight, well-distributed source of
-/// randomness. Delays of 1 ms or less are returned unchanged because jitter
-/// below that threshold adds no desynchronization value.
-fn jittered_delay(base: Duration) -> Duration {
-    let base_ms = base.as_millis() as u64;
-    if base_ms <= 1 {
-        return base;
-    }
-    let mut hasher = domain_hasher("gossip.scanner_runtime.distributed.jitter");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    nanos.write_canonical(&mut hasher);
-    let hash = finalize_64(&hasher);
-    Duration::from_millis((hash % base_ms).max(1))
-}
-
 /// Poll a lease deadline until shard execution finishes or the deadline elapses.
 ///
 /// The watcher uses [`std::thread::park_timeout`] instead of
@@ -1540,10 +1519,10 @@ where
                 if progress.active() == 0 {
                     return Ok(None);
                 }
-                std::thread::sleep(jittered_delay(claim_retry_delay(now, earliest_deadline)));
+                std::thread::sleep(claim_retry_delay(now, earliest_deadline));
             }
             Err(ClaimError::Throttled { retry_after }) => {
-                std::thread::sleep(jittered_delay(claim_retry_delay(now, Some(retry_after))));
+                std::thread::sleep(claim_retry_delay(now, Some(retry_after)));
             }
             Err(error) => {
                 return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
@@ -1633,31 +1612,10 @@ where
     }
 
     let op_id = deterministic_op_id(lease.lease().shard_key(), lease.lease().fence(), op_kind);
-    let applied = match outcome {
-        ShardCompletionOutcome::Checkpoint { .. } => coordinator
-            .checkpoint(
-                wall_clock_now(),
-                identity.tenant,
-                &lease.lease(),
-                &cursor,
-                op_id,
-            )
-            .map_err(|error| match error {
-                CheckpointError::StaleFence { presented, current } => {
-                    DistributedRuntimeError::LeaseUncertain(
-                        LeaseUncertainty::CompletionStaleFence { presented, current },
-                    )
-                }
-                CheckpointError::LeaseExpired { deadline, now } => {
-                    DistributedRuntimeError::LeaseUncertain(
-                        LeaseUncertainty::CompletionLeaseExpired { deadline, now },
-                    )
-                }
-                other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
-            })?,
-        ShardCompletionOutcome::Complete { .. } | ShardCompletionOutcome::ExhaustedEmpty => {
-            coordinator
-                .complete(
+    let applied =
+        match outcome {
+            ShardCompletionOutcome::Checkpoint { .. } => coordinator
+                .checkpoint(
                     wall_clock_now(),
                     identity.tenant,
                     &lease.lease(),
@@ -1665,20 +1623,42 @@ where
                     op_id,
                 )
                 .map_err(|error| match error {
-                    CompleteError::StaleFence { presented, current } => {
+                    CheckpointError::StaleFence { presented, current } => {
                         DistributedRuntimeError::LeaseUncertain(
-                            LeaseUncertainty::CompletionStaleFence { presented, current },
+                            LeaseUncertainty::AdvanceStaleFence { presented, current },
                         )
                     }
-                    CompleteError::LeaseExpired { deadline, now } => {
+                    CheckpointError::LeaseExpired { deadline, now } => {
                         DistributedRuntimeError::LeaseUncertain(
-                            LeaseUncertainty::CompletionLeaseExpired { deadline, now },
+                            LeaseUncertainty::AdvanceLeaseExpired { deadline, now },
                         )
                     }
                     other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
-                })?
-        }
-    };
+                })?,
+            ShardCompletionOutcome::Complete { .. } | ShardCompletionOutcome::ExhaustedEmpty => {
+                coordinator
+                    .complete(
+                        wall_clock_now(),
+                        identity.tenant,
+                        &lease.lease(),
+                        &cursor,
+                        op_id,
+                    )
+                    .map_err(|error| match error {
+                        CompleteError::StaleFence { presented, current } => {
+                            DistributedRuntimeError::LeaseUncertain(
+                                LeaseUncertainty::AdvanceStaleFence { presented, current },
+                            )
+                        }
+                        CompleteError::LeaseExpired { deadline, now } => {
+                            DistributedRuntimeError::LeaseUncertain(
+                                LeaseUncertainty::AdvanceLeaseExpired { deadline, now },
+                            )
+                        }
+                        other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
+                    })?
+            }
+        };
 
     if !applied.is_executed() {
         tracing::info!(
@@ -2748,7 +2728,7 @@ mod tests {
             deadline: LogicalTime::from_raw(10),
             observed: LogicalTime::from_raw(11),
         };
-        let second = LeaseUncertainty::CompletionStaleFence {
+        let second = LeaseUncertainty::AdvanceStaleFence {
             presented: FenceEpoch::from_raw(1),
             current: FenceEpoch::from_raw(2),
         };
@@ -4629,35 +4609,6 @@ mod tests {
     }
 
     #[test]
-    fn jittered_delay_stays_within_bounds() {
-        for base_ms in [2, 10, 25, 100, 1000] {
-            let base = Duration::from_millis(base_ms);
-            for _ in 0..20 {
-                let result = jittered_delay(base);
-                assert!(
-                    result >= Duration::from_millis(1),
-                    "jittered delay must be at least 1 ms, got {result:?} for base {base_ms} ms"
-                );
-                assert!(
-                    result <= base,
-                    "jittered delay must not exceed base, got {result:?} for base {base_ms} ms"
-                );
-                // Yield briefly so the nanosecond input changes between iterations.
-                std::thread::yield_now();
-            }
-        }
-    }
-
-    #[test]
-    fn jittered_delay_returns_base_for_one_ms() {
-        assert_eq!(
-            jittered_delay(Duration::from_millis(1)),
-            Duration::from_millis(1),
-            "1 ms base must pass through without jitter"
-        );
-    }
-
-    #[test]
     fn watch_lease_deadline_exits_promptly_on_unpark() {
         let signal = LeaseUncertaintySignal::default();
         let cancel = CancellationToken::new();
@@ -4846,9 +4797,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                DistributedRuntimeError::LeaseUncertain(
-                    LeaseUncertainty::CompletionStaleFence { .. }
-                )
+                DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceStaleFence { .. })
             ),
             "expected LeaseUncertain stale-fence variant, got: {err:?}"
         );
@@ -4878,7 +4827,7 @@ mod tests {
             matches!(
                 err,
                 DistributedRuntimeError::LeaseUncertain(
-                    LeaseUncertainty::CompletionLeaseExpired { .. }
+                    LeaseUncertainty::AdvanceLeaseExpired { .. }
                 )
             ),
             "expected LeaseUncertain lease-expired variant, got: {err:?}"
@@ -4910,9 +4859,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                DistributedRuntimeError::LeaseUncertain(
-                    LeaseUncertainty::CompletionStaleFence { .. }
-                )
+                DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceStaleFence { .. })
             ),
             "expected LeaseUncertain stale-fence variant, got: {err:?}"
         );
@@ -4941,7 +4888,7 @@ mod tests {
             matches!(
                 err,
                 DistributedRuntimeError::LeaseUncertain(
-                    LeaseUncertainty::CompletionLeaseExpired { .. }
+                    LeaseUncertainty::AdvanceLeaseExpired { .. }
                 )
             ),
             "expected LeaseUncertain lease-expired variant, got: {err:?}"
