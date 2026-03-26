@@ -85,9 +85,7 @@ use gossip_contracts::{
         RuleFingerprint, RunId, ShardKey, TenantId, TenantSecretKey, WorkerId, domain_hasher,
         finalize_64,
     },
-    persistence::{
-        CheckpointCommitReceipt, DoneLedger, DoneLedgerErrorCode, FindingsSink, WriteContext,
-    },
+    persistence::{CheckpointCommitReceipt, DoneLedger, FindingsSink, WriteContext},
 };
 use gossip_coordination::{
     AcquireResultView, AcquireScratch, ClaimError, CoordinationFacade, CursorSemantics, Lease,
@@ -116,7 +114,6 @@ use crate::{
     ordered_content::{
         OrderedContentExecutionOutcome, OrderedContentItemExecution, OrderedContentItemOutcome,
         OrderedContentReadStop, OrderedContentRuntime, OrderedContentRuntimeInput,
-        OrderedContentScanMissExecution, OrderedContentSkipReason,
     },
     result_translation::{ItemResult, ScanTiming, translate_item_result},
 };
@@ -1794,6 +1791,7 @@ mod tests {
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
         coordination_sink::{CommitProgressRecord, StoredGitEvent},
+        ordered_content::OrderedContentSkipReason,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3690,16 +3688,16 @@ mod tests {
 
     #[test]
     fn ordered_content_error_codes_are_valid_and_match_expected_values() {
-        let failure = ordered_content_failure_code();
+        let failure = OrderedContentReadStop::failure_code();
         assert_eq!(failure.as_str(), "READ_FAILED");
 
-        let truncation = ordered_content_truncation_code();
+        let truncation = OrderedContentReadStop::truncation_code();
         assert_eq!(truncation.as_str(), "TRUNCATED");
 
-        let binary = ordered_content_skip_code(OrderedContentSkipReason::Binary);
+        let binary = OrderedContentSkipReason::Binary.done_ledger_code();
         assert_eq!(binary.as_str(), "BINARY");
 
-        let extractable = ordered_content_skip_code(OrderedContentSkipReason::BinaryExtractable);
+        let extractable = OrderedContentSkipReason::BinaryExtractable.done_ledger_code();
         assert_eq!(extractable.as_str(), "BINARY_EXTRACTABLE");
     }
 

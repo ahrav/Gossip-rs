@@ -1060,6 +1060,7 @@ impl OrderedContentRuntime {
             <scanner_engine::Engine as ScanEngine>::max_findings_per_chunk(&engine),
         );
         let mut scan_metrics = WorkerMetricsLocal::new();
+        let mut findings_scratch: Vec<FsFindingRecord> = Vec::new();
 
         let (classified, page_state, page_report, resume_cursor) = page.into_parts();
         let mut outcomes = Vec::new();
@@ -1120,6 +1121,7 @@ impl OrderedContentRuntime {
                             &mut scan_scratch,
                             &mut scan_pending,
                             &mut scan_metrics,
+                            &mut findings_scratch,
                         )?
                     } else {
                         execute_item_via_open(
@@ -1134,6 +1136,7 @@ impl OrderedContentRuntime {
                             &mut scan_scratch,
                             &mut scan_pending,
                             &mut scan_metrics,
+                            &mut findings_scratch,
                         )?
                     };
 
@@ -1289,12 +1292,13 @@ fn scan_item_chunks(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
+    findings_scratch: &mut Vec<FsFindingRecord>,
     mut read_next: impl FnMut(u64, &mut [u8], u64) -> Result<usize, OrderedContentReadStop>,
 ) -> OrderedContentItemResult {
     let overlap = <scanner_engine::Engine as ScanEngine>::required_overlap(engine);
     pending.clear();
     *metrics = WorkerMetricsLocal::new();
-    let mut findings = Vec::new();
+    findings_scratch.clear();
     let started_at = Instant::now();
     let mut connector_bytes_consumed = 0u64;
     let mut offset = 0u64;
@@ -1319,9 +1323,13 @@ fn scan_item_chunks(
                 Ok(_) | Err(_) => false,
             };
             if eof {
-                break OrderedContentItemOutcome::Scanned { findings };
+                break OrderedContentItemOutcome::Scanned {
+                    findings: std::mem::take(findings_scratch),
+                };
             }
-            break OrderedContentItemOutcome::Truncated { findings };
+            break OrderedContentItemOutcome::Truncated {
+                findings: std::mem::take(findings_scratch),
+            };
         }
         let read_max = chunk_size
             .min(buf.len().saturating_sub(carry))
@@ -1329,7 +1337,9 @@ fn scan_item_chunks(
         if read_max == 0 {
             // Buffer too small to make progress; unreachable after the
             // chunk_size > 0 guard, but safe to treat as truncated.
-            break OrderedContentItemOutcome::Truncated { findings };
+            break OrderedContentItemOutcome::Truncated {
+                findings: std::mem::take(findings_scratch),
+            };
         }
 
         let n = match read_next(
@@ -1341,7 +1351,9 @@ fn scan_item_chunks(
             Err(stop) => break OrderedContentItemOutcome::Failed(stop),
         };
         if n == 0 {
-            break OrderedContentItemOutcome::Scanned { findings };
+            break OrderedContentItemOutcome::Scanned {
+                findings: std::mem::take(findings_scratch),
+            };
         }
 
         connector_bytes_consumed = connector_bytes_consumed.saturating_add(n as u64);
@@ -1393,7 +1405,7 @@ fn scan_item_chunks(
             &buf[..total_len],
             metrics,
         );
-        append_findings(pending, &mut findings);
+        append_findings(pending, findings_scratch);
 
         offset = offset.saturating_add(n as u64);
         have = total_len;
@@ -1439,6 +1451,7 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
+    findings_scratch: &mut Vec<FsFindingRecord>,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
     let item_byte_budget = item_byte_budget(&item, remaining_bytes);
     let item_ref = item.item_ref().clone();
@@ -1453,6 +1466,7 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
+        findings_scratch,
         move |offset, dst, remaining_item_bytes| {
             let budgets = connector_read_budgets(remaining_item_bytes).map_err(|error| {
                 OrderedContentReadStop {
@@ -1489,6 +1503,7 @@ fn execute_item_via_open<S: OrderedContentSource>(
     scratch: &mut RealEngineScratch,
     pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
     metrics: &mut WorkerMetricsLocal,
+    findings_scratch: &mut Vec<FsFindingRecord>,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
     let item_byte_budget = item_byte_budget(&item, remaining_bytes);
     // Open the reader with one byte of headroom beyond the scan budget so the
@@ -1522,6 +1537,7 @@ fn execute_item_via_open<S: OrderedContentSource>(
         scratch,
         pending,
         metrics,
+        findings_scratch,
         // Sequential io::Read — offset tracking is implicit, no seek support.
         // The byte budget is enforced by scan_item_chunks, which sizes each
         // read slice to the remaining item budget.
