@@ -133,6 +133,10 @@ The distributed module exports the concrete worker-loop types and helpers:
 `gossip-frontier` for shard metadata decoding. Filesystem lease
 execution starts a lease-deadline watchdog that drives the shared
 `CancellationToken` when the claimed lease is no longer trustworthy.
+Successful receipt-drain completion seals the local deadline signal
+before the watchdog joins, so any lease rejection after durable local
+completion is decided by the coordinator `complete`/`checkpoint` call
+rather than by a late local watchdog tick.
 The ordered page loop polls that token between page acquisitions and
 before queueing new commit work so expiry stops the shard before more
 items are enqueued. Successful filesystem lease execution returns an

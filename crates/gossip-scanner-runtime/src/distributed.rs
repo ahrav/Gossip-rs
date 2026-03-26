@@ -475,27 +475,59 @@ pub enum LeaseUncertainty {
 }
 
 /// Shared lease-uncertainty signal written by the deadline watcher.
+///
+/// The signal can be sealed once the receipt drain finishes successfully so a
+/// later wall-clock expiry does not retroactively invalidate a completed local
+/// durability stage.
+#[derive(Clone, Debug, Default)]
+enum LeaseUncertaintyState {
+    #[default]
+    Open,
+    Recorded(LeaseUncertainty),
+    Closed,
+}
+
+/// Shared lease-uncertainty signal written by the deadline watcher and sealed
+/// when the local durability stage has finished successfully.
 #[derive(Clone, Debug, Default)]
 struct LeaseUncertaintySignal {
-    reason: Arc<Mutex<Option<LeaseUncertainty>>>,
+    state: Arc<Mutex<LeaseUncertaintyState>>,
 }
 
 impl LeaseUncertaintySignal {
-    fn note(&self, reason: LeaseUncertainty) {
+    fn note(&self, reason: LeaseUncertainty) -> bool {
         let mut guard = self
-            .reason
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_none() {
-            *guard = Some(reason);
+        match &*guard {
+            LeaseUncertaintyState::Open => {
+                *guard = LeaseUncertaintyState::Recorded(reason);
+                true
+            }
+            LeaseUncertaintyState::Recorded(_) | LeaseUncertaintyState::Closed => false,
+        }
+    }
+
+    fn close(&self) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*guard, LeaseUncertaintyState::Open) {
+            *guard = LeaseUncertaintyState::Closed;
         }
     }
 
     fn current(&self) -> Option<LeaseUncertainty> {
-        self.reason
+        match &*self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        {
+            LeaseUncertaintyState::Recorded(reason) => Some(reason.clone()),
+            LeaseUncertaintyState::Open | LeaseUncertaintyState::Closed => None,
+        }
     }
 }
 
@@ -1407,11 +1439,12 @@ fn watch_lease_deadline(
 
         let now = wall_clock_now();
         if now.as_raw() >= deadline.as_raw() {
-            signal.note(LeaseUncertainty::DeadlineElapsed {
+            if signal.note(LeaseUncertainty::DeadlineElapsed {
                 deadline,
                 observed: now,
-            });
-            cancel.cancel();
+            }) {
+                cancel.cancel();
+            }
             return;
         }
 
@@ -1970,8 +2003,18 @@ where
     let (outcome, submitted, stage_result, watch_result) = std::thread::scope(|scope| {
         let write_context = lease.write_context();
         let max_buffered = config.commit_queue_capacity.get();
-        let stage_handle =
-            scope.spawn(move || drain_commit_stage(drainer, write_context, max_buffered));
+        let stage_handle = scope.spawn({
+            let done = Arc::clone(&lease_watch_done);
+            let signal = lease_uncertainty.clone();
+            move || {
+                let result = drain_commit_stage(drainer, write_context, max_buffered);
+                if result.is_ok() {
+                    signal.close();
+                }
+                done.store(true, Ordering::Release);
+                result
+            }
+        });
         let deadline_handle = scope.spawn({
             let cancel = cancel.clone();
             let done = Arc::clone(&lease_watch_done);
@@ -2659,13 +2702,37 @@ mod tests {
             current: FenceEpoch::from_raw(2),
         };
 
-        signal.note(first.clone());
-        signal.note(second);
+        assert!(
+            signal.note(first.clone()),
+            "first note() should record the reason"
+        );
+        assert!(
+            !signal.note(second),
+            "second note() must not overwrite the first reason"
+        );
 
         assert_eq!(
             signal.current(),
             Some(first),
             "second note() must not overwrite the first reason"
+        );
+    }
+
+    #[test]
+    fn lease_uncertainty_signal_close_ignores_late_reason() {
+        let signal = LeaseUncertaintySignal::default();
+        signal.close();
+
+        assert!(
+            !signal.note(LeaseUncertainty::DeadlineElapsed {
+                deadline: LogicalTime::from_raw(10),
+                observed: LogicalTime::from_raw(11),
+            }),
+            "closed signal must reject late deadline notes"
+        );
+        assert!(
+            signal.current().is_none(),
+            "closed signal must not surface a late deadline reason"
         );
     }
 
@@ -2818,6 +2885,49 @@ mod tests {
             error,
             DistributedRuntimeError::LeaseUncertain(actual) if actual == reason
         ));
+    }
+
+    #[test]
+    fn watch_lease_deadline_records_uncertainty_and_cancels_when_open() {
+        let signal = LeaseUncertaintySignal::default();
+        let cancel = CancellationToken::new();
+
+        watch_lease_deadline(
+            LogicalTime::from_raw(1),
+            cancel.clone(),
+            Arc::new(AtomicBool::new(false)),
+            signal.clone(),
+        );
+
+        assert!(cancel.is_cancelled(), "open signal should cancel on expiry");
+        assert!(matches!(
+            signal.current(),
+            Some(LeaseUncertainty::DeadlineElapsed { deadline, .. })
+                if deadline == LogicalTime::from_raw(1)
+        ));
+    }
+
+    #[test]
+    fn watch_lease_deadline_ignores_expiry_after_signal_closes() {
+        let signal = LeaseUncertaintySignal::default();
+        signal.close();
+        let cancel = CancellationToken::new();
+
+        watch_lease_deadline(
+            LogicalTime::from_raw(1),
+            cancel.clone(),
+            Arc::new(AtomicBool::new(false)),
+            signal.clone(),
+        );
+
+        assert!(
+            !cancel.is_cancelled(),
+            "closed signal must suppress late deadline cancellation"
+        );
+        assert!(
+            signal.current().is_none(),
+            "closed signal must not surface a late deadline reason"
+        );
     }
 
     #[test]
