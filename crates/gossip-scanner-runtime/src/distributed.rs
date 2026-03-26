@@ -74,7 +74,7 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
@@ -1421,13 +1421,45 @@ fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -
         .unwrap_or(CLAIM_RACE_RETRY_DELAY)
 }
 
+/// Apply full jitter to a base delay to prevent thundering-herd
+/// synchronization when multiple workers retry at the same time.
+///
+/// Returns a duration in `[1 ms, base]` using a BLAKE3 hash of the current
+/// nanosecond timestamp as a lightweight, well-distributed source of
+/// randomness. Delays of 1 ms or less are returned unchanged because jitter
+/// below that threshold adds no desynchronization value.
+fn jittered_delay(base: Duration) -> Duration {
+    let base_ms = base.as_millis() as u64;
+    if base_ms <= 1 {
+        return base;
+    }
+    let mut hasher = domain_hasher("gossip.scanner_runtime.distributed.jitter");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos.write_canonical(&mut hasher);
+    let hash = finalize_64(&hasher);
+    Duration::from_millis((hash % base_ms).max(1))
+}
+
 /// Poll a lease deadline until shard execution finishes or the deadline elapses.
 ///
-/// The watcher reuses [`claim_retry_delay`] and clamps it to
-/// [`CLAIM_RACE_RETRY_DELAY`] so expiry detection stays responsive without
-/// introducing a separate busy-spin interval.
+/// The watcher uses [`std::thread::park_timeout`] instead of
+/// [`std::thread::sleep`] so the caller can wake it immediately via
+/// [`std::thread::Thread::unpark`] when shard execution completes before the
+/// deadline. The sleep interval is clamped to [`CLAIM_RACE_RETRY_DELAY`] so
+/// expiry detection stays responsive without introducing a separate
+/// busy-spin interval.
+///
+/// Deadline comparison uses a monotonic [`Instant`] to avoid false-positive
+/// or false-negative detection from `CLOCK_REALTIME` jumps (NTP step
+/// corrections, VM live migration, leap seconds). The wall-clock
+/// [`LogicalTime`] deadline is retained only for the diagnostic fields in
+/// [`LeaseUncertainty::DeadlineElapsed`].
 fn watch_lease_deadline(
     deadline: LogicalTime,
+    monotonic_deadline: Instant,
     cancel: CancellationToken,
     done: Arc<AtomicBool>,
     signal: LeaseUncertaintySignal,
@@ -1437,18 +1469,20 @@ fn watch_lease_deadline(
             return;
         }
 
-        let now = wall_clock_now();
-        if now.as_raw() >= deadline.as_raw() {
+        if Instant::now() >= monotonic_deadline {
             if signal.note(LeaseUncertainty::DeadlineElapsed {
                 deadline,
-                observed: now,
+                observed: wall_clock_now(),
             }) {
                 cancel.cancel();
             }
             return;
         }
 
-        std::thread::sleep(claim_retry_delay(now, Some(deadline)).min(CLAIM_RACE_RETRY_DELAY));
+        let remaining = monotonic_deadline
+            .saturating_duration_since(Instant::now())
+            .min(CLAIM_RACE_RETRY_DELAY);
+        std::thread::park_timeout(remaining);
     }
 }
 
@@ -1506,10 +1540,10 @@ where
                 if progress.active() == 0 {
                     return Ok(None);
                 }
-                std::thread::sleep(claim_retry_delay(now, earliest_deadline));
+                std::thread::sleep(jittered_delay(claim_retry_delay(now, earliest_deadline)));
             }
             Err(ClaimError::Throttled { retry_after }) => {
-                std::thread::sleep(claim_retry_delay(now, Some(retry_after)));
+                std::thread::sleep(jittered_delay(claim_retry_delay(now, Some(retry_after))));
             }
             Err(error) => {
                 return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
@@ -1975,6 +2009,12 @@ where
     }
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
+    let monotonic_deadline = Instant::now()
+        + Duration::from_millis(
+            lease_deadline
+                .as_raw()
+                .saturating_sub(start_time.as_raw()),
+        );
     let pipeline = CommitPipeline::start(
         persistence.findings_sink.clone(),
         persistence.done_ledger.clone(),
@@ -2019,7 +2059,7 @@ where
             let cancel = cancel.clone();
             let done = Arc::clone(&lease_watch_done);
             let signal = lease_uncertainty.clone();
-            move || watch_lease_deadline(lease_deadline, cancel, done, signal)
+            move || watch_lease_deadline(lease_deadline, monotonic_deadline, cancel, done, signal)
         });
 
         let outcome = scan_ordered_filesystem_lease_with_engine(
@@ -2034,6 +2074,7 @@ where
         let submitted = commit.finish();
         let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread");
         lease_watch_done.store(true, Ordering::Release);
+        deadline_handle.thread().unpark();
         let watch_result = join_scoped(deadline_handle, "lease deadline watchdog");
 
         (outcome, submitted, stage_result, watch_result)
@@ -2892,8 +2933,11 @@ mod tests {
         let signal = LeaseUncertaintySignal::default();
         let cancel = CancellationToken::new();
 
+        // Monotonic deadline in the past triggers immediate expiry.
+        let expired = Instant::now() - Duration::from_secs(1);
         watch_lease_deadline(
             LogicalTime::from_raw(1),
+            expired,
             cancel.clone(),
             Arc::new(AtomicBool::new(false)),
             signal.clone(),
@@ -2913,8 +2957,10 @@ mod tests {
         signal.close();
         let cancel = CancellationToken::new();
 
+        let expired = Instant::now() - Duration::from_secs(1);
         watch_lease_deadline(
             LogicalTime::from_raw(1),
+            expired,
             cancel.clone(),
             Arc::new(AtomicBool::new(false)),
             signal.clone(),
@@ -4570,6 +4616,75 @@ mod tests {
     fn claim_retry_delay_falls_back_without_deadline() {
         let now = LogicalTime::from_raw(1000);
         assert_eq!(claim_retry_delay(now, None), CLAIM_RACE_RETRY_DELAY);
+    }
+
+    #[test]
+    fn jittered_delay_stays_within_bounds() {
+        for base_ms in [2, 10, 25, 100, 1000] {
+            let base = Duration::from_millis(base_ms);
+            for _ in 0..20 {
+                let result = jittered_delay(base);
+                assert!(
+                    result >= Duration::from_millis(1),
+                    "jittered delay must be at least 1 ms, got {result:?} for base {base_ms} ms"
+                );
+                assert!(
+                    result <= base,
+                    "jittered delay must not exceed base, got {result:?} for base {base_ms} ms"
+                );
+                // Yield briefly so the nanosecond input changes between iterations.
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[test]
+    fn jittered_delay_returns_base_for_one_ms() {
+        assert_eq!(
+            jittered_delay(Duration::from_millis(1)),
+            Duration::from_millis(1),
+            "1 ms base must pass through without jitter"
+        );
+    }
+
+    #[test]
+    fn watch_lease_deadline_exits_promptly_on_unpark() {
+        let signal = LeaseUncertaintySignal::default();
+        let cancel = CancellationToken::new();
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Deadline far in the future — the watchdog should park, not fire.
+        let far_future = Instant::now() + Duration::from_secs(60);
+        let done_clone = Arc::clone(&done);
+        let signal_clone = signal.clone();
+        let cancel_clone = cancel.clone();
+        let handle = std::thread::spawn(move || {
+            watch_lease_deadline(
+                LogicalTime::from_raw(u64::MAX),
+                far_future,
+                cancel_clone,
+                done_clone,
+                signal_clone,
+            );
+        });
+
+        // Signal completion and unpark immediately.
+        done.store(true, Ordering::Release);
+        handle.thread().unpark();
+
+        // The watchdog should exit almost instantly rather than sleeping 25 ms.
+        handle
+            .join()
+            .expect("watchdog thread should not panic");
+
+        assert!(
+            !cancel.is_cancelled(),
+            "early exit via unpark must not trigger cancellation"
+        );
+        assert!(
+            signal.current().is_none(),
+            "early exit via unpark must not record a deadline reason"
+        );
     }
 
     #[test]
