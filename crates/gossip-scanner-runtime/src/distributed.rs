@@ -3289,7 +3289,7 @@ mod tests {
             .set_auto_complete(false)
             .expect("disable done-ledger auto-complete");
 
-        let coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 1_000);
+        let coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 200);
         let first_run = std::thread::spawn({
             let findings_sink = findings_sink.clone();
             let done_ledger = done_ledger.clone();
@@ -3339,8 +3339,7 @@ mod tests {
             assert_eq!(
                 done_ledger.snapshot().expect("done-ledger snapshot").len(),
                 committed + 1,
-                "timed out waiting for done-ledger row {} to become durable",
-                committed + 1
+                "done-ledger durability did not converge within 10s for commit {committed}"
             );
         }
 
@@ -3456,7 +3455,8 @@ mod tests {
             .difference(&done_keys_before_recovery)
             .copied()
             .collect();
-        let expected_new_keys: std::collections::HashSet<_> = expected_done_keys
+        let expected_new_keys: std::collections::HashSet<_> = expected
+            .done_keys
             .iter()
             .copied()
             .filter(|k| !done_keys_before_recovery.contains(k))
