@@ -414,7 +414,7 @@ the receipt-driven durability model:
 4. Constructs a `ReceiptCommitSink` with the sender handle.
 5. Uses `std::thread::scope` to run scan execution and commit-stage draining
    concurrently: scan execution instantiates a `FilesystemConnector`,
-   acquires one ordered page, prefilters it against the done ledger,
+   loops through ordered pages (each prefiltered against the done ledger),
    executes the remaining scan-miss items with the shared engine, emits
    scheduler-compatible finding and summary events, and submits each ordered
    item outcome to `ReceiptCommitSink`. A second thread calls
