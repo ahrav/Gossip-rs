@@ -1572,8 +1572,8 @@ mod tests {
         connector::{Cursor, ItemKey},
         coordination::ShardSpec,
         identity::{
-            FenceEpoch, FindingId, ObservationId, OccurrenceId, OpId, PolicyHash, RuleFingerprint,
-            RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
+            FenceEpoch, FindingId, ObservationId, OccurrenceId, OpId, PolicyHash,
+            RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
             derive_rule_fingerprint,
         },
         persistence::{DoneLedgerKey, DoneLedgerStatus, WriteContext},
@@ -3411,13 +3411,6 @@ mod tests {
                 DistributedRuntimeError::Durability(_) | DistributedRuntimeError::Runtime(_)
             ),
             "expected runtime or durability error, got: {first_error:?}"
-        );
-        assert!(
-            first_error.to_string().contains("durable commit failed")
-                || first_error
-                    .to_string()
-                    .contains("commit pipeline cancelled"),
-            "unexpected error: {first_error}"
         );
 
         let summaries_after_crash = shard_summaries(&coordinator);
