@@ -32,8 +32,11 @@ cycles.
 ```text
 fill_page(shard, cursor, budgets)
   -> Result<Option<PageBuf<ScanItem>>, EnumerateError>
-     Ok(None)          => terminal completion (shard fully enumerated)
+     Ok(None)          => exhausted-empty terminal signal
      Ok(Some(PageBuf)) => { items, state: HasMore{cursor} | Complete }
+                          Complete pages are terminal non-empty pages; the
+                          runtime performs one exhausted-empty suffix call
+                          before treating the shard as fully enumerated.
      for each item:
         open(item_ref, budgets) -> Result<Box<dyn io::Read + Send>, ReadError>
         (optionally) read_range(item_ref, offset, dst, budgets) -> Result<usize, ReadError>

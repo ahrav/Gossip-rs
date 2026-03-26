@@ -787,8 +787,11 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
     let mut source = FilesystemConnector::new(canonical_path);
 
     match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
-        ordered_content::OrderedContentExecutionOutcome::Finished => Ok(ScanReport::default()),
-        ordered_content::OrderedContentExecutionOutcome::Page(page) => {
+        ordered_content::OrderedContentExecutionOutcome::ExhaustedEmpty => {
+            Ok(ScanReport::default())
+        }
+        ordered_content::OrderedContentExecutionOutcome::Page(page)
+        | ordered_content::OrderedContentExecutionOutcome::TerminalPage(page) => {
             if page.page().state().next_cursor().is_some() {
                 let items = page.report().items_scanned;
                 tracing::warn!(
