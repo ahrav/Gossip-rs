@@ -282,7 +282,7 @@ submodules that are part of the crate's public API.
 | ----------------------- | ---------------------------------------------------------- |
 | `GoodputTracker`        | Tracks completion ratio during overload rounds for goodput reporting |
 
-### Composition Extensions (`sim/composition.rs`, `sim/scan_driver_sim.rs`)
+### Composition Extensions (`sim/composition.rs`, `sim/composition_invariants.rs`, `sim/scan_driver_sim.rs`)
 
 | Type | Purpose |
 | ---- | ------- |
@@ -290,7 +290,9 @@ submodules that are part of the crate's public API.
 | `CompositionSimOp` | Operation enum for composition steps: coordinator passthrough, scan lifecycle, and ledger fault injection |
 | `CompositionSimEvent` | Outcome enum for composition operations |
 | `CompositionSimViolation` | Wrapper over coordination and persistence invariant violations |
+| `CompositionInvariantChecker` | Cross-component invariant checker for coordinator ↔ done-ledger provenance (C1–C4) |
 | `CompositionFaultConfig` | Cross-boundary fault-rate configuration for composition simulation |
+| `CrossComponentViolation` | Cross-boundary invariant violation enum for orphaned provenance, fence drift, and post-terminal writes |
 | `DoneLedgerFaultOp` | Imperative done-ledger fault injection operations used by the composition loop |
 | `ProvenanceEntry` | Bridge record linking shard completion to done-ledger writes for cross-component checking |
 | `ScanOutcome` | Synthetic scan result: done-ledger records plus cursor bytes for `complete()` |
