@@ -882,6 +882,7 @@ impl OrderedContentScanMissExecution {
     pub fn assignment_report(&self) -> ScanReport {
         let mut report = self.execution_report();
         report.items_scanned = self.already_done_len() as u64 + self.outcomes().len() as u64;
+        report.items_deferred = self.deferred().len() as u64;
         report
     }
 }
@@ -1715,6 +1716,7 @@ pub(crate) fn scan_local_filesystem_with_engine(
 
         Ok(ScanReport {
             items_scanned: report.stats.files_enqueued,
+            items_deferred: 0,
             bytes_scanned: report.metrics.bytes_scanned,
             chunks_scanned: report.metrics.chunks_scanned,
             findings_emitted: report.metrics.findings_emitted,

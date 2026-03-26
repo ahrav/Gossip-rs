@@ -736,7 +736,13 @@ impl ReceiptCommitSink {
         let sequence_no = self.next_sequence_no();
 
         self.record_begin(&item_key, &meta);
-        let work = self.translate_ordered_item(sequence_no, execution)?;
+        let work = match self.translate_ordered_item(sequence_no, execution) {
+            Ok(work) => work,
+            Err(error) => {
+                self.record_finish(&item_key);
+                return Err(error);
+            }
+        };
         self.submit_queued_commit(&item_key, sequence_no, work)
     }
 
@@ -947,7 +953,7 @@ fn emit_ordered_summary(out: &dyn EventOutput, report: ScanReport) {
     };
     out.emit_core(CoreEvent::Summary(SummaryEvent {
         source: SourceKind::Fs,
-        status: "ok",
+        status: if report.errors == 0 { "ok" } else { "error" },
         elapsed_ms,
         bytes_scanned: report.bytes_scanned,
         findings_emitted: report.findings_emitted,
@@ -3757,7 +3763,10 @@ mod tests {
         };
 
         assert_eq!(*source, SourceKind::Fs);
-        assert_eq!(*status, "ok");
+        assert_eq!(
+            *status, "error",
+            "non-zero errors must produce status=error"
+        );
         // 2_000_000_000 ns = 2000 ms
         assert_eq!(*elapsed_ms, 2000);
         assert_eq!(*bytes_scanned, 10 * 1024 * 1024);
@@ -3768,5 +3777,25 @@ mod tests {
             (*throughput_mib_s - 5.0).abs() < 0.001,
             "expected ~5.0 MiB/s, got {throughput_mib_s}"
         );
+    }
+
+    #[test]
+    fn emit_ordered_summary_reports_ok_when_no_errors() {
+        let report = ScanReport {
+            items_scanned: 10,
+            bytes_scanned: 500,
+            errors: 0,
+            scan_ns: 1_000_000,
+            ..ScanReport::default()
+        };
+
+        let sink = CapturingEventOutput::default();
+        emit_ordered_summary(&sink, report);
+
+        let events = sink.take();
+        let OwnedCoreEvent::Summary { status, .. } = &events[0] else {
+            panic!("expected Summary event");
+        };
+        assert_eq!(*status, "ok", "zero errors must produce status=ok");
     }
 }
