@@ -46,3 +46,7 @@ specs/tla2tools.jar
 .osgrep
 
 .env
+
+runbooks/
+run-runbook.sh
+runbook-params.json

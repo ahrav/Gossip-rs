@@ -731,6 +731,8 @@ impl ReceiptCommitSink {
     fn submit_ordered_item(&self, execution: &OrderedContentItemExecution) -> Result<()> {
         let item_key = execution.item().item_key().clone();
         let meta = Self::ordered_item_meta(execution);
+        // Sequence gap on translation failure is tolerated — the shard terminates
+        // on error, so the gap never reaches wait_for_submitted_commits.
         let sequence_no = self.next_sequence_no();
 
         self.record_begin(&item_key, &meta);
@@ -923,6 +925,11 @@ fn ordered_content_skip_code(reason: OrderedContentSkipReason) -> DoneLedgerErro
     DoneLedgerErrorCode::try_new(code).expect("hardcoded ordered-content error code")
 }
 
+/// Build a shard-level report from a scan-miss execution.
+///
+/// Overrides `items_scanned` to count both already-done items (skipped by the
+/// done-ledger prefilter) and executed outcomes. The execution report's own
+/// `items_scanned` only counts items that were opened/read/scanned.
 fn ordered_content_assignment_report(execution: &OrderedContentScanMissExecution) -> ScanReport {
     let mut report = execution.execution_report();
     report.items_scanned = execution.already_done_len() as u64 + execution.outcomes().len() as u64;
@@ -1481,10 +1488,10 @@ where
     )?;
     let report = ordered_content_assignment_report(&execution);
     for item in execution.outcomes() {
-        emit_ordered_item_findings(out, &engine, item);
         commit
             .submit_ordered_item(item)
             .map_err(ScanRuntimeError::Driver)?;
+        emit_ordered_item_findings(out, &engine, item);
     }
     emit_ordered_summary(out, report);
 

@@ -1411,8 +1411,8 @@ pub(crate) fn scan_local_filesystem(
 /// Run a parallel filesystem scan against a local directory or single file
 /// using a caller-provided detection engine.
 ///
-/// Distributed execution uses this to share one engine instance between the
-/// scan workers and the receipt commit sink's rule-fingerprint lookup.
+/// Reuses a prebuilt engine instance, avoiding redundant rule compilation for
+/// the local filesystem scan path.
 ///
 /// Returns early with a default (zero-count) report if cancellation has
 /// already been requested. Otherwise spawns two scoped forwarder threads
@@ -2360,6 +2360,39 @@ mod tests {
             source.range_calls.is_empty(),
             "open-fallback path should not call read_range"
         );
+    }
+
+    #[test]
+    fn execute_scan_misses_skips_binary_extractable_items() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::default();
+        // NUL-free content with .ipynb extension triggers BinaryExtractable
+        // in the content classifier (extractable extension, no NUL bytes).
+        source.insert(b"notebook.ipynb", b"{}");
+        let page = prefiltered_page(
+            vec![(
+                item(b"notebook.ipynb", 2),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_scan_binary(false)
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1);
+        assert_eq!(
+            execution.outcomes()[0].outcome(),
+            &OrderedContentItemOutcome::Skipped(OrderedContentSkipReason::BinaryExtractable)
+        );
+        assert_eq!(execution.execution_report().binary_skipped, 1);
     }
 
     #[test]
