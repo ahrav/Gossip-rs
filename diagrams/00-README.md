@@ -50,6 +50,7 @@ graph TD
     SP[12-split-operations.md<br/>split_replace + split_residual<br/>5 diagrams]
     SA[13-shard-algebra-types.md<br/>B3 deep dive: types, keys,<br/>hints, builder<br/>7 diagrams]
     CA[14-connector-architecture.md<br/>B4 deep dive: traits, types,<br/>runtime-family bridge, errors<br/>4 diagrams]
+    OCS[15-ordered-content-scan-flow.md<br/>End-to-end shard lifecycle:<br/>fill, prefilter, scan, commit<br/>5 diagrams]
     CR[16-cursor-resume-strategy.md<br/>Two-layer cursor,<br/>token fallback<br/>5 diagrams]
     FW[17-filesystem-walk-state-machine.md<br/>DFS walk, WalkToken,<br/>pruning, safety<br/>5 diagrams]
     SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
@@ -75,6 +76,8 @@ graph TD
     BD --> SA
     SP --> SA
     E2E --> CA
+    CA --> OCS
+    OCS --> CR
     CA --> CR
     CR --> FW
     SE --> SP
@@ -100,6 +103,7 @@ graph TD
     style SP fill:#FFF7ED,stroke:#9A3412
     style SA fill:#FFF7ED,stroke:#9A3412
     style CA fill:#FEE2E2,stroke:#991B1B
+    style OCS fill:#FEE2E2,stroke:#991B1B
     style CR fill:#FEE2E2,stroke:#991B1B
     style FW fill:#FEE2E2,stroke:#991B1B
     style SE fill:#FEE2E2,stroke:#991B1B
@@ -131,20 +135,21 @@ graph TD
 9. `22-done-ledger-postgres.md` — Done-ledger PostgreSQL backend: upsert pipeline, provenance merge, schema
 10. `09-circuit-breaker.md` — Failure isolation for external APIs
 11. `14-connector-architecture.md` — Trait hierarchy, types, runtime-family bridge, error classification
-12. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
-13. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
-14. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
+12. `15-ordered-content-scan-flow.md` — End-to-end ordered-content shard lifecycle: fill, prefilter, scan, commit
+13. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
+14. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
+15. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
 
 **Deep dive into etcd coordination persistence** (after persistence):
-15. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
+16. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
 
 **Cross-cutting concerns** (after any deep dive):
-16. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
-17. `11-tenant-isolation.md` — Cryptographic multi-tenancy
-18. `12-split-operations.md` — Dynamic work distribution via shard splitting
+17. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
+18. `11-tenant-isolation.md` — Cryptographic multi-tenancy
+19. `12-split-operations.md` — Dynamic work distribution via shard splitting
 
 **Deep dive into shard algebra** (after split operations):
-19. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
+20. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
 
 ## File Index
 
@@ -165,6 +170,7 @@ graph TD
 | 12  | `12-split-operations.md`             | 5        | B2, B3           | split_replace, split_residual, coverage validation                        |
 | 13  | `13-shard-algebra-types.md`          | 7        | B3               | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration    |
 | 14  | `14-connector-architecture.md`       | 4        | B4               | Trait hierarchy, core types, runtime-family bridge, error classification  |
+| 15  | `15-ordered-content-scan-flow.md`    | 5        | B4, B5, B2       | End-to-end shard lifecycle, page acquisition, done-ledger prefilter, scan-miss execution, commit pipeline |
 | 16  | `16-cursor-resume-strategy.md`       | 5        | B4               | Two-layer cursor, token encoding, resilience model, resume decision       |
 | 17  | `17-filesystem-walk-state-machine.md`| 5        | B4               | DFS walk, WalkFrame stack, subtree pruning, WalkToken, safety mechanisms  |
 | 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |
@@ -172,7 +178,7 @@ graph TD
 | 20  | `20-etcd-coordinator-persistence.md` | 5        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
 | 21  | `21-findings-postgres-dedup.md`      | 5        | B5               | Batch dedup pipeline, per-layer conflict rules, observation merge, dual convergence, read API surface |
 | 22  | `22-done-ledger-postgres.md`         | 7        | B5               | Backend architecture, batch upsert pipeline, provenance winner-selection, SQL schema/indexes, BIGINT encoding, error hierarchy |
-|     | **Total**                            | **106**  |                  |                                                                           |
+|     | **Total**                            | **111**  |                  |                                                                           |
 
 ## Implementation Status Legend
 
@@ -219,6 +225,7 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `12-split-operations.md`             | `04-boundary-2-coordination/06-split-operations.md`                                                                                                                                         |
 | `13-shard-algebra-types.md`          | `crates/gossip-frontier/src/key_encoding.rs`, `hint.rs`, `builder.rs`; `crates/gossip-contracts/src/coordination/shard_spec.rs`, `split.rs`; `crates/gossip-contracts/src/connector/api.rs` |
 | `14-connector-architecture.md`       | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`, `ordered.rs`, `git.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`, `in_memory.rs`; `crates/gossip-scanner-runtime/src/ordered_content.rs`, `git_repo.rs`, `distributed.rs` |
+| `15-ordered-content-scan-flow.md`    | `crates/gossip-scanner-runtime/src/ordered_content.rs`, `distributed.rs`, `result_translation.rs`, `result_committer.rs`, `checkpoint_aggregator.rs`; `crates/gossip-contracts/src/connector/ordered.rs`, `common.rs`; `crates/gossip-contracts/src/persistence/done_ledger.rs`, `ovid.rs`; `crates/gossip-connectors/src/filesystem.rs`, `in_memory.rs` |
 | `16-cursor-resume-strategy.md`       | `crates/gossip-contracts/src/connector/types.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`                                                                                        |
 | `17-filesystem-walk-state-machine.md`| `crates/gossip-connectors/src/filesystem.rs` (WalkState, WalkFrame, WalkToken, should_skip_subtree)                                                                                                                             |
 | `18-streaming-split-estimation.md`   | `crates/gossip-connectors/src/split_estimator.rs`, `common.rs`; `crates/gossip-contracts/src/connector/api.rs` (choose_split_point)                                                                                             |
