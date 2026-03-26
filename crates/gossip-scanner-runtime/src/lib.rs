@@ -234,21 +234,26 @@ impl CancellationToken {
 /// byte limits; direct local scan paths (`scan_fs_with_runtime`,
 /// `scan_git_with_runtime`) still do not use them.
 ///
-/// Defaults are intentionally conservative (256 items, 1 MB) to bound
-/// memory pressure in distributed workers.
+/// Defaults target a work-to-overhead ratio where the scan engine is
+/// active for tens of milliseconds per page — long enough to amortize
+/// coordination round-trips (typically 10–20 ms) and connector I/O
+/// setup. At 1–2 GB/s engine throughput, 64 MiB yields ~32–64 ms of
+/// scan work per page.  Memory pressure stays bounded because only one
+/// 256 KiB scan buffer is live at a time; the byte budget controls how
+/// many bytes are *read from the source*, not how much RAM is resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudgets {
     /// Maximum items processed between checkpoints.
     pub max_items: usize,
-    /// Runtime-level byte budget knob.
+    /// Total bytes the executor may read from the source per page pass.
     pub max_bytes: u64,
 }
 
 impl Default for ScanBudgets {
     fn default() -> Self {
         Self {
-            max_items: 256,
-            max_bytes: 1_000_000,
+            max_items: 4_096,
+            max_bytes: 64 * 1024 * 1024, // 64 MiB
         }
     }
 }
@@ -602,6 +607,28 @@ pub struct ScanReport {
     pub scan_ns: u64,
     /// Aggregate persistence emission time in nanoseconds.
     pub persist_ns: u64,
+}
+
+impl std::ops::AddAssign for ScanReport {
+    #[allow(clippy::suspicious_op_assign_impl)] // |= for persist_incomplete is intentional (any-incomplete flag)
+    fn add_assign(&mut self, rhs: Self) {
+        self.items_scanned = self.items_scanned.saturating_add(rhs.items_scanned);
+        self.bytes_scanned = self.bytes_scanned.saturating_add(rhs.bytes_scanned);
+        self.chunks_scanned = self.chunks_scanned.saturating_add(rhs.chunks_scanned);
+        self.findings_emitted = self.findings_emitted.saturating_add(rhs.findings_emitted);
+        self.errors = self.errors.saturating_add(rhs.errors);
+        self.binary_skipped = self.binary_skipped.saturating_add(rhs.binary_skipped);
+        self.ext_skipped = self.ext_skipped.saturating_add(rhs.ext_skipped);
+        self.lock_skipped = self.lock_skipped.saturating_add(rhs.lock_skipped);
+        self.binary_extracted = self.binary_extracted.saturating_add(rhs.binary_extracted);
+        self.dropped_findings = self.dropped_findings.saturating_add(rhs.dropped_findings);
+        self.persist_emit_failures = self
+            .persist_emit_failures
+            .saturating_add(rhs.persist_emit_failures);
+        self.persist_incomplete |= rhs.persist_incomplete;
+        self.scan_ns = self.scan_ns.saturating_add(rhs.scan_ns);
+        self.persist_ns = self.persist_ns.saturating_add(rhs.persist_ns);
+    }
 }
 
 /// Incremental progress checkpoint produced by the runtime.

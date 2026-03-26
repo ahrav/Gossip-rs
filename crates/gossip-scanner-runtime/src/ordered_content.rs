@@ -26,7 +26,7 @@
 //!
 //! The ordered-content entrypoints own page validation plus bounded
 //! `scan_miss` execution. Durable translation, receipt emission, and
-//! checkpoint advancement remain in later runtime stages.
+//! checkpoint advancement occur in later runtime stages.
 //!
 //! # Done-ledger prefilter
 //!
@@ -87,8 +87,8 @@ use scanner_engine::content_policy::{CHECK_LEN, ContentVerdict, classify_content
 use scanner_scheduler::events::EventOutput;
 use scanner_scheduler::scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
 use scanner_scheduler::{
-    FileId, FindingWithHashRecord, FsFindingRecord, ScanEngine, WorkerMetricsLocal,
-    carry_overlap_prefix, scan_chunk_postprocess,
+    EngineScratch, FileId, FindingWithHashRecord, FsFindingRecord, RealEngineScratch, ScanEngine,
+    WorkerMetricsLocal, carry_overlap_prefix, scan_chunk_postprocess,
 };
 
 use crate::{
@@ -679,6 +679,10 @@ impl std::fmt::Display for OrderedContentReadStop {
 pub enum OrderedContentSkipReason {
     /// Item content was classified as binary and `scan_binary` was disabled.
     Binary,
+    /// Item is a known extractable binary format (`.ipynb`, `.class`, `.jar`,
+    /// `.pyc`, `.env`); the extraction pipeline requires full-item buffering
+    /// that the ordered-content chunked-read path does not support.
+    BinaryExtractable,
 }
 
 /// Non-durable outcome for one ordered-content item execution attempt.
@@ -694,6 +698,12 @@ pub enum OrderedContentItemOutcome {
     /// Findings are already post-processed through the shared chunk pipeline
     /// (overlap pruning, cross-rule dedupe, and dropped-finding accounting).
     Scanned { findings: Vec<FsFindingRecord> },
+    /// The per-item byte budget was exhausted before the connector signaled EOF.
+    /// Only a prefix of the item was scanned, so findings past the truncation
+    /// point may have been missed. Downstream translation stages must NOT
+    /// persist a terminal done-ledger status for truncated items so they are
+    /// retried on the next pass.
+    Truncated { findings: Vec<FsFindingRecord> },
     /// Connector open/read failed for this item.
     ///
     /// The failure is captured in-band so the page-level execution can still
@@ -751,7 +761,11 @@ impl OrderedContentItemExecution {
 
 /// Ordered execution results for one prefiltered page's `ScanMiss` subset.
 ///
-/// `outcomes` and `deferred` preserve the original page order of miss items.
+/// `outcomes` and `deferred` each preserve the original page order of their
+/// miss items. Items whose `size_hint` exceeds the remaining byte budget are
+/// individually deferred (skipped ahead) so smaller items behind them can still
+/// be processed; this means `deferred` may contain items from the interior of
+/// the page, not only a contiguous suffix.
 /// The page-level `page_state`, `page_report`, and `resume_cursor` values are
 /// carried through unchanged from the input prefiltered page.
 ///
@@ -836,30 +850,6 @@ impl OrderedContentScanMissExecution {
     #[must_use]
     pub fn resume_cursor(&self) -> &Cursor {
         &self.resume_cursor
-    }
-
-    /// Consume the page execution and return its owned parts.
-    #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<OrderedContentItemExecution>,
-        Vec<ScanItem>,
-        usize,
-        PageState,
-        ScanReport,
-        ScanReport,
-        Cursor,
-    ) {
-        (
-            self.outcomes,
-            self.deferred,
-            self.already_done_len,
-            self.page_state,
-            self.page_report,
-            self.execution_report,
-            self.resume_cursor,
-        )
     }
 }
 
@@ -949,6 +939,7 @@ impl OrderedContentRuntime {
             config.budgets,
             config.scan_binary,
             engine,
+            DEFAULT_ORDERED_CHUNK_SIZE,
         )
     }
 
@@ -957,10 +948,12 @@ impl OrderedContentRuntime {
     /// `AlreadyDone` entries are counted but never opened. At most one miss
     /// is in flight at a time. Item-count and byte limits are
     /// enforced before admitting an item, then bridged into per-item connector
-    /// read budgets. If the next miss cannot fit inside the remaining budget,
-    /// that miss and the remaining miss suffix are returned in `deferred`
-    /// without opening them. The returned outcomes are non-durable: this stage
-    /// does not emit receipts, advance checkpoints, or write the done ledger.
+    /// read budgets. A miss whose `size_hint` exceeds the remaining byte
+    /// budget is individually deferred so that smaller items behind it can
+    /// still be processed; when the budget is fully exhausted the remaining
+    /// miss suffix is drained into `deferred`. The returned outcomes are
+    /// non-durable: this stage does not emit receipts, advance checkpoints,
+    /// or write the done ledger.
     ///
     /// # Read strategy
     ///
@@ -973,10 +966,10 @@ impl OrderedContentRuntime {
     ///
     /// If an item exposes `size_hint`, that hint is treated as the minimum
     /// byte budget needed to admit the item. When the hint exceeds the
-    /// remaining page budget, the runtime defers that item and the remaining
-    /// miss suffix without opening them. Items without a `size_hint` inherit
-    /// the remaining page budget because the runtime has no pre-open size
-    /// bound to enforce.
+    /// remaining page budget, only that item is deferred — the loop
+    /// continues to try smaller items behind it. Items without a `size_hint`
+    /// are assigned a fixed cap (16 MiB) to
+    /// prevent a single unbounded item from consuming the entire page budget.
     ///
     /// After admission, `size_hint` also serves as the per-item read cap
     /// (clamped to the remaining page budget). This prevents a single item
@@ -999,10 +992,22 @@ impl OrderedContentRuntime {
         budgets: ScanBudgets,
         scan_binary: bool,
         engine: Arc<scanner_engine::Engine>,
+        chunk_size: usize,
     ) -> Result<OrderedContentScanMissExecution, ScanRuntimeError> {
         budgets.validate()?;
+        if chunk_size == 0 {
+            return Err(ScanRuntimeError::Driver(anyhow!(
+                "ordered-content chunk_size must be greater than 0"
+            )));
+        }
+        let overlap = <scanner_engine::Engine as ScanEngine>::required_overlap(&engine);
+        let mut scan_buf = vec![0u8; chunk_size.saturating_add(overlap)];
+        let mut scan_scratch = <scanner_engine::Engine as ScanEngine>::new_scratch(&engine);
+        let mut scan_pending = Vec::with_capacity(
+            <scanner_engine::Engine as ScanEngine>::max_findings_per_chunk(&engine),
+        );
+        let mut scan_metrics = WorkerMetricsLocal::new();
 
-        let chunk_size = default_ordered_chunk_size();
         let (classified, page_state, page_report, resume_cursor) = page.into_parts();
         let mut outcomes = Vec::new();
         let mut deferred = Vec::new();
@@ -1031,19 +1036,17 @@ impl OrderedContentRuntime {
                         break;
                     }
 
-                    // A size hint is the only pre-open bound we have. If it
-                    // cannot fit in the remaining page budget, we must defer
-                    // this item and the untouched miss suffix.
-                    if let Some(size_hint) = item.size_hint()
-                        && size_hint > remaining_bytes
-                    {
-                        defer_remaining_misses(
-                            item,
-                            &mut classified_iter,
-                            &mut deferred,
-                            &mut already_done_len,
-                        );
-                        break;
+                    // Skip ahead past oversized items instead of deferring the
+                    // entire remaining suffix. The item may be binary or
+                    // extractable, and classification (which skips for free)
+                    // requires reading content. By deferring only this item,
+                    // smaller items behind it still get a chance to be
+                    // processed in the current pass.
+                    let exceeds_budget =
+                        item.size_hint().is_some_and(|hint| hint > remaining_bytes);
+                    if exceeds_budget {
+                        deferred.push(item);
+                        continue;
                     }
 
                     let file_id = FileId(next_file_id);
@@ -1060,6 +1063,10 @@ impl OrderedContentRuntime {
                             scan_binary,
                             remaining_bytes,
                             chunk_size,
+                            &mut scan_buf,
+                            &mut scan_scratch,
+                            &mut scan_pending,
+                            &mut scan_metrics,
                         )?
                     } else {
                         execute_item_via_open(
@@ -1070,18 +1077,17 @@ impl OrderedContentRuntime {
                             scan_binary,
                             remaining_bytes,
                             chunk_size,
+                            &mut scan_buf,
+                            &mut scan_scratch,
+                            &mut scan_pending,
+                            &mut scan_metrics,
                         )?
                     };
 
                     remaining_items = remaining_items.saturating_sub(1);
-                    remaining_bytes = remaining_bytes
-                        .checked_sub(item_result.connector_bytes_consumed)
-                        .ok_or_else(|| {
-                            ScanRuntimeError::Driver(anyhow!(
-                                "ordered-content execution consumed more bytes than budgeted"
-                            ))
-                        })?;
-                    accumulate_scan_report(&mut execution_report, item_result.execution.report());
+                    remaining_bytes =
+                        remaining_bytes.saturating_sub(item_result.connector_bytes_consumed);
+                    execution_report += item_result.execution.report();
                     outcomes.push(item_result.execution);
                 }
             }
@@ -1104,11 +1110,37 @@ struct OrderedContentItemResult {
     connector_bytes_consumed: u64,
 }
 
-/// Reuse the scheduler's default chunk size so direct and connector-backed
-/// scanning exercise the same overlap and post-processing behavior.
-fn default_ordered_chunk_size() -> usize {
-    ParallelScanConfig::default().chunk_size
+/// Clamp an item's declared size to the remaining byte budget.
+///
+/// When the item carries a `size_hint`, that value (floored to 1) is
+/// clamped to `remaining_bytes`.  When no hint is available the item's
+/// true size is unknown, so a fixed cap ([`DEFAULT_UNKNOWN_ITEM_BYTE_CAP`])
+/// prevents a single unbounded item from consuming the entire page
+/// budget, which would otherwise cause a perpetual truncation loop: the
+/// item gets the full budget, is truncated, is retried, gets the full
+/// budget again, and so on.
+fn item_byte_budget(item: &ScanItem, remaining_bytes: u64) -> u64 {
+    item.size_hint()
+        .map(|hint| hint.max(1))
+        .unwrap_or(DEFAULT_UNKNOWN_ITEM_BYTE_CAP)
+        .min(remaining_bytes)
 }
+
+/// Per-item byte cap applied when the connector does not provide a
+/// `size_hint`.  16 MiB covers >99 % of source-code files while leaving
+/// the majority of a 64 MiB page budget available for subsequent items.
+const DEFAULT_UNKNOWN_ITEM_BYTE_CAP: u64 = 16 * 1024 * 1024;
+
+/// Default chunk size for ordered-content scanning (256 KiB).
+///
+/// This value is validated by the engine's buffer-scaling benchmarks
+/// (`scanner_throughput.rs`) and sits in the L2-cache sweet spot
+/// (256 KiB–1 MiB on modern CPUs).  At 2 GB/s engine throughput each
+/// chunk scans in ~128 µs with ~1.5 % per-call overhead — negligible
+/// for Tiers 2–4.  Hyperscan/Vectorscan has no buffer-size preference
+/// beyond "not tiny", so the value is driven by cache residency and
+/// I/O amortization, not by the engine.
+const DEFAULT_ORDERED_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Convert a per-item byte allowance into connector budgets.
 ///
@@ -1117,36 +1149,6 @@ fn default_ordered_chunk_size() -> usize {
 /// allowance for the current item attempt.
 fn connector_read_budgets(max_bytes: u64) -> Result<Budgets, ScanRuntimeError> {
     Budgets::try_new(1, max_bytes, None).map_err(ScanRuntimeError::ConnectorInput)
-}
-
-/// Fold one per-item report into the page-level execution totals.
-///
-/// The caller owns the policy of which counters belong to item execution
-/// versus page enumeration; this helper only performs saturating addition on
-/// the per-item report fields.
-fn accumulate_scan_report(total: &mut ScanReport, report: ScanReport) {
-    total.items_scanned = total.items_scanned.saturating_add(report.items_scanned);
-    total.bytes_scanned = total.bytes_scanned.saturating_add(report.bytes_scanned);
-    total.chunks_scanned = total.chunks_scanned.saturating_add(report.chunks_scanned);
-    total.findings_emitted = total
-        .findings_emitted
-        .saturating_add(report.findings_emitted);
-    total.errors = total.errors.saturating_add(report.errors);
-    total.binary_skipped = total.binary_skipped.saturating_add(report.binary_skipped);
-    total.ext_skipped = total.ext_skipped.saturating_add(report.ext_skipped);
-    total.lock_skipped = total.lock_skipped.saturating_add(report.lock_skipped);
-    total.binary_extracted = total
-        .binary_extracted
-        .saturating_add(report.binary_extracted);
-    total.dropped_findings = total
-        .dropped_findings
-        .saturating_add(report.dropped_findings);
-    total.persist_emit_failures = total
-        .persist_emit_failures
-        .saturating_add(report.persist_emit_failures);
-    total.persist_incomplete |= report.persist_incomplete;
-    total.scan_ns = total.scan_ns.saturating_add(report.scan_ns);
-    total.persist_ns = total.persist_ns.saturating_add(report.persist_ns);
 }
 
 /// Drain `item` and every remaining `ScanMiss` entry from `iter` into
@@ -1190,55 +1192,56 @@ fn build_item_report(
         findings_emitted,
         errors,
         binary_skipped,
-        ext_skipped: 0,
-        lock_skipped: 0,
         binary_extracted: metrics.binary_extracted,
         dropped_findings: metrics.findings_dropped,
-        persist_emit_failures: 0,
-        persist_incomplete: false,
         scan_ns,
-        persist_ns: 0,
+        ..ScanReport::default()
     }
 }
 
 /// Copy engine findings into the runtime's persistence-oriented record type.
 fn append_findings<F: FindingWithHashRecord>(src: &[F], dst: &mut Vec<FsFindingRecord>) {
-    for finding in src {
-        dst.push(FsFindingRecord {
-            rule_id: finding.rule_id(),
-            root_hint_start: finding.root_hint_start(),
-            root_hint_end: finding.root_hint_end(),
-            span_start: finding.span_start(),
-            span_end: finding.span_end(),
-            norm_hash: *finding.norm_hash(),
-            confidence_score: finding.confidence_score(),
-        });
-    }
+    dst.extend(src.iter().map(|finding| FsFindingRecord {
+        rule_id: finding.rule_id(),
+        root_hint_start: finding.root_hint_start(),
+        root_hint_end: finding.root_hint_end(),
+        span_start: finding.span_start(),
+        span_end: finding.span_end(),
+        norm_hash: *finding.norm_hash(),
+        confidence_score: finding.confidence_score(),
+    }));
 }
 
 /// Stream one item's bytes through the shared chunk scan pipeline.
 ///
 /// The callback supplies bytes either via `read_range` or a streaming reader.
 /// Execution stops on the first classified read failure, on EOF, or once the
-/// admitted `item_byte_budget` has been consumed. Budget exhaustion is treated
-/// as a normal end-of-item condition because admission decided up front how
-/// many connector bytes this attempt was allowed to consume.
+/// admitted `item_byte_budget` has been consumed.
+///
+/// After the per-item budget is exhausted, a one-byte EOF probe
+/// distinguishes "connector has no more data" (`Scanned`) from "content
+/// extends beyond the budget" (`Truncated`). Callers that use a budget-
+/// capped reader (the `open` path) must open it with at least one byte of
+/// headroom beyond `item_byte_budget` so the probe can read past the scan
+/// budget and observe real EOF.
+#[allow(clippy::too_many_arguments)]
 fn scan_item_chunks(
     engine: &scanner_engine::Engine,
-    item: &ScanItem,
+    item: ScanItem,
     file_id: FileId,
     scan_binary: bool,
     item_byte_budget: u64,
     chunk_size: usize,
+    buf: &mut [u8],
+    scratch: &mut RealEngineScratch,
+    pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
+    metrics: &mut WorkerMetricsLocal,
     mut read_next: impl FnMut(u64, &mut [u8], u64) -> Result<usize, OrderedContentReadStop>,
 ) -> OrderedContentItemResult {
     let overlap = <scanner_engine::Engine as ScanEngine>::required_overlap(engine);
-    let mut scratch = <scanner_engine::Engine as ScanEngine>::new_scratch(engine);
-    let mut pending =
-        Vec::with_capacity(<scanner_engine::Engine as ScanEngine>::max_findings_per_chunk(engine));
+    pending.clear();
+    *metrics = WorkerMetricsLocal::new();
     let mut findings = Vec::new();
-    let mut metrics = WorkerMetricsLocal::new();
-    let mut buf = vec![0u8; chunk_size.saturating_add(overlap)];
     let started_at = Instant::now();
     let mut connector_bytes_consumed = 0u64;
     let mut offset = 0u64;
@@ -1248,18 +1251,32 @@ fn scan_item_chunks(
 
     let outcome = loop {
         if carry > 0 && have > 0 {
-            carry_overlap_prefix(&mut buf, have, carry);
+            carry_overlap_prefix(buf, have, carry);
         }
 
         let remaining_item_bytes = item_byte_budget.saturating_sub(connector_bytes_consumed);
         if remaining_item_bytes == 0 {
-            break OrderedContentItemOutcome::Scanned { findings };
+            // Budget exhausted. Probe one more byte to distinguish real EOF
+            // from budget-limit EOF. The open path opens the reader with one
+            // byte of headroom beyond the scan budget so this probe can read
+            // past the budget and observe real EOF.
+            let mut probe = [0u8; 1];
+            let eof = match read_next(offset, &mut probe, 1) {
+                Ok(0) => true,
+                Ok(_) | Err(_) => false,
+            };
+            if eof {
+                break OrderedContentItemOutcome::Scanned { findings };
+            }
+            break OrderedContentItemOutcome::Truncated { findings };
         }
         let read_max = chunk_size
             .min(buf.len().saturating_sub(carry))
             .min(usize::try_from(remaining_item_bytes).unwrap_or(usize::MAX));
         if read_max == 0 {
-            break OrderedContentItemOutcome::Scanned { findings };
+            // Buffer too small to make progress; unreachable after the
+            // chunk_size > 0 guard, but safe to treat as truncated.
+            break OrderedContentItemOutcome::Truncated { findings };
         }
 
         let n = match read_next(
@@ -1267,7 +1284,7 @@ fn scan_item_chunks(
             &mut buf[carry..carry + read_max],
             remaining_item_bytes,
         ) {
-            Ok(n) => n,
+            Ok(n) => n.min(read_max),
             Err(stop) => break OrderedContentItemOutcome::Failed(stop),
         };
         if n == 0 {
@@ -1286,26 +1303,44 @@ fn scan_item_chunks(
                 item.item_key().as_bytes(),
                 CHECK_LEN,
             );
-            if matches!(verdict, ContentVerdict::Binary) {
-                break OrderedContentItemOutcome::Skipped(OrderedContentSkipReason::Binary);
+            match verdict {
+                ContentVerdict::Binary => {
+                    // Probe bytes are not charged to the byte budget so that
+                    // binary items are free from a budget perspective, matching
+                    // the filesystem scan path semantics.
+                    connector_bytes_consumed = 0;
+                    break OrderedContentItemOutcome::Skipped(OrderedContentSkipReason::Binary);
+                }
+                ContentVerdict::BinaryExtractable(_) => {
+                    // Extractable formats (.class, .jar, .pyc, .ipynb, .env)
+                    // require full-item buffering for `extract_content`, which
+                    // the ordered-content chunked-read path does not provide.
+                    connector_bytes_consumed = 0;
+                    break OrderedContentItemOutcome::Skipped(
+                        OrderedContentSkipReason::BinaryExtractable,
+                    );
+                }
+                ContentVerdict::Text => {}
             }
-        } else {
-            first_chunk = false;
         }
 
         let total_len = carry + n;
+        debug_assert!(
+            offset >= carry as u64,
+            "base_offset underflow: offset={offset}, carry={carry}"
+        );
         let base_offset = offset.saturating_sub(carry as u64);
         scan_chunk_postprocess(
             engine,
-            &mut scratch,
-            &mut pending,
+            scratch,
+            pending,
             file_id,
             base_offset,
             carry,
             &buf[..total_len],
-            &mut metrics,
+            metrics,
         );
-        append_findings(&pending, &mut findings);
+        append_findings(pending, &mut findings);
 
         offset = offset.saturating_add(n as u64);
         have = total_len;
@@ -1314,19 +1349,22 @@ fn scan_item_chunks(
 
     let wall_clock_scan_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let (findings_emitted, errors, binary_skipped) = match &outcome {
-        OrderedContentItemOutcome::Scanned { findings } => (findings.len() as u64, 0, 0),
+        OrderedContentItemOutcome::Scanned { findings }
+        | OrderedContentItemOutcome::Truncated { findings } => (findings.len() as u64, 0, 0),
         OrderedContentItemOutcome::Failed(_stop) => (0, 1, 0),
-        OrderedContentItemOutcome::Skipped(OrderedContentSkipReason::Binary) => (0, 0, 1),
+        OrderedContentItemOutcome::Skipped(
+            OrderedContentSkipReason::Binary | OrderedContentSkipReason::BinaryExtractable,
+        ) => (0, 0, 1),
     };
     let report = build_item_report(
-        &metrics,
+        metrics,
         findings_emitted,
         errors,
         binary_skipped,
         wall_clock_scan_ns,
     );
     OrderedContentItemResult {
-        execution: OrderedContentItemExecution::new(item.clone(), report, outcome),
+        execution: OrderedContentItemExecution::new(item, report, outcome),
         connector_bytes_consumed,
     }
 }
@@ -1335,6 +1373,7 @@ fn scan_item_chunks(
 ///
 /// Range reads can honor the remaining item budget on every chunk request, so
 /// the runtime does not need to trust the connector to stop at EOF.
+#[allow(clippy::too_many_arguments)]
 fn execute_item_via_range_read<S: OrderedContentSource>(
     source: &mut S,
     engine: &scanner_engine::Engine,
@@ -1343,20 +1382,24 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
     scan_binary: bool,
     remaining_bytes: u64,
     chunk_size: usize,
+    buf: &mut [u8],
+    scratch: &mut RealEngineScratch,
+    pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
+    metrics: &mut WorkerMetricsLocal,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
-    let item_byte_budget = item
-        .size_hint()
-        .map(|size_hint| size_hint.max(1))
-        .unwrap_or(remaining_bytes)
-        .min(remaining_bytes);
+    let item_byte_budget = item_byte_budget(&item, remaining_bytes);
     let item_ref = item.item_ref().clone();
     Ok(scan_item_chunks(
         engine,
-        &item,
+        item,
         file_id,
         scan_binary,
         item_byte_budget,
         chunk_size,
+        buf,
+        scratch,
+        pending,
+        metrics,
         move |offset, dst, remaining_item_bytes| {
             let budgets = connector_read_budgets(remaining_item_bytes).map_err(|error| {
                 OrderedContentReadStop {
@@ -1374,10 +1417,13 @@ fn execute_item_via_range_read<S: OrderedContentSource>(
 
 /// Execute one item through the connector's streaming `open` fallback.
 ///
-/// The returned reader is opened under the admitted per-item budget. Any
-/// subsequent `std::io::Read` failure is classified locally because the
-/// connector's structured [`ReadError`] is no longer available after `open`
-/// succeeds.
+/// The returned reader is opened with one byte of headroom beyond the
+/// per-item scan budget. This allows the EOF probe in `scan_item_chunks`
+/// to read past the scan budget and distinguish real EOF from the reader's
+/// budget cap. Any subsequent `std::io::Read` failure is classified
+/// locally because the connector's structured [`ReadError`] is no longer
+/// available after `open` succeeds.
+#[allow(clippy::too_many_arguments)]
 fn execute_item_via_open<S: OrderedContentSource>(
     source: &mut S,
     engine: &scanner_engine::Engine,
@@ -1386,13 +1432,16 @@ fn execute_item_via_open<S: OrderedContentSource>(
     scan_binary: bool,
     remaining_bytes: u64,
     chunk_size: usize,
+    buf: &mut [u8],
+    scratch: &mut RealEngineScratch,
+    pending: &mut Vec<<RealEngineScratch as EngineScratch>::Finding>,
+    metrics: &mut WorkerMetricsLocal,
 ) -> Result<OrderedContentItemResult, ScanRuntimeError> {
-    let item_byte_budget = item
-        .size_hint()
-        .map(|size_hint| size_hint.max(1))
-        .unwrap_or(remaining_bytes)
-        .min(remaining_bytes);
-    let reader_budgets = connector_read_budgets(item_byte_budget)?;
+    let item_byte_budget = item_byte_budget(&item, remaining_bytes);
+    // Open the reader with one byte of headroom beyond the scan budget so the
+    // EOF probe in scan_item_chunks can read past the budget and distinguish
+    // real EOF from the reader's budget cap.
+    let reader_budgets = connector_read_budgets(item_byte_budget.saturating_add(1))?;
     let mut reader = match source.open(item.item_ref(), reader_budgets) {
         Ok(reader) => reader,
         Err(error) => {
@@ -1411,11 +1460,18 @@ fn execute_item_via_open<S: OrderedContentSource>(
     };
     Ok(scan_item_chunks(
         engine,
-        &item,
+        item,
         file_id,
         scan_binary,
         item_byte_budget,
         chunk_size,
+        buf,
+        scratch,
+        pending,
+        metrics,
+        // Sequential io::Read — offset tracking is implicit, no seek support.
+        // The byte budget is enforced by scan_item_chunks, which sizes each
+        // read slice to the remaining item budget.
         move |_offset, dst, _remaining_item_bytes| {
             reader
                 .read(dst)
@@ -1630,6 +1686,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use crate::test_fixtures::write_context;
+    use crate::{AnchorMode, TransformFilter};
 
     struct ScriptedSource {
         next: Option<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
@@ -1672,6 +1729,15 @@ mod tests {
             VersionId::Strong(ObjectVersionId::from_version_bytes(path)),
         )
         .with_size_hint(size_hint)
+    }
+
+    fn item_no_hint(path: &[u8]) -> ScanItem {
+        ScanItem::new(
+            ItemKey::try_from_slice(path).expect("item key"),
+            ItemRef::try_from_slice(path).expect("item ref"),
+            StableItemId::from_bytes([path[0]; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(path)),
+        )
     }
 
     fn runtime_input(
@@ -2179,6 +2245,10 @@ mod tests {
             "per-item size_hint should become the connector byte budget"
         );
         assert_eq!(source.range_calls[0].max_items, 1);
+        assert!(
+            source.open_calls.is_empty(),
+            "range-read path should not call open"
+        );
     }
 
     #[test]
@@ -2286,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_scan_misses_defers_item_that_would_exceed_remaining_byte_budget() {
+    fn execute_scan_misses_skips_oversized_item_and_scans_smaller_items_behind_it() {
         let rules = write_runtime_rules();
         let mut source = ContentSource::with_range_read();
         source.insert(b"a.txt", b"aaa");
@@ -2319,18 +2389,92 @@ mod tests {
         let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
             .expect("scan-miss execution succeeds");
 
-        assert_eq!(execution.outcomes().len(), 1);
-        assert_eq!(execution.deferred().len(), 2);
+        // a.txt (3 bytes) is admitted and scanned.
+        // b.txt (4 bytes) exceeds remaining budget (5-3=2) — deferred, NOT
+        // draining the entire suffix.
+        // c.txt (2 bytes) fits remaining budget (2) — admitted and scanned.
+        assert_eq!(execution.outcomes().len(), 2, "a.txt and c.txt are scanned");
+        assert_eq!(
+            execution.outcomes()[0].item().item_key().as_bytes(),
+            b"a.txt"
+        );
+        assert_eq!(
+            execution.outcomes()[1].item().item_key().as_bytes(),
+            b"c.txt"
+        );
+        assert_eq!(execution.deferred().len(), 1, "only b.txt is deferred");
         assert_eq!(execution.deferred()[0].item_key().as_bytes(), b"b.txt");
-        assert_eq!(execution.deferred()[1].item_key().as_bytes(), b"c.txt");
         let touched = source
             .range_calls
             .iter()
             .map(|call| call.item_ref.clone())
             .collect::<HashSet<_>>();
         assert!(touched.contains(b"a.txt".as_slice()));
-        assert!(!touched.contains(b"b.txt".as_slice()));
-        assert!(!touched.contains(b"c.txt".as_slice()));
+        assert!(
+            !touched.contains(b"b.txt".as_slice()),
+            "oversized item is not opened"
+        );
+        assert!(
+            touched.contains(b"c.txt".as_slice()),
+            "smaller item behind oversized is scanned"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_counts_already_done_after_deferral_point() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"aaa");
+        source.insert(b"e.txt", b"ee");
+        // Page: ScanMiss(a, fits), ScanMiss(b, over budget), AlreadyDone(c),
+        // AlreadyDone(d), ScanMiss(e, fits remaining).
+        // With skip-ahead admission: b.txt is deferred (oversized), then c/d
+        // are counted as AlreadyDone, then e.txt fits the remaining budget.
+        let page = prefiltered_page(
+            vec![
+                (
+                    item(b"a.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"b.txt", 100),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"c.txt", 4),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"d.txt", 5),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"e.txt", 2),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 5,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        // a.txt (3 bytes) scanned, b.txt deferred (oversized), e.txt (2 bytes)
+        // scanned after skipping past the oversized item.
+        assert_eq!(execution.outcomes().len(), 2, "a.txt and e.txt are scanned");
+        assert_eq!(execution.deferred().len(), 1, "only b.txt is deferred");
+        assert_eq!(execution.deferred()[0].item_key().as_bytes(), b"b.txt");
+        assert_eq!(
+            execution.already_done_len(),
+            2,
+            "c.txt and d.txt are counted as AlreadyDone"
+        );
     }
 
     #[test]
@@ -2429,8 +2573,288 @@ mod tests {
         assert_eq!(stop.class(), ErrorClass::Permanent);
         assert_eq!(execution.execution_report().binary_skipped, 1);
         assert_eq!(execution.execution_report().errors, 1);
-        assert_eq!(source.open_calls[0].max_bytes, 4);
-        assert_eq!(source.open_calls[1].max_bytes, 4);
+        assert_eq!(
+            source.open_calls[0].max_bytes, 5,
+            "item_byte_budget(4) + 1 probe headroom"
+        );
+        assert_eq!(
+            source.open_calls[1].max_bytes, 5,
+            "item_byte_budget(4) + 1 probe headroom"
+        );
+        assert!(
+            source.range_calls.is_empty(),
+            "open-fallback path should not call read_range"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_admits_items_without_size_hint() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        let content_a = b"prefix TOK_AAAAAAAA suffix";
+        let content_b = b"prefix TOK_BBBBBBBB suffix";
+        source.insert(b"no-hint-a.txt", content_a);
+        source.insert(b"no-hint-b.txt", content_b);
+        let page = prefiltered_page(
+            vec![
+                (
+                    item_no_hint(b"no-hint-a.txt"),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item_no_hint(b"no-hint-b.txt"),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert!(
+            execution.deferred().is_empty(),
+            "both items should be admitted"
+        );
+        assert_eq!(execution.outcomes().len(), 2);
+        let OrderedContentItemOutcome::Scanned { findings } = execution.outcomes()[0].outcome()
+        else {
+            panic!("expected first item scanned");
+        };
+        assert!(!findings.is_empty(), "rule should match TOK_AAAAAAAA");
+        let OrderedContentItemOutcome::Scanned { findings } = execution.outcomes()[1].outcome()
+        else {
+            panic!("expected second item scanned");
+        };
+        assert!(!findings.is_empty(), "rule should match TOK_BBBBBBBB");
+        assert_eq!(execution.execution_report().items_scanned, 2);
+        // Without size_hint, item_byte_budget is min(DEFAULT_UNKNOWN_ITEM_BYTE_CAP,
+        // remaining_bytes). Here 1_024 < 16 MiB, so remaining_bytes wins.
+        assert_eq!(
+            source.range_calls[0].max_bytes, 1_024,
+            "capped budget still clamps to remaining_bytes when smaller"
+        );
+    }
+
+    #[test]
+    fn budget_exhaustion_before_eof_produces_truncated_outcome() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // Content is 100 bytes, but the page byte budget is only 32.
+        // The item has no size_hint, so it is admitted with
+        // item_byte_budget = remaining_bytes = 32. After reading 32 bytes
+        // the budget is exhausted while the connector still has 68 bytes
+        // remaining — the outcome must be Truncated, not Scanned.
+        let content = vec![b'x'; 100];
+        source.insert(b"big.txt", &content);
+        let page = prefiltered_page(
+            vec![(
+                item_no_hint(b"big.txt"),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let engine = build_runtime_engine(
+            Some(rules.path()),
+            &TransformFilter::default(),
+            None,
+            AnchorMode::default(),
+        )
+        .expect("engine builds");
+        let execution = OrderedContentRuntime::execute_scan_misses_with_engine(
+            &mut source,
+            page,
+            ScanBudgets {
+                max_items: 8,
+                max_bytes: 32,
+            },
+            false,
+            engine,
+            DEFAULT_ORDERED_CHUNK_SIZE,
+        )
+        .expect("execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1);
+        assert!(
+            matches!(
+                execution.outcomes()[0].outcome(),
+                OrderedContentItemOutcome::Truncated { .. }
+            ),
+            "budget-exhausted item must be Truncated, got {:?}",
+            execution.outcomes()[0].outcome()
+        );
+    }
+
+    #[test]
+    fn unknown_size_item_is_capped_and_does_not_consume_entire_budget() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // Item a has no size_hint and is small — fits under the cap.
+        // Item b has no size_hint and is small too.
+        // With a large page budget (32 MiB) and two small no-hint items,
+        // both should be admitted. The per-item connector budget must be
+        // capped at DEFAULT_UNKNOWN_ITEM_BYTE_CAP (16 MiB), NOT the full
+        // remaining page budget (32 MiB).
+        let content_a = b"prefix TOK_AAAAAAAA suffix";
+        let content_b = b"prefix TOK_BBBBBBBB suffix";
+        source.insert(b"a.txt", content_a);
+        source.insert(b"b.txt", content_b);
+        let page = prefiltered_page(
+            vec![
+                (
+                    item_no_hint(b"a.txt"),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item_no_hint(b"b.txt"),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 32 * 1024 * 1024, // 32 MiB — well above the cap
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 2, "both items admitted");
+        assert!(execution.deferred().is_empty());
+
+        // The connector byte budget for the first no-hint item must be
+        // capped at DEFAULT_UNKNOWN_ITEM_BYTE_CAP, not the full 32 MiB
+        // remaining budget.
+        assert_eq!(
+            source.range_calls[0].max_bytes,
+            super::DEFAULT_UNKNOWN_ITEM_BYTE_CAP,
+            "first no-hint item budget must be capped at DEFAULT_UNKNOWN_ITEM_BYTE_CAP"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_deferred_suffix_excludes_already_done() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        source.insert(b"a.txt", b"aaa");
+        source.insert(b"c.txt", b"ccc");
+        source.insert(b"e.txt", b"eee");
+        // Pattern: ScanMiss, AlreadyDone, ScanMiss, AlreadyDone, ScanMiss
+        // Budget: max_items=1 so only the first ScanMiss is scanned.
+        let page = prefiltered_page(
+            vec![
+                (
+                    item(b"a.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"b.txt", 3),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"c.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+                (
+                    item(b"d.txt", 3),
+                    OrderedContentPrefilterDisposition::AlreadyDone,
+                ),
+                (
+                    item(b"e.txt", 3),
+                    OrderedContentPrefilterDisposition::ScanMiss,
+                ),
+            ],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 1,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1, "only first ScanMiss scanned");
+        assert_eq!(
+            execution.outcomes()[0].item().item_key().as_bytes(),
+            b"a.txt"
+        );
+        // Deferred should contain only the remaining ScanMiss items, not AlreadyDone.
+        assert_eq!(execution.deferred().len(), 2);
+        assert_eq!(execution.deferred()[0].item_key().as_bytes(), b"c.txt");
+        assert_eq!(execution.deferred()[1].item_key().as_bytes(), b"e.txt");
+        // AlreadyDone count covers the full page: b.txt counted in the main
+        // loop, d.txt counted during the post-budget-exhaustion drain.
+        assert_eq!(execution.already_done_len(), 2);
+    }
+
+    #[test]
+    fn execute_scan_misses_detects_token_across_chunk_boundary() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+
+        // Build content where the secret token straddles the chunk boundary.
+        // With chunk_size=32, place the 16-byte token "TOK_CDEFGHIJ" so
+        // its first half is at the end of chunk 1 and its second half at the
+        // start of chunk 2. The overlap carry should allow the engine to
+        // detect the full token across the boundary.
+        let mut content = vec![b'x'; 24]; // 24 bytes of padding
+        content.extend_from_slice(b"TOK_CDEFGHIJ"); // 12 bytes starting at offset 24
+        content.extend_from_slice(&[b'y'; 20]); // tail padding, total 56 bytes
+        source.insert(b"cross-chunk.txt", &content);
+
+        let page = prefiltered_page(
+            vec![(
+                item(b"cross-chunk.txt", content.len() as u64),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+
+        let engine = build_runtime_engine(
+            Some(rules.path()),
+            &TransformFilter::default(),
+            None,
+            AnchorMode::default(),
+        )
+        .expect("engine builds");
+        let execution = OrderedContentRuntime::execute_scan_misses_with_engine(
+            &mut source,
+            page,
+            ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            },
+            false,
+            engine,
+            32, // small chunk_size forces multi-chunk scanning
+        )
+        .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1);
+        let OrderedContentItemOutcome::Scanned { findings } = execution.outcomes()[0].outcome()
+        else {
+            panic!("expected item to scan successfully");
+        };
+        assert!(
+            !findings.is_empty(),
+            "token straddling chunk boundary should be detected via overlap carry"
+        );
+        assert!(
+            execution.execution_report().chunks_scanned >= 2,
+            "content should span at least 2 chunks with chunk_size=32"
+        );
     }
 
     #[test]
