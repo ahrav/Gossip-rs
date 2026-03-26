@@ -3300,4 +3300,94 @@ mod tests {
         assert_eq!(filtered.already_done_len(), 4);
         assert_eq!(filtered.scan_miss_len(), 1);
     }
+
+    #[test]
+    fn execute_scan_misses_range_error_on_second_chunk_returns_failed_outcome() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // Content larger than chunk_size=32 forces a multi-chunk scan.
+        // The first 32-byte chunk succeeds; the second chunk at offset 32 fails.
+        let content = vec![b'x'; 64];
+        source.insert(b"mid-fail.txt", &content);
+        source.set_range_error(
+            b"mid-fail.txt",
+            32,
+            ReadError::rate_limited("throttled mid-stream", 42),
+        );
+
+        let page = prefiltered_page(
+            vec![(
+                item(b"mid-fail.txt", content.len() as u64),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+
+        let engine = build_runtime_engine(
+            Some(rules.path()),
+            &TransformFilter::default(),
+            None,
+            AnchorMode::default(),
+        )
+        .expect("engine builds");
+        let execution = OrderedContentRuntime::execute_scan_misses_with_engine(
+            &mut source,
+            page,
+            ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            },
+            false,
+            engine,
+            32, // small chunk_size forces multi-chunk scanning
+        )
+        .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1);
+        let OrderedContentItemOutcome::Failed(stop) = execution.outcomes()[0].outcome() else {
+            panic!("expected retryable failure on second chunk");
+        };
+        assert_eq!(stop.class(), ErrorClass::Retryable);
+        assert_eq!(stop.retry_after_ms(), Some(42));
+        assert_eq!(
+            execution.execution_report().errors,
+            1,
+            "mid-stream read failure counts as one error"
+        );
+    }
+
+    #[test]
+    fn execute_scan_misses_admits_item_with_zero_size_hint() {
+        let rules = write_runtime_rules();
+        let mut source = ContentSource::with_range_read();
+        // size_hint=Some(0) exercises the .max(1) guard in item_byte_budget,
+        // which converts 0 to 1 so that Budgets::try_new does not reject
+        // max_bytes=0. The item is still admitted because 0 <= remaining_bytes.
+        source.insert(b"zero.txt", b"hello");
+        let page = prefiltered_page(
+            vec![(
+                item(b"zero.txt", 0),
+                OrderedContentPrefilterDisposition::ScanMiss,
+            )],
+            PageState::Complete,
+        );
+        let config = FsScanConfig::new("/tmp/ordered-content-test")
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_budgets(ScanBudgets {
+                max_items: 8,
+                max_bytes: 1_024,
+            });
+
+        let execution = OrderedContentRuntime::execute_scan_misses(&mut source, page, &config)
+            .expect("scan-miss execution succeeds");
+
+        assert_eq!(execution.outcomes().len(), 1, "item must not be deferred");
+        assert!(
+            execution.deferred().is_empty(),
+            "zero size_hint should not cause deferral"
+        );
+        let OrderedContentItemOutcome::Scanned { .. } = execution.outcomes()[0].outcome() else {
+            panic!("expected item with zero size_hint to scan successfully");
+        };
+    }
 }
