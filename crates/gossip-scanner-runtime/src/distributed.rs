@@ -1488,6 +1488,8 @@ where
             .min();
 
         let mut hit_non_terminal = false;
+        let mut submitted_report = ScanReport::default();
+        let mut items_submitted: u64 = 0;
         for item in execution.outcomes() {
             // A deferred item with a key before this outcome means the
             // checkpoint would skip past the deferred item if we commit
@@ -1509,8 +1511,17 @@ where
                 .submit_ordered_item(item)
                 .map_err(ScanRuntimeError::Driver)?;
             emit_ordered_item_findings(out, &engine, item);
+            submitted_report += item.report();
+            items_submitted += 1;
         }
-        report += execution.assignment_report();
+
+        // Build the page report from only submitted items so that
+        // findings_emitted and other counters reflect what was actually
+        // sent to the event stream. Items past the non-terminal break
+        // point will be re-scanned on the next claim.
+        submitted_report.items_scanned = execution.already_done_len() as u64 + items_submitted;
+        submitted_report.items_deferred = execution.deferred().len() as u64;
+        report += submitted_report;
 
         // When non-terminal items (retryable or deferred) exist on this
         // page, stop scanning additional pages. The checkpoint will only
