@@ -1839,10 +1839,11 @@ mod tests {
         connector::{Cursor, ItemKey},
         coordination::ShardSpec,
         identity::{
-            FenceEpoch, OpId, PolicyHash, RuleFingerprint, RunId, ShardId, StableItemId, TenantId,
-            TenantSecretKey, WorkerId, derive_rule_fingerprint,
+            FenceEpoch, FindingId, ObservationId, OccurrenceId, OpId, PolicyHash, RuleFingerprint,
+            RunId, ShardId, StableItemId, TenantId, TenantSecretKey, WorkerId,
+            derive_rule_fingerprint,
         },
-        persistence::{DoneLedgerStatus, WriteContext},
+        persistence::{DoneLedgerKey, DoneLedgerStatus, WriteContext},
     };
     use gossip_coordination::{
         AcquireScratch, CoordinationBackend, CursorSemantics, CursorUpdate as CoordCursorUpdate,
@@ -2144,6 +2145,46 @@ mod tests {
         );
 
         (pipeline, sink, recorder)
+    }
+
+    struct SinkSnapshot {
+        done_keys: Vec<DoneLedgerKey>,
+        finding_ids: Vec<FindingId>,
+        occurrence_ids: Vec<OccurrenceId>,
+        observation_ids: Vec<ObservationId>,
+    }
+
+    fn snapshot_sink_state(
+        findings_sink: &InMemoryFindingsSink,
+        done_ledger: &InMemoryDoneLedger,
+        label: &str,
+    ) -> SinkSnapshot {
+        SinkSnapshot {
+            done_keys: done_ledger
+                .snapshot()
+                .unwrap_or_else(|e| panic!("{label} done-ledger snapshot: {e}"))
+                .into_iter()
+                .map(|r| r.key())
+                .collect(),
+            finding_ids: findings_sink
+                .findings_snapshot()
+                .unwrap_or_else(|e| panic!("{label} findings snapshot: {e}"))
+                .into_iter()
+                .map(|r| r.finding_id())
+                .collect(),
+            occurrence_ids: findings_sink
+                .occurrences_snapshot()
+                .unwrap_or_else(|e| panic!("{label} occurrences snapshot: {e}"))
+                .into_iter()
+                .map(|r| r.occurrence_id())
+                .collect(),
+            observation_ids: findings_sink
+                .observations_snapshot()
+                .unwrap_or_else(|e| panic!("{label} observations snapshot: {e}"))
+                .into_iter()
+                .map(|r| r.observation_id())
+                .collect(),
+        }
     }
 
     #[test]
@@ -3575,6 +3616,246 @@ mod tests {
 
         assert_eq!(report.leases_seen, 1);
         assert_eq!(report.shards_scanned, 1);
+        assert_eq!(run_progress(&coordinator).done(), 1);
+    }
+
+    #[test]
+    fn run_worker_recovers_from_partial_done_ledger_failure_without_duplicate_rows() {
+        const SECRET_FILE_COUNT: usize = 12;
+        const SUCCESSFUL_COMMITS_BEFORE_CRASH: usize = 4;
+        const POLL_ITERATIONS: usize = 2_000;
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+        let dir = tempdir().expect("tempdir");
+        for index in 0..SECRET_FILE_COUNT {
+            let path = dir.path().join(format!("secret-{index:02}.txt"));
+            fs::write(path, secret_fixture()).expect("write secret fixture");
+        }
+
+        let config = DistributedRuntimeConfig {
+            commit_queue_capacity: NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ..DistributedRuntimeConfig::default()
+        };
+
+        let expected_findings_sink = InMemoryFindingsSink::new();
+        let expected_done_ledger = InMemoryDoneLedger::new();
+        let mut expected_coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        run_worker(
+            &mut expected_coordinator,
+            worker_identity(Path::new("/fallback")),
+            DistributedPersistence::new(
+                expected_findings_sink.clone(),
+                expected_done_ledger.clone(),
+            ),
+            config,
+        )
+        .expect("baseline run should succeed");
+
+        let expected =
+            snapshot_sink_state(&expected_findings_sink, &expected_done_ledger, "baseline");
+        let expected_last_key = shard_summaries(&expected_coordinator)[0]
+            .last_key()
+            .expect("completed baseline shard should have a last_key")
+            .to_vec();
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        done_ledger
+            .set_auto_complete(false)
+            .expect("disable done-ledger auto-complete");
+
+        let coordinator = setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 2_000);
+        let first_run = std::thread::spawn({
+            let findings_sink = findings_sink.clone();
+            let done_ledger = done_ledger.clone();
+            move || {
+                let mut coordinator = coordinator;
+                let result = run_worker(
+                    &mut coordinator,
+                    worker_identity(Path::new("/fallback")),
+                    DistributedPersistence::new(findings_sink, done_ledger),
+                    config,
+                );
+                (coordinator, result)
+            }
+        });
+
+        let next_pending_done_commit = || {
+            for _ in 0..POLL_ITERATIONS {
+                let pending = done_ledger.pending_ids().expect("pending done-ledger ids");
+                match pending.as_slice() {
+                    [op_id] => return *op_id,
+                    [] => std::thread::sleep(POLL_INTERVAL),
+                    _ => panic!(
+                        "expected one pending done-ledger commit with queue capacity 1, got {}",
+                        pending.len()
+                    ),
+                }
+            }
+            panic!("timed out waiting for a pending done-ledger commit (10s)");
+        };
+
+        for committed in 0..SUCCESSFUL_COMMITS_BEFORE_CRASH {
+            let op_id = next_pending_done_commit();
+            assert!(
+                done_ledger
+                    .release_specific(op_id)
+                    .expect("release successful done-ledger commit"),
+                "pending done-ledger op should release"
+            );
+
+            for _ in 0..POLL_ITERATIONS {
+                let durable_rows = done_ledger.snapshot().expect("done-ledger snapshot");
+                if durable_rows.len() == committed + 1 {
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            assert_eq!(
+                done_ledger.snapshot().expect("done-ledger snapshot").len(),
+                committed + 1,
+                "done-ledger durability did not converge within 10s for commit {committed}"
+            );
+        }
+
+        let failing_op = next_pending_done_commit();
+        done_ledger
+            .fail_next_commits(1)
+            .expect("inject done-ledger commit failure");
+        assert!(
+            done_ledger
+                .release_specific(failing_op)
+                .expect("release failing done-ledger commit"),
+            "failing done-ledger op should release"
+        );
+
+        // The findings sink is in auto-complete mode, so observations for the
+        // failing commit are already durable before its done-ledger commit was
+        // submitted. No synchronization wait is needed before snapshotting.
+        let partial_done_keys = done_ledger
+            .snapshot()
+            .expect("partial done-ledger snapshot")
+            .into_iter()
+            .map(|record| record.key())
+            .collect::<Vec<_>>();
+        let partial_observation_ids = findings_sink
+            .observations_snapshot()
+            .expect("partial observations snapshot")
+            .into_iter()
+            .map(|record| record.observation_id())
+            .collect::<Vec<_>>();
+
+        assert_eq!(partial_done_keys.len(), SUCCESSFUL_COMMITS_BEFORE_CRASH);
+        assert!(partial_done_keys.len() < expected.done_keys.len());
+        assert!(
+            partial_observation_ids.len() > partial_done_keys.len(),
+            "the failed item should leave durable observations ahead of the done-ledger"
+        );
+
+        done_ledger
+            .set_auto_complete(true)
+            .expect("re-enable done-ledger auto-complete");
+        for _ in 0..POLL_ITERATIONS {
+            if first_run.is_finished() {
+                break;
+            }
+            for op_id in done_ledger.pending_ids().expect("pending done-ledger ids") {
+                assert!(
+                    done_ledger
+                        .release_specific(op_id)
+                        .expect("release pending done-ledger commit"),
+                    "pending done-ledger op should release"
+                );
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(
+            first_run.is_finished(),
+            "worker thread did not terminate within 10s after releasing all pending commits"
+        );
+
+        let (mut coordinator, first_result) =
+            first_run.join().expect("worker thread should not panic");
+        let first_error =
+            first_result.expect_err("first worker invocation should fail on done-ledger commit");
+        assert!(
+            matches!(
+                &first_error,
+                DistributedRuntimeError::Durability(_) | DistributedRuntimeError::Runtime(_)
+            ),
+            "expected runtime or durability error, got: {first_error:?}"
+        );
+
+        let summaries_after_crash = shard_summaries(&coordinator);
+        assert_eq!(summaries_after_crash.len(), 1);
+        assert_eq!(summaries_after_crash[0].status(), ShardStatus::Active);
+        assert!(
+            summaries_after_crash[0].last_key().is_none(),
+            "coordinator cursor must not advance before complete_shard runs"
+        );
+        let acquire_count_after_crash = summaries_after_crash[0].acquire_count();
+
+        let progress_after_crash = run_progress(&coordinator);
+        assert_eq!(progress_after_crash.active(), 1);
+        assert_eq!(progress_after_crash.done(), 0);
+
+        let done_keys_before_recovery: std::collections::HashSet<_> = done_ledger
+            .snapshot()
+            .expect("pre-recovery done-ledger snapshot")
+            .into_iter()
+            .map(|r| r.key())
+            .collect();
+
+        let recovery_report = run_worker(
+            &mut coordinator,
+            worker_identity(Path::new("/fallback")),
+            DistributedPersistence::new(findings_sink.clone(), done_ledger.clone()),
+            config,
+        )
+        .expect("second worker invocation should recover after lease expiry");
+        assert_eq!(recovery_report.leases_seen, 1);
+        assert_eq!(recovery_report.shards_scanned, 1);
+
+        let done_keys_after_recovery: std::collections::HashSet<_> = done_ledger
+            .snapshot()
+            .expect("post-recovery done-ledger snapshot")
+            .into_iter()
+            .map(|r| r.key())
+            .collect();
+        let new_keys_from_recovery: std::collections::HashSet<_> = done_keys_after_recovery
+            .difference(&done_keys_before_recovery)
+            .copied()
+            .collect();
+        let expected_new_keys: std::collections::HashSet<_> = expected
+            .done_keys
+            .iter()
+            .copied()
+            .filter(|k| !done_keys_before_recovery.contains(k))
+            .collect();
+        assert_eq!(
+            new_keys_from_recovery, expected_new_keys,
+            "recovery should only commit items not already in the done-ledger"
+        );
+
+        let recovered = snapshot_sink_state(&findings_sink, &done_ledger, "recovered");
+
+        assert_eq!(recovered.done_keys, expected.done_keys);
+        assert_eq!(recovered.finding_ids, expected.finding_ids);
+        assert_eq!(recovered.occurrence_ids, expected.occurrence_ids);
+        assert_eq!(recovered.observation_ids, expected.observation_ids);
+
+        let summaries_after_recovery = shard_summaries(&coordinator);
+        assert_eq!(summaries_after_recovery.len(), 1);
+        assert_eq!(summaries_after_recovery[0].status(), ShardStatus::Done);
+        assert_eq!(
+            summaries_after_recovery[0].last_key(),
+            Some(expected_last_key.as_slice())
+        );
+        assert!(
+            summaries_after_recovery[0].acquire_count() > acquire_count_after_crash,
+            "recovery must reacquire the shard under a higher fence epoch"
+        );
         assert_eq!(run_progress(&coordinator).done(), 1);
     }
 
