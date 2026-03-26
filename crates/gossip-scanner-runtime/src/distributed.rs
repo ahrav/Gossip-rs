@@ -1428,7 +1428,7 @@ where
         lease.lease().fence(),
         OpKind::Complete,
     );
-    let outcome = coordinator
+    let completion_result = coordinator
         .complete(
             wall_clock_now(),
             identity.tenant,
@@ -1438,7 +1438,7 @@ where
         )
         .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
 
-    if !outcome.is_executed() {
+    if !completion_result.is_executed() {
         tracing::info!(
             shard_id = %lease.shard_id(),
             "completion was an idempotent replay",
@@ -4377,6 +4377,46 @@ mod tests {
             &FilesystemShardCompletionOutcome::ExhaustedEmpty,
         )
         .expect_err("out-of-range exhausted-empty fallback must be rejected");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Runtime(_)),
+            "expected Runtime error for out-of-range completion cursor, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("not in bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_shard_rejects_out_of_range_progress_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let claimed = claim_lease(&mut coordinator, &identity);
+        let lease = ShardLease::new(
+            Arc::clone(claimed.shard_id_arc()),
+            claimed.lease(),
+            RestoredShardState::new(
+                ShardSpec::with_range(vec![0x01], vec![0x0F]),
+                Cursor::initial(),
+                CursorSemantics::Completed,
+            ),
+            claimed.filesystem_source.clone(),
+            claimed.write_context(),
+            claimed.tenant_secret_key(),
+        );
+
+        let err = complete_shard(
+            &mut coordinator,
+            &identity,
+            &lease,
+            &FilesystemShardCompletionOutcome::Progress {
+                checkpoint: Cursor::with_last_key(item_key("\x0F")),
+            },
+        )
+        .expect_err("out-of-range progress checkpoint must be rejected");
 
         assert!(
             matches!(err, DistributedRuntimeError::Runtime(_)),
