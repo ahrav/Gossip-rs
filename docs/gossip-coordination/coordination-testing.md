@@ -275,7 +275,7 @@ invariant accidentally violates another.
 
 ## 6. Tier 4 — Simulation Tests
 
-**Primary files:** `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`, `crates/gossip-coordination/src/sim/mega_sim_tests.rs`, `crates/gossip-coordination/src/sim/overload_tests.rs`, `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs`
+**Primary files:** `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`, `crates/gossip-coordination/src/sim/mega_sim_tests.rs`, `crates/gossip-coordination/src/sim/overload_tests.rs`, `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs`, `crates/gossip-coordination/src/sim/composition_tests.rs`
 **Declared in:** `crates/gossip-coordination/src/sim/mod.rs` (`#[cfg(test)]`)
 
 Seven sub-tiers exercise the full simulation harness.
@@ -591,6 +591,9 @@ Full invariant definitions and the checker implementation are in
 | `crates/gossip-coordination/src/sim/overload.rs`                     | Overload scenario/reports and scripted op generators                   |
 | `crates/gossip-coordination/src/sim/overload_tests.rs`               | Overload scenario tests: per-kind, replay, D1 accuracy, proptest       |
 | `crates/gossip-coordination/src/sim/composition.rs`                  | Test-support composition harness coupling coordinator and done-ledger  |
+| `crates/gossip-coordination/src/sim/composition_invariants.rs`       | Cross-component invariant checker for coordinator ↔ done-ledger provenance (C1–C4) |
+| `crates/gossip-coordination/src/sim/composition_invariants_tests.rs` | Targeted unit tests for `CompositionInvariantChecker` and C1–C4 violations |
+| `crates/gossip-coordination/src/sim/composition_tests.rs`            | Four-tier composition test suite for the coordinator ↔ done-ledger boundary |
 | `crates/gossip-coordination/src/sim/scan_driver_sim.rs`              | Deterministic synthetic scan-outcome generator for composition runs    |
 | `crates/gossip-coordination/src/sim/shared.rs`                       | Internal helper aliases and utility functions shared by both harnesses |
 | `crates/gossip-coordination/src/sim/backend.rs`                      | `SimIntrospection` and `SimulationBackend` trait definitions           |
