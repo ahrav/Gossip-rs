@@ -133,13 +133,23 @@ The distributed module exports the concrete worker-loop types and helpers:
 `gossip-frontier` for shard metadata decoding. Filesystem lease
 execution starts a lease-deadline watchdog that drives the shared
 `CancellationToken` when the claimed lease is no longer trustworthy.
-Successful receipt-drain completion seals the local deadline signal
-before the watchdog joins, so any lease rejection after durable local
-completion is decided by the coordinator `complete`/`checkpoint` call
-rather than by a late local watchdog tick.
+The watchdog compares against a monotonic `Instant`-based deadline
+(converted from the coordinator's wall-clock `LogicalTime` at claim
+time) so `CLOCK_REALTIME` jumps from NTP corrections or VM migration
+cannot cause false-positive or false-negative expiry detection. The
+watchdog uses `std::thread::park_timeout` instead of `thread::sleep`
+so the main thread can wake it immediately via `unpark()` when shard
+execution finishes, avoiding up to one polling interval of exit
+latency. Successful receipt-drain completion seals the local deadline
+signal before the watchdog joins, so any lease rejection after durable
+local completion is decided by the coordinator `complete`/`checkpoint`
+call rather than by a late local watchdog tick.
 The ordered page loop polls that token between page acquisitions and
 before queueing new commit work so expiry stops the shard before more
-items are enqueued. Successful filesystem lease execution returns an
+items are enqueued. Claim retry delays apply full jitter via a BLAKE3
+hash of the current nanosecond timestamp, preventing thundering-herd
+synchronization when multiple workers' leases expire at the same
+time. Successful filesystem lease execution returns an
 explicit `ShardCompletionOutcome`: `Complete { checkpoint }` uses the
 committed-prefix cursor for terminal completion,
 `Checkpoint { checkpoint }` preserves non-terminal progress through

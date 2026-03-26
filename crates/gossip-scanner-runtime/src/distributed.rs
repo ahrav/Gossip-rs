@@ -2010,11 +2010,7 @@ where
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
     let monotonic_deadline = Instant::now()
-        + Duration::from_millis(
-            lease_deadline
-                .as_raw()
-                .saturating_sub(start_time.as_raw()),
-        );
+        + Duration::from_millis(lease_deadline.as_raw().saturating_sub(start_time.as_raw()));
     let pipeline = CommitPipeline::start(
         persistence.findings_sink.clone(),
         persistence.done_ledger.clone(),
@@ -4673,9 +4669,7 @@ mod tests {
         handle.thread().unpark();
 
         // The watchdog should exit almost instantly rather than sleeping 25 ms.
-        handle
-            .join()
-            .expect("watchdog thread should not panic");
+        handle.join().expect("watchdog thread should not panic");
 
         assert!(
             !cancel.is_cancelled(),
