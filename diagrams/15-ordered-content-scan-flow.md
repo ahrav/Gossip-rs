@@ -139,12 +139,14 @@ sequenceDiagram
 
 **Three-outcome dispatch.** The worker loop matches on `ExhaustedEmpty`
 (terminal), `Stopped` (connector failure with retry classification), or
-`Page` (validated, ready for prefiltering). `ExhaustedEmpty` is the
-second half of a two-call completion pattern: the first call returns a
-non-empty terminal page (`PageState::Complete`), transitioning the runtime
-page loop to `AwaitingExhaustedEmpty`; the second `fill_page` call returns
-`Ok(None)`, confirming exhaustion inside the runtime loop before
-`checkpoint`/`complete` is sent to the coordinator.
+`Page` (validated, ready for prefiltering). `ExhaustedEmpty` is returned
+whenever `fill_page` yields `Ok(None)`, which covers two distinct cases:
+(a) the source is empty from the start (first call returns no items), and
+(b) the two-call suffix handshake after a non-empty terminal page
+(`PageState::Complete` triggers `AwaitingExhaustedEmpty`; the next
+`fill_page` returns `Ok(None)` to confirm exhaustion). In both cases the
+runtime page loop confirms exhaustion before `checkpoint`/`complete` is
+sent to the coordinator.
 
 ---
 
@@ -298,7 +300,7 @@ graph TD
     end
 
     subgraph Translation["result_translation"]
-        TIR["translate_item_result<br/>NormHash -> SecretHash -> FindingId<br/>FindingId + version -> OccurrenceId<br/>TenantId + PolicyHash + OccurrenceId -> ObservationId"]
+        TIR["translate_item_result<br/>NormHash -> SecretHash -> FindingId<br/>FindingId + object_version_id + byte_offset + byte_length -> OccurrenceId<br/>TenantId + PolicyHash + OccurrenceId -> ObservationId"]
     end
 
     subgraph Pipeline["CommitPipeline"]
