@@ -2447,7 +2447,7 @@ mod tests {
     const FILESYSTEM_CONNECTOR_TEST_SOURCE: &str =
         include_str!("../../gossip-connectors/src/filesystem_tests.rs");
 
-    /// Epic 2 filesystem failure requirements that must remain covered by at
+    /// Filesystem failure requirements that must remain covered by at
     /// least one named proof.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum FilesystemFailureSuiteCase {
@@ -2516,6 +2516,15 @@ mod tests {
         RealBackend,
     }
 
+    impl FilesystemFailureSuiteBoundary {
+        const ALL: [Self; 4] = [
+            Self::ConnectorConformance,
+            Self::RuntimeDurability,
+            Self::DistributedRuntime,
+            Self::RealBackend,
+        ];
+    }
+
     /// One auditable mapping from a failure requirement to a concrete test.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct FilesystemFailureSuiteProof {
@@ -2527,7 +2536,7 @@ mod tests {
         coverage_note: &'static str,
     }
 
-    /// Audit map from each Epic 2 filesystem failure requirement to the test
+    /// Audit map from each filesystem failure requirement to the test
     /// that proves it at the intended boundary.
     const FILESYSTEM_FAILURE_SUITE_PROOFS: &[FilesystemFailureSuiteProof] = &[
         FilesystemFailureSuiteProof {
@@ -2646,7 +2655,7 @@ mod tests {
 
     /// Guards the audit map against missing requirements and stale test names.
     #[test]
-    fn filesystem_distributed_failure_suite_matrix_covers_every_epic_2_case() {
+    fn filesystem_distributed_failure_suite_matrix_covers_every_case() {
         let mut seen = std::collections::BTreeSet::new();
         for proof in FILESYSTEM_FAILURE_SUITE_PROOFS {
             assert!(
@@ -2683,108 +2692,49 @@ mod tests {
                 case.as_str(),
             );
         }
+
+        for boundary in FilesystemFailureSuiteBoundary::ALL {
+            assert!(
+                FILESYSTEM_FAILURE_SUITE_PROOFS
+                    .iter()
+                    .any(|proof| proof.boundary == boundary),
+                "missing failure-suite proof at boundary {:?}",
+                boundary,
+            );
+        }
     }
 
     /// Freezes the intended boundary split so future edits do not drift into
     /// duplicate or misplaced proofs.
     #[test]
     fn filesystem_distributed_failure_suite_matrix_uses_intentional_boundaries() {
-        let has_proof = |case, boundary| {
-            FILESYSTEM_FAILURE_SUITE_PROOFS
-                .iter()
-                .any(|proof| proof.case == case && proof.boundary == boundary)
-        };
+        use FilesystemFailureSuiteBoundary as B;
+        use FilesystemFailureSuiteCase as C;
 
-        // Bidirectional guard: the individual assertions below catch removals;
-        // this count catches unexpected additions of new (case, boundary) pairs.
-        let actual_pairs: std::collections::BTreeSet<_> = FILESYSTEM_FAILURE_SUITE_PROOFS
+        let actual: std::collections::BTreeSet<_> = FILESYSTEM_FAILURE_SUITE_PROOFS
             .iter()
             .map(|p| (p.case, p.boundary))
             .collect();
-        assert_eq!(
-            actual_pairs.len(),
-            11,
-            "boundary split changed: expected 11 unique (case, boundary) pairs, found {}; \
-             update the assertions below when adding or removing boundary assignments",
-            actual_pairs.len(),
-        );
 
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::Ordering,
-                FilesystemFailureSuiteBoundary::ConnectorConformance,
-            ),
-            "ordering should stay proved at the connector conformance boundary"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::RangeMembership,
-                FilesystemFailureSuiteBoundary::ConnectorConformance,
-            ),
-            "range membership should stay proved at the connector conformance boundary"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::TokenFallback,
-                FilesystemFailureSuiteBoundary::ConnectorConformance,
-            ),
-            "token fallback should stay proved at the connector conformance boundary"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::PrefixCommit,
-                FilesystemFailureSuiteBoundary::RuntimeDurability,
-            ),
-            "prefix commit should stay proved at the receipt-durability boundary"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::ExhaustedEmptyBehavior,
-                FilesystemFailureSuiteBoundary::DistributedRuntime,
-            ),
-            "exhausted-empty behavior should stay proved in the distributed runtime"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::NonEmptyFinalPageBehavior,
-                FilesystemFailureSuiteBoundary::DistributedRuntime,
-            ),
-            "non-empty final-page behavior should stay proved in the distributed runtime"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::LeaseLossMidPage,
-                FilesystemFailureSuiteBoundary::DistributedRuntime,
-            ),
-            "lease loss mid-page should stay proved in the distributed runtime"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::LeaseLossMidPage,
-                FilesystemFailureSuiteBoundary::RealBackend,
-            ),
-            "lease loss mid-page should retain a live-backend proof"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::RetryAfterReassignment,
-                FilesystemFailureSuiteBoundary::RuntimeDurability,
-            ),
-            "retry after reassignment should stay proved at the receipt-durability boundary"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::RetryAfterReassignment,
-                FilesystemFailureSuiteBoundary::DistributedRuntime,
-            ),
-            "retry after reassignment should stay proved in the filesystem worker runtime"
-        );
-        assert!(
-            has_proof(
-                FilesystemFailureSuiteCase::RetryAfterReassignment,
-                FilesystemFailureSuiteBoundary::RealBackend,
-            ),
-            "retry after reassignment should retain a live-backend proof"
+        let expected: std::collections::BTreeSet<_> = [
+            (C::Ordering, B::ConnectorConformance),
+            (C::RangeMembership, B::ConnectorConformance),
+            (C::TokenFallback, B::ConnectorConformance),
+            (C::PrefixCommit, B::RuntimeDurability),
+            (C::ExhaustedEmptyBehavior, B::DistributedRuntime),
+            (C::NonEmptyFinalPageBehavior, B::DistributedRuntime),
+            (C::LeaseLossMidPage, B::DistributedRuntime),
+            (C::LeaseLossMidPage, B::RealBackend),
+            (C::RetryAfterReassignment, B::RuntimeDurability),
+            (C::RetryAfterReassignment, B::DistributedRuntime),
+            (C::RetryAfterReassignment, B::RealBackend),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            actual, expected,
+            "boundary split drifted — update this expected set if the change is intentional"
         );
     }
 
