@@ -39,7 +39,7 @@ static TELEMETRY_HASHER: LazyLock<gossip_contracts::blake3::Hasher> =
 
 thread_local! {
     /// Per-thread hasher seeded from [`TELEMETRY_HASHER`]. Using `reset()` between
-    /// calls avoids the ~1.9 KiB memcpy of cloning the full hasher state.
+    /// calls avoids the memcpy of cloning the full hasher state.
     static LOCAL_HASHER: RefCell<gossip_contracts::blake3::Hasher> =
         RefCell::new(TELEMETRY_HASHER.clone());
 }
@@ -986,6 +986,22 @@ mod tests {
         assert!(s.starts_with("len=4,hash="));
         // 16 hex chars for the 64-bit hash
         assert_eq!(s.len(), "len=4,hash=".len() + 16);
+    }
+
+    #[test]
+    fn redacted_digest_reset_clears_state_between_calls() {
+        let first = RedactedDigest::bytes("field", b"alpha");
+        let second = RedactedDigest::bytes("field", b"beta");
+        let reference = RedactedDigest::bytes("field", b"beta");
+
+        assert_ne!(
+            first, second,
+            "different inputs should produce different digests"
+        );
+        assert_eq!(
+            second, reference,
+            "reset() must fully clear state from the previous call"
+        );
     }
 
     #[test]

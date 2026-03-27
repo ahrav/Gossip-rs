@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::num::NonZeroU64;
-use std::{error::Error, fmt};
 
 use gossip_contracts::{
     connector::{Cursor, ItemKey},
@@ -84,30 +83,39 @@ impl PendingPrefixCheckpoint {
 }
 
 /// Deterministic contract violations from [`PrefixCheckpointAggregator`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PrefixCheckpointError {
     /// Incoming receipt belongs to a different tenant/run/shard/fence scope.
+    #[error("receipt for sequence {sequence_no} had owner scope {actual:?}, expected {expected:?}")]
     OwnershipMismatch {
         sequence_no: u64,
         expected: Box<WriteContext>,
         actual: Box<WriteContext>,
     },
     /// The durable scope disagreed with the runtime completed-unit boundary.
+    #[error("durable receipt for sequence {sequence_no} did not match its completed-unit boundary")]
     ReceiptBoundaryMismatch { sequence_no: u64 },
     /// A committed unit must always carry a key-bearing checkpoint boundary.
+    #[error("receipt for sequence {sequence_no} did not carry a key-bearing checkpoint boundary")]
     MissingProgressKey { sequence_no: u64 },
     /// The aggregator only accepts per-unit receipts.
+    #[error(
+        "receipt for sequence {sequence_no} represented {actual} committed units; expected exactly 1"
+    )]
     PerUnitReceiptExpected { sequence_no: u64, actual: u64 },
     /// One aggregator instance must not mix ordered-content and repo-frontier
     /// receipts.
+    #[error("checkpoint boundary kind mismatch: expected {expected:?}, got {actual:?}")]
     BoundaryKindMismatch {
         expected: CheckpointBoundaryKind,
         actual: CheckpointBoundaryKind,
     },
     /// A second receipt arrived for the same still-buffered sequence number,
     /// but it did not match the buffered one exactly.
+    #[error("conflicting durable receipts arrived for sequence {sequence_no}")]
     ConflictingReceiptForSequence { sequence_no: u64 },
     /// The contiguous prefix would move the checkpoint boundary backwards.
+    #[error("checkpoint boundary regressed while aggregating sequence {sequence_no}")]
     BoundaryRegression { sequence_no: u64 },
     /// Ordered-content mode requires strictly increasing keys at checkpoint
     /// unit boundaries. Equal keys would cause tokenless resume (which uses
@@ -117,121 +125,43 @@ pub enum PrefixCheckpointError {
     /// the offending receipt remains in the reorder buffer and no method can
     /// remove it. Callers that encounter this error must discard the
     /// aggregator and reconstruct it from the last acknowledged checkpoint.
+    #[error(
+        "ordered-content checkpoint key at sequence {sequence_no} equals the previous \
+         key; strictly increasing keys are required for safe tokenless resume"
+    )]
     OrderedContentEqualKey { sequence_no: u64 },
     /// The reorder buffer has reached its configured capacity. The caller
     /// should drain the buffer by acknowledging a pending checkpoint before
     /// submitting more receipts.
+    #[error(
+        "reorder buffer is full ({buffered}/{capacity}); acknowledge a pending \
+         checkpoint to drain buffered receipts"
+    )]
     BufferFull { buffered: usize, capacity: usize },
     /// A `u64` counter overflowed during prefix aggregation or acknowledgement.
+    #[error("{}", fmt_count_overflow_error(*.sequence_no, .field))]
     CountOverflow {
         sequence_no: Option<u64>,
         field: &'static str,
     },
     /// Reconstructing the pending aggregate page commit failed validation.
-    InvalidPreparedCheckpoint(PageCommitValidationError),
+    #[error("reconstructed aggregate receipt was invalid: {0}")]
+    InvalidPreparedCheckpoint(#[source] PageCommitValidationError),
     /// The runtime tried to acknowledge a checkpoint when none was pending.
+    #[error("no checkpoint prefix is currently prepared")]
     NoPendingCheckpoint,
     /// The supplied checkpoint receipt did not match the pending checkpoint.
-    InvalidCheckpointReceipt(PageCommitValidationError),
+    #[error("durable checkpoint receipt did not match the pending prefix: {0}")]
+    InvalidCheckpointReceipt(#[source] PageCommitValidationError),
     /// An internal invariant was violated during prefix construction.
+    #[error("internal inconsistency: {detail}")]
     InternalInconsistency { detail: &'static str },
 }
 
-impl fmt::Display for PrefixCheckpointError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OwnershipMismatch {
-                sequence_no,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "receipt for sequence {sequence_no} had owner scope {actual:?}, expected {expected:?}"
-            ),
-            Self::ReceiptBoundaryMismatch { sequence_no } => write!(
-                f,
-                "durable receipt for sequence {sequence_no} did not match its completed-unit boundary"
-            ),
-            Self::MissingProgressKey { sequence_no } => write!(
-                f,
-                "receipt for sequence {sequence_no} did not carry a key-bearing checkpoint boundary"
-            ),
-            Self::PerUnitReceiptExpected {
-                sequence_no,
-                actual,
-            } => write!(
-                f,
-                "receipt for sequence {sequence_no} represented {actual} committed units; expected exactly 1"
-            ),
-            Self::BoundaryKindMismatch { expected, actual } => write!(
-                f,
-                "checkpoint boundary kind mismatch: expected {expected:?}, got {actual:?}"
-            ),
-            Self::ConflictingReceiptForSequence { sequence_no } => write!(
-                f,
-                "conflicting durable receipts arrived for sequence {sequence_no}"
-            ),
-            Self::BoundaryRegression { sequence_no } => write!(
-                f,
-                "checkpoint boundary regressed while aggregating sequence {sequence_no}"
-            ),
-            Self::OrderedContentEqualKey { sequence_no } => write!(
-                f,
-                "ordered-content checkpoint key at sequence {sequence_no} equals the previous \
-                 key; strictly increasing keys are required for safe tokenless resume"
-            ),
-            Self::BufferFull { buffered, capacity } => write!(
-                f,
-                "reorder buffer is full ({buffered}/{capacity}); acknowledge a pending \
-                 checkpoint to drain buffered receipts"
-            ),
-            Self::CountOverflow {
-                sequence_no: Some(seq),
-                field,
-            } => write!(
-                f,
-                "aggregating {field} overflowed while processing sequence {seq}"
-            ),
-            Self::CountOverflow {
-                sequence_no: None,
-                field,
-            } => write!(f, "checkpoint progress counter '{field}' overflowed"),
-            Self::InvalidPreparedCheckpoint(err) => {
-                write!(f, "reconstructed aggregate receipt was invalid: {err}")
-            }
-            Self::NoPendingCheckpoint => {
-                write!(f, "no checkpoint prefix is currently prepared")
-            }
-            Self::InvalidCheckpointReceipt(err) => {
-                write!(
-                    f,
-                    "durable checkpoint receipt did not match the pending prefix: {err}"
-                )
-            }
-            Self::InternalInconsistency { detail } => {
-                write!(f, "internal inconsistency: {detail}")
-            }
-        }
-    }
-}
-
-impl Error for PrefixCheckpointError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidPreparedCheckpoint(err) | Self::InvalidCheckpointReceipt(err) => Some(err),
-            Self::OwnershipMismatch { .. }
-            | Self::ReceiptBoundaryMismatch { .. }
-            | Self::MissingProgressKey { .. }
-            | Self::PerUnitReceiptExpected { .. }
-            | Self::BoundaryKindMismatch { .. }
-            | Self::ConflictingReceiptForSequence { .. }
-            | Self::BoundaryRegression { .. }
-            | Self::OrderedContentEqualKey { .. }
-            | Self::BufferFull { .. }
-            | Self::CountOverflow { .. }
-            | Self::NoPendingCheckpoint
-            | Self::InternalInconsistency { .. } => None,
-        }
+fn fmt_count_overflow_error(sequence_no: Option<u64>, field: &str) -> String {
+    match sequence_no {
+        Some(seq) => format!("aggregating {field} overflowed while processing sequence {seq}"),
+        None => format!("checkpoint progress counter '{field}' overflowed"),
     }
 }
 
@@ -740,6 +670,7 @@ fn checked_add(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::error::Error as _;
 
     use super::*;
 

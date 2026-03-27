@@ -9,8 +9,6 @@
 //! Connector-mode filesystem scans route through the distributed worker loop.
 //! They do not silently downgrade to the local scan path.
 
-use std::fmt;
-
 use gossip_scanner_runtime::{
     ScanReport, ScanRuntimeError, distributed::DistributedRunReport, scan_fs, scan_git,
 };
@@ -23,31 +21,14 @@ use tracing_subscriber::EnvFilter;
 
 /// Worker-level error distinguishing configuration errors from runtime
 /// failures.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum WorkerError {
-    Config(gossip_worker::config::WorkerConfigError),
-    LocalRuntime(ScanRuntimeError),
-    ProductionRuntime(ProductionWorkerError),
-}
-
-impl fmt::Display for WorkerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(error) => write!(f, "{error}"),
-            Self::LocalRuntime(error) => write!(f, "scan failed: {error}"),
-            Self::ProductionRuntime(error) => write!(f, "scan failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for WorkerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Config(error) => Some(error),
-            Self::LocalRuntime(error) => Some(error),
-            Self::ProductionRuntime(error) => Some(error),
-        }
-    }
+    #[error("{0}")]
+    Config(#[source] gossip_worker::config::WorkerConfigError),
+    #[error("scan failed: {0}")]
+    LocalRuntime(#[source] ScanRuntimeError),
+    #[error("scan failed: {0}")]
+    ProductionRuntime(#[source] ProductionWorkerError),
 }
 
 impl From<gossip_worker::config::WorkerConfigError> for WorkerError {
@@ -77,13 +58,25 @@ enum WorkerRunReport {
 
 /// Initialize the global tracing subscriber.
 ///
-/// Reads `RUST_LOG` if present, silently falls back to `info` when absent,
-/// and accepts partial/lossy directives without warning.
+/// Reads `RUST_LOG` if present and falls back to `info` when absent. When
+/// `RUST_LOG` contains invalid directives, a warning is printed to stderr
+/// (the tracing subscriber is not yet available at that point) and the
+/// filter falls back to lossy parsing so the process still starts.
 fn init_tracing() {
-    let filter = EnvFilter::builder()
+    let filter = match EnvFilter::builder()
         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
-        .from_env_lossy();
+        .from_env()
+    {
+        Ok(f) => f,
+        Err(err) => {
+            eprintln!("WARNING: malformed RUST_LOG directive ({err}); falling back to default");
+            EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy()
+        }
+    };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .compact()
@@ -109,6 +102,7 @@ fn run_distributed_worker(
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
     run_production_worker(
         cfg.production_backends(),
+        cfg.startup(),
         cfg.worker_identity(),
         cfg.runtime_config(),
     )
@@ -220,6 +214,7 @@ mod tests {
     };
     use gossip_coordination_etcd::EtcdCoordinatorConfig;
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+    use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
     use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
     use gossip_scanner_runtime::{
         ScanBudgets,
@@ -231,6 +226,7 @@ mod tests {
         DistributedWorkerRuntimeSettings, FsSourceSettings, GitSourceSettings,
         ProductionBackendConfig, WorkerIdentityConfig,
     };
+    use gossip_worker::production::ProductionStartupSettings;
     use tempfile::tempdir;
 
     fn create_git_repo(path: &Path) {
@@ -300,6 +296,7 @@ mod tests {
         .expect("test worker identity config should be valid");
         DistributedWorkerConfig::new(
             backends,
+            ProductionStartupSettings::validate_only(),
             identity,
             FsSourceSettings::new(path.to_path_buf()),
             DistributedWorkerRuntimeSettings::new(
@@ -344,11 +341,13 @@ mod tests {
             .expect("test run creation should succeed");
 
         let mut scratch = ShardSpecScratch::new();
-        let connector_extra = path
-            .to_str()
-            .expect("test paths must be valid UTF-8")
-            .as_bytes();
-        let spec_ref = range_shard_ref(start, end, connector_extra, &mut scratch)
+        let connector_extra = FilesystemShardPayload::new(
+            FilesystemSourceMode::DirectoryRoot,
+            path.canonicalize().expect("test path must canonicalize"),
+        )
+        .encode()
+        .expect("test payload should encode");
+        let spec_ref = range_shard_ref(start, end, &connector_extra, &mut scratch)
             .expect("range shard spec should build");
         let spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec should build");
         let shard_id = ShardId::from_raw(1);

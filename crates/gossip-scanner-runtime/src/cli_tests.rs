@@ -272,6 +272,7 @@ fn default_summary_omits_workers_but_keeps_errors_for_git() {
 fn debug_summary_includes_extended_fs_metrics() {
     let report = ScanReport {
         items_scanned: 9,
+        items_deferred: 0,
         bytes_scanned: 1024,
         chunks_scanned: 3,
         findings_emitted: 4,

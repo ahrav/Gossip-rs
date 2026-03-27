@@ -7,9 +7,11 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use gossip_contracts::{
+    connector::FILESYSTEM_CONNECTOR_TAG,
     coordination::ShardSpec,
     identity::{
-        LogicalTime, OpId, PolicyHash, RunId, ShardId, TenantId, TenantSecretKey, WorkerId,
+        ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, OpId, PolicyHash, RunId, ShardId,
+        TenantId, TenantSecretKey, WorkerId,
     },
 };
 use gossip_coordination::{
@@ -17,6 +19,7 @@ use gossip_coordination::{
     RunConfig, RunManagement,
 };
 use gossip_frontier::{ShardSpecScratch, range_shard_ref};
+use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
 use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
 use serde_json::Value;
 use tempfile::{NamedTempFile, tempdir};
@@ -88,6 +91,45 @@ fn write_empty_rules() -> NamedTempFile {
     file
 }
 
+/// Independent oracle for filesystem stable-item-ID derivation.
+///
+/// Re-derives the ID from raw primitives (connector tag + instance hash +
+/// locator) without going through [`FilesystemIdentityScope`], so tests
+/// can assert the production path matches an independently computed value.
+///
+/// Passes `locator` directly as the identity key's third component. This is
+/// equivalent to the production path (`ItemKey::try_from_slice` followed by
+/// `as_bytes()`) because `ItemKey` stores the input bytes unmodified.
+fn expected_fs_stable_item_id(
+    root: &Path,
+    locator: &[u8],
+) -> gossip_contracts::identity::StableItemId {
+    let connector_instance =
+        ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_encoded_bytes());
+    ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, locator).stable_id()
+}
+
+/// Run a single-worker filesystem scan with persistence enabled, returning
+/// the outcome and a spy sink that captured all commit-sink calls.
+fn scan_fs_with_spy_commit_sink(
+    path: &Path,
+    rules: &NamedTempFile,
+) -> (AssignmentOutcome, SpyCommitSink) {
+    let sink = SpyCommitSink::default();
+    let cancel = CancellationToken::new();
+    let outcome = scan_fs_with_runtime(
+        &FsScanConfig::new(path)
+            .with_rules_file(Some(rules.path().to_path_buf()))
+            .with_persist_findings(true)
+            .with_workers(1),
+        &NullEventOutput,
+        &sink,
+        &cancel,
+    )
+    .expect("filesystem scan should succeed");
+    (outcome, sink)
+}
+
 fn parse_jsonl(bytes: Vec<u8>) -> Vec<Value> {
     String::from_utf8(bytes)
         .expect("event sink output should be valid utf-8")
@@ -129,7 +171,7 @@ fn comparable_findings_from_jsonl(bytes: Vec<u8>, root: &Path) -> Vec<Comparable
     findings
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct DistributedCoreRecorder {
     core_events: Mutex<Vec<OwnedCoreEvent>>,
 }
@@ -195,6 +237,16 @@ fn distributed_now() -> LogicalTime {
     LogicalTime::from_raw(1)
 }
 
+fn distributed_filesystem_payload(path: &Path, mode: FilesystemSourceMode) -> Vec<u8> {
+    FilesystemShardPayload::new(
+        mode,
+        path.canonicalize()
+            .expect("distributed payload path must canonicalize"),
+    )
+    .encode()
+    .expect("distributed payload must encode")
+}
+
 fn setup_distributed_coordinator(
     path: &Path,
     lease_duration_ms: u64,
@@ -210,13 +262,10 @@ fn setup_distributed_coordinator(
         )
         .expect("create run");
 
-    let connector_extra = path
-        .to_str()
-        .expect("test path must be valid UTF-8")
-        .as_bytes();
+    let connector_extra = distributed_filesystem_payload(path, FilesystemSourceMode::DirectoryRoot);
     let mut scratch = ShardSpecScratch::new();
-    let spec_ref =
-        range_shard_ref(b"\x00", b"\xFF", connector_extra, &mut scratch).expect("range shard spec");
+    let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
+        .expect("range shard spec");
     let spec = ShardSpec::try_from_ref(spec_ref).expect("owned shard spec");
     let shard_id = ShardId::from_raw(1);
     let shards = [InitialShardInput::new(
@@ -367,13 +416,16 @@ fn scan_budgets_reject_zero_bytes() {
 fn scan_fs_direct_rejects_nonexistent_path() {
     let error = scan_fs_direct(&FsScanConfig::new("/no/such/path"))
         .expect_err("nonexistent path should fail");
-    assert!(matches!(
-        error,
-        ScanRuntimeError::InvalidPath {
-            source: "filesystem",
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            error,
+            ScanRuntimeError::InvalidPath {
+                origin: "filesystem",
+                ..
+            }
+        ),
+        "nonexistent path surfaces as an InvalidPath error: {error}"
+    );
 }
 
 #[test]
@@ -395,23 +447,45 @@ fn scan_fs_direct_scans_directory_with_custom_rules() {
 }
 
 #[test]
-fn scan_fs_connector_matches_direct_counters() {
+fn scan_fs_connector_uses_ordered_page_fill_runtime() {
     let dir = tempdir().expect("tempdir");
-    fs::write(dir.path().join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    fs::write(dir.path().join("a.txt"), "a").expect("write first fixture");
+    fs::write(dir.path().join("secret.txt"), "prefix TOK_ABCDEFGH suffix")
+        .expect("write secret fixture");
+    fs::write(dir.path().join("z.txt"), "zz").expect("write last fixture");
     let rules = write_runtime_rules();
     let rules_path = rules.path().to_path_buf();
-    let base = FsScanConfig::new(dir.path()).with_rules_file(Some(rules_path));
+    let base = FsScanConfig::new(dir.path())
+        .with_rules_file(Some(rules_path))
+        .with_budgets(ScanBudgets {
+            max_items: 1,
+            max_bytes: 1_024,
+        });
 
     let direct = scan_fs(&base.clone().with_execution_mode(ExecutionMode::Direct))
         .expect("direct filesystem scan");
     let connector = scan_fs(&base.with_execution_mode(ExecutionMode::Connector))
         .expect("connector filesystem scan");
 
-    assert_eq!(connector.items_scanned, direct.items_scanned);
-    assert_eq!(connector.bytes_scanned, direct.bytes_scanned);
-    assert_eq!(connector.chunks_scanned, direct.chunks_scanned);
-    assert_eq!(connector.findings_emitted, direct.findings_emitted);
-    assert_eq!(connector.errors, direct.errors);
+    assert_eq!(
+        connector.items_scanned, 1,
+        "connector mode should report only the first validated ordered page"
+    );
+    assert_eq!(
+        connector.bytes_scanned, 1,
+        "the first ordered item is a.txt with one byte of content"
+    );
+    assert_eq!(connector.findings_emitted, 0);
+    assert_eq!(connector.errors, 0);
+
+    assert!(
+        direct.items_scanned >= 3,
+        "direct mode still performs the full local scan"
+    );
+    assert!(
+        direct.findings_emitted >= 1,
+        "direct mode still executes rule matching on item content"
+    );
 }
 
 #[test]
@@ -455,7 +529,8 @@ fn scan_fs_with_runtime_forwards_persisted_findings() {
     let outcome = scan_fs_with_runtime(
         &FsScanConfig::new(dir.path())
             .with_rules_file(Some(rules.path().to_path_buf()))
-            .with_persist_findings(true),
+            .with_persist_findings(true)
+            .with_workers(1),
         &NullEventOutput,
         &sink,
         &cancel,
@@ -477,6 +552,71 @@ fn scan_fs_with_runtime_forwards_persisted_findings() {
 }
 
 #[test]
+fn scan_fs_with_runtime_derives_expected_stable_item_id() {
+    let dir = tempdir().expect("tempdir");
+    let nested = dir.path().join("nested");
+    fs::create_dir_all(&nested).expect("create nested fixture dir");
+    fs::write(nested.join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    let rules = write_runtime_rules();
+    let canonical_root = fs::canonicalize(dir.path()).expect("canonicalize root");
+
+    let (outcome, sink) = scan_fs_with_spy_commit_sink(dir.path(), &rules);
+    let begun = sink.begun();
+
+    assert_eq!(outcome.report.items_scanned, 1);
+    assert_eq!(begun.len(), 1);
+    assert_eq!(begun[0].0, b"nested/secret.txt".to_vec());
+    assert_eq!(
+        begun[0].1.stable_item_id,
+        expected_fs_stable_item_id(&canonical_root, b"nested/secret.txt"),
+    );
+}
+
+#[test]
+fn scan_fs_with_runtime_distinguishes_same_relative_path_under_different_roots() {
+    let dir_a = tempdir().expect("tempdir");
+    let dir_b = tempdir().expect("tempdir");
+    for root in [dir_a.path(), dir_b.path()] {
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested fixture dir");
+        fs::write(nested.join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    }
+    let rules = write_runtime_rules();
+
+    let (_, sink_a) = scan_fs_with_spy_commit_sink(dir_a.path(), &rules);
+    let (_, sink_b) = scan_fs_with_spy_commit_sink(dir_b.path(), &rules);
+    let begun_a = sink_a.begun();
+    let begun_b = sink_b.begun();
+
+    assert_eq!(begun_a.len(), 1);
+    assert_eq!(begun_b.len(), 1);
+    assert_eq!(begun_a[0].0, b"nested/secret.txt".to_vec());
+    assert_eq!(begun_b[0].0, b"nested/secret.txt".to_vec());
+    assert_ne!(begun_a[0].1.stable_item_id, begun_b[0].1.stable_item_id);
+}
+
+#[test]
+fn scan_fs_with_runtime_aligns_equivalent_root_spellings() {
+    let dir = tempdir().expect("tempdir");
+    let nested = dir.path().join("nested");
+    fs::create_dir_all(&nested).expect("create nested fixture dir");
+    fs::write(nested.join("secret.txt"), "prefix TOK_ABCDEFGH suffix").expect("write fixture");
+    let dotted_root = dir.path().join(".");
+    let rules = write_runtime_rules();
+
+    let (_, sink_a) = scan_fs_with_spy_commit_sink(dir.path(), &rules);
+    let (_, sink_b) = scan_fs_with_spy_commit_sink(&dotted_root, &rules);
+    let begun_a = sink_a.begun();
+    let begun_b = sink_b.begun();
+
+    assert_eq!(begun_a.len(), 1);
+    assert_eq!(begun_b.len(), 1);
+    assert_eq!(begun_a[0].0, b"nested/secret.txt".to_vec());
+    assert_eq!(begun_b[0].0, begun_a[0].0);
+    assert_eq!(begun_b[0].1.stable_item_id, begun_a[0].1.stable_item_id);
+}
+
+#[test]
 fn scan_fs_with_runtime_uses_file_name_for_single_file_persistence_key() {
     let dir = tempdir().expect("tempdir");
     let file_path = dir.path().join("secret.txt");
@@ -488,7 +628,8 @@ fn scan_fs_with_runtime_uses_file_name_for_single_file_persistence_key() {
     let outcome = scan_fs_with_runtime(
         &FsScanConfig::new(&file_path)
             .with_rules_file(Some(rules.path().to_path_buf()))
-            .with_persist_findings(true),
+            .with_persist_findings(true)
+            .with_workers(1),
         &NullEventOutput,
         &sink,
         &cancel,
@@ -532,7 +673,7 @@ fn scan_git_direct_rejects_missing_repo() {
         .expect_err("missing path should fail");
     assert!(matches!(
         error,
-        ScanRuntimeError::InvalidPath { source: "git", .. }
+        ScanRuntimeError::InvalidPath { origin: "git", .. }
     ));
 }
 
@@ -553,7 +694,7 @@ fn scan_git_rejects_subdirectory_of_repo() {
     let error = scan_git_direct(&GitScanConfig::new(&subdir)).expect_err("subdirectory");
     assert!(matches!(
         error,
-        ScanRuntimeError::InvalidPath { source: "git", .. }
+        ScanRuntimeError::InvalidPath { origin: "git", .. }
     ));
 }
 
@@ -752,12 +893,14 @@ fn forward_commits_surfaces_first_commit_error() {
         object_path: b"file_a.txt".to_vec(),
         stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x01; 32]),
         findings: Vec::new(),
+        discovery_sequence: 0,
     }))
     .unwrap();
     tx.send(CommitMessage::Batch(OwnedCommitBatch {
         object_path: b"file_b.txt".to_vec(),
         stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x02; 32]),
         findings: Vec::new(),
+        discovery_sequence: 1,
     }))
     .unwrap();
     drop(tx);
@@ -821,6 +964,7 @@ fn forward_commits_drains_channel_after_error() {
             object_path: format!("file_{i}.txt").into_bytes(),
             stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([i; 32]),
             findings: Vec::new(),
+            discovery_sequence: u32::from(i),
         }))
         .unwrap();
     }
@@ -868,7 +1012,10 @@ fn channel_store_producer_sends_run_loss_and_end_run() {
 
     let (tx, rx) = sync_channel(16);
     let dir = tempdir().expect("tempdir");
-    let producer = ChannelStoreProducer::new(tx, dir.path().to_path_buf());
+    let producer = ChannelStoreProducer::from_canonical_root(
+        tx,
+        fs::canonicalize(dir.path()).expect("canonicalize root"),
+    );
 
     producer
         .record_fs_run_loss(scanner_scheduler::store::FsRunLoss {
@@ -937,7 +1084,7 @@ fn scan_git_with_runtime_returns_empty_report_when_pre_cancelled() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedCoreEvent round-trip fidelity (F11)
+// OwnedCoreEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1017,7 +1164,7 @@ fn owned_core_event_diagnostic_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedGitEvent round-trip fidelity (F11)
+// OwnedGitEvent round-trip fidelity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1125,4 +1272,592 @@ fn owned_git_event_identity_dictionary_round_trips() {
     let event = &events[0];
     assert_eq!(event["type"], "identity_dictionary");
     assert_eq!(event["id"], 99);
+}
+
+// ===========================================================================
+// DiscoveryOrderBuffer unit tests
+// ===========================================================================
+
+/// Helper to build a minimal `OwnedCommitBatch` with a given path and
+/// discovery sequence. Findings are empty; the stable item id is derived
+/// from the sequence for uniqueness.
+fn test_batch(path: &[u8], ds: u32) -> OwnedCommitBatch {
+    let mut id_bytes = [0u8; 32];
+    id_bytes[..4].copy_from_slice(&ds.to_le_bytes());
+    OwnedCommitBatch {
+        object_path: path.to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes(id_bytes),
+        findings: Vec::new(),
+        discovery_sequence: ds,
+    }
+}
+
+/// Convenience: collect all flushed paths from a buffer via push + drain_ready.
+fn push_and_collect(buf: &mut DiscoveryOrderBuffer, batch: OwnedCommitBatch) -> Vec<Vec<u8>> {
+    let mut ready = Vec::new();
+    buf.push(batch);
+    buf.drain_ready(&mut ready);
+    ready.iter().map(|b| b.object_path.clone()).collect()
+}
+
+#[test]
+fn discovery_order_buffer_passthrough_when_already_sorted() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // Batches arrive in discovery order: ds=0, ds=1, ds=2.
+    // Each ds transition marks the previous as complete.
+    let flushed_0 = push_and_collect(&mut buf, test_batch(b"a.txt", 0));
+    // ds=0 is current but not yet complete (no transition).
+    assert!(flushed_0.is_empty());
+
+    let flushed_1 = push_and_collect(&mut buf, test_batch(b"b.txt", 1));
+    // ds=0 is now complete; it matches next_flush=0, so it flushes.
+    assert_eq!(flushed_1, vec![b"a.txt".to_vec()]);
+
+    let flushed_2 = push_and_collect(&mut buf, test_batch(b"c.txt", 2));
+    assert_eq!(flushed_2, vec![b"b.txt".to_vec()]);
+
+    // Finish drains the last item.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(remaining, vec![b"c.txt".to_vec()]);
+}
+
+#[test]
+fn discovery_order_buffer_reorders_reversed_input() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // LIFO reversal: files arrive as ds=2, ds=1, ds=0.
+    let f = push_and_collect(&mut buf, test_batch(b"c.txt", 2));
+    assert!(f.is_empty(), "ds=2 not ready (next_flush=0)");
+
+    let f = push_and_collect(&mut buf, test_batch(b"b.txt", 1));
+    assert!(
+        f.is_empty(),
+        "ds=1 not ready (next_flush=0), ds=2 complete but not contiguous"
+    );
+
+    let f = push_and_collect(&mut buf, test_batch(b"a.txt", 0));
+    assert!(
+        f.is_empty(),
+        "ds=0 not ready yet (ds=1 just became complete)"
+    );
+
+    // Channel close: finish flushes everything in discovery order.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()],
+        "finish must produce batches in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_multi_batch_reversal() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // Two injection batches, each reversed by LIFO.
+    // Discovery: [A(0), B(1), C(2), D(3), E(4), F(5)]
+    // Batch 1 (LIFO): C(2), B(1), A(0)
+    // Batch 2 (LIFO): F(5), E(4), D(3)
+    for &(path, ds) in &[
+        (&b"c.txt"[..], 2u32),
+        (b"b.txt", 1),
+        (b"a.txt", 0),
+        (b"f.txt", 5),
+        (b"e.txt", 4),
+        (b"d.txt", 3),
+    ] {
+        buf.push(test_batch(path, ds));
+    }
+
+    // After all pushes, transitions have marked {2,1,0,5,4} complete.
+    // current_ds = 3 (not yet complete). drain_ready flushes 0→1→2.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    let flushed: Vec<Vec<u8>> = ready.into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        flushed,
+        vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c.txt".to_vec()],
+        "first injection batch should flush in discovery order"
+    );
+
+    // finish marks ds=3 complete, then flushes 3→4→5.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"d.txt".to_vec(), b"e.txt".to_vec(), b"f.txt".to_vec(),],
+        "second injection batch should flush in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_multi_batch_per_file() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // File with ds=1 has two chunks. File with ds=0 has one chunk.
+    // Arrival: ds=1 chunk_a, ds=1 chunk_b, ds=0 chunk_a.
+    buf.push(test_batch(b"b_chunk1.txt", 1));
+    buf.push(test_batch(b"b_chunk2.txt", 1));
+    buf.push(test_batch(b"a_chunk1.txt", 0));
+    // ds=1 is marked complete when ds=0 arrives.
+    // drain_ready: next_flush=0, 0 not in complete → nothing.
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![
+            b"a_chunk1.txt".to_vec(),
+            b"b_chunk1.txt".to_vec(),
+            b"b_chunk2.txt".to_vec(),
+        ],
+        "within a ds group, batches must preserve arrival order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_single_item() {
+    let mut buf = DiscoveryOrderBuffer::new();
+    buf.push(test_batch(b"only.txt", 0));
+
+    // No transition → nothing drained eagerly.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    assert!(ready.is_empty());
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(remaining, vec![b"only.txt".to_vec()]);
+}
+
+#[test]
+fn discovery_order_buffer_empty() {
+    let buf = DiscoveryOrderBuffer::new();
+    let remaining: Vec<OwnedCommitBatch> = buf.finish().into_iter().collect();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn forward_commits_reorders_lifo_reversed_batches() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Simulate LIFO reversal: discovery order is a,b,c but processing
+    // order is c,b,a. Discovery sequences are 2,1,0 respectively.
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok());
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 3, "all three items should be committed");
+    let keys: Vec<&[u8]> = begun.iter().map(|(k, _)| k.as_slice()).collect();
+    // Verify discovery order is preserved: ds=0 -> ds=1 -> ds=2.
+    assert_eq!(
+        keys,
+        vec![
+            b"a.txt".as_slice(),
+            b"b.txt".as_slice(),
+            b"c.txt".as_slice()
+        ],
+        "begin_item must be called in discovery order"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_handles_gap_in_sequences() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // ds=0 and ds=2 present; ds=1 was never produced (file skipped).
+    buf.push(test_batch(b"c.txt", 2));
+    buf.push(test_batch(b"a.txt", 0));
+
+    // current_ds=0 after the second push. drain_ready stops when
+    // next_flush equals current_ds, so nothing is drained yet.
+    let mut ready = Vec::new();
+    buf.drain_ready(&mut ready);
+    assert!(ready.is_empty(), "ds=0 is current, not yet complete");
+
+    // finish() flushes the contiguous prefix (ds=0) then hits the gap
+    // at ds=1. The safety net flushes residual ds=2 in BTreeMap key
+    // order — correct discovery order despite the gap.
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"c.txt".to_vec()],
+        "finish must produce batches in discovery order despite gap at ds=1"
+    );
+}
+
+#[test]
+fn forward_commits_captures_error_from_finish_flush() {
+    use std::sync::mpsc::sync_channel;
+
+    /// Commit sink that fails when `begin_item` sees a key starting
+    /// with "a". All other keys succeed.
+    struct FailOnASink;
+
+    impl commit_sink::CommitSink for FailOnASink {
+        fn begin_item(
+            &self,
+            item_key: &gossip_contracts::connector::ItemKey,
+            _meta: &commit_sink::ItemMeta,
+        ) -> anyhow::Result<()> {
+            if item_key.as_bytes().starts_with(b"a") {
+                anyhow::bail!("injected failure for key starting with 'a'");
+            }
+            Ok(())
+        }
+
+        fn upsert_findings(
+            &self,
+            _item_key: &gossip_contracts::connector::ItemKey,
+            _batch: &commit_sink::FindingsBatch,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_item(
+            &self,
+            _item_key: &gossip_contracts::connector::ItemKey,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = FailOnASink;
+    let (tx, rx) = sync_channel(16);
+
+    // Send reversed: ds=2, ds=1, ds=0. All batches buffer until
+    // finish() because the reversed arrival means drain_ready never
+    // flushes the contiguous prefix during the recv loop.
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(
+        result.is_err(),
+        "error from finish-path batch must propagate"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("injected failure"),
+        "expected injected failure, got: {err_msg}"
+    );
+}
+
+#[test]
+fn forward_commits_eagerly_flushes_in_order_input() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Send batches in discovery order: ds=0, ds=1, ds=2. Each new
+    // sequence number completes the previous one, so drain_ready fires
+    // during the recv loop rather than deferring everything to finish().
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"c.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([2; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 2,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok());
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 3, "all three items should be committed");
+    let keys: Vec<&[u8]> = begun.iter().map(|(k, _)| k.as_slice()).collect();
+    // Verify discovery order is preserved: ds=0 -> ds=1 -> ds=2.
+    assert_eq!(
+        keys,
+        vec![
+            b"a.txt".as_slice(),
+            b"b.txt".as_slice(),
+            b"c.txt".as_slice()
+        ],
+        "begin_item must be called in discovery order"
+    );
+}
+
+#[test]
+fn forward_commits_handles_interleaved_run_loss_with_buffered_batches() {
+    use std::sync::mpsc::sync_channel;
+
+    let sink = SpyCommitSink::default();
+    let (tx, rx) = sync_channel(16);
+
+    // Batch(ds=1), RunLoss, Batch(ds=0): RunLoss must not interfere
+    // with the discovery-order buffer, and batches must still arrive at
+    // the sink in discovery order (ds=0 before ds=1).
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"b.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([1; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 1,
+    }))
+    .unwrap();
+    tx.send(CommitMessage::RunLoss(
+        scanner_scheduler::store::FsRunLoss {
+            dropped_findings: 0,
+            persistence_emit_failures: 0,
+        },
+    ))
+    .unwrap();
+    tx.send(CommitMessage::Batch(OwnedCommitBatch {
+        object_path: b"a.txt".to_vec(),
+        stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0; 32]),
+        findings: Vec::new(),
+        discovery_sequence: 0,
+    }))
+    .unwrap();
+    drop(tx);
+
+    let result = forward_commits(&sink, rx);
+    assert!(result.is_ok(), "interleaved RunLoss must not cause errors");
+
+    let begun = sink.begun();
+    assert_eq!(begun.len(), 2, "both batches should be committed");
+    assert_eq!(
+        begun[0].0,
+        b"a.txt".to_vec(),
+        "ds=0 batch must be forwarded first"
+    );
+    assert_eq!(
+        begun[1].0,
+        b"b.txt".to_vec(),
+        "ds=1 batch must be forwarded second"
+    );
+}
+
+#[test]
+fn discovery_order_buffer_handles_multiple_gaps() {
+    let mut buf = DiscoveryOrderBuffer::new();
+
+    // ds=0, ds=3, ds=6: gaps at {1,2} and {4,5}. The buffer must
+    // produce all three in discovery order despite the missing sequences.
+    buf.push(test_batch(b"a.txt", 0));
+    buf.push(test_batch(b"d.txt", 3));
+    buf.push(test_batch(b"g.txt", 6));
+
+    let remaining: Vec<Vec<u8>> = buf.finish().into_iter().map(|b| b.object_path).collect();
+    assert_eq!(
+        remaining,
+        vec![b"a.txt".to_vec(), b"d.txt".to_vec(), b"g.txt".to_vec()],
+        "finish must produce batches in discovery order despite multiple gaps"
+    );
+}
+
+#[test]
+fn scan_local_filesystem_rejects_multi_worker_persist() {
+    let dir = tempdir().expect("tempdir");
+    let cancel = CancellationToken::new();
+
+    let result = scan_fs_with_runtime(
+        &FsScanConfig::new(dir.path())
+            .with_persist_findings(true)
+            .with_workers(4),
+        &NullEventOutput,
+        &commit_sink::CliNoOpCommitSink,
+        &cancel,
+    );
+
+    assert!(result.is_err(), "multi-worker persist must be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("workers=1"),
+        "error should mention workers=1, got: {err_msg}"
+    );
+}
+
+#[test]
+fn scan_fs_connector_reports_all_items_when_budget_fits_entire_directory() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("a.txt"), "abc").expect("write a.txt");
+    fs::write(dir.path().join("b.txt"), "defgh").expect("write b.txt");
+
+    let config = FsScanConfig::new(dir.path())
+        .with_execution_mode(ExecutionMode::Connector)
+        .with_budgets(ScanBudgets {
+            max_items: 256,
+            max_bytes: 1_000_000,
+        });
+
+    let report = scan_fs(&config).expect("connector scan should succeed");
+
+    assert_eq!(
+        report.items_scanned, 2,
+        "both files fit within the page budget"
+    );
+    assert_eq!(
+        report.bytes_scanned, 8,
+        "total bytes: 3 (a.txt) + 5 (b.txt)"
+    );
+}
+
+#[test]
+fn scan_fs_connector_handles_single_file_path() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("target.txt");
+    fs::write(&file_path, "1234567").expect("write target.txt");
+
+    let config = FsScanConfig::new(&file_path).with_execution_mode(ExecutionMode::Connector);
+
+    let report = scan_fs(&config).expect("connector scan of single file should succeed");
+
+    assert_eq!(report.items_scanned, 1, "single file produces one item");
+}
+
+#[test]
+fn scan_report_add_assign_accumulates_all_fields() {
+    let a = ScanReport {
+        items_scanned: 10,
+        items_deferred: 1,
+        bytes_scanned: 2000,
+        chunks_scanned: 50,
+        findings_emitted: 3,
+        errors: 1,
+        binary_skipped: 4,
+        ext_skipped: 5,
+        lock_skipped: 6,
+        binary_extracted: 7,
+        dropped_findings: 2,
+        persist_emit_failures: 8,
+        persist_incomplete: false,
+        scan_ns: 100_000,
+        persist_ns: 200_000,
+    };
+    let b = ScanReport {
+        items_scanned: 20,
+        items_deferred: 3,
+        bytes_scanned: 3000,
+        chunks_scanned: 70,
+        findings_emitted: 5,
+        errors: 2,
+        binary_skipped: 10,
+        ext_skipped: 11,
+        lock_skipped: 12,
+        binary_extracted: 13,
+        dropped_findings: 4,
+        persist_emit_failures: 9,
+        persist_incomplete: true,
+        scan_ns: 300_000,
+        persist_ns: 400_000,
+    };
+
+    // false |= true => true
+    let mut result = a;
+    result += b;
+
+    assert_eq!(result.items_scanned, 30);
+    assert_eq!(result.items_deferred, 4);
+    assert_eq!(result.bytes_scanned, 5000);
+    assert_eq!(result.chunks_scanned, 120);
+    assert_eq!(result.findings_emitted, 8);
+    assert_eq!(result.errors, 3);
+    assert_eq!(result.binary_skipped, 14);
+    assert_eq!(result.ext_skipped, 16);
+    assert_eq!(result.lock_skipped, 18);
+    assert_eq!(result.binary_extracted, 20);
+    assert_eq!(result.dropped_findings, 6);
+    assert_eq!(result.persist_emit_failures, 17);
+    assert!(
+        result.persist_incomplete,
+        "any-incomplete flag: false |= true must be true"
+    );
+    assert_eq!(result.scan_ns, 400_000);
+    assert_eq!(result.persist_ns, 600_000);
+
+    // true |= false => true (assignment must use |=, not plain =)
+    let mut lhs_true = ScanReport {
+        persist_incomplete: true,
+        ..ScanReport::default()
+    };
+    lhs_true += ScanReport::default();
+    assert!(
+        lhs_true.persist_incomplete,
+        "any-incomplete flag: true |= false must stay true"
+    );
+
+    // false |= false => false
+    let mut both_complete = a;
+    let a2 = a;
+    both_complete += a2;
+    assert!(
+        !both_complete.persist_incomplete,
+        "any-incomplete flag: false |= false must be false"
+    );
+
+    // saturating addition must not wrap
+    let mut near_max = ScanReport {
+        bytes_scanned: u64::MAX,
+        ..ScanReport::default()
+    };
+    near_max += ScanReport {
+        bytes_scanned: 1,
+        ..ScanReport::default()
+    };
+    assert_eq!(
+        near_max.bytes_scanned,
+        u64::MAX,
+        "saturating_add must clamp at u64::MAX"
+    );
 }

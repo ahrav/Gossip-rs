@@ -873,14 +873,6 @@ mod tests {
         }
     }
 
-    fn assert_perf_u64(actual: u64, expected: u64) {
-        if cfg!(all(feature = "perf-stats", debug_assertions)) {
-            assert_eq!(actual, expected);
-        } else {
-            assert_eq!(actual, 0);
-        }
-    }
-
     #[test]
     fn diff_identical_trees() {
         let mut source = MockTreeSource::new();
@@ -934,7 +926,7 @@ mod tests {
             .unwrap();
 
         assert!(candidates.is_empty());
-        assert_perf_u64(walker.stats().subtrees_skipped, 1);
+        crate::test_utils::assert_perf_u64(walker.stats().subtrees_skipped, 1);
     }
 
     #[test]
@@ -1276,13 +1268,13 @@ mod tests {
             .unwrap();
 
         let stats = walker.stats();
-        assert_perf_u64(stats.trees_loaded, 1);
+        crate::test_utils::assert_perf_u64(stats.trees_loaded, 1);
         if cfg!(all(feature = "perf-stats", debug_assertions)) {
             assert_eq!(stats.tree_bytes_loaded as usize, data.len());
         } else {
             assert_eq!(stats.tree_bytes_loaded, 0);
         }
-        assert_perf_u64(stats.candidates_emitted, 1);
+        crate::test_utils::assert_perf_u64(stats.candidates_emitted, 1);
     }
 
     #[test]
@@ -1298,7 +1290,7 @@ mod tests {
         walker
             .diff_trees(&mut source, &mut candidates, Some(&oid), None, 1, 0)
             .unwrap();
-        assert_perf_u64(walker.stats().candidates_emitted, 1);
+        crate::test_utils::assert_perf_u64(walker.stats().candidates_emitted, 1);
 
         walker.reset_stats();
         assert_eq!(walker.stats().candidates_emitted, 0);

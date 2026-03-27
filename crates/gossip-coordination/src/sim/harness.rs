@@ -118,6 +118,10 @@ use super::overload::{
     D1Observation, GoodputTracker, OverloadKind, OverloadReport, OverloadScenario,
     generate_burst_claim, generate_burst_shards, generate_capacity_drop,
 };
+use super::shared::{
+    CheckpointOpMap, DEFAULT_LEASE_DURATION, MAX_STALE_LEASES, SessionTerminalAction,
+    SplitInputCopy, random_midpoint, require_lease_and_op,
+};
 use super::worker::SimWorker;
 use super::{FaultConfig, FaultLevel, SimContext};
 
@@ -359,142 +363,108 @@ pub enum RejectionKind {
 // every error variant is covered, and adding a new variant triggers a
 // compile error here (thanks to non-wildcard matches).
 
-impl From<AcquireError> for RejectionKind {
-    fn from(e: AcquireError) -> Self {
-        match e {
-            AcquireError::ShardTerminal { .. } => Self::TerminalState,
-            AcquireError::ShardNotFound { .. } => Self::ShardNotFound,
-            AcquireError::TenantMismatch { .. } => Self::TenantMismatch,
-            AcquireError::AlreadyLeased { .. } => Self::AlreadyLeased,
-            AcquireError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
+/// Generates `impl From<$error_ty> for RejectionKind`.
+///
+/// Each arm maps an error variant pattern to a `RejectionKind` variant.
+/// A `BackendError` arm is appended automatically and panics, since the
+/// in-memory simulation backend never produces infrastructure errors.
+macro_rules! impl_rejection_from {
+    ($error_ty:ident, $($variant:pat => $kind:expr),+ $(,)?) => {
+        impl From<$error_ty> for RejectionKind {
+            fn from(e: $error_ty) -> Self {
+                match e {
+                    $($variant => $kind,)+
+                    $error_ty::BackendError(infra) => {
+                        panic!(
+                            "simulation backend produced unexpected infrastructure error: {infra}"
+                        )
+                    }
+                }
             }
         }
-    }
+    };
 }
 
-impl From<RenewError> for RejectionKind {
-    fn from(e: RenewError) -> Self {
-        match e {
-            RenewError::StaleFence { .. } => Self::StaleFence,
-            RenewError::LeaseExpired { .. } => Self::LeaseExpired,
-            RenewError::ShardTerminal { .. } => Self::TerminalState,
-            RenewError::ShardNotFound { .. } => Self::ShardNotFound,
-            RenewError::TenantMismatch { .. } => Self::TenantMismatch,
-            RenewError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(AcquireError,
+    AcquireError::ShardTerminal { .. } => Self::TerminalState,
+    AcquireError::ShardNotFound { .. } => Self::ShardNotFound,
+    AcquireError::TenantMismatch { .. } => Self::TenantMismatch,
+    AcquireError::AlreadyLeased { .. } => Self::AlreadyLeased,
+);
 
-impl From<CheckpointError> for RejectionKind {
-    fn from(e: CheckpointError) -> Self {
-        match e {
-            CheckpointError::StaleFence { .. } => Self::StaleFence,
-            CheckpointError::LeaseExpired { .. } => Self::LeaseExpired,
-            CheckpointError::ShardTerminal { .. } => Self::TerminalState,
-            CheckpointError::OpIdConflict { .. } => Self::OpIdConflict,
-            CheckpointError::CursorRegression { .. } => Self::CursorRegression,
-            CheckpointError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
-            CheckpointError::CursorKeyTooLarge { .. } => Self::CursorKeyTooLarge,
-            CheckpointError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
-            CheckpointError::ShardNotFound { .. } => Self::ShardNotFound,
-            CheckpointError::TenantMismatch { .. } => Self::TenantMismatch,
-            CheckpointError::CheckpointMissingKey => Self::CheckpointMissingKey,
-            CheckpointError::ResourceExhausted(_) => Self::ResourceExhausted,
-            CheckpointError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(RenewError,
+    RenewError::StaleFence { .. }      => Self::StaleFence,
+    RenewError::LeaseExpired { .. }    => Self::LeaseExpired,
+    RenewError::ShardTerminal { .. }   => Self::TerminalState,
+    RenewError::ShardNotFound { .. }   => Self::ShardNotFound,
+    RenewError::TenantMismatch { .. }  => Self::TenantMismatch,
+);
 
-impl From<CompleteError> for RejectionKind {
-    fn from(e: CompleteError) -> Self {
-        match e {
-            CompleteError::StaleFence { .. } => Self::StaleFence,
-            CompleteError::LeaseExpired { .. } => Self::LeaseExpired,
-            CompleteError::ShardTerminal { .. } => Self::TerminalState,
-            CompleteError::OpIdConflict { .. } => Self::OpIdConflict,
-            CompleteError::CursorRegression { .. } => Self::CursorRegression,
-            CompleteError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
-            CompleteError::CursorKeyTooLarge { .. } => Self::CursorKeyTooLarge,
-            CompleteError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
-            CompleteError::ShardNotFound { .. } => Self::ShardNotFound,
-            CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
-            CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,
-            CompleteError::ResourceExhausted(_) => Self::ResourceExhausted,
-            CompleteError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(CheckpointError,
+    CheckpointError::StaleFence { .. }         => Self::StaleFence,
+    CheckpointError::LeaseExpired { .. }       => Self::LeaseExpired,
+    CheckpointError::ShardTerminal { .. }      => Self::TerminalState,
+    CheckpointError::OpIdConflict { .. }       => Self::OpIdConflict,
+    CheckpointError::CursorRegression { .. }   => Self::CursorRegression,
+    CheckpointError::CursorOutOfBounds(_)      => Self::CursorOutOfBounds,
+    CheckpointError::CursorKeyTooLarge { .. }  => Self::CursorKeyTooLarge,
+    CheckpointError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
+    CheckpointError::ShardNotFound { .. }      => Self::ShardNotFound,
+    CheckpointError::TenantMismatch { .. }     => Self::TenantMismatch,
+    CheckpointError::CheckpointMissingKey      => Self::CheckpointMissingKey,
+    CheckpointError::ResourceExhausted(_)      => Self::ResourceExhausted,
+);
 
-impl From<ParkError> for RejectionKind {
-    fn from(e: ParkError) -> Self {
-        match e {
-            ParkError::StaleFence { .. } => Self::StaleFence,
-            ParkError::LeaseExpired { .. } => Self::LeaseExpired,
-            ParkError::ShardTerminal { .. } => Self::TerminalState,
-            ParkError::OpIdConflict { .. } => Self::OpIdConflict,
-            ParkError::ShardNotFound { .. } => Self::ShardNotFound,
-            ParkError::TenantMismatch { .. } => Self::TenantMismatch,
-            ParkError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(CompleteError,
+    CompleteError::StaleFence { .. }         => Self::StaleFence,
+    CompleteError::LeaseExpired { .. }       => Self::LeaseExpired,
+    CompleteError::ShardTerminal { .. }      => Self::TerminalState,
+    CompleteError::OpIdConflict { .. }       => Self::OpIdConflict,
+    CompleteError::CursorRegression { .. }   => Self::CursorRegression,
+    CompleteError::CursorOutOfBounds(_)      => Self::CursorOutOfBounds,
+    CompleteError::CursorKeyTooLarge { .. }  => Self::CursorKeyTooLarge,
+    CompleteError::CursorTokenTooLarge { .. } => Self::CursorTokenTooLarge,
+    CompleteError::ShardNotFound { .. }      => Self::ShardNotFound,
+    CompleteError::TenantMismatch { .. }     => Self::TenantMismatch,
+    CompleteError::CheckpointMissingKey      => Self::CheckpointMissingKey,
+    CompleteError::ResourceExhausted(_)      => Self::ResourceExhausted,
+);
 
-impl From<SplitError> for RejectionKind {
-    fn from(e: SplitError) -> Self {
-        match e {
-            SplitError::StaleFence { .. } => Self::StaleFence,
-            SplitError::LeaseExpired { .. } => Self::LeaseExpired,
-            SplitError::ShardTerminal { .. } => Self::TerminalState,
-            SplitError::OpIdConflict { .. } => Self::OpIdConflict,
-            SplitError::SplitInvalid(_) => Self::SplitValidation,
-            SplitError::ShardNotFound { .. } => Self::ShardNotFound,
-            SplitError::TenantMismatch { .. } => Self::TenantMismatch,
-            SplitError::ResourceExhausted(_) => Self::ResourceExhausted,
-            SplitError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(ParkError,
+    ParkError::StaleFence { .. }      => Self::StaleFence,
+    ParkError::LeaseExpired { .. }    => Self::LeaseExpired,
+    ParkError::ShardTerminal { .. }   => Self::TerminalState,
+    ParkError::OpIdConflict { .. }    => Self::OpIdConflict,
+    ParkError::ShardNotFound { .. }   => Self::ShardNotFound,
+    ParkError::TenantMismatch { .. }  => Self::TenantMismatch,
+);
 
-impl From<UnparkError> for RejectionKind {
-    fn from(e: UnparkError) -> Self {
-        match e {
-            UnparkError::ShardNotFound => Self::ShardNotFound,
-            UnparkError::TenantMismatch { .. } => Self::TenantMismatch,
-            UnparkError::RunTerminal { .. } => Self::TerminalState,
-            UnparkError::NotParked { .. } => Self::NotParked,
-            UnparkError::OpIdConflict(_) => Self::OpIdConflict,
-            UnparkError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(SplitError,
+    SplitError::StaleFence { .. }      => Self::StaleFence,
+    SplitError::LeaseExpired { .. }    => Self::LeaseExpired,
+    SplitError::ShardTerminal { .. }   => Self::TerminalState,
+    SplitError::OpIdConflict { .. }    => Self::OpIdConflict,
+    SplitError::SplitInvalid(_)        => Self::SplitValidation,
+    SplitError::ShardNotFound { .. }   => Self::ShardNotFound,
+    SplitError::TenantMismatch { .. }  => Self::TenantMismatch,
+    SplitError::ResourceExhausted(_)   => Self::ResourceExhausted,
+);
 
-impl From<RunTransitionError> for RejectionKind {
-    fn from(e: RunTransitionError) -> Self {
-        match e {
-            RunTransitionError::RunNotFound => Self::RunNotFound,
-            RunTransitionError::TenantMismatch { .. } => Self::TenantMismatch,
-            RunTransitionError::RunTerminal { .. } => Self::TerminalState,
-            RunTransitionError::WrongStatus { .. } => Self::WrongRunStatus,
-            RunTransitionError::OpIdConflict(_) => Self::OpIdConflict,
-            RunTransitionError::BackendError(infra) => {
-                panic!("simulation backend produced unexpected infrastructure error: {infra}")
-            }
-        }
-    }
-}
+impl_rejection_from!(UnparkError,
+    UnparkError::ShardNotFound         => Self::ShardNotFound,
+    UnparkError::TenantMismatch { .. } => Self::TenantMismatch,
+    UnparkError::RunTerminal { .. }    => Self::TerminalState,
+    UnparkError::NotParked { .. }      => Self::NotParked,
+    UnparkError::OpIdConflict(_)       => Self::OpIdConflict,
+);
+
+impl_rejection_from!(RunTransitionError,
+    RunTransitionError::RunNotFound          => Self::RunNotFound,
+    RunTransitionError::TenantMismatch { .. } => Self::TenantMismatch,
+    RunTransitionError::RunTerminal { .. }   => Self::TerminalState,
+    RunTransitionError::WrongStatus { .. }   => Self::WrongRunStatus,
+    RunTransitionError::OpIdConflict(_)      => Self::OpIdConflict,
+);
 
 /// Payload-free event discriminant for histogram counting.
 ///
@@ -558,36 +528,7 @@ impl SimEvent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SessionTerminalAction
-// ---------------------------------------------------------------------------
-
-/// Terminal action selection for [`exec_session_lifecycle`](CoordinationSim::exec_session_lifecycle).
-///
-/// Determines how a `WorkerSession` lifecycle ends. Probabilities assume
-/// the shard's byte range is wide enough for splits (at least 2 distinct
-/// values between start and end):
-///
-/// - `Complete` (50%): mark shard done
-/// - `Park` (20%): park shard for later retry
-/// - `SplitReplace` (20%): replace parent with two children (terminal)
-/// - `SplitResidualThenComplete` (10%): shrink parent, create residual,
-///   then complete the narrowed parent -- exercises the `WorkerSession`
-///   snapshot-rebuild path under simulation fault injection.
-///
-/// See the `random_range(0u32..10)` match in `exec_session_lifecycle` for
-/// the authoritative weight table.
-///
-/// When the range is too narrow for splits, `SplitReplace` and
-/// `SplitResidualThenComplete` fall back to `Complete`, raising its
-/// effective rate to up to 80%.
-#[derive(Debug, Clone, Copy)]
-enum SessionTerminalAction {
-    Complete,
-    Park,
-    SplitReplace,
-    SplitResidualThenComplete,
-}
+// `SessionTerminalAction` is defined in `super::shared`.
 
 // ---------------------------------------------------------------------------
 // SimReport
@@ -630,16 +571,7 @@ pub struct SimReport {
 // CoordinationSim
 // ---------------------------------------------------------------------------
 
-/// Default lease duration (in logical ticks) for the simulated coordinator.
-///
-/// Balances two competing needs:
-/// - **Long enough** that warmup operations (5 ops) can acquire, checkpoint,
-///   and renew before expiry, even with small time advances (1--50 ticks each).
-/// - **Short enough** that a single Stormy time-jump (50--200 ticks) or two
-///   Radioactive time-jumps (100--500 ticks) can expire a lease mid-flight,
-///   creating the stale-lease and zombie-worker scenarios the simulation
-///   is designed to stress-test.
-const DEFAULT_LEASE_DURATION: u64 = 100;
+// `DEFAULT_LEASE_DURATION` is defined in `super::shared`.
 
 /// Number of initial operations where faults are suppressed to let the
 /// system reach a healthy baseline.
@@ -658,90 +590,11 @@ const WARMUP_OPS: usize = 5;
 /// is always valid and advances the simulation meaningfully.
 const MAX_OP_RETRIES: usize = 10;
 
-/// Maximum number of stale leases retained for zombie checkpoint injection.
-///
-/// Capped to prevent unbounded growth in long-running simulations. When
-/// the limit is exceeded, random entries are evicted via `swap_remove`.
-const MAX_STALE_LEASES: usize = 64;
+// `MAX_STALE_LEASES` is defined in `super::shared`.
 
-/// Saved checkpoint data for idempotency and conflict testing.
-///
-/// Keyed by `(worker_raw, run_raw, shard_raw)` because the key includes a
-/// `WorkerId` dimension that `ShardKey` does not carry. Each entry stores the
-/// `(OpId, last_key, WorkerId, ShardKey)` from the last successful checkpoint,
-/// enabling:
-///
-/// - [`SimOp::ReplayCheckpoint`]: resubmit the same OpId + same payload to
-///   exercise idempotent deduplication.
-/// - [`SimOp::ConflictCheckpoint`]: resubmit the same OpId with a *different*
-///   payload to exercise at-most-once conflict detection.
-///
-/// Only the most recent checkpoint per `(worker, run, shard)` is retained.
-/// Earlier entries are overwritten, which is correct because the op-log's
-/// dedup window is bounded and older ops may already be evicted.
-/// Per-(worker, run, shard) checkpoint history for replay/conflict testing.
-///
-/// Key is `(worker_raw, run_raw, shard_raw)` because the key includes a
-/// `WorkerId` dimension that `ShardKey` does not carry. Value stores the
-/// last successful checkpoint's `(OpId, last_key_bytes, WorkerId, ShardKey)`.
-type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Vec<u8>, WorkerId, ShardKey)>;
+// `CheckpointOpMap`, `SplitBoundsBuf`, `SplitInputCopy` are defined in `super::shared`.
 
-/// Stack-owned copy of a shard's spec bounds: `(start_buf, start_len, end_buf, end_len)`.
-///
-/// Fixed-capacity arrays avoid holding immutable borrows into the coordinator
-/// while building split plans that require mutable coordinator access.
-type SplitBoundsBuf = ([u8; MAX_KEY_SIZE], usize, [u8; MAX_KEY_SIZE], usize);
-
-/// Split input snapshot: spec bounds plus the optional first cursor byte.
-///
-/// The cursor byte is used by split-residual to place the split point after
-/// already-scanned data.
-type SplitInputCopy = (SplitBoundsBuf, Option<u8>);
-
-/// Validate worker preconditions and consume the next op-ID in one shot.
-///
-/// Checks that `worker` exists and is not paused (both conditions return
-/// `WorkerPaused` — the harness registers all workers at init, so a missing
-/// worker is a harness bug, not an expected rejection), holds a lease on `key`,
-/// and advances its op-ID counter. Returns the lease and fresh op-ID on
-/// success, or a `Rejected` event on failure.
-///
-/// This is a free function (not `&mut self`) to enable borrow splitting:
-/// callers can pass `&mut self.workers` while retaining mutable access to
-/// `self.coordinator`, `self.context`, and other fields. Without this
-/// split, the borrow checker would reject code that reads a lease from
-/// `self.workers` and then calls `self.coordinator.checkpoint(...)` in
-/// the same expression.
-fn require_lease_and_op(
-    workers: &mut BTreeMap<WorkerId, SimWorker>,
-    worker: WorkerId,
-    key: &ShardKey,
-) -> Result<(Lease, OpId), SimEvent> {
-    let w = workers
-        .get_mut(&worker)
-        .filter(|w| !w.is_paused())
-        .ok_or(SimEvent::Rejected {
-            kind: RejectionKind::WorkerPaused,
-        })?;
-    let lease = *w.lease_for(key).ok_or(SimEvent::Rejected {
-        kind: RejectionKind::NotLeased,
-    })?;
-    let op_id = w.next_op_id();
-    Ok((lease, op_id))
-}
-
-/// Compute a random split midpoint in the half-open interval `[lo, hi)`.
-///
-/// Returns `None` when the interval is empty (`lo >= hi`).
-/// Used by the precompute functions (session lifecycle Phase 1) and
-/// `compute_split_byte` (standalone split ops) to eliminate the duplicated
-/// range-check + sample pattern.
-fn random_midpoint(rng: &mut ChaCha8Rng, lo: u8, hi: u8) -> Option<u8> {
-    if lo >= hi {
-        return None;
-    }
-    Some(rng.random_range(lo..hi))
-}
+// `require_lease_and_op` and `random_midpoint` are defined in `super::shared`.
 
 /// Pre-compute a split-replace plan from the parent's key range.
 ///

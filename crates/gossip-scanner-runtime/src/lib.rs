@@ -29,10 +29,10 @@
 //!
 //! # Execution modes
 //!
-//! [`ExecutionMode::Direct`] and [`ExecutionMode::Connector`] both resolve to
-//! the same scan logic today. The distinction exists so that worker and CLI
-//! entry points exercise the same runtime boundary, and so the connector path
-//! can diverge when remote source enumeration is added.
+//! [`ExecutionMode::Direct`] dispatches scans via the scheduler-driven local
+//! scan path. [`ExecutionMode::Connector`] selects the family boundary
+//! instead: filesystem sources perform ordered page acquisition and validation
+//! through `OrderedContentRuntime`, while Git sources use the direct path.
 //!
 //! # Durability model
 //!
@@ -54,7 +54,6 @@
 //! Owned event types (`OwnedCoreEvent`, `OwnedGitEvent`) carry the
 //! channel payloads without borrowing into the scan's lifetime.
 
-use std::fmt;
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -63,9 +62,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 
+use gossip_connectors::FilesystemConnector;
 pub use gossip_contracts::connector::git::GitDebugLevel;
-use gossip_contracts::connector::{ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG};
 use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
+use gossip_contracts::{
+    connector::{Budgets, ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG},
+    coordination::{CursorSemantics, RestoredShardState, ShardSpec},
+};
 use scanner_engine::TransformId;
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformMode, Tuning};
 use scanner_git::{
@@ -110,10 +113,10 @@ pub mod result_translation;
 
 /// How the runtime acquires source items.
 ///
-/// Both modes currently route through the same scan implementation.
-/// The distinction exists so worker and CLI entry points converge on a
-/// single runtime boundary, and so the `Connector` path can later add
-/// remote source enumeration without changing callers.
+/// `Direct` dispatches via the local scan implementation. `Connector`
+/// selects the source-family boundary: filesystem scans run one ordered
+/// connector page acquisition/validation step, while Git connector mode
+/// uses the direct path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// Scan source items directly from local state.
@@ -138,22 +141,11 @@ impl std::str::FromStr for ExecutionMode {
 }
 
 /// Error returned when parsing [`ExecutionMode`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid execution mode '{}' (expected 'direct' or 'connector')", raw)]
 pub struct ParseExecutionModeError {
     raw: String,
 }
-
-impl fmt::Display for ParseExecutionModeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid execution mode '{}' (expected 'direct' or 'connector')",
-            self.raw
-        )
-    }
-}
-
-impl std::error::Error for ParseExecutionModeError {}
 
 /// Anchor extraction mode for rule planning.
 ///
@@ -234,32 +226,45 @@ impl CancellationToken {
 
 /// Runtime budgets for source scans.
 ///
-/// Both fields must be non-zero; validation enforces this constraint
-/// before distributed scan dispatch. Local scan paths (`scan_fs_with_runtime`,
-/// `scan_git_with_runtime`) do not validate or consume budgets — they are
-/// relevant only to the distributed runtime. Both fields are validated
-/// (non-zero) before dispatch but are not yet enforced at execution time.
+/// Both fields must be non-zero. Validation enforces this constraint in
+/// three places: before distributed scan dispatch, during connector-mode
+/// page acquisition (where `scan_fs_connector` converts these values into
+/// connector [`Budgets`] via `Budgets::try_new`), and before ordered-content miss execution. The
+/// ordered-content executor consumes these values as real item-count and
+/// byte limits; direct local scan paths (`scan_fs_with_runtime`,
+/// `scan_git_with_runtime`) still do not use them.
 ///
-/// Defaults are intentionally conservative (256 items, 1 MB) to bound
-/// memory pressure in distributed workers.
+/// Defaults target a work-to-overhead ratio where the scan engine is
+/// active for tens of milliseconds per page — long enough to amortize
+/// coordination round-trips (typically 10–20 ms) and connector I/O
+/// setup. At 1–2 GB/s engine throughput, 64 MiB yields ~32–64 ms of
+/// scan work per page.  Memory pressure stays bounded because only one
+/// 256 KiB scan buffer is live at a time; the byte budget controls how
+/// many bytes are *read from the source*, not how much RAM is resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudgets {
     /// Maximum items processed between checkpoints.
     pub max_items: usize,
-    /// Runtime-level byte budget knob.
+    /// Total bytes the executor may read from the source per page pass.
     pub max_bytes: u64,
 }
 
 impl Default for ScanBudgets {
     fn default() -> Self {
         Self {
-            max_items: 256,
-            max_bytes: 1_000_000,
+            max_items: 4_096,
+            max_bytes: 64 * 1024 * 1024, // 64 MiB
         }
     }
 }
 
 impl ScanBudgets {
+    /// Reject zero-valued runtime budgets before execution starts.
+    ///
+    /// Ordered-content miss execution treats both fields as hard admission
+    /// limits, so a zero value would make progress impossible while looking
+    /// like a valid configuration. Returns
+    /// [`ScanRuntimeError::ConnectorInput`] naming the offending field.
     pub fn validate(self) -> Result<(), ScanRuntimeError> {
         if self.max_items == 0 {
             return Err(ScanRuntimeError::ConnectorInput(
@@ -576,6 +581,9 @@ impl GitScanConfig {
 pub struct ScanReport {
     /// Total items (files / blobs) processed.
     pub items_scanned: u64,
+    /// Items deferred by the skip-ahead admission check because they
+    /// exceeded the remaining runtime byte budget.
+    pub items_deferred: u64,
     /// Total payload bytes scanned.
     pub bytes_scanned: u64,
     /// Total chunk windows scanned across all items.
@@ -604,6 +612,29 @@ pub struct ScanReport {
     pub persist_ns: u64,
 }
 
+impl std::ops::AddAssign for ScanReport {
+    #[allow(clippy::suspicious_op_assign_impl)] // |= for persist_incomplete is intentional (any-incomplete flag)
+    fn add_assign(&mut self, rhs: Self) {
+        self.items_scanned = self.items_scanned.saturating_add(rhs.items_scanned);
+        self.items_deferred = self.items_deferred.saturating_add(rhs.items_deferred);
+        self.bytes_scanned = self.bytes_scanned.saturating_add(rhs.bytes_scanned);
+        self.chunks_scanned = self.chunks_scanned.saturating_add(rhs.chunks_scanned);
+        self.findings_emitted = self.findings_emitted.saturating_add(rhs.findings_emitted);
+        self.errors = self.errors.saturating_add(rhs.errors);
+        self.binary_skipped = self.binary_skipped.saturating_add(rhs.binary_skipped);
+        self.ext_skipped = self.ext_skipped.saturating_add(rhs.ext_skipped);
+        self.lock_skipped = self.lock_skipped.saturating_add(rhs.lock_skipped);
+        self.binary_extracted = self.binary_extracted.saturating_add(rhs.binary_extracted);
+        self.dropped_findings = self.dropped_findings.saturating_add(rhs.dropped_findings);
+        self.persist_emit_failures = self
+            .persist_emit_failures
+            .saturating_add(rhs.persist_emit_failures);
+        self.persist_incomplete |= rhs.persist_incomplete;
+        self.scan_ns = self.scan_ns.saturating_add(rhs.scan_ns);
+        self.persist_ns = self.persist_ns.saturating_add(rhs.persist_ns);
+    }
+}
+
 /// Incremental progress checkpoint produced by the runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanCheckpoint {
@@ -618,18 +649,20 @@ pub struct ScanCheckpoint {
 /// Covers the full lifecycle from path validation through engine construction
 /// and scan dispatch. Each variant carries enough context for a human-readable
 /// error message without requiring access to the original inputs.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ScanRuntimeError {
     /// A scan target path failed validation.
+    #[error("{origin} path '{}' invalid: {message}", path.display())]
     InvalidPath {
         /// Which subsystem originated the path.
-        source: &'static str,
+        origin: &'static str,
         /// The path that failed validation.
         path: PathBuf,
         /// Human-readable reason for the failure.
         message: String,
     },
     /// A `git` subprocess exited with a non-zero status.
+    #[error("git command failed for '{}' (status={status_code:?}): {stderr}", repo.display())]
     GitCommandFailed {
         /// Repository path the command was invoked against.
         repo: PathBuf,
@@ -639,15 +672,18 @@ pub enum ScanRuntimeError {
         stderr: String,
     },
     /// An I/O operation failed during runtime setup.
+    #[error("{}", fmt_io_error(.op, .path.as_ref(), .error))]
     Io {
         /// Short description of the operation.
         op: &'static str,
         /// Associated file path, when applicable.
         path: Option<PathBuf>,
         /// Underlying I/O error.
+        #[source]
         error: std::io::Error,
     },
     /// The external rules configuration file could not be loaded or parsed.
+    #[error("{}", fmt_rules_config_error(.path.as_ref(), .message))]
     RulesConfig {
         /// Path to the rules file, if one was specified.
         path: Option<PathBuf>,
@@ -655,50 +691,24 @@ pub enum ScanRuntimeError {
         message: String,
     },
     /// A connector input parameter was invalid.
-    ConnectorInput(ConnectorInputError),
+    #[error("{0}")]
+    ConnectorInput(#[source] ConnectorInputError),
     /// The family runtime returned an execution error.
-    Driver(anyhow::Error),
+    #[error("runtime execution failed: {0}")]
+    Driver(#[source] anyhow::Error),
 }
 
-impl fmt::Display for ScanRuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPath {
-                source,
-                path,
-                message,
-            } => write!(f, "{source} path '{}' invalid: {message}", path.display()),
-            Self::GitCommandFailed {
-                repo,
-                status_code,
-                stderr,
-            } => write!(
-                f,
-                "git command failed for '{}' (status={status_code:?}): {stderr}",
-                repo.display()
-            ),
-            Self::Io { op, path, error } => match path {
-                Some(path) => write!(f, "{op} failed for '{}': {error}", path.display()),
-                None => write!(f, "{op} failed: {error}"),
-            },
-            Self::RulesConfig { path, message } => match path {
-                Some(path) => write!(f, "rules config error for '{}': {message}", path.display()),
-                None => write!(f, "rules config error: {message}"),
-            },
-            Self::ConnectorInput(error) => write!(f, "{error}"),
-            Self::Driver(error) => write!(f, "runtime execution failed: {error}"),
-        }
+fn fmt_io_error(op: &str, path: Option<&PathBuf>, error: &std::io::Error) -> String {
+    match path {
+        Some(path) => format!("{op} failed for '{}': {error}", path.display()),
+        None => format!("{op} failed: {error}"),
     }
 }
 
-impl std::error::Error for ScanRuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { error, .. } => Some(error),
-            Self::ConnectorInput(error) => Some(error),
-            Self::Driver(error) => Some(error.as_ref()),
-            _ => None,
-        }
+fn fmt_rules_config_error(path: Option<&PathBuf>, message: &str) -> String {
+    match path {
+        Some(path) => format!("rules config error for '{}': {message}", path.display()),
+        None => format!("rules config error: {message}"),
     }
 }
 
@@ -728,8 +738,8 @@ pub struct AssignmentOutcome {
 /// Top-level filesystem scan dispatcher.
 ///
 /// Routes to `scan_fs_direct` or `scan_fs_connector` based on
-/// [`FsScanConfig::execution_mode`]. Both currently resolve to the same
-/// implementation.
+/// [`FsScanConfig::execution_mode`]. Direct mode runs the local scan;
+/// connector mode exercises the ordered-content page-fill boundary.
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_fs_direct(config),
@@ -759,9 +769,42 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
     scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
-/// Connector-mode filesystem scan. Currently delegates to [`scan_fs_direct`].
+/// Connector-mode filesystem scan (single-page validation boundary).
+///
+/// Validates the target path, constructs a [`FilesystemConnector`], and
+/// executes one ordered page acquisition through
+/// [`ordered_content::OrderedContentRuntime`]. Content reads, rule execution,
+/// and durability are handled by the direct filesystem runtime path.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    scan_fs_direct(config)
+    let canonical_path = validate_fs_path(&config.path)?;
+    let budgets = Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)?;
+    let state = RestoredShardState::new(
+        ShardSpec::unbounded(),
+        Cursor::initial(),
+        CursorSemantics::Completed,
+    );
+    let runtime_input = ordered_content::OrderedContentRuntimeInput::new(state, budgets);
+    let mut source = FilesystemConnector::new(canonical_path);
+
+    match ordered_content::OrderedContentRuntime::execute_source(&mut source, &runtime_input)? {
+        ordered_content::OrderedContentExecutionOutcome::ExhaustedEmpty => {
+            Ok(ScanReport::default())
+        }
+        ordered_content::OrderedContentExecutionOutcome::Page(page) => {
+            if page.page().state().next_cursor().is_some() {
+                let items = page.report().items_scanned;
+                tracing::warn!(
+                    items_scanned = items,
+                    "connector page indicates more items available; \
+                     scan result is partial"
+                );
+            }
+            Ok(page.report())
+        }
+        ordered_content::OrderedContentExecutionOutcome::Stopped(stop) => {
+            Err(ScanRuntimeError::Driver(anyhow::anyhow!("{stop}")))
+        }
+    }
 }
 
 /// Git scan using a null event sink (no event output).
@@ -791,29 +834,6 @@ pub(crate) fn scan_fs_with_runtime(
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
     let canonical_path = validate_fs_path(&config.path)?;
     ordered_content::scan_local_filesystem(config, canonical_path, out, commit, cancel)
-}
-
-/// Internal filesystem entrypoint that reuses a caller-provided detection
-/// engine.
-///
-/// Distributed scans use this to share one engine instance between file
-/// scanning and rule-fingerprint lookup for receipt-driven commit translation.
-pub(crate) fn scan_fs_with_prebuilt_engine(
-    config: &FsScanConfig,
-    engine: Arc<scanner_engine::Engine>,
-    out: &dyn EventOutput,
-    commit: &dyn commit_sink::CommitSink,
-    cancel: &CancellationToken,
-) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    let canonical_path = validate_fs_path(&config.path)?;
-    ordered_content::scan_local_filesystem_with_engine(
-        config,
-        canonical_path,
-        engine,
-        out,
-        commit,
-        cancel,
-    )
 }
 
 /// Internal Git entrypoint that accepts a caller-provided event sink.
@@ -1057,35 +1077,70 @@ pub(crate) fn forward_core_events(out: &dyn EventOutput, rx: Receiver<OwnedDrive
     out.flush();
 }
 
-/// [`StoreProducer`] adapter that normalizes paths and derives stable item
-/// identities before forwarding finding batches through a commit channel.
+/// Derives deterministic [`StableItemId`] values for filesystem objects
+/// under a single canonicalized scan root.
 ///
-/// Path normalization strips the scan root prefix and converts to
-/// forward-slash-separated bytes, producing a deterministic item key
-/// regardless of platform path separators.
+/// Identity is a three-part hash: the fixed filesystem connector tag, a
+/// connector-instance hash derived from the canonical root path, and the
+/// normalized forward-slash-separated item key. Two scan roots that
+/// resolve to the same canonical path always produce the same instance
+/// hash (and therefore the same stable IDs), while distinct roots
+/// produce distinct namespaces even for identical relative paths.
+///
+/// # Platform note
+///
+/// Identity stability assumes `fs::canonicalize` returns byte-identical
+/// results for the same logical directory across invocations. On macOS
+/// APFS, directory names containing non-ASCII characters may be stored in
+/// NFC or NFD Unicode normalization forms; `fs::canonicalize` preserves
+/// whichever form the filesystem reports. Two scans of the same directory
+/// created under different normalization forms would produce distinct
+/// connector-instance hashes. This edge case (non-ASCII directory names
+/// on APFS) does not warrant a `unicode-normalization` dependency.
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelStoreProducer {
-    tx: SyncSender<CommitMessage>,
-    root: PathBuf,
+struct FilesystemIdentityScope {
+    canonical_root: PathBuf,
     connector_instance: ConnectorInstanceIdHash,
 }
 
-impl ChannelStoreProducer {
-    pub(crate) fn new(tx: SyncSender<CommitMessage>, root: PathBuf) -> Self {
-        let connector_instance =
-            ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_encoded_bytes());
+impl FilesystemIdentityScope {
+    /// Build one filesystem identity scope for a canonicalized scan root.
+    ///
+    /// Equivalent input spellings belong to the same connector-instance
+    /// namespace because the runtime canonicalizes before constructing this
+    /// scope.
+    fn from_canonical_root(canonical_root: PathBuf) -> Self {
+        debug_assert!(
+            canonical_root.is_absolute()
+                && !canonical_root.components().any(|c| matches!(
+                    c,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )),
+            "FilesystemIdentityScope requires a fully canonicalized path \
+             (no `.`, no `..`), got: {canonical_root:?}"
+        );
+        let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(
+            canonical_root.as_os_str().as_encoded_bytes(),
+        );
         Self {
-            tx,
-            root,
+            canonical_root,
             connector_instance,
         }
     }
-}
 
-impl StoreProducer for ChannelStoreProducer {
-    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+    /// Normalize a scheduler-produced object path and derive its stable
+    /// identity.
+    ///
+    /// Returns the normalized forward-slash path bytes alongside the
+    /// [`StableItemId`]. Fails if the path cannot be made relative to
+    /// the canonical root or if the resulting key exceeds [`ItemKey`]
+    /// length limits.
+    fn stable_item_id_for_scheduler_path(
+        &self,
+        object_path: &[u8],
+    ) -> Result<(Vec<u8>, StableItemId), FsStoreError> {
         let normalized_path =
-            normalize_scheduler_path(&self.root, batch.object_path).map_err(|error| {
+            normalize_scheduler_path(&self.canonical_root, object_path).map_err(|error| {
                 FsStoreError::backend(format!("path normalization failed: {error}"))
             })?;
         let item_key = gossip_contracts::connector::ItemKey::try_from_slice(&normalized_path)
@@ -1098,12 +1153,43 @@ impl StoreProducer for ChannelStoreProducer {
             item_key.as_bytes(),
         )
         .stable_id();
+        Ok((normalized_path, stable_item_id))
+    }
+}
+
+/// [`StoreProducer`] adapter that derives stable item identities via
+/// [`FilesystemIdentityScope`] and forwards finding batches through a
+/// bounded commit channel.
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelStoreProducer {
+    tx: SyncSender<CommitMessage>,
+    identity: FilesystemIdentityScope,
+}
+
+impl ChannelStoreProducer {
+    pub(crate) fn from_canonical_root(
+        tx: SyncSender<CommitMessage>,
+        canonical_root: PathBuf,
+    ) -> Self {
+        Self {
+            tx,
+            identity: FilesystemIdentityScope::from_canonical_root(canonical_root),
+        }
+    }
+}
+
+impl StoreProducer for ChannelStoreProducer {
+    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+        let (normalized_path, stable_item_id) = self
+            .identity
+            .stable_item_id_for_scheduler_path(batch.object_path)?;
 
         self.tx
             .send(CommitMessage::Batch(OwnedCommitBatch {
                 object_path: normalized_path,
                 stable_item_id,
                 findings: batch.findings.to_vec(),
+                discovery_sequence: batch.discovery_sequence,
             }))
             .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
     }
@@ -1144,6 +1230,144 @@ pub(crate) struct OwnedCommitBatch {
     object_path: Vec<u8>,
     stable_item_id: StableItemId,
     findings: Vec<FsFindingRecord>,
+    /// Discovery-order sequence from the sorted file walk. Used by the
+    /// commit forwarder to reorder batches so `begin_item` calls respect
+    /// the original path-sorted discovery order, ensuring checkpoint
+    /// sequence numbers are monotonically consistent with `ItemKey`.
+    discovery_sequence: u32,
+}
+
+/// Reorder buffer that ensures commit batches are forwarded in
+/// discovery order (file-path-sorted) rather than executor processing
+/// order (LIFO-reversed).
+///
+/// The work-stealing executor's LIFO local deque reverses file
+/// processing order relative to the sorted discovery order. Without
+/// reordering, `ReceiptCommitSink::begin_item` assigns monotonically
+/// increasing sequence numbers in *processing* order, causing
+/// `PrefixCheckpointAggregator::build_contiguous_prefix` to observe
+/// decreasing `ItemKey` values and return `BoundaryRegression`.
+///
+/// With `workers=1` (enforced for receipt-driven execution), files are
+/// processed sequentially: all batches for one file arrive on the
+/// channel before any batches for the next file. The buffer exploits
+/// this by tracking discovery-sequence transitions: when the incoming
+/// `discovery_sequence` changes, the previous sequence is known to be
+/// complete and can be flushed if it is the next expected sequence.
+///
+/// Internally the buffer uses a `VecDeque` indexed by
+/// `(discovery_sequence - next_flush)`, giving O(1) insert and O(1)
+/// drain per slot with cache-linear iteration. Discovery sequences are
+/// dense `u32`s starting from 0, so direct indexing avoids the O(log n)
+/// overhead and pointer chasing of a tree-based map.
+///
+/// When files arrive in near-discovery order, memory stays bounded by
+/// the number of in-flight files (`max_in_flight_objects`). When
+/// skipped files create gaps, `drain_ready` stalls and all produced
+/// batches accumulate until `finish()` drains them at channel close.
+///
+/// Files that produce zero batches (skipped by extension, binary
+/// classification, size limit, or I/O error) create gaps in the
+/// discovery-sequence space. `drain_ready` stalls at the first gap
+/// because the missing sequence is never marked complete. The
+/// `finish()` safety net handles this correctly: it flushes all
+/// residual batches in index order (ascending discovery sequence).
+/// Under real workloads with skipped files the buffer therefore
+/// degrades to sort-at-end rather than streaming, which is acceptable
+/// since it runs on a dedicated consumer thread.
+struct DiscoveryOrderBuffer {
+    /// Batches indexed by `(discovery_sequence - next_flush)`. `None`
+    /// slots represent gaps from skipped files that produced zero
+    /// batches.
+    pending: std::collections::VecDeque<Option<Vec<OwnedCommitBatch>>>,
+    /// The discovery sequence currently being received (all batches
+    /// arriving on the channel belong to this sequence until it changes).
+    current_ds: Option<u32>,
+    /// Next discovery sequence to flush (starts at 0, increments after
+    /// each successful flush).
+    next_flush: u32,
+}
+
+impl DiscoveryOrderBuffer {
+    fn new() -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            current_ds: None,
+            next_flush: 0,
+        }
+    }
+
+    /// Accept a batch. When the discovery sequence changes, the previous
+    /// sequence is implicitly complete (single-writer guarantee) and
+    /// becomes eligible for flushing via [`drain_ready`].
+    fn push(&mut self, batch: OwnedCommitBatch) {
+        let ds = batch.discovery_sequence;
+        if ds < self.next_flush {
+            tracing::error!(
+                discovery_sequence = ds,
+                next_flush = self.next_flush,
+                path = %String::from_utf8_lossy(&batch.object_path),
+                "batch arrived for already-flushed discovery sequence; \
+                 dropping to prevent duplicate forwarding"
+            );
+            return;
+        }
+        self.current_ds = Some(ds);
+        let idx = (ds - self.next_flush) as usize;
+        if idx >= self.pending.len() {
+            self.pending.resize_with(idx + 1, || None);
+        }
+        self.pending[idx].get_or_insert_with(Vec::new).push(batch);
+    }
+
+    /// Drain all contiguous complete discovery sequences starting at
+    /// `next_flush`, preserving arrival order within each sequence.
+    /// A pending sequence is complete when it differs from `current_ds`
+    /// (the single-writer guarantee means no more batches will arrive).
+    fn drain_ready(&mut self, out: &mut Vec<OwnedCommitBatch>) {
+        while Some(self.next_flush) != self.current_ds {
+            match self.pending.front() {
+                Some(Some(_)) => {
+                    // Front slot is populated — flush it.
+                    if let Some(Some(batches)) = self.pending.pop_front() {
+                        out.extend(batches);
+                    }
+                }
+                Some(None) => {
+                    // Gap: skipped file produced zero batches.
+                    tracing::debug!(
+                        gap_at = self.next_flush,
+                        buffered_sequences = self.pending.iter().filter(|s| s.is_some()).count(),
+                        "drain stalled at sequence gap (skipped file); \
+                         remaining batches deferred to finish()"
+                    );
+                    break;
+                }
+                None => break,
+            }
+            self.next_flush += 1;
+        }
+    }
+
+    /// Flush all remaining batches in discovery order. Called when the
+    /// channel is closed — all sequences are complete at this point.
+    /// Iterates the `VecDeque` front-to-back, which is ascending
+    /// discovery-sequence order by construction.
+    fn finish(self) -> Vec<OwnedCommitBatch> {
+        let has_leading_gap = self.pending.front().is_some_and(|slot| slot.is_none());
+        if has_leading_gap {
+            tracing::debug!(
+                expected_next = self.next_flush,
+                residual_sequences = self.pending.iter().filter(|s| s.is_some()).count(),
+                "discovery order buffer: gaps detected in sequence space"
+            );
+        }
+        let mut out = Vec::new();
+        for batches in self.pending.into_iter().flatten() {
+            out.extend(batches);
+        }
+        out
+    }
 }
 
 /// Drain commit messages from the channel and forward finding batches to
@@ -1164,30 +1388,63 @@ pub(crate) fn forward_commits(
 ) -> anyhow::Result<()> {
     let mut first_error: Option<anyhow::Error> = None;
     let mut error_count: u64 = 0;
+    let mut buffer = DiscoveryOrderBuffer::new();
+    let mut ready = Vec::new();
+
+    /// Record an error, keeping only the first. Subsequent errors are
+    /// logged individually so operators have a trail for every failure.
+    fn record_err(
+        result: anyhow::Result<()>,
+        first_error: &mut Option<anyhow::Error>,
+        error_count: &mut u64,
+    ) {
+        if let Err(error) = result {
+            *error_count += 1;
+            if first_error.is_none() {
+                *first_error = Some(error);
+            } else {
+                tracing::warn!(
+                    error_number = *error_count,
+                    %error,
+                    "additional commit forwarding error (only first is propagated)"
+                );
+            }
+        }
+    }
 
     while let Ok(message) = rx.recv() {
-        let result = match message {
-            CommitMessage::Batch(batch) => forward_commit_batch(commit, batch),
+        match message {
+            CommitMessage::Batch(batch) => {
+                buffer.push(batch);
+                buffer.drain_ready(&mut ready);
+                for b in ready.drain(..) {
+                    record_err(
+                        forward_commit_batch(commit, b),
+                        &mut first_error,
+                        &mut error_count,
+                    );
+                }
+            }
             CommitMessage::RunLoss(loss) => {
                 tracing::debug!(
                     dropped_findings = loss.dropped_findings,
                     persistence_emit_failures = loss.persistence_emit_failures,
                     "received run-loss record",
                 );
-                Ok(())
             }
             CommitMessage::EndRun(had_coverage_limits) => {
                 tracing::debug!(had_coverage_limits, "received end-run signal");
-                Ok(())
-            }
-        };
-
-        if let Err(error) = result {
-            error_count += 1;
-            if first_error.is_none() {
-                first_error = Some(error);
             }
         }
+    }
+
+    // Channel closed: flush remaining buffered batches in discovery order.
+    for batch in buffer.finish() {
+        record_err(
+            forward_commit_batch(commit, batch),
+            &mut first_error,
+            &mut error_count,
+        );
     }
 
     if error_count > 1 {
@@ -1262,8 +1519,9 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> anyhow::Result<Vec
     #[cfg(windows)]
     compile_error!("normalize_scheduler_path relies on Unix byte-string semantics for OsStr");
 
-    // SAFETY: raw_bytes are OS-string-encoded paths from the scheduler.
-    // On Unix, any &[u8] is a valid OsStr encoding.
+    // SAFETY: raw_bytes originate from FsFindingBatch::object_path, which the
+    // scanner-scheduler populates from std::fs directory traversal. On Unix,
+    // any &[u8] is a valid OsStr encoding.
     let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(raw_bytes) };
     let path = Path::new(os_str);
     let rel = path.strip_prefix(root).map_err(|_| {
@@ -1619,17 +1877,28 @@ pub(crate) fn join_scoped<T>(
 /// Returns the canonicalized path on success. Rejects paths that do not exist
 /// or are neither a regular file nor a directory (e.g. symlinks to special
 /// files, device nodes).
+///
+/// `fs::metadata` runs first to check existence and classify the path kind.
+/// `NotFound` maps to `InvalidPath` (bad user input); other I/O failures
+/// (e.g. `PermissionDenied`) map to `Io` to preserve the underlying error
+/// chain. `fs::canonicalize` follows only when the kind is acceptable,
+/// avoiding a redundant second stat on the already-resolved path.
 fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
-    if !path.exists() {
-        return Err(ScanRuntimeError::InvalidPath {
-            source: "filesystem",
+    let meta = fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ScanRuntimeError::InvalidPath {
+            origin: "filesystem",
             path: path.to_path_buf(),
             message: "path does not exist".to_owned(),
-        });
-    }
-    if !path.is_file() && !path.is_dir() {
+        },
+        _ => ScanRuntimeError::Io {
+            op: "metadata",
+            path: Some(path.to_path_buf()),
+            error,
+        },
+    })?;
+    if !meta.is_file() && !meta.is_dir() {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "filesystem",
+            origin: "filesystem",
             path: path.to_path_buf(),
             message: "path must be a regular file or directory".to_owned(),
         });
@@ -1650,14 +1919,14 @@ fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
 fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "git",
+            origin: "git",
             path: path.to_path_buf(),
             message: "path does not exist".to_owned(),
         });
     }
     if !path.is_dir() {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "git",
+            origin: "git",
             path: path.to_path_buf(),
             message: "path must be a directory".to_owned(),
         });
@@ -1697,7 +1966,7 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
 
     if canonical_input != canonical_toplevel {
         return Err(ScanRuntimeError::InvalidPath {
-            source: "git",
+            origin: "git",
             path: path.to_path_buf(),
             message: format!(
                 "path is inside a git repository but is not the repository root (root is '{}')",

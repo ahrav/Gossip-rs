@@ -197,17 +197,26 @@ pub enum ShardHint<'a> {
 ///
 /// Each variant describes a specific framing error in a standalone hint frame.
 /// For metadata-envelope decode failures see [`ShardMetadataDecodeError`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ShardHintDecodeError {
     /// Input is empty where a hint tag is required.
+    #[error("shard hint decode: input is empty")]
     EmptyData,
     /// Tag byte is not recognized.
+    #[error("shard hint decode: unknown tag 0x{0:02X}")]
     UnknownTag(u8),
     /// Prefix frame is incomplete.
+    #[error("shard hint decode: prefix frame truncated (need {expected_min} bytes, got {actual})")]
     TruncatedPrefix { expected_min: usize, actual: usize },
     /// Manifest frame is incomplete.
+    #[error(
+        "shard hint decode: manifest frame truncated (need {expected_min} bytes, got {actual})"
+    )]
     TruncatedManifest { expected_min: usize, actual: usize },
     /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
+    #[error(
+        "shard hint decode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
+    )]
     InvertedManifestRows { start_row: u64, end_row: u64 },
 }
 
@@ -223,56 +232,6 @@ pub struct ShardMetadataDecodeError {
     /// length exceeds input, or consumed bytes != declared hint length).
     pub hint_error: Option<ShardHintDecodeError>,
 }
-
-/// Encode failures for [`ShardHint::encode_into`] and
-/// [`ShardMetadata::encode_into`].
-///
-/// A single error type covers both hint-level and metadata-level encode
-/// failures. Callers match on variant to distinguish prefix-framing overflow,
-/// hint-size overflow, total-metadata overflow, and invalid manifest bounds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ShardEncodeError {
-    /// Prefix bytes exceed `u32` framing width.
-    PrefixTooLarge { size: usize, max: usize },
-    /// Encoded hint exceeds metadata capacity.
-    HintTooLarge { size: usize, max: usize },
-    /// Encoded metadata exceeds [`MAX_METADATA_SIZE`].
-    MetadataTooLarge { size: usize, max: usize },
-    /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
-    InvertedManifestRows { start_row: u64, end_row: u64 },
-}
-
-impl fmt::Display for ShardHintDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyData => write!(f, "shard hint decode: input is empty"),
-            Self::UnknownTag(tag) => {
-                write!(f, "shard hint decode: unknown tag 0x{tag:02X}")
-            }
-            Self::TruncatedPrefix {
-                expected_min,
-                actual,
-            } => write!(
-                f,
-                "shard hint decode: prefix frame truncated (need {expected_min} bytes, got {actual})"
-            ),
-            Self::TruncatedManifest {
-                expected_min,
-                actual,
-            } => write!(
-                f,
-                "shard hint decode: manifest frame truncated (need {expected_min} bytes, got {actual})"
-            ),
-            Self::InvertedManifestRows { start_row, end_row } => write!(
-                f,
-                "shard hint decode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ShardHintDecodeError {}
 
 impl fmt::Display for ShardMetadataDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -294,33 +253,28 @@ impl std::error::Error for ShardMetadataDecodeError {
     }
 }
 
-impl fmt::Display for ShardEncodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PrefixTooLarge { size, max } => {
-                write!(
-                    f,
-                    "shard encode: prefix too large ({size} bytes, max {max})"
-                )
-            }
-            Self::HintTooLarge { size, max } => {
-                write!(f, "shard encode: hint too large ({size} bytes, max {max})")
-            }
-            Self::MetadataTooLarge { size, max } => {
-                write!(
-                    f,
-                    "shard encode: metadata too large ({size} bytes, max {max})"
-                )
-            }
-            Self::InvertedManifestRows { start_row, end_row } => write!(
-                f,
-                "shard encode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
-            ),
-        }
-    }
+/// Encode failures for [`ShardHint::encode_into`] and
+/// [`ShardMetadata::encode_into`].
+///
+/// A single error type covers both hint-level and metadata-level encode
+/// failures. Callers match on variant to distinguish prefix-framing overflow,
+/// hint-size overflow, total-metadata overflow, and invalid manifest bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ShardEncodeError {
+    /// Prefix bytes exceed `u32` framing width.
+    #[error("shard encode: prefix too large ({size} bytes, max {max})")]
+    PrefixTooLarge { size: usize, max: usize },
+    /// Encoded hint exceeds metadata capacity.
+    #[error("shard encode: hint too large ({size} bytes, max {max})")]
+    HintTooLarge { size: usize, max: usize },
+    /// Encoded metadata exceeds [`MAX_METADATA_SIZE`].
+    #[error("shard encode: metadata too large ({size} bytes, max {max})")]
+    MetadataTooLarge { size: usize, max: usize },
+    /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
+    #[error("shard encode: manifest rows inverted (start_row={start_row} >= end_row={end_row})")]
+    InvertedManifestRows { start_row: u64, end_row: u64 },
 }
-
-impl std::error::Error for ShardEncodeError {}
 
 /// Structured shard metadata envelope.
 ///
@@ -880,10 +834,11 @@ impl fmt::Display for SplitBoundary {
 }
 
 /// Errors returned by [`propagate_hint_on_split`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum HintPropagationError {
     /// Prefix child boundary falls outside the parent prefix range.
+    #[error("prefix split propagation: invalid child {boundary} boundary for prefix shard")]
     InvalidPrefixBoundary {
         /// Which boundary failed validation.
         boundary: SplitBoundary,
@@ -895,11 +850,13 @@ pub enum HintPropagationError {
     /// outside the parent's `[start_row, end_row)` interval).  Splitting into
     /// separate variants is a future option if downstream callers need to
     /// distinguish the two failure modes.
+    #[error("manifest split propagation: invalid child {boundary} boundary")]
     InvalidManifestBoundary {
         /// Which boundary failed validation.
         boundary: SplitBoundary,
     },
     /// Manifest child boundary uses a different manifest ID than the parent.
+    #[error("manifest split propagation: manifest_id mismatch (parent={parent}, child={child})")]
     ManifestIdMismatch {
         /// Parent manifest ID.
         parent: u64,
@@ -907,6 +864,7 @@ pub enum HintPropagationError {
         child: u64,
     },
     /// Manifest child rows are inverted or degenerate (`start_row >= end_row`).
+    #[error("manifest split propagation: empty or inverted child range ({start_row} >= {end_row})")]
     EmptyManifestRange {
         /// Child start row.
         start_row: u64,
@@ -914,31 +872,6 @@ pub enum HintPropagationError {
         end_row: u64,
     },
 }
-
-impl fmt::Display for HintPropagationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPrefixBoundary { boundary } => write!(
-                f,
-                "prefix split propagation: invalid child {boundary} boundary for prefix shard"
-            ),
-            Self::InvalidManifestBoundary { boundary } => write!(
-                f,
-                "manifest split propagation: invalid child {boundary} boundary"
-            ),
-            Self::ManifestIdMismatch { parent, child } => write!(
-                f,
-                "manifest split propagation: manifest_id mismatch (parent={parent}, child={child})"
-            ),
-            Self::EmptyManifestRange { start_row, end_row } => write!(
-                f,
-                "manifest split propagation: empty or inverted child range ({start_row} >= {end_row})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for HintPropagationError {}
 
 /// Derive a child hint from `parent_hint` and child key-range boundaries.
 ///

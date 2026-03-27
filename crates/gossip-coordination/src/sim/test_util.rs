@@ -124,6 +124,76 @@ pub const TENANT: TenantId = TenantId::from_bytes([0x01; 32]);
 /// trigger expiry.
 pub const LEASE_DUR: u64 = 100;
 
+/// Human-readable fault level name for reproduction commands in assertion messages.
+pub fn fault_level_name(level: FaultLevel) -> &'static str {
+    match level {
+        FaultLevel::SunnyDay => "sunny",
+        FaultLevel::Stormy => "stormy",
+        FaultLevel::Radioactive => "radioactive",
+    }
+}
+
+/// Read `{prefix}_SEEDS` from the environment, defaulting to `default`.
+///
+/// Warns on parse errors so that accidentally malformed values are
+/// visible in test output rather than silently ignored.
+pub fn parse_env_seed_count(prefix: &str, default: usize) -> usize {
+    let var = format!("{prefix}_SEEDS");
+    match std::env::var(&var) {
+        Ok(s) => match s.parse() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!(
+                    "warning: {var}={s:?} is not a valid number ({e}), \
+                     falling back to default {default}"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+/// Read `{prefix}_SEED` for single-seed reproduction mode.
+///
+/// When set, the sweep runs only the specified seed, making failure
+/// investigation fast and deterministic. Warns on parse errors.
+pub fn parse_env_single_seed(prefix: &str) -> Option<u64> {
+    let var = format!("{prefix}_SEED");
+    match std::env::var(&var) {
+        Ok(s) => match s.parse() {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("warning: {var}={s:?} is not a valid number ({e}), ignoring");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Read `{prefix}_FAULT` to override the default fault level.
+///
+/// Defaults to `Stormy` when unset. Warns on unrecognized values.
+pub fn parse_env_fault_level(prefix: &str) -> FaultLevel {
+    let var = format!("{prefix}_FAULT");
+    match std::env::var(&var) {
+        Ok(s) => match s.to_lowercase().as_str() {
+            "sunny" | "sunnyday" => FaultLevel::SunnyDay,
+            "radioactive" => FaultLevel::Radioactive,
+            "stormy" => FaultLevel::Stormy,
+            _ => {
+                eprintln!(
+                    "warning: {var}={s:?} is not recognized \
+                     (expected sunny|stormy|radioactive), falling back to Stormy"
+                );
+                FaultLevel::Stormy
+            }
+        },
+        Err(_) => FaultLevel::Stormy,
+    }
+}
+
 /// Convenience constructor for [`ShardKey`] from raw integer IDs.
 ///
 /// Wraps the three-step `RunId::from_raw` + `ShardId::from_raw` + `ShardKey::new`

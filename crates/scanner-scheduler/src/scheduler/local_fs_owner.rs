@@ -316,6 +316,14 @@ pub(super) struct FileTask {
     pub(super) _permit: super::count_budget::CountPermit,
 }
 
+impl FileTask {
+    /// Discovery-order sequence number from the sorted-path file walk.
+    /// Used to reorder commit batches into discovery order downstream.
+    pub(super) fn discovery_sequence(&self) -> u32 {
+        self.file_id.0
+    }
+}
+
 // ============================================================================
 // Per-Worker Scratch
 // ============================================================================
@@ -547,9 +555,13 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
     }
 }
 
-/// Build and emit a persistence batch for one chunk's post-dedupe findings.
+/// Build and emit a persistence batch for post-dedupe findings.
 ///
-/// No-ops when `store_producer` is `None` or `findings` is empty.
+/// No-ops when `store_producer` is `None`. Accepts empty findings slices
+/// so the downstream pipeline can record a "scanned clean" done-ledger
+/// entry for objects with zero matches. Callers control emission frequency:
+/// for plain files, per-chunk when findings are present plus once per file
+/// for clean files; for archive entries, per-chunk unconditionally.
 ///
 /// # Fail-soft design
 ///
@@ -567,14 +579,15 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     findings: &[F],
     persist_batch: &mut Vec<FsFindingRecord>,
     metrics: &mut WorkerMetricsLocal,
+    discovery_sequence: u32,
 ) {
     let Some(producer) = store_producer else {
         return;
     };
-    if findings.is_empty() {
-        return;
-    }
 
+    // Handles empty findings slices: callers pass empty batches for clean
+    // files so the downstream pipeline can record a "scanned, nothing
+    // found" done-ledger entry.
     build_persistence_batch(findings, persist_batch);
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]
@@ -583,6 +596,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     let emit_result = producer.emit_fs_batch(FsFindingBatch {
         object_path: path,
         findings: persist_batch.as_slice(),
+        discovery_sequence,
     });
 
     #[cfg(all(feature = "perf-stats", debug_assertions))]
@@ -605,6 +619,16 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
                 message: msg.as_str(),
             },
         ));
+    }
+}
+
+/// Record the archive result for either extension- or header-based dispatch.
+#[inline]
+fn record_archive_outcome(metrics: &mut WorkerMetricsLocal, path: &[u8], outcome: ArchiveEnd) {
+    match outcome {
+        ArchiveEnd::Scanned => metrics.archive.record_archive_scanned(),
+        ArchiveEnd::Skipped(reason) => metrics.archive.record_archive_skipped(reason, path, false),
+        ArchiveEnd::Partial(reason) => metrics.archive.record_archive_partial(reason, path, false),
     }
 }
 
@@ -658,21 +682,32 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// open(path) ─► metadata.len() ─► acquire_buffer()
 ///                    │
 ///                    ▼
-///     ┌──────────────────────────────────┐
-///     │     for each chunk:              │◄───────────────┐
-///     │  1. copy_within(overlap)         │                │
-///     │  2. read(new_bytes)              │                │
-///     │  3. scan_chunk_into()            │                │
-///     │  4. drop_prefix_findings()       │                │
-///     │  5. drain + apply_cross_rule_dedupe() │             │
-///     │  6. emit_persistence_batch()     │                │
-///     │  7. emit_findings()              │                │
-///     └──────────────┬───────────────────┘                │
-///                    │                                   │
-///                    ▼                                   │
-///            offset < file_size? ───yes──────────────────┘
+///     ┌─────────────────────────────────────────┐
+///     │     for each chunk:                     │◄──────────┐
+///     │  1. copy_within(overlap)                │           │
+///     │  2. read(new_bytes)                     │           │
+///     │  3. scan_chunk_into()                   │           │
+///     │  4. drop_prefix_findings()              │           │
+///     │  5. drain + apply_cross_rule_dedupe()   │           │
+///     │  6. if findings: emit_persistence_batch()│          │
+///     │  7. emit_findings()                     │           │
+///     └──────────────┬──────────────────────────┘           │
+///                    │                                      │
+///                    ▼                                      │
+///            offset < file_size? ───yes─────────────────────┘
 ///                    │
-///                    no
+///                    no (scan_completed)
+///                    ▼
+///     scan_completed && !file_had_findings?
+///            │                │
+///           yes               no
+///            ▼                ▼
+///     emit_persistence_batch  (skip — already
+///       (empty batch;          emitted per-chunk)
+///        done-ledger marks
+///        file as "clean")
+///            │                │
+///            └───────┬────────┘
 ///                    ▼
 ///             release_buffer()
 /// ```
@@ -700,17 +735,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     if let Some(kind) = ext_kind {
         ctx.metrics.archive.record_archive_seen();
         let outcome = dispatch_archive_scan(&task, ctx, kind);
-        match outcome {
-            ArchiveEnd::Scanned => ctx.metrics.archive.record_archive_scanned(),
-            ArchiveEnd::Skipped(r) => ctx
-                .metrics
-                .archive
-                .record_archive_skipped(r, path_bytes, false),
-            ArchiveEnd::Partial(r) => ctx
-                .metrics
-                .archive
-                .record_archive_partial(r, path_bytes, false),
-        }
+        record_archive_outcome(&mut ctx.metrics, path_bytes, outcome);
         return;
     }
 
@@ -775,8 +800,18 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             .saturating_add(open_start.elapsed().as_nanos() as u64);
     }
 
-    // Empty file: nothing to scan
+    // Empty file: record a clean sentinel and return.
     if file_size == 0 {
+        scratch.pending.clear();
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+            task.discovery_sequence(),
+        );
         return;
     }
 
@@ -815,17 +850,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             drop(buf); // release buffer before dispatch (re-opens file)
             ctx.metrics.archive.record_archive_seen();
             let outcome = dispatch_archive_scan(&task, ctx, kind);
-            match outcome {
-                ArchiveEnd::Scanned => ctx.metrics.archive.record_archive_scanned(),
-                ArchiveEnd::Skipped(r) => ctx
-                    .metrics
-                    .archive
-                    .record_archive_skipped(r, path_bytes, false),
-                ArchiveEnd::Partial(r) => ctx
-                    .metrics
-                    .archive
-                    .record_archive_partial(r, path_bytes, false),
-            }
+            record_archive_outcome(&mut ctx.metrics, path_bytes, outcome);
             return;
         }
     }
@@ -857,6 +882,8 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     let mut carry: usize = 0; // Bytes of overlap prefix for next scan
     let mut have: usize = 0; // Total bytes in buffer from last iteration
     let mut preloaded: usize = first_n; // First chunk already in buf[0..first_n]
+    let mut file_had_findings = false;
+    let mut scan_completed = false;
 
     loop {
         // Move tail overlap bytes to front as next prefix
@@ -877,6 +904,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             let remaining_in_snapshot = file_size.saturating_sub(offset) as usize;
             if remaining_in_snapshot == 0 {
                 // Reached snapshot boundary - done with this file
+                scan_completed = true;
                 break;
             }
             let read_max = chunk_size.min(buf.len() - carry).min(remaining_in_snapshot);
@@ -910,6 +938,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         // EOF: done with this file
         if n == 0 {
+            scan_completed = true;
             break;
         }
 
@@ -933,15 +962,20 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &mut ctx.metrics,
         );
 
-        emit_persistence_batch(
-            scratch.store_producer.as_deref(),
-            &*scratch.event_sink,
-            path_bytes,
-            &scratch.pending,
-            &mut scratch.persist_batch,
-            &mut ctx.metrics,
-        );
-        // Emit findings
+        // Emit persistence batches only for chunks that produced findings.
+        // Clean-file done-ledger entries are emitted once after the loop.
+        if !scratch.pending.is_empty() {
+            file_had_findings = true;
+            emit_persistence_batch(
+                scratch.store_producer.as_deref(),
+                &*scratch.event_sink,
+                path_bytes,
+                &scratch.pending,
+                &mut scratch.persist_batch,
+                &mut ctx.metrics,
+                task.discovery_sequence(),
+            );
+        }
         emit_findings(
             engine.as_ref(),
             &*scratch.event_sink,
@@ -956,8 +990,29 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         // Stop at snapshot size (consistent point-in-time semantics)
         if offset >= file_size {
+            scan_completed = true;
             break;
         }
+    }
+
+    // Clean files emit a single empty batch so the done-ledger records
+    // "scanned, nothing found." Finding-bearing files already emitted
+    // per-chunk batches inside the loop. Skip the sentinel when the loop
+    // exited due to an IO error — a partially-scanned file must not be
+    // recorded as clean.
+    if scan_completed && !file_had_findings {
+        // `scan_chunk_postprocess` clears `pending` before draining, so
+        // it is already empty here when no chunk produced findings.
+        debug_assert!(scratch.pending.is_empty());
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+            task.discovery_sequence(),
+        );
     }
 
     // Buffer returned to pool on drop
@@ -1224,7 +1279,32 @@ where
         }
 
         let file_id = FileId(next_file_id);
-        next_file_id = next_file_id.wrapping_add(1);
+        // Virtual archive-entry FileIds occupy 0x8000_0000.. so real
+        // file IDs must stay below that boundary to avoid aliasing.
+        const VIRTUAL_BASE: u32 = 0x8000_0000;
+        next_file_id = match next_file_id.checked_add(1) {
+            Some(id) if id < VIRTUAL_BASE => id,
+            _ => {
+                eprintln!(
+                    "discovery file ID reached virtual-entry namespace \
+                     boundary ({VIRTUAL_BASE:#x}); stopping file enumeration"
+                );
+                // Enqueue this last file, then stop accepting new files.
+                stats.files_enqueued = stats.files_enqueued.saturating_add(1);
+                stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);
+                progress_sink.on_progress(LocalProgress {
+                    files_enqueued: stats.files_enqueued,
+                    bytes_enqueued: stats.bytes_enqueued,
+                });
+                let task = FileTask {
+                    file_id,
+                    path: file.path,
+                    _permit: permit,
+                };
+                batch.push(task);
+                break;
+            }
+        };
 
         stats.files_enqueued = stats.files_enqueued.saturating_add(1);
         stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);

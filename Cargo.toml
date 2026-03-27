@@ -16,8 +16,10 @@ members = [
     "crates/gossip-coordination-etcd",
     "crates/gossip-persistence-inmemory",
     "crates/gossip-frontier",
+    "crates/gossip-orchestrator",
     "crates/gossip-worker",
     "crates/scanner-rs-cli",
+    "tools/dev-seed",
 ]
 
 [workspace.package]
@@ -43,8 +45,10 @@ gossip-coordination = { path = "crates/gossip-coordination" }
 gossip-coordination-etcd = { path = "crates/gossip-coordination-etcd" }
 gossip-persistence-inmemory = { path = "crates/gossip-persistence-inmemory" }
 gossip-frontier = { path = "crates/gossip-frontier" }
+gossip-orchestrator = { path = "crates/gossip-orchestrator" }
 
 # External dependencies
+thiserror = "2"
 postgres = "0.19"
 
 # External dev/test dependencies

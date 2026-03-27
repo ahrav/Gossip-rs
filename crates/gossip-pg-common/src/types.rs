@@ -31,18 +31,17 @@
 //! match. This avoids the `Vec<u8>` allocation that `try_get::<_, Vec<u8>>`
 //! would incur.
 
-use std::{error::Error, fmt};
-
 /// Error produced when a `u64` ↔ `BIGINT` conversion violates domain
 /// constraints.
 ///
 /// Both variants carry the `field` name so that error messages identify which
 /// column triggered the failure without requiring the caller to wrap the error
 /// with additional context.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PgU64ConversionError {
     /// A `u64` value exceeds `i64::MAX` and cannot be stored in ordered
     /// non-negative mode without breaking SQL ordering semantics.
+    #[error("value {value} for field {field} exceeds non-negative PostgreSQL BIGINT range")]
     OrderedOutOfRange {
         /// Schema column name (e.g. `"fence_epoch"`, `"bytes_scanned"`).
         field: &'static str,
@@ -52,6 +51,9 @@ pub enum PgU64ConversionError {
     /// A value read from a column that the schema constrains to `>= 0` was
     /// negative. This indicates either data corruption or a schema-constraint
     /// bypass.
+    #[error(
+        "stored value {value} for field {field} is negative but the schema requires non-negative BIGINT"
+    )]
     NegativeStoredValue {
         /// Schema column name (e.g. `"started_at"`).
         field: &'static str,
@@ -59,23 +61,6 @@ pub enum PgU64ConversionError {
         value: i64,
     },
 }
-
-impl fmt::Display for PgU64ConversionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::OrderedOutOfRange { field, value } => write!(
-                f,
-                "value {value} for field {field} exceeds non-negative PostgreSQL BIGINT range"
-            ),
-            Self::NegativeStoredValue { field, value } => write!(
-                f,
-                "stored value {value} for field {field} is negative but the schema requires non-negative BIGINT"
-            ),
-        }
-    }
-}
-
-impl Error for PgU64ConversionError {}
 
 /// Encode a `u64` as `BIGINT` by reinterpreting the raw 8-byte representation.
 ///
@@ -139,9 +124,10 @@ pub fn pg_bigint_nonnegative_to_u64(
 
 /// Error produced when a `BYTEA` column cannot be decoded into a
 /// fixed-length byte array.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PgByteDecodeError {
     /// The stored blob length does not match the expected fixed width.
+    #[error("field {field}: expected {expected} bytes, got {actual}")]
     InvalidByteLength {
         /// Schema column or field name.
         field: &'static str,
@@ -151,20 +137,6 @@ pub enum PgByteDecodeError {
         actual: usize,
     },
 }
-
-impl fmt::Display for PgByteDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::InvalidByteLength {
-                field,
-                expected,
-                actual,
-            } => write!(f, "field {field}: expected {expected} bytes, got {actual}"),
-        }
-    }
-}
-
-impl Error for PgByteDecodeError {}
 
 /// Decode a `BYTEA` column value into a fixed 32-byte identity array.
 ///

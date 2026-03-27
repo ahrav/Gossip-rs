@@ -87,6 +87,7 @@ The module provides seven core capabilities:
 | `error.rs`           | Shared `CoordError`, `InfraError` (typed infrastructure errors), and `IdempotentOutcome`          |
 | `run_errors.rs`      | Run-management error types                                                                       |
 | `validation.rs`      | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency`                        |
+| `shard_limits.rs`    | Shared shard-count limit validation helpers and `ShardLimitViolation` snapshots used by both backends |
 | `events.rs`          | `EventCollector`, `EventKind`, `StateTransitionEvent`                                            |
 | `facade.rs`          | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                                              |
 | `session.rs`         | `WorkerSession` ergonomic wrapper with move/borrow lifecycle                                     |
@@ -97,9 +98,11 @@ The module provides seven core capabilities:
 
 | File           | Role                                                                                                                       |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `mod.rs`       | Module root, re-exports, and boundary ownership map                                                                     |
 | `cursor.rs`    | `Cursor` type with monotonicity and bounds semantics                                                                       |
 | `shard_spec.rs`| `ShardSpec` key-range type, `CursorSemantics`, split validation                                                            |
 | `pooled.rs`    | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers                                                       |
+| `restored_state.rs` | `RestoredShardState` — grouped acquire/restore payload handed to runtime layers                                    |
 | `limits.rs`    | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`)                                       |
 | `manifest.rs`  | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards`                                 |
 | `split.rs`     | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
@@ -121,6 +124,8 @@ The module provides seven core capabilities:
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
 | `error.rs`        | etcd connection, codec, lease, and transaction error surfaces                                 |
+| `sim_coordinator.rs` | Feature-gated deterministic simulation adapter that runs the sync etcd backend over the in-memory KV model |
+| `test_support.rs` | Testcontainers-backed lifecycle helpers plus namespace-isolated coordinator builders for integration tests |
 | `tests.rs`        | Config validation, keyspace path invariants (proptest), and ignored etcd integration tests covering acquire/checkpoint/renew/split lifecycle, unpark, collision/limit paths, fault-injected split atomicity, lease expiry, and contention |
 
 ---

@@ -26,7 +26,6 @@
 //! elapsed/throughput numbers.
 
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
@@ -113,32 +112,17 @@ pub struct CliConfig {
 /// [`HelpRequested`](CliError::HelpRequested) exits cleanly (exit code 0);
 /// [`Usage`](CliError::Usage) exits with a non-zero code and error message;
 /// [`Runtime`](CliError::Runtime) wraps scan-runtime failures.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CliError {
     /// `--help` or `-h` was passed; the contained string is the usage text.
+    #[error("{0}")]
     HelpRequested(String),
     /// Invalid arguments or missing required flags.
+    #[error("{0}")]
     Usage(String),
     /// The scan runtime returned an error during execution.
-    Runtime(ScanRuntimeError),
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::HelpRequested(message) | Self::Usage(message) => write!(f, "{message}"),
-            Self::Runtime(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for CliError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Runtime(error) => Some(error),
-            _ => None,
-        }
-    }
+    #[error("{0}")]
+    Runtime(#[source] ScanRuntimeError),
 }
 
 impl From<ScanRuntimeError> for CliError {

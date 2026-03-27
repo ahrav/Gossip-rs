@@ -443,4 +443,6 @@ Stop forging when:
 - `/performance-analyzer` — Static hotspot analysis for this project's patterns
 - `/linux-perf-profile` — Hardware counter analysis on Linux (PMU, cache, TLB)
 - `/bench-compare` — Quick before/after benchmark comparison
+- `/perf-topdown` — Cross-arch TMA classification; use when `perf report --stdio --percent-limit=5.0` has identified hot symbols for ASM analysis
 - `/perf-regression` — Full regression testing workflow before merging
+- `/pgo-bolt` — After exhausting source-level ASM improvements, apply PGO+BOLT for binary-level layout optimization

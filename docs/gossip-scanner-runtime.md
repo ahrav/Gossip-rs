@@ -16,9 +16,10 @@
   leases, direct coordination claim/complete helpers, persistence handles,
   runtime configuration, run reports, and error layering
 
-The crate no longer depends on a separate scan-driver abstraction. Its
-public surface stays stable for callers while direct and connector-mode
-entrypoints share the same local runtime execution paths.
+The crate no longer depends on a separate scan-driver abstraction.
+Execution mode selects the family boundary: direct mode runs the local
+scan pipeline, filesystem connector mode performs ordered page acquisition
+and validation, and Git connector mode uses the direct path.
 
 ---
 
@@ -26,17 +27,17 @@ entrypoints share the same local runtime execution paths.
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, mode-specific dispatchers (`scan_fs_direct`, `scan_fs_connector`, `scan_git_direct`, `scan_git_connector`), and crate-internal `scan_fs_with_runtime`, `scan_git_with_runtime`, `scan_fs_with_prebuilt_engine` |
+| `src/lib.rs` | Core types and entrypoints: configs, reports, validation, `scan_fs`, `scan_git`, mode-specific dispatchers (`scan_fs_direct`, `scan_fs_connector`, `scan_git_direct`, `scan_git_connector`), and crate-internal `scan_fs_with_runtime`, `scan_git_with_runtime` |
 | `src/cli.rs` | `scanner-rs scan fs / git` parsing, sink selection, runtime dispatch, stderr summary rendering |
 | `src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt`, `CheckpointAggregatorInput`, and shared `WriteContext` threading into commit requests |
 | `src/commit_pipeline.rs` | Bounded execution -> commit worker that owns authoritative durable completion, backpressures scan execution through bounded queues, and emits receipt-ready checkpoint input. `CommitPipeline::split()` decomposes the pipeline into a `CommitPipelineSender` (for execution threads) and a `CommitPipelineDrainer` (for concurrent receipt draining) |
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
-| `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (CommitSink adapter for receipt-driven execution), `drain_commit_stage` (receipt-driven checkpoint builder), `run_filesystem_lease` (single-shard execution entrypoint), direct `CoordinationFacade` claim/complete helpers, and `run_worker` (lease loop) |
+| `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), ordered-content filesystem lease execution, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
-| `src/ordered_content.rs` | Ordered-content local filesystem execution and generic-family marker types |
+| `src/ordered_content.rs` | Ordered-content page validation, explicit terminal page / exhausted-empty outcomes, scan-miss execution, and direct local filesystem execution helpers |
 | `src/result_translation.rs` | Deterministic translation from completed item results into persistence rows (findings, occurrences, observations, done-ledger) |
 | `src/result_committer.rs` | Authoritative findings -> done-ledger durability stage for one completed unit, with request validation and `UnitCommitReceipt` construction |
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
@@ -57,31 +58,68 @@ The crate exposes two public scan entrypoints:
 - `scan_fs(&FsScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 - `scan_git(&GitScanConfig) -> Result<ScanReport, ScanRuntimeError>`
 
-Each entrypoint dispatches on `ExecutionMode`, but both `Direct` and
-`Connector` currently converge on the same local family-facing runtime
-surface. The execution-mode flag is retained so callers can preserve
-their existing CLI and worker flows while the public runtime API stays
-stable.
+Each entrypoint dispatches on `ExecutionMode`. `Direct` runs the
+local scan implementation. `Connector` selects the family
+boundary instead: filesystem scans execute one ordered connector page
+acquisition/validation step, while Git scans use the direct
+path.
 
 ### Validation-first execution
 
 The runtime performs setup work in a fixed order:
 
 1. Validate the requested path.
-2. Validate runtime budgets (distributed path only; local paths skip budget validation).
+2. Validate runtime budgets (distributed path and filesystem connector-mode
+   local path via `Budgets`; direct local scans and Git connector mode skip
+   budget validation).
 3. Normalize source-specific inputs.
 4. Call the source family boundary.
 
 Current behavior after validation:
 
-- filesystem scans route to `ordered_content::scan_local_filesystem`
+- direct filesystem scans route to `ordered_content::scan_local_filesystem`
+- connector-mode filesystem scans instantiate `FilesystemConnector` and route
+  through ordered-content page validation (done-ledger prefiltering and bounded
+  scan-miss execution are available as library APIs but are not wired into the
+  live dispatcher)
 - git scans route to `git_repo::scan_local_repo`
 - distributed worker assembly uses the foundational types in `distributed.rs`
 
-Filesystem scans build a runtime engine, forward scheduler events through
-owned channel bridges, optionally forward persisted findings through the
-local commit sink surface, and convert scheduler counters into the local
-`ScanReport`.
+Direct filesystem scans build a runtime engine, forward scheduler events
+through owned channel bridges, optionally forward persisted findings
+through the local commit sink surface, and convert scheduler counters
+into the local `ScanReport`. When persistence is enabled, the runtime
+derives each filesystem `StableItemId` from the filesystem connector tag,
+a connector-instance hash of the canonicalized scan root, and the
+normalized root-relative path (the locator in `ItemIdentityKey`). The
+commit forwarder (`forward_commits`) uses a `DiscoveryOrderBuffer` to
+reorder finding batches from executor processing order (LIFO-reversed)
+back into file-path-sorted discovery order before calling `begin_item`.
+This ensures checkpoint sequence numbers are monotonically consistent
+with `ItemKey` ordering, preventing `BoundaryRegression` errors in the
+prefix checkpoint aggregator for ordered-content shards with multiple
+files.
+
+Connector-mode filesystem scans acquire one ordered page through
+`OrderedContentRuntime::execute_source` from the real
+`FilesystemConnector`, validate shard bounds and cursor monotonicity,
+and classify enumerate failures from the connector error taxonomy. The
+runtime maps the ordered filesystem path onto explicit
+`ShardCompletionOutcome` variants: `ExhaustedEmpty` only after
+the connector confirms exhausted-empty (`Ok(None)` at the page-fill
+boundary), `Complete { checkpoint }` after a terminal non-empty page is
+followed by that exhausted-empty suffix call, and `Checkpoint {
+checkpoint }` when the scan stops early after receipt-backed progress
+exists. This lets distributed callers require the exhausted-empty suffix
+before they treat a shard as fully enumerated, while still preserving
+checkpointable progress on retryable stops. The current
+`scan_fs_connector` entry point returns the validated page report without
+performing content reads. Done-ledger prefiltering and
+`OrderedContentRuntime::execute_scan_misses` (which bridges runtime
+`ScanBudgets` into connector read budgets, scans each item through the
+shared chunked engine path, preserves retryable versus permanent read
+failures, and returns ordered non-durable outcomes) are available as
+library APIs but are not wired into the live dispatcher.
 
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
@@ -92,7 +130,41 @@ The distributed module exports the concrete worker-loop types and helpers:
 `DistributedRuntimeConfig`, `DistributedRunReport`, and
 `DistributedRuntimeError`. The runtime depends directly on
 `gossip-coordination` for claim and completion operations and on
-`gossip-frontier` for shard metadata decoding.
+`gossip-frontier` for shard metadata decoding. Filesystem lease
+execution starts a lease-deadline watchdog that drives the shared
+`CancellationToken` when the claimed lease is no longer trustworthy.
+The watchdog compares against a monotonic `Instant`-based deadline
+(converted from the coordinator-provided logical lease deadline at
+claim time) so `CLOCK_REALTIME` jumps from NTP corrections or VM
+migration cannot cause false-positive or false-negative expiry
+detection. The
+watchdog uses `std::thread::park_timeout` instead of `thread::sleep`
+so the main thread can wake it immediately via `unpark()` when shard
+execution finishes, avoiding up to one polling interval of exit
+latency. Successful receipt-drain completion seals the local deadline
+signal before the watchdog joins. This ensures any lease rejection
+after durable local completion is decided by the coordinator
+`complete`/`checkpoint` call rather than by a late local watchdog tick.
+Coordinator-side `StaleFence` and `LeaseExpired` rejections from both
+`checkpoint` and `complete` are normalized to
+`DistributedRuntimeError::LeaseUncertain`, preserving the lease-loss
+classification after local durable progress exists.
+The ordered page loop polls that token between page acquisitions and
+before queueing new commit work so expiry stops the shard before more
+items are enqueued. Claim retry delays honor coordinator-provided
+`retry_after` and `earliest_deadline` floors directly, falling back to
+the fixed race-retry delay only when no logical wakeup hint is
+available. Successful filesystem lease execution returns an
+explicit `ShardCompletionOutcome`: `Complete { checkpoint }` uses the
+committed-prefix cursor for terminal completion,
+`Checkpoint { checkpoint }` preserves non-terminal progress through
+coordination `checkpoint`, and `ExhaustedEmpty` derives a range-safe
+fallback cursor only when the scan truly observed exhausted-empty
+before any durable committed unit existed. If the deadline elapses
+first, or if `complete` rejects a stale or expired lease, the worker
+surfaces `DistributedRuntimeError::LeaseUncertain` and leaves the
+shard for a higher-fence reassignment to resume from durable receipt
+and done-ledger state.
 
 ### Family split
 
@@ -188,7 +260,15 @@ pub struct ScanReport {
     pub chunks_scanned: u64,
     pub findings_emitted: u64,
     pub errors: u64,
-    ...
+    pub binary_skipped: u64,
+    pub ext_skipped: u64,
+    pub lock_skipped: u64,
+    pub binary_extracted: u64,
+    pub dropped_findings: u64,
+    pub persist_emit_failures: u64,
+    pub persist_incomplete: bool,
+    pub scan_ns: u64,
+    pub persist_ns: u64,
 }
 ```
 
@@ -320,9 +400,10 @@ decomposition.
 
 #### `ReceiptCommitSink`
 
-`ReceiptCommitSink` implements the `CommitSink` trait to bridge scan-driver
-item lifecycle callbacks into the receipt-driven commit pipeline. It tracks
-in-flight items in a `BTreeMap<ItemKey, InFlightItem>`:
+`ReceiptCommitSink` bridges runtime item execution into the receipt-driven
+commit pipeline. It supports both the scan-loop `CommitSink` lifecycle and
+direct ordered-content item submission. The scan-loop path tracks in-flight
+items in a `BTreeMap<ItemKey, InFlightItem>`:
 
 - `begin_item` assigns a monotonically increasing sequence number and
   inserts an `InFlightItem` into the in-flight map.
@@ -333,6 +414,12 @@ in-flight items in a `BTreeMap<ItemKey, InFlightItem>`:
   rows, wraps them in a `QueuedCommit`, and submits to the pipeline through
   `CommitPipelineSender`. On translation or submission failure, the item is
   re-inserted into the in-flight map so the caller can retry.
+
+For ordered-content execution, `submit_ordered_item` derives `ItemMeta`,
+translates the `OrderedContentItemOutcome` into the same persistence rows,
+and submits the resulting `QueuedCommit` directly. Both surfaces converge on
+the same bounded commit pipeline, so durable receipt handling and checkpoint
+aggregation stay identical regardless of how the runtime discovered the item.
 
 The sink derives logical timing from sequence numbers (`2n, 2n+1` intervals)
 and uses a weak object-version derived from item-key bytes when the source
@@ -369,8 +456,11 @@ the receipt-driven durability model:
 3. Starts a `CommitPipeline` and splits it into sender and drainer.
 4. Constructs a `ReceiptCommitSink` with the sender handle.
 5. Uses `std::thread::scope` to run scan execution and commit-stage draining
-   concurrently: scan execution calls `scan_fs_with_prebuilt_engine` with
-   the `ReceiptCommitSink`, while a second thread calls
+   concurrently: scan execution instantiates a `FilesystemConnector`,
+   loops through ordered pages (each prefiltered against the done ledger),
+   executes the remaining scan-miss items with the shared engine, emits
+   scheduler-compatible finding and summary events, and submits each ordered
+   item outcome to `ReceiptCommitSink`. A second thread calls
    `drain_commit_stage` with the drainer.
 6. After both threads complete, resolves the scan, submission, and drain
    outcomes in diagnostic order. Scan-runtime failures surface
@@ -380,10 +470,13 @@ the receipt-driven durability model:
    `wait_for_submitted_commits` and verifies that the durable receipt count
    matches the number of items submitted to the commit pipeline.
 7. Prepares a checkpoint prefix from the aggregator, acknowledges the
-   checkpoint to advance the aggregator watermark, and returns the checkpoint
-   cursor to the caller. Shards with zero durable commit units (empty
-   directories or directories where no file produced durable rows) return no
-   checkpoint cursor.
+   checkpoint to advance the aggregator watermark, and returns an explicit
+   `ShardCompletionOutcome` to the caller. Receipt-backed progress yields
+   `Complete { checkpoint }` or `Checkpoint { checkpoint }`, while replay-only
+   recovery can still return either outcome from the recovered resume cursor
+   when this claim produced no new durable receipts but did recover durable
+   coverage from earlier committed work. `ExhaustedEmpty` is reserved for
+   shards that are confirmed empty and have no durable coverage to preserve.
 
 If any step fails, the shard is not completed in coordination and will be
 retried when the lease expires.
@@ -393,10 +486,10 @@ retried when the lease expires.
 `run_worker` is the top-level distributed lease loop. It acquires leases until
 the coordinator returns no more active work, counts every claimed lease in
 `DistributedRunReport`, routes each lease through `run_filesystem_lease`, and
-then completes it directly against the coordination backend. Completion uses
-the receipt-derived checkpoint cursor when one exists; otherwise it falls back
-to the shard's range start so `CursorSemantics::Completed` runs still advance
-terminal state for clean or empty shards.
+then advances it directly against the coordination backend. `advance_shard`
+uses the explicit `ShardCompletionOutcome`: `Complete` and `Checkpoint`
+forward their cursor, while `ExhaustedEmpty` derives a range-safe empty-shard
+cursor from the restored lease state.
 
 Unit tests exercise this loop through `gossip_coordination::InMemoryCoordinator`,
 which is the same reference backend used elsewhere in the coordination layer.
@@ -429,10 +522,11 @@ runtime:
 - `CliNoOpCommitSink`
 
 Distributed receipt-driven execution implements that surface with
-`ReceiptCommitSink` in `src/distributed.rs`. The adapter accumulates compact
-finding batches, reconstructs the richer translation inputs expected by
-`translate_item_result`, and submits the resulting persistence work to the
-bounded commit pipeline. That translation path computes:
+`ReceiptCommitSink` in `src/distributed.rs`. The adapter accepts either
+compact scan-loop finding batches or direct ordered-content item outcomes,
+reconstructs the richer translation inputs expected by `translate_item_result`,
+and submits the resulting persistence work to the bounded commit pipeline.
+That translation path computes:
 
 - tenant-scoped secret hash (derived from the bridge batch's `norm_hash`)
 - finding ID (using the rule-fingerprint resolver for position-independent rule identity)
@@ -553,11 +647,17 @@ pub struct WorkerIdentity {
 
 ```rust
 pub struct ShardLease {
+    /// String shard label used for routing recorder events.
     shard_id: Arc<str>,
+    /// Authoritative coordination-layer lease used for terminal completion.
     lease: Lease,
-    range_start: Vec<u8>,
-    scan_config: FsScanConfig,
+    /// Authoritative shard bounds, resume cursor, and cursor semantics.
+    state: RestoredShardState,
+    /// Hydrated filesystem source configuration plus explicit source mode.
+    filesystem_source: HydratedFilesystemSource,
+    /// Shared routing and fencing metadata for all writes emitted under the lease.
     write_context: WriteContext,
+    /// Tenant secret key used for secret-hash derivation.
     tenant_secret_key: TenantSecretKey,
 }
 ```
@@ -596,9 +696,10 @@ completion helpers.
 `ShardLease` is the hand-off object from `gossip-coordination` into the worker
 loop. It keeps the string shard label used for recorder routing separate from
 the numeric shard identity carried inside `Lease` and `WriteContext`, stores
-the shard's key-range start for completion fallback, and carries the
-filesystem scan config derived from the claimed shard spec plus connector
-metadata.
+the authoritative restored shard state (`RestoredShardState`, including shard
+bounds plus any resume cursor and cursor semantics), and carries the hydrated
+filesystem source state (`HydratedFilesystemSource`) that pairs the per-shard
+scan configuration with the explicit source mode decoded from shard metadata.
 
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones

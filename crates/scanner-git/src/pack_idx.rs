@@ -16,8 +16,6 @@
 //! - `offset_at()` is O(1), may follow large offset indirection.
 //! - `iter_oids()` is O(N) sequential iteration (ideal for k-way merge).
 
-use std::fmt;
-
 use super::object_id::ObjectFormat;
 
 /// Pack index magic bytes for v2 format.
@@ -36,23 +34,29 @@ const LARGE_OFFSET_FLAG: u32 = 0x8000_0000;
 const MAX_IDX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Errors from pack index parsing.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum IdxError {
     /// Index file is corrupt or malformed.
+    #[error("corrupt pack index: {detail}")]
     Corrupt { detail: &'static str },
     /// Index version is not supported.
+    #[error("unsupported pack index version: {version} (expected 2)")]
     UnsupportedVersion { version: u32 },
     /// Index file exceeds size limit.
+    #[error("pack index too large: {size} bytes (max: {max})")]
     TooLarge { size: u64, max: u64 },
     /// Index hash version doesn't match expected format.
+    #[error("pack index OID length mismatch: expected {} bytes, computed {actual_oid_len}", expected.oid_len())]
     FormatMismatch {
         expected: ObjectFormat,
         actual_oid_len: usize,
     },
     /// Large offset index out of bounds.
+    #[error("large offset index out of bounds: {index} >= {count}")]
     LargeOffsetOutOfBounds { index: u32, count: u32 },
     /// Fanout-derived object count inconsistent with computed count from section sizes.
+    #[error("object count mismatch: fanout says {fanout_count}, computed {computed_count}")]
     ObjectCountMismatch {
         fanout_count: u32,
         computed_count: u32,
@@ -66,40 +70,6 @@ impl IdxError {
         Self::Corrupt { detail }
     }
 }
-
-impl fmt::Display for IdxError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Corrupt { detail } => write!(f, "corrupt pack index: {detail}"),
-            Self::UnsupportedVersion { version } => {
-                write!(f, "unsupported pack index version: {version} (expected 2)")
-            }
-            Self::TooLarge { size, max } => {
-                write!(f, "pack index too large: {size} bytes (max: {max})")
-            }
-            Self::FormatMismatch {
-                expected,
-                actual_oid_len,
-            } => write!(
-                f,
-                "pack index OID length mismatch: expected {} bytes, computed {actual_oid_len}",
-                expected.oid_len()
-            ),
-            Self::LargeOffsetOutOfBounds { index, count } => {
-                write!(f, "large offset index out of bounds: {index} >= {count}")
-            }
-            Self::ObjectCountMismatch {
-                fanout_count,
-                computed_count,
-            } => write!(
-                f,
-                "object count mismatch: fanout says {fanout_count}, computed {computed_count}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for IdxError {}
 
 /// Zero-copy view over a pack index v2 file.
 ///

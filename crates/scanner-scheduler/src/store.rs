@@ -29,7 +29,6 @@
 //! | [`InMemoryStoreProducer`] | Collects batches in memory for tests and diagnostics |
 
 use crate::engine::NormHash;
-use std::fmt;
 use std::sync::Mutex;
 
 /// Persistence-ready representation of one FS finding.
@@ -73,6 +72,13 @@ pub struct FsFindingBatch<'a> {
     pub object_path: &'a [u8],
     /// Post-dedupe findings for this object, in scan-order.
     pub findings: &'a [FsFindingRecord],
+    /// Monotonic counter assigned at file discovery time in sorted path
+    /// order. For top-level files this is the [`FileId`] from the
+    /// discovery loop; for archive entries it equals the parent file's
+    /// discovery sequence. Used downstream to reorder commit batches
+    /// into discovery order so checkpoint sequence numbers are
+    /// monotonically consistent with [`ItemKey`] ordering.
+    pub discovery_sequence: u32,
 }
 
 /// Run-level loss accounting for FS persistence.
@@ -99,7 +105,8 @@ impl FsRunLoss {
 }
 
 /// Persistence producer error.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("fs persistence error: {detail}")]
 pub struct FsStoreError {
     detail: String,
 }
@@ -118,14 +125,6 @@ impl FsStoreError {
     }
 }
 
-impl fmt::Display for FsStoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "fs persistence error: {}", self.detail)
-    }
-}
-
-impl std::error::Error for FsStoreError {}
-
 /// Producer interface for FS finding persistence.
 ///
 /// Implementations must be `Send + Sync` because the scheduler calls
@@ -134,9 +133,11 @@ impl std::error::Error for FsStoreError {}
 ///
 /// # Contract
 ///
-/// - `emit_fs_batch` is called zero or more times during a scan, once per
-///   scanned object that produced findings. Batches may arrive out of file
-///   order when workers run in parallel.
+/// - `emit_fs_batch` is called one or more times per scanned object.
+///   For plain files: once per chunk that produced findings, plus a
+///   single empty-findings call for fully-scanned clean files. For
+///   archive entries and extracted binaries: once per chunk unconditionally.
+///   Batches may arrive out of file order when workers run in parallel.
 /// - `record_fs_run_loss` is called exactly once at the end of a scan run.
 ///   Implementations should persist or log the loss data before returning.
 /// - `end_run` is called once after `record_fs_run_loss` to finalize the run
@@ -147,6 +148,8 @@ impl std::error::Error for FsStoreError {}
 pub trait StoreProducer: Send + Sync + 'static {
     /// Emit one post-dedupe finding batch for a single scanned object.
     ///
+    /// The findings slice may be empty for objects with no matches;
+    /// implementations must handle this to record "scanned clean" status.
     /// Called from a worker thread. The batch borrows data from scratch
     /// buffers, so implementations must copy or serialize before returning.
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError>;
@@ -202,6 +205,7 @@ pub struct InMemoryStoreProducer {
 pub struct OwnedFsFindingBatch {
     pub object_path: Vec<u8>,
     pub findings: Vec<FsFindingRecord>,
+    pub discovery_sequence: u32,
 }
 
 impl InMemoryStoreProducer {
@@ -233,6 +237,7 @@ impl StoreProducer for InMemoryStoreProducer {
         guard.push(OwnedFsFindingBatch {
             object_path: batch.object_path.to_vec(),
             findings: batch.findings.to_vec(),
+            discovery_sequence: batch.discovery_sequence,
         });
         Ok(())
     }
@@ -315,6 +320,7 @@ mod tests {
         let batch = FsFindingBatch {
             object_path: b"/tmp/test.txt",
             findings: &[],
+            discovery_sequence: 0,
         };
         assert!(producer.emit_fs_batch(batch).is_ok());
     }
@@ -349,10 +355,12 @@ mod tests {
         let batch1 = FsFindingBatch {
             object_path: b"/file1.txt",
             findings: &[rec],
+            discovery_sequence: 0,
         };
         let batch2 = FsFindingBatch {
             object_path: b"/file2.txt",
             findings: &[],
+            discovery_sequence: 1,
         };
         producer.emit_fs_batch(batch1).unwrap();
         producer.emit_fs_batch(batch2).unwrap();
@@ -429,6 +437,7 @@ mod tests {
         let batch = FsFindingBatch {
             object_path: b"/test",
             findings: &[],
+            discovery_sequence: 0,
         };
         let err = producer.emit_fs_batch(batch).unwrap_err();
         assert!(err.detail().contains("injected"));
@@ -453,6 +462,7 @@ mod tests {
         let batch = FsFindingBatch {
             object_path: b"/ok",
             findings: &[],
+            discovery_sequence: 0,
         };
         assert!(producer.emit_fs_batch(batch).is_ok());
         assert!(producer.record_fs_run_loss(FsRunLoss::default()).is_err());

@@ -122,3 +122,8 @@ dir = "crates/scanner-rs-cli/src/"
 [[scopes]]
 doc = "docs/scanner-core-parity.md"
 dir = "crates/gossip-worker/src/"
+
+# Orchestrator request model (filesystem submission normalization).
+[[scopes]]
+doc = "docs/source-families.md"
+dir = "crates/gossip-orchestrator/src/"

@@ -63,19 +63,30 @@ pub mod fault_injector;
 mod harness;
 mod invariants;
 mod overload;
+mod shared;
 mod worker;
 
 pub use backend::{SimIntrospection, SimulationBackend};
 pub use fault_injector::FaultInjectingIntrospector;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod composition;
+#[cfg(any(test, feature = "test-support"))]
+pub mod composition_invariants;
+#[cfg(test)]
+mod composition_tests;
 #[cfg(test)]
 mod mega_sim_tests;
 #[cfg(test)]
 mod proptest_state_machine_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod scan_driver_sim;
 #[cfg(test)]
 mod sim_behavioral_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_util;
+#[cfg(any(test, feature = "test-support"))]
+pub use composition_invariants::{CompositionInvariantChecker, CrossComponentViolation};
 pub use harness::{
     CoordinationSim, RejectionKind, RunTerminalKind, SimEvent, SimEventKind, SimOp, SimReport,
 };

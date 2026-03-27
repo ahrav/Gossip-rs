@@ -32,7 +32,7 @@ graph TD
     EM -->|"caps() returns"| CC
 
     subgraph Connectors["Concrete implementations"]
-        FS["<b>FilesystemConnector</b><br/>seek_by_key: ✓<br/>token_resume: ✗<br/>range_read: ✓<br/>split_hints: ✗"]
+        FS["<b>FilesystemConnector</b><br/>seek_by_key: ✓<br/>token_resume: ✗<br/>range_read: ✓<br/>split_hints: ✗ (caps)<br/><i>has choose_split_point<br/>via StreamingSplitEstimator</i>"]
         GIT["<b>GitConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
         MEM["<b>InMemoryDeterministicConnector</b><br/>seek_by_key: ✓<br/>token_resume: configurable<br/>range_read: ✓<br/>split_hints: ✓"]
     end
@@ -58,9 +58,14 @@ graph TD
   Orchestration can apply different retry and circuit-breaker policies to each
   path.
 - `choose_split_point` is only meaningful for connectors that advertise
-  `split_hints: true`.
+  `split_hints: true`. `FilesystemConnector` reports `split_hints: false`
+  via `caps()` but does implement `choose_split_point` backed by a
+  `StreamingSplitEstimator` — the capability flag under-reports what the
+  connector can do.
 - `FilesystemConnector` keeps a simpler capability profile: key-based seek and
-  range reads are available, while token resume and split hints are not.
+  range reads are available, while token resume is not. Split estimation is
+  available via `StreamingSplitEstimator` even though `split_hints` reports
+  `false` in `caps()`.
 - `GitConnector` and `InMemoryDeterministicConnector` can expose token resume
   conditionally through `with_tokens(bool)`.
 
@@ -99,7 +104,7 @@ graph TD
     IR -->|"item_ref field"| SI
 
     subgraph Budgets["Scan budgets"]
-        BU["<b>Budgets</b><br/>max_items: NonZeroUsize<br/>max_bytes: NonZeroU64<br/>deadline: Option&lt;Instant&gt;"]
+        BU["<b>Budgets</b><br/>max_items: NonZeroUsize<br/>max_bytes: NonZeroU64<br/>deadline: Option&lt;Instant&gt;<br/><i>try_new(), is_expired_at()</i>"]
     end
 
     subgraph Errors["Error types"]
@@ -239,7 +244,7 @@ graph TD
     end
 
     subgraph Classify["Classification (gossip-connectors::common)"]
-        IPIE["<b>is_permanent_io_error()</b><br/>NotFound<br/>PermissionDenied<br/>InvalidInput<br/>InvalidFilename<br/>NotADirectory<br/>IsADirectory<br/>ELOOP (symlink loop)"]
+        IPIE["<b>is_permanent_io_error()</b><br/>NotFound<br/>PermissionDenied<br/>InvalidInput<br/>InvalidFilename<br/>NotADirectory<br/>IsADirectory<br/>ELOOP (Unix raw_os_error<br/>via is_symlink_loop())"]
         CIE2["<b>classify_io_enumerate_error()</b><br/>op, path, &io::Error<br/>→ EnumerateError"]
         CIR["<b>classify_io_read_error()</b><br/>op, Option&lt;path&gt;, &io::Error<br/>→ ReadError"]
     end
@@ -293,7 +298,7 @@ graph TD
 | `InvalidFilename` | Permanent | OS-rejected filename |
 | `NotADirectory` | Permanent | Type mismatch |
 | `IsADirectory` | Permanent | Type mismatch |
-| `ELOOP` (Unix) | Permanent | Symlink cycle |
+| `ELOOP` (Unix) | Permanent | Symlink cycle (detected via `raw_os_error`, not `ErrorKind`) |
 | Everything else | Retryable | Interrupted, would-block, timeout, or capacity failure |
 
 See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for how classified
@@ -310,7 +315,8 @@ for system-wide recovery patterns.
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/types.rs` | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `ScanItem`, `Budgets`, `ConnectorInputError`, `ContentHints`, `Location`, `VersionId`, `PooledByteSlab`, `ToxicDigest` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/ordered.rs` | `OrderedContentSource`, `OrderedContentCapabilities` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/git.rs` | `GitRepoDiscoverySource`, `GitMirrorManager`, `GitRepoExecutor`, `GitRepoTarget`, `LocalMirror`, `GitRunOutcome`, `GitRunError` |
-| `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG`, `path_buf_from_bytes` |
+| `gossip-contracts` | `crates/gossip-contracts/src/connector/mod.rs` | `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG`, re-export hub |
+| `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `is_permanent_io_error`, `classify_io_enumerate_error`, `classify_io_read_error`, `path_digest`, `path_buf_from_bytes`, `borrowed_shard_bound`, `resolve_bounds`, `key_resume_start`, `estimate_split_from_sorted`, `is_valid_split_candidate` |
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/git.rs` | `GitConnector` |
 | `gossip-connectors` | `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector`, `MemItem` |

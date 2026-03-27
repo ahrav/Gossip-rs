@@ -21,6 +21,7 @@ use gossip_scanner_runtime::coordination_sink::CoordinationEventRecorder;
 use gossip_scanner_runtime::distributed::{DistributedRuntimeConfig, WorkerIdentity};
 use gossip_scanner_runtime::{AnchorMode, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets};
 
+use crate::production::{ProductionStartupSettings, StartupSchemaMode};
 use crate::recorder::ProductionCoordinationEventRecorder;
 
 /// Environment variable selecting the worker runtime family.
@@ -49,6 +50,8 @@ pub const ENV_WORKER_ID: &str = "GOSSIP_WORKER_ID";
 pub const ENV_POLICY_HASH: &str = "GOSSIP_POLICY_HASH";
 /// Environment variable supplying the tenant secret key as a 32-byte hex string.
 pub const ENV_TENANT_SECRET_KEY: &str = "GOSSIP_TENANT_SECRET_KEY";
+/// Environment variable selecting startup schema validation policy.
+pub const ENV_STARTUP_SCHEMA_MODE: &str = "GOSSIP_STARTUP_SCHEMA_MODE";
 /// Environment variable supplying the maximum items processed between checkpoints.
 pub const ENV_MAX_ITEMS: &str = "GOSSIP_MAX_ITEMS";
 /// Environment variable supplying the maximum bytes processed between checkpoints.
@@ -543,28 +546,15 @@ impl fmt::Debug for ProductionBackendConfig {
 }
 
 /// Validation errors for [`ProductionBackendConfig`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProductionBackendConfigError {
     /// The done-ledger PostgreSQL DSN was empty after trimming whitespace.
+    #[error("done-ledger PostgreSQL DSN must not be empty")]
     EmptyDoneLedgerPostgresDsn,
     /// The findings PostgreSQL DSN was empty after trimming whitespace.
+    #[error("findings PostgreSQL DSN must not be empty")]
     EmptyFindingsPostgresDsn,
 }
-
-impl fmt::Display for ProductionBackendConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyDoneLedgerPostgresDsn => {
-                f.write_str("done-ledger PostgreSQL DSN must not be empty")
-            }
-            Self::EmptyFindingsPostgresDsn => {
-                f.write_str("findings PostgreSQL DSN must not be empty")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProductionBackendConfigError {}
 
 /// Distributed runtime tuning parsed from worker config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -728,6 +718,7 @@ impl fmt::Debug for WorkerIdentityConfig {
 #[derive(Clone, Debug)]
 pub struct DistributedWorkerConfig {
     backends: ProductionBackendConfig,
+    startup: ProductionStartupSettings,
     identity: WorkerIdentityConfig,
     source: FsSourceSettings,
     runtime: DistributedWorkerRuntimeSettings,
@@ -741,6 +732,7 @@ impl DistributedWorkerConfig {
     /// [`WorkerIdentityConfig::new`].
     pub fn new(
         backends: ProductionBackendConfig,
+        startup: ProductionStartupSettings,
         identity: WorkerIdentityConfig,
         source: FsSourceSettings,
         runtime: DistributedWorkerRuntimeSettings,
@@ -755,6 +747,7 @@ impl DistributedWorkerConfig {
         }
         Ok(Self {
             backends,
+            startup,
             identity,
             source,
             runtime,
@@ -772,6 +765,12 @@ impl DistributedWorkerConfig {
     #[must_use]
     pub fn production_backends(&self) -> &ProductionBackendConfig {
         &self.backends
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn startup(&self) -> ProductionStartupSettings {
+        self.startup
     }
 
     #[inline]
@@ -865,28 +864,37 @@ pub enum ResolvedWorkerConfig {
 }
 
 /// Error returned when parsing or validating worker configuration.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WorkerConfigError {
     /// Invalid CLI usage or unknown flags.
+    #[error("{0}")]
     Usage(String),
     /// A required field was missing.
+    #[error("missing required value for {field} (set {flag}=... or {env}=...)")]
     MissingRequiredValue {
         field: &'static str,
         flag: &'static str,
         env: &'static str,
     },
     /// A field value was present but invalid.
+    #[error("invalid value for {field}: {value} ({reason})")]
     InvalidValue {
         field: &'static str,
         value: String,
         reason: String,
     },
     /// The etcd configuration was syntactically invalid.
-    InvalidEtcdConfig(EtcdCoordinatorConfigError),
+    #[error("invalid etcd worker configuration: {0}")]
+    InvalidEtcdConfig(#[source] EtcdCoordinatorConfigError),
     /// The production backend configuration was invalid.
-    InvalidBackendConfig(ProductionBackendConfigError),
+    #[error("invalid production backend configuration: {0}")]
+    InvalidBackendConfig(#[source] ProductionBackendConfigError),
     /// The provided combination of mode, backend, and source is unsupported.
+    #[error("{message}")]
     UnsupportedCombination { message: String },
+    /// An environment variable is set but contains invalid UTF-8.
+    #[error("environment variable {key} is set but contains invalid UTF-8")]
+    InvalidEncoding { key: &'static str },
 }
 
 impl WorkerConfigError {
@@ -911,40 +919,6 @@ impl WorkerConfigError {
     }
 }
 
-impl fmt::Display for WorkerConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Usage(message) => f.write_str(message),
-            Self::MissingRequiredValue { field, flag, env } => write!(
-                f,
-                "missing required value for {field} (set {flag}=... or {env}=...)"
-            ),
-            Self::InvalidValue {
-                field,
-                value,
-                reason,
-            } => write!(f, "invalid value for {field}: {value} ({reason})"),
-            Self::InvalidEtcdConfig(source) => {
-                write!(f, "invalid etcd worker configuration: {source}")
-            }
-            Self::InvalidBackendConfig(source) => {
-                write!(f, "invalid production backend configuration: {source}")
-            }
-            Self::UnsupportedCombination { message } => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for WorkerConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidEtcdConfig(source) => Some(source),
-            Self::InvalidBackendConfig(source) => Some(source),
-            _ => None,
-        }
-    }
-}
-
 impl From<EtcdCoordinatorConfigError> for WorkerConfigError {
     fn from(value: EtcdCoordinatorConfigError) -> Self {
         Self::InvalidEtcdConfig(value)
@@ -960,7 +934,12 @@ impl From<ProductionBackendConfigError> for WorkerConfigError {
 /// Provider abstraction for environment variable access.
 pub trait EnvProvider {
     /// Return the current value for `key`, if it is set.
-    fn get(&self, key: &'static str) -> Option<String>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerConfigError::InvalidEncoding`] when the variable is set
+    /// but contains bytes that are not valid UTF-8.
+    fn get(&self, key: &'static str) -> Result<Option<String>, WorkerConfigError>;
 }
 
 /// Environment provider backed by the current process environment.
@@ -968,16 +947,12 @@ pub trait EnvProvider {
 pub struct ProcessEnv;
 
 impl EnvProvider for ProcessEnv {
-    fn get(&self, key: &'static str) -> Option<String> {
+    fn get(&self, key: &'static str) -> Result<Option<String>, WorkerConfigError> {
         match std::env::var(key) {
-            Ok(val) => Some(val),
-            Err(std::env::VarError::NotPresent) => None,
+            Ok(val) => Ok(Some(val)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
             Err(std::env::VarError::NotUnicode(_)) => {
-                tracing::error!(
-                    env_var = key,
-                    "environment variable contains invalid UTF-8; treating as absent"
-                );
-                None
+                Err(WorkerConfigError::InvalidEncoding { key })
             }
         }
     }
@@ -1001,6 +976,7 @@ struct RawWorkerConfig {
     etcd_namespace: Option<String>,
     done_ledger_postgres_dsn: Option<String>,
     findings_postgres_dsn: Option<String>,
+    startup_schema_mode: Option<String>,
     tenant: Option<String>,
     run: Option<String>,
     worker: Option<String>,
@@ -1035,6 +1011,7 @@ impl fmt::Debug for RawWorkerConfig {
             .field("etcd_namespace", &self.etcd_namespace)
             .field("done_ledger_postgres_dsn", &"[redacted]")
             .field("findings_postgres_dsn", &"[redacted]")
+            .field("startup_schema_mode", &self.startup_schema_mode)
             .field("tenant", &self.tenant)
             .field("run", &self.run)
             .field("worker", &self.worker)
@@ -1049,34 +1026,35 @@ impl fmt::Debug for RawWorkerConfig {
 }
 
 impl RawWorkerConfig {
-    fn from_env<E: EnvProvider + ?Sized>(env: &E) -> Self {
-        Self {
-            execution_mode: env.get(ENV_WORKER_MODE),
-            backend: env.get(ENV_WORKER_BACKEND),
-            source: env.get(ENV_WORKER_SOURCE),
-            path: env.get(ENV_WORKER_PATH),
-            rules_file: env.get(ENV_WORKER_RULES_FILE),
-            decode_depth: env.get(ENV_WORKER_DECODE_DEPTH),
-            scan_binary: env.get(ENV_WORKER_SCAN_BINARY),
-            skip_archives: env.get(ENV_FS_SKIP_ARCHIVES),
-            anchor_mode: env.get(ENV_WORKER_ANCHOR_MODE),
-            max_items: env.get(ENV_MAX_ITEMS),
-            max_bytes: env.get(ENV_MAX_BYTES),
-            commit_queue_capacity: env.get(ENV_COMMIT_QUEUE_CAPACITY),
-            etcd_endpoints_csv: env.get(ENV_ETCD_ENDPOINTS),
-            etcd_namespace: env.get(ENV_ETCD_NAMESPACE),
-            done_ledger_postgres_dsn: env.get(ENV_DONE_LEDGER_POSTGRES_DSN),
-            findings_postgres_dsn: env.get(ENV_FINDINGS_POSTGRES_DSN),
-            tenant: env.get(ENV_TENANT_ID),
-            run: env.get(ENV_RUN_ID),
-            worker: env.get(ENV_WORKER_ID),
-            policy_hash: env.get(ENV_POLICY_HASH),
-            tenant_secret_key: env.get(ENV_TENANT_SECRET_KEY),
+    fn from_env<E: EnvProvider + ?Sized>(env: &E) -> Result<Self, WorkerConfigError> {
+        Ok(Self {
+            execution_mode: env.get(ENV_WORKER_MODE)?,
+            backend: env.get(ENV_WORKER_BACKEND)?,
+            source: env.get(ENV_WORKER_SOURCE)?,
+            path: env.get(ENV_WORKER_PATH)?,
+            rules_file: env.get(ENV_WORKER_RULES_FILE)?,
+            decode_depth: env.get(ENV_WORKER_DECODE_DEPTH)?,
+            scan_binary: env.get(ENV_WORKER_SCAN_BINARY)?,
+            skip_archives: env.get(ENV_FS_SKIP_ARCHIVES)?,
+            anchor_mode: env.get(ENV_WORKER_ANCHOR_MODE)?,
+            max_items: env.get(ENV_MAX_ITEMS)?,
+            max_bytes: env.get(ENV_MAX_BYTES)?,
+            commit_queue_capacity: env.get(ENV_COMMIT_QUEUE_CAPACITY)?,
+            etcd_endpoints_csv: env.get(ENV_ETCD_ENDPOINTS)?,
+            etcd_namespace: env.get(ENV_ETCD_NAMESPACE)?,
+            done_ledger_postgres_dsn: env.get(ENV_DONE_LEDGER_POSTGRES_DSN)?,
+            findings_postgres_dsn: env.get(ENV_FINDINGS_POSTGRES_DSN)?,
+            startup_schema_mode: env.get(ENV_STARTUP_SCHEMA_MODE)?,
+            tenant: env.get(ENV_TENANT_ID)?,
+            run: env.get(ENV_RUN_ID)?,
+            worker: env.get(ENV_WORKER_ID)?,
+            policy_hash: env.get(ENV_POLICY_HASH)?,
+            tenant_secret_key: env.get(ENV_TENANT_SECRET_KEY)?,
             cli_tenant_secret_key: false,
             cli_done_ledger_dsn: false,
             cli_findings_dsn: false,
             cli_etcd_endpoints: false,
-        }
+        })
     }
 
     fn apply_cli_args<I, S>(&mut self, args: I) -> Result<(), WorkerConfigError>
@@ -1189,6 +1167,7 @@ impl RawWorkerConfig {
                 self.findings_postgres_dsn = Some(value.to_owned());
                 self.cli_findings_dsn = true;
             }
+            "startup-schema-mode" => self.startup_schema_mode = Some(value.to_owned()),
             "tenant-id" => self.tenant = Some(value.to_owned()),
             "run-id" => self.run = Some(value.to_owned()),
             "worker-id" => self.worker = Some(value.to_owned()),
@@ -1222,8 +1201,14 @@ impl RawWorkerConfig {
             parse_from_str::<WorkerSource>,
         )?
         .unwrap_or(WorkerSource::Fs);
-        let path = parse_optional(self.path.as_deref(), "path", parse_path)?
-            .unwrap_or_else(|| PathBuf::from("."));
+        let path = parse_optional(self.path.as_deref(), "path", parse_path)?.unwrap_or_else(|| {
+            let default = PathBuf::from(".");
+            tracing::warn!(
+                path = %default.display(),
+                "no scan path configured; defaulting to current directory"
+            );
+            default
+        });
         let rules_file = parse_optional(self.rules_file.as_deref(), "rules_file", parse_path)?;
         let decode_depth =
             parse_optional(self.decode_depth.as_deref(), "decode_depth", parse_usize)?;
@@ -1314,7 +1299,11 @@ impl RawWorkerConfig {
                 make_local()
             }
             ExecutionMode::Connector => {
-                let backend = backend.expect("connector mode always defaults a backend");
+                let backend = backend.ok_or(WorkerConfigError::MissingRequiredValue {
+                    field: "backend",
+                    flag: "--backend",
+                    env: ENV_WORKER_BACKEND,
+                })?;
                 match backend {
                     BackendSelection::Local => Err(WorkerConfigError::UnsupportedCombination {
                         message: "connector mode runs the distributed worker loop against the real production backends; switch to --mode=direct for local scans".to_owned(),
@@ -1355,6 +1344,12 @@ impl RawWorkerConfig {
                             "--findings-postgres-dsn",
                             ENV_FINDINGS_POSTGRES_DSN,
                         )?;
+                        let startup_schema_mode = parse_optional(
+                            self.startup_schema_mode.as_deref(),
+                            "startup_schema_mode",
+                            parse_startup_schema_mode,
+                        )?
+                        .unwrap_or_default();
                         let tenant = parse_required(
                             self.tenant.as_deref(),
                             parse_tenant_id,
@@ -1415,6 +1410,7 @@ impl RawWorkerConfig {
                         .unwrap_or(defaults.commit_queue_capacity);
                         let runtime =
                             DistributedWorkerRuntimeSettings::new(budgets, commit_queue_capacity);
+                        let startup = ProductionStartupSettings::new(startup_schema_mode);
                         let identity = WorkerIdentityConfig::new(
                             tenant,
                             run,
@@ -1423,7 +1419,13 @@ impl RawWorkerConfig {
                             tenant_secret_key,
                         )?;
                         Ok(ResolvedWorkerConfig::Distributed(Box::new(
-                            DistributedWorkerConfig::new(backends, identity, source, runtime)?,
+                            DistributedWorkerConfig::new(
+                                backends,
+                                startup,
+                                identity,
+                                source,
+                                runtime,
+                            )?,
                         )))
                     }
                 }
@@ -1454,7 +1456,7 @@ where
     S: Into<String>,
     E: EnvProvider + ?Sized,
 {
-    let mut raw = RawWorkerConfig::from_env(env);
+    let mut raw = RawWorkerConfig::from_env(env)?;
     raw.apply_cli_args(args)?;
     raw.resolve()
 }
@@ -1464,6 +1466,7 @@ fn usage() -> &'static str {
      [--tenant-id=HEX32] [--run-id=U64] [--worker-id=U64] [--policy-hash=HEX32] \\
      [--tenant-secret-key=HEX32] [--etcd-endpoints=CSV] [--etcd-namespace=PREFIX] \\
      [--done-ledger-postgres-dsn=DSN] [--findings-postgres-dsn=DSN] \\
+     [--startup-schema-mode=validate|dev-auto-migrate] \\
      [--rules-file=PATH] [--decode-depth=N] [--scan-binary=true|false] \\
      [--skip-archives=true|false] [--anchor-mode=manual|derived] \\
      [--max-items=N] [--max-bytes=N] [--commit-queue-capacity=N] \\
@@ -1582,6 +1585,21 @@ fn parse_optional<T>(
 fn parse_mode(field: &'static str, raw: &str) -> Result<ExecutionMode, WorkerConfigError> {
     raw.parse::<ExecutionMode>()
         .map_err(|error| WorkerConfigError::invalid_value(field, raw, error.to_string()))
+}
+
+fn parse_startup_schema_mode(
+    field: &'static str,
+    raw: &str,
+) -> Result<StartupSchemaMode, WorkerConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "validate" => Ok(StartupSchemaMode::Validate),
+        "dev-auto-migrate" | "dev_auto_migrate" => Ok(StartupSchemaMode::DevAutoMigrate),
+        _ => Err(WorkerConfigError::invalid_value(
+            field,
+            raw,
+            "expected 'validate' or 'dev-auto-migrate'",
+        )),
+    }
 }
 
 /// Parse a `FromStr` type whose `Err` is `WorkerConfigError`, remapping the
@@ -1810,8 +1828,8 @@ mod tests {
     }
 
     impl EnvProvider for TestEnv {
-        fn get(&self, key: &'static str) -> Option<String> {
-            self.vars.get(key).cloned()
+        fn get(&self, key: &'static str) -> Result<Option<String>, WorkerConfigError> {
+            Ok(self.vars.get(key).cloned())
         }
     }
 
@@ -1881,6 +1899,21 @@ mod tests {
                     cfg.production_backends().etcd().namespace_prefix(),
                     "/gossip/v1"
                 );
+                assert_eq!(cfg.startup(), ProductionStartupSettings::validate_only());
+            }
+            other => panic!("expected distributed config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn production_config_reads_startup_schema_mode_from_env() {
+        let env = production_env().with(ENV_STARTUP_SCHEMA_MODE, "dev-auto-migrate");
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("production env should resolve");
+
+        match resolved {
+            ResolvedWorkerConfig::Distributed(cfg) => {
+                assert_eq!(cfg.startup(), ProductionStartupSettings::dev_auto_migrate());
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
@@ -1896,6 +1929,20 @@ mod tests {
             ResolvedWorkerConfig::Distributed(cfg) => {
                 assert_eq!(cfg.run(), RunId::from_raw(99));
                 assert_eq!(cfg.source().path(), Path::new("/tmp"));
+            }
+            other => panic!("expected distributed config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_overrides_env_for_startup_schema_mode() {
+        let env = production_env().with(ENV_STARTUP_SCHEMA_MODE, "validate");
+        let resolved = resolve_worker_config_from(["--startup-schema-mode=dev-auto-migrate"], &env)
+            .expect("CLI startup-schema-mode override should resolve");
+
+        match resolved {
+            ResolvedWorkerConfig::Distributed(cfg) => {
+                assert_eq!(cfg.startup(), ProductionStartupSettings::dev_auto_migrate());
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
@@ -2090,6 +2137,22 @@ mod tests {
             ExecutionMode::Connector
         );
         assert_eq!(identity.scan_template.budgets, cfg.runtime().budgets());
+    }
+
+    #[test]
+    fn distributed_worker_identity_uses_production_recorder() {
+        let env = production_env();
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("production env should resolve");
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        let identity = cfg.worker_identity();
+        let debug = format!("{:?}", identity.recorder);
+        assert!(
+            debug.contains("ProductionCoordinationEventRecorder"),
+            "default worker_identity() must wire the production recorder: {debug}"
+        );
     }
 
     #[test]
@@ -2324,6 +2387,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_startup_schema_mode_accepts_supported_variants() {
+        assert_eq!(
+            parse_startup_schema_mode("startup_schema_mode", "validate").unwrap(),
+            StartupSchemaMode::Validate
+        );
+        assert_eq!(
+            parse_startup_schema_mode("startup_schema_mode", "DEV-AUTO-MIGRATE").unwrap(),
+            StartupSchemaMode::DevAutoMigrate
+        );
+        assert_eq!(
+            parse_startup_schema_mode("startup_schema_mode", "dev_auto_migrate").unwrap(),
+            StartupSchemaMode::DevAutoMigrate
+        );
+    }
+
+    #[test]
+    fn parse_startup_schema_mode_rejects_unknown() {
+        let err = parse_startup_schema_mode("startup_schema_mode", "auto")
+            .expect_err("unknown startup schema mode must fail");
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "startup_schema_mode",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn parse_source_accepts_both_variants() {
         assert_eq!(
             parse_from_str::<WorkerSource>("source", "fs").unwrap(),
@@ -2435,6 +2527,16 @@ mod tests {
             WorkerConfigError::Usage(ref msg)
                 if msg.contains("source specified both")
         ));
+    }
+
+    #[test]
+    fn local_worker_config_execution_mode_is_always_direct() {
+        let cfg = LocalWorkerConfig::new(
+            WorkerSourceSettings::Fs(FsSourceSettings::new(PathBuf::from("/tmp"))),
+            ScanBudgets::default(),
+        )
+        .expect("default local config should be valid");
+        assert_eq!(cfg.execution_mode(), ExecutionMode::Direct);
     }
 
     #[test]
@@ -3107,6 +3209,7 @@ mod tests {
         let runtime = DistributedWorkerRuntimeSettings::new(ScanBudgets::default(), over_ceiling);
         let result = DistributedWorkerConfig::new(
             backends,
+            ProductionStartupSettings::validate_only(),
             identity,
             FsSourceSettings::new("/tmp"),
             runtime,

@@ -259,6 +259,10 @@ pub(super) struct ArchiveScanCtx<'a, E: ScanEngine> {
     pub(super) chunk_size: usize,
     /// Shared abort flag; set by `FailRun` policy handlers.
     pub(super) abort_run: &'a AtomicBool,
+    /// Discovery-order sequence number of the parent (top-level) file.
+    /// Propagated to `emit_persistence_batch` so the commit forwarder can
+    /// reorder archive-entry batches into discovery order.
+    pub(super) discovery_sequence: u32,
 }
 
 impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
@@ -269,6 +273,7 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
     pub(super) fn new(
         scratch: &'a mut LocalScratch<E>,
         metrics: &'a mut WorkerMetricsLocal,
+        discovery_sequence: u32,
     ) -> Self {
         Self {
             engine: &scratch.engine,
@@ -290,6 +295,7 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
             archive: &scratch.archive,
             chunk_size: scratch.chunk_size,
             abort_run: scratch.abort_run.as_ref(),
+            discovery_sequence,
         }
     }
 
@@ -360,6 +366,7 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
             self.pending,
             self.persist_batch,
             self.metrics,
+            self.discovery_sequence,
         );
         emit_findings(self.engine.as_ref(), self.event_sink, display, self.pending);
 

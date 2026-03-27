@@ -52,13 +52,16 @@ use super::hashing::{
 ///
 /// All variants carry enough context to produce a useful error message
 /// without re-inspecting the original input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IdentityInputError {
     /// Connector tag is empty.
+    #[error("ConnectorTag must not be empty")]
     EmptyTag,
     /// Connector tag exceeds 8 bytes.
+    #[error("ConnectorTag must be at most 8 bytes, got {0}")]
     TagTooLong(usize),
     /// Connector tag contains a non-ASCII-graphic byte at the given index.
+    #[error("ConnectorTag byte at index {index} is not ASCII graphic: 0x{byte:02X}")]
     NonGraphicByte {
         /// Byte index within the tag.
         index: usize,
@@ -66,39 +69,15 @@ pub enum IdentityInputError {
         byte: u8,
     },
     /// Connector instance ID bytes are empty.
+    #[error("connector instance ID bytes must not be empty")]
     EmptyConnectorInstanceId,
     /// Item locator is empty.
+    #[error("ItemIdentityKey locator must not be empty")]
     EmptyLocator,
     /// Version bytes are empty.
+    #[error("version bytes must not be empty")]
     EmptyVersionBytes,
 }
-
-impl fmt::Display for IdentityInputError {
-    /// Formats the error with a human-readable message that includes the
-    /// offending value (e.g., byte index, length) when applicable.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyTag => write!(f, "ConnectorTag must not be empty"),
-            Self::TagTooLong(len) => {
-                write!(f, "ConnectorTag must be at most 8 bytes, got {len}")
-            }
-            Self::NonGraphicByte { index, byte } => {
-                write!(
-                    f,
-                    "ConnectorTag byte at index {index} is not ASCII graphic: 0x{byte:02X}"
-                )
-            }
-            Self::EmptyConnectorInstanceId => {
-                write!(f, "connector instance ID bytes must not be empty")
-            }
-            Self::EmptyLocator => write!(f, "ItemIdentityKey locator must not be empty"),
-            Self::EmptyVersionBytes => write!(f, "version bytes must not be empty"),
-        }
-    }
-}
-
-/// All variants are self-describing leaf errors with no inner `source`.
-impl std::error::Error for IdentityInputError {}
 
 // ---------------------------------------------------------------------------
 // ConnectorTag — source discriminator

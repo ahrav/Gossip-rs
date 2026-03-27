@@ -130,15 +130,21 @@ jobs:
             shared-key: stable-linux
             timeout: 15
             label: x86_64
+            extra-excludes: ""
           - os: macos-15
             shared-key: stable-macos
             timeout: 30
             label: aarch64
+            # gossip-worker tests need Docker (testcontainers) which is
+            # unavailable on macOS runners. Those tests run on x86_64/ubuntu
+            # and in the dedicated postgres/etcd CI jobs.
+            extra-excludes: "--exclude gossip-worker"
     env:
       PROPTEST_CASES: "4"
       STRESS_ITERATIONS: "20"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -146,7 +152,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        uses: taiki-e/install-action@06203676c62f0d3c765be3f2fcfbebbcb02d09f5 # v2.69.6
         with:
           tool: cargo-nextest
 
@@ -158,6 +164,7 @@ jobs:
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
           --exclude gossip-coordination-etcd
+          ${{ matrix.extra-excludes }}
           --no-run
           --profile ci
 
@@ -169,6 +176,7 @@ jobs:
           --exclude gossip-findings-postgres
           --exclude gossip-done-ledger-postgres
           --exclude gossip-coordination-etcd
+          ${{ matrix.extra-excludes }}
           --profile ci
 
       # nextest does not run doctests; run them separately.
@@ -213,7 +221,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        uses: taiki-e/install-action@06203676c62f0d3c765be3f2fcfbebbcb02d09f5 # v2.69.6
         with:
           tool: cargo-nextest
 
@@ -293,7 +301,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        uses: taiki-e/install-action@06203676c62f0d3c765be3f2fcfbebbcb02d09f5 # v2.69.6
         with:
           tool: cargo-nextest
 
@@ -429,7 +437,7 @@ jobs:
         working-directory: tools/eval-harness
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        uses: taiki-e/install-action@06203676c62f0d3c765be3f2fcfbebbcb02d09f5 # v2.69.6
         with:
           tool: cargo-nextest
 
@@ -550,7 +558,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@d6e286fa45544157a02d45a43742857ebbc25d12 # v2.68.16
+        uses: taiki-e/install-action@06203676c62f0d3c765be3f2fcfbebbcb02d09f5 # v2.69.6
         with:
           tool: cargo-nextest
 

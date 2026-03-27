@@ -433,94 +433,62 @@ impl Default for EtcdCoordinatorConfig {
 /// Each variant pinpoints a single invalid parameter, with positional
 /// indexes for multi-valued fields (endpoints). All checks run eagerly
 /// at construction time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum EtcdCoordinatorConfigError {
     /// No endpoints were provided (the list is empty after filtering).
+    #[error("at least one etcd endpoint is required")]
     NoEndpoints,
     /// The endpoint at `index` resolved to an empty string after trimming.
+    #[error("etcd endpoint at index {index} must not be empty")]
     EmptyEndpoint { index: usize },
     /// The endpoint at `index` does not use `http://` or `https://`.
+    #[error("etcd endpoint at index {index} has invalid scheme (expected http:// or https://)")]
     InvalidEndpointScheme { index: usize },
     /// The namespace prefix is empty after trimming.
+    #[error("namespace_prefix must not be empty")]
     EmptyNamespacePrefix,
     /// The namespace prefix must start with `/` to form absolute etcd paths.
+    #[error("namespace_prefix must start with '/'")]
     NamespacePrefixMustStartWithSlash,
     /// The namespace prefix must not end with `/` (unless it is exactly `"/"`).
+    #[error("namespace_prefix must not end with '/' unless it is exactly '/'")]
     NamespacePrefixMustNotEndWithSlash,
     /// The namespace prefix contains consecutive slashes (`//`), which
     /// would create invisible empty path segments.
+    #[error("namespace_prefix must not contain consecutive slashes '//'")]
     NamespacePrefixContainsDoubleSlash,
     /// `owner_lease_ttl_secs` must be positive (> 0).
+    #[error("owner_lease_ttl_secs must be > 0")]
     NonPositiveOwnerLeaseTtl,
     /// `optimistic_txn_retries` must be at least 1.
+    #[error("optimistic_txn_retries must be > 0")]
     ZeroOptimisticTxnRetries,
     /// `optimistic_txn_retries` exceeds the safety ceiling. High retry
     /// counts cause CAS operations to block for minutes under contention.
+    #[error("optimistic_txn_retries ({requested}) exceeds maximum ({max})")]
     ExcessiveOptimisticTxnRetries { requested: usize, max: usize },
     /// `max_shards_per_tenant` must be at least 1.
+    #[error("max_shards_per_tenant must be > 0")]
     ZeroMaxShardsPerTenant,
     /// `max_total_shards` must be at least 1.
+    #[error("max_total_shards must be > 0")]
     ZeroMaxTotalShards,
     /// `max_children_per_op` must be at least 1.
+    #[error("max_children_per_op must be > 0")]
     ZeroMaxChildrenPerOp,
     /// `max_children_per_op` would produce a `split_replace` transaction
     /// exceeding etcd's default `--max-txn-ops` limit of 128.
     ///
     /// Each child adds 3 transaction entries (1 compare + 2 ops) to a
     /// fixed overhead of 9, so the ceiling is `(128 - 9) / 3 = 39`.
+    #[error(
+        "max_children_per_op ({requested}) exceeds etcd split-transaction budget ({max}); \
+         each child adds 3 txn entries to a fixed overhead of 9, \
+         capped at 128 total (etcd default --max-txn-ops)"
+    )]
     MaxChildrenPerOpExceedsEtcdTxnBudget { requested: usize, max: usize },
     /// `max_children_per_op` cannot exceed the global split limit.
+    #[error("max_children_per_op ({requested}) exceeds global MAX_SPLIT_CHILDREN ({global_max})")]
     MaxChildrenPerOpExceedsGlobalLimit { requested: usize, global_max: usize },
 }
-
-impl fmt::Display for EtcdCoordinatorConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoEndpoints => f.write_str("at least one etcd endpoint is required"),
-            Self::EmptyEndpoint { index } => {
-                write!(f, "etcd endpoint at index {index} must not be empty")
-            }
-            Self::InvalidEndpointScheme { index } => {
-                write!(
-                    f,
-                    "etcd endpoint at index {index} has invalid scheme (expected http:// or https://)"
-                )
-            }
-            Self::EmptyNamespacePrefix => f.write_str("namespace_prefix must not be empty"),
-            Self::NamespacePrefixMustStartWithSlash => {
-                f.write_str("namespace_prefix must start with '/'")
-            }
-            Self::NamespacePrefixMustNotEndWithSlash => {
-                f.write_str("namespace_prefix must not end with '/' unless it is exactly '/'")
-            }
-            Self::NamespacePrefixContainsDoubleSlash => {
-                f.write_str("namespace_prefix must not contain consecutive slashes '//'")
-            }
-            Self::NonPositiveOwnerLeaseTtl => f.write_str("owner_lease_ttl_secs must be > 0"),
-            Self::ZeroOptimisticTxnRetries => f.write_str("optimistic_txn_retries must be > 0"),
-            Self::ExcessiveOptimisticTxnRetries { requested, max } => write!(
-                f,
-                "optimistic_txn_retries ({requested}) exceeds maximum ({max})",
-            ),
-            Self::ZeroMaxShardsPerTenant => f.write_str("max_shards_per_tenant must be > 0"),
-            Self::ZeroMaxTotalShards => f.write_str("max_total_shards must be > 0"),
-            Self::ZeroMaxChildrenPerOp => f.write_str("max_children_per_op must be > 0"),
-            Self::MaxChildrenPerOpExceedsEtcdTxnBudget { requested, max } => write!(
-                f,
-                "max_children_per_op ({requested}) exceeds etcd split-transaction budget ({max}); \
-                 each child adds 3 txn entries to a fixed overhead of 9, \
-                 capped at 128 total (etcd default --max-txn-ops)",
-            ),
-            Self::MaxChildrenPerOpExceedsGlobalLimit {
-                requested,
-                global_max,
-            } => write!(
-                f,
-                "max_children_per_op ({requested}) exceeds global MAX_SPLIT_CHILDREN ({global_max})",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EtcdCoordinatorConfigError {}

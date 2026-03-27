@@ -44,3 +44,9 @@ specs/tla2tools.jar
 **/fuzz/artifacts/
 .bench/
 .osgrep
+
+.env
+
+runbooks/
+run-runbook.sh
+runbook-params.json

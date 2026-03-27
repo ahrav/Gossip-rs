@@ -68,104 +68,41 @@ impl PackIoLimits {
 }
 
 /// Errors from pack I/O.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PackIoError {
     /// MIDX bytes are missing.
+    #[error("midx bytes missing")]
     MissingMidx,
     /// MIDX parsing or lookup failed.
-    Midx(MidxError),
+    #[error("{0}")]
+    Midx(#[from] MidxError),
     /// Pack file I/O failed.
-    Io(io::Error),
+    #[error("pack I/O error: {0}")]
+    Io(#[from] io::Error),
     /// Pack header parsing failed.
-    PackParse(PackParseError),
+    #[error("{0}")]
+    PackParse(#[from] PackParseError),
     /// Entry decode failed.
-    Decode(PackDecodeError),
+    #[error("{0}")]
+    Decode(#[from] PackDecodeError),
     /// Delta application failed.
-    Delta(DeltaError),
+    #[error("{0}")]
+    Delta(#[from] DeltaError),
     /// Pack ID does not exist in the pack list.
+    #[error("pack id {pack_id} out of range (pack count {pack_count})")]
     PackIdOutOfRange { pack_id: u16, pack_count: usize },
     /// Pack list length does not match the MIDX pack count.
+    #[error("pack count mismatch: midx expects {expected}, provided {actual}")]
     PackCountMismatch { expected: usize, actual: usize },
     /// Delta chain exceeded the configured depth.
+    #[error("delta depth exceeded (max {max_depth})")]
     DeltaDepthExceeded { max_depth: u8 },
     /// OID length does not match the configured MIDX format.
+    #[error("OID length mismatch: got {got}, expected {expected}")]
     OidLengthMismatch { got: u8, expected: u8 },
     /// Loose object load failed.
+    #[error("loose object error: {detail}")]
     LooseObject { detail: String },
-}
-
-impl std::fmt::Display for PackIoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingMidx => write!(f, "midx bytes missing"),
-            Self::Midx(err) => write!(f, "{err}"),
-            Self::Io(err) => write!(f, "pack I/O error: {err}"),
-            Self::PackParse(err) => write!(f, "{err}"),
-            Self::Decode(err) => write!(f, "{err}"),
-            Self::Delta(err) => write!(f, "{err}"),
-            Self::PackIdOutOfRange {
-                pack_id,
-                pack_count,
-            } => write!(
-                f,
-                "pack id {pack_id} out of range (pack count {pack_count})"
-            ),
-            Self::PackCountMismatch { expected, actual } => write!(
-                f,
-                "pack count mismatch: midx expects {expected}, provided {actual}"
-            ),
-            Self::DeltaDepthExceeded { max_depth } => {
-                write!(f, "delta depth exceeded (max {max_depth})")
-            }
-            Self::OidLengthMismatch { got, expected } => {
-                write!(f, "OID length mismatch: got {got}, expected {expected}")
-            }
-            Self::LooseObject { detail } => write!(f, "loose object error: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for PackIoError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Midx(err) => Some(err),
-            Self::Io(err) => Some(err),
-            Self::PackParse(err) => Some(err),
-            Self::Decode(err) => Some(err),
-            Self::Delta(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<MidxError> for PackIoError {
-    fn from(err: MidxError) -> Self {
-        Self::Midx(err)
-    }
-}
-
-impl From<io::Error> for PackIoError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<PackParseError> for PackIoError {
-    fn from(err: PackParseError) -> Self {
-        Self::PackParse(err)
-    }
-}
-
-impl From<PackDecodeError> for PackIoError {
-    fn from(err: PackDecodeError) -> Self {
-        Self::Decode(err)
-    }
-}
-
-impl From<DeltaError> for PackIoError {
-    fn from(err: DeltaError) -> Self {
-        Self::Delta(err)
-    }
 }
 
 /// Pack I/O helper for external base resolution.

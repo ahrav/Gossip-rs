@@ -19,15 +19,19 @@ gossip-done-ledger-postgres.workspace = true
 gossip-findings-postgres.workspace = true
 gossip-scanner-runtime.workspace = true
 postgres.workspace = true
+thiserror = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 gossip-coordination.workspace = true
+gossip-stdx.workspace = true
 gossip-coordination-etcd = { workspace = true, features = ["test-support"] }
 gossip-frontier.workspace = true
+gossip-orchestrator.workspace = true
 gossip-persistence-inmemory.workspace = true
 gossip-pg-common = { workspace = true, features = ["test-support"] }
 gossip-scanner-runtime = { workspace = true, features = ["test-support"] }
 scanner-scheduler.workspace = true
 tempfile = "3"
+wait-timeout = "0.2"

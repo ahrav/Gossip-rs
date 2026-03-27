@@ -48,64 +48,37 @@ use super::pack_idx::{IdxError, IdxView};
 use super::repo::GitRepoPaths;
 
 /// Errors from MIDX building.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MidxBuildError {
     /// I/O error during pack enumeration or file operations.
-    Io(io::Error),
+    #[error("MIDX build I/O error: {0}")]
+    Io(#[from] io::Error),
     /// No pack files found.
+    #[error("no pack files found")]
     NoPacksFound,
     /// Too many pack files.
+    #[error("too many packs: {count} (max: {max})")]
     TooManyPacks { count: usize, max: usize },
     /// MIDX would exceed size limit.
+    #[error("MIDX too large: {size} bytes (limit: {limit})")]
     ArtifactsTooLarge { size: u64, limit: u64 },
     /// Pack index parsing failed.
-    IdxParseFailed { path: PathBuf, source: IdxError },
+    #[error("failed to parse {}: {source}", path.display())]
+    IdxParseFailed {
+        path: PathBuf,
+        #[source]
+        source: IdxError,
+    },
     /// Generated MIDX failed validation.
-    ValidationFailed { source: MidxError },
+    #[error("MIDX validation failed: {source}")]
+    ValidationFailed {
+        #[source]
+        source: MidxError,
+    },
     /// Too many objects across all packs.
+    #[error("too many objects: {count} (max: {max})")]
     TooManyObjects { count: u64, max: u64 },
-}
-
-impl std::fmt::Display for MidxBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "MIDX build I/O error: {err}"),
-            Self::NoPacksFound => write!(f, "no pack files found"),
-            Self::TooManyPacks { count, max } => {
-                write!(f, "too many packs: {count} (max: {max})")
-            }
-            Self::ArtifactsTooLarge { size, limit } => {
-                write!(f, "MIDX too large: {size} bytes (limit: {limit})")
-            }
-            Self::IdxParseFailed { path, source } => {
-                write!(f, "failed to parse {}: {source}", path.display())
-            }
-            Self::ValidationFailed { source } => {
-                write!(f, "MIDX validation failed: {source}")
-            }
-            Self::TooManyObjects { count, max } => {
-                write!(f, "too many objects: {count} (max: {max})")
-            }
-        }
-    }
-}
-
-impl std::error::Error for MidxBuildError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            Self::IdxParseFailed { source, .. } => Some(source),
-            Self::ValidationFailed { source } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for MidxBuildError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
 }
 
 /// Limits for MIDX building.

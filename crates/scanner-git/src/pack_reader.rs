@@ -4,36 +4,21 @@
 //! short reads, interruptions, and corruption without relying on OS I/O.
 //! Implementations should be deterministic for identical inputs.
 
-use std::fmt;
-
 use super::bytes::BytesView;
 
 /// Errors produced by pack readers.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PackReadError {
     /// The requested read exceeded the available range.
+    #[error("read out of range at {offset} (len {len})")]
     OutOfRange { offset: u64, len: usize },
     /// The reader returned fewer bytes than requested.
+    #[error("short read: expected {expected}, got {got}")]
     ShortRead { expected: usize, got: usize },
     /// Reader-specific I/O error.
+    #[error("pack read error: {0}")]
     Io(String),
 }
-
-impl fmt::Display for PackReadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OutOfRange { offset, len } => {
-                write!(f, "read out of range at {offset} (len {len})")
-            }
-            Self::ShortRead { expected, got } => {
-                write!(f, "short read: expected {expected}, got {got}")
-            }
-            Self::Io(msg) => write!(f, "pack read error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for PackReadError {}
 
 /// Read-only pack reader interface.
 pub trait PackReader {

@@ -49,8 +49,6 @@
 //! slab allocation fails mid-loop in either split helper, previously appended
 //! children remain staged while later children are lost.
 
-use core::fmt;
-
 use gossip_stdx::{InlineVec, SlabFull};
 
 use crate::hint::{
@@ -73,92 +71,51 @@ struct BuilderEntry<'a> {
 }
 
 /// Error for [`PreallocShardBuilder`] construction and add/build operations.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PreallocShardBuilderError {
     // -- Configuration (returned from `new`) --
     /// `entry_limit` was zero.
+    #[error("entry_limit must be > 0")]
     EntryLimitZero,
     /// `entry_limit` exceeded const generic `CAP`.
+    #[error("entry_limit ({entry_limit}) exceeds builder CAP ({cap})")]
     CapMismatch { entry_limit: usize, cap: usize },
     /// `entry_limit` exceeded [`MAX_INITIAL_SHARDS`].
+    #[error("entry_limit ({entry_limit}) exceeds MAX_INITIAL_SHARDS ({max})")]
     EntryLimitExceedsManifestMax { entry_limit: usize, max: usize },
 
     // -- Add/build --
     /// Requested append would exceed configured entry budget.
+    #[error("entry capacity exceeded: {current} existing + {additional} new > {limit} limit")]
     CapacityExceeded {
         limit: usize,
         current: usize,
         additional: usize,
     },
     /// Bulk split fan-out exceeds [`MAX_SPLIT_CHILDREN`].
+    #[error("split fan-out exceeded: {requested} children requested > {limit} limit")]
     FanOutExceeded { limit: usize, requested: usize },
     /// Arena handle table or byte slab could not allocate another spec.
-    SlabFull(SlabFull),
+    #[error("{0}")]
+    SlabFull(#[source] SlabFull),
     /// Range constructor rejected bounds or metadata sizing.
-    RangeInvalid(ShardSpecInputError),
+    #[error("{0}")]
+    RangeInvalid(#[source] ShardSpecInputError),
     /// Prefix constructor rejected prefix semantics or derived range.
-    PrefixInvalid(PrefixShardError),
+    #[error("{0}")]
+    PrefixInvalid(#[source] PrefixShardError),
     /// Manifest constructor rejected row bounds or metadata sizing.
-    ManifestCtorInvalid(ShardSpecInputError),
+    #[error("{0}")]
+    ManifestCtorInvalid(#[source] ShardSpecInputError),
     /// Borrowed spec input failed [`ShardSpec`] validation.
-    SpecInvalid(ShardSpecInputError),
+    #[error("{0}")]
+    SpecInvalid(#[source] ShardSpecInputError),
     /// Handle was stale, foreign, or otherwise not live in this arena.
+    #[error("invalid, stale, or foreign shard-spec handle")]
     InvalidSpecHandle,
     /// Staged entries failed manifest-level checks at build time.
-    ManifestInvalid(ManifestValidationError),
-}
-
-impl fmt::Display for PreallocShardBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EntryLimitZero => write!(f, "entry_limit must be > 0"),
-            Self::CapMismatch { entry_limit, cap } => {
-                write!(f, "entry_limit ({entry_limit}) exceeds builder CAP ({cap})")
-            }
-            Self::EntryLimitExceedsManifestMax { entry_limit, max } => write!(
-                f,
-                "entry_limit ({entry_limit}) exceeds MAX_INITIAL_SHARDS ({max})"
-            ),
-            Self::CapacityExceeded {
-                limit,
-                current,
-                additional,
-            } => write!(
-                f,
-                "entry capacity exceeded: {current} existing + {additional} new > {limit} limit"
-            ),
-            Self::FanOutExceeded { limit, requested } => write!(
-                f,
-                "split fan-out exceeded: {requested} children requested > {limit} limit"
-            ),
-            Self::SlabFull(err) => write!(f, "{err}"),
-            Self::RangeInvalid(err) => write!(f, "{err}"),
-            Self::PrefixInvalid(err) => write!(f, "{err}"),
-            Self::ManifestCtorInvalid(err) => write!(f, "{err}"),
-            Self::SpecInvalid(err) => write!(f, "{err}"),
-            Self::InvalidSpecHandle => write!(f, "invalid, stale, or foreign shard-spec handle"),
-            Self::ManifestInvalid(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for PreallocShardBuilderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SlabFull(err) => Some(err),
-            Self::RangeInvalid(err) => Some(err),
-            Self::PrefixInvalid(err) => Some(err),
-            Self::ManifestCtorInvalid(err) => Some(err),
-            Self::SpecInvalid(err) => Some(err),
-            Self::ManifestInvalid(err) => Some(err),
-            Self::EntryLimitZero
-            | Self::CapMismatch { .. }
-            | Self::EntryLimitExceedsManifestMax { .. }
-            | Self::CapacityExceeded { .. }
-            | Self::FanOutExceeded { .. }
-            | Self::InvalidSpecHandle => None,
-        }
-    }
+    #[error("{0}")]
+    ManifestInvalid(#[source] ManifestValidationError),
 }
 
 /// Startup-preallocated shard builder backed by a borrowed arena.

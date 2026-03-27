@@ -7,7 +7,7 @@
 //! configure, DDL, advisory lock, etc.). Backend operation failures are
 //! exposed through [`DoneLedgerPgError`].
 
-use std::{error::Error, fmt};
+use std::fmt;
 
 use gossip_contracts::persistence::PersistenceInputError;
 pub use gossip_pg_common::migration::{
@@ -23,53 +23,20 @@ use crate::types::{PgByteDecodeError, PgU64ConversionError};
 /// Most variants pinpoint the column and the nature of the mismatch so
 /// that data-corruption or schema-drift issues can be diagnosed without
 /// inspecting raw SQL results.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DoneLedgerPgConversionError {
     /// Numeric `u64`/`BIGINT` conversion failed.
-    U64Conversion(PgU64ConversionError),
+    #[error("{0}")]
+    U64Conversion(#[from] PgU64ConversionError),
     /// BYTEA column decode: unexpected byte length.
-    ByteDecode(PgByteDecodeError),
+    #[error("{0}")]
+    ByteDecode(#[from] PgByteDecodeError),
     /// A persisted status rank did not map to a known `DoneLedgerStatus`.
+    #[error("stored unknown done-ledger status rank {rank}")]
     UnknownStatusRank { rank: i16 },
     /// A persisted `findings_count` value did not fit in `u32`.
+    #[error("stored findings_count {value} does not fit in u32")]
     FindingsCountOutOfRange { value: i64 },
-}
-
-impl fmt::Display for DoneLedgerPgConversionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::U64Conversion(source) => write!(f, "{source}"),
-            Self::ByteDecode(source) => write!(f, "{source}"),
-            Self::UnknownStatusRank { rank } => {
-                write!(f, "stored unknown done-ledger status rank {rank}")
-            }
-            Self::FindingsCountOutOfRange { value } => {
-                write!(f, "stored findings_count {value} does not fit in u32")
-            }
-        }
-    }
-}
-
-impl Error for DoneLedgerPgConversionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::U64Conversion(source) => Some(source),
-            Self::ByteDecode(source) => Some(source),
-            Self::UnknownStatusRank { .. } | Self::FindingsCountOutOfRange { .. } => None,
-        }
-    }
-}
-
-impl From<PgU64ConversionError> for DoneLedgerPgConversionError {
-    fn from(value: PgU64ConversionError) -> Self {
-        Self::U64Conversion(value)
-    }
-}
-
-impl From<PgByteDecodeError> for DoneLedgerPgConversionError {
-    fn from(value: PgByteDecodeError) -> Self {
-        Self::ByteDecode(value)
-    }
 }
 
 /// Unified backend error for the PostgreSQL done-ledger implementation.
@@ -90,12 +57,12 @@ impl From<PgByteDecodeError> for DoneLedgerPgConversionError {
 ///   [`PersistedRecordInvalid`](Self::PersistedRecordInvalid)).
 ///
 /// [`DoneLedgerPg`]: crate::DoneLedgerPg
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DoneLedgerPgError {
     /// PostgreSQL client failure.
-    Postgres(postgres::Error),
+    Postgres(#[from] postgres::Error),
     /// Embedded migration application failed.
-    Migration(DoneLedgerPgMigrationError),
+    Migration(#[from] DoneLedgerPgMigrationError),
     /// Internal client mutex was poisoned by a panic.
     MutexPoisoned,
     /// Input batch exceeded the supported maximum.
@@ -107,10 +74,14 @@ pub enum DoneLedgerPgError {
     /// Input record failed validation before SQL mutation.
     InvalidRecord {
         index: usize,
+        #[source]
         source: PersistenceInputError,
     },
     /// Duplicate-key merge produced an invalid record shape.
-    InvalidMergedRecord { source: PersistenceInputError },
+    InvalidMergedRecord {
+        #[source]
+        source: PersistenceInputError,
+    },
     /// Rust ↔ SQL conversion failed.
     ///
     /// When this occurs during batch encoding (write path), `record_index`
@@ -118,6 +89,7 @@ pub enum DoneLedgerPgError {
     /// decode (read path), `record_index` is `None`.
     Conversion {
         record_index: Option<usize>,
+        #[source]
         source: DoneLedgerPgConversionError,
     },
     /// Provenance timestamps violate the `finished_at >= started_at` ordering
@@ -130,6 +102,7 @@ pub enum DoneLedgerPgError {
     /// Persisted row failed decode-time contract validation.
     PersistedRecordInvalid {
         context: &'static str,
+        #[source]
         source: PersistenceInputError,
     },
 }
@@ -203,34 +176,6 @@ impl fmt::Display for DoneLedgerPgError {
     }
 }
 
-impl Error for DoneLedgerPgError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Postgres(source) => Some(source),
-            Self::Migration(source) => Some(source),
-            Self::MutexPoisoned | Self::BatchTooLarge { .. } | Self::ProvenanceInvalid { .. } => {
-                None
-            }
-            Self::InvalidRecord { source, .. }
-            | Self::InvalidMergedRecord { source }
-            | Self::PersistedRecordInvalid { source, .. } => Some(source),
-            Self::Conversion { source, .. } => Some(source),
-        }
-    }
-}
-
-impl From<postgres::Error> for DoneLedgerPgError {
-    fn from(value: postgres::Error) -> Self {
-        Self::Postgres(value)
-    }
-}
-
-impl From<DoneLedgerPgMigrationError> for DoneLedgerPgError {
-    fn from(value: DoneLedgerPgMigrationError) -> Self {
-        Self::Migration(value)
-    }
-}
-
 impl From<DoneLedgerPgConversionError> for DoneLedgerPgError {
     fn from(value: DoneLedgerPgConversionError) -> Self {
         Self::Conversion {
@@ -251,6 +196,8 @@ impl From<PgByteDecodeError> for DoneLedgerPgError {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
 
     #[test]

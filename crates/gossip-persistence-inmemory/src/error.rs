@@ -11,7 +11,7 @@
 //! - [`PendingWriteId`] — opaque handle referencing a specific pending write
 //!   operation.
 
-use std::{error::Error, fmt};
+use std::fmt;
 
 use gossip_contracts::{
     identity::{FindingId, ObservationId, OccurrenceId, TenantId},
@@ -99,24 +99,28 @@ impl fmt::Display for PendingWriteId {
 ///   [`ObservationConflict`](Self::ObservationConflict),
 ///   [`BatchValidation`](Self::BatchValidation)) — referential integrity or
 ///   immutability violations caught during apply.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InMemoryPersistenceError {
     /// The request was rejected before a handle was created.
+    #[error("in-memory {store} submission failed via fault injection")]
     InjectedSubmissionFailure {
         /// Store that rejected the submission.
         store: InMemoryStoreKind,
     },
     /// The request was accepted, but the durable commit failed.
+    #[error("in-memory {store} commit failed via fault injection")]
     InjectedCommitFailure {
         /// Store whose commit failed.
         store: InMemoryStoreKind,
     },
     /// The backend's mutex or condvar became poisoned.
+    #[error("in-memory {store} state lock poisoned")]
     Poisoned {
         /// Store whose internal state was poisoned.
         store: InMemoryStoreKind,
     },
     /// A commit handle waited on an operation that no longer exists.
+    #[error("unknown in-memory {store} operation {op_id}")]
     UnknownOperation {
         /// Store that issued the handle.
         store: InMemoryStoreKind,
@@ -125,6 +129,9 @@ pub enum InMemoryPersistenceError {
     },
     /// An occurrence referenced a finding that was neither durable nor present
     /// in the same batch.
+    #[error(
+        "occurrence {occurrence_id:?} for tenant {tenant_id:?} references missing finding {finding_id:?}"
+    )]
     MissingFinding {
         tenant_id: TenantId,
         finding_id: FindingId,
@@ -132,6 +139,9 @@ pub enum InMemoryPersistenceError {
     },
     /// An observation referenced an occurrence that was neither durable nor
     /// present in the same batch.
+    #[error(
+        "observation {observation_id:?} for tenant {tenant_id:?} references missing occurrence {occurrence_id:?}"
+    )]
     MissingOccurrence {
         tenant_id: TenantId,
         occurrence_id: OccurrenceId,
@@ -139,93 +149,26 @@ pub enum InMemoryPersistenceError {
     },
     /// Two finding rows shared the same `(tenant_id, finding_id)` but had
     /// different immutable content.
+    #[error("finding conflict for tenant {tenant_id:?}, finding {finding_id:?}")]
     FindingConflict {
         tenant_id: TenantId,
         finding_id: FindingId,
     },
     /// Two occurrence rows shared the same `(tenant_id, occurrence_id)` but had
     /// different immutable content.
+    #[error("occurrence conflict for tenant {tenant_id:?}, occurrence {occurrence_id:?}")]
     OccurrenceConflict {
         tenant_id: TenantId,
         occurrence_id: OccurrenceId,
     },
     /// Two observation rows shared the same `(tenant_id, observation_id)` but
     /// disagreed on immutable identity fields.
+    #[error("observation conflict for tenant {tenant_id:?}, observation {observation_id:?}")]
     ObservationConflict {
         tenant_id: TenantId,
         observation_id: ObservationId,
     },
     /// Local validation failed before submission.
-    BatchValidation(PersistenceInputError),
-}
-
-impl fmt::Display for InMemoryPersistenceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InjectedSubmissionFailure { store } => {
-                write!(f, "in-memory {store} submission failed via fault injection")
-            }
-            Self::InjectedCommitFailure { store } => {
-                write!(f, "in-memory {store} commit failed via fault injection")
-            }
-            Self::Poisoned { store } => write!(f, "in-memory {store} state lock poisoned"),
-            Self::UnknownOperation { store, op_id } => {
-                write!(f, "unknown in-memory {store} operation {op_id}")
-            }
-            Self::MissingFinding {
-                tenant_id,
-                finding_id,
-                occurrence_id,
-            } => write!(
-                f,
-                "occurrence {occurrence_id:?} for tenant {tenant_id:?} references missing finding {finding_id:?}"
-            ),
-            Self::MissingOccurrence {
-                tenant_id,
-                occurrence_id,
-                observation_id,
-            } => write!(
-                f,
-                "observation {observation_id:?} for tenant {tenant_id:?} references missing occurrence {occurrence_id:?}"
-            ),
-            Self::FindingConflict {
-                tenant_id,
-                finding_id,
-            } => write!(
-                f,
-                "finding conflict for tenant {tenant_id:?}, finding {finding_id:?}"
-            ),
-            Self::OccurrenceConflict {
-                tenant_id,
-                occurrence_id,
-            } => write!(
-                f,
-                "occurrence conflict for tenant {tenant_id:?}, occurrence {occurrence_id:?}"
-            ),
-            Self::ObservationConflict {
-                tenant_id,
-                observation_id,
-            } => write!(
-                f,
-                "observation conflict for tenant {tenant_id:?}, observation {observation_id:?}"
-            ),
-            Self::BatchValidation(err) => err.fmt(f),
-        }
-    }
-}
-
-impl Error for InMemoryPersistenceError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::BatchValidation(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<PersistenceInputError> for InMemoryPersistenceError {
-    #[inline]
-    fn from(value: PersistenceInputError) -> Self {
-        Self::BatchValidation(value)
-    }
+    #[error("{0}")]
+    BatchValidation(#[from] PersistenceInputError),
 }

@@ -62,8 +62,6 @@
 //! Both channels are bounded. A capacity of `0` is allowed and means rendezvous
 //! semantics: the sender and receiver must meet for every item.
 
-use std::error::Error;
-use std::fmt;
 use std::sync::mpsc::{
     Receiver, RecvError, RecvTimeoutError, SendError, SyncSender, TryRecvError, sync_channel,
 };
@@ -184,24 +182,15 @@ impl<FindingsError, DoneLedgerError> CommitStageOutput<FindingsError, DoneLedger
 }
 
 /// Errors from attempting to submit work to the commit pipeline.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
     /// The pipeline has been cancelled before the work entered the queue.
+    #[error("commit pipeline cancelled")]
     Cancelled(Box<QueuedCommit>),
     /// The commit worker has exited, so the queue is disconnected.
+    #[error("commit pipeline worker disconnected")]
     Disconnected(Box<QueuedCommit>),
 }
-
-impl fmt::Display for SubmitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cancelled(_) => write!(f, "commit pipeline cancelled"),
-            Self::Disconnected(_) => write!(f, "commit pipeline worker disconnected"),
-        }
-    }
-}
-
-impl Error for SubmitError {}
 
 impl SubmitError {
     /// Recover the work item that failed to enter the queue.

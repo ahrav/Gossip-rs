@@ -32,17 +32,45 @@ cycles.
 ```text
 fill_page(shard, cursor, budgets)
   -> Result<Option<PageBuf<ScanItem>>, EnumerateError>
-     Ok(None)          => terminal completion (shard fully enumerated)
+     Ok(None)          => exhausted-empty terminal signal
      Ok(Some(PageBuf)) => { items, state: HasMore{cursor} | Complete }
+                          Complete pages are terminal non-empty pages; the
+                          runtime performs one exhausted-empty suffix call
+                          before treating the shard as fully enumerated.
      for each item:
         open(item_ref, budgets) -> Result<Box<dyn io::Read + Send>, ReadError>
         (optionally) read_range(item_ref, offset, dst, budgets) -> Result<usize, ReadError>
      checkpoint cursor
 ```
 
-**Concrete connectors** (inherent methods, not direct trait impls):
-`FilesystemConnector`, `GitConnector` (git-tracked files via `ls-files`),
-`InMemoryDeterministicConnector` — all in `gossip-connectors/src/`.
+**Concrete connectors:**
+`FilesystemConnector` directly implements `OrderedContentSource` and keeps
+matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
+`GitConnector` (git-tracked files via `ls-files`) and
+`InMemoryDeterministicConnector` expose the same read/split surface as
+inherent methods in `gossip-connectors/src/`.
+
+**Submission staging (filesystem-specific):**
+
+`gossip-orchestrator` stages filesystem submissions before runtime execution:
+- `request.rs` canonicalizes raw paths, validates them against the requested
+  source mode (single file vs. directory root), and enforces path/mode
+  consistency. For untrusted input, `normalize_within(allowed_root)` also
+  verifies that the canonical path resides within a server-configured root
+  directory, rejecting symlink escapes and traversal attempts. Produces
+  `NormalizedFilesystemRequest`.
+- `planner.rs` maps normalized requests into the deterministic one-shard
+  startup geometry consumed by later payload and registration stages.
+- `payload.rs` encodes the typed filesystem shard metadata that coordination
+  stores in `connector_extra` and the runtime later decodes during lease
+  hydration.
+- `setup.rs` lowers the normalized request, planned geometry, and typed
+  payload into a validated initial manifest, then executes the
+  `create_run_with_shards` lifecycle that makes the startup shard set
+  claimable.
+
+These stages are optional for other ordered-content sources (e.g., git
+ls-files connectors) but required for filesystem security and determinism.
 
 ### Git Repo-Native
 
@@ -106,6 +134,12 @@ and `types.rs`.
 | `crates/gossip-connectors/src/git.rs` | Git `ls-files` ordered-content connector |
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
+| `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
+| `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem request normalization, planning, and run setup |
+| `crates/gossip-orchestrator/src/request.rs` | Canonical filesystem submission request normalization |
+| `crates/gossip-orchestrator/src/planner.rs` | Deterministic filesystem initial shard geometry planner |
+| `crates/gossip-orchestrator/src/payload.rs` | Typed filesystem shard payload wire format (encode/decode) |
+| `crates/gossip-orchestrator/src/setup.rs` | Coordination-backed filesystem run setup and shard registration |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
