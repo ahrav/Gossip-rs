@@ -1181,6 +1181,20 @@ fn resolve_filesystem_lease_results(
     Ok((outcome, submitted, stage_result))
 }
 
+/// Keep the shard locally trustworthy after receipt drain succeeds.
+///
+/// The watchdog records deadline expiry through [`LeaseUncertaintySignal`].
+/// Once the drain thread closes that signal, later wall-clock ticks must not
+/// retroactively invalidate already-durable local progress.
+fn ensure_post_drain_lease_trust(
+    lease_uncertainty: &LeaseUncertaintySignal,
+) -> Result<(), DistributedRuntimeError> {
+    if let Some(reason) = lease_uncertainty.current() {
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
+    Ok(())
+}
+
 /// Drain commit-stage outcomes to completion while building the receipt-driven
 /// checkpoint prefix.
 ///
@@ -2259,10 +2273,7 @@ where
         checkpoint_cursor,
         resume_cursor,
     )?;
-
-    if let Some(reason) = armed_lease_deadline.expiry_reason() {
-        return Err(DistributedRuntimeError::LeaseUncertain(reason));
-    }
+    ensure_post_drain_lease_trust(&lease_uncertainty)?;
 
     Ok((report, completion))
 }
@@ -2899,6 +2910,33 @@ mod tests {
             Some(reason),
             "close() on a Recorded signal must preserve the recorded reason"
         );
+    }
+
+    #[test]
+    fn ensure_post_drain_lease_trust_ignores_late_reason_after_signal_closes() {
+        let signal = LeaseUncertaintySignal::default();
+        signal.close();
+
+        assert!(
+            ensure_post_drain_lease_trust(&signal).is_ok(),
+            "closed signal must keep post-drain progress locally trustworthy"
+        );
+    }
+
+    #[test]
+    fn ensure_post_drain_lease_trust_preserves_recorded_reason_after_signal_closes() {
+        let signal = LeaseUncertaintySignal::default();
+        let reason = LeaseUncertainty::DeadlineElapsed {
+            deadline: LogicalTime::from_raw(10),
+            observed: LogicalTime::from_raw(11),
+        };
+
+        assert!(signal.note(reason), "note should record the reason");
+        signal.close();
+        assert!(matches!(
+            ensure_post_drain_lease_trust(&signal),
+            Err(DistributedRuntimeError::LeaseUncertain(found)) if found == reason
+        ));
     }
 
     #[test]
