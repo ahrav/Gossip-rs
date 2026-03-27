@@ -1519,6 +1519,25 @@ fn deterministic_op_id(key: ShardKey, fence: FenceEpoch, op_kind: OpKind) -> OpI
     OpId::from_raw(finalize_64(&hasher))
 }
 
+/// Map a coordinator stale-fence rejection to [`DistributedRuntimeError::LeaseUncertain`].
+fn stale_fence_to_lease_uncertain(
+    presented: FenceEpoch,
+    current: FenceEpoch,
+) -> DistributedRuntimeError {
+    DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceStaleFence {
+        presented,
+        current,
+    })
+}
+
+/// Map a coordinator lease-expired rejection to [`DistributedRuntimeError::LeaseUncertain`].
+fn lease_expired_to_lease_uncertain(
+    deadline: LogicalTime,
+    now: LogicalTime,
+) -> DistributedRuntimeError {
+    DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceLeaseExpired { deadline, now })
+}
+
 /// Claim the next available shard, retrying while the run still has active
 /// work or the coordinator is enforcing worker cooldown.
 ///
@@ -1650,10 +1669,27 @@ where
     }
 
     let op_id = deterministic_op_id(lease.lease().shard_key(), lease.lease().fence(), op_kind);
-    let applied =
-        match outcome {
-            ShardCompletionOutcome::Checkpoint { .. } => coordinator
-                .checkpoint(
+    let applied = match outcome {
+        ShardCompletionOutcome::Checkpoint { .. } => coordinator
+            .checkpoint(
+                wall_clock_now(),
+                identity.tenant,
+                &lease.lease(),
+                &cursor,
+                op_id,
+            )
+            .map_err(|error| match error {
+                CheckpointError::StaleFence { presented, current } => {
+                    stale_fence_to_lease_uncertain(presented, current)
+                }
+                CheckpointError::LeaseExpired { deadline, now } => {
+                    lease_expired_to_lease_uncertain(deadline, now)
+                }
+                other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
+            })?,
+        ShardCompletionOutcome::Complete { .. } | ShardCompletionOutcome::ExhaustedEmpty => {
+            coordinator
+                .complete(
                     wall_clock_now(),
                     identity.tenant,
                     &lease.lease(),
@@ -1661,42 +1697,16 @@ where
                     op_id,
                 )
                 .map_err(|error| match error {
-                    CheckpointError::StaleFence { presented, current } => {
-                        DistributedRuntimeError::LeaseUncertain(
-                            LeaseUncertainty::AdvanceStaleFence { presented, current },
-                        )
+                    CompleteError::StaleFence { presented, current } => {
+                        stale_fence_to_lease_uncertain(presented, current)
                     }
-                    CheckpointError::LeaseExpired { deadline, now } => {
-                        DistributedRuntimeError::LeaseUncertain(
-                            LeaseUncertainty::AdvanceLeaseExpired { deadline, now },
-                        )
+                    CompleteError::LeaseExpired { deadline, now } => {
+                        lease_expired_to_lease_uncertain(deadline, now)
                     }
                     other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
-                })?,
-            ShardCompletionOutcome::Complete { .. } | ShardCompletionOutcome::ExhaustedEmpty => {
-                coordinator
-                    .complete(
-                        wall_clock_now(),
-                        identity.tenant,
-                        &lease.lease(),
-                        &cursor,
-                        op_id,
-                    )
-                    .map_err(|error| match error {
-                        CompleteError::StaleFence { presented, current } => {
-                            DistributedRuntimeError::LeaseUncertain(
-                                LeaseUncertainty::AdvanceStaleFence { presented, current },
-                            )
-                        }
-                        CompleteError::LeaseExpired { deadline, now } => {
-                            DistributedRuntimeError::LeaseUncertain(
-                                LeaseUncertainty::AdvanceLeaseExpired { deadline, now },
-                            )
-                        }
-                        other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
-                    })?
-            }
-        };
+                })?
+        }
+    };
 
     if !applied.is_executed() {
         tracing::info!(
@@ -2819,6 +2829,22 @@ mod tests {
     }
 
     #[test]
+    fn lease_uncertainty_signal_close_preserves_recorded_reason() {
+        let signal = LeaseUncertaintySignal::default();
+        let reason = LeaseUncertainty::DeadlineElapsed {
+            deadline: LogicalTime::from_raw(10),
+            observed: LogicalTime::from_raw(11),
+        };
+        assert!(signal.note(reason.clone()), "note should record the reason");
+        signal.close();
+        assert_eq!(
+            signal.current(),
+            Some(reason),
+            "close() on a Recorded signal must preserve the recorded reason"
+        );
+    }
+
+    #[test]
     fn armed_lease_deadline_rejects_elapsed_deadline() {
         let error = ArmedLeaseDeadline::arm_from(
             LogicalTime::from_raw(10),
@@ -3075,6 +3101,30 @@ mod tests {
         assert!(
             signal.current().is_none(),
             "closed signal must not surface a late deadline reason"
+        );
+    }
+
+    #[test]
+    fn watch_lease_deadline_exits_immediately_when_done_on_entry() {
+        let signal = LeaseUncertaintySignal::default();
+        let cancel = CancellationToken::new();
+        let expired = Instant::now() - Duration::from_secs(1);
+        watch_lease_deadline(
+            ArmedLeaseDeadline {
+                deadline: LogicalTime::from_raw(1),
+                monotonic_deadline: expired,
+            },
+            cancel.clone(),
+            Arc::new(AtomicBool::new(true)),
+            signal.clone(),
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "done-on-entry must prevent cancellation even with an expired deadline"
+        );
+        assert!(
+            signal.current().is_none(),
+            "done-on-entry must prevent recording a deadline reason"
         );
     }
 
@@ -4034,6 +4084,30 @@ mod tests {
             summaries[0].last_key(),
             Some(lease.range_start()),
             "completion must honor the receipt-derived checkpoint instead of the shard range start",
+        );
+    }
+
+    #[test]
+    fn advance_shard_idempotent_replay_succeeds_silently() {
+        let dir = tempdir().expect("tempdir");
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x05", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let outcome = ShardCompletionOutcome::ExhaustedEmpty;
+
+        advance_shard(&mut coordinator, &identity, &lease, &outcome)
+            .expect("first completion should succeed");
+
+        advance_shard(&mut coordinator, &identity, &lease, &outcome)
+            .expect("replayed completion with identical OpId should succeed");
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].status(),
+            ShardStatus::Done,
+            "idempotent replay must not regress terminal shard state"
         );
     }
 
