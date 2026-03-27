@@ -1484,14 +1484,14 @@ fn watch_lease_deadline(
     signal: LeaseUncertaintySignal,
 ) {
     loop {
-        if done.load(Ordering::Acquire) {
-            return;
-        }
-
         if let Some(reason) = armed_deadline.expiry_reason() {
             if signal.note(reason) {
                 cancel.cancel();
             }
+            return;
+        }
+
+        if done.load(Ordering::Acquire) {
             return;
         }
 
@@ -3076,6 +3076,33 @@ mod tests {
             signal.current().is_none(),
             "closed signal must not surface a late deadline reason"
         );
+    }
+
+    #[test]
+    fn watch_lease_deadline_records_open_expiry_before_done_exit() {
+        let signal = LeaseUncertaintySignal::default();
+        let cancel = CancellationToken::new();
+
+        let expired = Instant::now() - Duration::from_secs(1);
+        watch_lease_deadline(
+            ArmedLeaseDeadline {
+                deadline: LogicalTime::from_raw(1),
+                monotonic_deadline: expired,
+            },
+            cancel.clone(),
+            Arc::new(AtomicBool::new(true)),
+            signal.clone(),
+        );
+
+        assert!(
+            cancel.is_cancelled(),
+            "open signal must still cancel when expiry wins over done"
+        );
+        assert!(matches!(
+            signal.current(),
+            Some(LeaseUncertainty::DeadlineElapsed { deadline, .. })
+                if deadline == LogicalTime::from_raw(1)
+        ));
     }
 
     #[test]
