@@ -243,10 +243,16 @@ pub struct ShardLease {
     write_context: WriteContext,
     /// Tenant secret key used for secret-hash derivation.
     tenant_secret_key: TenantSecretKey,
+    /// Wall-clock timestamp captured at claim time, used to anchor the
+    /// lease deadline to the monotonic clock without NTP skew.
+    claim_wall_clock: LogicalTime,
+    /// Monotonic instant captured alongside `claim_wall_clock`.
+    claim_instant: Instant,
 }
 
 impl ShardLease {
     /// Construct one concrete filesystem shard lease.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         shard_id: Arc<str>,
         lease: Lease,
@@ -254,6 +260,8 @@ impl ShardLease {
         filesystem_source: HydratedFilesystemSource,
         write_context: WriteContext,
         tenant_secret_key: TenantSecretKey,
+        claim_wall_clock: LogicalTime,
+        claim_instant: Instant,
     ) -> Self {
         Self {
             shard_id,
@@ -262,6 +270,8 @@ impl ShardLease {
             filesystem_source,
             write_context,
             tenant_secret_key,
+            claim_wall_clock,
+            claim_instant,
         }
     }
 
@@ -356,6 +366,21 @@ impl ShardLease {
         self.tenant_secret_key
     }
 
+    /// Wall-clock timestamp captured at claim time, anchoring the monotonic
+    /// deadline calculation to the coordinator's view of time.
+    #[inline]
+    #[must_use]
+    fn claim_wall_clock(&self) -> LogicalTime {
+        self.claim_wall_clock
+    }
+
+    /// Monotonic instant captured alongside `claim_wall_clock`.
+    #[inline]
+    #[must_use]
+    fn claim_instant(&self) -> Instant {
+        self.claim_instant
+    }
+
     /// Build an ordered-content runtime input from this lease's restored state.
     #[must_use]
     pub fn to_runtime_input(
@@ -446,7 +471,7 @@ impl DistributedRunReport {
 }
 
 /// Explicit reason the worker can no longer trust a claimed lease.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LeaseUncertainty {
     /// The local worker reached or passed the lease deadline before the shard
     /// finished its scan and commit pipeline.
@@ -526,7 +551,7 @@ impl LeaseUncertaintySignal {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
         {
-            LeaseUncertaintyState::Recorded(reason) => Some(reason.clone()),
+            LeaseUncertaintyState::Recorded(reason) => Some(*reason),
             LeaseUncertaintyState::Open | LeaseUncertaintyState::Closed => None,
         }
     }
@@ -545,10 +570,6 @@ struct ArmedLeaseDeadline {
 }
 
 impl ArmedLeaseDeadline {
-    fn arm(deadline: LogicalTime) -> Result<Self, LeaseUncertainty> {
-        Self::arm_from(deadline, wall_clock_now(), Instant::now())
-    }
-
     fn arm_from(
         deadline: LogicalTime,
         observed: LogicalTime,
@@ -1402,6 +1423,8 @@ fn hydrate_filesystem_source_from_spec(
 fn build_lease_from_acquire(
     acquired: AcquireResultView<'_>,
     identity: &WorkerIdentity,
+    claim_wall_clock: LogicalTime,
+    claim_instant: Instant,
 ) -> Result<ShardLease> {
     let snapshot = acquired.snapshot;
     let spec = snapshot.spec();
@@ -1433,6 +1456,8 @@ fn build_lease_from_acquire(
         hydrate_filesystem_source_from_spec(spec, &identity.scan_template)?,
         write_context,
         identity.tenant_secret_key,
+        claim_wall_clock,
+        claim_instant,
     ))
 }
 
@@ -1557,6 +1582,7 @@ where
 {
     loop {
         let now = wall_clock_now();
+        let claim_instant = Instant::now();
         match coordinator.claim_next_available(
             now,
             identity.tenant,
@@ -1565,7 +1591,7 @@ where
             scratch,
         ) {
             Ok(acquired) => {
-                return build_lease_from_acquire(acquired, identity)
+                return build_lease_from_acquire(acquired, identity, now, claim_instant)
                     .map(Some)
                     .map_err(DistributedRuntimeError::Coordinator);
             }
@@ -2027,8 +2053,12 @@ where
         "receipt-driven execution requires single-threaded scanning"
     );
 
-    let armed_lease_deadline = ArmedLeaseDeadline::arm(lease.lease().deadline())
-        .map_err(DistributedRuntimeError::LeaseUncertain)?;
+    let armed_lease_deadline = ArmedLeaseDeadline::arm_from(
+        lease.lease().deadline(),
+        lease.claim_wall_clock(),
+        lease.claim_instant(),
+    )
+    .map_err(DistributedRuntimeError::LeaseUncertain)?;
 
     let engine = build_runtime_engine(
         scan_config.rules_file.as_deref(),
@@ -2059,14 +2089,6 @@ where
         cancel.clone(),
     )
     .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
-    if let Some(reason) = armed_lease_deadline.expiry_reason() {
-        pipeline.shutdown().map_err(|_| {
-            DistributedRuntimeError::Durability(AnyError::msg(
-                "commit pipeline worker panicked during lease-expiry shutdown",
-            ))
-        })?;
-        return Err(DistributedRuntimeError::LeaseUncertain(reason));
-    }
     let (submitter, drainer) = pipeline.split();
     let commit = ReceiptCommitSink::new(
         recorder,
@@ -2182,8 +2204,7 @@ where
         termination,
         resume_cursor,
     } = outcome;
-    let recovered_checkpoint =
-        (resume_cursor != *lease.resume_cursor()).then_some(resume_cursor.clone());
+    let recovered_checkpoint = (resume_cursor != *lease.resume_cursor()).then_some(resume_cursor);
 
     let completion = match (termination, checkpoint_cursor, recovered_checkpoint) {
         (PageLoopTermination::ExhaustedEmptyConfirmed, None, None) => {
@@ -2575,16 +2596,18 @@ mod tests {
         identity: &WorkerIdentity,
     ) -> ShardLease {
         let mut scratch = AcquireScratch::new();
+        let now = wall_clock_now();
+        let instant = Instant::now();
         let acquired = coordinator
             .claim_next_available(
-                wall_clock_now(),
+                now,
                 identity.tenant,
                 identity.run,
                 identity.worker,
                 &mut scratch,
             )
             .expect("claim next available");
-        build_lease_from_acquire(acquired, identity).expect("runtime lease")
+        build_lease_from_acquire(acquired, identity, now, instant).expect("runtime lease")
     }
 
     fn claim_coordination_lease(
@@ -2794,10 +2817,7 @@ mod tests {
             current: FenceEpoch::from_raw(2),
         };
 
-        assert!(
-            signal.note(first.clone()),
-            "first note() should record the reason"
-        );
+        assert!(signal.note(first), "first note() should record the reason");
         assert!(
             !signal.note(second),
             "second note() must not overwrite the first reason"
@@ -2835,7 +2855,7 @@ mod tests {
             deadline: LogicalTime::from_raw(10),
             observed: LogicalTime::from_raw(11),
         };
-        assert!(signal.note(reason.clone()), "note should record the reason");
+        assert!(signal.note(reason), "note should record the reason");
         signal.close();
         assert_eq!(
             signal.current(),
@@ -3018,7 +3038,7 @@ mod tests {
             }),
             Err(anyhow!("submit cancelled after lease expiry")),
             Err(anyhow!("unused")),
-            Some(reason.clone()),
+            Some(reason),
         )
         .expect_err("lease uncertainty should win over cancellation-induced submission gaps");
 
@@ -3041,7 +3061,7 @@ mod tests {
             Err(scan_error),
             Err(anyhow!("submitted cancelled after lease expiry")),
             Err(anyhow!("unused")),
-            Some(reason.clone()),
+            Some(reason),
         )
         .expect_err("lease uncertainty should win over a concurrent scan error");
 
@@ -3869,7 +3889,7 @@ mod tests {
                 &mut scratch,
             )
             .expect("claim next available");
-        let err = build_lease_from_acquire(acquired, &identity)
+        let err = build_lease_from_acquire(acquired, &identity, wall_clock_now(), Instant::now())
             .expect_err("empty filesystem payload must be rejected");
 
         assert!(
@@ -3914,8 +3934,13 @@ mod tests {
                 &mut acquire_scratch,
             )
             .expect("claim next available");
-        let lease = build_lease_from_acquire(acquired, &worker_identity(Path::new("/fallback")))
-            .expect("runtime lease");
+        let lease = build_lease_from_acquire(
+            acquired,
+            &worker_identity(Path::new("/fallback")),
+            wall_clock_now(),
+            Instant::now(),
+        )
+        .expect("runtime lease");
 
         assert_eq!(lease.range_start(), b"a");
         assert_eq!(lease.range_end(), b"m");
@@ -4021,6 +4046,8 @@ mod tests {
             claimed.filesystem_source.clone(),
             claimed.write_context(),
             claimed.tenant_secret_key(),
+            wall_clock_now(),
+            Instant::now(),
         );
 
         advance_shard(
@@ -5244,7 +5271,7 @@ mod tests {
             .expect("claim next available");
         let identity = worker_identity(Path::new("/fallback"));
 
-        let err = build_lease_from_acquire(acquired, &identity)
+        let err = build_lease_from_acquire(acquired, &identity, wall_clock_now(), Instant::now())
             .expect_err("non-UTF-8 filesystem payload path must be rejected");
         assert!(
             err.to_string()
@@ -5266,7 +5293,7 @@ mod tests {
             .expect("claim next available");
         let identity = worker_identity(Path::new("/fallback"));
 
-        let err = build_lease_from_acquire(acquired, &identity)
+        let err = build_lease_from_acquire(acquired, &identity, wall_clock_now(), Instant::now())
             .expect_err("mode/path mismatch must fail during hydration");
         assert!(
             err.to_string()
@@ -5296,7 +5323,7 @@ mod tests {
             .expect("claim next available");
         let identity = worker_identity(Path::new("/fallback"));
 
-        let err = build_lease_from_acquire(acquired, &identity)
+        let err = build_lease_from_acquire(acquired, &identity, wall_clock_now(), Instant::now())
             .expect_err("symlink payload path must be rejected");
         assert!(
             err.to_string().contains("is a symlink"),
@@ -5682,6 +5709,8 @@ mod tests {
             ),
             claimed.write_context(),
             claimed.tenant_secret_key(),
+            wall_clock_now(),
+            Instant::now(),
         );
         let done_ledger = InMemoryDoneLedger::new();
         let persistence =
@@ -5931,6 +5960,8 @@ mod tests {
             claimed.filesystem_source.clone(),
             claimed.write_context(),
             claimed.tenant_secret_key(),
+            wall_clock_now(),
+            Instant::now(),
         );
 
         advance_shard(
@@ -5969,6 +6000,8 @@ mod tests {
             claimed.filesystem_source.clone(),
             claimed.write_context(),
             claimed.tenant_secret_key(),
+            wall_clock_now(),
+            Instant::now(),
         );
 
         let err = advance_shard(
@@ -6007,6 +6040,8 @@ mod tests {
             claimed.filesystem_source.clone(),
             claimed.write_context(),
             claimed.tenant_secret_key(),
+            wall_clock_now(),
+            Instant::now(),
         );
 
         let err = advance_shard(
@@ -6538,6 +6573,112 @@ mod tests {
         assert!(
             err.to_string().contains("no prior progress"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// When every item in the shard is already in the done ledger, the page
+    /// loop commits zero new receipts (`checkpoint_cursor = None`). If the
+    /// page loop still advanced the resume cursor past the lease's original
+    /// position, the recovered cursor provides the completion checkpoint.
+    ///
+    /// This exercises the `(ExhaustedEmptyConfirmed, None, Some(recovered))`
+    /// arm of the completion match in `run_filesystem_lease`.
+    #[test]
+    fn run_filesystem_lease_exhausted_with_zero_commits_uses_recovered_cursor_for_completion() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), clean_fixture()).expect("write alpha");
+        fs::write(dir.path().join("bravo.txt"), clean_fixture()).expect("write bravo");
+
+        // Seed pass: scan both files to populate the done ledger with durable
+        // entries. The seed completion must be `Complete` so we know the ledger
+        // has rows for every item in the shard.
+        let done_ledger = InMemoryDoneLedger::new();
+        let seed_identity = worker_identity(Path::new("/fallback"));
+        let mut seed_coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let seed_lease = claim_lease(&mut seed_coordinator, &seed_identity);
+        let seed_persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+
+        let (_seed_report, seed_completion) = run_filesystem_lease(
+            Arc::clone(&seed_identity.recorder),
+            &seed_persistence,
+            &seed_lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("seed pass should populate the done ledger");
+        assert!(
+            matches!(seed_completion, ShardCompletionOutcome::Complete { .. }),
+            "seed pass should terminate with Complete"
+        );
+
+        let done_count_after_seed = done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot after seed")
+            .len();
+        assert_eq!(
+            done_count_after_seed, 2,
+            "seed pass should write one done-ledger row per item"
+        );
+
+        // Recovery pass: fresh coordinator so the lease starts at
+        // Cursor::initial(). The done ledger is shared, so every item is
+        // already done and zero receipts are committed. The page loop still
+        // advances the resume cursor past both files, producing a recovered
+        // checkpoint that differs from the lease's original cursor.
+        let recovery_identity = worker_identity(Path::new("/fallback"));
+        let mut recovery_coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let recovery_lease = claim_lease(&mut recovery_coordinator, &recovery_identity);
+        let recovery_persistence =
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone());
+
+        assert_eq!(
+            *recovery_lease.resume_cursor(),
+            Cursor::initial(),
+            "recovery lease should start at the initial cursor"
+        );
+
+        let (recovery_report, recovery_completion) = run_filesystem_lease(
+            Arc::clone(&recovery_identity.recorder),
+            &recovery_persistence,
+            &recovery_lease,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("recovery pass with all-done items should succeed");
+
+        // Both items were visited but none were committed (all already done).
+        assert_eq!(
+            recovery_report.items_scanned, 2,
+            "both files should be visited even though they are already done"
+        );
+
+        // The completion must be `Complete` with the cursor advanced to the
+        // last item in key order. This cursor came from the page loop's
+        // resume position, not from committed receipts.
+        let ShardCompletionOutcome::Complete { checkpoint } = recovery_completion else {
+            panic!(
+                "zero-commit recovery with advanced resume cursor should produce Complete, \
+                 got: {recovery_completion:?}"
+            );
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("recovered checkpoint last_key")
+                .as_bytes(),
+            b"bravo.txt",
+            "recovered cursor should point to the last item in key order"
+        );
+
+        // The done ledger must not have grown — no new receipts were committed.
+        let done_count_after_recovery = done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot after recovery")
+            .len();
+        assert_eq!(
+            done_count_after_recovery, done_count_after_seed,
+            "recovery pass should not add new done-ledger entries"
         );
     }
 }
