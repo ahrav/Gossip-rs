@@ -696,9 +696,10 @@ completion helpers.
 `ShardLease` is the hand-off object from `gossip-coordination` into the worker
 loop. It keeps the string shard label used for recorder routing separate from
 the numeric shard identity carried inside `Lease` and `WriteContext`, stores
-the authoritative shard bounds and resume state (`shard_spec`,
-`resume_cursor`, `cursor_semantics`), and carries the filesystem scan config
-derived from the claimed shard spec plus connector metadata.
+the authoritative restored shard state (`RestoredShardState`, including shard
+bounds plus any resume cursor and cursor semantics), and carries the hydrated
+filesystem source state (`HydratedFilesystemSource`) that pairs the per-shard
+scan configuration with the explicit source mode decoded from shard metadata.
 
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones

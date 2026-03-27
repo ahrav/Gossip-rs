@@ -532,6 +532,47 @@ impl LeaseUncertaintySignal {
     }
 }
 
+/// Local monotonic view of a coordination lease deadline.
+///
+/// The worker samples wall-clock time exactly once when it arms the local
+/// deadline so later setup latency does not silently extend the watchdog
+/// window. Callers can then re-check whether that original monotonic deadline
+/// has already elapsed before starting scan or durability work.
+#[derive(Clone, Copy, Debug)]
+struct ArmedLeaseDeadline {
+    deadline: LogicalTime,
+    monotonic_deadline: Instant,
+}
+
+impl ArmedLeaseDeadline {
+    fn arm(deadline: LogicalTime) -> Result<Self, LeaseUncertainty> {
+        Self::arm_from(deadline, wall_clock_now(), Instant::now())
+    }
+
+    fn arm_from(
+        deadline: LogicalTime,
+        observed: LogicalTime,
+        monotonic_observed: Instant,
+    ) -> Result<Self, LeaseUncertainty> {
+        if observed.as_raw() >= deadline.as_raw() {
+            return Err(LeaseUncertainty::DeadlineElapsed { deadline, observed });
+        }
+
+        Ok(Self {
+            deadline,
+            monotonic_deadline: monotonic_observed
+                + Duration::from_millis(deadline.as_raw().saturating_sub(observed.as_raw())),
+        })
+    }
+
+    fn expiry_reason(&self) -> Option<LeaseUncertainty> {
+        (Instant::now() >= self.monotonic_deadline).then(|| LeaseUncertainty::DeadlineElapsed {
+            deadline: self.deadline,
+            observed: wall_clock_now(),
+        })
+    }
+}
+
 /// Layered error from the distributed runtime.
 ///
 /// Classifies failures by origin so callers can distinguish coordinator
@@ -1437,8 +1478,7 @@ fn claim_retry_delay(now: LogicalTime, earliest_deadline: Option<LogicalTime>) -
 /// [`LogicalTime`] deadline is retained only for the diagnostic fields in
 /// [`LeaseUncertainty::DeadlineElapsed`].
 fn watch_lease_deadline(
-    deadline: LogicalTime,
-    monotonic_deadline: Instant,
+    armed_deadline: ArmedLeaseDeadline,
     cancel: CancellationToken,
     done: Arc<AtomicBool>,
     signal: LeaseUncertaintySignal,
@@ -1448,17 +1488,15 @@ fn watch_lease_deadline(
             return;
         }
 
-        if Instant::now() >= monotonic_deadline {
-            if signal.note(LeaseUncertainty::DeadlineElapsed {
-                deadline,
-                observed: wall_clock_now(),
-            }) {
+        if let Some(reason) = armed_deadline.expiry_reason() {
+            if signal.note(reason) {
                 cancel.cancel();
             }
             return;
         }
 
-        let remaining = monotonic_deadline
+        let remaining = armed_deadline
+            .monotonic_deadline
             .saturating_duration_since(Instant::now())
             .min(CLAIM_RACE_RETRY_DELAY);
         std::thread::park_timeout(remaining);
@@ -1979,16 +2017,8 @@ where
         "receipt-driven execution requires single-threaded scanning"
     );
 
-    let lease_deadline = lease.lease().deadline();
-    let start_time = wall_clock_now();
-    if start_time.as_raw() >= lease_deadline.as_raw() {
-        return Err(DistributedRuntimeError::LeaseUncertain(
-            LeaseUncertainty::DeadlineElapsed {
-                deadline: lease_deadline,
-                observed: start_time,
-            },
-        ));
-    }
+    let armed_lease_deadline = ArmedLeaseDeadline::arm(lease.lease().deadline())
+        .map_err(DistributedRuntimeError::LeaseUncertain)?;
 
     let engine = build_runtime_engine(
         scan_config.rules_file.as_deref(),
@@ -1996,6 +2026,9 @@ where
         scan_config.decode_depth,
         scan_config.anchor_mode,
     )?;
+    if let Some(reason) = armed_lease_deadline.expiry_reason() {
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
     let rule_fingerprint = {
         let engine = Arc::clone(&engine);
         Arc::new(move |rule_id| RuleFingerprint::from_bytes(engine.rule_fingerprint_bytes(rule_id)))
@@ -2006,8 +2039,6 @@ where
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
-    let monotonic_deadline = Instant::now()
-        + Duration::from_millis(lease_deadline.as_raw().saturating_sub(start_time.as_raw()));
     let pipeline = CommitPipeline::start(
         persistence.findings_sink.clone(),
         persistence.done_ledger.clone(),
@@ -2018,6 +2049,14 @@ where
         cancel.clone(),
     )
     .map_err(|error| DistributedRuntimeError::Durability(AnyError::new(error)))?;
+    if let Some(reason) = armed_lease_deadline.expiry_reason() {
+        pipeline.shutdown().map_err(|_| {
+            DistributedRuntimeError::Durability(AnyError::msg(
+                "commit pipeline worker panicked during lease-expiry shutdown",
+            ))
+        })?;
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
     let (submitter, drainer) = pipeline.split();
     let commit = ReceiptCommitSink::new(
         recorder,
@@ -2052,7 +2091,7 @@ where
             let cancel = cancel.clone();
             let done = Arc::clone(&lease_watch_done);
             let signal = lease_uncertainty.clone();
-            move || watch_lease_deadline(lease_deadline, monotonic_deadline, cancel, done, signal)
+            move || watch_lease_deadline(armed_lease_deadline, cancel, done, signal)
         });
 
         let outcome = scan_ordered_filesystem_lease_with_engine(
@@ -2780,6 +2819,59 @@ mod tests {
     }
 
     #[test]
+    fn armed_lease_deadline_rejects_elapsed_deadline() {
+        let error = ArmedLeaseDeadline::arm_from(
+            LogicalTime::from_raw(10),
+            LogicalTime::from_raw(10),
+            Instant::now(),
+        )
+        .expect_err("equal observation/deadline should report lease expiry");
+
+        assert!(
+            matches!(error, LeaseUncertainty::DeadlineElapsed { .. }),
+            "expected DeadlineElapsed, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn armed_lease_deadline_anchors_to_original_observation_instant() {
+        let monotonic_observed = Instant::now();
+        let armed = ArmedLeaseDeadline::arm_from(
+            LogicalTime::from_raw(250),
+            LogicalTime::from_raw(100),
+            monotonic_observed,
+        )
+        .expect("future deadline should arm successfully");
+
+        assert_eq!(
+            armed.monotonic_deadline.duration_since(monotonic_observed),
+            Duration::from_millis(150),
+            "monotonic deadline should preserve the original remaining lease window"
+        );
+    }
+
+    #[test]
+    fn armed_lease_deadline_reports_elapsed_after_monotonic_deadline_passes() {
+        let armed = ArmedLeaseDeadline::arm_from(
+            LogicalTime::from_raw(20),
+            LogicalTime::from_raw(10),
+            Instant::now() - Duration::from_secs(1),
+        )
+        .expect("future logical deadline should arm successfully");
+
+        assert!(
+            matches!(
+                armed.expiry_reason(),
+                Some(LeaseUncertainty::DeadlineElapsed {
+                    deadline,
+                    observed: _
+                }) if deadline == LogicalTime::from_raw(20)
+            ),
+            "expired monotonic deadline should surface a deadline-elapsed reason"
+        );
+    }
+
+    #[test]
     fn resolve_filesystem_lease_results_prefers_scan_failure_over_drain_failure() {
         let scan_error = ScanRuntimeError::Driver(AnyError::msg("scan boom"));
         let submitted_error = anyhow!("submitted boom");
@@ -2942,8 +3034,10 @@ mod tests {
         // Monotonic deadline in the past triggers immediate expiry.
         let expired = Instant::now() - Duration::from_secs(1);
         watch_lease_deadline(
-            LogicalTime::from_raw(1),
-            expired,
+            ArmedLeaseDeadline {
+                deadline: LogicalTime::from_raw(1),
+                monotonic_deadline: expired,
+            },
             cancel.clone(),
             Arc::new(AtomicBool::new(false)),
             signal.clone(),
@@ -2965,8 +3059,10 @@ mod tests {
 
         let expired = Instant::now() - Duration::from_secs(1);
         watch_lease_deadline(
-            LogicalTime::from_raw(1),
-            expired,
+            ArmedLeaseDeadline {
+                deadline: LogicalTime::from_raw(1),
+                monotonic_deadline: expired,
+            },
             cancel.clone(),
             Arc::new(AtomicBool::new(false)),
             signal.clone(),
@@ -4637,8 +4733,10 @@ mod tests {
         let cancel_clone = cancel.clone();
         let handle = std::thread::spawn(move || {
             watch_lease_deadline(
-                LogicalTime::from_raw(u64::MAX),
-                far_future,
+                ArmedLeaseDeadline {
+                    deadline: LogicalTime::from_raw(u64::MAX),
+                    monotonic_deadline: far_future,
+                },
                 cancel_clone,
                 done_clone,
                 signal_clone,
