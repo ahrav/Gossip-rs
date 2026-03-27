@@ -472,11 +472,11 @@ the receipt-driven durability model:
 7. Prepares a checkpoint prefix from the aggregator, acknowledges the
    checkpoint to advance the aggregator watermark, and returns an explicit
    `ShardCompletionOutcome` to the caller. Receipt-backed progress yields
-   `Complete { checkpoint }` or `Checkpoint { checkpoint }`, while a
-   replay-only terminal recovery can still return `Complete { checkpoint }`
-   from the recovered resume cursor even when this claim produced no new
-   durable receipts. `ExhaustedEmpty` is reserved for shards that are
-   confirmed empty and have no durable coverage to preserve.
+   `Complete { checkpoint }` or `Checkpoint { checkpoint }`, while replay-only
+   recovery can still return either outcome from the recovered resume cursor
+   when this claim produced no new durable receipts but did recover durable
+   coverage from earlier committed work. `ExhaustedEmpty` is reserved for
+   shards that are confirmed empty and have no durable coverage to preserve.
 
 If any step fails, the shard is not completed in coordination and will be
 retried when the lease expires.

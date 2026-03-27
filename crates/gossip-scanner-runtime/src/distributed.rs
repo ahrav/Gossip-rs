@@ -471,6 +471,11 @@ impl DistributedRunReport {
 }
 
 /// Explicit reason the worker can no longer trust a claimed lease.
+///
+/// `DeadlineElapsed` is raised by local monotonic deadline checks (the
+/// watchdog thread, arming validation, and phase-boundary guards).
+/// `AdvanceStaleFence` and `AdvanceLeaseExpired` are raised by the
+/// coordinator during shard advancement after local durability has completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LeaseUncertainty {
     /// The local worker reached or passed the lease deadline before the shard
@@ -543,6 +548,10 @@ impl LeaseUncertaintySignal {
         if matches!(*guard, LeaseUncertaintyState::Open) {
             *guard = LeaseUncertaintyState::Closed;
         }
+        // A prior Recorded reason is preserved intentionally: local drain
+        // success does not retroactively restore lease trust once the deadline
+        // has elapsed. The coordinator's fence epoch is the authoritative
+        // backstop.
     }
 
     fn current(&self) -> Option<LeaseUncertainty> {
@@ -559,10 +568,11 @@ impl LeaseUncertaintySignal {
 
 /// Local monotonic view of a coordination lease deadline.
 ///
-/// The worker samples wall-clock time exactly once when it arms the local
-/// deadline so later setup latency does not silently extend the watchdog
-/// window. Callers can then re-check whether that original monotonic deadline
-/// has already elapsed before starting scan or durability work.
+/// The deadline is anchored to a wall-clock and monotonic-clock snapshot
+/// captured at claim time, so later setup latency (engine build, pipeline
+/// start) does not silently extend the watchdog window. Callers can then
+/// re-check whether that original monotonic deadline has already elapsed
+/// before starting scan or durability work.
 #[derive(Clone, Copy, Debug)]
 struct ArmedLeaseDeadline {
     deadline: LogicalTime,
@@ -579,10 +589,14 @@ impl ArmedLeaseDeadline {
             return Err(LeaseUncertainty::DeadlineElapsed { deadline, observed });
         }
 
+        let remaining = Duration::from_millis(deadline.as_raw().saturating_sub(observed.as_raw()));
+        let monotonic_deadline = monotonic_observed
+            .checked_add(remaining)
+            .ok_or(LeaseUncertainty::DeadlineElapsed { deadline, observed })?;
+
         Ok(Self {
             deadline,
-            monotonic_deadline: monotonic_observed
-                + Duration::from_millis(deadline.as_raw().saturating_sub(observed.as_raw())),
+            monotonic_deadline,
         })
     }
 
@@ -1324,6 +1338,38 @@ fn checkpoint_logical_time(last_sequence_no: u64) -> Result<LogicalTime> {
         .ok_or_else(|| anyhow!("checkpoint logical time overflow: last_sequence_no is u64::MAX"))
 }
 
+/// Convert page-loop termination state plus durable progress into one explicit
+/// shard-advance action.
+fn select_shard_completion(
+    shard_id: &str,
+    initial_resume_cursor: &Cursor,
+    termination: PageLoopTermination,
+    checkpoint_cursor: Option<Cursor>,
+    resume_cursor: Cursor,
+) -> Result<ShardCompletionOutcome, DistributedRuntimeError> {
+    let recovered_checkpoint = (resume_cursor != *initial_resume_cursor).then_some(resume_cursor);
+
+    match (termination, checkpoint_cursor, recovered_checkpoint) {
+        (PageLoopTermination::ExhaustedEmptyConfirmed, None, None) => {
+            Ok(ShardCompletionOutcome::ExhaustedEmpty)
+        }
+        (PageLoopTermination::ExhaustedEmptyConfirmed, Some(checkpoint), _)
+        | (PageLoopTermination::ExhaustedEmptyConfirmed, None, Some(checkpoint)) => {
+            Ok(ShardCompletionOutcome::Complete { checkpoint })
+        }
+        (PageLoopTermination::Partial, Some(checkpoint), _)
+        | (PageLoopTermination::Partial, None, Some(checkpoint)) => {
+            Ok(ShardCompletionOutcome::Checkpoint { checkpoint })
+        }
+        (PageLoopTermination::Partial, None, None) => Err(DistributedRuntimeError::Runtime(
+            ScanRuntimeError::Driver(anyhow!(
+                "filesystem shard '{}' stopped before confirming exhaustion and produced no receipt-backed progress",
+                shard_id
+            )),
+        )),
+    }
+}
+
 /// Fallback delay when no lease deadline is available to guide retry timing.
 ///
 /// Kept short (25 ms) to avoid stalling the worker loop when concurrent
@@ -1523,7 +1569,8 @@ fn watch_lease_deadline(
         let remaining = armed_deadline
             .monotonic_deadline
             .saturating_duration_since(Instant::now())
-            .min(CLAIM_RACE_RETRY_DELAY);
+            .min(CLAIM_RACE_RETRY_DELAY)
+            .max(Duration::from_millis(1));
         std::thread::park_timeout(remaining);
     }
 }
@@ -1544,23 +1591,27 @@ fn deterministic_op_id(key: ShardKey, fence: FenceEpoch, op_kind: OpKind) -> OpI
     OpId::from_raw(finalize_64(&hasher))
 }
 
-/// Map a coordinator stale-fence rejection to [`DistributedRuntimeError::LeaseUncertain`].
-fn stale_fence_to_lease_uncertain(
-    presented: FenceEpoch,
-    current: FenceEpoch,
-) -> DistributedRuntimeError {
-    DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceStaleFence {
-        presented,
-        current,
-    })
-}
-
-/// Map a coordinator lease-expired rejection to [`DistributedRuntimeError::LeaseUncertain`].
-fn lease_expired_to_lease_uncertain(
-    deadline: LogicalTime,
-    now: LogicalTime,
-) -> DistributedRuntimeError {
-    DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceLeaseExpired { deadline, now })
+/// Maps coordinator advance errors (`StaleFence`, `LeaseExpired`) to
+/// `DistributedRuntimeError::LeaseUncertain`, falling back to
+/// `DistributedRuntimeError::Coordinator` for other variants.
+macro_rules! map_advance_error {
+    ($error:expr, $error_type:ident) => {
+        match $error {
+            $error_type::StaleFence { presented, current } => {
+                DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceStaleFence {
+                    presented,
+                    current,
+                })
+            }
+            $error_type::LeaseExpired { deadline, now } => {
+                DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::AdvanceLeaseExpired {
+                    deadline,
+                    now,
+                })
+            }
+            other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
+        }
+    };
 }
 
 /// Claim the next available shard, retrying while the run still has active
@@ -1634,6 +1685,11 @@ where
 /// succeeds. Coordinator-side lease loss (`StaleFence` / `LeaseExpired`)
 /// surfaces as [`DistributedRuntimeError::LeaseUncertain`] for both
 /// checkpoint and completion paths.
+///
+/// The `now` parameter passed to checkpoint/complete uses
+/// `wall_clock_now()` (SystemTime). The local monotonic watchdog is a
+/// best-effort early-warning mechanism; the coordinator's server-side
+/// deadline and fence-epoch checks are authoritative.
 fn advance_shard<C>(
     coordinator: &mut C,
     identity: &WorkerIdentity,
@@ -1704,15 +1760,7 @@ where
                 &cursor,
                 op_id,
             )
-            .map_err(|error| match error {
-                CheckpointError::StaleFence { presented, current } => {
-                    stale_fence_to_lease_uncertain(presented, current)
-                }
-                CheckpointError::LeaseExpired { deadline, now } => {
-                    lease_expired_to_lease_uncertain(deadline, now)
-                }
-                other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
-            })?,
+            .map_err(|e| map_advance_error!(e, CheckpointError))?,
         ShardCompletionOutcome::Complete { .. } | ShardCompletionOutcome::ExhaustedEmpty => {
             coordinator
                 .complete(
@@ -1722,15 +1770,7 @@ where
                     &cursor,
                     op_id,
                 )
-                .map_err(|error| match error {
-                    CompleteError::StaleFence { presented, current } => {
-                        stale_fence_to_lease_uncertain(presented, current)
-                    }
-                    CompleteError::LeaseExpired { deadline, now } => {
-                        lease_expired_to_lease_uncertain(deadline, now)
-                    }
-                    other => DistributedRuntimeError::Coordinator(AnyError::new(other)),
-                })?
+                .map_err(|e| map_advance_error!(e, CompleteError))?
         }
     };
 
@@ -2108,14 +2148,12 @@ where
         let write_context = lease.write_context();
         let max_buffered = config.commit_queue_capacity.get();
         let stage_handle = scope.spawn({
-            let done = Arc::clone(&lease_watch_done);
             let signal = lease_uncertainty.clone();
             move || {
                 let result = drain_commit_stage(drainer, write_context, max_buffered);
                 if result.is_ok() {
                     signal.close();
                 }
-                done.store(true, Ordering::Release);
                 result
             }
         });
@@ -2137,6 +2175,8 @@ where
         );
         let submitted = commit.finish();
         let stage_result = join_scoped(stage_handle, "receipt checkpoint drain thread");
+        // Keep the watchdog armed until both scan work and receipt-drain
+        // resolution finish so expired leases still cancel unfinished shards.
         lease_watch_done.store(true, Ordering::Release);
         deadline_handle.thread().unpark();
         let watch_result = join_scoped(deadline_handle, "lease deadline watchdog");
@@ -2204,28 +2244,17 @@ where
         termination,
         resume_cursor,
     } = outcome;
-    let recovered_checkpoint = (resume_cursor != *lease.resume_cursor()).then_some(resume_cursor);
+    let completion = select_shard_completion(
+        lease.shard_id(),
+        lease.resume_cursor(),
+        termination,
+        checkpoint_cursor,
+        resume_cursor,
+    )?;
 
-    let completion = match (termination, checkpoint_cursor, recovered_checkpoint) {
-        (PageLoopTermination::ExhaustedEmptyConfirmed, None, None) => {
-            ShardCompletionOutcome::ExhaustedEmpty
-        }
-        (PageLoopTermination::ExhaustedEmptyConfirmed, Some(checkpoint), _)
-        | (PageLoopTermination::ExhaustedEmptyConfirmed, None, Some(checkpoint)) => {
-            ShardCompletionOutcome::Complete { checkpoint }
-        }
-        (PageLoopTermination::Partial, Some(checkpoint), _) => {
-            ShardCompletionOutcome::Checkpoint { checkpoint }
-        }
-        (PageLoopTermination::Partial, None, _) => {
-            return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-                anyhow!(
-                    "filesystem shard '{}' stopped before confirming exhaustion and produced no receipt-backed progress",
-                    lease.shard_id()
-                ),
-            )));
-        }
-    };
+    if let Some(reason) = armed_lease_deadline.expiry_reason() {
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
 
     Ok((report, completion))
 }
@@ -2880,6 +2909,22 @@ mod tests {
     }
 
     #[test]
+    fn armed_lease_deadline_rejects_strictly_past_deadline() {
+        let result = ArmedLeaseDeadline::arm_from(
+            LogicalTime::from_raw(10),
+            LogicalTime::from_raw(15), // strictly past the deadline
+            Instant::now(),
+        );
+        assert!(matches!(
+            result,
+            Err(LeaseUncertainty::DeadlineElapsed {
+                deadline,
+                observed,
+            }) if deadline.as_raw() == 10 && observed.as_raw() == 15
+        ));
+    }
+
+    #[test]
     fn armed_lease_deadline_anchors_to_original_observation_instant() {
         let monotonic_observed = Instant::now();
         let armed = ArmedLeaseDeadline::arm_from(
@@ -3070,6 +3115,56 @@ mod tests {
             error,
             DistributedRuntimeError::LeaseUncertain(actual) if actual == reason
         ));
+    }
+
+    #[test]
+    fn resolve_filesystem_lease_results_returns_ok_on_all_success() {
+        let outcome = OrderedSourceAssignmentOutcome {
+            report: ScanReport::default(),
+            termination: PageLoopTermination::Partial,
+            resume_cursor: Cursor::initial(),
+        };
+        let submitted = vec![1, 2, 3];
+        let drain_result = CommitStageDrainResult {
+            aggregator: PrefixCheckpointAggregator::new(write_context(), 0, 16),
+            committed_sequence_nos: vec![1, 2, 3],
+        };
+
+        let (returned_outcome, returned_submitted, returned_drain) =
+            resolve_filesystem_lease_results(
+                Ok(outcome),
+                Ok(submitted),
+                Ok(Ok(drain_result)),
+                None,
+            )
+            .expect("all-success inputs should return Ok");
+
+        assert_eq!(returned_outcome.termination, PageLoopTermination::Partial);
+        assert_eq!(returned_submitted, vec![1, 2, 3]);
+        assert_eq!(returned_drain.committed_sequence_nos, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn select_shard_completion_uses_recovered_cursor_for_partial_zero_commit_progress() {
+        let completion = select_shard_completion(
+            "shard-1",
+            &Cursor::initial(),
+            PageLoopTermination::Partial,
+            None,
+            Cursor::with_last_key(item_key("tenant/repo/recovered.txt")),
+        )
+        .expect("advanced resume cursor should preserve checkpoint progress");
+
+        let ShardCompletionOutcome::Checkpoint { checkpoint } = completion else {
+            panic!("partial recovery should checkpoint recovered progress, got: {completion:?}");
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"tenant/repo/recovered.txt"
+        );
     }
 
     #[test]
@@ -5640,6 +5735,139 @@ mod tests {
         assert!(
             summaries[0].last_key().is_none(),
             "lease uncertainty must not attempt terminal completion"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_reports_deadline_expiry_after_drain_failure_with_remaining_work() {
+        const SECRET_FILE_COUNT: usize = 12;
+        const SUCCESSFUL_COMMITS_BEFORE_FAILURE: usize = 2;
+        const POLL_ITERATIONS: usize = 2_000;
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+        const LEASE_TTL_MS: u64 = 1_500;
+
+        let dir = tempdir().expect("tempdir");
+        for index in 0..SECRET_FILE_COUNT {
+            let path = dir.path().join(format!("secret-{index:02}.txt"));
+            fs::write(path, secret_fixture()).expect("write secret fixture");
+        }
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], LEASE_TTL_MS);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        done_ledger
+            .set_auto_complete(false)
+            .expect("disable done-ledger auto-complete");
+
+        let recorder = Arc::clone(&identity.recorder);
+        let lease_for_thread = lease.clone();
+        let findings_for_thread = findings_sink.clone();
+        let done_for_thread = done_ledger.clone();
+        let handle = std::thread::spawn(move || {
+            let persistence = DistributedPersistence::new(findings_for_thread, done_for_thread);
+            run_filesystem_lease(
+                recorder,
+                &persistence,
+                &lease_for_thread,
+                DistributedRuntimeConfig {
+                    commit_queue_capacity: NonZeroUsize::new(1)
+                        .expect("non-zero commit queue capacity"),
+                    ..DistributedRuntimeConfig::default()
+                },
+            )
+        });
+
+        let next_pending_done_commit = || {
+            for _ in 0..POLL_ITERATIONS {
+                let pending = done_ledger.pending_ids().expect("pending done-ledger ids");
+                match pending.as_slice() {
+                    [op_id] => return *op_id,
+                    [] => std::thread::sleep(POLL_INTERVAL),
+                    _ => panic!(
+                        "expected one pending done-ledger commit with queue capacity 1, got {}",
+                        pending.len()
+                    ),
+                }
+            }
+            panic!("timed out waiting for a pending done-ledger commit (10s)");
+        };
+
+        for committed in 0..SUCCESSFUL_COMMITS_BEFORE_FAILURE {
+            let op_id = next_pending_done_commit();
+            assert!(
+                done_ledger
+                    .release_specific(op_id)
+                    .expect("release successful done-ledger commit"),
+                "pending done-ledger op should release"
+            );
+
+            for _ in 0..POLL_ITERATIONS {
+                if done_ledger.snapshot().expect("done-ledger snapshot").len() == committed + 1 {
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            assert_eq!(
+                done_ledger.snapshot().expect("done-ledger snapshot").len(),
+                committed + 1,
+                "done-ledger durability did not converge within 10s for commit {committed}"
+            );
+        }
+
+        let failing_op = next_pending_done_commit();
+        done_ledger
+            .fail_next_commits(1)
+            .expect("inject done-ledger commit failure");
+        assert!(
+            done_ledger
+                .release_specific(failing_op)
+                .expect("release failing done-ledger commit"),
+            "failing done-ledger op should release"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !handle.is_finished(),
+            "lease thread should still have outstanding scan or commit work after the failed done-ledger commit"
+        );
+
+        std::thread::sleep(Duration::from_millis(LEASE_TTL_MS + 250));
+        done_ledger
+            .set_auto_complete(true)
+            .expect("re-enable done-ledger auto-complete");
+        for _ in 0..POLL_ITERATIONS {
+            if handle.is_finished() {
+                break;
+            }
+            for op_id in done_ledger.pending_ids().expect("pending done-ledger ids") {
+                assert!(
+                    done_ledger
+                        .release_specific(op_id)
+                        .expect("release pending done-ledger commit"),
+                    "pending done-ledger op should release"
+                );
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(
+            handle.is_finished(),
+            "filesystem lease thread did not terminate within 10s after releasing all pending commits"
+        );
+
+        let error = handle
+            .join()
+            .expect("filesystem lease thread should not panic")
+            .expect_err("deadline expiry should outrank drain failure while work remains active");
+        assert!(
+            matches!(
+                error,
+                DistributedRuntimeError::LeaseUncertain(LeaseUncertainty::DeadlineElapsed { .. })
+            ),
+            "expected deadline-based lease uncertainty, got: {error:?}"
         );
     }
 
