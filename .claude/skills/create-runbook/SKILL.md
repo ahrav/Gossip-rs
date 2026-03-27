@@ -144,6 +144,7 @@ cargo check --all-features
 ```
 
 For PR-scoped runbooks, replace checkout with:
+
 ```bash
 gh pr checkout {{pr_number}}
 ```
@@ -201,6 +202,7 @@ Two parts:
 2. **Checklist** — `- [ ]` markdown items matching every required outcome
 
 Footer (verbatim):
+
 ```markdown
 **If ANY item fails, go back and fix it. Do NOT finish until all items pass.**
 ```
@@ -230,7 +232,7 @@ Run this mental checklist before writing the runbook file:
 
 | Mistake | Fix |
 |---------|-----|
-| Inventing template variables beyond the 5 supported | Add to `run-runbook.sh` first, or use env vars |
+| Inventing template variables beyond the 6 supported | Add to `runbook-params.json` and `run-runbook.sh` first, or use env vars |
 | Using `<<'EOF'` for PR body (suppresses variable expansion) | Use `<<EOF` so `${BEFORE}` etc. expand |
 | Writing output files only at the end | Skeleton in Step 1, update after each step |
 | Placeholder JSON with "fill in later" | Capture data in shell vars, write inline with `cat <<EOF` |
