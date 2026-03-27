@@ -52,6 +52,12 @@ digraph create_runbook {
 | Review branch | `{{review_branch}}` | `runbook-params.json` `.review_branch` |
 | Cargo home | `${CARGO_HOME:-~/.cargo}` | `runbook-params.json` `.CARGO_HOME` |
 
+`{{var}}` placeholders are substituted by `run-runbook.sh` before the runbook
+executes. `${VAR}` entries use normal shell expansion at runtime, so reserve
+them for injected environment variables such as `${GITHUB_TOKEN}` and
+`${CARGO_HOME:-~/.cargo}` or for shell-local variables the runbook defines
+earlier, such as `${BEFORE}` in a generated PR body.
+
 If you need additional parameters, add them to both files:
 1. `runbook-params.json` — add a new key (e.g., `"target_crate": "gossip-stdx"`)
 2. `run-runbook.sh` — add a `jq -r` extraction line and a `${runbook//\{\{new_var\}\}/$var}` substitution
@@ -143,10 +149,11 @@ mkdir -p /app/results
 cargo check --all-features
 ```
 
-For PR-scoped runbooks, replace checkout with:
+For PR-scoped runbooks, replace the checkout/pull sequence with:
 
 ```bash
 gh pr checkout {{pr_number}}
+git log --oneline -5
 ```
 
 Add any domain-specific tool installs (npm packages, cargo tools) after
@@ -219,7 +226,7 @@ Run this mental checklist before writing the runbook file:
 
 | Check | How to verify |
 |-------|---------------|
-| All template vars are in the supported set | grep for `{{` and `${` — only the 6 listed above |
+| Runner-injected placeholders follow the compatibility contract | grep for `{{` — only the supported `{{...}}` placeholders appear; confirm `${...}` uses are either documented runner env vars or shell variables defined earlier |
 | Objective gives full scope in <30 seconds | Read it cold — would a new agent know what to do? |
 | Every output file has a skeleton write in Step 1 | Timeout at minute 5 still produces partial results |
 | No "replace placeholder" instructions | Shell vars expand inline; no deferred substitution |
