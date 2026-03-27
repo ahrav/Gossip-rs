@@ -5285,8 +5285,8 @@ mod tests {
         assert_eq!(extractable.as_str(), "BINARY_EXTRACTABLE");
     }
 
-    /// Capturing event sink that converts borrowed `CoreEvent`s into owned
-    /// snapshots so tests can assert on structured fields after the call.
+    /// Capturing event sink that snapshots borrowed `CoreEvent`s into owned
+    /// values, preserving emitted event data after the original borrow ends.
     #[derive(Default)]
     struct CapturingEventOutput {
         events: Mutex<Vec<OwnedCoreEvent>>,
@@ -6042,8 +6042,8 @@ mod tests {
 
         // The cancel fires during fill_page call #0, so the inner
         // item-submission loop also sees cancellation and skips commits.
-        // The key assertion: the function returns Ok (graceful break in
-        // the AwaitingExhaustedEmpty phase), not Err.
+        // AwaitingExhaustedEmpty treats that path as a graceful break and
+        // returns Ok instead of surfacing an error.
         let _outcome = run_suffix_protocol_test_core(source, cancel, fill_page_calls)
             .expect("cancellation during suffix wait should break gracefully, not error");
     }
