@@ -1393,8 +1393,10 @@ const EMPTY_RANGE_SENTINEL_KEY: &[u8] = b"\x00";
 /// authoritative receipt-backed checkpoint cursor. `Checkpoint` means the scan
 /// stopped early after a checkpointable cursor was available, so the worker
 /// must preserve progress without terminally completing the shard.
-/// `ExhaustedEmpty` means the scan observed exhausted-empty before any durable
-/// committed unit existed, so completion must use a range-safe fallback cursor.
+/// `ExhaustedEmpty` means the scan observed exhausted-empty without producing a
+/// new receipt-backed checkpoint in this claim. Completion preserves the
+/// restored resume cursor when the shard already had prior progress and falls
+/// back to a range-safe cursor only for truly initial empty shards.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ShardCompletionOutcome {
     ExhaustedEmpty,
@@ -1555,14 +1557,14 @@ fn watch_lease_deadline(
     signal: LeaseUncertaintySignal,
 ) {
     loop {
-        if done.load(Ordering::Acquire) {
-            return;
-        }
-
         if let Some(reason) = armed_deadline.expiry_reason() {
             if signal.note(reason) {
                 cancel.cancel();
             }
+            return;
+        }
+
+        if done.load(Ordering::Acquire) {
             return;
         }
 
@@ -1881,6 +1883,12 @@ where
         let (page, terminal) = match OrderedContentRuntime::execute_source(source, &runtime_input)?
         {
             OrderedContentExecutionOutcome::ExhaustedEmpty => {
+                if phase == PageLoopPhase::Paging && executed_any_page {
+                    return Err(ScanRuntimeError::Driver(anyhow!(
+                        "ordered-content source reported exhausted-empty \
+                         without first emitting a terminal non-empty page"
+                    )));
+                }
                 termination = PageLoopTermination::ExhaustedEmptyConfirmed;
                 break;
             }
@@ -3220,9 +3228,10 @@ mod tests {
     }
 
     #[test]
-    fn watch_lease_deadline_exits_immediately_when_done_on_entry() {
+    fn watch_lease_deadline_records_open_expiry_before_done_exit() {
         let signal = LeaseUncertaintySignal::default();
         let cancel = CancellationToken::new();
+
         let expired = Instant::now() - Duration::from_secs(1);
         watch_lease_deadline(
             ArmedLeaseDeadline {
@@ -3233,14 +3242,16 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             signal.clone(),
         );
+
         assert!(
-            !cancel.is_cancelled(),
-            "done-on-entry must prevent cancellation even with an expired deadline"
+            cancel.is_cancelled(),
+            "open signal must still cancel when expiry wins over done"
         );
-        assert!(
-            signal.current().is_none(),
-            "done-on-entry must prevent recording a deadline reason"
-        );
+        assert!(matches!(
+            signal.current(),
+            Some(LeaseUncertainty::DeadlineElapsed { deadline, .. })
+                if deadline == LogicalTime::from_raw(1)
+        ));
     }
 
     #[test]
@@ -5983,8 +5994,8 @@ mod tests {
         assert_eq!(extractable.as_str(), "BINARY_EXTRACTABLE");
     }
 
-    /// Capturing event sink that converts borrowed `CoreEvent`s into owned
-    /// snapshots so tests can assert on structured fields after the call.
+    /// Capturing event sink that snapshots borrowed `CoreEvent`s into owned
+    /// values, preserving emitted event data after the original borrow ends.
     #[derive(Default)]
     struct CapturingEventOutput {
         events: Mutex<Vec<OwnedCoreEvent>>,
@@ -6683,6 +6694,26 @@ mod tests {
     }
 
     #[test]
+    fn suffix_protocol_rejects_exhausted_empty_after_has_more_page() {
+        let has_more_page = PageBuf::try_new(
+            vec![suffix_test_item(b"a.txt", 10)],
+            PageState::HasMore {
+                cursor: Cursor::with_last_key(item_key("a.txt")),
+            },
+        )
+        .expect("has-more page");
+
+        let err = run_suffix_protocol_test(vec![Ok(Some(has_more_page)), Ok(None)])
+            .expect_err("exhausted-empty after has-more should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("exhausted-empty without first emitting a terminal non-empty page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn suffix_protocol_preserves_progress_on_retryable_stop_after_terminal_page() {
         let terminal_page =
             PageBuf::try_new(vec![suffix_test_item(b"a.txt", 10)], PageState::Complete)
@@ -6746,8 +6777,8 @@ mod tests {
 
         // The cancel fires during fill_page call #0, so the inner
         // item-submission loop also sees cancellation and skips commits.
-        // The key assertion: the function returns Ok (graceful break in
-        // the AwaitingExhaustedEmpty phase), not Err.
+        // AwaitingExhaustedEmpty treats that path as a graceful break and
+        // returns Ok instead of surfacing an error.
         let _outcome = run_suffix_protocol_test_core(source, cancel, fill_page_calls)
             .expect("cancellation during suffix wait should break gracefully, not error");
     }

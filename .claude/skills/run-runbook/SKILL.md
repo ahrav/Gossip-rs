@@ -37,7 +37,7 @@ Use concrete values in the JSON file instead of shell expressions:
 
 | Parameter | Default | Override for |
 |-----------|---------|-------------|
-| `timeout_sec` | 3600 (1hr) | Long audits: 7200 (2hr), 10800 (3hr) |
+| `timeout_sec` | 3600 (1 hr) | Long audits: 7200 (2 hr), 10800 (3 hr) |
 | `pr_number` | varies | PR-specific runbooks (reviews, comment response) |
 | `base_branch` | `main` | Auditing a different branch |
 
