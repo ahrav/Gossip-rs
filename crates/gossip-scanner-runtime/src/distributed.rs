@@ -2435,6 +2435,359 @@ mod tests {
         ordered_content::OrderedContentSkipReason,
     };
 
+    const DISTRIBUTED_TEST_PATH: &str = "crates/gossip-scanner-runtime/src/distributed.rs";
+    const DISTRIBUTED_TEST_SOURCE: &str = include_str!("distributed.rs");
+    const RUNTIME_DURABILITY_TEST_PATH: &str =
+        "crates/gossip-scanner-runtime/src/runtime_durability_tests.rs";
+    const RUNTIME_DURABILITY_TEST_SOURCE: &str = include_str!("runtime_durability_tests.rs");
+    const REAL_BACKEND_TEST_PATH: &str = "crates/gossip-worker/tests/real_backend_launch_proof.rs";
+    const REAL_BACKEND_TEST_SOURCE: &str =
+        include_str!("../../gossip-worker/tests/real_backend_launch_proof.rs");
+    const FILESYSTEM_CONNECTOR_TEST_PATH: &str = "crates/gossip-connectors/src/filesystem_tests.rs";
+    const FILESYSTEM_CONNECTOR_TEST_SOURCE: &str =
+        include_str!("../../gossip-connectors/src/filesystem_tests.rs");
+
+    /// Epic 2 filesystem failure requirements that must remain covered by at
+    /// least one named proof.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum FilesystemFailureSuiteCase {
+        Ordering,
+        RangeMembership,
+        TokenFallback,
+        PrefixCommit,
+        ExhaustedEmptyBehavior,
+        NonEmptyFinalPageBehavior,
+        LeaseLossMidPage,
+        RetryAfterReassignment,
+    }
+
+    impl FilesystemFailureSuiteCase {
+        const ALL: [Self; 8] = [
+            Self::Ordering,
+            Self::RangeMembership,
+            Self::TokenFallback,
+            Self::PrefixCommit,
+            Self::ExhaustedEmptyBehavior,
+            Self::NonEmptyFinalPageBehavior,
+            Self::LeaseLossMidPage,
+            Self::RetryAfterReassignment,
+        ];
+
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Ordering => "ordering",
+                Self::RangeMembership => "range membership",
+                Self::TokenFallback => "token fallback",
+                Self::PrefixCommit => "prefix commit",
+                Self::ExhaustedEmptyBehavior => "exhausted-empty behavior",
+                Self::NonEmptyFinalPageBehavior => "non-empty final-page behavior",
+                Self::LeaseLossMidPage => "lease loss mid-page",
+                Self::RetryAfterReassignment => "retry after reassignment",
+            }
+        }
+    }
+
+    // Compile-time exhaustiveness guard: adding or removing a variant forces
+    // a compile error here because the match has no wildcard. Update both
+    // `ALL` and this guard when the variant set changes.
+    const _: () = {
+        const fn _exhaustive(c: FilesystemFailureSuiteCase) -> u8 {
+            match c {
+                FilesystemFailureSuiteCase::Ordering => 0,
+                FilesystemFailureSuiteCase::RangeMembership => 1,
+                FilesystemFailureSuiteCase::TokenFallback => 2,
+                FilesystemFailureSuiteCase::PrefixCommit => 3,
+                FilesystemFailureSuiteCase::ExhaustedEmptyBehavior => 4,
+                FilesystemFailureSuiteCase::NonEmptyFinalPageBehavior => 5,
+                FilesystemFailureSuiteCase::LeaseLossMidPage => 6,
+                FilesystemFailureSuiteCase::RetryAfterReassignment => 7,
+            }
+        }
+        let _ = _exhaustive(FilesystemFailureSuiteCase::Ordering);
+        assert!(FilesystemFailureSuiteCase::ALL.len() == 8);
+    };
+
+    /// Boundary where a failure mode is proved.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum FilesystemFailureSuiteBoundary {
+        ConnectorConformance,
+        RuntimeDurability,
+        DistributedRuntime,
+        RealBackend,
+    }
+
+    /// One auditable mapping from a failure requirement to a concrete test.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FilesystemFailureSuiteProof {
+        case: FilesystemFailureSuiteCase,
+        boundary: FilesystemFailureSuiteBoundary,
+        source_path: &'static str,
+        source_text: &'static str,
+        test_name: &'static str,
+        coverage_note: &'static str,
+    }
+
+    /// Audit map from each Epic 2 filesystem failure requirement to the test
+    /// that proves it at the intended boundary.
+    const FILESYSTEM_FAILURE_SUITE_PROOFS: &[FilesystemFailureSuiteProof] = &[
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::Ordering,
+            boundary: FilesystemFailureSuiteBoundary::ConnectorConformance,
+            source_path: FILESYSTEM_CONNECTOR_TEST_PATH,
+            source_text: FILESYSTEM_CONNECTOR_TEST_SOURCE,
+            test_name: "ordered_content_conformance_matches_sorted_random_files",
+            coverage_note: "Runs ordered-content conformance against FilesystemConnector over randomized fixtures, so the full drain must stay sorted and repeatable.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::RangeMembership,
+            boundary: FilesystemFailureSuiteBoundary::ConnectorConformance,
+            source_path: FILESYSTEM_CONNECTOR_TEST_PATH,
+            source_text: FILESYSTEM_CONNECTOR_TEST_SOURCE,
+            test_name: "ordered_content_conformance_accepts_bounded_fixture_and_root_canary",
+            coverage_note: "Runs filesystem conformance under explicit shard bounds and asserts only in-range keys drain from the bounded fixture.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::TokenFallback,
+            boundary: FilesystemFailureSuiteBoundary::ConnectorConformance,
+            source_path: FILESYSTEM_CONNECTOR_TEST_PATH,
+            source_text: FILESYSTEM_CONNECTOR_TEST_SOURCE,
+            test_name: "ordered_content_conformance_accepts_bounded_fixture_and_root_canary",
+            coverage_note: "run_ordered_content_conformance includes the corrupt-token versus key-only resume probe for FilesystemConnector.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::PrefixCommit,
+            boundary: FilesystemFailureSuiteBoundary::RuntimeDurability,
+            source_path: RUNTIME_DURABILITY_TEST_PATH,
+            source_text: RUNTIME_DURABILITY_TEST_SOURCE,
+            test_name: "real_receipts_only_advance_the_contiguous_prefix",
+            coverage_note: "Out-of-order durable receipts stay buffered until the missing earlier receipt arrives, so checkpoint progress follows the committed prefix.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::ExhaustedEmptyBehavior,
+            boundary: FilesystemFailureSuiteBoundary::DistributedRuntime,
+            source_path: DISTRIBUTED_TEST_PATH,
+            source_text: DISTRIBUTED_TEST_SOURCE,
+            test_name: "run_filesystem_lease_zero_item_shard_returns_exhausted_empty_completion",
+            coverage_note: "An empty filesystem shard completes as ExhaustedEmpty and leaves the done ledger untouched.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::ExhaustedEmptyBehavior,
+            boundary: FilesystemFailureSuiteBoundary::DistributedRuntime,
+            source_path: DISTRIBUTED_TEST_PATH,
+            source_text: DISTRIBUTED_TEST_SOURCE,
+            test_name: "advance_shard_exhausted_empty_unbounded_lower_bound_uses_range_safe_sentinel",
+            coverage_note: "The exhausted-empty completion cursor stays range-safe even when the shard has no lower bound.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::NonEmptyFinalPageBehavior,
+            boundary: FilesystemFailureSuiteBoundary::DistributedRuntime,
+            source_path: DISTRIBUTED_TEST_PATH,
+            source_text: DISTRIBUTED_TEST_SOURCE,
+            test_name: "run_filesystem_lease_complete_path_scans_required_exhausted_empty_suffix",
+            coverage_note: "A non-empty terminal page still requires the final exhausted-empty suffix before the shard can complete.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::NonEmptyFinalPageBehavior,
+            boundary: FilesystemFailureSuiteBoundary::DistributedRuntime,
+            source_path: DISTRIBUTED_TEST_PATH,
+            source_text: DISTRIBUTED_TEST_SOURCE,
+            test_name: "run_filesystem_lease_multi_page_terminal_exhausted_empty_sequence",
+            coverage_note: "A multi-page shard completes with the last committed key from the terminal page after the page loop drains to exhaustion.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::NonEmptyFinalPageBehavior,
+            boundary: FilesystemFailureSuiteBoundary::DistributedRuntime,
+            source_path: DISTRIBUTED_TEST_PATH,
+            source_text: DISTRIBUTED_TEST_SOURCE,
+            test_name: "run_filesystem_lease_all_already_done_terminal_recovery_returns_complete_cursor",
+            coverage_note: "Replaying an already-done terminal shard preserves the terminal cursor instead of downgrading it to exhausted-empty.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::LeaseLossMidPage,
+            boundary: FilesystemFailureSuiteBoundary::DistributedRuntime,
+            source_path: DISTRIBUTED_TEST_PATH,
+            source_text: DISTRIBUTED_TEST_SOURCE,
+            test_name: "run_filesystem_lease_reports_deadline_expiry_before_completion",
+            coverage_note: "Mid-shard lease expiry after one durable commit aborts the lease without terminal completion or cursor advancement.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::LeaseLossMidPage,
+            boundary: FilesystemFailureSuiteBoundary::RealBackend,
+            source_path: REAL_BACKEND_TEST_PATH,
+            source_text: REAL_BACKEND_TEST_SOURCE,
+            test_name: "stale_fence_smoke_rejects_progress_after_owner_lease_loss",
+            coverage_note: "Live etcd owner-lease loss rejects zombie checkpoint and renew calls before a replacement worker reacquires the shard.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::RetryAfterReassignment,
+            boundary: FilesystemFailureSuiteBoundary::RuntimeDurability,
+            source_path: RUNTIME_DURABILITY_TEST_PATH,
+            source_text: RUNTIME_DURABILITY_TEST_SOURCE,
+            test_name: "crash_after_ledger_before_checkpoint_allows_reassignment_retry_and_rejects_stale_fence",
+            coverage_note: "After reassignment, the higher-fence retry re-establishes checkpointable progress without duplicating durable rows.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::RetryAfterReassignment,
+            boundary: FilesystemFailureSuiteBoundary::DistributedRuntime,
+            source_path: DISTRIBUTED_TEST_PATH,
+            source_text: DISTRIBUTED_TEST_SOURCE,
+            test_name: "run_worker_recovers_from_partial_done_ledger_failure_without_duplicate_rows",
+            coverage_note: "A recovered worker reacquires under a higher fence and commits only the missing suffix after the first attempt crashes mid-shard.",
+        },
+        FilesystemFailureSuiteProof {
+            case: FilesystemFailureSuiteCase::RetryAfterReassignment,
+            boundary: FilesystemFailureSuiteBoundary::RealBackend,
+            source_path: REAL_BACKEND_TEST_PATH,
+            source_text: REAL_BACKEND_TEST_SOURCE,
+            test_name: "stale_fence_smoke_rejects_progress_after_owner_lease_loss",
+            coverage_note: "The live-backend smoke test exercises replacement-worker reacquisition and successful post-loss checkpoint progress.",
+        },
+    ];
+
+    /// Guards the audit map against missing requirements and stale test names.
+    #[test]
+    fn filesystem_distributed_failure_suite_matrix_covers_every_epic_2_case() {
+        let mut seen = std::collections::BTreeSet::new();
+        for proof in FILESYSTEM_FAILURE_SUITE_PROOFS {
+            assert!(
+                !proof.coverage_note.is_empty(),
+                "{}::{} must explain how it proves {}",
+                proof.source_path,
+                proof.test_name,
+                proof.case.as_str(),
+            );
+
+            let needle = format!("fn {}(", proof.test_name);
+            assert!(
+                proof.source_text.contains(&needle),
+                "failure-suite matrix points at missing proof {}::{}; update the matrix entry",
+                proof.source_path,
+                proof.test_name,
+            );
+
+            assert!(
+                seen.insert((proof.case, proof.boundary, proof.test_name)),
+                "duplicate failure-suite proof entry for {} at {}::{}",
+                proof.case.as_str(),
+                proof.source_path,
+                proof.test_name,
+            );
+        }
+
+        for case in FilesystemFailureSuiteCase::ALL {
+            assert!(
+                FILESYSTEM_FAILURE_SUITE_PROOFS
+                    .iter()
+                    .any(|proof| proof.case == case),
+                "missing failure-suite proof for {}",
+                case.as_str(),
+            );
+        }
+    }
+
+    /// Freezes the intended boundary split so future edits do not drift into
+    /// duplicate or misplaced proofs.
+    #[test]
+    fn filesystem_distributed_failure_suite_matrix_uses_intentional_boundaries() {
+        let has_proof = |case, boundary| {
+            FILESYSTEM_FAILURE_SUITE_PROOFS
+                .iter()
+                .any(|proof| proof.case == case && proof.boundary == boundary)
+        };
+
+        // Bidirectional guard: the individual assertions below catch removals;
+        // this count catches unexpected additions of new (case, boundary) pairs.
+        let actual_pairs: std::collections::BTreeSet<_> = FILESYSTEM_FAILURE_SUITE_PROOFS
+            .iter()
+            .map(|p| (p.case, p.boundary))
+            .collect();
+        assert_eq!(
+            actual_pairs.len(),
+            11,
+            "boundary split changed: expected 11 unique (case, boundary) pairs, found {}; \
+             update the assertions below when adding or removing boundary assignments",
+            actual_pairs.len(),
+        );
+
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::Ordering,
+                FilesystemFailureSuiteBoundary::ConnectorConformance,
+            ),
+            "ordering should stay proved at the connector conformance boundary"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::RangeMembership,
+                FilesystemFailureSuiteBoundary::ConnectorConformance,
+            ),
+            "range membership should stay proved at the connector conformance boundary"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::TokenFallback,
+                FilesystemFailureSuiteBoundary::ConnectorConformance,
+            ),
+            "token fallback should stay proved at the connector conformance boundary"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::PrefixCommit,
+                FilesystemFailureSuiteBoundary::RuntimeDurability,
+            ),
+            "prefix commit should stay proved at the receipt-durability boundary"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::ExhaustedEmptyBehavior,
+                FilesystemFailureSuiteBoundary::DistributedRuntime,
+            ),
+            "exhausted-empty behavior should stay proved in the distributed runtime"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::NonEmptyFinalPageBehavior,
+                FilesystemFailureSuiteBoundary::DistributedRuntime,
+            ),
+            "non-empty final-page behavior should stay proved in the distributed runtime"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::LeaseLossMidPage,
+                FilesystemFailureSuiteBoundary::DistributedRuntime,
+            ),
+            "lease loss mid-page should stay proved in the distributed runtime"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::LeaseLossMidPage,
+                FilesystemFailureSuiteBoundary::RealBackend,
+            ),
+            "lease loss mid-page should retain a live-backend proof"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::RetryAfterReassignment,
+                FilesystemFailureSuiteBoundary::RuntimeDurability,
+            ),
+            "retry after reassignment should stay proved at the receipt-durability boundary"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::RetryAfterReassignment,
+                FilesystemFailureSuiteBoundary::DistributedRuntime,
+            ),
+            "retry after reassignment should stay proved in the filesystem worker runtime"
+        );
+        assert!(
+            has_proof(
+                FilesystemFailureSuiteCase::RetryAfterReassignment,
+                FilesystemFailureSuiteBoundary::RealBackend,
+            ),
+            "retry after reassignment should retain a live-backend proof"
+        );
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct StubFindings(u8);
 
