@@ -105,7 +105,7 @@ Connector-mode filesystem scans acquire one ordered page through
 `FilesystemConnector`, validate shard bounds and cursor monotonicity,
 and classify enumerate failures from the connector error taxonomy. The
 runtime maps the ordered filesystem path onto explicit
-`FilesystemShardCompletionOutcome` variants: `ExhaustedEmpty` only after
+`ShardCompletionOutcome` variants: `ExhaustedEmpty` only after
 the connector confirms exhausted-empty (`Ok(None)` at the page-fill
 boundary), `Complete { checkpoint }` after a terminal non-empty page is
 followed by that exhausted-empty suffix call, and `Checkpoint {
@@ -131,12 +131,40 @@ The distributed module exports the concrete worker-loop types and helpers:
 `DistributedRuntimeError`. The runtime depends directly on
 `gossip-coordination` for claim and completion operations and on
 `gossip-frontier` for shard metadata decoding. Filesystem lease
-execution returns an explicit `FilesystemShardCompletionOutcome`:
-`Complete { checkpoint }` uses the committed-prefix cursor for terminal
-completion, `Checkpoint { checkpoint }` preserves non-terminal progress
-through coordination `checkpoint`, and `ExhaustedEmpty` derives a
-range-safe fallback cursor only when the scan truly observed
-exhausted-empty before any durable committed unit existed.
+execution starts a lease-deadline watchdog that drives the shared
+`CancellationToken` when the claimed lease is no longer trustworthy.
+The watchdog compares against a monotonic `Instant`-based deadline
+(converted from the coordinator-provided logical lease deadline at
+claim time) so `CLOCK_REALTIME` jumps from NTP corrections or VM
+migration cannot cause false-positive or false-negative expiry
+detection. The
+watchdog uses `std::thread::park_timeout` instead of `thread::sleep`
+so the main thread can wake it immediately via `unpark()` when shard
+execution finishes, avoiding up to one polling interval of exit
+latency. Successful receipt-drain completion seals the local deadline
+signal before the watchdog joins. This ensures any lease rejection
+after durable local completion is decided by the coordinator
+`complete`/`checkpoint` call rather than by a late local watchdog tick.
+Coordinator-side `StaleFence` and `LeaseExpired` rejections from both
+`checkpoint` and `complete` are normalized to
+`DistributedRuntimeError::LeaseUncertain`, preserving the lease-loss
+classification after local durable progress exists.
+The ordered page loop polls that token between page acquisitions and
+before queueing new commit work so expiry stops the shard before more
+items are enqueued. Claim retry delays honor coordinator-provided
+`retry_after` and `earliest_deadline` floors directly, falling back to
+the fixed race-retry delay only when no logical wakeup hint is
+available. Successful filesystem lease execution returns an
+explicit `ShardCompletionOutcome`: `Complete { checkpoint }` uses the
+committed-prefix cursor for terminal completion,
+`Checkpoint { checkpoint }` preserves non-terminal progress through
+coordination `checkpoint`, and `ExhaustedEmpty` derives a range-safe
+fallback cursor only when the scan truly observed exhausted-empty
+before any durable committed unit existed. If the deadline elapses
+first, or if `complete` rejects a stale or expired lease, the worker
+surfaces `DistributedRuntimeError::LeaseUncertain` and leaves the
+shard for a higher-fence reassignment to resume from durable receipt
+and done-ledger state.
 
 ### Family split
 
@@ -442,10 +470,13 @@ the receipt-driven durability model:
    `wait_for_submitted_commits` and verifies that the durable receipt count
    matches the number of items submitted to the commit pipeline.
 7. Prepares a checkpoint prefix from the aggregator, acknowledges the
-   checkpoint to advance the aggregator watermark, and returns the checkpoint
-   cursor to the caller. Shards with zero durable commit units (empty
-   directories or directories where no file produced durable rows) return no
-   checkpoint cursor.
+   checkpoint to advance the aggregator watermark, and returns an explicit
+   `ShardCompletionOutcome` to the caller. Receipt-backed progress yields
+   `Complete { checkpoint }` or `Checkpoint { checkpoint }`, while a
+   replay-only terminal recovery can still return `Complete { checkpoint }`
+   from the recovered resume cursor even when this claim produced no new
+   durable receipts. `ExhaustedEmpty` is reserved for shards that are
+   confirmed empty and have no durable coverage to preserve.
 
 If any step fails, the shard is not completed in coordination and will be
 retried when the lease expires.
@@ -455,10 +486,10 @@ retried when the lease expires.
 `run_worker` is the top-level distributed lease loop. It acquires leases until
 the coordinator returns no more active work, counts every claimed lease in
 `DistributedRunReport`, routes each lease through `run_filesystem_lease`, and
-then completes it directly against the coordination backend. Completion uses
-the receipt-derived checkpoint cursor when one exists; otherwise it falls back
-to the shard's range start so `CursorSemantics::Completed` runs still advance
-terminal state for clean or empty shards.
+then advances it directly against the coordination backend. `advance_shard`
+uses the explicit `ShardCompletionOutcome`: `Complete` and `Checkpoint`
+forward their cursor, while `ExhaustedEmpty` derives a range-safe empty-shard
+cursor from the restored lease state.
 
 Unit tests exercise this loop through `gossip_coordination::InMemoryCoordinator`,
 which is the same reference backend used elsewhere in the coordination layer.
@@ -620,14 +651,10 @@ pub struct ShardLease {
     shard_id: Arc<str>,
     /// Authoritative coordination-layer lease used for terminal completion.
     lease: Lease,
-    /// Authoritative shard bounds and metadata restored from acquire/restore state.
-    shard_spec: ShardSpec,
-    /// Authoritative resume cursor restored from acquire/restore state.
-    resume_cursor: Cursor,
-    /// Coordination cursor semantics for this shard.
-    cursor_semantics: CursorSemantics,
-    /// Filesystem scan configuration for this shard.
-    scan_config: FsScanConfig,
+    /// Authoritative shard bounds, resume cursor, and cursor semantics.
+    state: RestoredShardState,
+    /// Hydrated filesystem source configuration plus explicit source mode.
+    filesystem_source: HydratedFilesystemSource,
     /// Shared routing and fencing metadata for all writes emitted under the lease.
     write_context: WriteContext,
     /// Tenant secret key used for secret-hash derivation.
@@ -669,9 +696,10 @@ completion helpers.
 `ShardLease` is the hand-off object from `gossip-coordination` into the worker
 loop. It keeps the string shard label used for recorder routing separate from
 the numeric shard identity carried inside `Lease` and `WriteContext`, stores
-the authoritative shard bounds and resume state (`shard_spec`,
-`resume_cursor`, `cursor_semantics`), and carries the filesystem scan config
-derived from the claimed shard spec plus connector metadata.
+the authoritative restored shard state (`RestoredShardState`, including shard
+bounds plus any resume cursor and cursor semantics), and carries the hydrated
+filesystem source state (`HydratedFilesystemSource`) that pairs the per-shard
+scan configuration with the explicit source mode decoded from shard metadata.
 
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones
