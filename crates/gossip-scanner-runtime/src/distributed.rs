@@ -2344,7 +2344,7 @@ mod tests {
     };
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
     use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
-    use gossip_persistence_inmemory::{InMemoryDoneLedger, InMemoryFindingsSink};
+    use gossip_persistence_inmemory::{CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink};
     use scanner_scheduler::events::NullEventOutput;
     use tempfile::tempdir;
 
@@ -4223,6 +4223,400 @@ mod tests {
                 .is_empty(),
             "the committed ordered items should still emit durable findings"
         );
+    }
+
+    #[test]
+    fn run_filesystem_lease_backpressures_when_findings_sink_is_slow() {
+        const SECRET_FILE_COUNT: usize = 4;
+        const POLL_ITERATIONS: usize = 2_000;
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+        let dir = tempdir().expect("tempdir");
+        for index in 0..SECRET_FILE_COUNT {
+            let path = dir.path().join(format!("secret-{index:02}.txt"));
+            fs::write(path, secret_fixture()).expect("write secret fixture");
+        }
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        let findings_sink = InMemoryFindingsSink::with_auto_complete(false);
+        let done_ledger = InMemoryDoneLedger::new();
+        let recorder = Arc::clone(&identity.recorder);
+        let lease_for_thread = lease.clone();
+        let findings_for_thread = findings_sink.clone();
+        let done_for_thread = done_ledger.clone();
+        let handle = std::thread::spawn(move || {
+            let persistence = DistributedPersistence::new(findings_for_thread, done_for_thread);
+            run_filesystem_lease(
+                recorder,
+                &persistence,
+                &lease_for_thread,
+                DistributedRuntimeConfig {
+                    commit_queue_capacity: NonZeroUsize::new(1)
+                        .expect("non-zero commit queue capacity"),
+                    ..DistributedRuntimeConfig::default()
+                },
+            )
+        });
+
+        for _ in 0..POLL_ITERATIONS {
+            if findings_sink.pending_count().expect("pending count") == 1 {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert_eq!(
+            findings_sink.pending_count().expect("pending count"),
+            1,
+            "queue capacity 1 should expose exactly one blocked findings write"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "done-ledger must stay empty until the first blocked findings write is released"
+        );
+
+        // With queue capacity 1, the first blocked findings write stalls the
+        // commit worker, the second item can occupy the execution queue, and
+        // any later ordered submission must stop behind that bound.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            findings_sink.pending_count().expect("pending count"),
+            1,
+            "the ordered filesystem runtime must stop at the bounded findings write instead of accumulating more pending writes"
+        );
+        assert!(
+            !handle.is_finished(),
+            "run_filesystem_lease should remain blocked while the bounded commit queue backpressures ordered execution"
+        );
+
+        for _ in 0..POLL_ITERATIONS {
+            if handle.is_finished() {
+                break;
+            }
+            findings_sink
+                .release_all(CompletionOrder::OldestFirst)
+                .expect("release pending findings writes");
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(
+            handle.is_finished(),
+            "filesystem lease thread did not complete within 10s after findings writes were released"
+        );
+
+        let (report, completion) = handle
+            .join()
+            .expect("filesystem lease thread should not panic")
+            .expect("filesystem lease should succeed once findings writes are released");
+
+        assert_eq!(report.items_scanned, SECRET_FILE_COUNT as u64);
+        let ShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("fully scanned shard should complete after backpressure clears");
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"secret-03.txt"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            SECRET_FILE_COUNT,
+            "every item should produce one durable done-ledger row after the blocked findings writes drain"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.status() == DoneLedgerStatus::ScannedWithFindings),
+            "all committed rows should preserve the findings-bearing status"
+        );
+    }
+
+    #[test]
+    fn run_filesystem_lease_backpressures_when_done_ledger_is_slow() {
+        const SECRET_FILE_COUNT: usize = 4;
+        const POLL_ITERATIONS: usize = 2_000;
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+        let dir = tempdir().expect("tempdir");
+        for index in 0..SECRET_FILE_COUNT {
+            let path = dir.path().join(format!("secret-{index:02}.txt"));
+            fs::write(path, secret_fixture()).expect("write secret fixture");
+        }
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::with_auto_complete(false);
+        let recorder = Arc::clone(&identity.recorder);
+        let lease_for_thread = lease.clone();
+        let findings_for_thread = findings_sink.clone();
+        let done_for_thread = done_ledger.clone();
+        let handle = std::thread::spawn(move || {
+            let persistence = DistributedPersistence::new(findings_for_thread, done_for_thread);
+            run_filesystem_lease(
+                recorder,
+                &persistence,
+                &lease_for_thread,
+                DistributedRuntimeConfig {
+                    commit_queue_capacity: NonZeroUsize::new(1)
+                        .expect("non-zero commit queue capacity"),
+                    ..DistributedRuntimeConfig::default()
+                },
+            )
+        });
+
+        for _ in 0..POLL_ITERATIONS {
+            if done_ledger
+                .pending_count()
+                .expect("pending done-ledger count")
+                == 1
+            {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert_eq!(
+            done_ledger
+                .pending_count()
+                .expect("pending done-ledger count"),
+            1,
+            "queue capacity 1 should expose exactly one blocked done-ledger write"
+        );
+        assert!(
+            !findings_sink
+                .observations_snapshot()
+                .expect("observations snapshot")
+                .is_empty(),
+            "findings should already be durable before the blocked done-ledger write completes"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "the blocked done-ledger write must prevent durable row advancement"
+        );
+
+        // Findings durability may already have succeeded for the leading item,
+        // but queue capacity 1 still requires the ordered runtime to stop once
+        // the first done-ledger commit is waiting for release.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            done_ledger
+                .pending_count()
+                .expect("pending done-ledger count"),
+            1,
+            "the ordered filesystem runtime must stop at the bounded done-ledger write instead of stacking more pending rows"
+        );
+        assert!(
+            !handle.is_finished(),
+            "run_filesystem_lease should remain blocked while the done-ledger write stalls the commit stage"
+        );
+
+        for _ in 0..POLL_ITERATIONS {
+            if handle.is_finished() {
+                break;
+            }
+            done_ledger
+                .release_all(CompletionOrder::OldestFirst)
+                .expect("release pending done-ledger writes");
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(
+            handle.is_finished(),
+            "filesystem lease thread did not complete within 10s after done-ledger writes were released"
+        );
+
+        let (report, completion) = handle
+            .join()
+            .expect("filesystem lease thread should not panic")
+            .expect("filesystem lease should succeed once done-ledger writes are released");
+
+        assert_eq!(report.items_scanned, SECRET_FILE_COUNT as u64);
+        let ShardCompletionOutcome::Complete { checkpoint } = completion else {
+            panic!("fully scanned shard should complete after backpressure clears");
+        };
+        assert_eq!(
+            checkpoint
+                .last_key()
+                .expect("checkpoint last_key")
+                .as_bytes(),
+            b"secret-03.txt"
+        );
+
+        let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+        assert_eq!(
+            rows.len(),
+            SECRET_FILE_COUNT,
+            "every item should produce one durable done-ledger row after the blocked ledger writes drain"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.status() == DoneLedgerStatus::ScannedWithFindings),
+            "all committed rows should preserve the findings-bearing status"
+        );
+    }
+
+    #[test]
+    fn ordered_filesystem_scan_backpressures_when_outcomes_are_not_drained() {
+        const SECRET_FILE_COUNT: usize = 5;
+        const POLL_ITERATIONS: usize = 2_000;
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+        let dir = tempdir().expect("tempdir");
+        for index in 0..SECRET_FILE_COUNT {
+            let path = dir.path().join(format!("secret-{index:02}.txt"));
+            fs::write(path, secret_fixture()).expect("write secret fixture");
+        }
+
+        let mut coordinator =
+            setup_coordinator_with_ranges(&[(dir.path(), b"\x00", b"\xFF")], 30_000);
+        let identity = worker_identity(Path::new("/fallback"));
+        let lease = claim_lease(&mut coordinator, &identity);
+        let done_ledger = InMemoryDoneLedger::new();
+        let scan_config = lease
+            .scan_config()
+            .clone()
+            .with_workers(1)
+            .with_persist_findings(true);
+        let engine = build_runtime_engine(
+            scan_config.rules_file.as_deref(),
+            &scan_config.transform_filter,
+            scan_config.decode_depth,
+            scan_config.anchor_mode,
+        )
+        .expect("engine");
+        let pipeline = CommitPipeline::start(
+            InMemoryFindingsSink::new(),
+            done_ledger.clone(),
+            CommitPipelineConfig {
+                execution_queue_capacity: 1,
+                outcome_queue_capacity: 1,
+            },
+            CancellationToken::new(),
+        )
+        .expect("pipeline");
+        let sender = pipeline.sender();
+        let recorder = Arc::new(Recorder::default());
+        let lease_for_thread = lease.clone();
+        let done_for_thread = done_ledger.clone();
+        let engine_for_thread = Arc::clone(&engine);
+        let scan_handle = std::thread::spawn(move || {
+            let out = NullEventOutput;
+            let cancel = CancellationToken::new();
+            let rule_fingerprint = {
+                let engine = Arc::clone(&engine_for_thread);
+                Arc::new(move |rule_id: u32| {
+                    RuleFingerprint::from_bytes(engine.rule_fingerprint_bytes(rule_id))
+                }) as Arc<dyn Fn(u32) -> RuleFingerprint + Send + Sync>
+            };
+            let commit = ReceiptCommitSink::new(
+                recorder,
+                Arc::clone(lease_for_thread.shard_id_arc()),
+                lease_for_thread.write_context(),
+                lease_for_thread.tenant_secret_key(),
+                rule_fingerprint,
+                sender,
+            );
+            let outcome = scan_ordered_filesystem_lease_with_engine(
+                &lease_for_thread,
+                &scan_config,
+                &done_for_thread,
+                engine_for_thread,
+                &out,
+                &commit,
+                &cancel,
+            );
+            let submitted = commit.finish();
+            (outcome, submitted)
+        });
+
+        let durable_before_block = loop {
+            let durable_rows = done_ledger.snapshot().expect("done-ledger snapshot").len();
+            if durable_rows >= 2 {
+                break durable_rows;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        };
+
+        // Outcome capacity 1 with no drainer means the first committed outcome
+        // occupies the queue and the next outcome send stalls the worker.
+        // Stable durable-row count across this window shows the ordered scan is
+        // waiting on the bounded outcome channel rather than still advancing.
+        std::thread::sleep(Duration::from_millis(200));
+        let durable_after_block = done_ledger.snapshot().expect("done-ledger snapshot").len();
+        assert_eq!(
+            durable_after_block, durable_before_block,
+            "without draining commit outcomes, durable progress must stop once the bounded outcome queue fills"
+        );
+        assert!(
+            !scan_handle.is_finished(),
+            "ordered filesystem scan should block once outcome delivery backpressures the receipt bridge"
+        );
+
+        let mut drained = 0usize;
+        for _ in 0..POLL_ITERATIONS {
+            if scan_handle.is_finished() {
+                break;
+            }
+            match pipeline.recv_timeout(POLL_INTERVAL) {
+                Ok(CommitStageOutput::Committed { .. }) => drained += 1,
+                Ok(CommitStageOutput::Failed { error, .. }) => {
+                    panic!("expected committed outcome, got failure: {error}")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("commit pipeline disconnected before scan completed")
+                }
+            }
+        }
+        assert!(
+            scan_handle.is_finished(),
+            "ordered filesystem scan did not finish within 10s after outcomes started draining"
+        );
+
+        let (outcome, submitted) = scan_handle.join().expect("scan thread should not panic");
+        let outcome = outcome.expect("ordered filesystem scan should succeed once outcomes drain");
+        let submitted = submitted.expect("receipt sink finish should succeed");
+        assert_eq!(
+            submitted.len(),
+            SECRET_FILE_COUNT,
+            "every ordered file should be submitted exactly once"
+        );
+        assert_eq!(
+            outcome.termination,
+            PageLoopTermination::ExhaustedEmptyConfirmed,
+            "draining outcomes should let the ordered filesystem scan finish the shard"
+        );
+
+        while drained < submitted.len() {
+            match pipeline
+                .recv_timeout(Duration::from_secs(1))
+                .expect("remaining commit outcome")
+            {
+                CommitStageOutput::Committed { .. } => drained += 1,
+                CommitStageOutput::Failed { error, .. } => {
+                    panic!("expected committed outcome, got failure: {error}")
+                }
+            }
+        }
+        assert_eq!(
+            done_ledger.snapshot().expect("done-ledger snapshot").len(),
+            SECRET_FILE_COUNT,
+            "all ordered items should commit durably after the outcome queue drains"
+        );
+        pipeline.shutdown().expect("worker should join");
     }
 
     #[test]

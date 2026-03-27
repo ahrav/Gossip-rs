@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId};
+use gossip_contracts::identity::{LogicalTime, OpId, RunId, TenantId, WorkerId};
 use gossip_coordination::{
     AcquireScratch, CheckpointError, CoordinationBackend, CursorSemantics, CursorUpdate,
-    InitialShardInput, RenewError, RunConfig, RunManagement, ShardKey, ShardStatus,
+    RenewError, RunConfig, RunStatus, ShardKey, ShardStatus,
 };
 use gossip_coordination_etcd::test_support::{
     contention_namespace, test_coordinator_in_namespace, test_coordinator_in_namespace_with_tuning,
@@ -32,8 +32,10 @@ use gossip_done_ledger_postgres::{
 use gossip_findings_postgres::{
     apply_all_migrations as apply_findings_migrations, schema as findings_schema,
 };
-use gossip_frontier::{ShardSpecScratch, range_shard_ref};
-use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
+use gossip_orchestrator::{
+    FilesystemRequest, FilesystemRunSetupInput, plan_filesystem_initial_shards,
+    setup_filesystem_run,
+};
 use gossip_pg_common::test_support::create_test_db;
 use gossip_stdx::hex_encode;
 use gossip_worker::config::{
@@ -49,7 +51,6 @@ use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
 const DEFAULT_LEASE_DURATION_MS: u64 = 30_000;
-const SHARD_ID_RAW: u64 = 1;
 const RUN_ID_RAW: u64 = 42;
 const WORKER_ID_RAW: u64 = 7;
 const TENANT_ID_BYTES: [u8; 32] = [0x11; 32];
@@ -151,7 +152,7 @@ impl SeededLaunchProof {
         migrate_database_pair(&done_ledger_dsn, &findings_dsn);
 
         let fixture = SafeScanFixture::new();
-        let shard_key = seed_filesystem_run(
+        let shard_key = submit_filesystem_request(
             &mut coordinator,
             fixture.scan_path(),
             DEFAULT_LEASE_DURATION_MS,
@@ -209,42 +210,82 @@ fn test_run_config(lease_duration_ms: u64) -> RunConfig {
         .expect("test run config should be valid")
 }
 
-fn seed_filesystem_run(
+fn submit_filesystem_request(
     coordinator: &mut EtcdCoordinator,
     scan_root: &Path,
     lease_duration_ms: u64,
 ) -> ShardKey {
-    coordinator
-        .create_run(
-            now(1),
-            tenant_id(),
-            run_id(),
-            test_run_config(lease_duration_ms),
-        )
-        .expect("test run creation should succeed");
-
-    let mut scratch = ShardSpecScratch::new();
-    let connector_extra = FilesystemShardPayload::new(
-        FilesystemSourceMode::DirectoryRoot,
-        scan_root
-            .canonicalize()
-            .expect("test path must canonicalize"),
+    let request = FilesystemRequest::directory_root(scan_root, test_run_config(lease_duration_ms))
+        .normalize()
+        .expect("test filesystem request should normalize");
+    let plan = plan_filesystem_initial_shards(request.clone());
+    let payload = plan.shard_payload();
+    let outcome = setup_filesystem_run(
+        coordinator,
+        now(1),
+        tenant_id(),
+        run_id(),
+        FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+        OpId::from_raw(1),
     )
-    .encode()
-    .expect("test payload should encode");
-    let spec_ref = range_shard_ref(b"\x00", b"\xFF", &connector_extra, &mut scratch)
-        .expect("range shard spec should build");
-    let shard_id = ShardId::from_raw(SHARD_ID_RAW);
-    let manifest = [InitialShardInput::new(
-        shard_id,
-        spec_ref,
-        CursorUpdate::initial(),
-    )];
-    let _ = coordinator
-        .register_shards(now(2), tenant_id(), run_id(), &manifest, OpId::from_raw(1))
-        .expect("test shard registration should succeed");
+    .expect("test filesystem run setup should succeed");
+    assert!(
+        outcome.is_executed(),
+        "fresh launch proof setup should execute instead of replaying an existing run"
+    );
+    let setup = outcome.into_inner();
+    assert_eq!(setup.run().status(), RunStatus::Active);
+    assert_eq!(
+        setup.root_shards().len(),
+        1,
+        "filesystem submission should register exactly one startup shard"
+    );
 
-    ShardKey::new(run_id(), shard_id)
+    // Control-plane setup must stop after registration: the shard exists and
+    // is runnable, but no worker has claimed it and no progress is recorded.
+    let shard_key = ShardKey::new(run_id(), setup.root_shards()[0]);
+    let shard = coordinator
+        .test_load_shard_snapshot(tenant_id(), shard_key)
+        .expect("submitted shard snapshot lookup should succeed")
+        .expect("filesystem submission should register the startup shard");
+    assert_eq!(shard.status, ShardStatus::Active);
+    assert!(
+        shard.cursor.last_key(shard.slab()).is_none(),
+        "fresh submission should not pre-populate shard progress"
+    );
+    assert!(
+        coordinator
+            .test_load_owner_binding(tenant_id(), shard_key)
+            .expect("owner-binding lookup should succeed after submission")
+            .is_none(),
+        "submission alone must not claim the shard"
+    );
+
+    shard_key
+}
+
+fn assert_completed_shard_state(coordinator: &EtcdCoordinator, key: ShardKey) {
+    let shard = coordinator
+        .test_load_shard_snapshot(tenant_id(), key)
+        .expect("shard snapshot lookup should succeed")
+        .expect("submitted shard must still exist after worker completion");
+    assert_eq!(shard.status, ShardStatus::Done);
+    assert!(
+        shard.cursor.last_key(shard.slab()).is_some(),
+        "receipt-driven completion must persist a progress cursor"
+    );
+    assert_ne!(
+        shard.cursor.last_key(shard.slab()),
+        Some(b"\x00".as_slice()),
+        "non-empty proof fixture must checkpoint a real filesystem progress key"
+    );
+    assert!(
+        coordinator
+            .test_load_owner_binding(tenant_id(), key)
+            .expect("owner-binding lookup should succeed after completion")
+            .is_none(),
+        "completed shard must not retain a live owner binding"
+    );
 }
 
 fn worker_binary_path() -> PathBuf {
@@ -461,20 +502,7 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
         "expected exactly 1 observation for rule '{}', got {observation_rows}",
         SAFE_RULE_NAME,
     );
-    let shard = proof
-        .coordinator
-        .test_load_shard_snapshot(tenant_id(), proof.shard_key)
-        .expect("shard snapshot lookup should succeed")
-        .expect("seeded shard must still exist after worker completion");
-    assert_eq!(shard.status, ShardStatus::Done);
-    assert!(
-        proof
-            .coordinator
-            .test_load_owner_binding(tenant_id(), proof.shard_key)
-            .expect("owner-binding lookup should succeed after completion")
-            .is_none(),
-        "completed shard must not retain a live owner binding"
-    );
+    assert_completed_shard_state(&proof.coordinator, proof.shard_key);
 }
 
 #[test]
@@ -510,12 +538,7 @@ fn worker_binary_restart_is_idempotent_after_completed_shard() {
         "restarting after shard completion must not duplicate findings observations"
     );
 
-    let shard = proof
-        .coordinator
-        .test_load_shard_snapshot(tenant_id(), proof.shard_key)
-        .expect("shard snapshot lookup should succeed after restart")
-        .expect("seeded shard must still exist after restart");
-    assert_eq!(shard.status, ShardStatus::Done);
+    assert_completed_shard_state(&proof.coordinator, proof.shard_key);
 }
 
 #[test]
@@ -526,7 +549,7 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
     let mut backend_a = test_coordinator_in_namespace_with_tuning(&namespace, ttl_secs, 8, 8);
     let mut backend_b = test_coordinator_in_namespace_with_tuning(&namespace, ttl_secs, 8, 8);
     let fixture = SafeScanFixture::new();
-    let key = seed_filesystem_run(
+    let key = submit_filesystem_request(
         &mut backend_a,
         fixture.scan_path(),
         DEFAULT_LEASE_DURATION_MS,
