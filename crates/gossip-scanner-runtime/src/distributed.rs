@@ -2186,7 +2186,15 @@ where
         (PageLoopTermination::Partial, Some(checkpoint), _) => {
             ShardCompletionOutcome::Checkpoint { checkpoint }
         }
-        (PageLoopTermination::Partial, None, _) => {
+        // The page loop advanced through AlreadyDone items without emitting
+        // new receipts. The recovered cursor represents real durable coverage
+        // from a prior claim, so checkpoint it rather than erroring.
+        (PageLoopTermination::Partial, None, Some(recovered)) => {
+            ShardCompletionOutcome::Checkpoint {
+                checkpoint: recovered,
+            }
+        }
+        (PageLoopTermination::Partial, None, None) => {
             return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
                 anyhow!(
                     "filesystem shard '{}' stopped before confirming exhaustion and produced no receipt-backed progress",
