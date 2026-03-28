@@ -155,8 +155,10 @@ items are enqueued. Claim retry delays honor coordinator-provided
 `retry_after` and `earliest_deadline` floors directly, falling back to
 the fixed race-retry delay only when no logical wakeup hint is
 available. Successful filesystem lease execution returns an
-explicit `ShardCompletionOutcome`: `Complete { checkpoint }` uses the
-committed-prefix cursor for terminal completion,
+explicit `ShardCompletionOutcome`: `Complete { checkpoint }` transitions
+the shard to `Done` using either the receipt-backed committed-prefix
+cursor or, when no new receipts were produced but prior durable progress
+exists, the recovered resume cursor from the previous claim.
 `Checkpoint { checkpoint }` preserves non-terminal progress through
 coordination `checkpoint`, and `ExhaustedEmpty` signals that the scan
 observed exhausted-empty without producing a new receipt-backed
@@ -495,8 +497,9 @@ the coordinator returns no more active work, counts every claimed lease in
 then advances it directly against the coordination backend. `advance_shard`
 uses the explicit `ShardCompletionOutcome`: `Complete` and `Checkpoint`
 forward their cursor, while `ExhaustedEmpty` preserves the restored
-resume cursor when the shard has prior progress and falls back to a
-range-safe empty-shard cursor from the shard bounds otherwise.
+resume cursor when the shard has prior progress, uses a synthetic
+sentinel key (`b"\x00"`) for unbounded empty shards, and falls back to
+`range_start()` for bounded empty shards.
 
 Unit tests exercise this loop through `gossip_coordination::InMemoryCoordinator`,
 which is the same reference backend used elsewhere in the coordination layer.
@@ -666,8 +669,8 @@ pub struct ShardLease {
     write_context: WriteContext,
     /// Tenant secret key used for secret-hash derivation.
     tenant_secret_key: TenantSecretKey,
-    /// Wall-clock timestamp captured at claim time, anchoring the monotonic
-    /// deadline calculation.
+    /// Wall-clock timestamp captured at claim time, used to anchor the
+    /// lease deadline to the monotonic clock without NTP skew.
     claim_wall_clock: LogicalTime,
     /// Monotonic instant captured alongside `claim_wall_clock`.
     claim_instant: Instant,
