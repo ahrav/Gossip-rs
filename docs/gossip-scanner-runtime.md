@@ -158,7 +158,7 @@ available. Successful filesystem lease execution returns an
 explicit `ShardCompletionOutcome`: `Complete { checkpoint }` transitions
 the shard to `Done` using either the receipt-backed committed-prefix
 cursor or, when no new receipts were produced but prior durable progress
-exists, the recovered resume cursor from the previous claim.
+exists, the recovered resume cursor rebuilt by replaying that durable coverage.
 `Checkpoint { checkpoint }` preserves non-terminal progress through
 coordination `checkpoint`, and `ExhaustedEmpty` signals that the scan
 observed exhausted-empty without producing a new receipt-backed
