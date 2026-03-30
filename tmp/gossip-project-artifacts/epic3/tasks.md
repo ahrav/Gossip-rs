@@ -219,7 +219,7 @@ For MVP, shard payload should carry exactly one normalized repo target plus its 
 **Deliverables**
 
 - `GitShardPayload`
-- versioned serialization
+- deterministic encode/decode (single fixed wire format, no version discriminants)
 - redacted `Debug`
 - payload validation on decode
 - metadata mapping into `connector_extra` / shard metadata
