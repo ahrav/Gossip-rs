@@ -155,12 +155,16 @@ items are enqueued. Claim retry delays honor coordinator-provided
 `retry_after` and `earliest_deadline` floors directly, falling back to
 the fixed race-retry delay only when no logical wakeup hint is
 available. Successful filesystem lease execution returns an
-explicit `ShardCompletionOutcome`: `Complete { checkpoint }` uses the
-committed-prefix cursor for terminal completion,
+explicit `ShardCompletionOutcome`: `Complete { checkpoint }` transitions
+the shard to `Done` using either the receipt-backed committed-prefix
+cursor or, when no new receipts were produced but prior durable progress
+exists, the recovered resume cursor rebuilt by replaying that durable coverage.
 `Checkpoint { checkpoint }` preserves non-terminal progress through
-coordination `checkpoint`, and `ExhaustedEmpty` derives a range-safe
-fallback cursor only when the scan truly observed exhausted-empty
-before any durable committed unit existed. If the deadline elapses
+coordination `checkpoint`, and `ExhaustedEmpty` signals that the scan
+observed exhausted-empty without producing a new receipt-backed
+checkpoint in this claim. Completion preserves the restored resume
+cursor when the shard already had prior progress and falls back to a
+range-safe cursor only for truly initial empty shards. If the deadline elapses
 first, or if `complete` rejects a stale or expired lease, the worker
 surfaces `DistributedRuntimeError::LeaseUncertain` and leaves the
 shard for a higher-fence reassignment to resume from durable receipt
@@ -256,6 +260,7 @@ full caller-facing scan surface:
 ```rust
 pub struct ScanReport {
     pub items_scanned: u64,
+    pub items_deferred: u64,
     pub bytes_scanned: u64,
     pub chunks_scanned: u64,
     pub findings_emitted: u64,
@@ -475,8 +480,11 @@ the receipt-driven durability model:
    `Complete { checkpoint }` or `Checkpoint { checkpoint }`, while replay-only
    recovery can still return either outcome from the recovered resume cursor
    when this claim produced no new durable receipts but did recover durable
-   coverage from earlier committed work. `ExhaustedEmpty` is reserved for
-   shards that are confirmed empty and have no durable coverage to preserve.
+   coverage from earlier committed work. `ExhaustedEmpty` indicates that the
+   scan observed exhausted-empty without producing a new receipt-backed
+   checkpoint in this claim; completion preserves the restored resume cursor
+   when prior progress exists and falls back to a range-safe cursor only for
+   truly initial empty shards.
 
 If any step fails, the shard is not completed in coordination and will be
 retried when the lease expires.
@@ -488,8 +496,10 @@ the coordinator returns no more active work, counts every claimed lease in
 `DistributedRunReport`, routes each lease through `run_filesystem_lease`, and
 then advances it directly against the coordination backend. `advance_shard`
 uses the explicit `ShardCompletionOutcome`: `Complete` and `Checkpoint`
-forward their cursor, while `ExhaustedEmpty` derives a range-safe empty-shard
-cursor from the restored lease state.
+forward their cursor, while `ExhaustedEmpty` preserves the restored
+resume cursor when the shard has prior progress, uses a synthetic
+sentinel key (`b"\x00"`) for unbounded empty shards, and falls back to
+`range_start()` for bounded empty shards.
 
 Unit tests exercise this loop through `gossip_coordination::InMemoryCoordinator`,
 which is the same reference backend used elsewhere in the coordination layer.
@@ -659,6 +669,11 @@ pub struct ShardLease {
     write_context: WriteContext,
     /// Tenant secret key used for secret-hash derivation.
     tenant_secret_key: TenantSecretKey,
+    /// Wall-clock timestamp captured at claim time, used to anchor the
+    /// lease deadline to the monotonic clock without NTP skew.
+    claim_wall_clock: LogicalTime,
+    /// Monotonic instant captured alongside `claim_wall_clock`.
+    claim_instant: Instant,
 }
 ```
 

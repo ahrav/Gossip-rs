@@ -1688,8 +1688,10 @@ where
 ///   checkpoint cursor and transitions the shard to `Done`.
 /// - [`ShardCompletionOutcome::Checkpoint`] uses the receipt-driven
 ///   checkpoint cursor but keeps the shard active for a later claim.
-/// - [`ShardCompletionOutcome::ExhaustedEmpty`] uses a range-safe
-///   exhausted-empty fallback cursor derived from the shard bounds.
+/// - [`ShardCompletionOutcome::ExhaustedEmpty`] preserves the restored
+///   resume cursor when the shard has prior progress (last key present),
+///   uses `EMPTY_RANGE_SENTINEL_KEY` for unbounded empty shards, and
+///   falls back to `range_start()` for bounded empty shards.
 ///
 /// The chosen cursor is validated with [`check_cursor_bounds`] before the
 /// coordinator call so checkpoint and completion updates cannot silently

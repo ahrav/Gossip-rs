@@ -140,13 +140,24 @@ sequenceDiagram
 **Three-outcome dispatch.** The worker loop matches on `ExhaustedEmpty`
 (terminal), `Stopped` (connector failure with retry classification), or
 `Page` (validated, ready for prefiltering). `ExhaustedEmpty` is returned
-whenever `fill_page` yields `Ok(None)`, which covers two distinct cases:
-(a) the source is empty from the start (first call returns no items), and
+whenever `fill_page` yields `Ok(None)`, which covers two accepted cases
+and one rejected case:
+
+(a) the source is empty from the start (first call returns no items,
+`executed_any_page` is false);
+
 (b) the two-call suffix handshake after a non-empty terminal page
 (`PageState::Complete` triggers `AwaitingExhaustedEmpty`; the next
-`fill_page` returns `Ok(None)` to confirm exhaustion). In both cases the
-runtime page loop confirms exhaustion before `checkpoint`/`complete` is
-sent to the coordinator.
+`fill_page` returns `Ok(None)` to confirm exhaustion);
+
+(c) **rejected** — `ExhaustedEmpty` while the loop is still in
+`Paging` phase after at least one `HasMore` page has been executed.
+This means the connector skipped the required `PageState::Complete`
+terminal page. The page loop raises `ScanRuntimeError::Driver` to
+surface the suffix protocol violation.
+
+In accepted cases (a) and (b) the runtime page loop confirms exhaustion
+before `checkpoint`/`complete` is sent to the coordinator.
 
 ---
 

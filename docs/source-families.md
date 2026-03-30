@@ -140,6 +140,7 @@ and `types.rs`.
 | `crates/gossip-orchestrator/src/planner.rs` | Deterministic filesystem initial shard geometry planner |
 | `crates/gossip-orchestrator/src/payload.rs` | Typed filesystem shard payload wire format (encode/decode) |
 | `crates/gossip-orchestrator/src/setup.rs` | Coordination-backed filesystem run setup and shard registration |
+| `crates/gossip-orchestrator/src/test_support.rs` | Shared test fixtures for orchestrator unit tests |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |

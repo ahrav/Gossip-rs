@@ -550,8 +550,7 @@ but they are computed independently at different abstraction levels.
 
 | File                                                   | Purpose                                                                                      |
 | :----------------------------------------------------- | :------------------------------------------------------------------------------------------- |
-| `04-boundary-2-coordination/09-worker-session.md`      | Worker session design document covering claim, scan, and completion phases                   |
-| `04-boundary-2-coordination/04-cursor-monotonicity.md` | Cursor monotonicity invariant specification and proof sketch                                 |
+| `docs/gossip-coordination/boundary-2-coordination.md`  | Coordination protocol spec: worker session lifecycle, cursor monotonicity invariants        |
 | `crates/gossip-contracts/src/coordination/`            | Coordination data types (shard_spec, cursor, pooled, manifest, limits)                       |
 | `crates/gossip-coordination/src/`                      | Coordination protocol (lease, fencing, session, facade, traits, record, error, etc.)         |
 | `crates/gossip-coordination/src/lease.rs`              | `Lease` and `LeaseHolder` types                                                              |
