@@ -626,7 +626,7 @@ Not full Epic 6, just the minimum needed to operate Git MVP safely.
 
 **Decision**
 
-Use low-cardinality stage metrics and hashed identifiers only. Do not emit raw repo paths, ref names, commit IDs, or secret-derived data in logs/traces/metrics. That follows the Phase VI guidance.
+Use low-cardinality stage metrics and hashed identifiers only. Do not emit raw repo paths, ref names, commit IDs, or secret-derived data in logs/traces/metrics.
 
 **Deliverables**
 
