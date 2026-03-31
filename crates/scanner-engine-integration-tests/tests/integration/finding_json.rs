@@ -11,14 +11,18 @@ pub(crate) struct FindingLine {
 ///
 /// This is a minimal parser that handles backslash-escaped quotes.
 pub(crate) fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":\"", key);
+    let needle = format!("\"{}\":", key);
     let start = json.find(&needle)? + needle.len();
-    let rest = &json[start..];
+    let rest = json[start..].trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let rest = &rest[1..];
     let bytes = rest.as_bytes();
     let mut end = 0;
     while end < bytes.len() {
         if bytes[end] == b'\\' {
-            end += 2;
+            end += if end + 1 < bytes.len() { 2 } else { 1 };
         } else if bytes[end] == b'"' {
             break;
         } else {
@@ -63,4 +67,28 @@ pub(crate) fn parse_findings(output: &str) -> Vec<FindingLine> {
         out.push(FindingLine { path, start });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_json_string;
+
+    #[test]
+    fn extract_json_string_accepts_whitespace_after_colon() {
+        let json = r#"{"path": "src/main.rs"}"#;
+
+        assert_eq!(
+            extract_json_string(json, "path"),
+            Some("src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_json_string_never_panics_on_trailing_escape() {
+        let json = "{\"path\":\"unterminated\\";
+
+        let result = std::panic::catch_unwind(|| extract_json_string(json, "path"));
+
+        assert!(result.is_ok());
+    }
 }
