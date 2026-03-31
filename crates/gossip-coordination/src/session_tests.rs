@@ -60,13 +60,13 @@ use proptest::prelude::*;
 ///
 /// Each shard covers a wide range: shard i covers `[i*0x40, (i+1)*0x40)`.
 /// This gives enough room for cursor values and split operations.
-/// The lease duration is 30 ticks (from `short_lease_run_config`), so
-/// acquiring at `now(2)` yields a deadline of 32.
+/// The lease duration comes from `short_lease_run_config()`, so acquiring at
+/// `now(2)` yields a deadline of 32.
 fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>) {
-    let mut coord = InMemoryCoordinator::new(30);
+    let config = short_lease_run_config();
+    let mut coord = InMemoryCoordinator::new(config.lease_duration());
     let tenant = test_tenant();
     let run = test_run();
-    let config = short_lease_run_config();
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
