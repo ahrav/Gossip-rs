@@ -60,13 +60,13 @@ use proptest::prelude::*;
 ///
 /// Each shard covers a wide range: shard i covers `[i*0x40, (i+1)*0x40)`.
 /// This gives enough room for cursor values and split operations.
-/// The lease duration is 30 ticks (from `short_lease_run_config`), so
-/// acquiring at `now(2)` yields a deadline of 32.
+/// The lease duration comes from `short_lease_run_config()`, so acquiring at
+/// `now(2)` yields a deadline of 32.
 fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>) {
-    let mut coord = InMemoryCoordinator::new(30);
+    let config = short_lease_run_config();
+    let mut coord = InMemoryCoordinator::new(config.lease_duration());
     let tenant = test_tenant();
     let run = test_run();
-    let config = short_lease_run_config();
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
@@ -401,11 +401,9 @@ fn checkpoint_after_split_validates_narrowed_bounds() {
 
     // Within narrowed range — succeeds.
     let ok_cursor = CursorUpdate::new(&[0x10]);
-    assert!(
-        session
-            .checkpoint(now(4), &ok_cursor, OpId::from_raw(801))
-            .is_ok()
-    );
+    assert!(session
+        .checkpoint(now(4), &ok_cursor, OpId::from_raw(801))
+        .is_ok());
 
     // Outside narrowed range — rejected.
     let bad_cursor = CursorUpdate::new(&[0x30]);
@@ -675,10 +673,11 @@ fn split_residual_error_does_not_corrupt_snapshot() {
 #[test]
 fn successive_split_residual_accumulates_spawned() {
     // Use a shard with range [0x00, 0x60) for room.
-    let mut coord = InMemoryCoordinator::new(30);
+    let config = short_lease_run_config();
+    let mut coord = InMemoryCoordinator::new(config.lease_duration());
     let tenant = test_tenant();
     let run = test_run();
-    let config = short_lease_run_config();
+
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard_spec =
