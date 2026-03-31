@@ -54,8 +54,8 @@ pub(crate) fn finding_paths(output: &str) -> Vec<String> {
 
 /// Parse JSONL finding lines into `(path, start)` pairs.
 ///
-/// This is intentionally lossy: end offsets and rule names are ignored because
-/// the tests only assert path attribution and the start position.
+/// This parser is intentionally lossy: it keeps only `path` and `start` from
+/// each finding event and ignores the other serialized fields.
 pub(crate) fn parse_findings(output: &str) -> Vec<FindingLine> {
     let mut out = Vec::new();
     for line in output.lines() {
