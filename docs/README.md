@@ -22,6 +22,14 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 
 ---
 
+## Architecture Decisions
+
+| Document | Focus |
+| --- | --- |
+| [0001-git-mvp-execution-model.md](adr/0001-git-mvp-execution-model.md) | Git repo-native execution model: `Active` substates, durable-receipt handoff, ownership-loss semantics, and scope locks |
+
+---
+
 ## 1. System Architecture
 
 | Document                                               | Focus                            | Key Concepts                                           |

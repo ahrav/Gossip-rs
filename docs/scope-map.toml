@@ -98,6 +98,27 @@ dir = "crates/gossip-scanner-runtime/src/"
 doc = "docs/scanner-core-parity.md"
 dir = "crates/scanner-engine/src/"
 
+# Git repo-native execution model ADR.
+[[scopes]]
+doc = "docs/adr/0001-git-mvp-execution-model.md"
+dir = "crates/gossip-contracts/src/connector/"
+
+[[scopes]]
+doc = "docs/adr/0001-git-mvp-execution-model.md"
+dir = "crates/gossip-scanner-runtime/src/"
+
+[[scopes]]
+doc = "docs/adr/0001-git-mvp-execution-model.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/adr/0001-git-mvp-execution-model.md"
+dir = "crates/gossip-coordination/src/"
+
+[[scopes]]
+doc = "docs/adr/0001-git-mvp-execution-model.md"
+dir = "crates/gossip-coordination-etcd/src/"
+
 # Source-family model (ordered content + git repo-native contracts).
 [[scopes]]
 doc = "docs/source-families.md"
