@@ -17,6 +17,7 @@ undocumented_unsafe_blocks = "warn"
 scanner-engine = { workspace = true, features = ["test-support"] }
 scanner-scheduler.workspace = true
 gossip-stdx.workspace = true
+gossip-contracts.workspace = true
 ahash = "0.8"
 blake3 = "1.5"
 bytemuck = { version = "1", features = ["derive"] }

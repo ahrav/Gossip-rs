@@ -251,6 +251,23 @@ impl GitRepoPaths {
         self.git_dir != self.common_dir
     }
 
+    /// Returns the canonical repository root used for identity and locators.
+    ///
+    /// Worktree repositories use the canonicalized worktree root. Bare
+    /// repositories use the canonicalized git directory, which is also the repo
+    /// root.
+    #[inline]
+    #[must_use]
+    pub fn canonical_repo_root(&self) -> &Path {
+        match self.kind {
+            RepoKind::Worktree => self
+                .worktree_root
+                .as_deref()
+                .expect("worktree repositories always carry a worktree root"),
+            RepoKind::Bare => self.git_dir.as_path(),
+        }
+    }
+
     /// Resolves paths given a known git directory.
     ///
     /// `git_dir` must already be canonicalized. This routine also validates

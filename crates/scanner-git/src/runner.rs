@@ -120,9 +120,10 @@ impl PackMmapLimits {
 /// Git scan runner configuration.
 ///
 /// The defaults mirror the Git scanning limits and are intended for
-/// production usage. Callers should set `repo_id` and `policy_hash` to
-/// stable identifiers for their environment to ensure consistent
-/// persistence keys and scan identity.
+/// production usage. Callers should derive `repo_id` from a normalized repo
+/// identity so persistence keys stay stable across equivalent path spellings,
+/// then set `policy_hash` to the stable scan-configuration identifier for
+/// their environment.
 ///
 /// `pack_cache_bytes` is an in-memory cache cap; oversized values are rejected
 /// at runtime when converting to `u32`.

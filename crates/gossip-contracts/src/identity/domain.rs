@@ -138,6 +138,15 @@ pub const TRIAGE_GROUP_KEY_V1: &str = "gossip/persistence/v1/triage-group";
 pub const COORDINATION_TELEMETRY_V1: &str = "gossip/worker/v1/coordination-telemetry";
 
 // =========================================================================
+// Git repo identity subsystem
+// =========================================================================
+
+/// Stable 64-bit repository-namespace derivation for repo-native Git scans.
+///
+/// Hash mode: BLAKE3 derive-key via `domain_hasher`.
+pub const GIT_REPO_ID_V1: &str = "gossip/git/v1/repo-id";
+
+// =========================================================================
 // Authoritative constant list
 // =========================================================================
 
@@ -146,7 +155,7 @@ pub const COORDINATION_TELEMETRY_V1: &str = "gossip/worker/v1/coordination-telem
 /// The array length is checked at compile time — adding a constant without
 /// updating `ALL` is a compile error. Tests use this for uniqueness and
 /// coverage checks.
-pub const ALL: [&str; 16] = [
+pub const ALL: [&str; 17] = [
     SPLIT_ID_V1,
     OP_PAYLOAD_V1,
     FINDING_ID_V1,
@@ -163,6 +172,7 @@ pub const ALL: [&str; 16] = [
     DONE_LEDGER_KEY_V1,
     TRIAGE_GROUP_KEY_V1,
     COORDINATION_TELEMETRY_V1,
+    GIT_REPO_ID_V1,
 ];
 
 // =========================================================================
@@ -197,6 +207,7 @@ pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static str)> {
         ("DONE_LEDGER_KEY_V1", DONE_LEDGER_KEY_V1),
         ("TRIAGE_GROUP_KEY_V1", TRIAGE_GROUP_KEY_V1),
         ("COORDINATION_TELEMETRY_V1", COORDINATION_TELEMETRY_V1),
+        ("GIT_REPO_ID_V1", GIT_REPO_ID_V1),
     ]
 }
 

@@ -3204,6 +3204,7 @@ dependencies = [
  "gix-commitgraph",
  "gix-hash",
  "gix-ref",
+ "gossip-contracts",
  "gossip-stdx",
  "libc",
  "memchr",
