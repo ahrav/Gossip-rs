@@ -51,11 +51,11 @@ graph TD
     SA[13-shard-algebra-types.md<br/>B3 deep dive: types, keys,<br/>hints, builder<br/>7 diagrams]
     CA[14-connector-architecture.md<br/>B4 deep dive: traits, types,<br/>runtime-family bridge, errors<br/>4 diagrams]
     OCS[15-ordered-content-scan-flow.md<br/>End-to-end shard lifecycle:<br/>fill, prefilter, scan, commit<br/>5 diagrams]
-    CR[16-cursor-resume-strategy.md<br/>Two-layer cursor,<br/>token fallback<br/>5 diagrams]
+    CR[16-cursor-resume-strategy.md<br/>Two-layer cursor,<br/>token fallback<br/>3 diagrams]
     FW[17-filesystem-walk-state-machine.md<br/>DFS walk, WalkToken,<br/>pruning, safety<br/>5 diagrams]
     SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
-    PCC[19-persistence-contracts.md<br/>Traits, data model, lattice,<br/>OVID, receipts<br/>5 diagrams]
-    ECP[20-etcd-coordinator-persistence.md<br/>Keyspace, codec, backend,<br/>delegation, wire format<br/>5 diagrams]
+    PCC[19-persistence-contracts.md<br/>Traits, data model, lattice,<br/>OVID, receipts<br/>6 diagrams]
+    ECP[20-etcd-coordinator-persistence.md<br/>Keyspace, codec, backend,<br/>delegation, wire format<br/>6 diagrams]
     FPD[21-findings-postgres-dedup.md<br/>Batch dedup, observation merge,<br/>dual convergence, read API<br/>5 diagrams]
     DLP[22-done-ledger-postgres.md<br/>Backend architecture, upsert<br/>pipeline, provenance merge,<br/>schema, errors<br/>7 diagrams]
 
@@ -171,11 +171,11 @@ graph TD
 | 13  | `13-shard-algebra-types.md`          | 7        | B3               | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration    |
 | 14  | `14-connector-architecture.md`       | 4        | B4               | Trait hierarchy, core types, runtime-family bridge, error classification  |
 | 15  | `15-ordered-content-scan-flow.md`    | 5        | B4, B5, B2       | End-to-end shard lifecycle, page acquisition, done-ledger prefilter, scan-miss execution, commit pipeline |
-| 16  | `16-cursor-resume-strategy.md`       | 5        | B4               | Two-layer cursor, token encoding, resilience model, resume decision       |
+| 16  | `16-cursor-resume-strategy.md`       | 3        | B4               | Two-layer cursor, token encoding, resilience model, resume decision       |
 | 17  | `17-filesystem-walk-state-machine.md`| 5        | B4               | DFS walk, WalkFrame stack, subtree pruning, WalkToken, safety mechanisms  |
 | 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |
-| 19  | `19-persistence-contracts.md`        | 5        | B5               | Trait hierarchy, findings data model, done-ledger lattice, OVID, receipts |
-| 20  | `20-etcd-coordinator-persistence.md` | 5        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
+| 19  | `19-persistence-contracts.md`        | 6        | B5               | Trait hierarchy, findings data model, done-ledger lattice, OVID, receipts |
+| 20  | `20-etcd-coordinator-persistence.md` | 6        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
 | 21  | `21-findings-postgres-dedup.md`      | 5        | B5               | Batch dedup pipeline, per-layer conflict rules, observation merge, dual convergence, read API surface |
 | 22  | `22-done-ledger-postgres.md`         | 7        | B5               | Backend architecture, batch upsert pipeline, provenance winner-selection, SQL schema/indexes, BIGINT encoding, error hierarchy |
 |     | **Total**                            | **111**  |                  |                                                                           |
