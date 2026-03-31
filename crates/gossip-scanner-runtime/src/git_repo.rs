@@ -166,19 +166,11 @@ pub(crate) fn scan_local_repo(
 
 /// Produce a [`ToxicDigest`] from a repo path for log-safe error messages.
 ///
-/// On Unix, extracts raw bytes via [`OsStrExt::as_bytes`] so distinct
-/// non-UTF-8 paths produce distinct digests. On non-Unix, falls back to
-/// lossy UTF-8 conversion.
+/// Uses [`OsStr::as_encoded_bytes`] on all platforms for consistency with
+/// [`NormalizedLocalRepoIdentity`]'s key derivation, so the digest
+/// correlates with the authoritative repo identity key.
 fn digest_repo_path(p: &std::path::Path) -> ToxicDigest {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        ToxicDigest::of_bytes(p.as_os_str().as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-        ToxicDigest::of_bytes(p.to_string_lossy().as_bytes())
-    }
+    ToxicDigest::of_bytes(p.as_os_str().as_encoded_bytes())
 }
 
 /// Translate the crate-level [`GitScanConfig`] into the lower-level

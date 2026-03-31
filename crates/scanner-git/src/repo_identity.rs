@@ -130,6 +130,8 @@ pub enum RepoIdentityError {
 
 /// Normalizes a set of repo paths into deterministic repo-key order.
 ///
+/// The returned vector is sorted by [`RepoKey`] so callers get stable,
+/// deterministic ordering suitable for paging and persistence.
 /// Duplicate normalized identities are rejected so callers can decide how to
 /// handle same-repo re-submission before building a request model on top.
 ///
@@ -445,9 +447,10 @@ mod tests {
 
         #[cfg(not(unix))]
         let path = {
-            let mut s = "x".repeat(gossip_contracts::connector::MAX_ITEM_KEY_SIZE);
-            s.replace_range(..1, "/");
-            PathBuf::from(s)
+            // Windows requires a drive prefix for `Path::is_absolute()` to
+            // return true; a bare `/` is only "rooted", not absolute.
+            let fill = "x".repeat(gossip_contracts::connector::MAX_ITEM_KEY_SIZE - 3);
+            PathBuf::from(format!("C:\\{fill}"))
         };
 
         let err = NormalizedLocalRepoIdentity::from_canonical_repo_root(tenant(0x66), path)

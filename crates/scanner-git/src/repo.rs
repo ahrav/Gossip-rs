@@ -212,19 +212,11 @@ impl fmt::Debug for GitRepoPaths {
 
 /// Produce a [`ToxicDigest`] from a path's raw byte representation.
 ///
-/// On Unix, extracts bytes directly via [`OsStrExt::as_bytes`] so that
-/// distinct non-UTF-8 paths produce distinct digests. On non-Unix, falls
-/// back to lossy UTF-8 (matching [`bytes_to_path`] conventions).
+/// Uses [`OsStr::as_encoded_bytes`] on all platforms for consistency with
+/// [`NormalizedLocalRepoIdentity`]'s `as_encoded_bytes()`-based key
+/// derivation, ensuring the digest correlates with the repo identity key.
 fn digest_path(p: &Path) -> ToxicDigest {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        ToxicDigest::of_bytes(p.as_os_str().as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-        ToxicDigest::of_bytes(p.to_string_lossy().as_bytes())
-    }
+    ToxicDigest::of_bytes(p.as_os_str().as_encoded_bytes())
 }
 
 impl GitRepoPaths {
