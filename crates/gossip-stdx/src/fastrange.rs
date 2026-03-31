@@ -48,11 +48,27 @@ mod tests {
     use proptest::prelude::*;
     use proptest::test_runner::{RngAlgorithm, TestRng};
 
-    const PROPTEST_CASES: u32 = 16;
     const PRNG_SEED: [u8; 32] = *b"fastrange-test-seed-000000000000";
 
     fn test_rng() -> TestRng {
         TestRng::from_seed(RngAlgorithm::ChaCha, &PRNG_SEED)
+    }
+
+    /// Under Miri, disables file-based failure persistence (which calls
+    /// `getcwd`, blocked by isolation) and reduces cases.
+    fn miri_proptest_config() -> proptest::test_runner::Config {
+        if cfg!(miri) {
+            proptest::test_runner::Config {
+                failure_persistence: None,
+                cases: 16,
+                ..Default::default()
+            }
+        } else {
+            proptest::test_runner::Config {
+                cases: 16,
+                ..Default::default()
+            }
+        }
     }
 
     #[test]
@@ -79,9 +95,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(
-            PROPTEST_CASES
-        ))]
+        #![proptest_config(miri_proptest_config())]
 
         #[test]
         fn output_is_within_range(word in any::<u64>(), p in 1u64..u64::MAX) {
