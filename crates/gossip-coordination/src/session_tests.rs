@@ -401,9 +401,11 @@ fn checkpoint_after_split_validates_narrowed_bounds() {
 
     // Within narrowed range — succeeds.
     let ok_cursor = CursorUpdate::new(&[0x10]);
-    assert!(session
-        .checkpoint(now(4), &ok_cursor, OpId::from_raw(801))
-        .is_ok());
+    assert!(
+        session
+            .checkpoint(now(4), &ok_cursor, OpId::from_raw(801))
+            .is_ok()
+    );
 
     // Outside narrowed range — rejected.
     let bad_cursor = CursorUpdate::new(&[0x30]);
