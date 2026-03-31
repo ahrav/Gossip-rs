@@ -7,6 +7,7 @@
 //!
 //! Run with: `cargo test --test integration`
 
+use crate::finding_json::finding_paths;
 use scanner_scheduler::events::EventOutput;
 use scanner_scheduler::events::VecEventOutput;
 use scanner_scheduler::scheduler::engine_stub::{MockEngine, MockRule};
@@ -17,33 +18,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
-
-/// Extract a JSON string value for a given key from a single JSON line.
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":\"", key);
-    let start = json.find(&needle)? + needle.len();
-    let rest = &json[start..];
-    let bytes = rest.as_bytes();
-    let mut end = 0;
-    while end < bytes.len() {
-        if bytes[end] == b'\\' {
-            end += 2;
-        } else if bytes[end] == b'"' {
-            break;
-        } else {
-            end += 1;
-        }
-    }
-    Some(rest[..end].to_string())
-}
-
-fn finding_paths(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter(|l| l.contains("\"type\":\"finding\""))
-        .filter_map(|l| extract_json_string(l, "path"))
-        .collect()
-}
 
 fn lf(path: PathBuf, size: u64) -> LocalFile {
     LocalFile { path, size }

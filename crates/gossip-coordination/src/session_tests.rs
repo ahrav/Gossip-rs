@@ -679,6 +679,7 @@ fn successive_split_residual_accumulates_spawned() {
     let mut coord = InMemoryCoordinator::new(config.lease_duration());
     let tenant = test_tenant();
     let run = test_run();
+
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard_spec =
