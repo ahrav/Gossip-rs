@@ -93,7 +93,7 @@ pub mod spsc;
 pub mod timing_wheel;
 
 /// Shared proptest configuration helpers for consistent test case counts.
-#[cfg(feature = "stdx-proptest")]
+#[cfg(any(test, feature = "stdx-proptest"))]
 pub mod test_support;
 
 pub use atomic_bitset::AtomicBitSet;

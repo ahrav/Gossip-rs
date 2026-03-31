@@ -154,25 +154,8 @@ mod proptests {
     use proptest::prelude::*;
     use std::collections::HashSet;
 
-    /// Under Miri, disables file-based failure persistence (which calls
-    /// `getcwd`, blocked by isolation) and reduces cases.
-    fn miri_proptest_config() -> proptest::test_runner::Config {
-        if cfg!(miri) {
-            proptest::test_runner::Config {
-                failure_persistence: None,
-                cases: 16,
-                ..Default::default()
-            }
-        } else {
-            proptest::test_runner::Config {
-                cases: 16,
-                ..Default::default()
-            }
-        }
-    }
-
     proptest! {
-        #![proptest_config(miri_proptest_config())]
+        #![proptest_config(crate::test_support::miri_proptest_config(16))]
 
         /// Second test_and_set returns false, count unchanged.
         #[test]

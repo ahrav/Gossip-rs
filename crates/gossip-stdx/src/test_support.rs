@@ -1,8 +1,8 @@
 //! Shared test helpers for proptest configuration.
 //!
-//! This module is gated behind the `stdx-proptest` feature and provides
-//! helpers that all crates in the workspace can use to configure proptest
-//! case counts consistently.
+//! Available under the `stdx-proptest` feature (for downstream crates) and
+//! under `#[cfg(test)]` (for internal gossip-stdx tests). Provides helpers
+//! that configure proptest case counts consistently across the workspace.
 
 /// Read an environment variable as a `u32`.
 fn env_u32(name: &str) -> Option<u32> {
@@ -57,4 +57,22 @@ pub fn proptest_fuzz_multiplier(default: u32) -> u32 {
         return default.max(1);
     }
     1
+}
+
+/// Returns a [`proptest::test_runner::Config`] with the given case count
+/// and Miri-safe failure persistence.
+///
+/// Under Miri, disables file-based failure persistence since Miri's default
+/// isolation mode blocks `getcwd` (used by proptest's file persister).
+/// Outside Miri, uses the default persistence strategy.
+///
+/// Gated behind `#[cfg(test)]` because it returns a proptest type that
+/// requires the `proptest` dev-dependency.
+#[cfg(test)]
+pub fn miri_proptest_config(cases: u32) -> proptest::test_runner::Config {
+    let mut config = proptest::test_runner::Config::with_cases(cases);
+    if cfg!(miri) {
+        config.failure_persistence = None;
+    }
+    config
 }

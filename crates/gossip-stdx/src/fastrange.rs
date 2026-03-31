@@ -54,23 +54,6 @@ mod tests {
         TestRng::from_seed(RngAlgorithm::ChaCha, &PRNG_SEED)
     }
 
-    /// Under Miri, disables file-based failure persistence (which calls
-    /// `getcwd`, blocked by isolation) and reduces cases.
-    fn miri_proptest_config() -> proptest::test_runner::Config {
-        if cfg!(miri) {
-            proptest::test_runner::Config {
-                failure_persistence: None,
-                cases: 16,
-                ..Default::default()
-            }
-        } else {
-            proptest::test_runner::Config {
-                cases: 16,
-                ..Default::default()
-            }
-        }
-    }
-
     #[test]
     fn distribution_matches_reference_rng() {
         let mut prng = test_rng();
@@ -95,7 +78,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(miri_proptest_config())]
+        #![proptest_config(crate::test_support::miri_proptest_config(16))]
 
         #[test]
         fn output_is_within_range(word in any::<u64>(), p in 1u64..u64::MAX) {
