@@ -24,12 +24,12 @@ pub(crate) fn extract_json_string(json: &str, key: &str) -> Option<String> {
         if bytes[end] == b'\\' {
             end += if end + 1 < bytes.len() { 2 } else { 1 };
         } else if bytes[end] == b'"' {
-            break;
+            return Some(rest[..end].to_string());
         } else {
             end += 1;
         }
     }
-    Some(rest[..end].to_string())
+    None
 }
 
 /// Extract a JSON numeric value for a given key from a single JSON line.
@@ -97,5 +97,12 @@ mod tests {
         let json = r#"{"start": 42}"#;
 
         assert_eq!(extract_json_u64(json, "start"), Some(42));
+    }
+
+    #[test]
+    fn extract_json_string_returns_none_for_unterminated_value() {
+        let json = "{\"path\":\"unterminated";
+
+        assert_eq!(extract_json_string(json, "path"), None);
     }
 }
