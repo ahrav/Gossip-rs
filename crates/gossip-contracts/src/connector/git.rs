@@ -102,13 +102,6 @@ impl<'a> DecodedRepoKey<'a> {
         self.locator_kind
     }
 
-    /// Returns the raw identity payload bytes that follow the locator kind.
-    #[inline]
-    #[must_use]
-    pub fn identity_payload(self) -> &'a [u8] {
-        self.identity_payload
-    }
-
     /// Returns the local-path payload bytes stored in the key.
     ///
     /// Higher-level normalization is responsible for ensuring those bytes were
