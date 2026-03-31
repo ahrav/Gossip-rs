@@ -675,10 +675,10 @@ fn split_residual_error_does_not_corrupt_snapshot() {
 #[test]
 fn successive_split_residual_accumulates_spawned() {
     // Use a shard with range [0x00, 0x60) for room.
-    let mut coord = InMemoryCoordinator::new(30);
+    let config = short_lease_run_config();
+    let mut coord = InMemoryCoordinator::new(config.lease_duration());
     let tenant = test_tenant();
     let run = test_run();
-    let config = short_lease_run_config();
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard_spec =
