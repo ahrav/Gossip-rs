@@ -22,7 +22,7 @@ use super::midx_error::MidxError;
 ///
 /// These errors occur before any object scanning begins and typically
 /// indicate repository layout, configuration, or limit violations.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum RepoOpenError {
     /// I/O error during file operations.
@@ -70,6 +70,55 @@ pub enum RepoOpenError {
     /// Config file contains invalid UTF-8.
     #[error("config file contains invalid UTF-8")]
     InvalidUtf8Config,
+}
+
+/// Redacts `io::Error` messages in Debug output to prevent filesystem path
+/// leakage through error chains. `Io` and `Canonicalization` show only the
+/// `ErrorKind`; all other variants format identically to the derived Debug.
+impl fmt::Debug for RepoOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => f
+                .debug_struct("Io")
+                .field("kind", &err.kind())
+                .field("message", &"(redacted)")
+                .finish(),
+            Self::Canonicalization(err) => f
+                .debug_struct("Canonicalization")
+                .field("kind", &err.kind())
+                .field("message", &"(redacted)")
+                .finish(),
+            Self::NotARepository => write!(f, "NotARepository"),
+            Self::MalformedGitdirFile => write!(f, "MalformedGitdirFile"),
+            Self::GitdirTargetNotDir => write!(f, "GitdirTargetNotDir"),
+            Self::MalformedCommondirFile => write!(f, "MalformedCommondirFile"),
+            Self::CommonDirNotDir => write!(f, "CommonDirNotDir"),
+            Self::ObjectsDirNotDir => write!(f, "ObjectsDirNotDir"),
+            Self::AlternateNotDir => write!(f, "AlternateNotDir"),
+            Self::FileTooLarge { size, limit } => f
+                .debug_struct("FileTooLarge")
+                .field("size", size)
+                .field("limit", limit)
+                .finish(),
+            Self::StartSetTooLarge { count, max } => f
+                .debug_struct("StartSetTooLarge")
+                .field("count", count)
+                .field("max", max)
+                .finish(),
+            Self::RefNameTooLong { len, max } => f
+                .debug_struct("RefNameTooLong")
+                .field("len", len)
+                .field("max", max)
+                .finish(),
+            Self::ArenaOverflow => write!(f, "ArenaOverflow"),
+            Self::WatermarkCountMismatch { got, expected } => f
+                .debug_struct("WatermarkCountMismatch")
+                .field("got", got)
+                .field("expected", expected)
+                .finish(),
+            Self::InvalidUtf8Config => write!(f, "InvalidUtf8Config"),
+        }
+    }
 }
 
 impl RepoOpenError {

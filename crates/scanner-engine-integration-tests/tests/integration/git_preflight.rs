@@ -118,7 +118,7 @@ fn preflight_alternates_in_pack_count() {
     };
     let report = preflight(tmp.path(), limits).unwrap();
 
-    assert_eq!(report.repo.alternate_object_dirs.len(), 1);
+    assert_eq!(report.repo.alternate_object_dirs().len(), 1);
 
     // Alternates contribute to maintenance recommendations without blocking readiness.
     assert!(matches!(report.status, ArtifactStatus::Ready));

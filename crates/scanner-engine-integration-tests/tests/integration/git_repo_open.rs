@@ -132,8 +132,8 @@ fn repo_open_linked_worktree_and_alternates() {
     .unwrap();
 
     assert!(state.paths.is_linked_worktree());
-    assert_eq!(state.paths.alternate_object_dirs.len(), 1);
-    assert!(state.paths.alternate_object_dirs[0].ends_with("alt-objects"));
+    assert_eq!(state.paths.alternate_object_dirs().len(), 1);
+    assert!(state.paths.alternate_object_dirs()[0].ends_with("alt-objects"));
 }
 
 #[test]

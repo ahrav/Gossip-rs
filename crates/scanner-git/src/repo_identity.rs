@@ -375,6 +375,31 @@ mod tests {
 
         assert_eq!(a1, a2);
         assert_ne!(a1, b);
+
+        // Same tenant, different repo key must produce a different repo_id.
+        let other_repo_key = RepoKey::for_local_path(b"/other/repo/path").expect("other repo key");
+        let c = derive_repo_id(tenant(0x55), &other_repo_key);
+        assert_ne!(
+            a1, c,
+            "same tenant with different repo key must yield different repo_id"
+        );
+    }
+
+    #[test]
+    fn derive_repo_id_golden_value() {
+        let tenant_id = TenantId::from_bytes([0x55; 32]);
+        let repo_key = RepoKey::for_local_path(b"/golden/test/path").expect("golden repo key");
+        let id = derive_repo_id(tenant_id, &repo_key);
+
+        // Pin the exact value. If this changes, persistence namespaces have silently diverged.
+        // Regenerate only after verifying no persisted repo_id values depend on the old output.
+        const EXPECTED: u64 = 0x_1c61_23ee_933d_8ec1;
+        assert_eq!(
+            id, EXPECTED,
+            "derive_repo_id golden vector changed (domain::GIT_REPO_ID_V1). \
+             Persisted repo_id namespaces will silently diverge if this value changes.\n\
+             Actual: {id:#018x}",
+        );
     }
 
     #[test]
@@ -412,5 +437,32 @@ mod tests {
         let canonical = identity.canonical_repo_path().display().to_string();
         assert!(!debug.contains(&canonical));
         assert!(debug.contains("NormalizedLocalRepoIdentity"));
+    }
+
+    #[test]
+    fn normalize_local_repo_identities_accepts_empty_input() {
+        let sorted = normalize_local_repo_identities(
+            tenant(0x99),
+            Vec::<&Path>::new(),
+            &RepoOpenLimits::default(),
+        )
+        .expect("empty input is valid");
+        assert!(sorted.is_empty());
+    }
+
+    #[test]
+    fn normalize_rejects_non_repository_path() {
+        let dir = tempdir().expect("tempdir");
+        // Do NOT call init_repo — the directory is not a git repository.
+        let err = NormalizedLocalRepoIdentity::normalize(
+            tenant(0x88),
+            dir.path(),
+            &RepoOpenLimits::default(),
+        )
+        .expect_err("non-repository path should fail normalization");
+        assert!(
+            matches!(err, RepoIdentityError::RepoOpen { .. }),
+            "expected RepoOpen error, got: {err:?}"
+        );
     }
 }

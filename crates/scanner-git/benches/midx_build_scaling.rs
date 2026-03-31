@@ -128,15 +128,15 @@ fn build_fixture(pack_count: usize, objects_per_pack: usize) -> MidxFixture {
         fs::write(idx_path, idx.build()).expect("write idx");
     }
 
-    let repo = GitRepoPaths {
-        kind: RepoKind::Worktree,
-        worktree_root: Some(temp.path().to_path_buf()),
-        git_dir: git_dir.clone(),
-        common_dir: git_dir,
+    let repo = GitRepoPaths::from_parts(
+        RepoKind::Worktree,
+        Some(temp.path().to_path_buf()),
+        git_dir.clone(),
+        git_dir,
         objects_dir,
         pack_dir,
-        alternate_object_dirs: Vec::<PathBuf>::new(),
-    };
+        Vec::<PathBuf>::new(),
+    );
 
     let total_objects = pack_count * objects_per_pack;
     let limits = MidxBuildLimits {

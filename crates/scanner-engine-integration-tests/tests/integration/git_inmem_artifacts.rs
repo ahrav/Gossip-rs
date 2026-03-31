@@ -728,7 +728,7 @@ fn inmem_midx_produces_correct_offsets() {
     let our_midx = MidxView::parse(our_midx_bytes.as_slice(), ObjectFormat::Sha1).unwrap();
 
     // Read git MIDX
-    let pack_dir = paths.objects_dir.join("pack");
+    let pack_dir = paths.objects_dir().join("pack");
     let git_midx_path = pack_dir.join("multi-pack-index");
     let git_midx_bytes = fs::read(&git_midx_path).unwrap();
     let git_midx = MidxView::parse(&git_midx_bytes, ObjectFormat::Sha1).unwrap();

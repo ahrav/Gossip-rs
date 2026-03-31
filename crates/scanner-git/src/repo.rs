@@ -27,10 +27,13 @@
 //! between resolution and subsequent operations (TOCTOU).
 
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use gossip_contracts::connector::ToxicDigest;
 
 use super::errors::RepoOpenError;
 use super::limits::RepoOpenLimits;
@@ -144,41 +147,82 @@ pub enum RepoKind {
 ///
 /// All paths are canonicalized and validated to exist at resolution time,
 /// except `pack_dir` which may be missing in an empty repository.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitRepoPaths {
     /// Repository kind (worktree or bare).
-    pub kind: RepoKind,
+    pub(crate) kind: RepoKind,
 
     /// Worktree root (where working files live).
     /// `None` for bare repositories.
     /// Canonicalized.
-    pub worktree_root: Option<PathBuf>,
+    pub(crate) worktree_root: Option<PathBuf>,
 
     /// The `.git` directory (or bare repo root).
     /// For linked worktrees, this is the worktree-specific gitdir.
     /// Canonicalized.
-    pub git_dir: PathBuf,
+    pub(crate) git_dir: PathBuf,
 
     /// The common directory for shared data.
     /// For normal repos: same as `git_dir`.
     /// For linked worktrees: the main repo's `.git` directory.
     /// Canonicalized.
-    pub common_dir: PathBuf,
+    pub(crate) common_dir: PathBuf,
 
     /// The `objects` directory.
     /// Always under `common_dir`.
     /// Canonicalized.
-    pub objects_dir: PathBuf,
+    pub(crate) objects_dir: PathBuf,
 
     /// The `objects/pack` directory.
     /// May not exist in empty repositories.
-    pub pack_dir: PathBuf,
+    pub(crate) pack_dir: PathBuf,
 
     /// Alternate object directories (from `info/alternates`).
     ///
     /// May be empty; bounded by limits. Only immediate alternates are
     /// resolved; recursive alternates are not expanded. Canonicalized.
-    pub alternate_object_dirs: Vec<PathBuf>,
+    pub(crate) alternate_object_dirs: Vec<PathBuf>,
+}
+
+/// Redacts all filesystem paths via [`ToxicDigest`] so that raw repo paths
+/// never appear in log, metric, or trace output.
+impl fmt::Debug for GitRepoPaths {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitRepoPaths")
+            .field("kind", &self.kind)
+            .field(
+                "worktree_root",
+                &self
+                    .worktree_root
+                    .as_ref()
+                    .map(|p| ToxicDigest::of_bytes(p.to_string_lossy().as_bytes())),
+            )
+            .field(
+                "git_dir",
+                &ToxicDigest::of_bytes(self.git_dir.to_string_lossy().as_bytes()),
+            )
+            .field(
+                "common_dir",
+                &ToxicDigest::of_bytes(self.common_dir.to_string_lossy().as_bytes()),
+            )
+            .field(
+                "objects_dir",
+                &ToxicDigest::of_bytes(self.objects_dir.to_string_lossy().as_bytes()),
+            )
+            .field(
+                "pack_dir",
+                &ToxicDigest::of_bytes(self.pack_dir.to_string_lossy().as_bytes()),
+            )
+            .field(
+                "alternate_object_dirs",
+                &self
+                    .alternate_object_dirs
+                    .iter()
+                    .map(|p| ToxicDigest::of_bytes(p.to_string_lossy().as_bytes()))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl GitRepoPaths {
@@ -265,6 +309,94 @@ impl GitRepoPaths {
                 .as_deref()
                 .expect("worktree repositories always carry a worktree root"),
             RepoKind::Bare => self.git_dir.as_path(),
+        }
+    }
+
+    /// Repository kind (worktree or bare).
+    #[inline]
+    #[must_use]
+    pub fn kind(&self) -> RepoKind {
+        self.kind
+    }
+
+    /// Worktree root (where working files live).
+    /// Returns `None` for bare repositories.
+    #[inline]
+    #[must_use]
+    pub fn worktree_root(&self) -> Option<&Path> {
+        self.worktree_root.as_deref()
+    }
+
+    /// The `.git` directory (or bare repo root).
+    /// For linked worktrees, this is the worktree-specific gitdir.
+    #[inline]
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// The common directory for shared data.
+    /// For normal repos this is the same as `git_dir`. For linked worktrees
+    /// it is the main repo's `.git` directory.
+    #[inline]
+    #[must_use]
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+
+    /// The `objects` directory (always under `common_dir`).
+    #[inline]
+    #[must_use]
+    pub fn objects_dir(&self) -> &Path {
+        &self.objects_dir
+    }
+
+    /// The `objects/pack` directory. May not exist in empty repositories.
+    #[inline]
+    #[must_use]
+    pub fn pack_dir(&self) -> &Path {
+        &self.pack_dir
+    }
+
+    /// Alternate object directories parsed from `info/alternates`.
+    #[inline]
+    #[must_use]
+    pub fn alternate_object_dirs(&self) -> &[PathBuf] {
+        &self.alternate_object_dirs
+    }
+
+    /// Constructs a `GitRepoPaths` directly from pre-validated components.
+    ///
+    /// Intended for benchmarks and integration tests that synthesize
+    /// repository layouts without going through `resolve`. Production code
+    /// should always use [`GitRepoPaths::resolve`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `kind` is [`RepoKind::Worktree`] and `worktree_root` is
+    /// `None`.
+    #[doc(hidden)]
+    pub fn from_parts(
+        kind: RepoKind,
+        worktree_root: Option<PathBuf>,
+        git_dir: PathBuf,
+        common_dir: PathBuf,
+        objects_dir: PathBuf,
+        pack_dir: PathBuf,
+        alternate_object_dirs: Vec<PathBuf>,
+    ) -> Self {
+        assert!(
+            kind != RepoKind::Worktree || worktree_root.is_some(),
+            "worktree repositories must carry a worktree root"
+        );
+        Self {
+            kind,
+            worktree_root,
+            git_dir,
+            common_dir,
+            objects_dir,
+            pack_dir,
+            alternate_object_dirs,
         }
     }
 
@@ -559,4 +691,48 @@ fn is_file(path: &Path) -> bool {
 #[inline]
 fn is_dir(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_repo_paths_debug_redacts_filesystem_paths() {
+        let paths = GitRepoPaths {
+            kind: RepoKind::Worktree,
+            worktree_root: Some(PathBuf::from("/home/user/secret-project")),
+            git_dir: PathBuf::from("/home/user/secret-project/.git"),
+            common_dir: PathBuf::from("/home/user/secret-project/.git"),
+            objects_dir: PathBuf::from("/home/user/secret-project/.git/objects"),
+            pack_dir: PathBuf::from("/home/user/secret-project/.git/objects/pack"),
+            alternate_object_dirs: vec![PathBuf::from("/shared/objects/alt")],
+        };
+
+        let debug = format!("{paths:?}");
+
+        // Raw filesystem paths must not appear in Debug output.
+        assert!(
+            !debug.contains("/home/user/secret-project"),
+            "raw worktree path leaked into Debug output: {debug}"
+        );
+        assert!(
+            !debug.contains("/shared/objects/alt"),
+            "raw alternate path leaked into Debug output: {debug}"
+        );
+
+        // Struct name and ToxicDigest markers must be present.
+        assert!(
+            debug.contains("GitRepoPaths"),
+            "missing struct name in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("len="),
+            "missing ToxicDigest redaction in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("hash="),
+            "missing ToxicDigest hash in Debug output: {debug}"
+        );
+    }
 }
