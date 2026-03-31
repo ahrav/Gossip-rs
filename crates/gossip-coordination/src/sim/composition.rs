@@ -50,8 +50,7 @@ use gossip_contracts::persistence::{CommitHandle, DoneLedger, DoneLedgerRecord, 
 use gossip_persistence_inmemory::CompletionOrder;
 use gossip_persistence_inmemory::InMemoryDoneLedger;
 use gossip_persistence_inmemory::sim::{
-    DoneLedgerFaultConfig, DoneLedgerInvariantChecker, DoneLedgerInvariantViolation,
-    DoneLedgerOracle,
+    DoneLedgerInvariantChecker, DoneLedgerInvariantViolation, DoneLedgerOracle,
 };
 
 use crate::Lease;
@@ -71,8 +70,8 @@ use super::shared::{
 };
 use super::worker::SimWorker;
 use super::{
-    FaultConfig, FaultLevel, InvariantChecker, InvariantViolation, RejectionKind, RunTerminalKind,
-    SimContext, SimEvent, SimIntrospection, SimOp,
+    FaultLevel, InvariantChecker, InvariantViolation, RejectionKind, RunTerminalKind, SimContext,
+    SimEvent, SimIntrospection, SimOp,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,17 +117,11 @@ pub enum DoneLedgerFaultOp {
 
 /// Cross-boundary fault configuration for composition simulation.
 ///
-/// Combines coordination-level faults (lease expiry, pause, time jump),
-/// persistence-level faults (submit fail, commit fail, delay), and
-/// cross-component faults unique to the composition boundary.
+/// Cross-component faults unique to the composition boundary: crash
+/// between coordinator `complete()` and done-ledger persistence, and
+/// stale provenance injection.
 #[derive(Debug, Clone)]
 pub struct CompositionFaultConfig {
-    /// Coordination-level faults (lease expiry, pause, time jump).
-    #[allow(dead_code)]
-    coordination: FaultConfig,
-    /// Persistence-level faults (submit fail, commit fail, delay).
-    #[allow(dead_code)]
-    persistence: DoneLedgerFaultConfig,
     /// Probability (PPM) of crashing between coordinator `complete()` and
     /// done-ledger `batch_upsert()`. Models the most dangerous cross-component
     /// failure mode: the coordinator believes the shard is done but the
@@ -167,17 +160,7 @@ impl CompositionFaultConfig {
             FaultLevel::Radioactive => (100_000, 80_000),
         };
 
-        // Convert coordination FaultLevel to persistence FaultLevel.
-        // Both enums have identical variants, so we map by discriminant.
-        let persistence_level = match level {
-            FaultLevel::SunnyDay => gossip_persistence_inmemory::sim::FaultLevel::SunnyDay,
-            FaultLevel::Stormy => gossip_persistence_inmemory::sim::FaultLevel::Stormy,
-            FaultLevel::Radioactive => gossip_persistence_inmemory::sim::FaultLevel::Radioactive,
-        };
-
         Self {
-            coordination: FaultConfig::for_level(level),
-            persistence: DoneLedgerFaultConfig::for_level(persistence_level),
             crash_after_complete_ppm: crash_ppm,
             stale_provenance_ppm: stale_ppm,
         }

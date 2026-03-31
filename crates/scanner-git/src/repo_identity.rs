@@ -453,7 +453,8 @@ mod tests {
     #[test]
     fn normalize_rejects_non_repository_path() {
         let dir = tempdir().expect("tempdir");
-        // Do NOT call init_repo — the directory is not a git repository.
+        // Directory is intentionally uninitialized (not a Git repository),
+        // so normalization observes a non-repository path.
         let err = NormalizedLocalRepoIdentity::normalize(
             tenant(0x88),
             dir.path(),

@@ -192,36 +192,38 @@ impl fmt::Debug for GitRepoPaths {
             .field("kind", &self.kind)
             .field(
                 "worktree_root",
-                &self
-                    .worktree_root
-                    .as_ref()
-                    .map(|p| ToxicDigest::of_bytes(p.to_string_lossy().as_bytes())),
+                &self.worktree_root.as_ref().map(|p| digest_path(p)),
             )
-            .field(
-                "git_dir",
-                &ToxicDigest::of_bytes(self.git_dir.to_string_lossy().as_bytes()),
-            )
-            .field(
-                "common_dir",
-                &ToxicDigest::of_bytes(self.common_dir.to_string_lossy().as_bytes()),
-            )
-            .field(
-                "objects_dir",
-                &ToxicDigest::of_bytes(self.objects_dir.to_string_lossy().as_bytes()),
-            )
-            .field(
-                "pack_dir",
-                &ToxicDigest::of_bytes(self.pack_dir.to_string_lossy().as_bytes()),
-            )
+            .field("git_dir", &digest_path(&self.git_dir))
+            .field("common_dir", &digest_path(&self.common_dir))
+            .field("objects_dir", &digest_path(&self.objects_dir))
+            .field("pack_dir", &digest_path(&self.pack_dir))
             .field(
                 "alternate_object_dirs",
                 &self
                     .alternate_object_dirs
                     .iter()
-                    .map(|p| ToxicDigest::of_bytes(p.to_string_lossy().as_bytes()))
+                    .map(|p| digest_path(p))
                     .collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+/// Produce a [`ToxicDigest`] from a path's raw byte representation.
+///
+/// On Unix, extracts bytes directly via [`OsStrExt::as_bytes`] so that
+/// distinct non-UTF-8 paths produce distinct digests. On non-Unix, falls
+/// back to lossy UTF-8 (matching [`bytes_to_path`] conventions).
+fn digest_path(p: &Path) -> ToxicDigest {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        ToxicDigest::of_bytes(p.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        ToxicDigest::of_bytes(p.to_string_lossy().as_bytes())
     }
 }
 

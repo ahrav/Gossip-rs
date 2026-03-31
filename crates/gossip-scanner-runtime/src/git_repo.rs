@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 
 use anyhow::anyhow;
+use gossip_contracts::connector::ToxicDigest;
 use gossip_contracts::connector::git::{GitMirrorManager, GitRepoDiscoverySource, GitRepoExecutor};
 use scanner_git::{
     GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanResult, NativeRefResolver,
@@ -139,7 +140,7 @@ pub(crate) fn scan_local_repo(
         .map_err(|error| {
             ScanRuntimeError::Driver(anyhow!(
                 "git scan failed for '{}': {error}",
-                canonical_repo.display()
+                digest_repo_path(&canonical_repo)
             ))
         })?;
         let scan_elapsed = scan_start.elapsed();
@@ -161,6 +162,23 @@ pub(crate) fn scan_local_repo(
         checkpoint_hint: None,
         debug_output,
     })
+}
+
+/// Produce a [`ToxicDigest`] from a repo path for log-safe error messages.
+///
+/// On Unix, extracts raw bytes via [`OsStrExt::as_bytes`] so distinct
+/// non-UTF-8 paths produce distinct digests. On non-Unix, falls back to
+/// lossy UTF-8 conversion.
+fn digest_repo_path(p: &std::path::Path) -> ToxicDigest {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        ToxicDigest::of_bytes(p.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        ToxicDigest::of_bytes(p.to_string_lossy().as_bytes())
+    }
 }
 
 /// Translate the crate-level [`GitScanConfig`] into the lower-level

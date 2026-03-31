@@ -179,9 +179,9 @@ Three distinct `ErrorClass` enums exist today:
 
 | Layer | Current location | Current shape | This ADR changes it? |
 | --- | --- | --- | --- |
-| Connector level | `crates/gossip-contracts/src/connector/api.rs` | `Retryable | Permanent` | Yes, conceptually reserve `StaleOwner` here. |
+| Connector level | `crates/gossip-contracts/src/connector/api.rs` | `Retryable \| Permanent` | Yes, conceptually reserve `StaleOwner` here. |
 | Scheduler level | `crates/scanner-scheduler/src/scheduler/failure.rs` | Binary with reason subtypes | No. |
-| Remote backend level | `crates/scanner-scheduler/src/scheduler/remote.rs` | `Retryable | Permanent` | No. |
+| Remote backend level | `crates/scanner-scheduler/src/scheduler/remote.rs` | `Retryable \| Permanent` | No. |
 
 This ADR changes only the connector-level meaning. Scheduler and remote error
 taxonomies remain separate until they need their own explicit ownership-loss

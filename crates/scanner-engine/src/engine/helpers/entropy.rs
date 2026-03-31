@@ -138,7 +138,7 @@ pub(crate) enum EntropyGateOutcome {
 impl EntropyGateOutcome {
     /// Returns true when the candidate should proceed through detection flow.
     #[inline(always)]
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn allows_candidate(self) -> bool {
         !matches!(self, Self::Failed)
     }
@@ -223,7 +223,7 @@ pub(crate) fn compute_entropy_metrics(
 /// # Returns
 /// - 0.0 for empty input.
 #[inline]
-#[allow(dead_code)]
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn shannon_entropy_bits_per_byte(
     bytes: &[u8],
     scratch: &mut EntropyScratch,
