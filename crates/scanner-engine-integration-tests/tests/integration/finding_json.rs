@@ -36,7 +36,7 @@ pub(crate) fn extract_json_string(json: &str, key: &str) -> Option<String> {
 pub(crate) fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{}\":", key);
     let start = json.find(&needle)? + needle.len();
-    let rest = &json[start..];
+    let rest = json[start..].trim_start();
     let end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
@@ -71,7 +71,7 @@ pub(crate) fn parse_findings(output: &str) -> Vec<FindingLine> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_json_string;
+    use super::{extract_json_string, extract_json_u64};
 
     #[test]
     fn extract_json_string_accepts_whitespace_after_colon() {
@@ -90,5 +90,12 @@ mod tests {
         let result = std::panic::catch_unwind(|| extract_json_string(json, "path"));
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn extract_json_u64_accepts_whitespace_after_colon() {
+        let json = r#"{"start": 42}"#;
+
+        assert_eq!(extract_json_u64(json, "start"), Some(42));
     }
 }
