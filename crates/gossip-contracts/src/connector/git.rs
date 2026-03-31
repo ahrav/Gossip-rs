@@ -223,6 +223,12 @@ impl RepoKey {
             .ok_or(RepoKeyDecodeError::MissingLocatorKind)?;
         let locator_kind = RepoLocatorKind::from_tag(*tag)
             .ok_or(RepoKeyDecodeError::UnknownLocatorKind { tag: *tag })?;
+        match locator_kind {
+            RepoLocatorKind::LocalPath if identity_payload.is_empty() => {
+                return Err(RepoKeyDecodeError::MissingLocalPathPayload);
+            }
+            _ => {}
+        }
         Ok(DecodedRepoKey {
             locator_kind,
             identity_payload,
@@ -921,8 +927,11 @@ mod tests {
     #[test]
     fn repo_key_decode_rejects_missing_local_payload() {
         let key = repo_key(&[RepoLocatorKind::LocalPath as u8]);
-        let err = key.local_path_bytes().unwrap_err();
+        let err = key.decode().unwrap_err();
         assert_eq!(err, RepoKeyDecodeError::MissingLocalPathPayload);
+        // The convenience accessor surfaces the same error via decode().
+        let err2 = key.local_path_bytes().unwrap_err();
+        assert_eq!(err2, RepoKeyDecodeError::MissingLocalPathPayload);
     }
 
     #[test]

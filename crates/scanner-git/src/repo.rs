@@ -251,10 +251,9 @@ impl GitRepoPaths {
         E: RepoError,
         L: RepoLimits,
     {
-        assert!(
-            !repo_root.as_os_str().is_empty(),
-            "repo_root cannot be empty"
-        );
+        if repo_root.as_os_str().is_empty() {
+            return Err(E::not_a_repository());
+        }
 
         let dot_git = repo_root.join(".git");
 
@@ -302,6 +301,11 @@ impl GitRepoPaths {
     /// Worktree repositories use the canonicalized worktree root. Bare
     /// repositories use the canonicalized git directory, which is also the repo
     /// root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `kind` is [`RepoKind::Worktree`] but `worktree_root` is `None`,
+    /// which indicates a construction invariant violation.
     #[inline]
     #[must_use]
     pub fn canonical_repo_root(&self) -> &Path {
@@ -612,10 +616,7 @@ where
         let path = bytes_to_path(trimmed);
         let resolved = resolve_path(objects_dir, &path);
 
-        let canonical = match canonicalize_path::<E>(&resolved) {
-            Ok(p) => p,
-            Err(_) => return Err(E::alternate_not_dir()),
-        };
+        let canonical = canonicalize_path::<E>(&resolved)?;
 
         if !is_dir(&canonical) {
             return Err(E::alternate_not_dir());
@@ -735,6 +736,48 @@ mod tests {
         assert!(
             debug.contains("hash="),
             "missing ToxicDigest hash in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_empty_repo_root() {
+        let err =
+            GitRepoPaths::resolve::<RepoOpenError, _>(Path::new(""), &RepoOpenLimits::default())
+                .expect_err("empty repo root should fail");
+        assert!(matches!(err, RepoOpenError::NotARepository));
+    }
+
+    /// Verifies that a non-existent alternate path produces a
+    /// `Canonicalization` error rather than swallowing the underlying
+    /// `io::Error` and returning `AlternateNotDir`.
+    #[test]
+    fn broken_alternate_propagates_canonicalization_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Minimal worktree layout: .git/HEAD, .git/objects, .git/refs.
+        let git_dir = root.join(".git");
+        let objects_dir = git_dir.join("objects");
+        let info_dir = objects_dir.join("info");
+        fs::create_dir_all(&info_dir).unwrap();
+        fs::create_dir_all(git_dir.join("refs")).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // Point alternates at a path that does not exist.
+        let bogus = root.join("no_such_dir");
+        fs::write(
+            info_dir.join("alternates"),
+            bogus.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+
+        let limits = RepoOpenLimits::DEFAULT;
+        let err = GitRepoPaths::resolve::<RepoOpenError, _>(root, &limits)
+            .expect_err("should fail on non-existent alternate");
+
+        assert!(
+            matches!(err, RepoOpenError::Canonicalization(_)),
+            "expected Canonicalization, got {err:?}"
         );
     }
 }

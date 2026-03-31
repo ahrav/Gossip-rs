@@ -374,4 +374,29 @@ mod tests {
         let spill_err: SpillError = io_err.into();
         assert!(matches!(spill_err, SpillError::Io(_)));
     }
+
+    #[test]
+    fn repo_open_error_debug_redacts_io_paths() {
+        let err = RepoOpenError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "/secret/path/to/repo",
+        ));
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("/secret/path"),
+            "io path leaked into Debug output: {debug}"
+        );
+        assert!(debug.contains("(redacted)"));
+
+        let err = RepoOpenError::Canonicalization(io::Error::new(
+            io::ErrorKind::NotFound,
+            "/secret/canonical/path",
+        ));
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("/secret/canonical"),
+            "canonical path leaked into Debug output: {debug}"
+        );
+        assert!(debug.contains("(redacted)"));
+    }
 }

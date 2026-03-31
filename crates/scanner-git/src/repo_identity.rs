@@ -38,6 +38,10 @@ impl NormalizedLocalRepoIdentity {
         tenant_id: TenantId,
         canonical_repo_path: PathBuf,
     ) -> Result<Self, ConnectorInputError> {
+        debug_assert!(
+            canonical_repo_path.is_absolute(),
+            "canonical_repo_path must be an absolute path"
+        );
         let repo_key = RepoKey::for_local_path(canonical_repo_path.as_os_str().as_encoded_bytes())?;
         let repo_locator = RepoLocator::local_path(canonical_repo_path.clone());
         let repo_id = derive_repo_id(tenant_id, &repo_key);
@@ -162,7 +166,12 @@ where
     Ok(identities)
 }
 
-/// Derives a stable tenant-scoped `repo_id` from a normalized [`RepoKey`].
+/// Derives a stable tenant-scoped 64-bit `repo_id` from a normalized [`RepoKey`]
+/// using the [`domain::GIT_REPO_ID_V1`] domain hasher.
+///
+/// The output is used as a persistence namespace key. Changing the domain
+/// constant or input encoding invalidates persisted namespaces — see the
+/// golden-vector test for regression detection.
 #[must_use]
 pub fn derive_repo_id(tenant_id: TenantId, repo_key: &RepoKey) -> u64 {
     let mut hasher = domain_hasher(domain::GIT_REPO_ID_V1);
@@ -273,7 +282,7 @@ mod tests {
             ],
         );
 
-        let identity = NormalizedLocalRepoIdentity::normalize(
+        let wt_identity = NormalizedLocalRepoIdentity::normalize(
             tenant(0x22),
             &worktree,
             &RepoOpenLimits::default(),
@@ -281,13 +290,33 @@ mod tests {
         .expect("normalize linked worktree");
         let expected_root = fs::canonicalize(&worktree).expect("canonical worktree");
 
-        assert_eq!(identity.canonical_repo_path(), expected_root.as_path());
+        assert_eq!(wt_identity.canonical_repo_path(), expected_root.as_path());
         assert_eq!(
-            identity
+            wt_identity
                 .repo_key()
                 .local_path_bytes()
                 .expect("repo key path"),
             expected_root.as_os_str().as_encoded_bytes()
+        );
+
+        // The parent repo must produce a different identity than the worktree
+        // so that persistence namespaces never collide.
+        let parent_identity = NormalizedLocalRepoIdentity::normalize(
+            tenant(0x22),
+            dir.path(),
+            &RepoOpenLimits::default(),
+        )
+        .expect("normalize parent repo");
+
+        assert_ne!(
+            parent_identity.repo_key(),
+            wt_identity.repo_key(),
+            "parent and worktree must have distinct repo_key values"
+        );
+        assert_ne!(
+            parent_identity.repo_id(),
+            wt_identity.repo_id(),
+            "parent and worktree must have distinct repo_id values"
         );
     }
 
@@ -409,13 +438,17 @@ mod tests {
             use std::ffi::OsString;
             use std::os::unix::ffi::OsStringExt;
 
-            PathBuf::from(OsString::from_vec(
-                vec![b'x'; gossip_contracts::connector::MAX_ITEM_KEY_SIZE],
-            ))
+            let mut bytes = vec![b'x'; gossip_contracts::connector::MAX_ITEM_KEY_SIZE];
+            bytes[0] = b'/';
+            PathBuf::from(OsString::from_vec(bytes))
         };
 
         #[cfg(not(unix))]
-        let path = PathBuf::from("x".repeat(gossip_contracts::connector::MAX_ITEM_KEY_SIZE));
+        let path = {
+            let mut s = "x".repeat(gossip_contracts::connector::MAX_ITEM_KEY_SIZE);
+            s.replace_range(..1, "/");
+            PathBuf::from(s)
+        };
 
         let err = NormalizedLocalRepoIdentity::from_canonical_repo_root(tenant(0x66), path)
             .expect_err("oversized canonical path should be rejected");
