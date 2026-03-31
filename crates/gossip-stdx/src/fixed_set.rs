@@ -158,7 +158,6 @@ mod proptests {
     use proptest::prelude::*;
     use std::collections::HashSet;
 
-    const PROPTEST_CASES: u32 = 16;
     const CAP: usize = 64;
 
     #[derive(Clone, Debug)]
@@ -172,9 +171,7 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(
-            PROPTEST_CASES
-        ))]
+        #![proptest_config(crate::test_support::miri_proptest_config(16))]
 
         // FixedSet128 proptests
 

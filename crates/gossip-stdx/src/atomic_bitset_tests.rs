@@ -154,12 +154,8 @@ mod proptests {
     use proptest::prelude::*;
     use std::collections::HashSet;
 
-    const PROPTEST_CASES: u32 = 16;
-
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(
-            PROPTEST_CASES
-        ))]
+        #![proptest_config(crate::test_support::miri_proptest_config(16))]
 
         /// Second test_and_set returns false, count unchanged.
         #[test]

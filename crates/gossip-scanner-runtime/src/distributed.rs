@@ -5869,7 +5869,17 @@ mod tests {
             );
         }
 
+        // Wait for the 3rd commit to appear but keep it blocked. The lease
+        // thread is parked waiting for this commit to resolve, so it is
+        // deterministically alive while we wait for the deadline to expire.
         let failing_op = next_pending_done_commit();
+
+        // Let the lease TTL expire while the commit is still pending. The
+        // watchdog fires independently and records LeaseUncertain.
+        std::thread::sleep(Duration::from_millis(LEASE_TTL_MS + 250));
+
+        // Now inject the failure and release. Both a drain failure and a
+        // deadline expiry are present; the test asserts LeaseUncertain wins.
         done_ledger
             .fail_next_commits(1)
             .expect("inject done-ledger commit failure");
@@ -5879,14 +5889,6 @@ mod tests {
                 .expect("release failing done-ledger commit"),
             "failing done-ledger op should release"
         );
-
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(
-            !handle.is_finished(),
-            "lease thread should still have outstanding scan or commit work after the failed done-ledger commit"
-        );
-
-        std::thread::sleep(Duration::from_millis(LEASE_TTL_MS + 250));
         done_ledger
             .set_auto_complete(true)
             .expect("re-enable done-ledger auto-complete");
