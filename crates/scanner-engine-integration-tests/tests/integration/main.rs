@@ -6,6 +6,7 @@ mod anchor_optimization;
 mod archive_scanning;
 mod bench_guards;
 mod binary_awareness;
+mod finding_json;
 // execution_mode_parity requires binary invocation — deferred until scanner-rs-cli binary name is settled.
 // mod execution_mode_parity;
 // fs_cli_archives requires binary invocation — deferred until scanner-rs-cli binary name is settled.

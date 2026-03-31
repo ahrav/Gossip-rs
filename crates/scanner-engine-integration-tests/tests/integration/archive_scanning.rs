@@ -12,6 +12,7 @@
 //! - Archive bytes are synthesized with minimal headers plus targeted
 //!   corruption for ZIP edge cases.
 
+use crate::finding_json::parse_findings;
 use crc32fast::Hasher as Crc32;
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -38,61 +39,6 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use zip::CompressionMethod;
 use zip::write::FileOptions;
-
-#[derive(Debug)]
-struct FindingLine {
-    path: String,
-    start: u64,
-}
-
-/// Extract a JSON string value for a given key from a single JSON line.
-///
-/// This is a minimal parser that handles backslash-escaped quotes.
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":\"", key);
-    let start = json.find(&needle)? + needle.len();
-    let rest = &json[start..];
-    let bytes = rest.as_bytes();
-    let mut end = 0;
-    while end < bytes.len() {
-        if bytes[end] == b'\\' {
-            end += 2;
-        } else if bytes[end] == b'"' {
-            break;
-        } else {
-            end += 1;
-        }
-    }
-    Some(rest[..end].to_string())
-}
-
-/// Extract a JSON numeric value for a given key from a single JSON line.
-fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
-    let needle = format!("\"{}\":", key);
-    let start = json.find(&needle)? + needle.len();
-    let rest = &json[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-
-/// Parse JSONL finding lines into `(path, start)` pairs.
-///
-/// This is intentionally lossy: end offsets and rule names are ignored because
-/// the tests only assert path attribution and the start position.
-fn parse_findings(output: &str) -> Vec<FindingLine> {
-    let mut out = Vec::new();
-    for line in output.lines() {
-        if !line.contains("\"type\":\"finding\"") {
-            continue;
-        }
-        let path = extract_json_string(line, "path").unwrap_or_default();
-        let start = extract_json_u64(line, "start").unwrap_or(0);
-        out.push(FindingLine { path, start });
-    }
-    out
-}
 
 fn perf_stats_enabled() -> bool {
     cfg!(all(feature = "perf-stats", debug_assertions))

@@ -46,48 +46,27 @@
 
 use super::*;
 use crate::in_memory::InMemoryCoordinator;
-use crate::run::{RunConfig, RunManagement};
-use crate::test_fixtures::acquire_result;
+use crate::run::RunManagement;
+use crate::test_fixtures::{
+    acquire_result, now, short_lease_run_config, test_run, test_tenant, test_worker,
+};
 use gossip_contracts::coordination::manifest::InitialShardInput;
-use gossip_contracts::coordination::shard_spec::CursorSemantics;
 use gossip_contracts::coordination::split::SplitReplaceChild;
-use gossip_contracts::identity::{RunId, ShardId};
+use gossip_contracts::identity::ShardId;
 use gossip_contracts::test_util::miri_proptest_config;
 use proptest::prelude::*;
-
-fn test_tenant() -> TenantId {
-    TenantId::from_bytes([0x01; 32])
-}
-
-fn test_run() -> RunId {
-    RunId::from_raw(1)
-}
-
-fn test_worker(id: u64) -> WorkerId {
-    WorkerId::from_raw(id)
-}
-
-fn now(t: u64) -> LogicalTime {
-    LogicalTime::from_raw(t)
-}
-
-/// Returns a run config with `CursorSemantics::Completed`, a 30-tick
-/// lease duration, and a max-shard-retries value of 5.
-fn test_run_config() -> RunConfig {
-    RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
-}
 
 /// Set up a coordinator with a single run containing `shard_count` shards.
 ///
 /// Each shard covers a wide range: shard i covers `[i*0x40, (i+1)*0x40)`.
 /// This gives enough room for cursor values and split operations.
-/// The lease duration is 30 ticks (from `test_run_config`), so acquiring
-/// at `now(2)` yields a deadline of 32.
+/// The lease duration is 30 ticks (from `short_lease_run_config`), so
+/// acquiring at `now(2)` yields a deadline of 32.
 fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>) {
     let mut coord = InMemoryCoordinator::new(30);
     let tenant = test_tenant();
     let run = test_run();
-    let config = test_run_config();
+    let config = short_lease_run_config();
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
@@ -699,7 +678,7 @@ fn successive_split_residual_accumulates_spawned() {
     let mut coord = InMemoryCoordinator::new(30);
     let tenant = test_tenant();
     let run = test_run();
-    let config = test_run_config();
+    let config = short_lease_run_config();
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard_spec =
