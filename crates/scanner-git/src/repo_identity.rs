@@ -173,8 +173,7 @@ where
 /// by cloning the cached [`REPO_ID_HASHER`] (`GIT_REPO_ID_V1` domain).
 ///
 /// The output is used as a persistence namespace key. Changing the domain
-/// constant or input encoding invalidates persisted namespaces — see the
-/// golden-vector test for regression detection.
+/// constant or input encoding invalidates persisted namespaces.
 #[must_use]
 pub fn derive_repo_id(tenant_id: TenantId, repo_key: &RepoKey) -> u64 {
     let mut hasher = REPO_ID_HASHER.clone();
