@@ -244,14 +244,6 @@ pub(crate) fn build_blob_key(
     key
 }
 
-/// Builds a per-OID seen key for the given repo/policy/OID.
-///
-/// This is a thin wrapper around `build_blob_key` using the `sb\0` namespace.
-#[cfg(test)]
-pub(crate) fn build_seen_blob_key(repo_id: u64, policy_hash: &[u8; 32], oid: &OidBytes) -> Vec<u8> {
-    build_blob_key(&NS_SEEN_BLOB, repo_id, policy_hash, oid)
-}
-
 /// Builds the scope key for the seen bitmap.
 pub(crate) fn build_seen_scope_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
     let mut key = Vec::with_capacity(SEEN_SCOPE_KEY_LEN);

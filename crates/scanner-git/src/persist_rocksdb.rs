@@ -20,7 +20,7 @@ use super::errors::{PersistError, RepoOpenError, SpillError};
 #[cfg(feature = "rocksdb")]
 use super::finalize::FinalizeOutcome;
 use super::finalize::FinalizeOutput;
-#[cfg(any(feature = "rocksdb", test))]
+#[cfg(feature = "rocksdb")]
 use super::finalize::NS_SEEN_BLOB;
 #[cfg(feature = "rocksdb")]
 use super::finalize::{build_ref_wm_key, build_seen_scope_key};
@@ -35,7 +35,7 @@ use super::start_set::StartSetId;
 use super::watermark_keys::decode_ref_watermark_value;
 
 #[cfg(feature = "rocksdb")]
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{Options, WriteBatch, DB};
 
 /// RocksDB-backed store for Git scan persistence.
 ///
@@ -59,46 +59,6 @@ pub struct RocksDbStore {
     /// never trips in production; if it does, the caller has a lease bug.
     #[cfg(feature = "rocksdb")]
     finalizing: AtomicBool,
-}
-
-/// Returns the byte length of a seen-blob key for the given OID length.
-#[cfg(test)]
-fn seen_blob_key_len(oid_len: u8) -> usize {
-    3 + 8 + 32 + oid_len as usize
-}
-
-/// Writes a `seen_blob` key into the provided buffer.
-///
-/// Layout: namespace prefix + repo_id + policy_hash + oid bytes.
-#[cfg(test)]
-fn write_seen_blob_key(buf: &mut [u8], repo_id: u64, policy_hash: &[u8; 32], oid: &OidBytes) {
-    debug_assert_eq!(buf.len(), seen_blob_key_len(oid.len()));
-    let mut offset = 0;
-    buf[offset..offset + 3].copy_from_slice(&NS_SEEN_BLOB);
-    offset += 3;
-    buf[offset..offset + 8].copy_from_slice(&repo_id.to_be_bytes());
-    offset += 8;
-    buf[offset..offset + 32].copy_from_slice(policy_hash);
-    offset += 32;
-    buf[offset..offset + oid.len() as usize].copy_from_slice(oid.as_slice());
-}
-
-/// Returns the byte length of the seen-bitmap scope key.
-#[cfg(test)]
-fn seen_scope_key_len() -> usize {
-    3 + 8 + 32
-}
-
-/// Writes the seen-bitmap scope key into the provided buffer.
-#[cfg(test)]
-fn write_seen_scope_key(buf: &mut [u8], repo_id: u64, policy_hash: &[u8; 32]) {
-    debug_assert_eq!(buf.len(), seen_scope_key_len());
-    let mut offset = 0;
-    buf[offset..offset + 3].copy_from_slice(&NS_SEEN_BLOB);
-    offset += 3;
-    buf[offset..offset + 8].copy_from_slice(&repo_id.to_be_bytes());
-    offset += 8;
-    buf[offset..offset + 32].copy_from_slice(policy_hash);
 }
 
 impl RocksDbStore {
@@ -178,75 +138,9 @@ impl RocksDbStore {
                 )),
                 Err(err) => Err(format!("corrupt seen-bitmap: {err}")),
             },
-            Ok(None) => self.migrate_legacy_seen_keys(oid_len, &scope_key),
+            Ok(None) => Ok(RoaringSeenStore::new(RoaringSeenBitmap::new(oid_len))),
             Err(err) => Err(err.to_string()),
         }
-    }
-
-    #[cfg(feature = "rocksdb")]
-    fn migrate_legacy_seen_keys(
-        &self,
-        oid_len: u8,
-        scope_key: &[u8],
-    ) -> Result<RoaringSeenStore, String> {
-        let mut migrated_keys = Vec::new();
-        let mut skipped_keys: usize = 0;
-        let mut legacy_oids = Vec::new();
-
-        for item in self
-            .db
-            .full_iterator(IteratorMode::From(scope_key, Direction::Forward))
-        {
-            let (key, _) = item.map_err(|err| err.to_string())?;
-            if !key.starts_with(scope_key) {
-                break;
-            }
-            if key.len() == scope_key.len() {
-                continue;
-            }
-
-            let suffix = &key[scope_key.len()..];
-            if suffix.len() == oid_len as usize {
-                if let Some(oid) = OidBytes::try_from_slice(suffix) {
-                    legacy_oids.push(oid);
-                    migrated_keys.push(key.to_vec());
-                    continue;
-                }
-            }
-            // Key has an unexpected suffix length or failed OID parsing;
-            // leave it in place rather than silently deleting it.
-            skipped_keys += 1;
-        }
-
-        if migrated_keys.is_empty() {
-            if skipped_keys > 0 {
-                return Err(format!(
-                    "migration found {skipped_keys} legacy seen keys with \
-                     unexpected suffix length (expected {oid_len}); \
-                     no keys were migrated or deleted"
-                ));
-            }
-            return Ok(RoaringSeenStore::new(RoaringSeenBitmap::new(oid_len)));
-        }
-
-        let mut bitmap = RoaringSeenBitmap::new(oid_len);
-        bitmap
-            .insert_batch(&legacy_oids)
-            .map_err(|err| err.to_string())?;
-
-        let mut batch = WriteBatch::default();
-        if !bitmap.is_empty() {
-            batch.put(
-                scope_key,
-                bitmap.serialize().map_err(|err| err.to_string())?,
-            );
-        }
-        for key in &migrated_keys {
-            batch.delete(key);
-        }
-        self.db.write(batch).map_err(|err| err.to_string())?;
-
-        Ok(RoaringSeenStore::new(bitmap))
     }
 }
 
@@ -476,35 +370,10 @@ impl RefWatermarkStore for RocksDbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finalize::{build_seen_blob_key, build_seen_scope_key, FinalizeStats, WriteOp};
+    use crate::finalize::{build_seen_scope_key, FinalizeStats, WriteOp};
 
     #[cfg(feature = "rocksdb")]
     use tempfile::tempdir;
-
-    #[test]
-    fn seen_blob_key_builder_matches_legacy() {
-        let repo_id = 42;
-        let policy_hash = [0xAB; 32];
-        let oid = OidBytes::sha1([0x11; 20]);
-
-        let expected = build_seen_blob_key(repo_id, &policy_hash, &oid);
-        let mut buf = vec![0u8; seen_blob_key_len(oid.len())];
-        write_seen_blob_key(&mut buf, repo_id, &policy_hash, &oid);
-
-        assert_eq!(buf, expected);
-    }
-
-    #[test]
-    fn seen_scope_key_builder_matches_finalize() {
-        let repo_id = 42;
-        let policy_hash = [0xCD; 32];
-
-        let expected = build_seen_scope_key(repo_id, &policy_hash);
-        let mut buf = vec![0u8; seen_scope_key_len()];
-        write_seen_scope_key(&mut buf, repo_id, &policy_hash);
-
-        assert_eq!(buf, expected);
-    }
 
     #[cfg(feature = "rocksdb")]
     fn seen_finalize_output(
@@ -558,118 +427,6 @@ mod tests {
                 .batch_check_seen(&[oid_a, oid_b, oid_c])
                 .expect("batch check"),
             vec![true, true, true]
-        );
-    }
-
-    #[cfg(feature = "rocksdb")]
-    #[test]
-    fn rocksdb_store_migrates_per_oid_seen_keys() {
-        let dir = tempdir().expect("tempdir");
-        let repo_id = 9;
-        let policy_hash = [0x99; 32];
-        let oid_a = OidBytes::sha1([0x0A; 20]);
-        let oid_b = OidBytes::sha1([0x0B; 20]);
-        let legacy_scope_key = build_seen_scope_key(repo_id, &policy_hash);
-
-        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
-        let mut batch = WriteBatch::default();
-        batch.put(build_seen_blob_key(repo_id, &policy_hash, &oid_a), [1u8]);
-        batch.put(build_seen_blob_key(repo_id, &policy_hash, &oid_b), [1u8]);
-        store.db.write(batch).expect("seed legacy keys");
-
-        assert_eq!(
-            store
-                .batch_check_seen(&[oid_a, oid_b, OidBytes::sha1([0x0C; 20])])
-                .expect("batch check"),
-            vec![true, true, false]
-        );
-
-        let bitmap_bytes = store
-            .db
-            .get(&legacy_scope_key)
-            .expect("read scope key")
-            .expect("scope key present");
-        let bitmap = RoaringSeenBitmap::deserialize(bitmap_bytes.as_ref()).expect("bitmap");
-        assert!(bitmap.contains(&oid_a));
-        assert!(bitmap.contains(&oid_b));
-        assert!(
-            store
-                .db
-                .get(build_seen_blob_key(repo_id, &policy_hash, &oid_a))
-                .expect("read legacy key")
-                .is_none(),
-            "legacy per-OID keys should be removed during migration"
-        );
-    }
-
-    #[cfg(feature = "rocksdb")]
-    #[test]
-    fn rocksdb_store_migration_preserves_unrecognized_keys() {
-        let dir = tempdir().expect("tempdir");
-        let repo_id = 10;
-        let policy_hash = [0xBB; 32];
-        let oid_a = OidBytes::sha1([0x0A; 20]);
-
-        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
-        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
-
-        // Seed one valid SHA-1 legacy key and one key with wrong suffix
-        // length (5 bytes instead of 20).
-        let mut batch = WriteBatch::default();
-        batch.put(build_seen_blob_key(repo_id, &policy_hash, &oid_a), [1u8]);
-        let mut bad_key = scope_key.to_vec();
-        bad_key.extend_from_slice(&[0xFF; 5]);
-        batch.put(&bad_key, [1u8]);
-        store.db.write(batch).expect("seed mixed keys");
-
-        // Migration should succeed: the valid key is migrated, the
-        // unrecognized key is left in place.
-        assert_eq!(
-            store
-                .batch_check_seen(&[oid_a, OidBytes::sha1([0x0B; 20])])
-                .expect("batch check"),
-            vec![true, false]
-        );
-
-        // The valid legacy key should be deleted.
-        assert!(
-            store
-                .db
-                .get(build_seen_blob_key(repo_id, &policy_hash, &oid_a))
-                .expect("read migrated key")
-                .is_none(),
-            "migrated key should be deleted"
-        );
-
-        // The unrecognized key should still exist.
-        assert!(
-            store.db.get(&bad_key).expect("read bad key").is_some(),
-            "unrecognized key should be preserved"
-        );
-    }
-
-    #[cfg(feature = "rocksdb")]
-    #[test]
-    fn rocksdb_store_migration_errors_when_only_unrecognized_keys_exist() {
-        let dir = tempdir().expect("tempdir");
-        let repo_id = 10;
-        let policy_hash = [0xBC; 32];
-
-        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
-        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
-
-        // Seed only keys with wrong suffix length.
-        let mut bad_key = scope_key.to_vec();
-        bad_key.extend_from_slice(&[0xFF; 5]);
-        store.db.put(&bad_key, [1u8]).expect("seed bad key");
-
-        let err = store
-            .batch_check_seen(&[OidBytes::sha1([0x01; 20])])
-            .expect_err("should fail when only unrecognized keys exist");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("unexpected suffix length"),
-            "error should mention unexpected suffix, got: {msg}"
         );
     }
 
