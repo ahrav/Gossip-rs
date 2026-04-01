@@ -365,9 +365,9 @@ impl GitRepoPaths {
 
     /// Constructs a `GitRepoPaths` directly from pre-validated components.
     ///
-    /// Intended for benchmarks and integration tests that synthesize
-    /// repository layouts without going through `resolve`. Production code
-    /// should always use [`GitRepoPaths::resolve`].
+    /// This bypasses repository discovery and filesystem validation, so all
+    /// inputs must already satisfy `GitRepoPaths` invariants. Prefer
+    /// [`GitRepoPaths::resolve`] when discovering repositories from disk.
     ///
     /// # Panics
     ///

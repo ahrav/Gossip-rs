@@ -471,7 +471,15 @@ mod tests {
 
         let debug = format!("{identity:?}");
         let canonical = identity.canonical_repo_path().display().to_string();
-        assert!(!debug.contains(&canonical));
+        let canonical_debug = format!("{:?}", identity.canonical_repo_path());
+        assert!(
+            !debug.contains(&canonical),
+            "display-form path leaked into Debug output: {debug}"
+        );
+        assert!(
+            !debug.contains(&canonical_debug),
+            "debug-escaped path leaked into Debug output: {debug}"
+        );
         assert!(debug.contains("NormalizedLocalRepoIdentity"));
     }
 
