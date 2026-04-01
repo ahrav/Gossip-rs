@@ -175,6 +175,8 @@ pub mod preflight_error;
 pub mod preflight_limits;
 /// Implements repository path resolution and layout detection.
 pub mod repo;
+/// Normalizes local Git repo identities and derives stable repo namespaces.
+pub mod repo_identity;
 /// Implements repository discovery, open, and start set resolution.
 pub mod repo_open;
 pub(crate) mod repo_paths;
@@ -261,6 +263,9 @@ pub use preflight::{
 pub use preflight_error::PreflightError;
 pub use preflight_limits::PreflightLimits;
 pub use repo::{GitRepoPaths, RepoKind};
+pub use repo_identity::{
+    derive_repo_id, normalize_local_repo_identities, NormalizedLocalRepoIdentity, RepoIdentityError,
+};
 pub use repo_open::{
     repo_open, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps, RepoArtifactPaths,
     RepoJobState, StartSetRef, StartSetResolver,

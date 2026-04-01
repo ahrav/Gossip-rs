@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 
 use anyhow::anyhow;
+use gossip_contracts::connector::ToxicDigest;
 use gossip_contracts::connector::git::{GitMirrorManager, GitRepoDiscoverySource, GitRepoExecutor};
 use scanner_git::{
     GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanResult, NativeRefResolver,
@@ -139,7 +140,7 @@ pub(crate) fn scan_local_repo(
         .map_err(|error| {
             ScanRuntimeError::Driver(anyhow!(
                 "git scan failed for '{}': {error}",
-                canonical_repo.display()
+                digest_repo_path(&canonical_repo)
             ))
         })?;
         let scan_elapsed = scan_start.elapsed();
@@ -161,6 +162,15 @@ pub(crate) fn scan_local_repo(
         checkpoint_hint: None,
         debug_output,
     })
+}
+
+/// Produce a [`ToxicDigest`] from a repo path for log-safe error messages.
+///
+/// Uses `OsStr::as_encoded_bytes` on all platforms for consistency with
+/// `NormalizedLocalRepoIdentity`'s key derivation, so the digest
+/// correlates with the authoritative repo identity key.
+fn digest_repo_path(p: &std::path::Path) -> ToxicDigest {
+    ToxicDigest::of_bytes(p.as_os_str().as_encoded_bytes())
 }
 
 /// Translate the crate-level [`GitScanConfig`] into the lower-level

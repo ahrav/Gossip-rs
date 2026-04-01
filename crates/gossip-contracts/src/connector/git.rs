@@ -61,12 +61,110 @@ use super::{Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey};
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RepoKey(ItemKey);
 
+/// Stable locator-kind tag stored at the front of [`RepoKey`] bytes.
+///
+/// The encoded key shape is `locator_kind || identity_payload`, where the
+/// payload format depends on the locator kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum RepoLocatorKind {
+    /// Canonical absolute local repository path bytes.
+    LocalPath = 1,
+}
+
+impl RepoLocatorKind {
+    #[inline]
+    const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::LocalPath),
+            _ => None,
+        }
+    }
+}
+
+/// Structured view over a decoded [`RepoKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedRepoKey<'a> {
+    locator_kind: RepoLocatorKind,
+    identity_payload: &'a [u8],
+}
+
+impl<'a> DecodedRepoKey<'a> {
+    /// Returns the locator-kind prefix stored in the encoded key.
+    #[inline]
+    #[must_use]
+    pub fn locator_kind(self) -> RepoLocatorKind {
+        self.locator_kind
+    }
+
+    /// Returns the local-path payload bytes stored in the key.
+    ///
+    /// Higher-level normalization is responsible for ensuring those bytes were
+    /// originally produced from a canonical absolute repo-root path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepoKeyDecodeError`] when the key declares a local-path
+    /// locator kind but does not carry any path bytes.
+    pub fn local_path_bytes(self) -> Result<&'a [u8], RepoKeyDecodeError> {
+        match self.locator_kind {
+            RepoLocatorKind::LocalPath if self.identity_payload.is_empty() => {
+                Err(RepoKeyDecodeError::MissingLocalPathPayload)
+            }
+            RepoLocatorKind::LocalPath => Ok(self.identity_payload),
+        }
+    }
+}
+
+/// Decode failures for structured [`RepoKey`] helpers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RepoKeyDecodeError {
+    /// The encoded key does not include the mandatory locator-kind prefix.
+    #[error("repo key is missing its locator-kind prefix")]
+    MissingLocatorKind,
+    /// The locator-kind byte is not recognized by the current contract.
+    #[error("repo key has unknown locator kind prefix 0x{tag:02x}")]
+    UnknownLocatorKind { tag: u8 },
+    /// A local-path repo key must carry canonical absolute path bytes.
+    #[error("local-path repo key is missing canonical path bytes")]
+    MissingLocalPathPayload,
+}
+
 impl RepoKey {
     /// Constructs a repo key from an already-validated ordered key.
     #[inline]
     #[must_use]
     pub fn new(item_key: ItemKey) -> Self {
         Self(item_key)
+    }
+
+    /// Encodes a local/static repo identity as `locator_kind || canonical_path`.
+    ///
+    /// The input must already be the canonical absolute repo-root path bytes for
+    /// the repository. Path canonicalization and repo-shape validation happen in
+    /// higher layers before calling this helper.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorInputError`] when the encoded bytes violate the
+    /// [`ItemKey`] contract, including empty paths and oversized keys.
+    pub fn for_local_path(
+        canonical_absolute_repo_path: &[u8],
+    ) -> Result<Self, ConnectorInputError> {
+        if canonical_absolute_repo_path.is_empty() {
+            return Err(ConnectorInputError::Empty {
+                field: "RepoKey.local_path",
+            });
+        }
+        let mut bytes = Vec::with_capacity(1 + canonical_absolute_repo_path.len());
+        bytes.push(RepoLocatorKind::LocalPath.tag());
+        bytes.extend_from_slice(canonical_absolute_repo_path);
+        Self::try_from_vec(bytes)
     }
 
     /// Validate and construct a repo key from owned bytes.
@@ -110,6 +208,44 @@ impl RepoKey {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
+    }
+
+    /// Decodes the structured locator kind and identity payload from this key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepoKeyDecodeError`] when the stored bytes are missing the
+    /// locator-kind prefix or use an unknown locator kind.
+    pub fn decode(&self) -> Result<DecodedRepoKey<'_>, RepoKeyDecodeError> {
+        let (tag, identity_payload) = self
+            .as_bytes()
+            .split_first()
+            .ok_or(RepoKeyDecodeError::MissingLocatorKind)?;
+        let locator_kind = RepoLocatorKind::from_tag(*tag)
+            .ok_or(RepoKeyDecodeError::UnknownLocatorKind { tag: *tag })?;
+        match locator_kind {
+            RepoLocatorKind::LocalPath if identity_payload.is_empty() => {
+                return Err(RepoKeyDecodeError::MissingLocalPathPayload);
+            }
+            _ => {}
+        }
+        Ok(DecodedRepoKey {
+            locator_kind,
+            identity_payload,
+        })
+    }
+
+    /// Returns the local-path payload bytes encoded in this key.
+    ///
+    /// Higher-level normalization is responsible for ensuring those bytes were
+    /// originally produced from a canonical absolute repo-root path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepoKeyDecodeError`] when the key does not decode as a
+    /// local-path repo key.
+    pub fn local_path_bytes(&self) -> Result<&[u8], RepoKeyDecodeError> {
+        self.decode()?.local_path_bytes()
     }
 }
 
@@ -691,6 +827,10 @@ mod tests {
         RepoKey::try_from_slice(bytes).expect("repo key")
     }
 
+    fn local_repo_key(path: &[u8]) -> RepoKey {
+        RepoKey::for_local_path(path).expect("local repo key")
+    }
+
     fn repo_locator() -> RepoLocator {
         RepoLocator::local_path("/var/lib/gossip/repos/acme/repo.git")
     }
@@ -746,6 +886,70 @@ mod tests {
             key.clone().into_item_key().as_bytes(),
             b"github.com\0acme\0repo"
         );
+    }
+
+    #[test]
+    fn local_path_repo_key_encodes_locator_prefix_and_round_trips() {
+        let key = local_repo_key(b"/var/lib/gossip/repos/acme/repo.git");
+        assert_eq!(key.as_bytes(), b"\x01/var/lib/gossip/repos/acme/repo.git");
+        let decoded = key.decode().expect("decode local repo key");
+        assert_eq!(decoded.locator_kind(), RepoLocatorKind::LocalPath);
+        assert_eq!(
+            decoded.local_path_bytes().expect("local path bytes"),
+            b"/var/lib/gossip/repos/acme/repo.git"
+        );
+        assert_eq!(
+            key.local_path_bytes().expect("repo key local path bytes"),
+            b"/var/lib/gossip/repos/acme/repo.git"
+        );
+    }
+
+    #[test]
+    fn local_path_repo_key_rejects_empty_path_payload() {
+        let err = RepoKey::for_local_path(b"").unwrap_err();
+        assert!(matches!(err, ConnectorInputError::Empty { .. }));
+    }
+
+    #[test]
+    fn local_path_repo_key_rejects_oversized_encoded_path() {
+        let oversized = vec![b'x'; crate::connector::MAX_ITEM_KEY_SIZE];
+        let err = RepoKey::for_local_path(&oversized).unwrap_err();
+        assert!(matches!(err, ConnectorInputError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn repo_key_decode_rejects_unknown_locator_prefix() {
+        let key = repo_key(b"\xffopaque");
+        let err = key.decode().unwrap_err();
+        assert_eq!(err, RepoKeyDecodeError::UnknownLocatorKind { tag: 0xff });
+    }
+
+    #[test]
+    fn repo_key_decode_rejects_missing_local_payload() {
+        let key = repo_key(&[RepoLocatorKind::LocalPath as u8]);
+        let err = key.decode().unwrap_err();
+        assert_eq!(err, RepoKeyDecodeError::MissingLocalPathPayload);
+        // The convenience accessor surfaces the same error via decode().
+        let err2 = key.local_path_bytes().unwrap_err();
+        assert_eq!(err2, RepoKeyDecodeError::MissingLocalPathPayload);
+    }
+
+    #[test]
+    fn local_path_repo_key_ord_matches_encoded_byte_order() {
+        let a = local_repo_key(b"/repos/a");
+        let b = local_repo_key(b"/repos/b");
+        assert!(a < b);
+    }
+
+    #[test]
+    fn repo_key_debug_and_display_redact_local_path_bytes() {
+        let key = local_repo_key(b"/var/lib/gossip/repos/acme/repo.git");
+        let debug = format!("{key:?}");
+        let display = format!("{key}");
+        assert!(!debug.contains("/var/lib/gossip/repos/acme/repo.git"));
+        assert!(!display.contains("/var/lib/gossip/repos/acme/repo.git"));
+        assert!(debug.contains("RepoKey"));
+        assert!(display.contains("RepoKey"));
     }
 
     #[test]

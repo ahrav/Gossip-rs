@@ -16,7 +16,7 @@ The module provides three core capabilities:
 - **Canonical encoding** -- the `CanonicalBytes` trait and its primitive
   implementations, providing deterministic, collision-free binary serialization
   for hash-input construction.
-- **Domain-separated hashing** -- a registry of 16 domain constants and two
+- **Domain-separated hashing** -- a registry of 17 domain constants and two
   hashing modes (keyed and derive-key) that prevent cross-derivation and
   cross-tenant collisions.
 - **Rule fingerprint derivation** -- `derive_rule_fingerprint` computes a
@@ -38,7 +38,7 @@ macros.
 | `types.rs`        | `TenantId`, `PolicyHash`, `TenantSecretKey`                                                                                   |
 | `canonical.rs`    | `CanonicalBytes` trait + primitive impls                                                                                      |
 | `hashing.rs`      | `domain_hasher`, `finalize_32`, `finalize_64`, `derive_from_cached`                           |
-| `domain.rs`       | 16 domain-separation constants + `ALL` registry                                                                               |
+| `domain.rs`       | 17 domain-separation constants + `ALL` registry                                                                               |
 | `item.rs`         | `ConnectorTag`, `ConnectorInstanceIdHash`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`, `IdentityInputError` |
 | `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId`, `ObservationId` + derivation fns (`derive_rule_fingerprint`, `derive_finding_id`, `derive_occurrence_id`, `derive_observation_id`) |
 | `policy.rs`       | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                                                       |
@@ -221,7 +221,7 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 
 ## 5. Domain Separation Registry
 
-All 16 domain constants live in `domain.rs` and follow the naming convention
+All 17 domain constants live in `domain.rs` and follow the naming convention
 `"gossip/<subsystem>/v<N>[/<operation>]"`.
 
 ### Constants
@@ -244,11 +244,12 @@ All 16 domain constants live in `domain.rs` and follow the naming convention
 | `DONE_LEDGER_KEY_V1`  | `gossip/persistence/v1/done-key`     | Persistence  | derive-key | Done-ledger key derivation (reserved)               |
 | `TRIAGE_GROUP_KEY_V1` | `gossip/persistence/v1/triage-group` | Persistence  | derive-key | `TriageGroupKey` derivation                         |
 | `COORDINATION_TELEMETRY_V1` | `gossip/worker/v1/coordination-telemetry` | Worker | derive-key | Coordination telemetry redaction digest             |
+| `GIT_REPO_ID_V1`     | `gossip/git/v1/repo-id`              | Git        | derive-key | Stable 64-bit repo-namespace derivation for repo-native Git scans |
 
 ### Uniqueness enforcement
 
 1. **Compile-time array length** -- The `ALL` array is declared as
-   `[&str; 15]`. Adding a constant without updating `ALL` is a compile error.
+   `[&str; 17]`. Adding a constant without updating `ALL` is a compile error.
 2. **`no_duplicate_values` test** -- Iterates `ALL` through a `HashSet` and
    panics on collision.
 3. **`no_duplicate_names` test** -- Checks the `(name, value)` fixture for

@@ -714,7 +714,7 @@ fn corrupt_tree_is_reported() {
     let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
 
     let corrupt_oid = OidBytes::sha1([0x11; 20]);
-    write_corrupt_tree(&state.paths.objects_dir, &corrupt_oid);
+    write_corrupt_tree(state.paths.objects_dir(), &corrupt_oid);
 
     let result = walker.diff_trees(&mut store, &mut candidates, Some(&corrupt_oid), None, 0, 0);
 
