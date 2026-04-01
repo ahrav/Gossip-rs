@@ -348,16 +348,18 @@ impl RoaringSeenBitmap {
             "batch_contains_sorted requires non-decreasing (sorted) input"
         );
         let mut result = vec![false; oids.len()];
+        let index = &self.oids;
+        let index_len = index.len();
         let mut idx = 0usize;
         for (i, oid) in oids.iter().enumerate() {
             if oid.len() != self.oid_len {
                 continue;
             }
             // Advance the index pointer past OIDs smaller than the probe.
-            while idx < self.oids.len() && self.oids[idx] < *oid {
+            while idx < index_len && index[idx] < *oid {
                 idx += 1;
             }
-            if idx < self.oids.len() && self.oids[idx] == *oid {
+            if idx < index_len && index[idx] == *oid {
                 result[i] = bitmap_contains(&self.seen, idx);
             }
         }
@@ -470,6 +472,14 @@ impl RoaringSeenBitmap {
     /// Serializes the persisted bitmap payload.
     pub fn serialize(&self) -> Result<Vec<u8>, SeenBitmapError> {
         let bitmap_len = self.seen.serialized_size();
+        // Enforce the same size cap that deserialize() applies so the write
+        // path never emits a payload that the read path would reject.
+        if bitmap_len > MAX_BITMAP_BYTES {
+            return Err(SeenBitmapError::BitmapTooLarge {
+                size: bitmap_len,
+                max: MAX_BITMAP_BYTES,
+            });
+        }
         let mut out = Vec::with_capacity(self.serialized_size());
         out.extend_from_slice(&BITMAP_MAGIC);
         out.push(self.oid_len);
@@ -955,7 +965,8 @@ mod proptests {
 
             let mut sorted_probe = probe.clone();
             sorted_probe.sort_unstable();
-            sorted_probe.dedup();
+            // Keep duplicates: batch_contains_sorted accepts non-decreasing
+            // input and the two-pointer scan must handle equal neighbors.
 
             let sorted_result = bitmap.batch_contains_sorted(&sorted_probe);
             let unsorted_result = bitmap.batch_contains(&sorted_probe);

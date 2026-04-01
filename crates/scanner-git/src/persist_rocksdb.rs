@@ -9,12 +9,10 @@
 //! When the feature is disabled, public constructors and methods return
 //! feature-not-available errors via the appropriate error variant.
 
+#[cfg(feature = "rocksdb")]
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
-#[cfg(feature = "rocksdb")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "rocksdb")]
-use std::sync::RwLock;
 
 use super::errors::{PersistError, RepoOpenError, SpillError};
 #[cfg(feature = "rocksdb")]
@@ -39,6 +37,11 @@ use rocksdb::{Options, WriteBatch, DB};
 
 /// RocksDB-backed store for Git scan persistence.
 ///
+/// All access is single-threaded: the scan pipeline calls `batch_check_seen`
+/// during the spill stage (before parallel pack execution) and
+/// `commit_finalize` once after all workers join. `RefCell` enforces this
+/// contract at runtime; a borrow panic indicates a caller bug.
+///
 /// The store retains the `repo_id` and `policy_hash` used to build
 /// the seen-bitmap scope key for the spill/dedupe stage.
 /// Watermark loading uses the caller-supplied `(repo_id, policy_hash)` so the
@@ -53,12 +56,12 @@ pub struct RocksDbStore {
     #[cfg(feature = "rocksdb")]
     policy_hash: [u8; 32],
     #[cfg(feature = "rocksdb")]
-    seen_store: RwLock<Option<RoaringSeenStore>>,
-    /// Set during `commit_finalize` to detect concurrent calls in debug builds.
+    seen_store: RefCell<Option<RoaringSeenStore>>,
+    /// Set during `commit_finalize` to detect re-entrant calls in debug builds.
     /// The single-writer invariant (one lease owner per scope) guarantees this
     /// never trips in production; if it does, the caller has a lease bug.
     #[cfg(feature = "rocksdb")]
-    finalizing: AtomicBool,
+    finalizing: Cell<bool>,
 }
 
 impl RocksDbStore {
@@ -85,8 +88,8 @@ impl RocksDbStore {
                 db,
                 repo_id,
                 policy_hash,
-                seen_store: RwLock::new(None),
-                finalizing: AtomicBool::new(false),
+                seen_store: RefCell::new(None),
+                finalizing: Cell::new(false),
             })
         }
 
@@ -99,29 +102,15 @@ impl RocksDbStore {
 
     #[cfg(feature = "rocksdb")]
     fn load_seen_store(&self, oid_len: u8) -> Result<(), String> {
-        {
-            let guard = self
-                .seen_store
-                .read()
-                .map_err(|_| "seen-store read lock poisoned".to_string())?;
-            if let Some(store) = guard.as_ref() {
-                if store.bitmap().oid_len() == oid_len {
-                    return Ok(());
-                }
-            }
-        }
-
-        let mut guard = self
+        let needs_load = self
             .seen_store
-            .write()
-            .map_err(|_| "seen-store write lock poisoned".to_string())?;
-        if let Some(store) = guard.as_ref() {
-            if store.bitmap().oid_len() == oid_len {
-                return Ok(());
-            }
+            .borrow()
+            .as_ref()
+            .is_none_or(|s| s.bitmap().oid_len() != oid_len);
+        if needs_load {
+            let loaded = self.load_seen_store_from_db(oid_len)?;
+            *self.seen_store.borrow_mut() = Some(loaded);
         }
-
-        *guard = Some(self.load_seen_store_from_db(oid_len)?);
         Ok(())
     }
 
@@ -150,15 +139,15 @@ impl PersistenceStore for RocksDbStore {
         {
             // Guard that clears the `finalizing` flag on all exit paths,
             // including early error returns.
-            struct FinalizingGuard<'a>(&'a AtomicBool);
+            struct FinalizingGuard<'a>(&'a Cell<bool>);
             impl Drop for FinalizingGuard<'_> {
                 fn drop(&mut self) {
-                    self.0.store(false, Ordering::Relaxed);
+                    self.0.set(false);
                 }
             }
             debug_assert!(
-                !self.finalizing.swap(true, Ordering::Relaxed),
-                "concurrent commit_finalize calls violate the single-writer invariant"
+                !self.finalizing.replace(true),
+                "re-entrant commit_finalize calls violate the single-writer invariant"
             );
             let _guard = FinalizingGuard(&self.finalizing);
 
@@ -181,11 +170,6 @@ impl PersistenceStore for RocksDbStore {
             let mut batch = WriteBatch::default();
             let mut seen_scope_key: Option<Vec<u8>> = None;
             let mut seen_oids = Vec::new();
-            // Declared outside the conditional so the write lock can be held
-            // through db.write, preventing readers from observing in-memory
-            // mutations before they are persisted to disk.
-            let mut _seen_guard: Option<std::sync::RwLockWriteGuard<'_, Option<RoaringSeenStore>>> =
-                None;
             for op in &output.data_ops {
                 if op.key.starts_with(&NS_SEEN_BLOB) {
                     let delta = SeenBitmapDelta::deserialize(&op.value)
@@ -231,13 +215,7 @@ impl PersistenceStore for RocksDbStore {
                     ));
                 }
 
-                // Hold the write lock through the entire
-                // read-modify-write-persist cycle so concurrent readers
-                // (batch_check_seen) never observe uncommitted mutations.
-                let mut guard = self
-                    .seen_store
-                    .write()
-                    .map_err(|_| PersistError::backend("seen-store write lock poisoned"))?;
+                let mut guard = self.seen_store.borrow_mut();
                 let store = guard.get_or_insert_with(|| {
                     RoaringSeenStore::new(RoaringSeenBitmap::new(delta.oid_len()))
                 });
@@ -253,10 +231,11 @@ impl PersistenceStore for RocksDbStore {
                         .serialize()
                         .map_err(|err| PersistError::backend(err.to_string()))?,
                 );
-                // Move the write guard out so it is held through db.write
-                // below. Without this, a concurrent batch_check_seen could
-                // observe the in-memory mutation before it is persisted.
-                _seen_guard = Some(guard);
+                // Drop the borrow before db.write so a panic in RocksDB does
+                // not leave the RefCell permanently borrowed. If db.write
+                // fails, the in-memory bitmap retains uncommitted mutations;
+                // the caller must discard the store.
+                drop(guard);
             }
 
             if matches!(output.outcome, FinalizeOutcome::Complete) {
@@ -267,11 +246,6 @@ impl PersistenceStore for RocksDbStore {
             self.db
                 .write(batch)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
-            // Write lock (if held) drops here after db.write succeeds,
-            // keeping the in-memory bitmap consistent with on-disk state.
-            // NOTE: if db.write fails, the in-memory bitmap retains
-            // uncommitted mutations; the caller must discard the store.
-            drop(_seen_guard);
             Ok(())
         }
 
@@ -294,10 +268,7 @@ impl SeenBlobStore for RocksDbStore {
             let oid_len = oids[0].len();
             self.load_seen_store(oid_len)
                 .map_err(|err| SpillError::Io(io::Error::other(err)))?;
-            let guard = self
-                .seen_store
-                .read()
-                .map_err(|_| SpillError::Io(io::Error::other("seen-store read lock poisoned")))?;
+            let guard = self.seen_store.borrow();
             let Some(store) = guard.as_ref() else {
                 return Err(SpillError::Io(io::Error::other(
                     "seen-store not initialized",

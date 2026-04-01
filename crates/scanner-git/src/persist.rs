@@ -68,16 +68,20 @@ pub struct InMemoryPersistenceStore {
 
 impl PersistenceStore for InMemoryPersistenceStore {
     fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
-        let mut data_ops = self.data_ops.borrow_mut();
+        // Stage all changes before committing so a mid-loop error does not
+        // leave partially applied ops in the store. This preserves the
+        // atomic commit contract: either all ops land or none do.
+        let mut staged_data = Vec::with_capacity(output.data_ops.len());
         #[cfg(feature = "rocksdb")]
-        let mut seen_scopes = self.seen_scopes.borrow_mut();
+        let mut staged_scopes: HashMap<Vec<u8>, RoaringSeenBitmap> =
+            self.seen_scopes.borrow().clone();
 
         for op in &output.data_ops {
             #[cfg(feature = "rocksdb")]
             if op.key.starts_with(&NS_SEEN_BLOB) {
                 let delta = SeenBitmapDelta::deserialize(&op.value)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                let mut bitmap = seen_scopes
+                let mut bitmap = staged_scopes
                     .remove(&op.key)
                     .unwrap_or_else(|| RoaringSeenBitmap::new(delta.oid_len()));
                 if bitmap.oid_len() != delta.oid_len() {
@@ -93,15 +97,22 @@ impl PersistenceStore for InMemoryPersistenceStore {
                 let merged = bitmap
                     .serialize()
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                seen_scopes.insert(op.key.clone(), bitmap);
-                data_ops.push(WriteOp {
+                staged_scopes.insert(op.key.clone(), bitmap);
+                staged_data.push(WriteOp {
                     key: op.key.clone(),
                     value: merged,
                 });
                 continue;
             }
 
-            data_ops.push(op.clone());
+            staged_data.push(op.clone());
+        }
+
+        // All ops validated — commit atomically.
+        self.data_ops.borrow_mut().extend(staged_data);
+        #[cfg(feature = "rocksdb")]
+        {
+            *self.seen_scopes.borrow_mut() = staged_scopes;
         }
         if matches!(output.outcome, FinalizeOutcome::Complete) {
             self.watermark_ops
