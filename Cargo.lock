@@ -1467,8 +1467,10 @@ dependencies = [
 name = "gossip-orchestrator"
 version = "0.1.0"
 dependencies = [
+ "gossip-contracts",
  "gossip-coordination",
  "gossip-frontier",
+ "scanner-git",
  "tempfile",
  "thiserror",
 ]

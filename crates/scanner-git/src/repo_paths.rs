@@ -271,17 +271,18 @@ pub(super) fn parse_loose_object(
 }
 
 /// Error taxonomy for hex OID parsing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HexOidParseError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HexOidParseError {
+    /// The hex string contains a non-hex ASCII byte.
+    #[error("invalid hex digit 0x{byte:02x} in object id")]
     InvalidHex { byte: u8 },
+    /// The hex string length does not match the requested object format.
+    #[error("invalid object id length: found {found} hex chars, expected {expected}")]
     InvalidOidLength { found: usize, expected: usize },
 }
 
 /// Parses a hex-encoded OID for the requested object format.
-pub(super) fn parse_hex_oid(
-    hex: &[u8],
-    format: ObjectFormat,
-) -> Result<OidBytes, HexOidParseError> {
+pub fn parse_hex_oid(hex: &[u8], format: ObjectFormat) -> Result<OidBytes, HexOidParseError> {
     let expected_len = format.hex_len() as usize;
     if hex.len() != expected_len {
         return Err(HexOidParseError::InvalidOidLength {

@@ -333,6 +333,7 @@ pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
 };
 pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
+pub use repo_paths::{parse_hex_oid, HexOidParseError};
 
 // ── Stage 6: Engine scanning ────────────────────────────────────────────
 pub use engine_adapter::{
