@@ -213,7 +213,7 @@ impl fmt::Debug for GitRepoPaths {
 /// Produce a [`ToxicDigest`] from a path's raw byte representation.
 ///
 /// Uses [`OsStr::as_encoded_bytes`] on all platforms for consistency with
-/// [`NormalizedLocalRepoIdentity`]'s `as_encoded_bytes()`-based key
+/// `NormalizedLocalRepoIdentity`'s `as_encoded_bytes()`-based key
 /// derivation, ensuring the digest correlates with the repo identity key.
 fn digest_path(p: &Path) -> ToxicDigest {
     ToxicDigest::of_bytes(p.as_os_str().as_encoded_bytes())
