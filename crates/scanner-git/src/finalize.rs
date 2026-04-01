@@ -32,7 +32,7 @@
 //! |--------|---------------|-------------------------------------|
 //! | `bc\0` | blob_ctx      | Canonical context per scanned blob  |
 //! | `fn\0` | finding       | Individual finding records          |
-//! | `sb\0` | seen_blob     | Scanned marker per blob OID         |
+//! | `sb\0` | seen_blob     | Finalize delta for the seen bitmap  |
 //!
 //! Watermark keys use the `rw` prefix from `watermark_keys`.
 
@@ -45,6 +45,7 @@ use super::engine_adapter::{
     sort_and_dedupe_findings, FindingKey, FindingSpan, ScannedBlob, ScoredFinding,
 };
 use super::object_id::OidBytes;
+use super::roaring_seen::SeenBitmapDelta;
 use super::start_set::StartSetId;
 use super::tree_candidate::CandidateContext;
 use super::watermark_keys::{encode_ref_watermark_value, NS_REF_WATERMARK};
@@ -53,7 +54,7 @@ use super::watermark_keys::{encode_ref_watermark_value, NS_REF_WATERMARK};
 pub(crate) const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
 /// Namespace prefix for finding keys.
 pub(crate) const NS_FINDING: [u8; 3] = *b"fn\0";
-/// Namespace prefix for seen blob marker keys.
+/// Namespace prefix for the seen bitmap scope key.
 pub(crate) const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
 
 // Compile-time: verify namespace lexicographic ordering.
@@ -137,7 +138,7 @@ pub enum FinalizeOutcome {
 #[derive(Debug)]
 #[must_use]
 pub struct FinalizeOutput {
-    /// Seen-blob markers + blob context + findings.
+    /// Seen-bitmap delta + blob context + findings.
     /// Sorted by key within each namespace, namespaces in order:
     /// `bc\0` (blob_ctx) -> `fn\0` (finding) -> `sb\0` (seen_blob).
     pub data_ops: Vec<WriteOp>,
@@ -175,7 +176,7 @@ pub struct NamespaceCounts {
     pub blob_ctx: u64,
     /// Finding ops.
     pub finding: u64,
-    /// Seen-blob marker ops.
+    /// Seen-bitmap scope ops.
     pub seen_blob: u64,
     /// Ref watermark ops.
     pub ref_watermark: u64,
@@ -221,7 +222,10 @@ fn ref_wm_key_len(ref_name: &[u8]) -> usize {
     2 + 8 + 32 + 32 + ref_name.len() + 1
 }
 
-/// Builds a key for blob-keyed namespaces (context or seen markers).
+/// Byte length of the fixed-width seen-bitmap scope key.
+const SEEN_SCOPE_KEY_LEN: usize = 43;
+
+/// Builds a key for blob-keyed namespaces.
 ///
 /// Big-endian numeric fields preserve lexicographic ordering across stores.
 pub(crate) fn build_blob_key(
@@ -240,12 +244,22 @@ pub(crate) fn build_blob_key(
     key
 }
 
-/// Builds a seen-blob marker key for the given repo/policy/OID.
+/// Builds a per-OID seen key for the given repo/policy/OID.
 ///
 /// This is a thin wrapper around `build_blob_key` using the `sb\0` namespace.
 #[cfg(test)]
 pub(crate) fn build_seen_blob_key(repo_id: u64, policy_hash: &[u8; 32], oid: &OidBytes) -> Vec<u8> {
     build_blob_key(&NS_SEEN_BLOB, repo_id, policy_hash, oid)
+}
+
+/// Builds the scope key for the seen bitmap.
+pub(crate) fn build_seen_scope_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SEEN_SCOPE_KEY_LEN);
+    key.extend_from_slice(&NS_SEEN_BLOB);
+    key.extend_from_slice(&repo_id.to_be_bytes());
+    key.extend_from_slice(policy_hash);
+    debug_assert_eq!(key.len(), SEEN_SCOPE_KEY_LEN);
+    key
 }
 
 /// Builds a finding key for a specific blob OID and finding tuple.
@@ -353,7 +367,7 @@ fn cmp_ctx(
 // MARKER value
 // =============================================================================
 
-/// Marker value for seen_blob and finding keys.
+/// Marker value for finding keys.
 ///
 /// The value is intentionally constant: presence is sufficient.
 #[inline]
@@ -376,7 +390,7 @@ fn marker_value() -> Vec<u8> {
 /// 2. For each OID group, pick the canonical context and encode it as
 ///    `blob_ctx`.
 /// 3. Gather findings across contexts, sort + dedupe, and emit `finding` ops.
-/// 4. Emit `seen_blob` markers.
+/// 4. Emit a single `seen_blob` scope delta containing all unique scanned OIDs.
 /// 5. If complete, emit ref watermarks.
 ///
 /// # Postconditions
@@ -416,7 +430,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
     let blob_count = input.scanned_blobs.len();
     let mut ops_ctx: Vec<WriteOp> = Vec::with_capacity(blob_count);
     let mut ops_finding: Vec<WriteOp> = Vec::with_capacity(blob_count * 2);
-    let mut ops_seen: Vec<WriteOp> = Vec::with_capacity(blob_count);
+    let mut seen_oids: Vec<OidBytes> = Vec::with_capacity(blob_count);
 
     // Reusable scratch buffers to avoid per-blob allocations.
     let mut ctx_val: Vec<u8> = Vec::with_capacity(128);
@@ -475,14 +489,21 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
         }
         perf_stats::sat_add_u64(&mut stats.total_findings, blob_findings.len() as u64);
 
-        // --- 3. seen_blob (namespace "sb\0") ---
-        ops_seen.push(WriteOp {
-            key: build_blob_key(&NS_SEEN_BLOB, input.repo_id, &input.policy_hash, &oid),
-            value: marker_value(),
-        });
+        // --- 3. seen_blob scope delta (namespace "sb\0") ---
+        seen_oids.push(oid);
 
         perf_stats::sat_add_u64(&mut stats.unique_blobs, 1);
         i = j;
+    }
+
+    let mut ops_seen: Vec<WriteOp> = Vec::with_capacity(usize::from(!seen_oids.is_empty()));
+    if !seen_oids.is_empty() {
+        let delta = SeenBitmapDelta::from_oids(&seen_oids)
+            .expect("scanned blobs always use a single object format");
+        ops_seen.push(WriteOp {
+            key: build_seen_scope_key(input.repo_id, &input.policy_hash),
+            value: delta.serialize(),
+        });
     }
 
     // Assemble data ops in namespace order: bc < fn < sb.
@@ -655,7 +676,7 @@ mod tests {
         let counts = out.compute_namespace_counts();
         assert_eq!(counts.blob_ctx, 2);
         assert_eq!(counts.finding, 1);
-        assert_eq!(counts.seen_blob, 2);
+        assert_eq!(counts.seen_blob, 1);
         assert_eq!(counts.ref_watermark, 1);
     }
 
