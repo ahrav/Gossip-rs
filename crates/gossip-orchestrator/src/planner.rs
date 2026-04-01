@@ -88,8 +88,8 @@ impl FilesystemInitialShardPlan {
 
     /// The single startup shard geometry.
     #[must_use]
-    pub fn initial_shard(&self) -> InitialShardGeometry {
-        self.initial_shard.clone()
+    pub fn initial_shard(&self) -> &InitialShardGeometry {
+        &self.initial_shard
     }
 
     /// Build the typed shard payload from the underlying normalized request.

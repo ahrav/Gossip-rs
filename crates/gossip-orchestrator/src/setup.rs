@@ -279,7 +279,7 @@ where
     //
     // The metadata envelope wraps the encoded payload in a ShardMetadata
     // frame: 4-byte hint-length prefix + 1-byte Range hint + payload bytes.
-    let metadata_raw = 5 + encoded_payload.len();
+    let metadata_raw = SHARD_METADATA_ENVELOPE_OVERHEAD + encoded_payload.len();
     let byte_capacity = slab_alloc_bound(start.len())
         + slab_alloc_bound(end.len())
         + slab_alloc_bound(metadata_raw);
@@ -343,6 +343,9 @@ fn lower_geometry_bounds(geometry: &InitialShardGeometry) -> (&[u8], &[u8]) {
     };
     (start, end)
 }
+
+/// ShardMetadata frame overhead: 4-byte hint-length prefix + 1-byte Range hint.
+pub(crate) const SHARD_METADATA_ENVELOPE_OVERHEAD: usize = 5;
 
 /// Upper-bound a single ByteSlab allocation.
 ///
@@ -469,7 +472,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(11),
         )
         .expect("run setup should succeed");
@@ -500,7 +503,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(20),
         )
         .expect("single-file run setup should succeed");
@@ -531,7 +534,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(12),
         )
         .expect("first setup should succeed")
@@ -542,7 +545,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(12),
         )
         .expect("replayed setup should succeed");
@@ -569,7 +572,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(13),
         )
         .expect("setup should resume from initializing state");
@@ -596,7 +599,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(14),
         )
         .expect_err("mismatched config should be rejected");
@@ -628,7 +631,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request_a, plan_a.initial_shard(), &payload_a),
+            FilesystemRunSetupInput::new(&request_a, plan_a.initial_shard().clone(), &payload_a),
             OpId::from_raw(15),
         )
         .expect("first setup should succeed");
@@ -638,7 +641,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request_b, plan_b.initial_shard(), &payload_b),
+            FilesystemRunSetupInput::new(&request_b, plan_b.initial_shard().clone(), &payload_b),
             OpId::from_raw(15),
         )
         .expect_err("conflicting replay payload should be rejected");
@@ -670,7 +673,11 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &mismatched_payload),
+            FilesystemRunSetupInput::new(
+                &request,
+                plan.initial_shard().clone(),
+                &mismatched_payload,
+            ),
             OpId::from_raw(16),
         )
         .expect_err("request/payload mismatch should be rejected before mutation");
@@ -704,7 +711,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(17),
         )
         .expect("short-name setup should succeed");
@@ -730,7 +737,11 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &mismatched_payload),
+            FilesystemRunSetupInput::new(
+                &request,
+                plan.initial_shard().clone(),
+                &mismatched_payload,
+            ),
             OpId::from_raw(18),
         )
         .expect_err("mode mismatch should be rejected before mutation");
@@ -757,7 +768,7 @@ mod tests {
         let request = normalize_directory(&scan_root, run_config());
         let plan = plan_filesystem_initial_shards(request.clone());
         let payload = plan.shard_payload();
-        let input = FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload);
+        let input = FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload);
 
         let rendered = format!("{input:?}");
 
@@ -798,7 +809,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
             OpId::from_raw(30),
         )
         .expect("deep-path run setup must not fail with SlabFull");

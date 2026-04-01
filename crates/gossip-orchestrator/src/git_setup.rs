@@ -19,6 +19,8 @@
 //! The returned [`IdempotentOutcome`] preserves whether this was the first
 //! execution or a safe replay after an earlier partial attempt.
 
+use std::fmt;
+
 use gossip_coordination::{
     CreateRunError, IdempotentOutcome, LogicalTime, OpId, RunId, RunManagement, RunRecord,
     RunStatus, ShardArena, ShardId, TenantId,
@@ -26,11 +28,9 @@ use gossip_coordination::{
 use gossip_frontier::builder::{PreallocShardBuilder, PreallocShardBuilderError};
 
 use crate::git_payload::{GitShardPayload, GitShardPayloadEncodeError};
-use crate::git_planner::{GitInitialShardPlan, exact_key_geometry};
+use crate::git_planner::{GitInitialShardPlan, exact_key_upper_bound};
 use crate::planner::InitialShardGeometry;
-use crate::setup::slab_alloc_bound;
-
-const GIT_SHARD_METADATA_OVERHEAD: usize = 5;
+use crate::setup::{SHARD_METADATA_ENVELOPE_OVERHEAD, slab_alloc_bound};
 const MAX_GIT_STARTUP_MANIFEST_SHARDS: usize = 1024;
 
 /// Result of a successful Git run setup.
@@ -89,7 +89,7 @@ impl<'a> GitRunSetupInput<'a> {
 }
 
 /// Errors from [`setup_git_run`].
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum GitRunSetupError {
     /// The explicit coordinator tenant must match the normalized request scope.
     #[error("git request tenant does not match the setup tenant")]
@@ -143,6 +143,45 @@ impl From<CreateRunError> for GitRunSetupError {
     }
 }
 
+// Custom Debug: redacts TenantId fields in TenantMismatch to prevent tenant
+// identity leakage through error chains.
+impl fmt::Debug for GitRunSetupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TenantMismatch { .. } => f
+                .debug_struct("TenantMismatch")
+                .field("request", &"<redacted>")
+                .field("tenant", &"<redacted>")
+                .finish(),
+            Self::EmptyPlan => write!(f, "EmptyPlan"),
+            Self::TargetCountMismatch { request, planned } => f
+                .debug_struct("TargetCountMismatch")
+                .field("request", request)
+                .field("planned", planned)
+                .finish(),
+            Self::TargetMismatch { target_index } => f
+                .debug_struct("TargetMismatch")
+                .field("target_index", target_index)
+                .finish(),
+            Self::PayloadTargetMismatch { target_index } => f
+                .debug_struct("PayloadTargetMismatch")
+                .field("target_index", target_index)
+                .finish(),
+            Self::PayloadRequestMismatch { target_index } => f
+                .debug_struct("PayloadRequestMismatch")
+                .field("target_index", target_index)
+                .finish(),
+            Self::GeometryMismatch { target_index } => f
+                .debug_struct("GeometryMismatch")
+                .field("target_index", target_index)
+                .finish(),
+            Self::PayloadEncode(err) => f.debug_tuple("PayloadEncode").field(err).finish(),
+            Self::ManifestBuild(err) => f.debug_tuple("ManifestBuild").field(err).finish(),
+            Self::CreateRun(err) => f.debug_tuple("CreateRun").field(err).finish(),
+        }
+    }
+}
+
 /// Create a Git run and register its startup shard manifest.
 ///
 /// The helper accepts the output of the earlier Git orchestrator seams
@@ -182,9 +221,14 @@ where
     validate_plan(tenant, plan)?;
 
     let entries = plan.entries();
+    let encoded_payloads: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|entry| entry.payload().encode())
+        .collect::<Result<_, _>>()?;
+
     let mut byte_capacity = 0usize;
-    for entry in entries {
-        let metadata_raw = GIT_SHARD_METADATA_OVERHEAD + entry.payload().encoded_len()?;
+    for (entry, encoded) in entries.iter().zip(&encoded_payloads) {
+        let metadata_raw = SHARD_METADATA_ENVELOPE_OVERHEAD + encoded.len();
         byte_capacity += slab_alloc_bound(entry.geometry().key_range_start().len());
         byte_capacity += slab_alloc_bound(entry.geometry().key_range_end().len());
         byte_capacity += slab_alloc_bound(metadata_raw);
@@ -193,12 +237,11 @@ where
     let mut arena = ShardArena::with_capacity(entries.len(), byte_capacity);
     let mut builder =
         PreallocShardBuilder::<MAX_GIT_STARTUP_MANIFEST_SHARDS>::new(&mut arena, entries.len())?;
-    for entry in entries {
-        let encoded_payload = entry.payload().encode()?;
+    for (entry, encoded) in entries.iter().zip(&encoded_payloads) {
         let _ = builder.add_range(
             entry.geometry().key_range_start(),
             entry.geometry().key_range_end(),
-            &encoded_payload,
+            encoded,
         )?;
     }
     let manifest = builder.build_inputs()?;
@@ -274,7 +317,12 @@ fn validate_geometry(
     repo_key: &[u8],
     geometry: &InitialShardGeometry,
 ) -> Result<(), GitRunSetupError> {
-    if geometry != &exact_key_geometry(repo_key) {
+    if geometry.key_range_start() != repo_key {
+        return Err(GitRunSetupError::GeometryMismatch { target_index });
+    }
+    let expected_end = exact_key_upper_bound(repo_key)
+        .map_err(|_| GitRunSetupError::GeometryMismatch { target_index })?;
+    if geometry.key_range_end() != expected_end.as_slice() {
         return Err(GitRunSetupError::GeometryMismatch { target_index });
     }
     Ok(())
@@ -297,8 +345,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::git_planner::{GitInitialShardPlanEntry, plan_git_initial_shards};
-    use crate::git_request::{GitRequest, NormalizedGitSelection};
+    use crate::git_planner::{
+        GitInitialShardPlanEntry, exact_key_geometry, plan_git_initial_shards,
+    };
+    use crate::git_request::GitRequest;
     use crate::test_support::{init_git_repo, run_config};
 
     const LEASE_DURATION_MS: u64 = 30_000;
@@ -361,7 +411,7 @@ mod tests {
         )
         .normalize()
         .expect("normalize request");
-        let plan = plan_git_initial_shards(normalized, execution_limits());
+        let plan = plan_git_initial_shards(normalized, execution_limits()).expect("plan shards");
         let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
 
         let outcome = setup_git_run(
@@ -429,7 +479,8 @@ mod tests {
             .normalize()
             .expect("normalize request"),
             execution_limits(),
-        );
+        )
+        .expect("plan shards");
         let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
 
         let first = setup_git_run(
@@ -455,6 +506,17 @@ mod tests {
 
         assert!(replay.is_replay());
         assert_eq!(replay.into_inner().root_shards(), first.root_shards());
+
+        // Verify replay shard contents match the original plan, not just IDs.
+        let mut scratch = AcquireScratch::new();
+        let claimed = coordinator
+            .claim_next_available(now(3), tenant(), run(), worker(500), &mut scratch)
+            .expect("replayed shard should be claimable");
+        let connector_extra =
+            decode_connector_extra(claimed.snapshot.spec()).expect("replay snapshot should decode");
+        let decoded =
+            GitShardPayload::decode(connector_extra).expect("replay payload should round-trip");
+        assert_eq!(&decoded, plan.entries()[0].payload());
     }
 
     #[test]
@@ -473,7 +535,8 @@ mod tests {
             .normalize()
             .expect("normalize request"),
             execution_limits(),
-        );
+        )
+        .expect("plan shards");
         let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
         coordinator
             .create_run(now(1), tenant(), run(), plan.request().run_config())
@@ -509,7 +572,8 @@ mod tests {
             .normalize()
             .expect("normalize request"),
             execution_limits(),
-        );
+        )
+        .expect("plan shards");
         let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
         coordinator
             .create_run(now(1), tenant(), run(), different_run_config())
@@ -552,7 +616,8 @@ mod tests {
             .normalize()
             .expect("normalize request a"),
             execution_limits(),
-        );
+        )
+        .expect("plan shards a");
         let plan_b = plan_git_initial_shards(
             GitRequest::single_repo(
                 tenant(),
@@ -564,7 +629,8 @@ mod tests {
             .normalize()
             .expect("normalize request b"),
             execution_limits(),
-        );
+        )
+        .expect("plan shards b");
         let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
 
         let _ = setup_git_run(
@@ -613,7 +679,8 @@ mod tests {
             .normalize()
             .expect("normalize request"),
             execution_limits(),
-        );
+        )
+        .expect("plan shards");
         let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
 
         let result = setup_git_run(
@@ -637,10 +704,11 @@ mod tests {
             .expect("claim snapshot should decode shard metadata");
         let decoded = GitShardPayload::decode(connector_extra).expect("decode payload");
 
-        assert!(matches!(
+        assert_eq!(
             decoded.selection(),
-            NormalizedGitSelection::ExplicitCommit { .. }
-        ));
+            plan.entries()[0].target().selection(),
+            "decoded selection must match the planned target's explicit commit"
+        );
         assert!(decoded.git_selection().is_none());
     }
 
@@ -690,5 +758,532 @@ mod tests {
         let claim =
             coordinator.claim_next_available(now(2), tenant(), run(), worker(300), &mut scratch);
         assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    // ── Validate-plan negative tests ──────────────────────────────────
+
+    #[test]
+    fn setup_git_run_rejects_tenant_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        init_git_repo(dir.path(), "git-setup-tests@example.com", "Git Setup Tests");
+
+        let plan = plan_git_initial_shards(
+            GitRequest::single_repo(
+                tenant(),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            )
+            .normalize()
+            .expect("normalize request"),
+            execution_limits(),
+        )
+        .expect("plan shards");
+        let wrong_tenant = TenantId::from_bytes([0x99; 32]);
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let err = setup_git_run(
+            &mut coordinator,
+            now(1),
+            wrong_tenant,
+            run(),
+            GitRunSetupInput::new(&plan),
+            OpId::from_raw(20),
+        )
+        .expect_err("tenant mismatch should be rejected before mutation");
+
+        assert!(matches!(err, GitRunSetupError::TenantMismatch { .. }));
+
+        let mut scratch = AcquireScratch::new();
+        let claim =
+            coordinator.claim_next_available(now(2), tenant(), run(), worker(400), &mut scratch);
+        assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    #[test]
+    fn setup_git_run_rejects_empty_plan() {
+        let dir = tempdir().expect("tempdir");
+        init_git_repo(dir.path(), "git-setup-tests@example.com", "Git Setup Tests");
+
+        let normalized = GitRequest::single_repo(
+            tenant(),
+            dir.path(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize request");
+        let bad_plan = GitInitialShardPlan::new(normalized, vec![]);
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let err = setup_git_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            GitRunSetupInput::new(&bad_plan),
+            OpId::from_raw(21),
+        )
+        .expect_err("empty plan should be rejected before mutation");
+
+        assert!(matches!(err, GitRunSetupError::EmptyPlan));
+
+        let mut scratch = AcquireScratch::new();
+        let claim =
+            coordinator.claim_next_available(now(2), tenant(), run(), worker(401), &mut scratch);
+        assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    #[test]
+    fn setup_git_run_rejects_target_count_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let repo_a = dir.path().join("a-repo");
+        let repo_b = dir.path().join("b-repo");
+        fs::create_dir_all(&repo_a).expect("create repo a");
+        fs::create_dir_all(&repo_b).expect("create repo b");
+        init_git_repo(&repo_a, "git-setup-tests@example.com", "Git Setup Tests");
+        init_git_repo(&repo_b, "git-setup-tests@example.com", "Git Setup Tests");
+
+        // Multi-repo request with 2 targets, but plan with only the first entry.
+        let normalized = GitRequest::repo_list(
+            tenant(),
+            [&repo_a, &repo_b],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize request");
+        let full_plan =
+            plan_git_initial_shards(normalized.clone(), execution_limits()).expect("plan shards");
+        let bad_plan = GitInitialShardPlan::new(normalized, vec![full_plan.entries()[0].clone()]);
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let err = setup_git_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            GitRunSetupInput::new(&bad_plan),
+            OpId::from_raw(22),
+        )
+        .expect_err("target count mismatch should be rejected before mutation");
+
+        assert!(matches!(err, GitRunSetupError::TargetCountMismatch { .. }));
+
+        let mut scratch = AcquireScratch::new();
+        let claim =
+            coordinator.claim_next_available(now(2), tenant(), run(), worker(402), &mut scratch);
+        assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    #[test]
+    fn setup_git_run_rejects_target_order_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let repo_a = dir.path().join("a-repo");
+        let repo_b = dir.path().join("b-repo");
+        fs::create_dir_all(&repo_a).expect("create repo a");
+        fs::create_dir_all(&repo_b).expect("create repo b");
+        init_git_repo(&repo_a, "git-setup-tests@example.com", "Git Setup Tests");
+        init_git_repo(&repo_b, "git-setup-tests@example.com", "Git Setup Tests");
+
+        let normalized = GitRequest::repo_list(
+            tenant(),
+            [&repo_a, &repo_b],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize request");
+        let full_plan =
+            plan_git_initial_shards(normalized.clone(), execution_limits()).expect("plan shards");
+
+        // Swap entry order so entries[0] is for targets[1] and vice versa.
+        let swapped_entries = vec![
+            full_plan.entries()[1].clone(),
+            full_plan.entries()[0].clone(),
+        ];
+        let bad_plan = GitInitialShardPlan::new(normalized, swapped_entries);
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let err = setup_git_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            GitRunSetupInput::new(&bad_plan),
+            OpId::from_raw(23),
+        )
+        .expect_err("target order mismatch should be rejected before mutation");
+
+        assert!(
+            matches!(err, GitRunSetupError::TargetMismatch { target_index: 0 }),
+            "expected TargetMismatch at index 0, got {err:?}"
+        );
+
+        let mut scratch = AcquireScratch::new();
+        let claim =
+            coordinator.claim_next_available(now(2), tenant(), run(), worker(403), &mut scratch);
+        assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    #[test]
+    fn setup_git_run_rejects_payload_target_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        fs::create_dir_all(&repo_a).expect("create repo a");
+        fs::create_dir_all(&repo_b).expect("create repo b");
+        init_git_repo(&repo_a, "git-setup-tests@example.com", "Git Setup Tests");
+        init_git_repo(&repo_b, "git-setup-tests@example.com", "Git Setup Tests");
+
+        // Build a valid plan for repo_a, then replace its payload with one
+        // derived from repo_b (different repo_id and repo_target).
+        let norm_a = GitRequest::single_repo(
+            tenant(),
+            &repo_a,
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize request a");
+        let norm_b = GitRequest::single_repo(
+            tenant(),
+            &repo_b,
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize request b");
+
+        let target_a = norm_a.targets()[0].clone();
+        let wrong_payload = GitShardPayload::from_normalized_request_target(
+            &norm_b,
+            &norm_b.targets()[0],
+            execution_limits(),
+        );
+        let geometry =
+            exact_key_geometry(target_a.repo_key().as_bytes()).expect("exact key geometry");
+        let bad_plan = GitInitialShardPlan::new(
+            norm_a,
+            vec![GitInitialShardPlanEntry::new(
+                target_a,
+                geometry,
+                wrong_payload,
+            )],
+        );
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let err = setup_git_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            GitRunSetupInput::new(&bad_plan),
+            OpId::from_raw(24),
+        )
+        .expect_err("payload target mismatch should be rejected before mutation");
+
+        assert!(
+            matches!(
+                err,
+                GitRunSetupError::PayloadTargetMismatch { target_index: 0 }
+            ),
+            "expected PayloadTargetMismatch at index 0, got {err:?}"
+        );
+
+        let mut scratch = AcquireScratch::new();
+        let claim =
+            coordinator.claim_next_available(now(2), tenant(), run(), worker(404), &mut scratch);
+        assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    #[test]
+    fn setup_git_run_rejects_payload_request_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        init_git_repo(dir.path(), "git-setup-tests@example.com", "Git Setup Tests");
+
+        // Build the plan with default scan_mode (DiffHistory), then construct
+        // a payload from a request that uses a different scan_mode.
+        let normalized = GitRequest::single_repo(
+            tenant(),
+            dir.path(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize request");
+        let alt_normalized = GitRequest::single_repo(
+            tenant(),
+            dir.path(),
+            run_config(),
+            GitScanMode::OdbBlobFast,
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize alt request");
+
+        let target = normalized.targets()[0].clone();
+        // Payload derived from alt_normalized carries OdbBlobFast instead of
+        // DiffHistory, which disagrees with the plan's request-scoped settings.
+        let wrong_payload = GitShardPayload::from_normalized_request_target(
+            &alt_normalized,
+            &alt_normalized.targets()[0],
+            execution_limits(),
+        );
+        let geometry =
+            exact_key_geometry(target.repo_key().as_bytes()).expect("exact key geometry");
+        let bad_plan = GitInitialShardPlan::new(
+            normalized,
+            vec![GitInitialShardPlanEntry::new(
+                target,
+                geometry,
+                wrong_payload,
+            )],
+        );
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let err = setup_git_run(
+            &mut coordinator,
+            now(1),
+            tenant(),
+            run(),
+            GitRunSetupInput::new(&bad_plan),
+            OpId::from_raw(25),
+        )
+        .expect_err("payload request mismatch should be rejected before mutation");
+
+        assert!(
+            matches!(
+                err,
+                GitRunSetupError::PayloadRequestMismatch { target_index: 0 }
+            ),
+            "expected PayloadRequestMismatch at index 0, got {err:?}"
+        );
+
+        let mut scratch = AcquireScratch::new();
+        let claim =
+            coordinator.claim_next_available(now(2), tenant(), run(), worker(405), &mut scratch);
+        assert!(matches!(claim, Err(ClaimError::RunNotFound)));
+    }
+
+    // ── Error display and source chaining tests ───────────────────────
+
+    #[test]
+    fn all_git_run_setup_error_variants_display_non_empty() {
+        let variants: Vec<GitRunSetupError> = vec![
+            GitRunSetupError::TenantMismatch {
+                request: TenantId::from_bytes([0xAA; 32]),
+                tenant: TenantId::from_bytes([0xBB; 32]),
+            },
+            GitRunSetupError::EmptyPlan,
+            GitRunSetupError::TargetCountMismatch {
+                request: 3,
+                planned: 1,
+            },
+            GitRunSetupError::TargetMismatch { target_index: 0 },
+            GitRunSetupError::PayloadTargetMismatch { target_index: 1 },
+            GitRunSetupError::PayloadRequestMismatch { target_index: 2 },
+            GitRunSetupError::GeometryMismatch { target_index: 0 },
+            GitRunSetupError::PayloadEncode(GitShardPayloadEncodeError::EmptyLocalPath),
+            GitRunSetupError::ManifestBuild(PreallocShardBuilderError::EntryLimitZero),
+            GitRunSetupError::CreateRun(CreateRunError::RunAlreadyExists { run: run() }),
+        ];
+        for err in &variants {
+            let display = format!("{err}");
+            assert!(!display.is_empty(), "Display must be non-empty for {err:?}");
+        }
+    }
+
+    #[test]
+    fn git_run_setup_error_source_chaining() {
+        use std::error::Error;
+
+        // Wrapping variants must chain to their inner error.
+        let encode_err =
+            GitRunSetupError::PayloadEncode(GitShardPayloadEncodeError::EmptyLocalPath);
+        assert!(
+            encode_err.source().is_some(),
+            "PayloadEncode must chain source"
+        );
+
+        let build_err = GitRunSetupError::ManifestBuild(PreallocShardBuilderError::EntryLimitZero);
+        assert!(
+            build_err.source().is_some(),
+            "ManifestBuild must chain source"
+        );
+
+        let create_err =
+            GitRunSetupError::CreateRun(CreateRunError::RunAlreadyExists { run: run() });
+        assert!(create_err.source().is_some(), "CreateRun must chain source");
+
+        // Leaf variants must not have a source.
+        let tenant_err = GitRunSetupError::TenantMismatch {
+            request: TenantId::from_bytes([0xAA; 32]),
+            tenant: TenantId::from_bytes([0xBB; 32]),
+        };
+        assert!(
+            tenant_err.source().is_none(),
+            "TenantMismatch must not chain source"
+        );
+
+        let empty_err = GitRunSetupError::EmptyPlan;
+        assert!(
+            empty_err.source().is_none(),
+            "EmptyPlan must not chain source"
+        );
+
+        let count_err = GitRunSetupError::TargetCountMismatch {
+            request: 3,
+            planned: 1,
+        };
+        assert!(
+            count_err.source().is_none(),
+            "TargetCountMismatch must not chain source"
+        );
+
+        let target_err = GitRunSetupError::TargetMismatch { target_index: 0 };
+        assert!(
+            target_err.source().is_none(),
+            "TargetMismatch must not chain source"
+        );
+
+        let payload_target_err = GitRunSetupError::PayloadTargetMismatch { target_index: 0 };
+        assert!(
+            payload_target_err.source().is_none(),
+            "PayloadTargetMismatch must not chain source"
+        );
+
+        let payload_request_err = GitRunSetupError::PayloadRequestMismatch { target_index: 0 };
+        assert!(
+            payload_request_err.source().is_none(),
+            "PayloadRequestMismatch must not chain source"
+        );
+
+        let geometry_err = GitRunSetupError::GeometryMismatch { target_index: 0 };
+        assert!(
+            geometry_err.source().is_none(),
+            "GeometryMismatch must not chain source"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_tenant_mismatch_error() {
+        let err = GitRunSetupError::TenantMismatch {
+            request: TenantId::from_bytes([0xAA; 32]),
+            tenant: TenantId::from_bytes([0xBB; 32]),
+        };
+        let rendered = format!("{err:?}");
+
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must contain <redacted>: {rendered}"
+        );
+        // Raw tenant bytes (hex-encoded) must not appear.
+        assert!(
+            !rendered.contains("aaaa"),
+            "Debug output must not leak raw request tenant bytes: {rendered}"
+        );
+        assert!(
+            !rendered.contains("bbbb"),
+            "Debug output must not leak raw setup tenant bytes: {rendered}"
+        );
+    }
+
+    #[test]
+    fn setup_git_run_isolates_tenants() {
+        let dir = tempdir().expect("tempdir");
+        let repo_a = dir.path().join("tenant-a-repo");
+        let repo_b = dir.path().join("tenant-b-repo");
+        fs::create_dir_all(&repo_a).expect("create repo a");
+        fs::create_dir_all(&repo_b).expect("create repo b");
+        init_git_repo(&repo_a, "git-setup-tests@example.com", "Git Setup Tests");
+        init_git_repo(&repo_b, "git-setup-tests@example.com", "Git Setup Tests");
+
+        let tenant_a = TenantId::from_bytes([0x11; 32]);
+        let tenant_b = TenantId::from_bytes([0x22; 32]);
+        let run_a = RunId::from_raw(100);
+        let run_b = RunId::from_raw(200);
+
+        let plan_a = plan_git_initial_shards(
+            GitRequest::single_repo(
+                tenant_a,
+                &repo_a,
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            )
+            .normalize()
+            .expect("normalize request a"),
+            execution_limits(),
+        )
+        .expect("plan shards a");
+
+        let plan_b = plan_git_initial_shards(
+            GitRequest::single_repo(
+                tenant_b,
+                &repo_b,
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            )
+            .normalize()
+            .expect("normalize request b"),
+            execution_limits(),
+        )
+        .expect("plan shards b");
+
+        let mut coordinator = InMemoryCoordinator::new(LEASE_DURATION_MS);
+
+        let result_a = setup_git_run(
+            &mut coordinator,
+            now(1),
+            tenant_a,
+            run_a,
+            GitRunSetupInput::new(&plan_a),
+            OpId::from_raw(30),
+        )
+        .expect("setup run a")
+        .into_inner();
+
+        let result_b = setup_git_run(
+            &mut coordinator,
+            now(2),
+            tenant_b,
+            run_b,
+            GitRunSetupInput::new(&plan_b),
+            OpId::from_raw(31),
+        )
+        .expect("setup run b")
+        .into_inner();
+
+        // Claim from tenant A's run and verify it carries tenant A's payload.
+        let mut scratch = AcquireScratch::new();
+        let claimed_a = coordinator
+            .claim_next_available(now(3), tenant_a, run_a, worker(300), &mut scratch)
+            .expect("tenant a shard should be claimable");
+        assert_eq!(claimed_a.lease.shard(), result_a.root_shards()[0]);
+        let extra_a = decode_connector_extra(claimed_a.snapshot.spec())
+            .expect("tenant a snapshot should decode");
+        let decoded_a = GitShardPayload::decode(extra_a).expect("tenant a payload round-trip");
+        assert_eq!(decoded_a.tenant_id(), tenant_a);
+        assert_eq!(&decoded_a, plan_a.entries()[0].payload());
+
+        // Claim from tenant B's run and verify it carries tenant B's payload.
+        let claimed_b = coordinator
+            .claim_next_available(now(4), tenant_b, run_b, worker(301), &mut scratch)
+            .expect("tenant b shard should be claimable");
+        assert_eq!(claimed_b.lease.shard(), result_b.root_shards()[0]);
+        let extra_b = decode_connector_extra(claimed_b.snapshot.spec())
+            .expect("tenant b snapshot should decode");
+        let decoded_b = GitShardPayload::decode(extra_b).expect("tenant b payload round-trip");
+        assert_eq!(decoded_b.tenant_id(), tenant_b);
+        assert_eq!(&decoded_b, plan_b.entries()[0].payload());
     }
 }

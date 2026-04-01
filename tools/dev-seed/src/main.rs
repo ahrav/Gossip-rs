@@ -201,7 +201,7 @@ where
         LogicalTime::from_raw(DEFAULT_SETUP_LOGICAL_TIME),
         TenantId::from_bytes(DEFAULT_TENANT_ID),
         run_id,
-        FilesystemRunSetupInput::new(plan.request(), plan.initial_shard(), &payload),
+        FilesystemRunSetupInput::new(plan.request(), plan.initial_shard().clone(), &payload),
         OpId::from_raw(DEFAULT_SETUP_OP_ID),
     )
     .map_err(|error| classify_submission_error(run_id_raw, error))?;

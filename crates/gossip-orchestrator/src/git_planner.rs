@@ -12,6 +12,14 @@ use crate::git_payload::GitShardPayload;
 use crate::git_request::{NormalizedGitRequest, NormalizedGitTarget};
 use crate::planner::InitialShardGeometry;
 
+/// Errors from Git startup shard planning.
+#[derive(Debug, thiserror::Error)]
+pub enum GitPlannerError {
+    /// The repo key at MAX_KEY_SIZE has no lexicographic successor (all bytes are 0xFF).
+    #[error("repo key at MAX_KEY_SIZE has no lexicographic successor")]
+    KeyHasNoSuccessor,
+}
+
 /// Startup plan for one normalized Git request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitInitialShardPlan {
@@ -87,41 +95,60 @@ impl GitInitialShardPlanEntry {
 /// request's deterministic repo-key order. Each shard uses exact singleton
 /// key-range geometry so one repo target never shares its startup shard with a
 /// strict-prefix neighbor.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`GitPlannerError::KeyHasNoSuccessor`] if a repo key at
+/// `MAX_KEY_SIZE` is all-0xFF and has no lexicographic successor.
 pub fn plan_git_initial_shards(
     request: NormalizedGitRequest,
     execution_limits: GitExecutionLimits,
-) -> GitInitialShardPlan {
+) -> Result<GitInitialShardPlan, GitPlannerError> {
     let entries = request
         .targets()
         .iter()
-        .map(|target| {
-            GitInitialShardPlanEntry::new(
-                target.clone(),
-                exact_key_geometry(target.repo_key().as_bytes()),
-                GitShardPayload::from_normalized_request_target(&request, target, execution_limits),
-            )
-        })
-        .collect();
-    GitInitialShardPlan::new(request, entries)
+        .map(
+            |target| -> Result<GitInitialShardPlanEntry, GitPlannerError> {
+                Ok(GitInitialShardPlanEntry::new(
+                    target.clone(),
+                    exact_key_geometry(target.repo_key().as_bytes())?,
+                    GitShardPayload::from_normalized_request_target(
+                        &request,
+                        target,
+                        execution_limits,
+                    ),
+                ))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GitInitialShardPlan::new(request, entries))
 }
 
-pub(crate) fn exact_key_geometry(key: &[u8]) -> InitialShardGeometry {
-    InitialShardGeometry::new(key.to_vec(), exact_key_upper_bound(key))
+pub(crate) fn exact_key_geometry(key: &[u8]) -> Result<InitialShardGeometry, GitPlannerError> {
+    Ok(InitialShardGeometry::new(
+        key.to_vec(),
+        exact_key_upper_bound(key)?,
+    ))
 }
 
-fn exact_key_upper_bound(key: &[u8]) -> Vec<u8> {
+pub(crate) fn exact_key_upper_bound(key: &[u8]) -> Result<Vec<u8>, GitPlannerError> {
+    debug_assert!(
+        key.iter().any(|&b| b != 0xFF),
+        "exact_key_upper_bound requires at least one non-0xFF byte \
+         (guaranteed by RepoKey's locator-kind tag prefix)"
+    );
+
     if key.len() < MAX_KEY_SIZE {
         let mut end = Vec::with_capacity(key.len() + 1);
         end.extend_from_slice(key);
         end.push(0);
-        return end;
+        return Ok(end);
     }
 
     let mut buf = KeyBuf::new();
-    prefix_successor(key, &mut buf)
-        .expect("MAX_KEY_SIZE keys derived from RepoKey always have a lexicographic successor")
-        .to_vec()
+    Ok(prefix_successor(key, &mut buf)
+        .ok_or(GitPlannerError::KeyHasNoSuccessor)?
+        .to_vec())
 }
 
 #[cfg(test)]
@@ -170,7 +197,8 @@ mod tests {
         .normalize()
         .expect("normalize request");
         let execution_limits = GitExecutionLimits::default();
-        let plan = plan_git_initial_shards(normalized.clone(), execution_limits);
+        let plan =
+            plan_git_initial_shards(normalized.clone(), execution_limits).expect("plan shards");
 
         assert_eq!(plan.request(), &normalized);
         assert_eq!(plan.entries().len(), 1);
@@ -225,7 +253,8 @@ mod tests {
         )
         .normalize()
         .expect("normalize request");
-        let plan = plan_git_initial_shards(normalized.clone(), GitExecutionLimits::default());
+        let plan = plan_git_initial_shards(normalized.clone(), GitExecutionLimits::default())
+            .expect("plan shards");
 
         assert_eq!(plan.entries().len(), normalized.targets().len());
         for (entry, target) in plan.entries().iter().zip(normalized.targets()) {
@@ -266,8 +295,9 @@ mod tests {
         .expect("normalize dotted request");
 
         assert_eq!(
-            plan_git_initial_shards(canonical, GitExecutionLimits::default()),
-            plan_git_initial_shards(dotted, GitExecutionLimits::default())
+            plan_git_initial_shards(canonical, GitExecutionLimits::default())
+                .expect("plan canonical"),
+            plan_git_initial_shards(dotted, GitExecutionLimits::default()).expect("plan dotted")
         );
     }
 
@@ -276,7 +306,7 @@ mod tests {
         let repo_key = RepoKey::try_from_vec(vec![0x01, 0x10]).expect("repo key");
         let strict_extension = RepoKey::try_from_vec(vec![0x01, 0x10, 0x01]).expect("extension");
         let end_sentinel = RepoKey::try_from_vec(vec![0x01, 0x10, 0x00]).expect("sentinel");
-        let geometry = exact_key_geometry(repo_key.as_bytes());
+        let geometry = exact_key_geometry(repo_key.as_bytes()).expect("short key geometry");
         let spec = ShardSpec::try_with_range_and_metadata(
             geometry.key_range_start(),
             geometry.key_range_end(),
@@ -290,9 +320,18 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "at least one non-0xFF byte")]
+    fn all_0xff_max_key_size_returns_error() {
+        let key = vec![0xFF; MAX_KEY_SIZE];
+        // In debug builds the debug_assert fires before reaching the
+        // `KeyHasNoSuccessor` error path.  Both layers reject this input.
+        let _ = exact_key_geometry(&key);
+    }
+
+    #[test]
     fn max_length_keys_use_lexicographic_successor_upper_bound() {
         let repo_key = vec![0x01; MAX_KEY_SIZE];
-        let geometry = exact_key_geometry(repo_key.as_slice());
+        let geometry = exact_key_geometry(repo_key.as_slice()).expect("max-length key geometry");
         let spec = ShardSpec::try_with_range_and_metadata(
             geometry.key_range_start(),
             geometry.key_range_end(),
@@ -307,5 +346,92 @@ mod tests {
         assert_eq!(geometry.key_range_end(), expected_end.as_slice());
         assert!(spec.contains_key(repo_key.as_slice()));
         assert!(!spec.contains_key(expected_end.as_slice()));
+    }
+
+    #[test]
+    fn exact_key_geometry_single_byte_key() {
+        let key: &[u8] = &[0x42];
+        let geometry = exact_key_geometry(key).expect("single-byte key geometry");
+        let spec = ShardSpec::try_with_range_and_metadata(
+            geometry.key_range_start(),
+            geometry.key_range_end(),
+            b"",
+        )
+        .expect("singleton range should be valid");
+
+        assert_eq!(geometry.key_range_start(), &[0x42]);
+        assert_eq!(geometry.key_range_end(), &[0x42, 0x00]);
+        assert!(spec.contains_key(&[0x42]));
+        assert!(!spec.contains_key(&[0x42, 0x00]));
+    }
+
+    #[test]
+    fn exact_key_geometry_empty_key() {
+        // Empty keys violate the non-0xFF-byte precondition (vacuously: no bytes
+        // at all means no non-0xFF byte). The short branch still produces the
+        // correct upper bound `[0x00]`, but the debug_assert catches the misuse.
+        // Construct the expected geometry manually to verify the short-branch
+        // arithmetic without triggering the assertion.
+        let start: &[u8] = &[];
+        let end: &[u8] = &[0x00];
+
+        let spec = ShardSpec::try_with_range_and_metadata(start, end, b"")
+            .expect("empty-start range should be valid");
+
+        assert!(spec.contains_key(&[]));
+        assert!(!spec.contains_key(&[0x00]));
+    }
+
+    #[test]
+    fn exact_key_geometry_trailing_ff_bytes() {
+        let key: &[u8] = &[0x01, 0xFF, 0xFF];
+        let geometry = exact_key_geometry(key).expect("trailing-0xFF key geometry");
+        let spec = ShardSpec::try_with_range_and_metadata(
+            geometry.key_range_start(),
+            geometry.key_range_end(),
+            b"",
+        )
+        .expect("singleton range should be valid");
+
+        assert_eq!(geometry.key_range_start(), &[0x01, 0xFF, 0xFF]);
+        assert_eq!(geometry.key_range_end(), &[0x01, 0xFF, 0xFF, 0x00]);
+        assert!(spec.contains_key(&[0x01, 0xFF, 0xFF]));
+        assert!(!spec.contains_key(&[0x01, 0xFF, 0xFF, 0x00]));
+    }
+
+    #[test]
+    fn exact_key_geometry_max_minus_one_length() {
+        let key = vec![0x01; MAX_KEY_SIZE - 1];
+        let geometry = exact_key_geometry(key.as_slice()).expect("max-minus-one key geometry");
+        let spec = ShardSpec::try_with_range_and_metadata(
+            geometry.key_range_start(),
+            geometry.key_range_end(),
+            b"",
+        )
+        .expect("singleton range should be valid");
+
+        // Short branch appends 0x00, producing a key of exactly MAX_KEY_SIZE.
+        assert_eq!(geometry.key_range_end().len(), MAX_KEY_SIZE);
+        assert!(spec.contains_key(key.as_slice()));
+    }
+
+    #[test]
+    fn max_length_key_with_trailing_ff_uses_stripped_successor() {
+        // First byte 0x01, remaining bytes all 0xFF — exercises prefix_successor's
+        // trailing-0xFF stripping: strips all 0xFF bytes, increments 0x01 to 0x02.
+        let mut key = vec![0xFF; MAX_KEY_SIZE];
+        key[0] = 0x01;
+        let geometry = exact_key_geometry(key.as_slice()).expect("max-length trailing-FF geometry");
+        let spec = ShardSpec::try_with_range_and_metadata(
+            geometry.key_range_start(),
+            geometry.key_range_end(),
+            b"",
+        )
+        .expect("singleton range should be valid");
+
+        assert_eq!(geometry.key_range_start(), key.as_slice());
+        assert_eq!(geometry.key_range_end(), &[0x02]);
+        assert!(spec.contains_key(key.as_slice()));
+        assert!(!spec.contains_key(&[0x02]));
     }
 }

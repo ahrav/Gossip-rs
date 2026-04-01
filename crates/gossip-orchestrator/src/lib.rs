@@ -48,7 +48,9 @@ pub mod setup;
 mod test_support;
 
 pub use git_payload::{GitShardPayload, GitShardPayloadDecodeError, GitShardPayloadEncodeError};
-pub use git_planner::{GitInitialShardPlan, GitInitialShardPlanEntry, plan_git_initial_shards};
+pub use git_planner::{
+    GitInitialShardPlan, GitInitialShardPlanEntry, GitPlannerError, plan_git_initial_shards,
+};
 pub use git_request::{
     GitRequest, GitRequestError, GitRequestSelection, GitRequestTarget, NormalizedGitRequest,
     NormalizedGitSelection, NormalizedGitTarget,
