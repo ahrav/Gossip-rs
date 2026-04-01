@@ -185,8 +185,11 @@ impl GitRequest {
     ///
     /// Equivalent inputs collapse to one normalized target. Targets that
     /// normalize to the same repo identity but disagree on request-side
-    /// selection or display metadata are rejected so later control-plane
-    /// stages never need to guess which intent to preserve.
+    /// selection are rejected so later control-plane stages never need to
+    /// guess which intent to preserve. Diagnostic display metadata is not
+    /// part of the identity or selection contract: when two targets share
+    /// the same repo key and selection, the first target's display name
+    /// wins and the duplicate is silently dropped.
     ///
     /// # Errors
     ///
@@ -238,6 +241,9 @@ impl GitRequest {
             if let Some(previous) = deduped.last()
                 && previous.target.repo_key() == candidate.target.repo_key()
             {
+                // Same repo key and same selection: collapse duplicates.
+                // Display-name differences are ignored because display_name
+                // is diagnostic-only metadata; the first target's name wins.
                 if previous.target.selection == candidate.target.selection {
                     continue;
                 }
@@ -572,6 +578,22 @@ pub enum GitRequestError {
         /// Zero-based position in the raw request target list.
         target_index: usize,
     },
+    /// An individual ref in the explicit refs list is empty (zero-length).
+    #[error("git request target {target_index} ref at position {ref_index} is empty")]
+    EmptyRef {
+        /// Zero-based position in the raw request target list.
+        target_index: usize,
+        /// Zero-based position within the refs list.
+        ref_index: usize,
+    },
+    /// An individual ref contains a NUL byte, which Git refnames prohibit.
+    #[error("git request target {target_index} ref at position {ref_index} contains a NUL byte")]
+    RefContainsNul {
+        /// Zero-based position in the raw request target list.
+        target_index: usize,
+        /// Zero-based position within the refs list.
+        ref_index: usize,
+    },
     /// Explicit commit resolved to the null OID (all zeros).
     #[error("git request target {target_index} has null commit OID (all zeros)")]
     NullExplicitCommit {
@@ -595,6 +617,20 @@ fn normalize_selection(
         GitRequestSelection::ExplicitRefs { refs } => {
             if refs.is_empty() {
                 return Err(GitRequestError::EmptyExplicitRefs { target_index });
+            }
+            for (ref_index, r) in refs.iter().enumerate() {
+                if r.is_empty() {
+                    return Err(GitRequestError::EmptyRef {
+                        target_index,
+                        ref_index,
+                    });
+                }
+                if r.contains(&0) {
+                    return Err(GitRequestError::RefContainsNul {
+                        target_index,
+                        ref_index,
+                    });
+                }
             }
             Ok(NormalizedGitSelection::ExplicitRefs {
                 refs: normalize_explicit_refs(refs),
@@ -1084,6 +1120,92 @@ mod tests {
     }
 
     #[test]
+    fn empty_individual_ref_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xA6),
+            vec![GitRequestTarget::new(
+                dir.path(),
+                GitRequestSelection::ExplicitRefs {
+                    refs: vec![b"refs/heads/main".to_vec(), vec![]],
+                },
+            )],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("empty individual ref should fail");
+        assert!(matches!(
+            err,
+            GitRequestError::EmptyRef {
+                target_index: 0,
+                ref_index: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn all_empty_individual_refs_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xA7),
+            vec![GitRequestTarget::new(
+                dir.path(),
+                GitRequestSelection::ExplicitRefs { refs: vec![vec![]] },
+            )],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request.normalize().expect_err("sole empty ref should fail");
+        assert!(matches!(
+            err,
+            GitRequestError::EmptyRef {
+                target_index: 0,
+                ref_index: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn ref_containing_nul_byte_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xA8),
+            vec![GitRequestTarget::new(
+                dir.path(),
+                GitRequestSelection::ExplicitRefs {
+                    refs: vec![b"refs/heads/main".to_vec(), b"refs/heads/\x00bad".to_vec()],
+                },
+            )],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("ref with NUL byte should fail");
+        assert!(matches!(
+            err,
+            GitRequestError::RefContainsNul {
+                target_index: 0,
+                ref_index: 1,
+            }
+        ));
+    }
+
+    #[test]
     fn explicit_commit_sha256_normalizes_to_typed_oid() {
         let dir = tempdir().expect("tempdir");
         init_repo(dir.path());
@@ -1150,6 +1272,172 @@ mod tests {
         let err = request
             .normalize()
             .expect_err("null OID should be rejected");
+        assert!(matches!(
+            err,
+            GitRequestError::NullExplicitCommit { target_index: 0 }
+        ));
+    }
+
+    #[test]
+    fn non_git_directory_fails_repo_normalization() {
+        let dir = tempdir().expect("tempdir");
+
+        let request = GitRequest::single_repo(
+            tenant(0xB0),
+            dir.path(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("non-Git directory should fail normalization");
+        assert!(matches!(
+            err,
+            GitRequestError::RepoNormalization {
+                target_index: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn repo_normalization_reports_correct_target_index() {
+        let good_dir = tempdir().expect("tempdir");
+        init_repo(good_dir.path());
+        let bad_dir = tempdir().expect("tempdir");
+
+        let request = GitRequest::new(
+            tenant(0xB1),
+            vec![
+                GitRequestTarget::new(good_dir.path(), GitRequestSelection::DefaultBranchOnly),
+                GitRequestTarget::new(bad_dir.path(), GitRequestSelection::DefaultBranchOnly),
+            ],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("second target should fail normalization");
+        assert!(matches!(
+            err,
+            GitRequestError::RepoNormalization {
+                target_index: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn three_or_more_identical_targets_collapse_to_one() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xB2),
+            vec![
+                GitRequestTarget::new(dir.path(), GitRequestSelection::DefaultBranchOnly),
+                GitRequestTarget::new(dir.path().join("."), GitRequestSelection::DefaultBranchOnly),
+                GitRequestTarget::new(
+                    dir.path().join("./"),
+                    GitRequestSelection::DefaultBranchOnly,
+                ),
+            ],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let normalized = request.normalize().expect("normalize request");
+        assert_eq!(normalized.targets().len(), 1);
+    }
+
+    #[test]
+    fn three_way_conflict_two_identical_plus_one_different() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xB3),
+            vec![
+                GitRequestTarget::new(dir.path(), GitRequestSelection::DefaultBranchOnly),
+                GitRequestTarget::new(dir.path().join("."), GitRequestSelection::DefaultBranchOnly),
+                GitRequestTarget::new(
+                    dir.path().join("./"),
+                    GitRequestSelection::explicit_refs([b"refs/heads/main".as_slice()]),
+                ),
+            ],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("three-way conflict should fail");
+        assert!(matches!(
+            err,
+            GitRequestError::ConflictingNormalizedTarget { .. }
+        ));
+    }
+
+    #[test]
+    fn mixed_selection_types_across_distinct_repos() {
+        let dir = tempdir().expect("tempdir");
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        let repo_c = dir.path().join("repo-c");
+        fs::create_dir_all(&repo_a).expect("create repo a");
+        fs::create_dir_all(&repo_b).expect("create repo b");
+        fs::create_dir_all(&repo_c).expect("create repo c");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+        init_repo(&repo_c);
+
+        let commit_hex = b"0123456789abcdef0123456789abcdef01234567";
+        let request = GitRequest::new(
+            tenant(0xB4),
+            vec![
+                GitRequestTarget::new(&repo_a, GitRequestSelection::DefaultBranchOnly),
+                GitRequestTarget::new(
+                    &repo_b,
+                    GitRequestSelection::explicit_refs([b"refs/heads/main".as_slice()]),
+                ),
+                GitRequestTarget::new(
+                    &repo_c,
+                    GitRequestSelection::explicit_commit(commit_hex.as_slice()),
+                ),
+            ],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let normalized = request.normalize().expect("normalize mixed selections");
+        assert_eq!(normalized.targets().len(), 3);
+    }
+
+    #[test]
+    fn sha256_null_oid_explicit_commit_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let null_sha256 = b"0000000000000000000000000000000000000000000000000000000000000000";
+
+        let request = GitRequest::repo_with_explicit_commit(
+            tenant(0xB5),
+            dir.path(),
+            null_sha256.as_slice(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("SHA-256 null OID should be rejected");
         assert!(matches!(
             err,
             GitRequestError::NullExplicitCommit { target_index: 0 }

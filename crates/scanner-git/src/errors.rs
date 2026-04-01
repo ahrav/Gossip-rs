@@ -26,9 +26,17 @@ use super::midx_error::MidxError;
 #[non_exhaustive]
 pub enum RepoOpenError {
     /// I/O error during file operations.
+    ///
+    /// Display shows only [`ErrorKind`](std::io::ErrorKind) to prevent
+    /// filesystem path leakage. The full [`io::Error`] is available via
+    /// [`Error::source()`](std::error::Error::source).
     #[error("I/O error ({})", .0.kind())]
     Io(#[source] io::Error),
     /// Path canonicalization failed.
+    ///
+    /// Display shows only [`ErrorKind`](std::io::ErrorKind) to prevent
+    /// filesystem path leakage. The full [`io::Error`] is available via
+    /// [`Error::source()`](std::error::Error::source).
     #[error("path canonicalization failed ({})", .0.kind())]
     Canonicalization(#[source] io::Error),
     /// Not a Git repository (no .git dir/file, not bare).

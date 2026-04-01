@@ -1,8 +1,8 @@
 //! Shared repository path and object-byte utilities.
 //!
-//! This module consolidates directory-listing and pack-resolution helpers that
-//! were previously duplicated across `object_store`, `runner_exec`, `pack_io`,
-//! and `commit_loader`, plus shared OID/loose-object parsing routines used by
+//! This module consolidates directory-listing and pack-resolution helpers
+//! shared by `object_store`, `runner_exec`, `pack_io`, and `commit_loader`,
+//! plus OID/loose-object parsing routines used by
 //! `object_store` and `commit_parse`. Fallible path helpers return `io::Error`
 //! so callers can convert to their domain error type with `.map_err()` or `?`
 //! (when `From<io::Error>` is implemented).
