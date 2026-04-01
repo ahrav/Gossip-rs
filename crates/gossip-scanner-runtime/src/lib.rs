@@ -1133,7 +1133,7 @@ impl FilesystemIdentityScope {
     ///
     /// Returns the normalized forward-slash path bytes alongside the
     /// [`StableItemId`]. Fails if the path cannot be made relative to
-    /// the canonical root or if the resulting key exceeds [`ItemKey`]
+    /// the canonical root or if the resulting key exceeds `ItemKey`
     /// length limits.
     fn stable_item_id_for_scheduler_path(
         &self,
@@ -1299,7 +1299,7 @@ impl DiscoveryOrderBuffer {
 
     /// Accept a batch. When the discovery sequence changes, the previous
     /// sequence is implicitly complete (single-writer guarantee) and
-    /// becomes eligible for flushing via [`drain_ready`].
+    /// becomes eligible for flushing via [`Self::drain_ready`].
     fn push(&mut self, batch: OwnedCommitBatch) {
         let ds = batch.discovery_sequence;
         if ds < self.next_flush {
