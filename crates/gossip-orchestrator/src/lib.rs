@@ -17,8 +17,11 @@
 //!    requests to deterministic startup shard geometries. The current policy
 //!    emits one full-range shard per request; later coordination split flows
 //!    handle fan-out after the worker makes progress.
-//! 3. **Shard payload encoding** ([`payload`]): defines the typed filesystem
-//!    metadata bytes carried through shard registration and lease hydration.
+//! 3. **Shard payload encoding**:
+//!    - [`payload`] defines the typed filesystem metadata bytes carried
+//!      through shard registration and lease hydration.
+//!    - [`git_payload`] defines the typed Git metadata bytes carried through
+//!      repo-frontier shard registration and later Git lease hydration.
 //! 4. **Run setup** ([`setup`]): lowers normalized requests, planned
 //!    geometry, and typed payloads into a validated initial manifest, then
 //!    creates and registers the run through the coordination lifecycle.
@@ -28,6 +31,7 @@
 //! [`RunManagement`](gossip_coordination::RunManagement) and mutates
 //! run/shard state.
 
+pub mod git_payload;
 pub mod git_request;
 pub mod payload;
 pub mod planner;
@@ -37,6 +41,7 @@ pub mod setup;
 #[cfg(test)]
 mod test_support;
 
+pub use git_payload::{GitShardPayload, GitShardPayloadDecodeError, GitShardPayloadEncodeError};
 pub use git_request::{
     GitRequest, GitRequestError, GitRequestSelection, GitRequestTarget, NormalizedGitRequest,
     NormalizedGitSelection, NormalizedGitTarget,

@@ -72,6 +72,9 @@ inherent methods in `gossip-connectors/src/`.
   identity via tenant-scoped normalization, and preserves request-side
   selection intent (default-branch, explicit refs, or explicit commit) for
   later Git control-plane stages.
+- `git_payload.rs` encodes the typed Git shard metadata that coordination
+  stores in `connector_extra` for repo-frontier shards and the runtime later
+  decodes during Git lease hydration.
 
 The filesystem stages are required for filesystem security and determinism.
 Git request normalization is required for tenant-scoped identity resolution
@@ -141,6 +144,7 @@ and `types.rs`.
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
 | `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem and Git request normalization, planning, and run setup |
+| `crates/gossip-orchestrator/src/git_payload.rs` | Typed Git shard payload wire format for repo-frontier shards (encode/decode) |
 | `crates/gossip-orchestrator/src/git_request.rs` | Canonical Git submission request normalization and target deduplication |
 | `crates/gossip-orchestrator/src/request.rs` | Canonical filesystem submission request normalization |
 | `crates/gossip-orchestrator/src/planner.rs` | Deterministic filesystem initial shard geometry planner |

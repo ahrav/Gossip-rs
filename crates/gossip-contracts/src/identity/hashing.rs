@@ -98,6 +98,10 @@ pub static SPLIT_ID_HASHER: LazyLock<Hasher> =
 pub static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OP_PAYLOAD_V1));
 
+/// Cached derive-key hasher for tenant-scoped Git repository-ID derivation.
+pub static REPO_ID_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::GIT_REPO_ID_V1));
+
 /// Clone a cached hasher, feed canonical input, and finalize to 32 bytes.
 ///
 /// This is the hot-path helper used by `derive_*` functions across the
@@ -149,7 +153,8 @@ pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
 /// Finalize a hasher into a 64-bit (8-byte) digest.
 ///
 /// Takes the first 8 bytes of the BLAKE3 output as a little-endian `u64`.
-/// Used for op-log payload hashes and split shard ID derivation.
+/// Used for op-log payload hashes, split shard ID derivation, and
+/// tenant-scoped repo-ID derivation.
 ///
 /// # Byte ordering
 ///
