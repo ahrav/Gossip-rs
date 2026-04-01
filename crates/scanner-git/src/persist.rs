@@ -274,4 +274,75 @@ mod tests {
         let bitmap = RoaringSeenBitmap::deserialize(&scope_ops[0].value).expect("bitmap");
         assert!(bitmap.contains(&OidBytes::sha256([0xAA; 32])));
     }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn in_memory_store_rollback_on_failed_commit() {
+        use crate::roaring_seen::RoaringSeenBitmap;
+
+        let store = InMemoryPersistenceStore::default();
+        let scope_key = build_seen_scope_key(42, &[0xAB; 32]);
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+        let oid_c = OidBytes::sha1([0x33; 20]);
+
+        // Seed the scope with OID A.
+        store
+            .commit_finalize(&seen_output(&[oid_a]))
+            .expect("seed commit");
+
+        // Attempt a batch where the first op adds OID B but the second
+        // op carries a corrupt payload. Staging must discard both ops.
+        let valid_delta = SeenBitmapDelta::from_oids(&[oid_b]).expect("delta b");
+        let output = FinalizeOutput {
+            data_ops: vec![
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: valid_delta.serialize(),
+                },
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: b"corrupt-payload".to_vec(),
+                },
+            ],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+
+        assert!(
+            store.commit_finalize(&output).is_err(),
+            "corrupt op must fail"
+        );
+
+        // The store must still contain only OID A — OID B from the failed
+        // batch must not have been committed.
+        let logged = store.data_ops.borrow();
+        let scope_ops: Vec<&WriteOp> = logged.iter().filter(|w| w.key == scope_key).collect();
+        assert_eq!(scope_ops.len(), 1, "failed commit must not add new ops");
+        let bitmap = RoaringSeenBitmap::deserialize(&scope_ops[0].value).expect("bitmap");
+        assert!(bitmap.contains(&oid_a), "OID A must still be present");
+        assert!(
+            !bitmap.contains(&oid_b),
+            "OID B must not appear after rollback"
+        );
+        drop(logged);
+
+        // A subsequent valid commit must merge correctly from the
+        // pre-failure state, proving staged_scopes was never applied.
+        store
+            .commit_finalize(&seen_output(&[oid_c]))
+            .expect("recovery commit");
+
+        let logged = store.data_ops.borrow();
+        let scope_ops: Vec<&WriteOp> = logged.iter().filter(|w| w.key == scope_key).collect();
+        assert_eq!(scope_ops.len(), 2, "recovery commit adds one op");
+        let bitmap = RoaringSeenBitmap::deserialize(&scope_ops[1].value).expect("bitmap");
+        assert!(bitmap.contains(&oid_a), "OID A present after recovery");
+        assert!(
+            !bitmap.contains(&oid_b),
+            "OID B still absent after recovery"
+        );
+        assert!(bitmap.contains(&oid_c), "OID C present after recovery");
+    }
 }
