@@ -22,21 +22,21 @@
 //! distributed runtime path.
 
 use std::path::PathBuf;
-use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 
 use anyhow::anyhow;
-use gossip_contracts::connector::git::{GitMirrorManager, GitRepoDiscoverySource, GitRepoExecutor};
 use gossip_contracts::connector::ToxicDigest;
+use gossip_contracts::connector::git::{GitMirrorManager, GitRepoDiscoverySource, GitRepoExecutor};
 use scanner_git::{
-    run_git_scan, GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanResult,
-    NativeRefResolver, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig,
+    GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanResult, NativeRefResolver,
+    NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig, run_git_scan,
 };
 
 use crate::{
-    build_runtime_engine, forward_git_events, join_scoped, AssignmentOutcome, CancellationToken,
-    ChannelEventOutput, GitDebugLevel, GitScanConfig, ScanReport, ScanRuntimeError,
-    EVENT_CHANNEL_CAP,
+    AssignmentOutcome, CancellationToken, ChannelEventOutput, EVENT_CHANNEL_CAP, GitDebugLevel,
+    GitScanConfig, ScanReport, ScanRuntimeError, build_runtime_engine, forward_git_events,
+    join_scoped,
 };
 
 /// Marker type for the Git-repository source family.
