@@ -185,8 +185,11 @@ impl GitRequest {
     ///
     /// Equivalent inputs collapse to one normalized target. Targets that
     /// normalize to the same repo identity but disagree on request-side
-    /// selection or display metadata are rejected so later control-plane
-    /// stages never need to guess which intent to preserve.
+    /// selection are rejected so later control-plane stages never need to
+    /// guess which intent to preserve. Diagnostic display metadata is not
+    /// part of the identity or selection contract: when two targets share
+    /// the same repo key and selection, the first target's display name
+    /// wins and the duplicate is silently dropped.
     ///
     /// # Errors
     ///
@@ -238,6 +241,9 @@ impl GitRequest {
             if let Some(previous) = deduped.last()
                 && previous.target.repo_key() == candidate.target.repo_key()
             {
+                // Same repo key and same selection: collapse duplicates.
+                // Display-name differences are ignored because display_name
+                // is diagnostic-only metadata; the first target's name wins.
                 if previous.target.selection == candidate.target.selection {
                     continue;
                 }
@@ -572,6 +578,12 @@ pub enum GitRequestError {
         /// Zero-based position in the raw request target list.
         target_index: usize,
     },
+    /// An individual ref in the explicit refs list is empty (zero-length).
+    #[error("git request target {target_index} contains an empty ref name")]
+    EmptyRef {
+        /// Zero-based position in the raw request target list.
+        target_index: usize,
+    },
     /// Explicit commit resolved to the null OID (all zeros).
     #[error("git request target {target_index} has null commit OID (all zeros)")]
     NullExplicitCommit {
@@ -595,6 +607,9 @@ fn normalize_selection(
         GitRequestSelection::ExplicitRefs { refs } => {
             if refs.is_empty() {
                 return Err(GitRequestError::EmptyExplicitRefs { target_index });
+            }
+            if refs.iter().any(|r| r.is_empty()) {
+                return Err(GitRequestError::EmptyRef { target_index });
             }
             Ok(NormalizedGitSelection::ExplicitRefs {
                 refs: normalize_explicit_refs(refs),
@@ -1081,6 +1096,50 @@ mod tests {
             err,
             GitRequestError::EmptyExplicitRefs { target_index: 0 }
         ));
+    }
+
+    #[test]
+    fn empty_individual_ref_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xA6),
+            vec![GitRequestTarget::new(
+                dir.path(),
+                GitRequestSelection::ExplicitRefs {
+                    refs: vec![b"refs/heads/main".to_vec(), vec![]],
+                },
+            )],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("empty individual ref should fail");
+        assert!(matches!(err, GitRequestError::EmptyRef { target_index: 0 }));
+    }
+
+    #[test]
+    fn all_empty_individual_refs_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xA7),
+            vec![GitRequestTarget::new(
+                dir.path(),
+                GitRequestSelection::ExplicitRefs { refs: vec![vec![]] },
+            )],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request.normalize().expect_err("sole empty ref should fail");
+        assert!(matches!(err, GitRequestError::EmptyRef { target_index: 0 }));
     }
 
     #[test]
