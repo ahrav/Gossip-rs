@@ -526,6 +526,58 @@ impl fmt::Debug for NormalizedGitSelection {
     }
 }
 
+/// Validation failures for individual explicit-ref entries.
+///
+/// Returned by [`validate_explicit_refs`] and converted into the caller's
+/// domain error via `From` impls on both the encode and decode error types.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExplicitRefValidationError {
+    /// The explicit refs list was empty.
+    #[error("explicit refs list must be non-empty")]
+    EmptyList,
+    /// One ref entry was zero-length.
+    #[error("explicit ref at position {ref_index} is empty")]
+    EmptyRef {
+        /// Zero-based position within the explicit-ref list.
+        ref_index: usize,
+    },
+    /// One ref entry contained a NUL byte.
+    #[error("explicit ref at position {ref_index} contains a NUL byte")]
+    RefContainsNul {
+        /// Zero-based position within the explicit-ref list.
+        ref_index: usize,
+    },
+    /// The refs were not in strict sorted, deduplicated order.
+    #[error("explicit refs must be strictly sorted and deduplicated")]
+    NonCanonical,
+}
+
+/// Validates that an explicit-ref list is non-empty, each entry is non-empty
+/// and NUL-free, and the entries are in strict sorted order with no duplicates.
+pub(crate) fn validate_explicit_refs(refs: &[Vec<u8>]) -> Result<(), ExplicitRefValidationError> {
+    if refs.is_empty() {
+        return Err(ExplicitRefValidationError::EmptyList);
+    }
+
+    let mut previous: Option<&[u8]> = None;
+    for (ref_index, value) in refs.iter().enumerate() {
+        if value.is_empty() {
+            return Err(ExplicitRefValidationError::EmptyRef { ref_index });
+        }
+        if value.contains(&0) {
+            return Err(ExplicitRefValidationError::RefContainsNul { ref_index });
+        }
+        if let Some(previous) = previous
+            && previous >= value.as_slice()
+        {
+            return Err(ExplicitRefValidationError::NonCanonical);
+        }
+        previous = Some(value);
+    }
+
+    Ok(())
+}
+
 /// Normalization failures for [`GitRequest`].
 #[derive(Debug, thiserror::Error)]
 pub enum GitRequestError {
@@ -1079,6 +1131,11 @@ mod tests {
             .normalize()
             .expect("display_name difference should dedupe, not conflict");
         assert_eq!(normalized.targets().len(), 1);
+        assert_eq!(
+            normalized.targets()[0].display_name(),
+            Some("display-a"),
+            "first target's display name should win during dedupe"
+        );
     }
 
     #[test]
