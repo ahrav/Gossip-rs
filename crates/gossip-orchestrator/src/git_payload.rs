@@ -50,7 +50,7 @@
 
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use gossip_contracts::connector::ConnectorInputError;
 use gossip_contracts::connector::ToxicDigest;
@@ -62,7 +62,10 @@ use gossip_contracts::coordination::shard_spec::MAX_METADATA_SIZE;
 use gossip_contracts::identity::TenantId;
 use scanner_git::{ObjectFormat, OidBytes, derive_repo_id};
 
-use crate::git_request::{NormalizedGitRequest, NormalizedGitSelection, NormalizedGitTarget};
+use crate::git_request::{
+    ExplicitRefValidationError, NormalizedGitRequest, NormalizedGitSelection, NormalizedGitTarget,
+    validate_explicit_refs,
+};
 
 const TENANT_ID_LEN: usize = 32;
 const U32_LEN: usize = std::mem::size_of::<u32>();
@@ -83,6 +86,9 @@ const GIT_SCAN_MODE_ODB_BLOB_FAST_TAG: u8 = 0x01;
 
 const GIT_MERGE_STRATEGY_ALL_PARENTS_TAG: u8 = 0x00;
 const GIT_MERGE_STRATEGY_FIRST_PARENT_ONLY_TAG: u8 = 0x01;
+
+const OBJECT_FORMAT_SHA1_TAG: u8 = 0x01;
+const OBJECT_FORMAT_SHA256_TAG: u8 = 0x02;
 
 const GIT_DEBUG_LEVEL_OFF_TAG: u8 = 0x00;
 const GIT_DEBUG_LEVEL_STATS_TAG: u8 = 0x01;
@@ -270,6 +276,7 @@ impl GitShardPayload {
     pub fn encoded_len(&self) -> Result<usize, GitShardPayloadEncodeError> {
         validate_repo_identity_for_encode(self.tenant_id, &self.repo_target, self.repo_id)?;
         validate_selection_for_encode(&self.selection)?;
+        validate_execution_limits_for_encode(self.execution_limits)?;
 
         let repo_key_len = self.repo_target.repo_key().as_bytes().len();
         let locator_len = encoded_locator_len(self.repo_target.locator())?;
@@ -416,6 +423,12 @@ pub enum GitShardPayloadEncodeError {
     /// Explicit-commit selection carried a null OID.
     #[error("git shard payload explicit commit OID must be non-null")]
     NullExplicitCommit,
+    /// The `pack_exec_workers` value exceeds the portable u32 wire limit.
+    #[error("git shard payload pack_exec_workers value {workers} exceeds portable u32 limit")]
+    PackExecWorkersTooLarge {
+        /// Worker-count override that exceeded the portable ceiling.
+        workers: usize,
+    },
     /// The encoded payload exceeds the shard-metadata size ceiling.
     #[error("git shard payload is too large ({size} bytes, max {max})")]
     MetadataTooLarge {
@@ -485,6 +498,9 @@ pub enum GitShardPayloadDecodeError {
     /// The decoded local-path locator was not absolute.
     #[error("git shard payload local-path locator must be absolute")]
     RelativeLocalPath,
+    /// The decoded local-path locator contains directory traversal (`..`).
+    #[error("git shard payload local-path locator contains directory traversal")]
+    LocalPathTraversal,
     /// The display-name presence flag is unknown.
     #[error("git shard payload display-name flag '{0}' is unknown")]
     UnknownDisplayNameFlag(u8),
@@ -550,6 +566,32 @@ pub enum GitShardPayloadDecodeError {
         /// Repo ID carried in the payload.
         actual: u64,
     },
+}
+
+impl From<ExplicitRefValidationError> for GitShardPayloadEncodeError {
+    fn from(err: ExplicitRefValidationError) -> Self {
+        match err {
+            ExplicitRefValidationError::EmptyList => Self::EmptyExplicitRefs,
+            ExplicitRefValidationError::EmptyRef { ref_index } => Self::EmptyRef { ref_index },
+            ExplicitRefValidationError::RefContainsNul { ref_index } => {
+                Self::RefContainsNul { ref_index }
+            }
+            ExplicitRefValidationError::NonCanonical => Self::NonCanonicalExplicitRefs,
+        }
+    }
+}
+
+impl From<ExplicitRefValidationError> for GitShardPayloadDecodeError {
+    fn from(err: ExplicitRefValidationError) -> Self {
+        match err {
+            ExplicitRefValidationError::EmptyList => Self::EmptyExplicitRefs,
+            ExplicitRefValidationError::EmptyRef { ref_index } => Self::EmptyRef { ref_index },
+            ExplicitRefValidationError::RefContainsNul { ref_index } => {
+                Self::RefContainsNul { ref_index }
+            }
+            ExplicitRefValidationError::NonCanonical => Self::NonCanonicalExplicitRefs,
+        }
+    }
 }
 
 fn validate_repo_identity_for_encode(
@@ -643,21 +685,8 @@ fn validate_selection_for_encode(
     match selection {
         NormalizedGitSelection::DefaultBranchOnly => Ok(()),
         NormalizedGitSelection::ExplicitRefs { refs } => {
-            validate_explicit_refs(refs).map_err(|err| match err {
-                GitShardPayloadDecodeError::EmptyExplicitRefs => {
-                    GitShardPayloadEncodeError::EmptyExplicitRefs
-                }
-                GitShardPayloadDecodeError::EmptyRef { ref_index } => {
-                    GitShardPayloadEncodeError::EmptyRef { ref_index }
-                }
-                GitShardPayloadDecodeError::RefContainsNul { ref_index } => {
-                    GitShardPayloadEncodeError::RefContainsNul { ref_index }
-                }
-                GitShardPayloadDecodeError::NonCanonicalExplicitRefs => {
-                    GitShardPayloadEncodeError::NonCanonicalExplicitRefs
-                }
-                other => unreachable!("unexpected explicit-ref validation error: {other}"),
-            })
+            validate_explicit_refs(refs)?;
+            Ok(())
         }
         NormalizedGitSelection::ExplicitCommit { commit } => {
             if commit.is_null() {
@@ -668,27 +697,14 @@ fn validate_selection_for_encode(
     }
 }
 
-fn validate_explicit_refs(refs: &[Vec<u8>]) -> Result<(), GitShardPayloadDecodeError> {
-    if refs.is_empty() {
-        return Err(GitShardPayloadDecodeError::EmptyExplicitRefs);
+fn validate_execution_limits_for_encode(
+    limits: GitExecutionLimits,
+) -> Result<(), GitShardPayloadEncodeError> {
+    if let Some(workers) = limits.pack_exec_workers()
+        && workers > u32::MAX as usize
+    {
+        return Err(GitShardPayloadEncodeError::PackExecWorkersTooLarge { workers });
     }
-
-    let mut previous: Option<&[u8]> = None;
-    for (ref_index, value) in refs.iter().enumerate() {
-        if value.is_empty() {
-            return Err(GitShardPayloadDecodeError::EmptyRef { ref_index });
-        }
-        if value.contains(&0) {
-            return Err(GitShardPayloadDecodeError::RefContainsNul { ref_index });
-        }
-        if let Some(previous) = previous
-            && previous >= value.as_slice()
-        {
-            return Err(GitShardPayloadDecodeError::NonCanonicalExplicitRefs);
-        }
-        previous = Some(value);
-    }
-
     Ok(())
 }
 
@@ -703,8 +719,8 @@ fn encoded_locator_len(locator: &RepoLocator) -> Result<usize, GitShardPayloadEn
 
 fn encoded_display_name_len(display_name: Option<&str>) -> usize {
     match display_name {
-        Some(display_name) => 1 + U32_LEN + display_name.len(),
-        None => 1,
+        Some(display_name) if !display_name.is_empty() => 1 + U32_LEN + display_name.len(),
+        _ => 1,
     }
 }
 
@@ -722,8 +738,11 @@ fn encoded_selection_len(selection: &NormalizedGitSelection) -> usize {
     }
 }
 
+#[allow(clippy::manual_saturating_arithmetic)]
 fn checked_add_len(current: usize, extra: usize) -> Result<usize, GitShardPayloadEncodeError> {
-    let total = current.saturating_add(extra);
+    // Use checked_add explicitly: on overflow, the sentinel usize::MAX is
+    // guaranteed to exceed MAX_METADATA_SIZE, producing MetadataTooLarge.
+    let total = current.checked_add(extra).unwrap_or(usize::MAX);
     enforce_metadata_limit(total)?;
     Ok(total)
 }
@@ -770,11 +789,11 @@ fn encode_locator_into(
 
 fn encode_display_name_into(out: &mut Vec<u8>, display_name: Option<&str>) {
     match display_name {
-        Some(display_name) => {
+        Some(display_name) if !display_name.is_empty() => {
             out.push(DISPLAY_NAME_SOME_TAG);
             push_len_prefixed_bytes(out, display_name.as_bytes());
         }
-        None => out.push(DISPLAY_NAME_NONE_TAG),
+        _ => out.push(DISPLAY_NAME_NONE_TAG),
     }
 }
 
@@ -816,7 +835,10 @@ fn encode_merge_strategy(strategy: GitMergeStrategy) -> u8 {
 }
 
 fn encode_object_format(format: ObjectFormat) -> u8 {
-    format as u8
+    match format {
+        ObjectFormat::Sha1 => OBJECT_FORMAT_SHA1_TAG,
+        ObjectFormat::Sha256 => OBJECT_FORMAT_SHA256_TAG,
+    }
 }
 
 fn encode_debug_level(level: GitDebugLevel) -> u8 {
@@ -865,6 +887,9 @@ fn decode_locator(
             if !path.is_absolute() {
                 return Err(GitShardPayloadDecodeError::RelativeLocalPath);
             }
+            if path.components().any(|c| matches!(c, Component::ParentDir)) {
+                return Err(GitShardPayloadDecodeError::LocalPathTraversal);
+            }
             Ok(RepoLocator::local_path(local_path))
         }
         other => Err(GitShardPayloadDecodeError::UnknownLocatorTag(other)),
@@ -879,6 +904,9 @@ fn decode_display_name(
         DISPLAY_NAME_NONE_TAG => Ok(None),
         DISPLAY_NAME_SOME_TAG => {
             let bytes = cursor.take_len_prefixed_bytes("display_name_len", "display_name")?;
+            if bytes.is_empty() {
+                return Ok(None);
+            }
             let display_name = std::str::from_utf8(bytes)
                 .map_err(|source| GitShardPayloadDecodeError::InvalidUtf8DisplayName { source })?;
             Ok(Some(display_name.to_owned()))
@@ -900,8 +928,21 @@ fn decode_selection(
                 return Err(GitShardPayloadDecodeError::EmptyExplicitRefs);
             }
 
-            let mut refs = Vec::with_capacity(count);
-            let mut previous: Option<Vec<u8>> = None;
+            // Each ref needs at minimum a 4-byte length prefix plus 1 byte
+            // of content, so the declared count cannot exceed the remaining
+            // cursor bytes divided by that minimum. Reject early to avoid an
+            // unbounded `Vec::with_capacity` allocation from a crafted count.
+            const MIN_BYTES_PER_REF: usize = U32_LEN + 1;
+            let capacity = count.min(cursor.remaining() / MIN_BYTES_PER_REF);
+            if capacity < count {
+                return Err(GitShardPayloadDecodeError::Truncated {
+                    field: "explicit_refs",
+                    expected_min: count.saturating_mul(MIN_BYTES_PER_REF),
+                    actual: cursor.remaining(),
+                });
+            }
+
+            let mut refs: Vec<Vec<u8>> = Vec::with_capacity(capacity);
             for ref_index in 0..count {
                 let value = cursor.take_len_prefixed_bytes("explicit_ref_len", "explicit_ref")?;
                 if value.is_empty() {
@@ -910,12 +951,11 @@ fn decode_selection(
                 if value.contains(&0) {
                     return Err(GitShardPayloadDecodeError::RefContainsNul { ref_index });
                 }
-                if let Some(previous) = previous.as_ref()
-                    && previous.as_slice() >= value
+                if let Some(prev) = refs.last()
+                    && prev.as_slice() >= value
                 {
                     return Err(GitShardPayloadDecodeError::NonCanonicalExplicitRefs);
                 }
-                previous = Some(value.to_vec());
                 refs.push(value.to_vec());
             }
 
@@ -937,8 +977,8 @@ fn decode_selection(
 
 fn decode_object_format(tag: u8) -> Result<ObjectFormat, GitShardPayloadDecodeError> {
     match tag {
-        x if x == ObjectFormat::Sha1 as u8 => Ok(ObjectFormat::Sha1),
-        x if x == ObjectFormat::Sha256 as u8 => Ok(ObjectFormat::Sha256),
+        OBJECT_FORMAT_SHA1_TAG => Ok(ObjectFormat::Sha1),
+        OBJECT_FORMAT_SHA256_TAG => Ok(ObjectFormat::Sha256),
         other => Err(GitShardPayloadDecodeError::UnknownObjectFormatTag(other)),
     }
 }
@@ -1158,6 +1198,45 @@ mod tests {
 
     fn locator_tag_offset(payload: &GitShardPayload) -> usize {
         TENANT_ID_LEN + U64_LEN + U32_LEN + repo_key_len(payload)
+    }
+
+    fn locator_path_len(payload: &GitShardPayload) -> usize {
+        payload
+            .repo_locator()
+            .as_local_path()
+            .expect("local path")
+            .to_str()
+            .expect("UTF-8 path")
+            .len()
+    }
+
+    fn display_name_flag_offset(payload: &GitShardPayload) -> usize {
+        // locator_tag (1) + locator_len (4) + locator_bytes
+        locator_tag_offset(payload) + 1 + U32_LEN + locator_path_len(payload)
+    }
+
+    fn selection_tag_offset(payload: &GitShardPayload) -> usize {
+        let base = display_name_flag_offset(payload) + 1; // flag byte
+        match payload.display_name() {
+            Some(name) => base + U32_LEN + name.len(),
+            None => base,
+        }
+    }
+
+    fn scan_mode_tag_offset(payload: &GitShardPayload) -> usize {
+        selection_tag_offset(payload) + encoded_selection_len(payload.selection())
+    }
+
+    fn merge_strategy_tag_offset(payload: &GitShardPayload) -> usize {
+        scan_mode_tag_offset(payload) + 1
+    }
+
+    fn execution_flags_offset(payload: &GitShardPayload) -> usize {
+        merge_strategy_tag_offset(payload) + 1
+    }
+
+    fn debug_level_tag_offset(payload: &GitShardPayload) -> usize {
+        execution_flags_offset(payload) + 1
     }
 
     fn encode_unchecked_from_payload(
@@ -1589,5 +1668,548 @@ mod tests {
             .encode()
             .expect_err("non-UTF-8 local path must be rejected");
         assert!(matches!(err, GitShardPayloadEncodeError::NonUtf8LocalPath));
+    }
+
+    /// Build a raw payload with an arbitrary locator path (bypasses encode
+    /// validation). Uses the given `locator_bytes` directly in the wire
+    /// format, with a matching `RepoKey` derived from `canonical_path`.
+    fn encode_raw_with_locator(
+        tenant_id: TenantId,
+        canonical_path: &Path,
+        locator_bytes: &[u8],
+    ) -> Vec<u8> {
+        let repo_key = RepoKey::for_local_path(canonical_path.as_os_str().as_encoded_bytes())
+            .expect("repo key");
+        let repo_id = derive_repo_id(tenant_id, &repo_key);
+        let mut out = Vec::new();
+        out.extend_from_slice(tenant_id.as_bytes());
+        push_u64_be(&mut out, repo_id);
+        push_len_prefixed_bytes(&mut out, repo_key.as_bytes());
+        out.push(LOCATOR_LOCAL_PATH_TAG);
+        push_len_prefixed_bytes(&mut out, locator_bytes);
+        out.push(DISPLAY_NAME_NONE_TAG);
+        out.push(SELECTION_DEFAULT_BRANCH_ONLY_TAG);
+        out.push(GIT_SCAN_MODE_ODB_BLOB_FAST_TAG);
+        out.push(GIT_MERGE_STRATEGY_ALL_PARENTS_TAG);
+        encode_execution_limits_into(&mut out, GitExecutionLimits::default());
+        out
+    }
+
+    // ── Decode rejection tests ──────────────────────────────────────────
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xD0),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        encoded.push(0x42);
+
+        let err = GitShardPayload::decode(&encoded).expect_err("trailing bytes must fail");
+        assert!(
+            matches!(
+                err,
+                GitShardPayloadDecodeError::TrailingBytes { remaining: 1 }
+            ),
+            "expected TrailingBytes {{ remaining: 1 }}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_oversized_payload() {
+        let oversized = vec![0u8; MAX_METADATA_SIZE + 1];
+        let err = GitShardPayload::decode(&oversized).expect_err("oversized payload must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::MetadataTooLarge {
+                size,
+                max,
+            } if size == MAX_METADATA_SIZE + 1 && max == MAX_METADATA_SIZE
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_selection_tag() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xD1),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        let offset = selection_tag_offset(&payload);
+        encoded[offset] = 0xFF;
+
+        let err = GitShardPayload::decode(&encoded).expect_err("unknown selection tag must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::UnknownSelectionTag(0xFF)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_scan_mode_tag() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xD2),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        let offset = scan_mode_tag_offset(&payload);
+        encoded[offset] = 0xFF;
+
+        let err = GitShardPayload::decode(&encoded).expect_err("unknown scan mode tag must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::UnknownScanModeTag(0xFF)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_merge_strategy_tag() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xD3),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        let offset = merge_strategy_tag_offset(&payload);
+        encoded[offset] = 0xFF;
+
+        let err =
+            GitShardPayload::decode(&encoded).expect_err("unknown merge strategy tag must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::UnknownMergeStrategyTag(0xFF)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_execution_flags() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xD4),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        let offset = execution_flags_offset(&payload);
+        encoded[offset] = 0xFF;
+
+        let err = GitShardPayload::decode(&encoded).expect_err("unknown execution flags must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::UnknownExecutionFlags(0xFF)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_debug_level_tag() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xD5),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        let offset = debug_level_tag_offset(&payload);
+        encoded[offset] = 0xFF;
+
+        let err = GitShardPayload::decode(&encoded).expect_err("unknown debug level tag must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::UnknownDebugLevelTag(0xFF)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_display_name_flag() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xD6),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        let offset = display_name_flag_offset(&payload);
+        encoded[offset] = 0xFF;
+
+        let err =
+            GitShardPayload::decode(&encoded).expect_err("unknown display name flag must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::UnknownDisplayNameFlag(0xFF)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_object_format_tag() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let commit_hex = b"0123456789abcdef0123456789abcdef01234567";
+        let (_, payload) = payload_from_request(
+            GitRequest::repo_with_explicit_commit(
+                tenant(0xD7),
+                dir.path(),
+                commit_hex.as_slice(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        // Object format tag is at selection_tag + 1 (after the 0x02 commit tag).
+        let offset = selection_tag_offset(&payload) + 1;
+        encoded[offset] = 0xFF;
+
+        let err =
+            GitShardPayload::decode(&encoded).expect_err("unknown object format tag must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::UnknownObjectFormatTag(0xFF)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_empty_locator_path() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let canonical = fs::canonicalize(dir.path()).expect("canonical path");
+        let encoded = encode_raw_with_locator(tenant(0xD8), &canonical, b"");
+
+        let err = GitShardPayload::decode(&encoded).expect_err("empty locator path must fail");
+        assert!(matches!(err, GitShardPayloadDecodeError::EmptyLocalPath));
+    }
+
+    #[test]
+    fn decode_rejects_relative_locator_path() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let canonical = fs::canonicalize(dir.path()).expect("canonical path");
+        let encoded = encode_raw_with_locator(tenant(0xD9), &canonical, b"relative/path");
+
+        let err = GitShardPayload::decode(&encoded).expect_err("relative locator path must fail");
+        assert!(matches!(err, GitShardPayloadDecodeError::RelativeLocalPath));
+    }
+
+    #[test]
+    fn decode_rejects_non_utf8_locator() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let canonical = fs::canonicalize(dir.path()).expect("canonical path");
+        let encoded = encode_raw_with_locator(tenant(0xDA), &canonical, &[b'/', 0xFF, 0xFE]);
+
+        let err = GitShardPayload::decode(&encoded).expect_err("non-UTF-8 locator must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::InvalidUtf8LocalPath { .. }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_path_traversal_in_locator() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let canonical = fs::canonicalize(dir.path()).expect("canonical path");
+        let encoded =
+            encode_raw_with_locator(tenant(0xDB), &canonical, b"/tmp/repo/../../etc/passwd");
+
+        let err = GitShardPayload::decode(&encoded).expect_err("path traversal must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::LocalPathTraversal
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_non_utf8_display_name() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xDC),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        // Build a raw payload with an invalid UTF-8 display name by
+        // replacing the NONE flag with SOME + bad bytes.
+        let encoded = payload.encode().expect("encode payload");
+        let flag_offset = display_name_flag_offset(&payload);
+
+        // Rebuild: everything before the display-name flag, then inject
+        // a SOME flag with invalid UTF-8 bytes, then the rest.
+        let mut patched = encoded[..flag_offset].to_vec();
+        patched.push(DISPLAY_NAME_SOME_TAG);
+        push_u32_be(&mut patched, 2);
+        patched.extend_from_slice(&[0xFF, 0xFE]);
+        patched.extend_from_slice(&encoded[flag_offset + 1..]);
+
+        let err = GitShardPayload::decode(&patched).expect_err("non-UTF-8 display name must fail");
+        assert!(matches!(
+            err,
+            GitShardPayloadDecodeError::InvalidUtf8DisplayName { .. }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_empty_explicit_refs_on_decode() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xDD),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let encoded = payload.encode().expect("encode payload");
+        let sel_offset = selection_tag_offset(&payload);
+
+        // Replace selection with explicit-refs tag + count=0.
+        let mut patched = encoded[..sel_offset].to_vec();
+        patched.push(SELECTION_EXPLICIT_REFS_TAG);
+        push_u32_be(&mut patched, 0);
+        // Append the remaining fields after the original 1-byte selection.
+        patched.extend_from_slice(&encoded[sel_offset + 1..]);
+
+        let err =
+            GitShardPayload::decode(&patched).expect_err("empty explicit refs on decode must fail");
+        assert!(matches!(err, GitShardPayloadDecodeError::EmptyExplicitRefs));
+    }
+
+    #[test]
+    fn decode_rejects_inflated_ref_count() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xDE),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let encoded = payload.encode().expect("encode payload");
+        let sel_offset = selection_tag_offset(&payload);
+
+        // Replace selection with explicit-refs tag + count=0xFFFFFFFF.
+        let mut patched = encoded[..sel_offset].to_vec();
+        patched.push(SELECTION_EXPLICIT_REFS_TAG);
+        push_u32_be(&mut patched, 0xFFFF_FFFF);
+        // Append remaining fields so the payload is otherwise well-formed.
+        patched.extend_from_slice(&encoded[sel_offset + 1..]);
+
+        let err = GitShardPayload::decode(&patched)
+            .expect_err("inflated ref count must be rejected before allocation");
+        assert!(
+            matches!(err, GitShardPayloadDecodeError::Truncated { .. }),
+            "expected Truncated from bounds check, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_null_explicit_commit() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        // Build a valid explicit-commit payload, then zero out the OID bytes.
+        let commit_hex = b"0123456789abcdef0123456789abcdef01234567";
+        let (_, payload) = payload_from_request(
+            GitRequest::repo_with_explicit_commit(
+                tenant(0xDF),
+                dir.path(),
+                commit_hex.as_slice(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+        // OID bytes start after selection_tag (1) + object_format_tag (1).
+        let oid_start = selection_tag_offset(&payload) + 2;
+        let oid_len = OidBytes::SHA1_LEN as usize;
+        for byte in &mut encoded[oid_start..oid_start + oid_len] {
+            *byte = 0;
+        }
+
+        let err =
+            GitShardPayload::decode(&encoded).expect_err("null explicit commit must be rejected");
+        assert!(
+            matches!(err, GitShardPayloadDecodeError::NullExplicitCommit),
+            "expected NullExplicitCommit, got {err:?}"
+        );
+    }
+
+    // ── Round-trip tests ───────────────────────────────────────────────
+
+    #[test]
+    fn payload_round_trips_explicit_refs_selection() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let refs = [
+            b"refs/heads/beta".as_slice(),
+            b"refs/heads/alpha".as_slice(),
+            b"refs/tags/v1.0".as_slice(),
+        ];
+        let (_, payload) = payload_from_request(
+            GitRequest::repo_with_explicit_refs(
+                tenant(0xE0),
+                dir.path(),
+                refs,
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+
+        let encoded = payload.encode().expect("encode payload");
+        let decoded = GitShardPayload::decode(&encoded).expect("decode payload");
+
+        assert_eq!(decoded, payload);
+        let selection = decoded
+            .git_selection()
+            .expect("explicit-refs selection must lower to GitSelection");
+        match selection.refs() {
+            GitRefSelection::ExplicitRefs { refs } => {
+                // Normalization sorts and deduplicates.
+                assert_eq!(refs.len(), 3);
+                assert!(refs[0] < refs[1], "refs must be in canonical sorted order");
+            }
+            other => panic!("expected ExplicitRefs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_round_trips_with_display_name() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xE1),
+            vec![
+                GitRequestTarget::new(dir.path(), GitRequestSelection::DefaultBranchOnly)
+                    .with_display_name("test-display"),
+            ],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+        let (_, payload) = payload_from_request(request, GitExecutionLimits::default());
+
+        let encoded = payload.encode().expect("encode payload");
+        let decoded = GitShardPayload::decode(&encoded).expect("decode payload");
+
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.display_name(), Some("test-display"));
+    }
+
+    #[test]
+    fn payload_round_trips_without_display_name() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xE2),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+
+        let encoded = payload.encode().expect("encode payload");
+        let decoded = GitShardPayload::decode(&encoded).expect("decode payload");
+
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.display_name(), None);
+    }
+
+    #[test]
+    fn payload_round_trips_default_execution_limits() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xE3),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+
+        let encoded = payload.encode().expect("encode payload");
+        let decoded = GitShardPayload::decode(&encoded).expect("decode payload");
+
+        let limits = decoded.execution_limits();
+        assert_eq!(limits.pack_exec_workers(), None);
+        assert_eq!(limits.tree_delta_cache_mb(), None);
+        assert_eq!(limits.engine_chunk_mb(), None);
+        assert!(!limits.scan_binary());
+        assert!(!limits.enrich_identities());
+        assert_eq!(limits.debug_level(), GitDebugLevel::Off);
     }
 }

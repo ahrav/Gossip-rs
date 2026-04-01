@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use gossip_contracts::connector::git::{RepoKey, RepoLocator};
 use gossip_contracts::connector::ConnectorInputError;
-use gossip_contracts::identity::{domain, domain_hasher, finalize_64, CanonicalBytes, TenantId};
+use gossip_contracts::identity::hashing::REPO_ID_HASHER;
+use gossip_contracts::identity::{finalize_64, CanonicalBytes, TenantId};
 
 use crate::errors::RepoOpenError;
 use crate::repo::{GitRepoPaths, RepoLimits};
@@ -169,17 +170,17 @@ where
 }
 
 /// Derives a stable tenant-scoped 64-bit `repo_id` from a normalized [`RepoKey`]
-/// using the [`domain::GIT_REPO_ID_V1`] domain hasher.
+/// by cloning the cached [`REPO_ID_HASHER`] (`GIT_REPO_ID_V1` domain).
 ///
 /// The output is used as a persistence namespace key. Changing the domain
 /// constant or input encoding invalidates persisted namespaces — see the
 /// golden-vector test for regression detection.
 #[must_use]
 pub fn derive_repo_id(tenant_id: TenantId, repo_key: &RepoKey) -> u64 {
-    let mut hasher = domain_hasher(domain::GIT_REPO_ID_V1);
-    tenant_id.write_canonical(&mut hasher);
-    repo_key.as_bytes().write_canonical(&mut hasher);
-    finalize_64(&hasher)
+    let mut h = REPO_ID_HASHER.clone();
+    tenant_id.write_canonical(&mut h);
+    repo_key.as_bytes().write_canonical(&mut h);
+    finalize_64(&h)
 }
 
 #[cfg(test)]
