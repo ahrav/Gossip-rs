@@ -89,7 +89,7 @@ impl FilesystemRunSetupResult {
 ///
 /// Its custom [`fmt::Debug`] implementation redacts the canonical root so tracing
 /// and test failures do not leak filesystem paths by default.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FilesystemRunSetupInput<'a> {
     request: &'a NormalizedFilesystemRequest,
     geometry: InitialShardGeometry,
@@ -133,19 +133,19 @@ impl<'a> FilesystemRunSetupInput<'a> {
 
     /// Normalized filesystem request to register.
     #[must_use]
-    pub fn request(self) -> &'a NormalizedFilesystemRequest {
+    pub fn request(&self) -> &'a NormalizedFilesystemRequest {
         self.request
     }
 
     /// Planned startup shard geometry.
     #[must_use]
-    pub fn geometry(self) -> InitialShardGeometry {
-        self.geometry
+    pub fn geometry(&self) -> &InitialShardGeometry {
+        &self.geometry
     }
 
     /// Typed payload to encode into shard metadata.
     #[must_use]
-    pub fn payload(self) -> &'a FilesystemShardPayload {
+    pub fn payload(&self) -> &'a FilesystemShardPayload {
         self.payload
     }
 }
@@ -270,7 +270,7 @@ where
     validate_request_payload(request, payload)?;
 
     let encoded_payload = payload.encode()?;
-    let (start, end) = lower_geometry_bounds(&geometry);
+    let (start, end) = lower_geometry_bounds(geometry);
 
     // The arena makes three individual ByteSlab allocations: start bound,
     // end bound, and encoded shard metadata.  ByteSlab rounds each to
@@ -349,7 +349,7 @@ fn lower_geometry_bounds(geometry: &InitialShardGeometry) -> (&[u8], &[u8]) {
 /// ByteSlab rounds each allocation to `max(n, 16).next_power_of_two()`.
 /// Zero-length inputs allocate zero bytes.
 #[inline]
-fn slab_alloc_bound(n: usize) -> usize {
+pub(crate) fn slab_alloc_bound(n: usize) -> usize {
     if n == 0 {
         return 0;
     }
