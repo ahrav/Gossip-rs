@@ -498,7 +498,9 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
 
     let mut ops_seen: Vec<WriteOp> = Vec::with_capacity(usize::from(!seen_oids.is_empty()));
     if !seen_oids.is_empty() {
-        let delta = SeenBitmapDelta::from_oids(&seen_oids)
+        // `seen_oids` collects one OID per group from the sorted-by-OID
+        // loop above, so the vector is already sorted and duplicate-free.
+        let delta = SeenBitmapDelta::from_canonical_oids(seen_oids)
             .expect("scanned blobs always use a single object format");
         ops_seen.push(WriteOp {
             key: build_seen_scope_key(input.repo_id, &input.policy_hash),

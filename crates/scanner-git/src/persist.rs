@@ -86,7 +86,9 @@ impl PersistenceStore for InMemoryPersistenceStore {
                 bitmap
                     .insert_batch(delta.oids())
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                let merged = bitmap.serialize();
+                let merged = bitmap
+                    .serialize()
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
                 seen_scopes.insert(op.key.clone(), bitmap);
                 data_ops.push(WriteOp {
                     key: op.key.clone(),

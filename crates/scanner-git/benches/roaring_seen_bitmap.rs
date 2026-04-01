@@ -50,7 +50,7 @@ fn bench_serialize(c: &mut Criterion) {
     let bitmap = build_bitmap(BITMAP_SIZE);
 
     c.bench_function("roaring_seen/serialize_1m", |b| {
-        b.iter(|| black_box(bitmap.serialize()))
+        b.iter(|| black_box(bitmap.serialize().expect("serialize")))
     });
 }
 

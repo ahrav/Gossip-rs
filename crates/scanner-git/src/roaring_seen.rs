@@ -17,6 +17,11 @@ use roaring::RoaringBitmap;
 const DELTA_MAGIC: [u8; 4] = *b"RSBD";
 #[cfg(feature = "rocksdb")]
 const BITMAP_MAGIC: [u8; 4] = *b"RSBM";
+/// Hard ceiling on the roaring bitmap payload size accepted during
+/// deserialization. 512 MiB is well beyond any realistic working set and
+/// prevents unbounded memory allocation from a corrupt or malicious payload.
+#[cfg(feature = "rocksdb")]
+const MAX_BITMAP_BYTES: usize = 512 * 1024 * 1024;
 
 /// Errors returned while encoding or decoding seen-bitmap payloads.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -48,6 +53,19 @@ pub enum SeenBitmapError {
     #[cfg(feature = "rocksdb")]
     #[error("invalid roaring bitmap payload: {0}")]
     InvalidBitmap(String),
+    /// The roaring bitmap could not be serialized.
+    #[cfg(feature = "rocksdb")]
+    #[error("bitmap serialization failed: {0}")]
+    SerializationFailed(String),
+    /// The serialized bitmap payload exceeds the maximum allowed size.
+    #[cfg(feature = "rocksdb")]
+    #[error("bitmap payload too large: {size} bytes (max {max})")]
+    BitmapTooLarge {
+        /// Actual size of the bitmap payload in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        max: usize,
+    },
 }
 
 fn validate_oid_len(oid_len: u8) -> Result<(), SeenBitmapError> {
@@ -64,6 +82,8 @@ fn u32_len(len: usize) -> Result<u32, SeenBitmapError> {
 
 fn canonicalize_oids(oids: &[OidBytes]) -> Result<(u8, Vec<OidBytes>), SeenBitmapError> {
     let Some(first) = oids.first() else {
+        // At least one OID is required to determine the object format
+        // (SHA-1 vs SHA-256). Callers must filter empty inputs upstream.
         return Err(SeenBitmapError::Truncated);
     };
 
@@ -96,8 +116,38 @@ pub struct SeenBitmapDelta {
 
 impl SeenBitmapDelta {
     /// Builds a canonical delta from the provided OIDs.
+    ///
+    /// The input must contain at least one OID so the object format (SHA-1
+    /// vs SHA-256) can be inferred. Returns `SeenBitmapError::Truncated`
+    /// when `oids` is empty. Duplicates and unsorted entries are accepted
+    /// and canonicalized internally.
     pub fn from_oids(oids: &[OidBytes]) -> Result<Self, SeenBitmapError> {
         let (oid_len, oids) = canonicalize_oids(oids)?;
+        Ok(Self { oid_len, oids })
+    }
+
+    /// Builds a delta from OIDs that are already sorted and unique.
+    ///
+    /// This avoids the sort/dedup cost of [`from_oids`](Self::from_oids) when
+    /// the caller can guarantee canonical ordering. Returns
+    /// `SeenBitmapError::NonCanonicalOids` if the invariant is violated.
+    /// Like `from_oids`, at least one OID is required to infer the object
+    /// format.
+    pub fn from_canonical_oids(oids: Vec<OidBytes>) -> Result<Self, SeenBitmapError> {
+        let Some(first) = oids.first() else {
+            return Err(SeenBitmapError::Truncated);
+        };
+        let oid_len = first.len();
+        validate_oid_len(oid_len)?;
+        for oid in &oids {
+            if oid.len() != oid_len {
+                return Err(SeenBitmapError::MixedOidLengths);
+            }
+        }
+        if !oids_are_canonical(&oids) {
+            return Err(SeenBitmapError::NonCanonicalOids);
+        }
+        let _ = u32_len(oids.len())?;
         Ok(Self { oid_len, oids })
     }
 
@@ -292,7 +342,12 @@ impl RoaringSeenBitmap {
         if other_oids.is_empty() {
             return Ok(());
         }
-        let _ = u32_len(self.oids.len().saturating_add(other_oids.len()))?;
+        let combined = self
+            .oids
+            .len()
+            .checked_add(other_oids.len())
+            .ok_or(SeenBitmapError::TooManyOids(usize::MAX))?;
+        let _ = u32_len(combined)?;
 
         let mut merged_oids = Vec::with_capacity(self.oids.len() + other_oids.len());
         let mut merged_seen = RoaringBitmap::new();
@@ -350,8 +405,7 @@ impl RoaringSeenBitmap {
     }
 
     /// Serializes the persisted bitmap payload.
-    #[must_use]
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Result<Vec<u8>, SeenBitmapError> {
         let bitmap_len = self.seen.serialized_size();
         let mut out = Vec::with_capacity(self.serialized_size());
         out.extend_from_slice(&BITMAP_MAGIC);
@@ -364,8 +418,8 @@ impl RoaringSeenBitmap {
         out.extend_from_slice(&(bitmap_len as u32).to_be_bytes());
         self.seen
             .serialize_into(&mut out)
-            .expect("Vec-backed bitmap serialization must be infallible");
-        out
+            .map_err(|err| SeenBitmapError::SerializationFailed(err.to_string()))?;
+        Ok(out)
     }
 
     /// Deserializes a persisted bitmap payload.
@@ -394,6 +448,12 @@ impl RoaringSeenBitmap {
                 .try_into()
                 .unwrap(),
         ) as usize;
+        if bitmap_len > MAX_BITMAP_BYTES {
+            return Err(SeenBitmapError::BitmapTooLarge {
+                size: bitmap_len,
+                max: MAX_BITMAP_BYTES,
+            });
+        }
         let expected_len = bitmap_len_offset + 4 + bitmap_len;
         if bytes.len() != expected_len {
             return Err(SeenBitmapError::LengthMismatch);
@@ -446,15 +506,9 @@ impl RoaringSeenStore {
         &self.bitmap
     }
 
-    /// Clones the underlying bitmap snapshot.
-    #[must_use]
-    pub fn clone_bitmap(&self) -> RoaringSeenBitmap {
-        self.bitmap.clone()
-    }
-
-    /// Replaces the stored bitmap snapshot.
-    pub fn replace_bitmap(&mut self, bitmap: RoaringSeenBitmap) {
-        self.bitmap = bitmap;
+    /// Returns a mutable reference to the underlying bitmap.
+    pub fn bitmap_mut(&mut self) -> &mut RoaringSeenBitmap {
+        &mut self.bitmap
     }
 }
 
@@ -521,6 +575,12 @@ mod tests {
     }
 
     #[test]
+    fn seen_bitmap_delta_rejects_empty_input() {
+        let err = SeenBitmapDelta::from_oids(&[]).expect_err("empty input must fail");
+        assert_eq!(err, SeenBitmapError::Truncated);
+    }
+
+    #[test]
     fn seen_bitmap_delta_rejects_mixed_lengths() {
         let err =
             SeenBitmapDelta::from_oids(&[OidBytes::sha1([0x11; 20]), OidBytes::sha256([0x22; 32])])
@@ -568,7 +628,7 @@ mod tests {
             .insert_batch(&[sha1(0x10), sha1(0x20), sha1(0x30)])
             .expect("insert");
 
-        let bytes = bitmap.serialize();
+        let bytes = bitmap.serialize().expect("serialize");
         let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
         assert_eq!(decoded, bitmap);
     }
@@ -583,6 +643,7 @@ mod tests {
 
         let actual: String = bitmap
             .serialize()
+            .expect("serialize")
             .into_iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
@@ -697,7 +758,7 @@ mod proptests {
             let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
             bitmap.insert_batch(&oids).expect("insert");
 
-            let bytes = bitmap.serialize();
+            let bytes = bitmap.serialize().expect("serialize");
             let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
 
             prop_assert_eq!(decoded, bitmap);
@@ -743,6 +804,25 @@ mod proptests {
             let batch = bitmap.batch_contains(&probe);
             let pointwise: Vec<bool> = probe.iter().map(|oid| bitmap.contains(oid)).collect();
             prop_assert_eq!(batch, pointwise);
+        }
+
+        #[test]
+        fn bitmap_merge_is_commutative(a in arb_sha1_oids(), b in arb_sha1_oids(), probe in arb_sha1_oids()) {
+            let mut ab = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            ab.insert_batch(&a).expect("a");
+            let mut b_side = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            b_side.insert_batch(&b).expect("b");
+            ab.merge(&b_side).expect("merge b into a");
+
+            let mut ba = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            ba.insert_batch(&b).expect("b");
+            let mut a_side = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            a_side.insert_batch(&a).expect("a");
+            ba.merge(&a_side).expect("merge a into b");
+
+            let ab_flags = ab.batch_contains(&probe);
+            let ba_flags = ba.batch_contains(&probe);
+            prop_assert_eq!(ab_flags, ba_flags);
         }
     }
 }
