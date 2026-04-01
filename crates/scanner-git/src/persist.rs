@@ -81,6 +81,12 @@ impl PersistenceStore for InMemoryPersistenceStore {
             if op.key.starts_with(&NS_SEEN_BLOB) {
                 let delta = SeenBitmapDelta::deserialize(&op.value)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
+                // Skip empty deltas to avoid seeding the scope with a
+                // particular OID length when no OIDs are actually present.
+                // Matches the RocksDB store's empty-delta skip.
+                if delta.is_empty() {
+                    continue;
+                }
                 let mut bitmap = staged_scopes
                     .remove(&op.key)
                     .unwrap_or_else(|| RoaringSeenBitmap::new(delta.oid_len()));
@@ -218,5 +224,54 @@ mod tests {
         let bitmap = RoaringSeenBitmap::deserialize(&scope_ops[0].value).expect("bitmap");
         assert!(bitmap.contains(&OidBytes::sha1([0x11; 20])));
         assert!(bitmap.contains(&OidBytes::sha1([0x22; 20])));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn in_memory_store_skips_empty_delta_before_seeding_scope() {
+        use crate::roaring_seen::RoaringSeenBitmap;
+
+        let store = InMemoryPersistenceStore::default();
+        let scope_key = build_seen_scope_key(42, &[0xAB; 32]);
+
+        // Craft an empty SHA-1 delta (oid_count=0) followed by a real
+        // SHA-256 delta. Without the empty-delta skip, the empty SHA-1
+        // delta would seed the scope with oid_len=20 and the SHA-256
+        // delta would fail with an OID-length mismatch.
+        let empty_sha1_bytes = {
+            let mut buf = Vec::with_capacity(9);
+            buf.extend_from_slice(b"RSBD"); // DELTA_MAGIC
+            buf.push(OidBytes::SHA1_LEN);
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            buf
+        };
+        let sha256_delta =
+            SeenBitmapDelta::from_oids(&[OidBytes::sha256([0xAA; 32])]).expect("delta");
+
+        let output = FinalizeOutput {
+            data_ops: vec![
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: empty_sha1_bytes,
+                },
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: sha256_delta.serialize(),
+                },
+            ],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+
+        store
+            .commit_finalize(&output)
+            .expect("empty delta must not seed scope with wrong OID length");
+
+        let logged = store.data_ops.borrow();
+        let scope_ops: Vec<&WriteOp> = logged.iter().filter(|w| w.key == scope_key).collect();
+        assert_eq!(scope_ops.len(), 1);
+        let bitmap = RoaringSeenBitmap::deserialize(&scope_ops[0].value).expect("bitmap");
+        assert!(bitmap.contains(&OidBytes::sha256([0xAA; 32])));
     }
 }
