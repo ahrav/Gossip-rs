@@ -1,27 +1,32 @@
 //! RocksDB-backed persistence adapters.
 //!
 //! This module is feature-gated. Enable with `--features rocksdb`.
-//! The adapter uses a single RocksDB instance with plain key/value pairs and
-//! relies on sorted keys for efficient `multi_get` access.
+//! The adapter uses a single RocksDB instance with plain key/value pairs.
+//! Ref watermarks still use sorted `multi_get` access, while seen-blob queries
+//! are served from a lazily loaded in-memory bitmap snapshot.
 //! Finalize output is committed with a single `WriteBatch` so data writes and
 //! watermarks become visible atomically.
 //! When the feature is disabled, public constructors and methods return
 //! feature-not-available errors via the appropriate error variant.
 
+#[cfg(feature = "rocksdb")]
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
 
 use super::errors::{PersistError, RepoOpenError, SpillError};
 #[cfg(feature = "rocksdb")]
-use super::finalize::build_ref_wm_key;
-#[cfg(feature = "rocksdb")]
 use super::finalize::FinalizeOutcome;
 use super::finalize::FinalizeOutput;
-#[cfg(any(feature = "rocksdb", test))]
+#[cfg(feature = "rocksdb")]
 use super::finalize::NS_SEEN_BLOB;
+#[cfg(feature = "rocksdb")]
+use super::finalize::{build_ref_wm_key, build_seen_scope_key};
 use super::object_id::OidBytes;
 use super::persist::PersistenceStore;
 use super::repo_open::RefWatermarkStore;
+#[cfg(feature = "rocksdb")]
+use super::roaring_seen::{RoaringSeenBitmap, RoaringSeenStore, SeenBitmapDelta};
 use super::seen_store::SeenBlobStore;
 use super::start_set::StartSetId;
 #[cfg(feature = "rocksdb")]
@@ -32,8 +37,13 @@ use rocksdb::{Options, WriteBatch, DB};
 
 /// RocksDB-backed store for Git scan persistence.
 ///
+/// All access is single-threaded: the scan pipeline calls `batch_check_seen`
+/// during the spill stage (before parallel pack execution) and
+/// `commit_finalize` once after all workers join. `RefCell` enforces this
+/// contract at runtime; a borrow panic indicates a caller bug.
+///
 /// The store retains the `repo_id` and `policy_hash` used to build
-/// `seen_blob` keys for the spill/dedupe stage.
+/// the seen-bitmap scope key for the spill/dedupe stage.
 /// Watermark loading uses the caller-supplied `(repo_id, policy_hash)` so the
 /// same RocksDB instance can serve multiple namespaces if needed. Callers must
 /// supply the same tuple used when writing watermarks to read consistent data.
@@ -45,35 +55,20 @@ pub struct RocksDbStore {
     repo_id: u64,
     #[cfg(feature = "rocksdb")]
     policy_hash: [u8; 32],
-}
-
-/// Returns the byte length of a seen-blob key for the given OID length.
-#[cfg(any(feature = "rocksdb", test))]
-fn seen_blob_key_len(oid_len: u8) -> usize {
-    3 + 8 + 32 + oid_len as usize
-}
-
-/// Writes a `seen_blob` key into the provided buffer.
-///
-/// Layout: namespace prefix + repo_id + policy_hash + oid bytes.
-#[cfg(any(feature = "rocksdb", test))]
-fn write_seen_blob_key(buf: &mut [u8], repo_id: u64, policy_hash: &[u8; 32], oid: &OidBytes) {
-    debug_assert_eq!(buf.len(), seen_blob_key_len(oid.len()));
-    let mut offset = 0;
-    buf[offset..offset + 3].copy_from_slice(&NS_SEEN_BLOB);
-    offset += 3;
-    buf[offset..offset + 8].copy_from_slice(&repo_id.to_be_bytes());
-    offset += 8;
-    buf[offset..offset + 32].copy_from_slice(policy_hash);
-    offset += 32;
-    buf[offset..offset + oid.len() as usize].copy_from_slice(oid.as_slice());
+    #[cfg(feature = "rocksdb")]
+    seen_store: RefCell<Option<RoaringSeenStore>>,
+    /// Set during `commit_finalize` to detect re-entrant calls in debug builds.
+    /// The single-writer invariant (one lease owner per scope) guarantees this
+    /// never trips in production; if it does, the caller has a lease bug.
+    #[cfg(feature = "rocksdb")]
+    finalizing: Cell<bool>,
 }
 
 impl RocksDbStore {
     /// Opens or creates a RocksDB database at the given path.
     ///
     /// The provided `repo_id` and `policy_hash` are stored on the handle and
-    /// used to build keys for `SeenBlobStore` lookups.
+    /// used to locate the seen-bitmap scope and ref-watermark namespace.
     /// When the `rocksdb` feature is disabled, this returns a backend error.
     ///
     /// # Errors
@@ -93,6 +88,8 @@ impl RocksDbStore {
                 db,
                 repo_id,
                 policy_hash,
+                seen_store: RefCell::new(None),
+                finalizing: Cell::new(false),
             })
         }
 
@@ -102,12 +99,58 @@ impl RocksDbStore {
             Err(PersistError::backend("rocksdb support not enabled"))
         }
     }
+
+    #[cfg(feature = "rocksdb")]
+    fn load_seen_store(&self, oid_len: u8) -> Result<(), String> {
+        let needs_load = self
+            .seen_store
+            .borrow()
+            .as_ref()
+            .is_none_or(|s| s.bitmap().oid_len() != oid_len);
+        if needs_load {
+            let loaded = self.load_seen_store_from_db(oid_len)?;
+            *self.seen_store.borrow_mut() = Some(loaded);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn load_seen_store_from_db(&self, oid_len: u8) -> Result<RoaringSeenStore, String> {
+        let scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
+        match self.db.get(&scope_key) {
+            Ok(Some(bytes)) => match RoaringSeenBitmap::deserialize(bytes.as_ref()) {
+                Ok(bitmap) if bitmap.oid_len() == oid_len => Ok(RoaringSeenStore::new(bitmap)),
+                Ok(bitmap) => Err(format!(
+                    "seen-bitmap OID length mismatch: stored={}, requested={}",
+                    bitmap.oid_len(),
+                    oid_len
+                )),
+                Err(err) => Err(format!("corrupt seen-bitmap: {err}")),
+            },
+            Ok(None) => Ok(RoaringSeenStore::new(RoaringSeenBitmap::new(oid_len))),
+            Err(err) => Err(err.to_string()),
+        }
+    }
 }
 
 impl PersistenceStore for RocksDbStore {
     fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
         #[cfg(feature = "rocksdb")]
         {
+            // Guard that clears the `finalizing` flag on all exit paths,
+            // including early error returns.
+            struct FinalizingGuard<'a>(&'a Cell<bool>);
+            impl Drop for FinalizingGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            debug_assert!(
+                !self.finalizing.replace(true),
+                "re-entrant commit_finalize calls violate the single-writer invariant"
+            );
+            let _guard = FinalizingGuard(&self.finalizing);
+
             debug_assert!(
                 output.data_ops.windows(2).all(|w| w[0].key <= w[1].key),
                 "data ops must be sorted by key"
@@ -125,9 +168,76 @@ impl PersistenceStore for RocksDbStore {
                 "watermark ops present for partial outcome"
             );
             let mut batch = WriteBatch::default();
+            let mut seen_scope_key: Option<Vec<u8>> = None;
+            let mut seen_oids = Vec::new();
             for op in &output.data_ops {
-                batch.put(&op.key, &op.value);
+                if op.key.starts_with(&NS_SEEN_BLOB) {
+                    let delta = SeenBitmapDelta::deserialize(&op.value)
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    if let Some(existing_key) = seen_scope_key.as_ref() {
+                        if existing_key != &op.key {
+                            return Err(PersistError::backend(
+                                "multiple seen-bitmap scope keys in one finalize batch",
+                            ));
+                        }
+                    } else {
+                        seen_scope_key = Some(op.key.clone());
+                    }
+                    seen_oids.extend_from_slice(delta.oids());
+                } else {
+                    batch.put(&op.key, &op.value);
+                }
             }
+
+            if !seen_oids.is_empty() {
+                // Multiple same-scope deltas may have individually sorted OID
+                // lists, but their concatenation is not necessarily globally
+                // sorted. Use `from_oids` to sort and dedup the combined set.
+                let delta = SeenBitmapDelta::from_oids(&seen_oids)
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                self.load_seen_store(delta.oid_len())
+                    .map_err(PersistError::backend)?;
+
+                // Validate that the scope key matches this store's identity.
+                // The multi-scope check above ensures all ops share one key,
+                // but that key must also match the store's repo_id/policy_hash
+                // to prevent cross-scope pollution.
+                let scope_key = seen_scope_key
+                    .as_ref()
+                    .ok_or_else(|| PersistError::backend("seen-bitmap delta without scope key"))?;
+                let expected_scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
+                if *scope_key != expected_scope_key {
+                    return Err(PersistError::backend(
+                        "seen-bitmap scope key does not match store identity",
+                    ));
+                }
+
+                let mut guard = self.seen_store.borrow_mut();
+                let store = guard.get_or_insert_with(|| {
+                    RoaringSeenStore::new(RoaringSeenBitmap::new(delta.oid_len()))
+                });
+
+                store
+                    .bitmap_mut()
+                    .insert_batch(delta.oids())
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                batch.put(
+                    scope_key,
+                    store
+                        .bitmap()
+                        .serialize()
+                        .map_err(|err| PersistError::backend(err.to_string()))?,
+                );
+                // Drop the borrow before db.write so a panic in RocksDB does
+                // not leave the RefCell permanently borrowed. If db.write
+                // fails, the in-memory bitmap retains uncommitted mutations;
+                // the caller must discard the store.
+                drop(guard);
+            }
+
             if matches!(output.outcome, FinalizeOutcome::Complete) {
                 for op in &output.watermark_ops {
                     batch.put(&op.key, &op.value);
@@ -151,42 +261,20 @@ impl SeenBlobStore for RocksDbStore {
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
         #[cfg(feature = "rocksdb")]
         {
-            // `oids` are expected to be sorted to preserve key ordering.
-            // Results mirror the input order because `multi_get` respects the
-            // provided key iterator.
             if oids.is_empty() {
                 return Ok(Vec::new());
             }
 
             let oid_len = oids[0].len();
-            let key_len = seen_blob_key_len(oid_len);
-            // Build a contiguous key buffer so multi_get can borrow slices without per-key Vecs.
-            let mut buf = Vec::with_capacity(key_len * oids.len());
-            let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(oids.len());
-            for oid in oids {
-                debug_assert_eq!(oid.len(), oid_len, "mixed oid lengths");
-                let start = buf.len();
-                let end = start + key_len;
-                buf.resize(end, 0);
-                write_seen_blob_key(&mut buf[start..end], self.repo_id, &self.policy_hash, oid);
-                ranges.push((start, end));
-            }
-            let keys: Vec<&[u8]> = ranges.iter().map(|(s, e)| &buf[*s..*e]).collect();
-            debug_assert!(
-                keys.windows(2).all(|w| w[0] <= w[1]),
-                "seen keys must be sorted"
-            );
-
-            let results = self.db.multi_get(keys.iter());
-            let mut out = Vec::with_capacity(results.len());
-            for res in results {
-                match res {
-                    Ok(Some(_)) => out.push(true),
-                    Ok(None) => out.push(false),
-                    Err(err) => return Err(SpillError::Io(io::Error::other(err.to_string()))),
-                }
-            }
-            Ok(out)
+            self.load_seen_store(oid_len)
+                .map_err(|err| SpillError::Io(io::Error::other(err)))?;
+            let guard = self.seen_store.borrow();
+            let Some(store) = guard.as_ref() else {
+                return Err(SpillError::Io(io::Error::other(
+                    "seen-store not initialized",
+                )));
+            };
+            store.batch_check_seen(oids)
         }
 
         #[cfg(not(feature = "rocksdb"))]
@@ -253,18 +341,247 @@ impl RefWatermarkStore for RocksDbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finalize::build_seen_blob_key;
+    use crate::finalize::{build_seen_scope_key, FinalizeStats, WriteOp};
 
+    #[cfg(feature = "rocksdb")]
+    use tempfile::tempdir;
+
+    #[cfg(feature = "rocksdb")]
+    fn seen_finalize_output(
+        repo_id: u64,
+        policy_hash: [u8; 32],
+        oids: &[OidBytes],
+    ) -> FinalizeOutput {
+        let delta = SeenBitmapDelta::from_oids(oids).expect("delta");
+        FinalizeOutput {
+            data_ops: vec![WriteOp {
+                key: build_seen_scope_key(repo_id, &policy_hash),
+                value: delta.serialize(),
+            }],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
     #[test]
-    fn seen_blob_key_builder_matches_legacy() {
-        let repo_id = 42;
-        let policy_hash = [0xAB; 32];
-        let oid = OidBytes::sha1([0x11; 20]);
+    fn rocksdb_store_commit_finalize_merges_seen_bitmap_scope() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 7;
+        let policy_hash = [0x55; 32];
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+        let oid_c = OidBytes::sha1([0x33; 20]);
 
-        let expected = build_seen_blob_key(repo_id, &policy_hash, &oid);
-        let mut buf = vec![0u8; seen_blob_key_len(oid.len())];
-        write_seen_blob_key(&mut buf, repo_id, &policy_hash, &oid);
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[oid_a, oid_b]))
+            .expect("first commit");
+        drop(store);
 
-        assert_eq!(buf, expected);
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("batch check"),
+            vec![true, true, false]
+        );
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[oid_b, oid_c]))
+            .expect("second commit");
+        drop(store);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen again");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("batch check"),
+            vec![true, true, true]
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_rejects_corrupt_bitmap_on_load() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 11;
+        let policy_hash = [0xCC; 32];
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        store
+            .db
+            .put(&scope_key, b"not-a-valid-bitmap")
+            .expect("seed corrupt data");
+
+        let err = store
+            .batch_check_seen(&[OidBytes::sha1([0x01; 20])])
+            .expect_err("corrupt bitmap should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("corrupt seen-bitmap"),
+            "error should mention corruption, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_rejects_oid_length_mismatch_on_load() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 12;
+        let policy_hash = [0xDD; 32];
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        // Persist a SHA-1 bitmap.
+        store
+            .commit_finalize(&seen_finalize_output(
+                repo_id,
+                policy_hash,
+                &[OidBytes::sha1([0x11; 20])],
+            ))
+            .expect("commit sha1 bitmap");
+        drop(store);
+
+        // Reopen and query with SHA-256 OIDs — the stored bitmap has
+        // oid_len=20 but the query requests oid_len=32.
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+        let err = store
+            .batch_check_seen(&[OidBytes::sha256([0x22; 32])])
+            .expect_err("OID length mismatch should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mismatch"),
+            "error should mention mismatch, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_rejects_multi_scope_finalize() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 13;
+        let policy_hash_a = [0xAA; 32];
+        let policy_hash_b = [0xBB; 32];
+
+        let oids_a = vec![OidBytes::sha1([0x11; 20])];
+        let oids_b = vec![OidBytes::sha1([0x22; 20])];
+        let delta_a = SeenBitmapDelta::from_oids(&oids_a).expect("delta a");
+        let delta_b = SeenBitmapDelta::from_oids(&oids_b).expect("delta b");
+
+        // Build a FinalizeOutput with two data_ops that carry different scope
+        // keys (different policy_hash). The store must reject this because a
+        // single finalize batch should never span multiple scopes.
+        let output = FinalizeOutput {
+            data_ops: vec![
+                WriteOp {
+                    key: build_seen_scope_key(repo_id, &policy_hash_a),
+                    value: delta_a.serialize(),
+                },
+                WriteOp {
+                    key: build_seen_scope_key(repo_id, &policy_hash_b),
+                    value: delta_b.serialize(),
+                },
+            ],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash_a).expect("open");
+        let err = store
+            .commit_finalize(&output)
+            .expect_err("multi-scope finalize must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("multiple seen-bitmap scope keys"),
+            "error should mention multiple scope keys, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_handles_multi_delta_same_scope() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 16;
+        let policy_hash = [0xEE; 32];
+
+        // Two deltas with the same scope key but interleaving OID ranges.
+        // Delta 1: [0x30, 0x40] (sorted within)
+        // Delta 2: [0x10, 0x20] (sorted within)
+        // Concatenation: [0x30, 0x40, 0x10, 0x20] — NOT globally sorted.
+        let oids_high = vec![OidBytes::sha1([0x30; 20]), OidBytes::sha1([0x40; 20])];
+        let oids_low = vec![OidBytes::sha1([0x10; 20]), OidBytes::sha1([0x20; 20])];
+        let delta_high = SeenBitmapDelta::from_oids(&oids_high).expect("delta high");
+        let delta_low = SeenBitmapDelta::from_oids(&oids_low).expect("delta low");
+
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        let output = FinalizeOutput {
+            data_ops: vec![
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: delta_high.serialize(),
+                },
+                WriteOp {
+                    key: scope_key,
+                    value: delta_low.serialize(),
+                },
+            ],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .commit_finalize(&output)
+            .expect("multi-delta same-scope commit");
+
+        assert_eq!(
+            store
+                .batch_check_seen(&[
+                    OidBytes::sha1([0x10; 20]),
+                    OidBytes::sha1([0x20; 20]),
+                    OidBytes::sha1([0x30; 20]),
+                    OidBytes::sha1([0x40; 20]),
+                ])
+                .expect("batch check"),
+            vec![true, true, true, true]
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_oid_len_mismatch_returns_error() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 15;
+        let policy_hash = [0xDD; 32];
+
+        // Commit SHA-1 OIDs.
+        let sha1_oid = OidBytes::sha1([0x11; 20]);
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[sha1_oid]))
+            .expect("commit SHA-1");
+        assert_eq!(
+            store.batch_check_seen(&[sha1_oid]).expect("check SHA-1"),
+            vec![true],
+            "SHA-1 OID should be seen after commit"
+        );
+        drop(store);
+
+        // Reopen and query with SHA-256 OIDs. The store holds a SHA-1 bitmap
+        // on disk, but the queried OID length differs. This must return an
+        // error rather than silently discarding the persisted bitmap.
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+        let sha256_oid = OidBytes::sha256([0x22; 32]);
+        let err = store
+            .batch_check_seen(&[sha256_oid])
+            .expect_err("OID length mismatch should return error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mismatch"),
+            "error should mention mismatch, got: {msg}"
+        );
     }
 }

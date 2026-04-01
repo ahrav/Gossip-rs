@@ -180,6 +180,8 @@ pub mod repo_identity;
 /// Implements repository discovery, open, and start set resolution.
 pub mod repo_open;
 pub(crate) mod repo_paths;
+/// Encodes seen-bitmap deltas and persisted roaring bitmap snapshots.
+pub mod roaring_seen;
 /// Defines the spill run file format and canonical record encoding.
 pub mod run_format;
 /// Implements a spill run reader with strict validation.
@@ -352,6 +354,9 @@ pub use finalize::{
     WriteOp,
 };
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
+#[cfg(feature = "rocksdb")]
+pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
+pub use roaring_seen::{SeenBitmapDelta, SeenBitmapError};
 pub use snapshot_plan::snapshot_plan;
 pub use watermark_keys::{
     decode_ref_watermark_value, encode_ref_watermark_value, KeyArena, KeyRef, NS_REF_WATERMARK,
