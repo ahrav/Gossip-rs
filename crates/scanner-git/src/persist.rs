@@ -73,6 +73,8 @@ impl PersistenceStore for InMemoryPersistenceStore {
         // atomic commit contract: either all ops land or none do.
         let mut staged_data: Vec<WriteOp> = Vec::with_capacity(output.data_ops.len());
         #[cfg(feature = "rocksdb")]
+        let mut seen_scope_key: Option<Vec<u8>> = None;
+        #[cfg(feature = "rocksdb")]
         let mut staged_scopes: HashMap<Vec<u8>, RoaringSeenBitmap> =
             self.seen_scopes.borrow().clone();
 
@@ -86,6 +88,17 @@ impl PersistenceStore for InMemoryPersistenceStore {
                 // Matches the RocksDB store's empty-delta skip.
                 if delta.is_empty() {
                     continue;
+                }
+                // Reject batches with multiple distinct scope keys,
+                // matching the RocksDB store's single-scope invariant.
+                if let Some(existing) = seen_scope_key.as_ref() {
+                    if existing != &op.key {
+                        return Err(PersistError::backend(
+                            "multiple seen-bitmap scope keys in one finalize batch",
+                        ));
+                    }
+                } else {
+                    seen_scope_key = Some(op.key.clone());
                 }
                 let mut bitmap = staged_scopes
                     .remove(&op.key)
@@ -344,5 +357,41 @@ mod tests {
             "OID B still absent after recovery"
         );
         assert!(bitmap.contains(&oid_c), "OID C present after recovery");
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn in_memory_store_rejects_multi_scope_finalize() {
+        let store = InMemoryPersistenceStore::default();
+
+        let scope_a = build_seen_scope_key(1, &[0xAA; 32]);
+        let scope_b = build_seen_scope_key(2, &[0xBB; 32]);
+
+        let delta_a = SeenBitmapDelta::from_oids(&[OidBytes::sha1([0x11; 20])]).expect("a");
+        let delta_b = SeenBitmapDelta::from_oids(&[OidBytes::sha1([0x22; 20])]).expect("b");
+
+        let output = FinalizeOutput {
+            data_ops: vec![
+                WriteOp {
+                    key: scope_a,
+                    value: delta_a.serialize(),
+                },
+                WriteOp {
+                    key: scope_b,
+                    value: delta_b.serialize(),
+                },
+            ],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+
+        let err = store
+            .commit_finalize(&output)
+            .expect_err("mixed scope keys must be rejected");
+        assert!(
+            err.to_string().contains("multiple seen-bitmap scope keys"),
+            "unexpected error: {err}"
+        );
     }
 }
