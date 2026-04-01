@@ -46,6 +46,17 @@ fn bench_batch_contains(c: &mut Criterion) {
     });
 }
 
+fn bench_batch_contains_sorted(c: &mut Criterion) {
+    let bitmap = build_bitmap(BITMAP_SIZE);
+    let mut probes = build_probe_batch(PROBE_BATCH);
+    probes.sort_unstable();
+    probes.dedup();
+
+    c.bench_function("roaring_seen/batch_contains_sorted_10k_against_1m", |b| {
+        b.iter(|| black_box(bitmap.batch_contains_sorted(black_box(&probes))))
+    });
+}
+
 fn bench_serialize(c: &mut Criterion) {
     let bitmap = build_bitmap(BITMAP_SIZE);
 
@@ -78,6 +89,7 @@ fn bench_insert_batch(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_batch_contains,
+    bench_batch_contains_sorted,
     bench_serialize,
     bench_insert_batch
 );

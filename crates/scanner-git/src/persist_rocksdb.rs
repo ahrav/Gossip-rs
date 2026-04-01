@@ -310,7 +310,10 @@ impl PersistenceStore for RocksDbStore {
             }
 
             if !seen_oids.is_empty() {
-                let delta = SeenBitmapDelta::from_oids(&seen_oids)
+                // OIDs were deserialized from a single canonical delta (the
+                // multi-scope check above rejects batches with different scope
+                // keys), so they are already sorted and unique.
+                let delta = SeenBitmapDelta::from_canonical_oids(seen_oids)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
                 self.load_seen_store(delta.oid_len())
                     .map_err(PersistError::backend)?;
@@ -579,6 +582,77 @@ mod tests {
 
     #[cfg(feature = "rocksdb")]
     #[test]
+    fn rocksdb_store_migration_preserves_unrecognized_keys() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 10;
+        let policy_hash = [0xBB; 32];
+        let oid_a = OidBytes::sha1([0x0A; 20]);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+
+        // Seed one valid SHA-1 legacy key and one key with wrong suffix
+        // length (5 bytes instead of 20).
+        let mut batch = WriteBatch::default();
+        batch.put(build_seen_blob_key(repo_id, &policy_hash, &oid_a), [1u8]);
+        let mut bad_key = scope_key.to_vec();
+        bad_key.extend_from_slice(&[0xFF; 5]);
+        batch.put(&bad_key, [1u8]);
+        store.db.write(batch).expect("seed mixed keys");
+
+        // Migration should succeed: the valid key is migrated, the
+        // unrecognized key is left in place.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, OidBytes::sha1([0x0B; 20])])
+                .expect("batch check"),
+            vec![true, false]
+        );
+
+        // The valid legacy key should be deleted.
+        assert!(
+            store
+                .db
+                .get(build_seen_blob_key(repo_id, &policy_hash, &oid_a))
+                .expect("read migrated key")
+                .is_none(),
+            "migrated key should be deleted"
+        );
+
+        // The unrecognized key should still exist.
+        assert!(
+            store.db.get(&bad_key).expect("read bad key").is_some(),
+            "unrecognized key should be preserved"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_migration_errors_when_only_unrecognized_keys_exist() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 10;
+        let policy_hash = [0xBC; 32];
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+
+        // Seed only keys with wrong suffix length.
+        let mut bad_key = scope_key.to_vec();
+        bad_key.extend_from_slice(&[0xFF; 5]);
+        store.db.put(&bad_key, [1u8]).expect("seed bad key");
+
+        let err = store
+            .batch_check_seen(&[OidBytes::sha1([0x01; 20])])
+            .expect_err("should fail when only unrecognized keys exist");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unexpected suffix length"),
+            "error should mention unexpected suffix, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
     fn rocksdb_store_rejects_corrupt_bitmap_on_load() {
         let dir = tempdir().expect("tempdir");
         let repo_id = 11;
@@ -677,7 +751,7 @@ mod tests {
 
     #[cfg(feature = "rocksdb")]
     #[test]
-    fn rocksdb_store_oid_len_mismatch_returns_fresh_bitmap() {
+    fn rocksdb_store_oid_len_mismatch_returns_error() {
         let dir = tempdir().expect("tempdir");
         let repo_id = 15;
         let policy_hash = [0xDD; 32];
@@ -696,16 +770,17 @@ mod tests {
         drop(store);
 
         // Reopen and query with SHA-256 OIDs. The store holds a SHA-1 bitmap
-        // on disk, but the queried OID length differs, so the load path must
-        // discard the SHA-1 bitmap and return a fresh empty SHA-256 bitmap.
+        // on disk, but the queried OID length differs. This must return an
+        // error rather than silently discarding the persisted bitmap.
         let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
         let sha256_oid = OidBytes::sha256([0x22; 32]);
-        assert_eq!(
-            store
-                .batch_check_seen(&[sha256_oid])
-                .expect("check SHA-256"),
-            vec![false],
-            "SHA-256 query against a SHA-1 bitmap must return false (fresh bitmap)"
+        let err = store
+            .batch_check_seen(&[sha256_oid])
+            .expect_err("OID length mismatch should return error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mismatch"),
+            "error should mention mismatch, got: {msg}"
         );
     }
 }

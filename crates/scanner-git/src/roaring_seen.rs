@@ -187,7 +187,12 @@ impl SeenBitmapDelta {
         let mut out = Vec::with_capacity(self.serialized_size());
         out.extend_from_slice(&DELTA_MAGIC);
         out.push(self.oid_len);
-        out.extend_from_slice(&(self.oids.len() as u32).to_be_bytes());
+        let oid_count: u32 = self
+            .oids
+            .len()
+            .try_into()
+            .expect("delta OID count validated at construction via u32_len");
+        out.extend_from_slice(&oid_count.to_be_bytes());
         for oid in &self.oids {
             debug_assert_eq!(oid.len(), self.oid_len, "delta OID length mismatch");
             out.extend_from_slice(oid.as_slice());
@@ -271,10 +276,24 @@ impl RoaringSeenBitmap {
         self.oid_len
     }
 
-    /// Returns the number of seen OIDs tracked by this bitmap.
+    /// Returns the number of OIDs marked as seen.
+    ///
+    /// This may be less than [`index_len`](Self::index_len) because the
+    /// sorted OID index retains entries from merges even when their seen
+    /// bit is unset.
     #[must_use]
     pub fn len(&self) -> usize {
         usize::try_from(self.seen.len()).unwrap_or(usize::MAX)
+    }
+
+    /// Returns the total number of OIDs in the sorted index.
+    ///
+    /// May exceed [`len`](Self::len) because the index grows
+    /// monotonically across merges. The difference represents OIDs
+    /// known to the index but not yet marked as seen.
+    #[must_use]
+    pub fn index_len(&self) -> usize {
+        self.oids.len()
     }
 
     /// Returns true when the bitmap tracks no seen OIDs.
@@ -302,9 +321,45 @@ impl RoaringSeenBitmap {
     }
 
     /// Batch membership query preserving the input order.
+    ///
+    /// Probes each OID independently via binary search. For sorted inputs
+    /// prefer [`batch_contains_sorted`](Self::batch_contains_sorted).
     #[must_use]
     pub fn batch_contains(&self, oids: &[OidBytes]) -> Vec<bool> {
         oids.iter().map(|oid| self.contains(oid)).collect()
+    }
+
+    /// O(n+m) batch membership query for **sorted** input.
+    ///
+    /// Walks two pointers over `self.oids` and the probe slice in a single
+    /// pass, avoiding the O(n log m) cost of per-element binary search.
+    /// The `SeenBlobStore` contract guarantees sorted inputs, so this is
+    /// the preferred hot-path implementation.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that `oids` is strictly sorted.
+    #[must_use]
+    pub fn batch_contains_sorted(&self, oids: &[OidBytes]) -> Vec<bool> {
+        debug_assert!(
+            oids_are_canonical(oids),
+            "batch_contains_sorted requires strictly sorted input"
+        );
+        let mut result = vec![false; oids.len()];
+        let mut idx = 0usize;
+        for (i, oid) in oids.iter().enumerate() {
+            if oid.len() != self.oid_len {
+                continue;
+            }
+            // Advance the index pointer past OIDs smaller than the probe.
+            while idx < self.oids.len() && self.oids[idx] < *oid {
+                idx += 1;
+            }
+            if idx < self.oids.len() && self.oids[idx] == *oid {
+                result[i] = bitmap_contains(&self.seen, idx);
+            }
+        }
+        result
     }
 
     /// Inserts a batch of OIDs, growing the index and seen bitmap as needed.
@@ -410,12 +465,22 @@ impl RoaringSeenBitmap {
         let mut out = Vec::with_capacity(self.serialized_size());
         out.extend_from_slice(&BITMAP_MAGIC);
         out.push(self.oid_len);
-        out.extend_from_slice(&(self.oids.len() as u32).to_be_bytes());
+        let oid_count: u32 = self
+            .oids
+            .len()
+            .try_into()
+            .expect("bitmap OID count validated at construction via u32_len");
+        out.extend_from_slice(&oid_count.to_be_bytes());
         for oid in &self.oids {
             debug_assert_eq!(oid.len(), self.oid_len, "bitmap OID length mismatch");
             out.extend_from_slice(oid.as_slice());
         }
-        out.extend_from_slice(&(bitmap_len as u32).to_be_bytes());
+        let bitmap_len_u32: u32 = bitmap_len.try_into().map_err(|_| {
+            SeenBitmapError::SerializationFailed(format!(
+                "roaring bitmap serialized size {bitmap_len} exceeds u32::MAX"
+            ))
+        })?;
+        out.extend_from_slice(&bitmap_len_u32.to_be_bytes());
         self.seen
             .serialize_into(&mut out)
             .map_err(|err| SeenBitmapError::SerializationFailed(err.to_string()))?;
@@ -515,7 +580,7 @@ impl RoaringSeenStore {
 #[cfg(feature = "rocksdb")]
 impl SeenBlobStore for RoaringSeenStore {
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
-        Ok(self.bitmap.batch_contains(oids))
+        Ok(self.bitmap.batch_contains_sorted(oids))
     }
 }
 
@@ -666,6 +731,23 @@ mod tests {
 
     #[cfg(feature = "rocksdb")]
     #[test]
+    fn roaring_bitmap_batch_contains_sorted_matches_unsorted() {
+        let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        bitmap
+            .insert_batch(&[sha1(0x10), sha1(0x30), sha1(0x50)])
+            .expect("insert");
+
+        let mut probes = vec![sha1(0x10), sha1(0x20), sha1(0x30), sha1(0x40), sha1(0x50)];
+        probes.sort_unstable();
+
+        let sorted_result = bitmap.batch_contains_sorted(&probes);
+        let unsorted_result = bitmap.batch_contains(&probes);
+        assert_eq!(sorted_result, unsorted_result);
+        assert_eq!(sorted_result, vec![true, false, true, false, true]);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
     fn roaring_bitmap_merge_preserves_membership() {
         let mut left = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
         left.insert_batch(&[sha1(0x10), sha1(0x30)]).expect("left");
@@ -804,6 +886,20 @@ mod proptests {
             let batch = bitmap.batch_contains(&probe);
             let pointwise: Vec<bool> = probe.iter().map(|oid| bitmap.contains(oid)).collect();
             prop_assert_eq!(batch, pointwise);
+        }
+
+        #[test]
+        fn batch_contains_sorted_matches_unsorted(seen in arb_sha1_oids(), probe in arb_sha1_oids()) {
+            let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            bitmap.insert_batch(&seen).expect("insert");
+
+            let mut sorted_probe = probe.clone();
+            sorted_probe.sort_unstable();
+            sorted_probe.dedup();
+
+            let sorted_result = bitmap.batch_contains_sorted(&sorted_probe);
+            let unsorted_result = bitmap.batch_contains(&sorted_probe);
+            prop_assert_eq!(sorted_result, unsorted_result);
         }
 
         #[test]
