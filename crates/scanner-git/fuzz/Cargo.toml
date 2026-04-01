@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
-scanner-git = { path = ".." }
+scanner-git = { path = "..", features = ["rocksdb"] }
 tempfile = "3"
 
 [[bin]]
@@ -31,6 +31,11 @@ doc = false
 [[bin]]
 name = "fuzz_pack_delta_into"
 path = "fuzz_targets/fuzz_pack_delta_into.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_roaring_seen_deserialize"
+path = "fuzz_targets/fuzz_roaring_seen_deserialize.rs"
 doc = false
 
 [workspace]
