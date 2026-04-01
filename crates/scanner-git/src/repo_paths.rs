@@ -216,15 +216,23 @@ pub(super) fn parse_decimal(bytes: &[u8]) -> Option<u64> {
 }
 
 /// Error taxonomy for loose object parsing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(super) enum LooseObjectParseError {
+    #[error("missing NUL header terminator")]
     MissingHeaderTerminator,
+    #[error("missing object kind in header")]
     MissingKind,
+    #[error("missing size in header")]
     MissingSize,
+    #[error("invalid header format")]
     InvalidHeader,
+    #[error("invalid size value")]
     InvalidSize,
+    #[error("object size {size} exceeds cap {max_payload}")]
     SizeExceedsCap { size: usize, max_payload: usize },
+    #[error("payload size does not match header")]
     SizeMismatch,
+    #[error("unknown object type")]
     UnknownType,
 }
 

@@ -270,6 +270,7 @@ pub use repo_open::{
     repo_open, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps, RepoArtifactPaths,
     RepoJobState, StartSetRef, StartSetResolver,
 };
+pub use repo_paths::{parse_hex_oid, HexOidParseError};
 pub use start_set::{StartSetConfig, StartSetId};
 
 // ── Stage 2: Commit loading & graph construction ────────────────────────
@@ -333,7 +334,6 @@ pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
 };
 pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
-pub use repo_paths::{parse_hex_oid, HexOidParseError};
 
 // ── Stage 6: Engine scanning ────────────────────────────────────────────
 pub use engine_adapter::{

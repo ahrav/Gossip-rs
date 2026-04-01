@@ -26,10 +26,10 @@ use super::midx_error::MidxError;
 #[non_exhaustive]
 pub enum RepoOpenError {
     /// I/O error during file operations.
-    #[error("I/O error: {0}")]
+    #[error("I/O error ({})", .0.kind())]
     Io(#[source] io::Error),
     /// Path canonicalization failed.
-    #[error("path canonicalization failed: {0}")]
+    #[error("path canonicalization failed ({})", .0.kind())]
     Canonicalization(#[source] io::Error),
     /// Not a Git repository (no .git dir/file, not bare).
     #[error("not a Git repository")]

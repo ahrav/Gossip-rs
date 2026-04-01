@@ -29,7 +29,7 @@ use scanner_git::{
 /// Raw Git submission request before normalization.
 ///
 /// The request carries tenant scope, shared run settings, Git execution knobs,
-/// and one or more repo targets. Convenience constructors cover the MVP input
+/// and one or more repo targets. Convenience constructors cover common input
 /// shapes, while [`new`](Self::new) accepts the fully general target list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitRequest {
@@ -194,6 +194,10 @@ impl GitRequest {
     /// is not valid hex for a supported OID width, or duplicates disagree
     /// after normalization.
     pub fn normalize(&self) -> Result<NormalizedGitRequest, GitRequestError> {
+        if self.targets.is_empty() {
+            return Err(GitRequestError::EmptyTargets);
+        }
+
         let mut normalized = Vec::with_capacity(self.targets.len());
         let limits = RepoOpenLimits::default();
 
@@ -222,15 +226,19 @@ impl GitRequest {
             });
         }
 
-        normalized
-            .sort_unstable_by(|left, right| left.target.repo_key().cmp(right.target.repo_key()));
+        normalized.sort_unstable_by(|left, right| {
+            left.target
+                .repo_key()
+                .cmp(right.target.repo_key())
+                .then(left.target_index.cmp(&right.target_index))
+        });
 
         let mut deduped: Vec<IndexedNormalizedGitTarget> = Vec::with_capacity(normalized.len());
         for candidate in normalized {
             if let Some(previous) = deduped.last()
                 && previous.target.repo_key() == candidate.target.repo_key()
             {
-                if previous.target == candidate.target {
+                if previous.target.selection == candidate.target.selection {
                     continue;
                 }
 
@@ -319,9 +327,10 @@ impl fmt::Debug for GitRequestTarget {
 
 /// Request-side selection intent before normalization.
 ///
-/// This remains distinct from runtime [`gossip_contracts::connector::git::GitSelection`]
-/// because explicit commits are preserved as typed request input until later
-/// Git control-plane stages lower them to a synthetic ref.
+/// This remains distinct from the contract-level [`gossip_contracts::connector::git::GitRefSelection`]
+/// because it carries an `ExplicitCommit` variant with raw hex OID bytes
+/// that must be parsed and validated before lowering to a synthetic ref
+/// in later Git control-plane stages.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub enum GitRequestSelection {
     /// Scan the repo's default branch only.
@@ -546,13 +555,28 @@ pub enum GitRequestError {
     },
     /// Two inputs normalized to the same repo identity but disagreed afterward.
     #[error(
-        "git request targets {first_index} and {second_index} normalized to the same repo identity but disagreed on selection or display metadata"
+        "git request targets {first_index} and {second_index} normalized to the same repo identity but disagreed on selection"
     )]
     ConflictingNormalizedTarget {
         /// First conflicting target index.
         first_index: usize,
         /// Second conflicting target index.
         second_index: usize,
+    },
+    /// The request contains no targets.
+    #[error("git request has no targets")]
+    EmptyTargets,
+    /// Explicit refs selection contains no refs.
+    #[error("git request target {target_index} has empty explicit refs list")]
+    EmptyExplicitRefs {
+        /// Zero-based position in the raw request target list.
+        target_index: usize,
+    },
+    /// Explicit commit resolved to the null OID (all zeros).
+    #[error("git request target {target_index} has null commit OID (all zeros)")]
+    NullExplicitCommit {
+        /// Zero-based position in the raw request target list.
+        target_index: usize,
     },
 }
 
@@ -568,9 +592,14 @@ fn normalize_selection(
 ) -> Result<NormalizedGitSelection, GitRequestError> {
     match selection {
         GitRequestSelection::DefaultBranchOnly => Ok(NormalizedGitSelection::DefaultBranchOnly),
-        GitRequestSelection::ExplicitRefs { refs } => Ok(NormalizedGitSelection::ExplicitRefs {
-            refs: normalize_explicit_refs(refs),
-        }),
+        GitRequestSelection::ExplicitRefs { refs } => {
+            if refs.is_empty() {
+                return Err(GitRequestError::EmptyExplicitRefs { target_index });
+            }
+            Ok(NormalizedGitSelection::ExplicitRefs {
+                refs: normalize_explicit_refs(refs),
+            })
+        }
         GitRequestSelection::ExplicitCommit { commit_hex } => {
             let format = infer_object_format_from_hex_len(commit_hex).ok_or_else(|| {
                 GitRequestError::InvalidExplicitCommitLength {
@@ -586,6 +615,9 @@ fn normalize_selection(
                     source,
                 }
             })?;
+            if commit.is_null() {
+                return Err(GitRequestError::NullExplicitCommit { target_index });
+            }
             Ok(NormalizedGitSelection::ExplicitCommit { commit })
         }
     }
@@ -987,5 +1019,140 @@ mod tests {
         let commit_debug = format!("{commit_normalized:?}");
         assert!(!commit_debug.contains(&dir.path().display().to_string()));
         assert!(!commit_debug.contains("0123456789abcdef0123456789abcdef01234567"));
+    }
+
+    #[test]
+    fn display_name_difference_dedupes_not_conflicts() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xA0),
+            vec![
+                GitRequestTarget::new(dir.path(), GitRequestSelection::DefaultBranchOnly)
+                    .with_display_name("display-a"),
+                GitRequestTarget::new(dir.path().join("."), GitRequestSelection::DefaultBranchOnly)
+                    .with_display_name("display-b"),
+            ],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let normalized = request
+            .normalize()
+            .expect("display_name difference should dedupe, not conflict");
+        assert_eq!(normalized.targets().len(), 1);
+    }
+
+    #[test]
+    fn empty_targets_rejected() {
+        let request = GitRequest::new(
+            tenant(0xA1),
+            vec![],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+        let err = request.normalize().expect_err("empty targets should fail");
+        assert!(matches!(err, GitRequestError::EmptyTargets));
+    }
+
+    #[test]
+    fn empty_explicit_refs_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let request = GitRequest::new(
+            tenant(0xA2),
+            vec![GitRequestTarget::new(
+                dir.path(),
+                GitRequestSelection::ExplicitRefs { refs: vec![] },
+            )],
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("empty explicit refs should fail");
+        assert!(matches!(
+            err,
+            GitRequestError::EmptyExplicitRefs { target_index: 0 }
+        ));
+    }
+
+    #[test]
+    fn explicit_commit_sha256_normalizes_to_typed_oid() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let commit_hex = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let request = GitRequest::repo_with_explicit_commit(
+            tenant(0xA3),
+            dir.path(),
+            commit_hex.as_slice(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let normalized = request.normalize().expect("normalize sha256 commit");
+        let expected =
+            parse_hex_oid(commit_hex, ObjectFormat::Sha256).expect("parse expected sha256 oid");
+        assert_eq!(
+            normalized.targets()[0].selection(),
+            &NormalizedGitSelection::ExplicitCommit { commit: expected }
+        );
+    }
+
+    #[test]
+    fn explicit_commit_uppercase_hex_normalizes_correctly() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let upper = b"0123456789ABCDEF0123456789ABCDEF01234567";
+        let lower = b"0123456789abcdef0123456789abcdef01234567";
+
+        let request = GitRequest::repo_with_explicit_commit(
+            tenant(0xA4),
+            dir.path(),
+            upper.as_slice(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let normalized = request.normalize().expect("normalize uppercase hex");
+        let expected =
+            parse_hex_oid(lower, ObjectFormat::Sha1).expect("parse expected lowercase oid");
+        assert_eq!(
+            normalized.targets()[0].selection(),
+            &NormalizedGitSelection::ExplicitCommit { commit: expected }
+        );
+    }
+
+    #[test]
+    fn null_oid_explicit_commit_rejected() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let null_hex = b"0000000000000000000000000000000000000000";
+
+        let request = GitRequest::repo_with_explicit_commit(
+            tenant(0xA5),
+            dir.path(),
+            null_hex.as_slice(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        );
+
+        let err = request
+            .normalize()
+            .expect_err("null OID should be rejected");
+        assert!(matches!(
+            err,
+            GitRequestError::NullExplicitCommit { target_index: 0 }
+        ));
     }
 }
