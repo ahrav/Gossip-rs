@@ -177,10 +177,10 @@ where
 /// golden-vector test for regression detection.
 #[must_use]
 pub fn derive_repo_id(tenant_id: TenantId, repo_key: &RepoKey) -> u64 {
-    let mut h = REPO_ID_HASHER.clone();
-    tenant_id.write_canonical(&mut h);
-    repo_key.as_bytes().write_canonical(&mut h);
-    finalize_64(&h)
+    let mut hasher = REPO_ID_HASHER.clone();
+    tenant_id.write_canonical(&mut hasher);
+    repo_key.as_bytes().write_canonical(&mut hasher);
+    finalize_64(&hasher)
 }
 
 #[cfg(test)]

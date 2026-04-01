@@ -382,11 +382,14 @@ pub enum GitShardPayloadEncodeError {
     /// The local-path locator was not absolute.
     #[error("git shard payload local-path locator must be absolute")]
     RelativeLocalPath,
+    /// The local-path locator contains directory traversal (`..`).
+    #[error("git shard payload local-path locator contains directory traversal")]
+    LocalPathTraversal,
     /// The local-path locator could not be represented as UTF-8.
     #[error("git shard payload local-path locator is not valid UTF-8")]
     NonUtf8LocalPath,
     /// The payload repo key does not decode as a valid local-path key.
-    #[error("git shard payload repo key is invalid: {source}")]
+    #[error("git shard payload repo key failed to decode: {source}")]
     RepoKeyDecode {
         /// Underlying repo-key decode failure.
         source: RepoKeyDecodeError,
@@ -478,7 +481,7 @@ pub enum GitShardPayloadDecodeError {
         source: ConnectorInputError,
     },
     /// The repo key does not decode as a supported local-path key.
-    #[error("git shard payload repo key is invalid: {source}")]
+    #[error("git shard payload repo key failed to decode: {source}")]
     RepoKeyDecode {
         /// Underlying structured repo-key decode failure.
         source: RepoKeyDecodeError,
@@ -504,6 +507,9 @@ pub enum GitShardPayloadDecodeError {
     /// The display-name presence flag is unknown.
     #[error("git shard payload display-name flag '{0}' is unknown")]
     UnknownDisplayNameFlag(u8),
+    /// The display-name carried SOME tag with empty content (non-canonical).
+    #[error("git shard payload display name uses SOME tag with empty content (non-canonical)")]
+    NonCanonicalEmptyDisplayName,
     /// The display-name bytes were not valid UTF-8.
     #[error("git shard payload display name is not valid UTF-8: {source}")]
     InvalidUtf8DisplayName {
@@ -660,13 +666,16 @@ fn validate_local_path_for_encode(path: &Path) -> Result<&str, GitShardPayloadEn
     if path.as_os_str().is_empty() {
         return Err(GitShardPayloadEncodeError::EmptyLocalPath);
     }
-    let path = path
+    let path_str = path
         .to_str()
         .ok_or(GitShardPayloadEncodeError::NonUtf8LocalPath)?;
-    if !Path::new(path).is_absolute() {
+    if !path.is_absolute() {
         return Err(GitShardPayloadEncodeError::RelativeLocalPath);
     }
-    Ok(path)
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(GitShardPayloadEncodeError::LocalPathTraversal);
+    }
+    Ok(path_str)
 }
 
 fn validate_decoded_local_path(path: &Path) -> Result<(), GitShardPayloadDecodeError> {
@@ -675,6 +684,9 @@ fn validate_decoded_local_path(path: &Path) -> Result<(), GitShardPayloadDecodeE
     }
     if !path.is_absolute() {
         return Err(GitShardPayloadDecodeError::RelativeLocalPath);
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(GitShardPayloadDecodeError::LocalPathTraversal);
     }
     Ok(())
 }
@@ -905,7 +917,9 @@ fn decode_display_name(
         DISPLAY_NAME_SOME_TAG => {
             let bytes = cursor.take_len_prefixed_bytes("display_name_len", "display_name")?;
             if bytes.is_empty() {
-                return Ok(None);
+                // SOME tag with empty content is non-canonical; the encoder
+                // always emits NONE_TAG for absent or empty names.
+                return Err(GitShardPayloadDecodeError::NonCanonicalEmptyDisplayName);
             }
             let display_name = std::str::from_utf8(bytes)
                 .map_err(|source| GitShardPayloadDecodeError::InvalidUtf8DisplayName { source })?;
@@ -1027,6 +1041,13 @@ fn decode_execution_limits(
         .with_debug_level(debug_level);
 
     if pack_exec_workers != 0 {
+        // Enforce the same u32 ceiling as encode to reject wire values that
+        // no encoder will produce.
+        if pack_exec_workers > u64::from(u32::MAX) {
+            return Err(GitShardPayloadDecodeError::PackExecWorkersTooLarge {
+                workers: pack_exec_workers,
+            });
+        }
         let workers = usize::try_from(pack_exec_workers).map_err(|_| {
             GitShardPayloadDecodeError::PackExecWorkersTooLarge {
                 workers: pack_exec_workers,
@@ -2133,6 +2154,7 @@ mod tests {
                 // Normalization sorts and deduplicates.
                 assert_eq!(refs.len(), 3);
                 assert!(refs[0] < refs[1], "refs must be in canonical sorted order");
+                assert!(refs[1] < refs[2], "refs must be in canonical sorted order");
             }
             other => panic!("expected ExplicitRefs, got {other:?}"),
         }
@@ -2211,5 +2233,129 @@ mod tests {
         assert!(!limits.scan_binary());
         assert!(!limits.enrich_identities());
         assert_eq!(limits.debug_level(), GitDebugLevel::Off);
+    }
+
+    #[test]
+    fn encode_rejects_path_with_traversal_component() {
+        let repo_key =
+            RepoKey::for_local_path(b"/repo/../etc/passwd").expect("repo key from raw bytes");
+        let locator = RepoLocator::local_path("/repo/../etc/passwd");
+        let payload = GitShardPayload::new(
+            tenant(0xF0),
+            GitRepoTarget::new(repo_key.clone(), locator),
+            derive_repo_id(tenant(0xF0), &repo_key),
+            NormalizedGitSelection::DefaultBranchOnly,
+            default_scan_mode(),
+            default_merge_strategy(),
+            GitExecutionLimits::default(),
+        );
+
+        let err = payload
+            .encode()
+            .expect_err("path with traversal must be rejected on encode");
+        assert!(
+            matches!(err, GitShardPayloadEncodeError::LocalPathTraversal),
+            "expected LocalPathTraversal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_non_canonical_display_name_some_tag_with_empty_content() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xF1),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let encoded = payload.encode().expect("encode payload");
+        let flag_offset = display_name_flag_offset(&payload);
+
+        // Inject SOME tag + 0-length content (non-canonical).
+        let mut patched = encoded[..flag_offset].to_vec();
+        patched.push(DISPLAY_NAME_SOME_TAG);
+        push_u32_be(&mut patched, 0);
+        patched.extend_from_slice(&encoded[flag_offset + 1..]);
+
+        let err = GitShardPayload::decode(&patched)
+            .expect_err("SOME tag with empty content must be rejected as non-canonical");
+        assert!(
+            matches!(
+                err,
+                GitShardPayloadDecodeError::NonCanonicalEmptyDisplayName
+            ),
+            "expected NonCanonicalEmptyDisplayName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_pack_exec_workers_above_u32_max() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0xF2),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+        let mut encoded = payload.encode().expect("encode payload");
+
+        // pack_exec_workers is at debug_level_tag_offset + 1 (after the 1-byte
+        // debug level tag), encoded as u64 BE.
+        let workers_offset = debug_level_tag_offset(&payload) + 1;
+        let over_u32_max: u64 = u64::from(u32::MAX) + 1;
+        encoded[workers_offset..workers_offset + U64_LEN]
+            .copy_from_slice(&over_u32_max.to_be_bytes());
+
+        let err = GitShardPayload::decode(&encoded)
+            .expect_err("pack_exec_workers above u32::MAX must be rejected on decode");
+        assert!(
+            matches!(
+                err,
+                GitShardPayloadDecodeError::PackExecWorkersTooLarge { workers }
+                    if workers == over_u32_max
+            ),
+            "expected PackExecWorkersTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn encode_golden_vector() {
+        // Fixed synthetic path avoids tempdir non-determinism.
+        let repo_key = RepoKey::for_local_path(b"/golden/repo").expect("repo key");
+        let payload = GitShardPayload::new(
+            tenant(0xAB),
+            GitRepoTarget::new(repo_key.clone(), RepoLocator::local_path("/golden/repo")),
+            derive_repo_id(tenant(0xAB), &repo_key),
+            NormalizedGitSelection::DefaultBranchOnly,
+            GitScanMode::OdbBlobFast,
+            GitMergeStrategy::AllParents,
+            GitExecutionLimits::default(),
+        );
+        let encoded = payload.encode().expect("encode golden payload");
+
+        // Pin the exact wire bytes. Any change to field order, tag values,
+        // or length-prefix endianness will fail this test, alerting that
+        // stored connector_extra blobs will diverge.
+        let hex = encoded
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        const EXPECTED_HEX: &str = "ababababababababababababababababababababababababababababababababbc1be4db17dee94f0000000d012f676f6c64656e2f7265706f010000000c2f676f6c64656e2f7265706f00000100000000000000000000000000000000000000";
+
+        assert_eq!(
+            hex, EXPECTED_HEX,
+            "wire format changed \u{2014} stored connector_extra blobs will diverge"
+        );
     }
 }
