@@ -1,8 +1,8 @@
 //! Shared repository path and object-byte utilities.
 //!
-//! This module consolidates directory-listing and pack-resolution helpers that
-//! were previously duplicated across `object_store`, `runner_exec`, `pack_io`,
-//! and `commit_loader`, plus shared OID/loose-object parsing routines used by
+//! This module consolidates directory-listing and pack-resolution helpers
+//! shared by `object_store`, `runner_exec`, `pack_io`, and `commit_loader`,
+//! plus OID/loose-object parsing routines used by
 //! `object_store` and `commit_parse`. Fallible path helpers return `io::Error`
 //! so callers can convert to their domain error type with `.map_err()` or `?`
 //! (when `From<io::Error>` is implemented).
@@ -216,15 +216,23 @@ pub(super) fn parse_decimal(bytes: &[u8]) -> Option<u64> {
 }
 
 /// Error taxonomy for loose object parsing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(super) enum LooseObjectParseError {
+    #[error("missing NUL header terminator")]
     MissingHeaderTerminator,
+    #[error("missing object kind in header")]
     MissingKind,
+    #[error("missing size in header")]
     MissingSize,
+    #[error("invalid header format")]
     InvalidHeader,
+    #[error("invalid size value")]
     InvalidSize,
+    #[error("object size {size} exceeds cap {max_payload}")]
     SizeExceedsCap { size: usize, max_payload: usize },
+    #[error("payload size does not match header")]
     SizeMismatch,
+    #[error("unknown object type")]
     UnknownType,
 }
 
@@ -271,17 +279,18 @@ pub(super) fn parse_loose_object(
 }
 
 /// Error taxonomy for hex OID parsing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HexOidParseError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HexOidParseError {
+    /// The hex string contains a non-hex ASCII byte.
+    #[error("invalid hex digit 0x{byte:02x} in object id")]
     InvalidHex { byte: u8 },
+    /// The hex string length does not match the requested object format.
+    #[error("invalid object id length: found {found} hex chars, expected {expected}")]
     InvalidOidLength { found: usize, expected: usize },
 }
 
 /// Parses a hex-encoded OID for the requested object format.
-pub(super) fn parse_hex_oid(
-    hex: &[u8],
-    format: ObjectFormat,
-) -> Result<OidBytes, HexOidParseError> {
+pub fn parse_hex_oid(hex: &[u8], format: ObjectFormat) -> Result<OidBytes, HexOidParseError> {
     let expected_len = format.hex_len() as usize;
     if hex.len() != expected_len {
         return Err(HexOidParseError::InvalidOidLength {

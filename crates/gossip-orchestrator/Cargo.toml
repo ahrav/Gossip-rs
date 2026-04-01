@@ -5,11 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Filesystem request normalization and control-plane planning surfaces"
+description = "Filesystem and Git request normalization plus control-plane planning surfaces"
 
 [dependencies]
 gossip-coordination.workspace = true
+gossip-contracts.workspace = true
 gossip-frontier.workspace = true
+scanner-git.workspace = true
 thiserror = { workspace = true }
 
 [dev-dependencies]

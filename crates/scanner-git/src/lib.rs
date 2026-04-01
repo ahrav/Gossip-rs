@@ -270,6 +270,7 @@ pub use repo_open::{
     repo_open, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps, RepoArtifactPaths,
     RepoJobState, StartSetRef, StartSetResolver,
 };
+pub use repo_paths::{parse_hex_oid, HexOidParseError};
 pub use start_set::{StartSetConfig, StartSetId};
 
 // ── Stage 2: Commit loading & graph construction ────────────────────────

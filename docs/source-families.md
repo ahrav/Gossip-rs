@@ -50,7 +50,7 @@ matching inherent helper methods in `gossip-connectors/src/filesystem.rs`.
 `InMemoryDeterministicConnector` expose the same read/split surface as
 inherent methods in `gossip-connectors/src/`.
 
-**Submission staging (filesystem-specific):**
+**Submission staging:**
 
 `gossip-orchestrator` stages filesystem submissions before runtime execution:
 - `request.rs` canonicalizes raw paths, validates them against the requested
@@ -68,9 +68,14 @@ inherent methods in `gossip-connectors/src/`.
   payload into a validated initial manifest, then executes the
   `create_run_with_shards` lifecycle that makes the startup shard set
   claimable.
+- `git_request.rs` canonicalizes raw Git repo targets, validates repository
+  identity via tenant-scoped normalization, and preserves request-side
+  selection intent (default-branch, explicit refs, or explicit commit) for
+  later Git control-plane stages.
 
-These stages are optional for other ordered-content sources (e.g., git
-ls-files connectors) but required for filesystem security and determinism.
+The filesystem stages are required for filesystem security and determinism.
+Git request normalization is required for tenant-scoped identity resolution
+and target deduplication.
 
 ### Git Repo-Native
 
@@ -135,7 +140,8 @@ and `types.rs`.
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
-| `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem request normalization, planning, and run setup |
+| `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem and Git request normalization, planning, and run setup |
+| `crates/gossip-orchestrator/src/git_request.rs` | Canonical Git submission request normalization and target deduplication |
 | `crates/gossip-orchestrator/src/request.rs` | Canonical filesystem submission request normalization |
 | `crates/gossip-orchestrator/src/planner.rs` | Deterministic filesystem initial shard geometry planner |
 | `crates/gossip-orchestrator/src/payload.rs` | Typed filesystem shard payload wire format (encode/decode) |

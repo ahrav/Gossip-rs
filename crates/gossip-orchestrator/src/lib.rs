@@ -1,14 +1,18 @@
 //! Reusable control-plane surfaces for request normalization and planning.
 //!
-//! This crate owns the filesystem submission contract that later
+//! This crate owns the filesystem and Git submission contracts that later
 //! orchestration steps consume for shard planning, payload encoding, and
 //! run setup.
 //!
 //! # Stages
 //!
-//! 1. **Request normalization** ([`request`]): canonicalizes raw filesystem
-//!    paths and validates them against the requested source mode (single file
-//!    vs. directory root). Produces [`NormalizedFilesystemRequest`].
+//! 1. **Request normalization**:
+//!    - [`request`] canonicalizes raw filesystem paths and validates them
+//!      against the requested source mode (single file vs. directory root).
+//!      Produces [`NormalizedFilesystemRequest`].
+//!    - [`git_request`] canonicalizes raw Git repo requests, validates
+//!      repository identity, and preserves request-side selection intent for
+//!      later Git control-plane stages.
 //! 2. **Initial shard geometry planning** ([`planner`]): maps normalized
 //!    requests to deterministic startup shard geometries. The current policy
 //!    emits one full-range shard per request; later coordination split flows
@@ -24,6 +28,7 @@
 //! [`RunManagement`](gossip_coordination::RunManagement) and mutates
 //! run/shard state.
 
+pub mod git_request;
 pub mod payload;
 pub mod planner;
 pub mod request;
@@ -32,6 +37,10 @@ pub mod setup;
 #[cfg(test)]
 mod test_support;
 
+pub use git_request::{
+    GitRequest, GitRequestError, GitRequestSelection, GitRequestTarget, NormalizedGitRequest,
+    NormalizedGitSelection, NormalizedGitTarget,
+};
 pub use payload::{
     FilesystemShardPayload, FilesystemShardPayloadDecodeError, FilesystemShardPayloadEncodeError,
 };
