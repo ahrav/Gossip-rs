@@ -50,3 +50,6 @@ specs/tla2tools.jar
 runbooks/
 run-runbook.sh
 runbook-params.json
+
+docker/
+.dockerignore
