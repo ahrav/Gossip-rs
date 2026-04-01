@@ -155,7 +155,7 @@ pub fn parse_commit(
     })
 }
 
-/// Parses the "tree <hex>\n" line.
+/// Parses the `tree <hex>\n` line.
 fn parse_tree_line(
     data: &[u8],
     pos: &mut usize,
@@ -187,7 +187,7 @@ fn parse_tree_line(
     Ok(oid)
 }
 
-/// Parses a "parent <hex>\n" line.
+/// Parses a `parent <hex>\n` line.
 fn parse_parent_line(
     data: &[u8],
     pos: &mut usize,
