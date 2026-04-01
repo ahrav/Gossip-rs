@@ -225,7 +225,7 @@ fn submit_filesystem_request(
         now(1),
         tenant_id(),
         run_id(),
-        FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+        FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
         OpId::from_raw(1),
     )
     .expect("test filesystem run setup should succeed");

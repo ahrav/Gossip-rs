@@ -399,13 +399,28 @@ impl fmt::Debug for GitRequestSelection {
 }
 
 /// Canonical Git request output after repo normalization and target dedupe.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NormalizedGitRequest {
     tenant_id: TenantId,
     run_config: RunConfig,
     scan_mode: GitScanMode,
     merge_strategy: GitMergeStrategy,
     targets: Vec<NormalizedGitTarget>,
+}
+
+// Custom Debug: shows target_count instead of the full target list to keep
+// log output concise for multi-repo requests.  Individual targets are visible
+// through GitInitialShardPlanEntry when needed.
+impl fmt::Debug for NormalizedGitRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NormalizedGitRequest")
+            .field("tenant_id", &self.tenant_id)
+            .field("run_config", &self.run_config)
+            .field("scan_mode", &self.scan_mode)
+            .field("merge_strategy", &self.merge_strategy)
+            .field("target_count", &self.targets.len())
+            .finish()
+    }
 }
 
 impl NormalizedGitRequest {
@@ -441,11 +456,43 @@ impl NormalizedGitRequest {
 }
 
 /// One canonical repo target inside a [`NormalizedGitRequest`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NormalizedGitTarget {
     repo_target: GitRepoTarget,
     repo_id: u64,
     selection: NormalizedGitSelection,
+}
+
+// Custom Debug: redacts repo identity through ToxicDigest to match the
+// established pattern in GitShardPayload::Debug.  RepoKey encodes the
+// canonical filesystem path, which must not appear raw in log output.
+impl fmt::Debug for NormalizedGitTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (locator_kind, locator_digest) = match self.repo_target.locator() {
+            RepoLocator::LocalPath(path) => (
+                "LocalPath",
+                ToxicDigest::of_bytes(path.as_os_str().as_encoded_bytes()),
+            ),
+        };
+
+        f.debug_struct("NormalizedGitTarget")
+            .field(
+                "repo_key",
+                &ToxicDigest::of_bytes(self.repo_target.repo_key().as_bytes()),
+            )
+            .field("locator_kind", &locator_kind)
+            .field("locator", &locator_digest)
+            .field(
+                "display_name",
+                &self
+                    .repo_target
+                    .display_name()
+                    .map(|n| ToxicDigest::of_bytes(n.as_bytes())),
+            )
+            .field("repo_id", &self.repo_id)
+            .field("selection", &self.selection)
+            .finish()
+    }
 }
 
 impl NormalizedGitTarget {
@@ -1476,5 +1523,66 @@ mod tests {
             err,
             GitRequestError::NullExplicitCommit { target_index: 0 }
         ));
+    }
+
+    #[test]
+    fn debug_redacts_normalized_request_targets() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let normalized = GitRequest::single_repo(
+            tenant(0xC1),
+            dir.path(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize");
+
+        let rendered = format!("{normalized:?}");
+
+        // Must not contain the filesystem path that enters the repo key.
+        let dir_str = dir.path().to_string_lossy();
+        assert!(
+            !rendered.contains(dir_str.as_ref()),
+            "Debug output must not leak the repo path: {rendered}"
+        );
+        // Must contain the target count instead of the full list.
+        assert!(
+            rendered.contains("target_count"),
+            "Debug output must show target_count: {rendered}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_normalized_target_repo_identity() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let normalized = GitRequest::single_repo(
+            tenant(0xC2),
+            dir.path(),
+            run_config(),
+            default_scan_mode(),
+            default_merge_strategy(),
+        )
+        .normalize()
+        .expect("normalize");
+
+        let target = &normalized.targets()[0];
+        let rendered = format!("{target:?}");
+
+        // Must not contain the raw filesystem path.
+        let dir_str = dir.path().to_string_lossy();
+        assert!(
+            !rendered.contains(dir_str.as_ref()),
+            "Debug output must not leak the repo path: {rendered}"
+        );
+        // Must contain ToxicDigest-style fields (len= and hash=).
+        assert!(
+            rendered.contains("len=") && rendered.contains("hash="),
+            "Debug output must use ToxicDigest redaction: {rendered}"
+        );
     }
 }

@@ -89,10 +89,10 @@ impl FilesystemRunSetupResult {
 ///
 /// Its custom [`fmt::Debug`] implementation redacts the canonical root so tracing
 /// and test failures do not leak filesystem paths by default.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct FilesystemRunSetupInput<'a> {
     request: &'a NormalizedFilesystemRequest,
-    geometry: InitialShardGeometry,
+    geometry: &'a InitialShardGeometry,
     payload: &'a FilesystemShardPayload,
 }
 
@@ -103,7 +103,7 @@ impl fmt::Debug for FilesystemRunSetupInput<'_> {
         f.debug_struct("FilesystemRunSetupInput")
             .field("mode", &self.request.mode())
             .field("canonical_root", &"<redacted>")
-            .field("geometry", &self.geometry)
+            .field("geometry", self.geometry)
             .field("payload", &self.payload)
             .finish()
     }
@@ -121,7 +121,7 @@ impl<'a> FilesystemRunSetupInput<'a> {
     #[must_use]
     pub fn new(
         request: &'a NormalizedFilesystemRequest,
-        geometry: InitialShardGeometry,
+        geometry: &'a InitialShardGeometry,
         payload: &'a FilesystemShardPayload,
     ) -> Self {
         Self {
@@ -139,8 +139,8 @@ impl<'a> FilesystemRunSetupInput<'a> {
 
     /// Planned startup shard geometry.
     #[must_use]
-    pub fn geometry(&self) -> &InitialShardGeometry {
-        &self.geometry
+    pub fn geometry(&self) -> &'a InitialShardGeometry {
+        self.geometry
     }
 
     /// Typed payload to encode into shard metadata.
@@ -472,7 +472,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(11),
         )
         .expect("run setup should succeed");
@@ -503,7 +503,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(20),
         )
         .expect("single-file run setup should succeed");
@@ -534,7 +534,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(12),
         )
         .expect("first setup should succeed")
@@ -545,7 +545,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(12),
         )
         .expect("replayed setup should succeed");
@@ -572,7 +572,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(13),
         )
         .expect("setup should resume from initializing state");
@@ -599,7 +599,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(14),
         )
         .expect_err("mismatched config should be rejected");
@@ -631,7 +631,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request_a, plan_a.initial_shard().clone(), &payload_a),
+            FilesystemRunSetupInput::new(&request_a, plan_a.initial_shard(), &payload_a),
             OpId::from_raw(15),
         )
         .expect("first setup should succeed");
@@ -641,7 +641,7 @@ mod tests {
             now(2),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request_b, plan_b.initial_shard().clone(), &payload_b),
+            FilesystemRunSetupInput::new(&request_b, plan_b.initial_shard(), &payload_b),
             OpId::from_raw(15),
         )
         .expect_err("conflicting replay payload should be rejected");
@@ -673,11 +673,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(
-                &request,
-                plan.initial_shard().clone(),
-                &mismatched_payload,
-            ),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &mismatched_payload),
             OpId::from_raw(16),
         )
         .expect_err("request/payload mismatch should be rejected before mutation");
@@ -711,7 +707,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(17),
         )
         .expect("short-name setup should succeed");
@@ -737,11 +733,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(
-                &request,
-                plan.initial_shard().clone(),
-                &mismatched_payload,
-            ),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &mismatched_payload),
             OpId::from_raw(18),
         )
         .expect_err("mode mismatch should be rejected before mutation");
@@ -768,7 +760,7 @@ mod tests {
         let request = normalize_directory(&scan_root, run_config());
         let plan = plan_filesystem_initial_shards(request.clone());
         let payload = plan.shard_payload();
-        let input = FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload);
+        let input = FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload);
 
         let rendered = format!("{input:?}");
 
@@ -809,7 +801,7 @@ mod tests {
             now(1),
             tenant(),
             run(),
-            FilesystemRunSetupInput::new(&request, plan.initial_shard().clone(), &payload),
+            FilesystemRunSetupInput::new(&request, plan.initial_shard(), &payload),
             OpId::from_raw(30),
         )
         .expect("deep-path run setup must not fail with SlabFull");
