@@ -1143,14 +1143,13 @@ mod tests {
     use std::fs;
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     use gossip_frontier::hint::{ShardSpecScratch, decode_connector_extra, range_shard_ref};
     use tempfile::tempdir;
 
     use super::*;
     use crate::git_request::{GitRequest, GitRequestSelection, GitRequestTarget};
-    use crate::test_support::run_config;
+    use crate::test_support::{init_git_repo, run_config};
 
     fn tenant(byte: u8) -> TenantId {
         TenantId::from_bytes([byte; 32])
@@ -1164,30 +1163,8 @@ mod tests {
         GitMergeStrategy::AllParents
     }
 
-    fn run_git_in(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-            dir.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
     fn init_repo(dir: &Path) {
-        run_git_in(dir, &["init", "-q"]);
-        run_git_in(
-            dir,
-            &["config", "user.email", "git-payload-tests@example.com"],
-        );
-        run_git_in(dir, &["config", "user.name", "Git Payload Tests"]);
+        init_git_repo(dir, "git-payload-tests@example.com", "Git Payload Tests");
     }
 
     fn execution_limits() -> GitExecutionLimits {

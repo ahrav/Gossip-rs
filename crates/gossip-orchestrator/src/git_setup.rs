@@ -43,12 +43,12 @@ pub struct GitRunSetupResult {
 
 impl GitRunSetupResult {
     fn from_run(run: RunRecord) -> Self {
-        debug_assert!(
+        assert!(
             run.status() == RunStatus::Active,
             "GitRunSetupResult requires Active status, got {:?}",
             run.status()
         );
-        debug_assert!(
+        assert!(
             !run.root_shards().is_empty(),
             "GitRunSetupResult requires non-empty root shards"
         );
@@ -97,6 +97,9 @@ pub enum GitRunSetupError {
     /// A Git startup plan must contain at least one repo target.
     #[error("git startup plan must contain at least one repo target")]
     EmptyPlan,
+    /// Planned target count exceeds the maximum startup manifest capacity.
+    #[error("git startup plan has {count} targets, exceeding the maximum of {max}")]
+    TooManyTargets { count: usize, max: usize },
     /// Planned shard count must match normalized target count.
     #[error(
         "git startup plan entry count {planned} does not match normalized target count {request}"
@@ -154,6 +157,11 @@ impl fmt::Debug for GitRunSetupError {
                 .field("tenant", &"<redacted>")
                 .finish(),
             Self::EmptyPlan => write!(f, "EmptyPlan"),
+            Self::TooManyTargets { count, max } => f
+                .debug_struct("TooManyTargets")
+                .field("count", count)
+                .field("max", max)
+                .finish(),
             Self::TargetCountMismatch { request, planned } => f
                 .debug_struct("TargetCountMismatch")
                 .field("request", request)
@@ -270,6 +278,12 @@ fn validate_plan(tenant: TenantId, plan: &GitInitialShardPlan) -> Result<(), Git
     let entries = plan.entries();
     if entries.is_empty() {
         return Err(GitRunSetupError::EmptyPlan);
+    }
+    if entries.len() > MAX_GIT_STARTUP_MANIFEST_SHARDS {
+        return Err(GitRunSetupError::TooManyTargets {
+            count: entries.len(),
+            max: MAX_GIT_STARTUP_MANIFEST_SHARDS,
+        });
     }
     if entries.len() != request.targets().len() {
         return Err(GitRunSetupError::TargetCountMismatch {
@@ -1083,6 +1097,10 @@ mod tests {
                 tenant: TenantId::from_bytes([0xBB; 32]),
             },
             GitRunSetupError::EmptyPlan,
+            GitRunSetupError::TooManyTargets {
+                count: 2048,
+                max: 1024,
+            },
             GitRunSetupError::TargetCountMismatch {
                 request: 3,
                 planned: 1,
@@ -1137,6 +1155,15 @@ mod tests {
         assert!(
             empty_err.source().is_none(),
             "EmptyPlan must not chain source"
+        );
+
+        let too_many_err = GitRunSetupError::TooManyTargets {
+            count: 2048,
+            max: 1024,
+        };
+        assert!(
+            too_many_err.source().is_none(),
+            "TooManyTargets must not chain source"
         );
 
         let count_err = GitRunSetupError::TargetCountMismatch {

@@ -730,42 +730,19 @@ fn infer_object_format_from_hex_len(hex: &[u8]) -> Option<ObjectFormat> {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     use gossip_contracts::identity::TenantId;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::test_support::run_config;
+    use crate::test_support::{init_git_repo, run_config, run_git_in};
 
     fn tenant(byte: u8) -> TenantId {
         TenantId::from_bytes([byte; 32])
     }
 
-    fn run_git_in(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-            dir.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
     fn init_repo(dir: &Path) {
-        run_git_in(dir, &["init", "-q"]);
-        run_git_in(
-            dir,
-            &["config", "user.email", "git-request-tests@example.com"],
-        );
-        run_git_in(dir, &["config", "user.name", "Git Request Tests"]);
+        init_git_repo(dir, "git-request-tests@example.com", "Git Request Tests");
     }
 
     fn init_committed_repo(dir: &Path) {

@@ -320,12 +320,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "at least one non-0xFF byte")]
-    fn all_0xff_max_key_size_returns_error() {
+    fn all_0xff_max_key_size_panics_in_debug() {
         let key = vec![0xFF; MAX_KEY_SIZE];
         // In debug builds the debug_assert fires before reaching the
-        // `KeyHasNoSuccessor` error path.  Both layers reject this input.
+        // `KeyHasNoSuccessor` error path.
         let _ = exact_key_geometry(&key);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn all_0xff_max_key_size_returns_error_in_release() {
+        let key = vec![0xFF; MAX_KEY_SIZE];
+        // In release builds, debug_assert is compiled out and the function
+        // returns KeyHasNoSuccessor via the prefix_successor fallback.
+        let result = exact_key_geometry(&key);
+        assert!(
+            result.is_err(),
+            "all-0xFF key at MAX_KEY_SIZE must return Err"
+        );
     }
 
     #[test]

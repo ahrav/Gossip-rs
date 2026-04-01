@@ -57,12 +57,12 @@ pub struct FilesystemRunSetupResult {
 
 impl FilesystemRunSetupResult {
     fn from_run(run: RunRecord) -> Self {
-        debug_assert!(
+        assert!(
             run.status() == RunStatus::Active,
             "FilesystemRunSetupResult requires Active status, got {:?}",
             run.status()
         );
-        debug_assert!(
+        assert!(
             !run.root_shards().is_empty(),
             "FilesystemRunSetupResult requires non-empty root shards"
         );
