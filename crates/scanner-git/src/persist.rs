@@ -71,7 +71,7 @@ impl PersistenceStore for InMemoryPersistenceStore {
         // Stage all changes before committing so a mid-loop error does not
         // leave partially applied ops in the store. This preserves the
         // atomic commit contract: either all ops land or none do.
-        let mut staged_data = Vec::with_capacity(output.data_ops.len());
+        let mut staged_data: Vec<WriteOp> = Vec::with_capacity(output.data_ops.len());
         #[cfg(feature = "rocksdb")]
         let mut staged_scopes: HashMap<Vec<u8>, RoaringSeenBitmap> =
             self.seen_scopes.borrow().clone();
@@ -98,10 +98,16 @@ impl PersistenceStore for InMemoryPersistenceStore {
                     .serialize()
                     .map_err(|err| PersistError::backend(err.to_string()))?;
                 staged_scopes.insert(op.key.clone(), bitmap);
-                staged_data.push(WriteOp {
-                    key: op.key.clone(),
-                    value: merged,
-                });
+                // Collapse same-scope deltas to a single logged write,
+                // matching the RocksDB store which emits one put per scope.
+                if let Some(existing) = staged_data.iter_mut().find(|w| w.key == op.key) {
+                    existing.value = merged;
+                } else {
+                    staged_data.push(WriteOp {
+                        key: op.key.clone(),
+                        value: merged,
+                    });
+                }
                 continue;
             }
 
@@ -166,5 +172,51 @@ mod tests {
         assert!(bitmap.contains(&oid_a));
         assert!(bitmap.contains(&oid_b));
         assert!(bitmap.contains(&oid_c));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn in_memory_store_collapses_same_scope_deltas_to_one_write() {
+        use crate::roaring_seen::RoaringSeenBitmap;
+
+        let store = InMemoryPersistenceStore::default();
+        let scope_key = build_seen_scope_key(42, &[0xAB; 32]);
+
+        // Two deltas for the same scope key in a single commit.
+        let delta_a = SeenBitmapDelta::from_oids(&[OidBytes::sha1([0x11; 20])]).expect("a");
+        let delta_b = SeenBitmapDelta::from_oids(&[OidBytes::sha1([0x22; 20])]).expect("b");
+
+        let output = FinalizeOutput {
+            data_ops: vec![
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: delta_a.serialize(),
+                },
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: delta_b.serialize(),
+                },
+            ],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+
+        store.commit_finalize(&output).expect("commit");
+
+        // Only one WriteOp should be logged for the scope key, containing
+        // the fully merged bitmap — matching RocksDB store behavior.
+        let logged = store.data_ops.borrow();
+        let scope_ops: Vec<&WriteOp> = logged.iter().filter(|w| w.key == scope_key).collect();
+        assert_eq!(
+            scope_ops.len(),
+            1,
+            "expected one collapsed WriteOp per scope key, got {}",
+            scope_ops.len()
+        );
+
+        let bitmap = RoaringSeenBitmap::deserialize(&scope_ops[0].value).expect("bitmap");
+        assert!(bitmap.contains(&OidBytes::sha1([0x11; 20])));
+        assert!(bitmap.contains(&OidBytes::sha1([0x22; 20])));
     }
 }
