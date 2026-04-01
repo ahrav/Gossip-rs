@@ -579,10 +579,12 @@ pub enum GitRequestError {
         target_index: usize,
     },
     /// An individual ref in the explicit refs list is empty (zero-length).
-    #[error("git request target {target_index} contains an empty ref name")]
+    #[error("git request target {target_index} ref at position {ref_index} is empty")]
     EmptyRef {
         /// Zero-based position in the raw request target list.
         target_index: usize,
+        /// Zero-based position within the refs list.
+        ref_index: usize,
     },
     /// An individual ref contains a NUL byte, which Git refnames prohibit.
     #[error("git request target {target_index} ref at position {ref_index} contains a NUL byte")]
@@ -616,10 +618,13 @@ fn normalize_selection(
             if refs.is_empty() {
                 return Err(GitRequestError::EmptyExplicitRefs { target_index });
             }
-            if refs.iter().any(|r| r.is_empty()) {
-                return Err(GitRequestError::EmptyRef { target_index });
-            }
             for (ref_index, r) in refs.iter().enumerate() {
+                if r.is_empty() {
+                    return Err(GitRequestError::EmptyRef {
+                        target_index,
+                        ref_index,
+                    });
+                }
                 if r.contains(&0) {
                     return Err(GitRequestError::RefContainsNul {
                         target_index,
@@ -1135,7 +1140,13 @@ mod tests {
         let err = request
             .normalize()
             .expect_err("empty individual ref should fail");
-        assert!(matches!(err, GitRequestError::EmptyRef { target_index: 0 }));
+        assert!(matches!(
+            err,
+            GitRequestError::EmptyRef {
+                target_index: 0,
+                ref_index: 1,
+            }
+        ));
     }
 
     #[test]
@@ -1155,7 +1166,13 @@ mod tests {
         );
 
         let err = request.normalize().expect_err("sole empty ref should fail");
-        assert!(matches!(err, GitRequestError::EmptyRef { target_index: 0 }));
+        assert!(matches!(
+            err,
+            GitRequestError::EmptyRef {
+                target_index: 0,
+                ref_index: 0,
+            }
+        ));
     }
 
     #[test]
