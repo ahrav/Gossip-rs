@@ -215,7 +215,9 @@ impl SeenBitmapDelta {
         let payload_len = oid_count
             .checked_mul(oid_len as usize)
             .ok_or(SeenBitmapError::LengthMismatch)?;
-        let expected_len = 9 + payload_len;
+        let expected_len = 9usize
+            .checked_add(payload_len)
+            .ok_or(SeenBitmapError::LengthMismatch)?;
         if bytes.len() != expected_len {
             return Err(SeenBitmapError::LengthMismatch);
         }
@@ -342,8 +344,8 @@ impl RoaringSeenBitmap {
     #[must_use]
     pub fn batch_contains_sorted(&self, oids: &[OidBytes]) -> Vec<bool> {
         debug_assert!(
-            oids_are_canonical(oids),
-            "batch_contains_sorted requires strictly sorted input"
+            oids.windows(2).all(|pair| pair[0] <= pair[1]),
+            "batch_contains_sorted requires non-decreasing (sorted) input"
         );
         let mut result = vec![false; oids.len()];
         let mut idx = 0usize;
@@ -397,12 +399,14 @@ impl RoaringSeenBitmap {
         if other_oids.is_empty() {
             return Ok(());
         }
-        let combined = self
+        // Pre-flight: catch usize overflow before allocation. The actual
+        // merged count may be smaller due to dedup, so this is a
+        // conservative upper bound rather than the authoritative check.
+        let _ = self
             .oids
             .len()
             .checked_add(other_oids.len())
             .ok_or(SeenBitmapError::TooManyOids(usize::MAX))?;
-        let _ = u32_len(combined)?;
 
         let mut merged_oids = Vec::with_capacity(self.oids.len() + other_oids.len());
         let mut merged_seen = RoaringBitmap::new();
@@ -454,6 +458,10 @@ impl RoaringSeenBitmap {
             right += 1;
         }
 
+        // Authoritative check: the deduped merged count is the real value
+        // that must fit in u32 for the bitmap to index correctly.
+        let _ = u32_len(merged_oids.len())?;
+
         self.oids = merged_oids;
         self.seen = merged_seen;
         Ok(())
@@ -500,11 +508,14 @@ impl RoaringSeenBitmap {
 
         let oid_len = bytes[4];
         validate_oid_len(oid_len)?;
-        let oid_count = u32::from_be_bytes(bytes[5..9].try_into().unwrap()) as usize;
+        let oid_count_u32 = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
+        let oid_count = oid_count_u32 as usize;
         let oid_bytes_len = oid_count
             .checked_mul(oid_len as usize)
             .ok_or(SeenBitmapError::LengthMismatch)?;
-        let bitmap_len_offset = 9 + oid_bytes_len;
+        let bitmap_len_offset = 9usize
+            .checked_add(oid_bytes_len)
+            .ok_or(SeenBitmapError::LengthMismatch)?;
         if bytes.len() < bitmap_len_offset + 4 {
             return Err(SeenBitmapError::Truncated);
         }
@@ -519,7 +530,10 @@ impl RoaringSeenBitmap {
                 max: MAX_BITMAP_BYTES,
             });
         }
-        let expected_len = bitmap_len_offset + 4 + bitmap_len;
+        let expected_len = bitmap_len_offset
+            .checked_add(4)
+            .and_then(|n| n.checked_add(bitmap_len))
+            .ok_or(SeenBitmapError::LengthMismatch)?;
         if bytes.len() != expected_len {
             return Err(SeenBitmapError::LengthMismatch);
         }
@@ -541,6 +555,18 @@ impl RoaringSeenBitmap {
             &bytes[bitmap_len_offset + 4..expected_len],
         ))
         .map_err(|err| SeenBitmapError::InvalidBitmap(err.to_string()))?;
+
+        // Reject payloads where the roaring bitmap references positions
+        // beyond the OID index. Without this check, a corrupt or malicious
+        // payload could inflate `len()` / `is_empty()` and persist phantom
+        // bits through round-trip serialization.
+        if let Some(max) = bitmap.max() {
+            if max >= oid_count_u32 {
+                return Err(SeenBitmapError::InvalidBitmap(format!(
+                    "bitmap references position {max} but OID index has {oid_count_u32} entries"
+                )));
+            }
+        }
 
         Ok(Self {
             oid_len,
@@ -713,7 +739,8 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect();
 
-        // Pin the exact serialization so on-disk format changes stay explicit.
+        // Canonical on-disk encoding: any change here means a storage format
+        // migration is needed.
         const EXPECTED: &str =
             "5253424d1400000003101010101010101010101010101010101010101020202020202020202020202020202020202020203030303030303030303030303030303030303030000000163a300000010000000000020010000000000001000200";
         assert_eq!(actual, EXPECTED, "roaring bitmap serialization changed");
@@ -797,6 +824,39 @@ mod tests {
     ) {
         let err = RoaringSeenBitmap::deserialize(&bytes).expect_err("invalid bitmap must fail");
         assert_eq!(err, expected);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn roaring_bitmap_deserialize_rejects_phantom_bits() {
+        // A payload whose roaring bitmap has bit 5 set, but the OID index
+        // only has 1 entry. Position 5 has no corresponding OID.
+        let mut phantom = RoaringBitmap::new();
+        phantom.insert(0); // valid: maps to the single OID
+        phantom.insert(5); // phantom: no OID at index 5
+
+        let mut bitmap_payload = Vec::new();
+        phantom
+            .serialize_into(&mut bitmap_payload)
+            .expect("serialize roaring");
+
+        let bytes = bitmap_bytes(
+            BITMAP_MAGIC,
+            OidBytes::SHA1_LEN,
+            1,
+            sha1(0x10).as_slice(),
+            bitmap_payload.len() as u32,
+            &bitmap_payload,
+        );
+
+        // Deserialization must reject payloads where the bitmap references
+        // positions beyond the OID index.
+        let result = RoaringSeenBitmap::deserialize(&bytes);
+        assert!(
+            result.is_err(),
+            "expected phantom-bit rejection, got bitmap with len={}",
+            result.as_ref().unwrap().len()
+        );
     }
 
     #[cfg(feature = "rocksdb")]

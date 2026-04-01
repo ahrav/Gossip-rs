@@ -287,6 +287,11 @@ impl PersistenceStore for RocksDbStore {
             let mut batch = WriteBatch::default();
             let mut seen_scope_key: Option<Vec<u8>> = None;
             let mut seen_oids = Vec::new();
+            // Declared outside the conditional so the write lock can be held
+            // through db.write, preventing readers from observing in-memory
+            // mutations before they are persisted to disk.
+            let mut _seen_guard: Option<std::sync::RwLockWriteGuard<'_, Option<RoaringSeenStore>>> =
+                None;
             for op in &output.data_ops {
                 if op.key.starts_with(&NS_SEEN_BLOB) {
                     let delta = SeenBitmapDelta::deserialize(&op.value)
@@ -310,18 +315,31 @@ impl PersistenceStore for RocksDbStore {
             }
 
             if !seen_oids.is_empty() {
-                // OIDs were deserialized from a single canonical delta (the
-                // multi-scope check above rejects batches with different scope
-                // keys), so they are already sorted and unique.
-                let delta = SeenBitmapDelta::from_canonical_oids(seen_oids)
+                // Multiple same-scope deltas may have individually sorted OID
+                // lists, but their concatenation is not necessarily globally
+                // sorted. Use `from_oids` to sort and dedup the combined set.
+                let delta = SeenBitmapDelta::from_oids(&seen_oids)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
                 self.load_seen_store(delta.oid_len())
                     .map_err(PersistError::backend)?;
 
-                // Hold the write lock for the entire read-modify-write-persist
-                // cycle. The single-writer invariant (one lease owner per scope)
-                // means no contention on the write lock, so holding it through
-                // serialization and db.write avoids cloning the bitmap.
+                // Validate that the scope key matches this store's identity.
+                // The multi-scope check above ensures all ops share one key,
+                // but that key must also match the store's repo_id/policy_hash
+                // to prevent cross-scope pollution.
+                let scope_key = seen_scope_key
+                    .as_ref()
+                    .ok_or_else(|| PersistError::backend("seen-bitmap delta without scope key"))?;
+                let expected_scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
+                if *scope_key != expected_scope_key {
+                    return Err(PersistError::backend(
+                        "seen-bitmap scope key does not match store identity",
+                    ));
+                }
+
+                // Hold the write lock through the entire
+                // read-modify-write-persist cycle so concurrent readers
+                // (batch_check_seen) never observe uncommitted mutations.
                 let mut guard = self
                     .seen_store
                     .write()
@@ -334,9 +352,6 @@ impl PersistenceStore for RocksDbStore {
                     .bitmap_mut()
                     .insert_batch(delta.oids())
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                let scope_key = seen_scope_key
-                    .as_ref()
-                    .ok_or_else(|| PersistError::backend("seen-bitmap delta without scope key"))?;
                 batch.put(
                     scope_key,
                     store
@@ -344,6 +359,10 @@ impl PersistenceStore for RocksDbStore {
                         .serialize()
                         .map_err(|err| PersistError::backend(err.to_string()))?,
                 );
+                // Move the write guard out so it is held through db.write
+                // below. Without this, a concurrent batch_check_seen could
+                // observe the in-memory mutation before it is persisted.
+                _seen_guard = Some(guard);
             }
 
             if matches!(output.outcome, FinalizeOutcome::Complete) {
@@ -356,6 +375,9 @@ impl PersistenceStore for RocksDbStore {
                 .map_err(|err| PersistError::backend(err.to_string()))?;
             // Write lock (if held) drops here after db.write succeeds,
             // keeping the in-memory bitmap consistent with on-disk state.
+            // NOTE: if db.write fails, the in-memory bitmap retains
+            // uncommitted mutations; the caller must discard the store.
+            drop(_seen_guard);
             Ok(())
         }
 
@@ -746,6 +768,57 @@ mod tests {
         assert!(
             msg.contains("multiple seen-bitmap scope keys"),
             "error should mention multiple scope keys, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_handles_multi_delta_same_scope() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 16;
+        let policy_hash = [0xEE; 32];
+
+        // Two deltas with the same scope key but interleaving OID ranges.
+        // Delta 1: [0x30, 0x40] (sorted within)
+        // Delta 2: [0x10, 0x20] (sorted within)
+        // Concatenation: [0x30, 0x40, 0x10, 0x20] — NOT globally sorted.
+        let oids_high = vec![OidBytes::sha1([0x30; 20]), OidBytes::sha1([0x40; 20])];
+        let oids_low = vec![OidBytes::sha1([0x10; 20]), OidBytes::sha1([0x20; 20])];
+        let delta_high = SeenBitmapDelta::from_oids(&oids_high).expect("delta high");
+        let delta_low = SeenBitmapDelta::from_oids(&oids_low).expect("delta low");
+
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        let output = FinalizeOutput {
+            data_ops: vec![
+                WriteOp {
+                    key: scope_key.clone(),
+                    value: delta_high.serialize(),
+                },
+                WriteOp {
+                    key: scope_key,
+                    value: delta_low.serialize(),
+                },
+            ],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .commit_finalize(&output)
+            .expect("multi-delta same-scope commit");
+
+        assert_eq!(
+            store
+                .batch_check_seen(&[
+                    OidBytes::sha1([0x10; 20]),
+                    OidBytes::sha1([0x20; 20]),
+                    OidBytes::sha1([0x30; 20]),
+                    OidBytes::sha1([0x40; 20]),
+                ])
+                .expect("batch check"),
+            vec![true, true, true, true]
         );
     }
 

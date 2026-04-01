@@ -81,7 +81,11 @@ impl PersistenceStore for InMemoryPersistenceStore {
                     .remove(&op.key)
                     .unwrap_or_else(|| RoaringSeenBitmap::new(delta.oid_len()));
                 if bitmap.oid_len() != delta.oid_len() {
-                    bitmap = RoaringSeenBitmap::new(delta.oid_len());
+                    return Err(PersistError::backend(format!(
+                        "seen-bitmap OID length mismatch: stored={}, incoming={}",
+                        bitmap.oid_len(),
+                        delta.oid_len()
+                    )));
                 }
                 bitmap
                     .insert_batch(delta.oids())
