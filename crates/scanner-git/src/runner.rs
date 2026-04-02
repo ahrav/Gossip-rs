@@ -871,8 +871,10 @@ pub enum GitScanError {
 /// - `resolver` controls how the start set is chosen (default branch, refs, etc.).
 /// - `seen_store` is used to dedupe candidates across runs.
 /// - `watermark_store` supplies existing ref watermarks; it is not mutated here.
-/// - `persist_store` is optional; when `Some`, finalize output (including
-///   watermarks on complete runs) is committed atomically.
+/// - `persist_store` is optional; when `Some`, spill-stage seen-bitmap
+///   deltas are staged incrementally, and finalize output (including
+///   watermarks on complete runs and folded staging deltas) is committed
+///   atomically.
 ///
 /// If no persistence store is provided, the caller is responsible for
 /// interpreting `FinalizeOutcome` and storing watermarks as needed.

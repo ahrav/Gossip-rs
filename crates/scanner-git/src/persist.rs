@@ -32,9 +32,10 @@ use super::seen_store::SeenBlobStore;
 ///
 /// The `SeenBitmapPersister` supertrait is required because the spill-flush
 /// pipeline dispatches the persistence store as a seen-bitmap persister to
-/// write incremental bitmap deltas between finalize calls. Any
-/// `PersistenceStore` implementation must therefore also provide durable
-/// seen-bitmap writes.
+/// write incremental bitmap deltas to a staging key between finalize calls.
+/// `commit_finalize` folds staging deltas into the live bitmap atomically.
+/// Any `PersistenceStore` implementation must therefore also provide
+/// staging-safe seen-bitmap writes.
 pub trait PersistenceStore: SeenBitmapPersister {
     /// Commits finalize output atomically.
     ///
