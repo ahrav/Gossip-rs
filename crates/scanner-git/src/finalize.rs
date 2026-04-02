@@ -56,6 +56,12 @@ pub(crate) const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
 pub(crate) const NS_FINDING: [u8; 3] = *b"fn\0";
 /// Namespace prefix for the seen bitmap scope key.
 pub(crate) const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
+/// Namespace prefix for the staging seen bitmap (spill checkpoints).
+///
+/// Spill-stage deltas are written here and folded into the live `sb\0`
+/// key only during `commit_finalize`. On crash, staging keys are orphaned
+/// and cleaned up on the next store open.
+pub(crate) const NS_SEEN_STAGING: [u8; 3] = *b"ss\0";
 
 // Compile-time: verify namespace lexicographic ordering.
 const _: () = {
@@ -224,6 +230,8 @@ fn ref_wm_key_len(ref_name: &[u8]) -> usize {
 
 /// Byte length of the fixed-width seen-bitmap scope key.
 const SEEN_SCOPE_KEY_LEN: usize = 43;
+/// Byte length of the fixed-width seen-bitmap staging key (same layout).
+const SEEN_STAGING_KEY_LEN: usize = 43;
 
 /// Builds a key for blob-keyed namespaces.
 ///
@@ -251,6 +259,19 @@ pub(crate) fn build_seen_scope_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<
     key.extend_from_slice(&repo_id.to_be_bytes());
     key.extend_from_slice(policy_hash);
     debug_assert_eq!(key.len(), SEEN_SCOPE_KEY_LEN);
+    key
+}
+
+/// Builds the staging key for spill-stage seen-bitmap deltas.
+///
+/// Same layout as the live scope key but under the `ss\0` namespace.
+/// Spill writes go here; `commit_finalize` folds into the live key.
+pub(crate) fn build_seen_staging_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SEEN_STAGING_KEY_LEN);
+    key.extend_from_slice(&NS_SEEN_STAGING);
+    key.extend_from_slice(&repo_id.to_be_bytes());
+    key.extend_from_slice(policy_hash);
+    debug_assert_eq!(key.len(), SEEN_STAGING_KEY_LEN);
     key
 }
 

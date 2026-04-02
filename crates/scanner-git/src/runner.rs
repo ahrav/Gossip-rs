@@ -988,7 +988,10 @@ pub fn run_git_scan(
         identity_interner: identity_interner.clone(),
     };
     let null_seen_persister = NullSeenBitmapPersister;
-    let seen_persister: &dyn SeenBitmapPersister = &null_seen_persister;
+    let seen_persister: &dyn SeenBitmapPersister = match persist_store {
+        Some(store) => store,
+        None => &null_seen_persister,
+    };
     #[allow(unused_mut)]
     let mut output = match config.scan_mode {
         GitScanMode::OdbBlobFast => super::runner_odb_blob::run_odb_blob(
