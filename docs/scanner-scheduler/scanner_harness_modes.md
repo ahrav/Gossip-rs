@@ -144,9 +144,9 @@ The canonical identity tuple is:
 
 The planned integration gate is intended to live in
 `crates/scanner-engine-integration-tests/tests/integration/execution_mode_parity.rs`.
-Today the `tests/integration/main.rs` module list still marks parity coverage as
-deferred until scanner-rs-cli binary naming is settled, so there is no CI job
-for this gate yet. The target matrix covers:
+The `tests/integration/main.rs` module list marks parity coverage as deferred
+until scanner-rs-cli binary naming is settled, so there is no CI job for this
+gate yet. The target matrix covers:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
