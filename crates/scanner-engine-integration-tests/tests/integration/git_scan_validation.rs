@@ -4,6 +4,8 @@
 //! presence, and missing objects. They rely on the `git` CLI to create repos,
 //! generate commit-graph/MIDX artifacts, and mutate the object store.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -19,8 +21,9 @@ use scanner_git::events::{NullEventSink, VecEventSink};
 use scanner_git::{
     ArtifactAcquireError, CommitLoadError, FinalizeOutcome, GitScanConfig, GitScanError,
     GitScanMode, GitScanReport, GitScanResult, InMemoryPersistenceStore, MappingCandidateKind,
-    NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig,
-    StartSetResolver, WriteOp, run_git_scan,
+    NeverSeenStore, OidBytes, PersistError, PersistenceStore, RefWatermarkStore, RepoOpenError,
+    SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig, StartSetResolver, WriteOp,
+    run_git_scan,
 };
 
 const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
@@ -173,6 +176,38 @@ impl RefWatermarkStore for TestWatermarkStore {
         ref_names: &[&[u8]],
     ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
         Ok(ref_names.iter().map(|_| self.watermark).collect())
+    }
+}
+
+#[derive(Default)]
+struct RetryStore {
+    seen: RefCell<HashSet<OidBytes>>,
+    fail_commit_once: Cell<bool>,
+}
+
+impl SeenBlobStore for RetryStore {
+    fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
+        let seen = self.seen.borrow();
+        Ok(oids.iter().map(|oid| seen.contains(oid)).collect())
+    }
+}
+
+impl SeenBitmapPersister for RetryStore {
+    fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError> {
+        let mut seen = self.seen.borrow_mut();
+        for &oid in oids {
+            seen.insert(oid);
+        }
+        Ok(())
+    }
+}
+
+impl PersistenceStore for RetryStore {
+    fn commit_finalize(&self, _output: &scanner_git::FinalizeOutput) -> Result<(), PersistError> {
+        if self.fail_commit_once.replace(false) {
+            return Err(PersistError::backend("injected finalize failure"));
+        }
+        Ok(())
     }
 }
 
@@ -671,6 +706,63 @@ fn run_scan_with_events(
         .map(String::from)
         .collect();
     (result, lines)
+}
+
+#[test]
+fn failed_finalize_retry_still_scans_blob() {
+    if !git_available() {
+        eprintln!("git not available, skipping");
+        return;
+    }
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+    commit_file(
+        repo,
+        "secret.txt",
+        "prefix TOK_ABCDEFGH suffix",
+        "add secret",
+    );
+    ensure_artifacts(repo);
+
+    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let resolver = TestResolver { tip };
+    let watermark_store = TestWatermarkStore { watermark: None };
+    let store = RetryStore {
+        seen: RefCell::new(HashSet::new()),
+        fail_commit_once: Cell::new(true),
+    };
+    let config = base_config();
+
+    let first = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &store,
+        &watermark_store,
+        Some(&store),
+        &config,
+        std::sync::Arc::new(NullEventSink),
+    );
+    assert!(
+        matches!(first, Err(GitScanError::Persist(_))),
+        "expected finalize persistence failure, got {first:?}"
+    );
+
+    let second = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &store,
+        &watermark_store,
+        Some(&store),
+        &config,
+        std::sync::Arc::new(NullEventSink),
+    )
+    .expect("retry should succeed");
+
+    assert_eq!(second.0.finalize.stats.unique_blobs, 1);
+    assert_eq!(second.0.finalize.stats.total_findings, 1);
 }
 
 /// Verify that every finding's `commit_id` has a matching `commit_meta` event
