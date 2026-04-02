@@ -161,7 +161,7 @@ a sustained-green gate script (separate implementation).
 ### Commands
 
 ```bash
-# Planned parity gate command once the test exists
+# Planned parity gate command
 cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 
 # Optional tuning knobs for local stress/debug
@@ -202,7 +202,7 @@ The planned implementation is expected to live in
 ### Commands
 
 ```bash
-# Planned command once the conformance test exists
+# Planned conformance test command
 cargo test --features connector-pipeline filesystem_enumeration_conformance_matrix_matches_connector
 ```
 
