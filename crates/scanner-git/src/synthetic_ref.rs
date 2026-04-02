@@ -230,8 +230,10 @@ pub fn materialize_synthetic_commit_ref(
 /// Uses a tiered resolution strategy to minimize I/O:
 ///
 /// 1. **Commit-graph** (Tier 0) — the on-disk commit-graph stores only commit
-///    OIDs. A hit is definitive proof the object is a commit, with zero pack
-///    I/O. A miss is inconclusive (the graph may be incomplete or absent).
+///    OIDs. A hit is a commit hint, but the object database is still probed to
+///    confirm the object exists because commit-graph entries can outlive
+///    pruned objects. A miss is inconclusive (the graph may be incomplete or
+///    absent).
 /// 2. **On-disk MIDX** (Tier 1) — if `<pack>/multi-pack-index` exists, it is
 ///    mmapped and used directly. This avoids the O(N log P) k-way merge that
 ///    `build_midx_bytes` performs when building an in-memory MIDX from scratch.
@@ -253,10 +255,9 @@ fn lookup_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
-    // Tier 0: commit-graph — definitive for commits, zero pack I/O.
-    if let Some(kind) = lookup_commit_graph_kind(paths, oid) {
-        return Ok(Some(kind));
-    }
+    // Tier 0: commit-graph — confirms commit identity, but not object
+    // liveness. The packed/loose tiers below still verify existence.
+    let _commit_graph_hit = lookup_commit_graph_kind(paths, oid).is_some();
 
     // Tier 1+2: on-disk MIDX (zero-copy mmap) or in-memory MIDX build.
     //
@@ -347,9 +348,10 @@ fn lookup_object_kind(
 /// Probe the on-disk commit-graph for `oid`.
 ///
 /// The commit-graph stores only commit OIDs in a fanout-indexed sorted array.
-/// A hit is definitive: if the OID is found, the object is a commit. A miss
-/// is inconclusive — the graph may be incomplete (not all commits are indexed)
-/// or absent entirely.
+/// A hit means the graph recorded this OID as a commit, but callers still need
+/// to confirm the object exists in the object database because commit-graph
+/// entries can outlive pruned objects. A miss is inconclusive — the graph may
+/// be incomplete (not all commits are indexed) or absent entirely.
 ///
 /// Tries `<objects>/info/commit-graph` first, then the split chain under
 /// `<objects>/info/commit-graphs/`. Errors (missing file, corrupt data) are
@@ -1146,6 +1148,44 @@ mod tests {
 
         let kind = lookup_object_kind(&paths, commit).expect("lookup succeeds");
         assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
+    fn lookup_object_kind_rejects_commit_graph_hits_when_the_object_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+        git(&mirror, &["commit-graph", "write", "--reachable"]);
+
+        let paths = GitRepoPaths::resolve::<RepoOpenError, _>(&mirror, &RepoOpenLimits::default())
+            .expect("resolve paths");
+
+        let hex = commit.to_string();
+        let (dir, file) = hex.split_at(2);
+        let object_path = paths.objects_dir.join(dir).join(file);
+        assert!(
+            object_path.exists(),
+            "commit object should exist before removal"
+        );
+        fs::remove_file(&object_path).expect("remove commit object");
+
+        let kind = lookup_object_kind(&paths, commit).expect("lookup succeeds");
+        assert_eq!(kind, None);
     }
 
     #[test]
