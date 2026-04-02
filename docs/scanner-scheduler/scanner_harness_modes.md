@@ -162,8 +162,9 @@ a sustained-green gate script (not yet implemented).
 ### Commands
 
 ```bash
-# No runnable command exists yet. Implement the deferred integration test module
-# before documenting an invocation here.
+# No runnable command exists yet. The integration test module
+# (`execution_mode_parity`) remains a commented-out placeholder in
+# `crates/scanner-engine-integration-tests/tests/integration/main.rs`.
 ```
 
 ## Mode 4: FS Enumeration Conformance Matrix (Phase 4)
