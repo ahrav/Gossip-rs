@@ -463,7 +463,7 @@ graph TB
         MOD_KS["keyspace.rs<br/>Deterministic key paths<br/>Buffer-reuse API"]
         MOD_CODEC["codec.rs<br/>Binary encode/decode<br/>Staged slab rollback"]
         MOD_ERR["error.rs<br/>Error hierarchy<br/>Operation labels"]
-        MOD_BACK["backend.rs<br/>Direct etcd persistence +<br/>sync-async bridge"]
+        MOD_BACK["backend/<br/>coordinator.rs + run_management.rs +<br/>shard_coordination.rs"]
     end
 
     subgraph testing ["Testing Coverage"]
@@ -525,13 +525,13 @@ graph TB
 | `keyspace.rs` | Complete | Deterministic paths, buffer-reuse API, scan isolation |
 | `codec.rs` | Complete | Binary encode/decode, staged rollback, fuzz-tested |
 | `error.rs` | Complete | Full error hierarchy with operation labels |
-| `backend.rs` | Mostly complete | Direct etcd persistence via CAS transactions for both `EtcdCoordinator` (sync) and `AsyncEtcdCoordinator` (async); `complete` and `park_shard` not yet implemented in either entrypoint |
+| `backend/` | Complete | `coordinator.rs` owns the entrypoints, etcd RPC wrappers, and CAS retry helpers; `run_management.rs` and `shard_coordination.rs` implement the full sync and async run/shard lifecycle, including `complete` and `park_shard` |
 
 The keyspace and codec are shared infrastructure used by the CAS transaction
-logic in `backend.rs`. Operations that are not yet implemented panic with
-`fail_unimplemented` — they have clear protocol semantics from the in-memory
-reference implementation and will be ported as the distributed runtime requires
-them.
+logic in `backend/`. The durable path no longer delegates through an
+`InMemoryCoordinator`; both `EtcdCoordinator` and `AsyncEtcdCoordinator`
+persist coordination state directly in etcd and share the same validation and
+transaction shapes across the sync and async entrypoints.
 
 ---
 
@@ -554,7 +554,10 @@ them.
 | File | Purpose |
 |:---|:---|
 | `crates/gossip-coordination-etcd/src/lib.rs` | Crate root, public re-exports |
-| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), CAS transaction logic, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend.rs` | Module root for the `backend/` tree; shared free functions and backend-wide helpers |
+| `crates/gossip-coordination-etcd/src/backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), sync-async bridge, low-level etcd RPC wrappers, CAS retry loop |
+| `crates/gossip-coordination-etcd/src/backend/run_management.rs` | Sync and async `RunManagement` implementations: run lifecycle, claim candidate collection, and `unpark_shard` |
+| `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | Sync and async `CoordinationBackend` implementations: acquire, renew, checkpoint, complete, park, and split operations |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |
