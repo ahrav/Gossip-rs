@@ -141,13 +141,13 @@ The canonical identity tuple is:
 - span (`start`, `end`)
 - git commit metadata (`oid`, `timestamp`) joined from `commit_meta`
 
-### Planned reduced matrix and CI gate
+### Reduced matrix for the deferred CI gate
 
 The integration gate is still deferred. `crates/scanner-engine-integration-tests/tests/integration/main.rs`
 currently comments out `mod execution_mode_parity;` until the scanner-rs-cli
 binary name is settled, so there is no live `execution_mode_parity.rs`
-integration module and no `execution-mode-parity` CI job yet. The intended reduced matrix
-for that future gate covers:
+integration module and no `execution-mode-parity` CI job. The reduced matrix
+for this gate covers:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
@@ -161,13 +161,13 @@ evaluation across CI windows; see
 the migration-defaulting closeout process (not yet documented) and
 a sustained-green gate script (not yet implemented).
 
-### Intended commands once implemented
+### Commands for the deferred gate
 
 ```bash
-# Planned local parity gate invocation (uses defaults: 9 iterations, 2%/5% thresholds)
+# Local parity gate invocation for this deferred mode (uses defaults: 9 iterations, 2%/5% thresholds)
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 
-# Planned tuning knobs for local stress/debug
+# Tuning knobs for local stress/debug
 EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
