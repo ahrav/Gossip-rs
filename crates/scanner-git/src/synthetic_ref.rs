@@ -270,6 +270,28 @@ fn lookup_object_kind(
         Ok((midx_bytes, from_disk)) => {
             match resolve_via_midx_bytes(midx_bytes.as_slice(), paths, oid) {
                 Ok(Some(kind)) => Ok(Some(kind)),
+                Ok(None) if from_disk => {
+                    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
+                        Ok(built) => match resolve_via_midx_bytes(built.as_slice(), paths, oid) {
+                            Ok(Some(kind)) => Ok(Some(kind)),
+                            Ok(None) => lookup_loose_object_kind(paths, oid),
+                            Err(pack_err) => match lookup_loose_object_kind(paths, oid) {
+                                Ok(Some(kind)) => Ok(Some(kind)),
+                                Ok(None) => Err(pack_err),
+                                Err(_) => Err(pack_err),
+                            },
+                        },
+                        Err(build_err) => {
+                            let err = SyntheticCommitRefError::ObjectLookup {
+                                detail: build_err.to_string(),
+                            };
+                            match lookup_loose_object_kind(paths, oid) {
+                                Ok(Some(kind)) => Ok(Some(kind)),
+                                _ => Err(err),
+                            }
+                        }
+                    }
+                }
                 Ok(None) => lookup_loose_object_kind(paths, oid),
                 Err(first_err) if from_disk => {
                     tracing::debug!(
@@ -1159,6 +1181,57 @@ mod tests {
         // lookup_object_kind should detect the corrupt on-disk MIDX, fall
         // back to building from the .idx file, and resolve the commit.
         let kind = lookup_object_kind(&paths, commit_oid).expect("lookup succeeds via fallback");
+        assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
+    fn lookup_object_kind_rebuilds_stale_ondisk_midx_before_reporting_missing_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+        fs::create_dir_all(&paths.pack_dir).expect("create pack dir");
+
+        let indexed_oid_bytes = [0x10; 20];
+        let target_oid_bytes = [0x11; 20];
+        let target_oid = OidBytes::sha1(target_oid_bytes);
+
+        let mut first_pack = SyntheticPackBuilder::new();
+        let first_idx = first_pack.add_non_delta(1, b"indexed commit");
+        let (first_pack_bytes, first_offsets) = first_pack.build();
+        let first_pack_name = "pack-indexed";
+        fs::write(
+            paths.pack_dir.join(format!("{first_pack_name}.pack")),
+            &first_pack_bytes,
+        )
+        .expect("write indexed pack");
+        fs::write(
+            paths.pack_dir.join(format!("{first_pack_name}.idx")),
+            build_test_idx(&[(indexed_oid_bytes, first_offsets[first_idx])]),
+        )
+        .expect("write indexed idx");
+
+        let mut second_pack = SyntheticPackBuilder::new();
+        let second_idx = second_pack.add_non_delta(1, b"newer commit");
+        let (second_pack_bytes, second_offsets) = second_pack.build();
+        let second_pack_name = "pack-newer";
+        fs::write(
+            paths.pack_dir.join(format!("{second_pack_name}.pack")),
+            &second_pack_bytes,
+        )
+        .expect("write newer pack");
+        fs::write(
+            paths.pack_dir.join(format!("{second_pack_name}.idx")),
+            build_test_idx(&[(target_oid_bytes, second_offsets[second_idx])]),
+        )
+        .expect("write newer idx");
+
+        let mut stale_midx = MidxBuilder::new();
+        stale_midx.add_pack(first_pack_name.as_bytes());
+        stale_midx.add_object(indexed_oid_bytes, 0, first_offsets[first_idx]);
+        fs::write(paths.pack_dir.join("multi-pack-index"), stale_midx.build())
+            .expect("write stale midx");
+
+        let kind = lookup_object_kind(&paths, target_oid).expect("lookup succeeds via rebuild");
         assert_eq!(kind, Some(ObjectKind::Commit));
     }
 }
