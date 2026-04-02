@@ -23,6 +23,7 @@ use gix_ref::bstr::ByteSlice;
 use gix_ref::transaction::{Change, LogChange, PreviousValue, RefEdit};
 use gix_ref::{FullName, Target};
 
+use crate::bytes::BytesView;
 use crate::commit_loader::resolve_pack_paths_from_midx;
 use crate::midx_build::{build_midx_bytes, MidxBuildLimits};
 use crate::native_ref_resolver::open_ref_store_with_format;
@@ -226,10 +227,18 @@ pub fn materialize_synthetic_commit_ref(
 
 /// Determine the object type of `oid` in the mirror's object database.
 ///
-/// Tries the pack index first (via MIDX header-only resolution), falling back
-/// to loose object lookup when packs are absent or when any MIDX/pack
-/// operation fails. Returns `Ok(None)` when the OID is not found in either
-/// store.
+/// Uses a tiered resolution strategy to minimize I/O:
+///
+/// 1. **Commit-graph** (Tier 0) — the on-disk commit-graph stores only commit
+///    OIDs. A hit is definitive proof the object is a commit, with zero pack
+///    I/O. A miss is inconclusive (the graph may be incomplete or absent).
+/// 2. **On-disk MIDX** (Tier 1) — if `<pack>/multi-pack-index` exists, it is
+///    mmapped and used directly. This avoids the O(N log P) k-way merge that
+///    `build_midx_bytes` performs when building an in-memory MIDX from scratch.
+/// 3. **In-memory MIDX build** (Tier 2) — when no on-disk MIDX is present,
+///    the MIDX is built from pack idx files.
+/// 4. **Loose objects** (fallback) — probed when packs are absent or when pack
+///    resolution fails.
 ///
 /// When a pack/MIDX error occurs and the subsequent loose probe also misses,
 /// the original pack error is surfaced rather than silently returning `None`
@@ -242,7 +251,13 @@ fn lookup_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
-    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
+    // Tier 0: commit-graph — definitive for commits, zero pack I/O.
+    if let Some(kind) = lookup_commit_graph_kind(paths, oid) {
+        return Ok(Some(kind));
+    }
+
+    // Tier 1+2: on-disk MIDX (zero-copy mmap) or in-memory MIDX build.
+    match load_or_build_midx(paths, oid.format()) {
         Ok(midx_bytes) => {
             let midx = MidxView::parse(midx_bytes.as_slice(), oid.format()).map_err(|err| {
                 SyntheticCommitRefError::ObjectLookup {
@@ -269,21 +284,70 @@ fn lookup_object_kind(
                 },
             }
         }
-        // Any MIDX build failure (missing packs, corrupt idx, too many
+        // Any MIDX load/build failure (missing packs, corrupt idx, too many
         // packs, etc.) falls back to loose object lookup rather than
         // hard-failing. The object may exist as a loose file even when
         // pack index enumeration cannot complete. If loose also misses,
         // surface the original MIDX error.
         Err(midx_err) => match lookup_loose_object_kind(paths, oid) {
             Ok(Some(kind)) => Ok(Some(kind)),
-            Ok(None) => Err(SyntheticCommitRefError::ObjectLookup {
-                detail: midx_err.to_string(),
-            }),
-            Err(_) => Err(SyntheticCommitRefError::ObjectLookup {
-                detail: midx_err.to_string(),
-            }),
+            Ok(None) => Err(midx_err),
+            Err(_) => Err(midx_err),
         },
     }
+}
+
+/// Probe the on-disk commit-graph for `oid`.
+///
+/// The commit-graph stores only commit OIDs in a fanout-indexed sorted array.
+/// A hit is definitive: if the OID is found, the object is a commit. A miss
+/// is inconclusive — the graph may be incomplete (not all commits are indexed)
+/// or absent entirely.
+///
+/// Tries `<objects>/info/commit-graph` first, then the split chain under
+/// `<objects>/info/commit-graphs/`. Errors (missing file, corrupt data) are
+/// silently swallowed — the caller falls through to pack-based resolution.
+fn lookup_commit_graph_kind(paths: &GitRepoPaths, oid: OidBytes) -> Option<ObjectKind> {
+    let info_dir = paths.objects_dir.join("info");
+    let graph = gix_commitgraph::Graph::from_info_dir(&info_dir).ok()?;
+    let gix_oid = gix_hash::ObjectId::try_from(oid.as_slice()).ok()?;
+    graph.commit_by_id(gix_oid).map(|_| ObjectKind::Commit)
+}
+
+/// Load an existing on-disk MIDX or build one from pack idx files.
+///
+/// The on-disk MIDX at `<pack>/multi-pack-index` is produced by
+/// `git multi-pack-index write` or `git maintenance`. When present it is
+/// mmapped and parsed in microseconds — far cheaper than the O(N log P)
+/// k-way merge that `build_midx_bytes` performs from scratch.
+///
+/// Falls back to `build_midx_bytes` when the on-disk file is absent.
+fn load_or_build_midx(
+    paths: &GitRepoPaths,
+    format: ObjectFormat,
+) -> Result<BytesView, SyntheticCommitRefError> {
+    let ondisk = paths.pack_dir.join("multi-pack-index");
+    if let Ok(file) = fs::File::open(&ondisk) {
+        // SAFETY: MIDX files are immutable for the duration of a mirror job.
+        let mmap = unsafe { memmap2::Mmap::map(&file) };
+        match mmap {
+            Ok(mmap) => {
+                // Validate the on-disk MIDX before trusting it. If parse
+                // fails (stale, corrupt, wrong hash version), fall through
+                // to the in-memory build path.
+                if MidxView::parse(&mmap, format).is_ok() {
+                    return Ok(BytesView::from_mmap(mmap));
+                }
+            }
+            Err(_) => { /* mmap failed — fall through to build */ }
+        }
+    }
+
+    build_midx_bytes(paths, format, &MidxBuildLimits::default()).map_err(|err| {
+        SyntheticCommitRefError::ObjectLookup {
+            detail: err.to_string(),
+        }
+    })
 }
 
 /// Maximum entry-header bytes parsed per pack entry. 64 bytes covers the
