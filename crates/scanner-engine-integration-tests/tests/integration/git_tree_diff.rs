@@ -892,7 +892,9 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
 
     let store = NeverSeenStore;
     let mut sink = CollectingUniqueBlobSink::default();
-    spiller.finalize(&store, &mut sink).unwrap();
+    spiller
+        .finalize(&store, &scanner_git::NullSeenBitmapPersister, &mut sink)
+        .unwrap();
     sink.blobs
 }
 
@@ -973,7 +975,9 @@ fn collect_unique_blobs_buffered(
 
     let store = NeverSeenStore;
     let mut sink = CollectingUniqueBlobSink::default();
-    spiller.finalize(&store, &mut sink).unwrap();
+    spiller
+        .finalize(&store, &scanner_git::NullSeenBitmapPersister, &mut sink)
+        .unwrap();
     sink.blobs
 }
 

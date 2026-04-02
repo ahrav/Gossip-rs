@@ -1,8 +1,9 @@
 //! Persistence store contract and helpers.
 //!
-//! This module defines the write-only persistence API used after finalize.
-//! Persistence must commit data and watermark ops atomically to prevent
-//! advancing ref tips past unscanned blobs.
+//! This module defines the finalize persistence API plus incremental
+//! seen-bitmap durability used during spill flushing. Finalize persistence must
+//! commit data and watermark ops atomically to prevent advancing ref tips past
+//! unscanned blobs.
 //!
 //! # Atomic contract
 //! - `data_ops` are always safe to write.
@@ -12,20 +13,25 @@
 
 #[cfg(feature = "rocksdb")]
 use std::collections::HashMap;
-
-use super::errors::PersistError;
 #[cfg(feature = "rocksdb")]
-use super::finalize::NS_SEEN_BLOB;
+use std::io;
+
+use super::errors::{PersistError, SpillError};
+#[cfg(feature = "rocksdb")]
+use super::finalize::{build_seen_scope_key, NS_SEEN_BLOB};
 use super::finalize::{FinalizeOutcome, FinalizeOutput, WriteOp};
 #[cfg(feature = "rocksdb")]
 use super::roaring_seen::{RoaringSeenBitmap, SeenBitmapDelta};
+use super::seen_store::SeenBitmapPersister;
+#[cfg(feature = "rocksdb")]
+use super::seen_store::SeenBlobStore;
 
 /// Persistence store interface for finalize output.
 ///
 /// Implementations must commit `data_ops` and (when complete) `watermark_ops`
 /// in a single atomic write. On partial runs, `watermark_ops` must be ignored,
 /// ensuring ref tips never advance past unscanned content.
-pub trait PersistenceStore {
+pub trait PersistenceStore: SeenBitmapPersister {
     /// Commits finalize output atomically.
     ///
     /// Implementations may assume ops are pre-sorted by key for performance
@@ -52,18 +58,124 @@ pub fn persist_finalize_output(
 /// skips synchronization; it uses `RefCell` for interior mutability and is not
 /// thread-safe.
 ///
-/// Each commit appends to the stored ops. Under the `rocksdb` feature, seen
-/// bitmap scope ops are merged per key before being recorded so the log matches
-/// what a stateful key/value backend would persist.
+/// Each successful persistence call appends to the stored ops. Under the
+/// `rocksdb` feature, finalize-time seen bitmap scope ops are merged per key
+/// before being recorded so the log matches what a stateful key/value backend
+/// would persist.
 #[derive(Debug, Default)]
 pub struct InMemoryPersistenceStore {
-    /// Recorded data writes from successful finalize calls.
+    /// Recorded data writes from successful persistence calls.
     pub data_ops: std::cell::RefCell<Vec<WriteOp>>,
     /// Recorded watermark writes from successful complete runs.
     pub watermark_ops: std::cell::RefCell<Vec<WriteOp>>,
     /// Current seen bitmap per scope key.
     #[cfg(feature = "rocksdb")]
     seen_scopes: std::cell::RefCell<HashMap<Vec<u8>, RoaringSeenBitmap>>,
+    /// Optional default scope for incremental seen-bitmap writes.
+    #[cfg(feature = "rocksdb")]
+    seen_scope_key: Option<Vec<u8>>,
+}
+
+impl InMemoryPersistenceStore {
+    /// Creates a store with a fixed seen-bitmap scope for incremental writes.
+    #[cfg(feature = "rocksdb")]
+    #[must_use]
+    pub fn with_seen_scope(repo_id: u64, policy_hash: [u8; 32]) -> Self {
+        Self {
+            data_ops: std::cell::RefCell::new(Vec::new()),
+            watermark_ops: std::cell::RefCell::new(Vec::new()),
+            seen_scopes: std::cell::RefCell::new(HashMap::new()),
+            seen_scope_key: Some(build_seen_scope_key(repo_id, &policy_hash)),
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn active_seen_scope_key(&self) -> Option<Vec<u8>> {
+        if let Some(scope_key) = self.seen_scope_key.as_ref() {
+            return Some(scope_key.clone());
+        }
+        let scopes = self.seen_scopes.borrow();
+        if scopes.len() == 1 {
+            scopes.keys().next().cloned()
+        } else {
+            None
+        }
+    }
+}
+
+impl SeenBitmapPersister for InMemoryPersistenceStore {
+    fn persist_seen_delta(&self, oids: &[super::object_id::OidBytes]) -> Result<(), SpillError> {
+        #[cfg(feature = "rocksdb")]
+        {
+            if oids.is_empty() {
+                return Ok(());
+            }
+
+            let Some(scope_key) = self.active_seen_scope_key() else {
+                return Ok(());
+            };
+            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())
+                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+            let mut staged_scopes = self.seen_scopes.borrow().clone();
+            let mut bitmap = staged_scopes
+                .remove(&scope_key)
+                .unwrap_or_else(|| RoaringSeenBitmap::new(delta.oid_len()));
+            if bitmap.oid_len() != delta.oid_len() {
+                return Err(SpillError::Io(io::Error::other(format!(
+                    "seen-bitmap OID length mismatch: stored={}, incoming={}",
+                    bitmap.oid_len(),
+                    delta.oid_len()
+                ))));
+            }
+            bitmap
+                .merge_delta(&delta)
+                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+            let serialized = bitmap
+                .serialize()
+                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+            staged_scopes.insert(scope_key.clone(), bitmap);
+            *self.seen_scopes.borrow_mut() = staged_scopes;
+            self.data_ops.borrow_mut().push(WriteOp {
+                key: scope_key,
+                value: serialized,
+            });
+            Ok(())
+        }
+
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            let _ = oids;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+impl SeenBlobStore for InMemoryPersistenceStore {
+    fn batch_check_seen(
+        &self,
+        oids: &[super::object_id::OidBytes],
+    ) -> Result<Vec<bool>, SpillError> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(scope_key) = self.active_seen_scope_key() else {
+            return Ok(vec![false; oids.len()]);
+        };
+        let scopes = self.seen_scopes.borrow();
+        let Some(bitmap) = scopes.get(&scope_key) else {
+            return Ok(vec![false; oids.len()]);
+        };
+        if bitmap.oid_len() != oids[0].len() {
+            return Err(SpillError::Io(io::Error::other(format!(
+                "seen-bitmap OID length mismatch: stored={}, requested={}",
+                bitmap.oid_len(),
+                oids[0].len()
+            ))));
+        }
+        Ok(bitmap.batch_contains_sorted(oids))
+    }
 }
 
 impl PersistenceStore for InMemoryPersistenceStore {
@@ -111,7 +223,7 @@ impl PersistenceStore for InMemoryPersistenceStore {
                     )));
                 }
                 bitmap
-                    .insert_batch(delta.oids())
+                    .merge_delta(&delta)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
                 let merged = bitmap
                     .serialize()
@@ -393,5 +505,43 @@ mod tests {
             err.to_string().contains("multiple seen-bitmap scope keys"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn in_memory_store_incremental_seen_deltas_are_queryable() {
+        let store = InMemoryPersistenceStore::with_seen_scope(42, [0xAB; 32]);
+        let scope_key = build_seen_scope_key(42, &[0xAB; 32]);
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+        let oid_c = OidBytes::sha1([0x33; 20]);
+
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("first incremental write");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("batch check"),
+            vec![true, true, false]
+        );
+
+        store
+            .persist_seen_delta(&[oid_b, oid_c])
+            .expect("second incremental write");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("batch check"),
+            vec![true, true, true]
+        );
+
+        let logged = store.data_ops.borrow();
+        let scope_ops: Vec<&WriteOp> = logged.iter().filter(|w| w.key == scope_key).collect();
+        assert_eq!(scope_ops.len(), 2, "expected one logged write per delta");
+        let bitmap = RoaringSeenBitmap::deserialize(&scope_ops[1].value).expect("bitmap");
+        assert!(bitmap.contains(&oid_a));
+        assert!(bitmap.contains(&oid_b));
+        assert!(bitmap.contains(&oid_c));
     }
 }

@@ -13,7 +13,10 @@
 use std::cell::RefCell;
 use std::io;
 
-use crate::{FinalizeOutcome, FinalizeOutput, PersistError, PersistenceStore};
+use crate::{
+    FinalizeOutcome, FinalizeOutput, OidBytes, PersistError, PersistenceStore, SeenBitmapPersister,
+    SpillError,
+};
 
 use super::fault::{GitFaultInjector, GitFaultPlan, GitIoFault, GitResourceId};
 
@@ -97,6 +100,12 @@ impl SimPersistStore {
 impl Default for SimPersistStore {
     fn default() -> Self {
         Self::new(GitFaultPlan::default())
+    }
+}
+
+impl SeenBitmapPersister for SimPersistStore {
+    fn persist_seen_delta(&self, _oids: &[OidBytes]) -> Result<(), SpillError> {
+        Ok(())
     }
 }
 

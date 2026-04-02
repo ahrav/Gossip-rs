@@ -16,8 +16,9 @@ subsystem provides a bounded-memory pipeline:
    sorted **run** file.
 3. At finalize, all runs are merged via a **k-way merge** that produces a
    globally sorted, deduplicated candidate stream.
-4. The merged stream is filtered against a **seen-blob store** and emitted
-   to a `UniqueBlobSink`.
+4. The merged stream is filtered against a **seen-blob store**, emitted to a
+   `UniqueBlobSink`, and optionally checkpointed into a durable seen bitmap
+   after each flush batch.
 
 For repositories where candidates fit in a single chunk, no disk I/O occurs.
 
@@ -97,6 +98,8 @@ For repositories where candidates fit in a single chunk, no disk I/O occurs.
 | Type | Location | Description |
 |------|----------|-------------|
 | `SeenBlobStore` (trait) | `seen_store.rs` | Batch query interface for seen-blob filtering. Returns one bool per OID; inputs expected sorted. |
+| `SeenBitmapPersister` (trait) | `seen_store.rs` | Incremental write interface for scope-scoped seen-bitmap updates. Inputs must already be sorted and unique. |
+| `NullSeenBitmapPersister` | `seen_store.rs` | No-op persister used when a scan has no durable mid-spill checkpoint target. |
 | `NeverSeenStore` | `seen_store.rs` | Marks all blobs unseen (full-scan mode). |
 | `AlwaysSeenStore` | `seen_store.rs` | Marks all blobs seen (testing). |
 | `InMemorySeenStore` | `seen_store.rs` | `HashSet`-backed store for tests. |
@@ -165,8 +168,10 @@ sorted stream:
 
 In both paths, unique OIDs are batched for seen-store queries (`BatchBuffer`
 with `seen_batch_max_oids` and `seen_batch_max_path_bytes` limits). Unseen
-blobs are emitted to the `UniqueBlobSink`. Temporary run files are deleted
-after finalize (also deleted on drop as a safety net).
+blobs are emitted to the `UniqueBlobSink`, and the batch's sorted OIDs are
+then forwarded to the seen-bitmap persister so crash recovery can resume from
+the last flushed checkpoint. Temporary run files are deleted after finalize
+(also deleted on drop as a safety net).
 
 ## Arena Allocation
 

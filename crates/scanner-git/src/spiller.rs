@@ -28,7 +28,7 @@ use super::object_id::OidBytes;
 use super::run_format::{RunContext, RunHeader, RunRecord};
 use super::run_reader::RunReader;
 use super::run_writer::RunWriter;
-use super::seen_store::SeenBlobStore;
+use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spill_chunk::CandidateChunk;
 use super::spill_limits::SpillLimits;
 use super::spill_merge::RunMerger;
@@ -210,9 +210,14 @@ impl Spiller {
     /// happens via `Drop` (best-effort).
     ///
     /// The spiller consumes itself so callers cannot reuse it after finalize.
-    pub fn finalize<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
+    pub fn finalize<
+        S: SeenBlobStore + ?Sized,
+        P: SeenBitmapPersister + ?Sized,
+        B: UniqueBlobSink,
+    >(
         mut self,
         seen_store: &S,
+        seen_persister: &P,
         sink: &mut B,
     ) -> Result<SpillStats, SpillError> {
         let mut stats = SpillStats {
@@ -226,12 +231,12 @@ impl Spiller {
 
         if self.runs.is_empty() {
             self.chunk.sort_and_dedupe();
-            self.process_chunk_only(seen_store, sink, &mut stats)?;
+            self.process_chunk_only(seen_store, seen_persister, sink, &mut stats)?;
         } else {
             self.spill_chunk()?;
             perf_stats::set_usize(&mut stats.spill_runs, self.runs.len());
             perf_stats::set_u64(&mut stats.spill_bytes, self.spill_bytes);
-            self.process_with_merge(seen_store, sink, &mut stats)?;
+            self.process_with_merge(seen_store, seen_persister, sink, &mut stats)?;
         }
 
         sink.finish()?;
@@ -244,9 +249,14 @@ impl Spiller {
     /// The chunk must already be sorted and deduped. For each OID, the
     /// canonical context is selected and then checked against the seen store
     /// in bounded batches.
-    fn process_chunk_only<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
+    fn process_chunk_only<
+        S: SeenBlobStore + ?Sized,
+        P: SeenBitmapPersister + ?Sized,
+        B: UniqueBlobSink,
+    >(
         &self,
         seen_store: &S,
+        seen_persister: &P,
         sink: &mut B,
         stats: &mut SpillStats,
     ) -> Result<(), SpillError> {
@@ -271,7 +281,14 @@ impl Spiller {
                     let best_ctx = canonical_ctx.expect("canonical ctx missing");
                     let best_path = canonical_path.expect("canonical path missing");
                     self.push_unique(
-                        &mut batch, oid, best_ctx, best_path, stats, seen_store, sink,
+                        &mut batch,
+                        oid,
+                        best_ctx,
+                        best_path,
+                        stats,
+                        seen_store,
+                        seen_persister,
+                        sink,
                     )?;
                     current_oid = Some(cand.oid);
                     canonical_ctx = Some(ctx);
@@ -291,11 +308,20 @@ impl Spiller {
         if let Some(oid) = current_oid {
             let ctx = canonical_ctx.expect("canonical ctx missing");
             let path = canonical_path.expect("canonical path missing");
-            self.push_unique(&mut batch, oid, ctx, path, stats, seen_store, sink)?;
+            self.push_unique(
+                &mut batch,
+                oid,
+                ctx,
+                path,
+                stats,
+                seen_store,
+                seen_persister,
+                sink,
+            )?;
         }
 
         if !batch.is_empty() {
-            self.flush_batch(&batch, stats, seen_store, sink)?;
+            self.flush_batch(&batch, stats, seen_store, seen_persister, sink)?;
             batch.clear();
         }
 
@@ -306,9 +332,14 @@ impl Spiller {
     ///
     /// For each OID, selects the canonical record and batches seen-store
     /// lookups. Run files must already be sorted by canonical run order.
-    fn process_with_merge<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
+    fn process_with_merge<
+        S: SeenBlobStore + ?Sized,
+        P: SeenBitmapPersister + ?Sized,
+        B: UniqueBlobSink,
+    >(
         &self,
         seen_store: &S,
+        seen_persister: &P,
         sink: &mut B,
         stats: &mut SpillStats,
     ) -> Result<(), SpillError> {
@@ -353,7 +384,14 @@ impl Spiller {
                 Some(oid) if oid != record.oid => {
                     let mut best = canonical.take().expect("canonical record missing");
                     self.push_unique(
-                        &mut batch, oid, best.ctx, &best.path, stats, seen_store, sink,
+                        &mut batch,
+                        oid,
+                        best.ctx,
+                        &best.path,
+                        stats,
+                        seen_store,
+                        seen_persister,
+                        sink,
                     )?;
                     current_oid = Some(record.oid);
                     set_canonical(&mut best, record);
@@ -371,12 +409,19 @@ impl Spiller {
         if let Some(oid) = current_oid {
             let best = canonical.expect("canonical record missing");
             self.push_unique(
-                &mut batch, oid, best.ctx, &best.path, stats, seen_store, sink,
+                &mut batch,
+                oid,
+                best.ctx,
+                &best.path,
+                stats,
+                seen_store,
+                seen_persister,
+                sink,
             )?;
         }
 
         if !batch.is_empty() {
-            self.flush_batch(&batch, stats, seen_store, sink)?;
+            self.flush_batch(&batch, stats, seen_store, seen_persister, sink)?;
             batch.clear();
         }
 
@@ -391,7 +436,11 @@ impl Spiller {
     /// # Errors
     /// Propagates errors from flushing or pushing into the batch.
     #[allow(clippy::too_many_arguments)]
-    fn push_unique<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
+    fn push_unique<
+        S: SeenBlobStore + ?Sized,
+        P: SeenBitmapPersister + ?Sized,
+        B: UniqueBlobSink,
+    >(
         &self,
         batch: &mut BatchBuffer,
         oid: OidBytes,
@@ -399,19 +448,20 @@ impl Spiller {
         path: &[u8],
         stats: &mut SpillStats,
         seen_store: &S,
+        seen_persister: &P,
         sink: &mut B,
     ) -> Result<(), SpillError> {
         perf_stats::sat_add_u64(&mut stats.unique_blobs, 1);
 
         if !batch.can_fit(path.len()) {
-            self.flush_batch(batch, stats, seen_store, sink)?;
+            self.flush_batch(batch, stats, seen_store, seen_persister, sink)?;
             batch.clear();
         }
 
         batch.push(oid, ctx, path)?;
 
         if batch.len() >= batch.max_oids() {
-            self.flush_batch(batch, stats, seen_store, sink)?;
+            self.flush_batch(batch, stats, seen_store, seen_persister, sink)?;
             batch.clear();
         }
 
@@ -424,11 +474,16 @@ impl Spiller {
     /// - `SpillError::SeenResponseMismatch` if the seen store returns a
     ///   mismatched number of flags.
     /// - Propagates errors from the seen store or sink.
-    fn flush_batch<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
+    fn flush_batch<
+        S: SeenBlobStore + ?Sized,
+        P: SeenBitmapPersister + ?Sized,
+        B: UniqueBlobSink,
+    >(
         &self,
         batch: &BatchBuffer,
         stats: &mut SpillStats,
         seen_store: &S,
+        seen_persister: &P,
         sink: &mut B,
     ) -> Result<(), SpillError> {
         if batch.is_empty() {
@@ -451,6 +506,8 @@ impl Spiller {
                 perf_stats::sat_add_u64(&mut stats.emitted_blobs, 1);
             }
         }
+
+        seen_persister.persist_seen_delta(batch.oids())?;
 
         Ok(())
     }
