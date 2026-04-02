@@ -283,17 +283,18 @@ impl PersistenceStore for RocksDbStore {
             let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
             match self.db.get(&staging_key) {
                 Ok(Some(staging_bytes)) => {
-                    // Every OID in the staging bitmap is marked seen — merge_delta
-                    // performs a set union. The debug_assert below guards this.
+                    // All OIDs in the staging bitmap are marked seen because
+                    // persist_seen_delta_inner only ever merges via merge_delta,
+                    // which uses `other_contains = |_| true`.
                     let staging_bitmap =
                         RoaringSeenBitmap::deserialize(&staging_bytes).map_err(|err| {
                             PersistError::backend(format!("corrupt staging bitmap: {err}"))
                         })?;
-                    debug_assert_eq!(
-                        staging_bitmap.len(),
-                        staging_bitmap.index_len(),
-                        "staging bitmap has unseen OIDs — fold would mark unprocessed blobs as seen"
-                    );
+                    if staging_bitmap.len() != staging_bitmap.index_len() {
+                        return Err(PersistError::backend(
+                            "staging bitmap contains unseen entries",
+                        ));
+                    }
                     seen_oids.extend_from_slice(staging_bitmap.all_oids());
                     // Delete the staging key in the same WriteBatch.
                     batch.delete(&staging_key);
@@ -780,10 +781,10 @@ mod tests {
         );
     }
 
-    /// Proves the core safety invariant: spill-stage `persist_seen_delta`
-    /// must NOT pollute the live bitmap that `batch_check_seen` reads.
-    /// If it does, a crash between spill and `commit_finalize` permanently
-    /// hides blobs whose findings were never committed.
+    /// Spill-stage `persist_seen_delta` writes must not pollute the live
+    /// bitmap that `batch_check_seen` reads. Otherwise a crash between
+    /// spill and `commit_finalize` permanently hides blobs whose findings
+    /// were never committed.
     #[cfg(feature = "rocksdb")]
     #[test]
     fn spill_checkpoint_without_finalize_must_not_pollute_live_bitmap() {
