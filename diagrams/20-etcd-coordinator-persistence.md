@@ -581,7 +581,7 @@ transaction shapes across the sync and async entrypoints.
 | `crates/gossip-coordination-etcd/src/backend.rs` | Module root for the `backend/` tree; shared free functions and backend-wide helpers |
 | `crates/gossip-coordination-etcd/src/backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), sync-async bridge, low-level etcd RPC wrappers, CAS retry loop |
 | `crates/gossip-coordination-etcd/src/backend/run_management.rs` | Sync and async `RunManagement` implementations: run lifecycle, claim candidate collection, and `unpark_shard` |
-| `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | Sync and async `CoordinationBackend` implementations: acquire, renew, checkpoint, complete, park, and split operations |
+| `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | Sync and async `CoordinationBackend` implementations: `acquire_and_restore_into`, `renew`, `checkpoint`, `complete`, `park_shard`, `split_replace`, and `split_residual` |
 | `crates/gossip-coordination-etcd/src/backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers |
 | `crates/gossip-coordination-etcd/src/behavioral_conformance.rs` | Real-etcd behavioral conformance scenarios that mirror the shared coordination harness using protocol operations plus persisted read-back oracles |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
