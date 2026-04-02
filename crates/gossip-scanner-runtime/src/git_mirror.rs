@@ -15,12 +15,14 @@
 //! `<digest>.git.initializing` marks first-create publication and
 //! `<digest>.git.lock` serializes mirror mutation. Construction removes stale
 //! control files left behind by dead processes or files older than the
-//! configured age backstop.
+//! configured age backstop. The cleanup logic is forward-compatible
+//! infrastructure — the write path for control files lands with remote-mirror
+//! support.
 //!
 //! Error classification follows the connector I/O policy: structural
 //! filesystem failures are permanent, concurrent maintenance remains
 //! retryable, and every path-bearing diagnostic is redacted through
-//! [`ToxicDigest`].
+//! [`ToxicDigest`](gossip_contracts::connector::ToxicDigest).
 //!
 //! Allocation tier: COLD. Mirror management runs during repo setup, not in any
 //! steady-state scan loop.
@@ -34,6 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gossip_contracts::connector::git::{
     GitMirrorManager, GitRunError, LocalMirror, RepoKey, RepoLocator,
 };
+use gossip_contracts::identity::CanonicalBytes;
 use gossip_contracts::identity::finalize_32;
 use gossip_contracts::identity::hashing::MIRROR_PATH_HASHER;
 use scanner_git::{ArtifactStatus, PreflightError, PreflightLimits, preflight};
@@ -127,8 +130,10 @@ impl LocalMirrorManager {
     /// This helper uses canonical repo identity bytes rather than raw
     /// user-supplied path spellings, so equivalent local-path inputs resolve to
     /// the same worker-local mirror directory. Local-path mirror sync validates
-    /// in place, so this helper exposes the stable cache naming rule without
-    /// requiring callers to create a cached clone first.
+    /// in place and returns the original canonical repo root, so this path is
+    /// a **stable naming convention only** — the returned directory is not
+    /// materialized on disk for local-path locators. Callers needing the actual
+    /// on-disk mirror path should use [`sync_mirror`](GitMirrorManager::sync_mirror).
     ///
     /// # Errors
     ///
@@ -182,7 +187,7 @@ impl LocalMirrorManager {
 
     fn cache_path_for_repo_key(&self, repo_key: &RepoKey) -> PathBuf {
         let mut hasher = MIRROR_PATH_HASHER.clone();
-        hasher.update(repo_key.as_bytes());
+        repo_key.as_bytes().write_canonical(&mut hasher);
         let digest = finalize_32(&hasher);
         let hex = gossip_stdx::hex_encode(&digest);
         let prefix = &hex[..4];
@@ -190,7 +195,8 @@ impl LocalMirrorManager {
     }
 
     fn cleanup_stale_control_files(&self) -> Result<(), GitRunError> {
-        let mut stack = vec![self.layout_root()];
+        let layout_root = self.layout_root();
+        let mut stack = vec![layout_root.clone()];
         let now_ms = wall_clock_now_ms();
         while let Some(dir) = stack.pop() {
             let entries = match fs::read_dir(&dir) {
@@ -214,7 +220,12 @@ impl LocalMirrorManager {
                 })?;
                 let path = entry.path();
                 if file_type.is_dir() {
-                    stack.push(path);
+                    // Only recurse into hash-prefix directories (2-4 char hex
+                    // names), never into `.git` mirror directories or other
+                    // nested trees that could contain thousands of entries.
+                    if dir == layout_root {
+                        stack.push(path);
+                    }
                     continue;
                 }
                 if !file_type.is_file() || !is_manager_control_file(&path) {
@@ -325,7 +336,16 @@ fn is_manager_control_file(path: &Path) -> bool {
     bytes.ends_with(b".git.lock") || bytes.ends_with(b".git.initializing")
 }
 
+/// Maximum control file size. Valid files are ~25 bytes (`pid:timestamp\n`);
+/// anything larger is corrupt or adversarially placed.
+const MAX_CONTROL_FILE_BYTES: u64 = 256;
+
 fn control_file_is_stale(path: &Path, now_ms: u64, max_age: Duration) -> io::Result<bool> {
+    // Reject oversized files before reading to avoid unbounded allocation.
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_CONTROL_FILE_BYTES {
+        return Ok(true);
+    }
     let bytes = fs::read(path)?;
     let Some(metadata) = ControlFileMetadata::decode(&bytes) else {
         return Ok(true);
@@ -357,6 +377,9 @@ fn pid_is_alive(pid: u32) -> bool {
     )
 }
 
+// Non-Unix platforms lack a cheap process-liveness syscall, so staleness
+// detection falls back to the age backstop only. Orphaned control files
+// from crashed processes may linger for up to `DEFAULT_STALE_CONTROL_AGE`.
 #[cfg(not(unix))]
 fn pid_is_alive(_pid: u32) -> bool {
     true
@@ -414,6 +437,11 @@ fn classify_preflight_error(path: &Path, err: PreflightError) -> GitRunError {
             "local repository ({}) exceeds preflight file limits: size={size} limit={limit}",
             redacted_path_digest(path)
         )),
+        // `PreflightError` is `#[non_exhaustive]`, so this arm catches future
+        // variants. Defaulting to retryable is safer than permanent — a
+        // retryable error lets the caller retry, whereas a false permanent
+        // error silently drops the repo. The warn log ensures new variants
+        // surface during development.
         _ => {
             tracing::warn!(
                 error = %err,
