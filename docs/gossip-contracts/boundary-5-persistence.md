@@ -180,9 +180,10 @@ Coordinator restart (durable backend behavior):
 - Workers reacquire shards, `fence_epoch` bumps, and resume from last durable cursor.
 
 > **Note:** The etcd backend persists coordination state directly in etcd.
-> Fresh `EtcdCoordinator` / `AsyncEtcdCoordinator` instances reload run and
-> shard state from etcd reads and prefix scans rather than delegating through
-> an inner `InMemoryCoordinator`.
+> Fresh `EtcdCoordinator` / `AsyncEtcdCoordinator` instances are stateless
+> with respect to coordination records. Each operation reads run and shard
+> state from etcd on demand rather than delegating through an inner
+> `InMemoryCoordinator`.
 
 ---
 
