@@ -289,6 +289,11 @@ impl PersistenceStore for RocksDbStore {
                         RoaringSeenBitmap::deserialize(&staging_bytes).map_err(|err| {
                             PersistError::backend(format!("corrupt staging bitmap: {err}"))
                         })?;
+                    debug_assert_eq!(
+                        staging_bitmap.len(),
+                        staging_bitmap.index_len(),
+                        "staging bitmap has unseen OIDs — fold would mark unprocessed blobs as seen"
+                    );
                     seen_oids.extend_from_slice(staging_bitmap.all_oids());
                     // Delete the staging key in the same WriteBatch.
                     batch.delete(&staging_key);
