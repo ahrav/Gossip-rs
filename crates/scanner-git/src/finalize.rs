@@ -33,6 +33,7 @@
 //! | `bc\0` | blob_ctx      | Canonical context per scanned blob  |
 //! | `fn\0` | finding       | Individual finding records          |
 //! | `sb\0` | seen_blob     | Finalize delta for the seen bitmap  |
+//! | `ss\0` | seen_staging  | Spill-stage seen bitmap (rocksdb only) |
 //!
 //! Watermark keys use the `rw` prefix from `watermark_keys`.
 
@@ -71,7 +72,8 @@ const _: () = {
 };
 #[cfg(feature = "rocksdb")]
 const _: () = {
-    // Staging namespace must sort after the live seen namespace.
+    // Staging namespace shares the first byte with the live namespace;
+    // ordering is determined by the second byte (`b` < `s`).
     assert!(NS_SEEN_BLOB[1] < NS_SEEN_STAGING[1]);
 };
 

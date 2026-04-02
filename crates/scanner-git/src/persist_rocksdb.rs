@@ -4,9 +4,10 @@
 //! The adapter uses a single RocksDB instance with plain key/value pairs.
 //! Ref watermarks still use sorted `multi_get` access, while seen-blob queries
 //! are served from a lazily loaded in-memory bitmap snapshot.
-//! Incremental seen-bitmap updates use single-key `put` writes during spill
-//! flushing. Finalize output is committed with a single `WriteBatch` so data
-//! writes and watermarks become visible atomically.
+//! Incremental seen-bitmap updates during spill flushing write to a staging
+//! key (`ss\0`). `commit_finalize` folds staging into the live scope key
+//! atomically within the `WriteBatch`, so data writes, seen-bitmap merges,
+//! and watermarks become visible atomically.
 //! When the feature is disabled, public constructors and methods return
 //! feature-not-available errors via the appropriate error variant.
 
@@ -282,9 +283,8 @@ impl PersistenceStore for RocksDbStore {
             let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
             match self.db.get(&staging_key) {
                 Ok(Some(staging_bytes)) => {
-                    // All OIDs in the staging bitmap are marked seen because
-                    // persist_seen_delta_inner only ever merges via merge_delta,
-                    // which uses `other_contains = |_| true`.
+                    // Every OID in the staging bitmap is marked seen — merge_delta
+                    // performs a set union. The debug_assert below guards this.
                     let staging_bitmap =
                         RoaringSeenBitmap::deserialize(&staging_bytes).map_err(|err| {
                             PersistError::backend(format!("corrupt staging bitmap: {err}"))
@@ -813,6 +813,122 @@ mod tests {
             seen,
             vec![false, false],
             "spill-only checkpoint without finalize must not mark OIDs as seen"
+        );
+    }
+
+    /// Multiple `persist_seen_delta` calls accumulate in the staging key.
+    /// `commit_finalize` folds the union into the live bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn multiple_spill_deltas_accumulate_in_staging() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 20;
+        let policy_hash = [0xCC; 32];
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+        let oid_c = OidBytes::sha1([0x33; 20]);
+        let oid_d = OidBytes::sha1([0x44; 20]);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+
+        // Two separate spill checkpoints with disjoint OID sets.
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("first spill");
+        store.persist_seen_delta(&[oid_c]).expect("second spill");
+
+        // Staging key should contain the union {A, B, C}.
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        let staging_bytes = store
+            .db
+            .get(&staging_key)
+            .expect("staging read")
+            .expect("staging key must exist");
+        let staging_bitmap =
+            RoaringSeenBitmap::deserialize(&staging_bytes).expect("staging deserialize");
+        assert!(staging_bitmap.contains(&oid_a));
+        assert!(staging_bitmap.contains(&oid_b));
+        assert!(staging_bitmap.contains(&oid_c));
+        assert!(!staging_bitmap.contains(&oid_d));
+
+        // None are visible to batch_check_seen yet.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("check before finalize"),
+            vec![false, false, false],
+        );
+
+        // Finalize with oid_d only — staging {A,B,C} + finalize {D} → all seen.
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[oid_d]))
+            .expect("finalize");
+
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c, oid_d])
+                .expect("check after finalize"),
+            vec![true, true, true, true],
+            "staging accumulation + finalize should produce the full union"
+        );
+
+        // Staging key deleted after finalize.
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging after finalize")
+                .is_none(),
+            "staging key must be deleted after finalize"
+        );
+    }
+
+    /// When all candidates are already seen and no new blobs are scanned,
+    /// `commit_finalize` receives empty `data_ops` but the staging key
+    /// still exists. The staging OIDs must land in the live bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn staging_only_finalize_folds_without_data_ops() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 21;
+        let policy_hash = [0xDD; 32];
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("spill checkpoint");
+
+        // Finalize with empty data_ops — only staging contributes.
+        let empty_finalize = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("empty finalize");
+
+        // Staging OIDs should now be visible.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("check after empty finalize"),
+            vec![true, true],
+            "staging-only finalize must fold OIDs into the live bitmap"
+        );
+
+        // Staging key deleted.
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging after finalize")
+                .is_none(),
+            "staging key must be deleted after finalize"
         );
     }
 }

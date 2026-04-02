@@ -25,7 +25,9 @@ pub trait SeenBlobStore {
 /// Incremental persistence interface for seen-bitmap scope updates.
 ///
 /// # Contract
-/// - `persist_seen_delta` records the provided OIDs durably for one scope.
+/// - `persist_seen_delta` stages the provided OIDs for one scope.
+///   Whether these writes are immediately visible to `batch_check_seen`
+///   or deferred until `commit_finalize` is implementation-defined.
 /// - Inputs are expected to be sorted and unique.
 /// - Implementations must not write ref watermarks through this path.
 pub trait SeenBitmapPersister {
