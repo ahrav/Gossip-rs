@@ -1114,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_object_kind_resolves_commit_via_commit_graph_tier() {
+    fn lookup_commit_graph_kind_reads_commit_from_commit_graph() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let source = init_repo(&tmp);
 
@@ -1146,8 +1146,10 @@ mod tests {
             "commit-graph file must be written by `git commit-graph write`"
         );
 
-        let kind = lookup_object_kind(&paths, commit).expect("lookup succeeds");
-        assert_eq!(kind, Some(ObjectKind::Commit));
+        assert_eq!(
+            lookup_commit_graph_kind(&paths, commit),
+            Some(ObjectKind::Commit)
+        );
     }
 
     #[test]
