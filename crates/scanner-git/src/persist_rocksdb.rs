@@ -278,25 +278,34 @@ impl PersistenceStore for RocksDbStore {
             // leaves the cache consistent with what is persisted.
             let mut staged_bitmap: Option<RoaringSeenBitmap> = None;
 
-            // Fold spill-stage staging bitmap (if any) into seen_oids so
-            // the finalize merge produces a single authoritative bitmap.
+            // Fold spill-stage staging bitmap into seen_oids only for
+            // complete runs. On partial finalize, staging may contain OIDs
+            // for blobs that were emitted but skipped (budget/corruption).
+            // Folding those would permanently hide them from future scans
+            // because `batch_check_seen` would suppress re-emission while
+            // watermarks remain un-advanced.
             let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
+            let is_complete = matches!(output.outcome, FinalizeOutcome::Complete);
             match self.db.get(&staging_key) {
                 Ok(Some(staging_bytes)) => {
-                    // All OIDs in the staging bitmap are marked seen because
-                    // persist_seen_delta_inner only ever merges via merge_delta,
-                    // which uses `other_contains = |_| true`.
-                    let staging_bitmap =
-                        RoaringSeenBitmap::deserialize(&staging_bytes).map_err(|err| {
-                            PersistError::backend(format!("corrupt staging bitmap: {err}"))
-                        })?;
-                    if staging_bitmap.len() != staging_bitmap.index_len() {
-                        return Err(PersistError::backend(
-                            "staging bitmap contains unseen entries",
-                        ));
+                    if is_complete {
+                        // All OIDs in the staging bitmap are marked seen because
+                        // persist_seen_delta_inner only ever merges via merge_delta,
+                        // which uses `other_contains = |_| true`.
+                        let staging_bitmap = RoaringSeenBitmap::deserialize(&staging_bytes)
+                            .map_err(|err| {
+                                PersistError::backend(format!("corrupt staging bitmap: {err}"))
+                            })?;
+                        if staging_bitmap.len() != staging_bitmap.index_len() {
+                            return Err(PersistError::backend(
+                                "staging bitmap contains unseen entries",
+                            ));
+                        }
+                        seen_oids.extend_from_slice(staging_bitmap.all_oids());
                     }
-                    seen_oids.extend_from_slice(staging_bitmap.all_oids());
-                    // Delete the staging key in the same WriteBatch.
+                    // Delete the staging key in both cases: complete folds
+                    // it into live; partial discards it so skipped blobs
+                    // can be re-emitted on the next run.
                     batch.delete(&staging_key);
                 }
                 Ok(None) => {}
@@ -806,6 +815,18 @@ mod tests {
         // Restart: the next run must NOT see these OIDs as "seen" because
         // commit_finalize never ran — findings were never committed.
         let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+
+        // The orphaned staging key must have been deleted by open().
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging lookup")
+                .is_none(),
+            "open() must delete the orphaned staging key"
+        );
+
         let seen = store
             .batch_check_seen(&[oid_a, oid_b])
             .expect("batch check after crash");

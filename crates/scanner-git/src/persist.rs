@@ -192,19 +192,26 @@ impl PersistenceStore for InMemoryPersistenceStore {
         let mut staged_scopes: HashMap<Vec<u8>, RoaringSeenBitmap> =
             self.seen_scopes.borrow().clone();
 
-        // Fold staging bitmaps into staged_scopes (mirrors RocksDbStore's staging fold).
+        // Fold staging bitmaps into staged_scopes only for complete runs.
+        // On partial finalize, staging may contain OIDs for blobs that were
+        // emitted but later skipped. Folding those would permanently hide
+        // them from future scans. Staging is always cleared regardless.
+        #[cfg(feature = "rocksdb")]
+        let is_complete = matches!(output.outcome, FinalizeOutcome::Complete);
         #[cfg(feature = "rocksdb")]
         {
-            let staging = self.seen_staging.borrow();
-            for (key, staging_bm) in staging.iter() {
-                let bitmap = staged_scopes
-                    .entry(key.clone())
-                    .or_insert_with(|| RoaringSeenBitmap::new(staging_bm.oid_len()));
-                bitmap
-                    .merge(staging_bm)
-                    .map_err(|err| PersistError::backend(err.to_string()))?;
+            if is_complete {
+                let staging = self.seen_staging.borrow();
+                for (key, staging_bm) in staging.iter() {
+                    let bitmap = staged_scopes
+                        .entry(key.clone())
+                        .or_insert_with(|| RoaringSeenBitmap::new(staging_bm.oid_len()));
+                    bitmap
+                        .merge(staging_bm)
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                }
+                drop(staging);
             }
-            drop(staging);
         }
 
         for op in &output.data_ops {
@@ -263,10 +270,9 @@ impl PersistenceStore for InMemoryPersistenceStore {
         }
 
         // Emit WriteOps for staging-only scope keys not already covered by
-        // data_ops. This ensures the ops log reflects the staged bitmap state
-        // even when no seen-bitmap delta arrives via the finalize output.
+        // data_ops. Only for complete runs — partial discards staging.
         #[cfg(feature = "rocksdb")]
-        {
+        if is_complete {
             let staging = self.seen_staging.borrow();
             for key in staging.keys() {
                 if !staged_data.iter().any(|w| w.key == *key) {
