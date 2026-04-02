@@ -193,13 +193,13 @@ Builder-pattern configuration parsed from CLI arguments:
 The `scanner-rs-cli` crate itself contains **no tests** by design -- the
 binary is a thin wrapper. All testing lives in `gossip-scanner-runtime`:
 
-- **CLI parsing tests** (9 tests in `cli.rs`): Flag parsing, CSV transform
+- **CLI parsing tests** (12 tests in `cli_tests.rs`): Flag parsing, CSV transform
   parsing, positional arguments, hidden flag exclusion, help text
-- **Core wiring tests** (~12 tests in `lib_tests.rs`): Execution mode
+- **Core wiring tests** (56 tests in `lib_tests.rs`): Execution mode
   parsing, FS/git scan dispatch, budget validation, direct/connector parity
 - **Event sink tests** (7 tests in `event_sink.rs`): JSONL, text, JSON,
   SARIF encoding, double-flush safety
-- **Parity tests** (5 tests in `parity.rs`): JSONL canonicalization for
+- **Parity tests** (6 tests in `parity.rs`): JSONL canonicalization for
   cross-scanner comparison
 
 ---

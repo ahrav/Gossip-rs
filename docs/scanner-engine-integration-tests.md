@@ -12,7 +12,7 @@ crates/scanner-engine-integration-tests/
   src/lib.rs                          # Marker crate (no library code)
   tests/
     chunked_file_scans.rs             # Standalone: overlap + transform provenance
-    integration/                      # ~159 tests: cross-crate integration
+    integration/                      # ~162 tests: cross-crate integration
     property/                         # ~100 tests + ~30 proptest cases
     simulation/                       # ~41 tests: deterministic sim replay
     diagnostic/                       # 2 tests: anchor derivation diagnostics
@@ -33,7 +33,7 @@ Each category is a separate test binary gated behind a Cargo feature:
 
 | Binary          | Path                       | Feature Gate         | Tests |
 | --------------- | -------------------------- | -------------------- | ----: |
-| `integration`   | `tests/integration/main.rs`| `integration-tests`  |  ~159 |
+| `integration`   | `tests/integration/main.rs`| `integration-tests`  |  ~162 |
 | `property`      | `tests/property/main.rs`   | `property-tests`     |  ~130 |
 | `simulation`    | `tests/simulation/main.rs` | various (see below)  |   ~41 |
 | `diagnostic`    | `tests/diagnostic/main.rs` | `diagnostic-tests`   |     2 |
@@ -99,8 +99,9 @@ scanner-git boundaries.
 | -------------------------- | ----: | -------------------------------------------------- |
 | `anchor_optimization`      |    14 | Anchor derivation and optimization                 |
 | `archive_scanning`         |    49 | Archive expansion, virtual paths, budget limits    |
-| `bench_guards`             |     1 | Benchmark feature guard                            |
+| `bench_guards`             |     0 | Deferred benchmark guard (commented out pending benchmark migration) |
 | `binary_awareness`         |    10 | Binary file detection                              |
+| `finding_json`             |     4 | JSONL finding parsing helpers used by integration assertions |
 | `git_commit_walk`          |     6 | Commit graph traversal                             |
 | `git_engine_adapter`       |     1 | Git-to-engine adapter                              |
 | `git_inmem_artifacts`      |    13 | In-memory git artifact handling                    |
@@ -141,6 +142,7 @@ contains both deterministic `#[test]` assertions and `proptest!` fuzz runs.
 | `git_spill_dedupe`                   |     3 |        2 | Spill deduplication                   |
 | `git_tree_diff`                      |     2 |        2 | Tree diff properties                  |
 | `path_policy_soundness`              |     4 |        1 | Path allow/deny soundness             |
+| `proptest_support`                   |     2 |        0 | Shared proptest helpers and shrinker guards |
 | `regex2anchor_soundness`             |    26 |        2 | Regex-to-anchor derivation soundness  |
 | `secret_bytes_safelist_soundness`    |     3 |        1 | Safelist soundness                    |
 | `value_suppressor_soundness`         |     2 |        1 | Value suppression soundness           |
