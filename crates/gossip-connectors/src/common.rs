@@ -441,9 +441,9 @@ mod borrowed_shard_bound_tests {
     }
 }
 
-/// Direct tests for [`is_permanent_io_error`] covering the `ErrorKind`-based
-/// classification boundary. Permanent errors are structural filesystem failures
-/// that will not resolve on retry; everything else is treated as transient.
+/// [`is_permanent_io_error`] treats structural filesystem failures
+/// (`PermissionDenied`, `NotFound`, `InvalidInput`, etc.) as permanent —
+/// they will not resolve on retry. All other `ErrorKind` variants are transient.
 #[cfg(test)]
 mod is_permanent_io_error_tests {
     use super::*;
