@@ -165,6 +165,176 @@ Dispatch when total weight >= threshold.
 **Safety override:** `/unsafe-review` and `/security-reviewer` bypass budget caps
 when signal weight >= 7.
 
+### Implementation Skill Recommendation
+
+After selecting enrichment skills (dispatched NOW), compute a separate set of
+**recommended implementation skills** — skills the IMPLEMENTING agent should
+invoke when it picks up the task. These are advisory, not dispatched.
+
+**Distinction:** Enrichment skills analyze the task to produce recommendations.
+Implementation skills help the agent execute the work correctly. Choosing the
+right skills is the difference between decent and great output.
+
+#### Taxonomy — Organized by Implementation Phase
+
+Skills are grouped by WHEN the implementing agent should invoke them.
+Within each phase, skills are ordered by domain and natural chain order.
+
+##### Before Starting Implementation
+
+Use these before writing code — they shape the approach.
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/plan-forge` | COMPLEX task, or multiple viable approaches, or ≥7 files affected | Stress-test the implementation plan before coding starts |
+| `/deep-research` | Task involves novel algorithms, safety-critical protocols, or designs where getting it wrong is expensive | Evidence-backed design from papers and production systems |
+| `/deeper-research` | `/deep-research` insufficient; topic needs adversarial challenge | 6-phase funnel with adversarial review for highest stakes |
+| `/design-tournament` | COMPLEX task with ≥3 viable implementation approaches | Competing proposals evaluated by independent agents |
+
+##### During Implementation
+
+**Testing**
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/test-strategy` | Task creates new test files or significantly changes coverage | Choose the right test type (unit/rstest/proptest/fuzz/kani/sim) |
+| `/sim-scaffold` | Task creates new module in gossip-coordination | Generate DST-ready boilerplate with sans-IO pattern and proptest harnesses |
+| `/invariant-test-review` | Task adds/modifies state-machine, simulation, or oracle tests | Ensure tests actually prove the claimed invariant, not just pass |
+| `/run-fuzz` | Task handles untrusted input, parsers, or data structure serialization | Crash discovery via cargo-fuzz before merging |
+
+**Performance** (chain: find → analyze → benchmark → optimize)
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/rust-hotspot-finder` | Performance optimization without a specific target function | Scan for likely hotspots before profiling — focus effort |
+| `/performance-analyzer` | Task modifies HOT-tier code | Static analysis catches allocation violations and hot-path issues early |
+| `/bench-compare` | Task touches functions with existing Criterion benchmarks | Validate no >5% median regression against baseline |
+| `/perf-regression` | Task modifies hot-path code in coordination or scanner engine | Full benchmark suite before/after regression test |
+| `/asm-forge` | Task modifies tight loops or `#[inline(always)]` in HOT-tier | Instruction-level analysis: bounds checks, register spills, codegen |
+| `/simd-optimize` | Task touches byte-processing loops or SIMD paths | Platform-specific intrinsics (x86 + ARM NEON/SVE) with validation |
+| `/heap-profile` | Task changes allocation patterns in HOT/WARM tier | Attribute allocations to call sites when AllocGuard trips |
+| `/perf-topdown` | Task needs CPU µarch analysis (branch mispredict, cache miss) | Classify slow code: front-end vs back-end vs speculation |
+| `/causal-profile` | Task modifies concurrent/async code on critical path | Distinguish critical-path bottlenecks from parallel slack |
+| `/linux-perf-profile` | Task needs hardware PMU counters beyond flamegraphs | Source-level drill-down on Linux/ARM/Graviton targets |
+| `/perf-pipeline` | Multiple perf dimensions need simultaneous triage | Orchestrates diagnosis + optimization dispatch in one pass |
+| `/pgo-bolt` | Final optimization pass on a binary target | 10-30% from I-cache, branch prediction, function layout |
+
+**Safety & Security** (chain: review → wrap → audit)
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/unsafe-review` | Task adds or modifies unsafe blocks | Audit safety invariants; demand benchmark+ASM proof of perf benefit |
+| `/safe-over-unsafe` | Task creates pub API wrapping unsafe internals | Design safe wrapper that's hard to misuse |
+| `/security-reviewer` | Task handles untrusted input, parsing, or buffer manipulation | Memory safety and security audit |
+
+**Coordination & Distributed Systems** (chain: audit → specify → simulate → test)
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/dist-sys-auditor` | Task modifies coordination protocols or distributed state | Audit against academic literature and battle-tested systems |
+| `/tla-spec` | Task changes coordination protocol semantics (leases, epochs, fences) | Formally verify safety/liveness properties before coding |
+| `/sim-review` | Task modifies gossip-coordination or coordination contracts | DST-compatibility code review |
+| `/sim-run` | Task changes coordination protocol behavior | Validate with deterministic simulation before merge |
+| `/jepsen-test` | Task modifies coordination protocol behavior under real network conditions | Real partition testing when DST alone isn't sufficient |
+
+**Design & Architecture**
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/interface-design-review` | Task adds new pub trait/struct/fn to contracts crate | Misuse-resistant API design review |
+
+**Domain-Specific**
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/rule-optimize` | Task adds/modifies rules in `default_rules.yaml` | Benchmark rule perf against test corpuses; validate anchors |
+| `/sqlite-review` | Task touches SQLite schemas, queries, or WAL config | EXPLAIN QUERY PLAN evidence for schema decisions |
+| `/postgres-review` | Task touches PostgreSQL schemas or migrations | Lock safety, query performance, and index optimization |
+
+##### After Implementation
+
+**Documentation** (chain: write → verify → audit)
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/doc-rigor` | Always — run after implementation | Write-then-verify documentation pipeline |
+| `/doc-rigor-verify` | Task changes pub API signatures, command examples, or platform-specific behavior | Independent accuracy verification with zero confirmation bias |
+| `/doc-verify` | Task adds unsafe invariants or changes pub API contracts | Fresh-agent verification against code reality |
+| `/doc-code-audit` | Task touches code in scope of a design doc (`docs/scope-map.toml`) | Verify design doc still matches code |
+| `/design-doc-audit` | Task touches multiple files covered by design docs, or adds new source files | Comprehensive doc coverage and accuracy check |
+
+**Testing Verification**
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/test-pipeline` | Feature implementation complete; need coverage gap assessment | Two-phase assess-then-improve testing |
+| `/test-dedup` | Task added many tests to modules with existing property/sim coverage | Remove redundant unit tests that duplicate higher-level coverage |
+| `/test-consolidate` | Task touches test modules with >15 existing similar tests | Consolidate verbose suites into rstest/proptest/fuzz |
+
+**Code Quality**
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/simplify` | Always — run before closing task | Final code simplification pass |
+| `/dedup-audit` | Task introduces new types/functions that cross ≥2 crates | Catch accidental duplication before it drifts |
+
+**Review**
+
+| Skill | Recommend When | Why |
+|-------|---------------|-----|
+| `/review-dispatch` | Task is COMPLEX or crosses ≥3 modules | Six parallel specialist agents for thorough review |
+| `/review-pipeline` | COMPLEX task needing review + automated fixes in one pass | Diagnose-then-fix pipeline |
+| `/execute-review-findings` | After `/review-dispatch` produces multiple findings | Systematically address findings across files and severities |
+
+#### Skill Chains
+
+When recommending multiple skills from the same domain, ORDER them as chains.
+Earlier skills produce findings that inform later skills. The synthesizer
+should present chains as ordered sequences, not unordered lists.
+
+| Chain | Progression | Trigger |
+|-------|-------------|---------|
+| **Perf optimization** | `/rust-hotspot-finder` → `/performance-analyzer` → `/bench-compare` → `/asm-forge` → `/simd-optimize` | HOT-tier optimization task |
+| **Perf diagnosis** | `/perf-regression` → `/perf-topdown` → `/causal-profile` → `/linux-perf-profile` | Benchmark regression needing root cause |
+| **Coordination** | `/dist-sys-auditor` → `/tla-spec` → `/sim-run` → `/jepsen-test` | Protocol correctness task |
+| **Safety** | `/unsafe-review` → `/safe-over-unsafe` → `/security-reviewer` | New or modified unsafe code |
+| **Documentation** | `/doc-rigor` → `/doc-verify` → `/design-doc-audit` | Post-implementation doc pass |
+| **Testing** | `/test-strategy` → `/invariant-test-review` → `/test-pipeline` → `/test-dedup` | Comprehensive test coverage |
+| **Review** | `/review-dispatch` → `/execute-review-findings` → `/simplify` | Pre-merge quality pass |
+| **Planning** | `/deep-research` → `/plan-forge` → `/design-tournament` | COMPLEX task kickoff |
+
+**Chain rules:**
+- Never recommend a later chain step without also recommending earlier steps.
+- If only part of a chain applies, truncate — don't skip middle steps.
+- Chains are advisory ordering; the agent may interleave with coding.
+
+#### Selection Process
+
+1. Apply the same signal extraction from the task description.
+2. Score each implementation skill against the taxonomy triggers.
+3. All matching skills are included — no budget cap (advisory only).
+4. Assemble matching skills into chains where applicable. If a skill
+   appears in a chain, include preceding chain steps that also match.
+5. Each enrichment agent also contributes 0-3 domain-specific picks (Phase 2).
+6. The synthesizer (Phase 3) merges, deduplicates, orders by chain,
+   and adds concrete invocation context.
+
+#### Invocation Guidance Format
+
+Each recommended skill gets a **when** (at what point during implementation)
+and a **why** (what it catches or validates):
+
+```
+| Phase | Skill | When to Invoke | Why |
+|-------|-------|---------------|-----|
+| During | `/sim-scaffold` | Before writing coordination module | Generate DST-ready boilerplate |
+| During | `/bench-compare` | After implementing the optimization | Validate no >5% regression |
+| After | `/invariant-test-review` | After writing sim tests | Ensure tests prove claimed invariant |
+| After | `/doc-rigor` | After all code is written | Write-then-verify documentation |
+```
+
+The orchestrator passes the initial skill set + chain analysis to the synthesizer.
+
 ---
 
 ## Phase 2 — Parallel Enrichment
@@ -297,6 +467,14 @@ For each:
 
 ### Test Dependencies
 | Dependency | Crate | How to Add |
+
+### Recommended Skills for Implementing Agent
+List 0-5 skills from your testing domain that the implementing agent should
+invoke. Only recommend if directly relevant. Consider the full palette:
+`/test-strategy`, `/invariant-test-review`, `/sim-scaffold`, `/sim-review`,
+`/sim-run`, `/run-fuzz`, `/jepsen-test`, `/test-pipeline`, `/test-dedup`,
+`/test-consolidate`. Order as a chain if multiple apply.
+| Skill | When to Invoke | Why |
 ```
 
 ### Agent B — Implementation Enrichment
@@ -358,6 +536,16 @@ For each:
 
 ### Anti-Patterns to Avoid
 | Anti-Pattern | Why | What to Do Instead |
+
+### Recommended Skills for Implementing Agent
+List 0-5 skills from your performance/implementation domain that the
+implementing agent should invoke. Only recommend if directly relevant.
+Consider the full palette:
+`/performance-analyzer`, `/rust-hotspot-finder`, `/bench-compare`,
+`/perf-regression`, `/asm-forge`, `/simd-optimize`, `/heap-profile`,
+`/perf-topdown`, `/causal-profile`, `/linux-perf-profile`, `/perf-pipeline`,
+`/pgo-bolt`, `/dedup-audit`, `/plan-forge`. Order as a chain if multiple apply.
+| Skill | When to Invoke | Why |
 ```
 
 ### Agent C — Documentation Enrichment
@@ -420,6 +608,15 @@ For each:
 
 ### Stale Docs to Update
 | File:Line | Current Doc | What Changed | Required Update |
+
+### Recommended Skills for Implementing Agent
+List 0-5 skills from your documentation/quality domain that the implementing
+agent should invoke. Only recommend if directly relevant. Consider the full
+palette: `/doc-rigor`, `/doc-rigor-verify`, `/doc-verify`, `/doc-code-audit`,
+`/design-doc-audit`, `/simplify`, `/dedup-audit`, `/review-dispatch`,
+`/review-pipeline`, `/execute-review-findings`.
+Order as a chain if multiple apply.
+| Skill | When to Invoke | Why |
 ```
 
 ### Domain Skill Dispatch
@@ -526,7 +723,29 @@ Do NOT duplicate what's already in the task.)
 (New or replacement section, if applicable. Merge implementation agent's
 allocation tier analysis with domain skill performance findings.)
 
-### 5. Rate Enrichment Quality
+### 5. Produce Recommended Skills Section
+
+Merge implementation skill recommendations from three sources:
+1. **Orchestrator's taxonomy-based picks** (passed in with this prompt)
+2. **Each enrichment agent's "Recommended Skills" output** (0-3 each)
+3. **Your own judgment** from reviewing the enrichment findings
+
+For each recommended skill, produce:
+- **Skill name** (slash command)
+- **When to invoke** (at what point during implementation)
+- **Why** (what it catches, validates, or improves — grounded in enrichment findings)
+
+**Ordering:** Skills the agent should invoke DURING implementation first
+(e.g., `/sim-scaffold`, `/design-tournament`), then skills for AFTER
+implementation (e.g., `/bench-compare`, `/doc-rigor`, `/review-dispatch`).
+
+**Deduplication:** If multiple agents recommend the same skill, keep the
+most specific "when" and "why". Merge, don't list twice.
+
+**Minimum set:** Always include `/doc-rigor` (after implementation) and
+`/simplify` (before closing). Omit only if task is TRIVIAL.
+
+### 6. Rate Enrichment Quality
 
 - STRONG: All three areas enriched with high-confidence recommendations.
   Task is implementation-ready.
@@ -559,6 +778,13 @@ allocation tier analysis with domain skill performance findings.)
 ### Performance Considerations
 {content, if applicable}
 
+### Recommended Skills
+Invoke these skills during and after implementation for best results.
+
+| Skill | When to Invoke | Why |
+|-------|---------------|-----|
+| `/skill-name` | {during/after implementation — specific trigger} | {what it catches or validates} |
+
 ### Filtered Out
 | # | Agent | Recommendation | Reason Dropped |
 ```
@@ -587,6 +813,10 @@ Domain skills: {list or "none"} | Conflicts resolved: {N}
 ### Documentation Requirements (new)
   - N type docs, N function docs, N module docs
 
+### Recommended Skills (new)
+  - During: {list of skills to invoke during implementation}
+  - After:  {list of skills to invoke after implementation}
+
 Options:
   - "approve" — apply all enrichments
   - "approve testing,implementation" — apply specific sections only
@@ -607,6 +837,7 @@ After user approval:
    - **Implementation Guidance Addendum**: Append to existing "Implementation Guidance"
    - **Documentation Requirements**: Insert after "Testing Strategy"
    - **Performance Considerations**: Replace or insert after "Documentation Requirements"
+   - **Recommended Skills**: Insert after "Acceptance Criteria", before "Pointers"
 3. Remove addressed `[NEEDS ENRICHMENT]` markers
 4. Update: `bd update <task-id> --description="$ENRICHED_DESC"`
 5. Add metadata footer: `<!-- task-forge: skills=[...] date=YYYY-MM-DD -->`
@@ -632,6 +863,7 @@ Sections Added/Updated:
   Implementation       — {N} recommendations
   Documentation        — {N} doc items
   Performance          — {N} constraints (if applicable)
+  Recommended Skills   — {N} skills ({M} during, {K} after)
 
 Next: bd update {id} --status=in_progress
   Or: /review-task {id}
@@ -663,6 +895,7 @@ already-dispatched skills unless task description changed (hash comparison).
                                   +-- embeds: /test-strategy methodology
                                   +-- embeds: /doc-rigor methodology
                                   +-- dispatches: domain skills (perf, dist-sys, unsafe, etc.)
+                                  +-- recommends: implementation skills for the picking-up agent
                                   +-- optionally invokes: /review-task (validation)
 ```
 
