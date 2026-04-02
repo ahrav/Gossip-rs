@@ -144,10 +144,9 @@ The canonical identity tuple is:
 
 The reduced execution-mode parity gate is currently **deferred**. The intended
 integration module (`execution_mode_parity`) is still commented out in
-`crates/scanner-engine-integration-tests/tests/integration/main.rs` because it
-requires binary invocation and the final `scanner-rs-cli` binary naming /
-invocation contract is not settled yet. When that module is re-enabled, the
-target matrix remains:
+`crates/scanner-engine-integration-tests/tests/integration/main.rs` because the
+integration target does not yet invoke the `scanner-rs` binary for this matrix.
+When that module is re-enabled, the target matrix remains:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
@@ -164,7 +163,7 @@ a sustained-green gate script (not yet implemented).
 ### Commands
 
 ```bash
-# No local cargo invocation is wired today.
+# No runnable command — `execution_mode_parity` is commented out in `main.rs`.
 # Re-enable `execution_mode_parity` in
 # `crates/scanner-engine-integration-tests/tests/integration/main.rs`
 # before adding a runnable command and CI job.
