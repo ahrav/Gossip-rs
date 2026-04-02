@@ -122,8 +122,8 @@ flowchart TD
 
 ## Mode 3: Direct-vs-Connector Parity Gate
 
-> **Status: Not yet implemented** — This mode describes a planned test
-> gate. The files referenced below do not yet exist in the codebase.
+> **Status: Planned** — This mode describes a planned test
+> gate. The files referenced below are not present in the codebase.
 
 ### What it tests
 
@@ -173,10 +173,10 @@ cargo test --features integration-tests --test integration execution_mode_parity
 
 ## Mode 4: FS Enumeration Conformance Matrix
 
-> **Status: Not yet implemented** — This mode describes a planned
+> **Status: Planned** — This mode describes a planned
 > conformance test. The `connector-pipeline` feature flag and
 > `filesystem_enumeration_conformance_matrix_matches_connector` test
-> do not yet exist.
+> are not present in the codebase.
 
 ### What it tests
 
