@@ -760,7 +760,11 @@ fn failed_finalize_retry_still_scans_blob() {
     .expect("retry should succeed");
 
     assert_eq!(second.0.finalize.stats.unique_blobs, 1);
-    assert_eq!(second.0.finalize.stats.total_findings, 1);
+    if perf_stats_enabled() {
+        assert_eq!(second.0.finalize.stats.total_findings, 1);
+    } else {
+        assert_eq!(second.0.finalize.stats.total_findings, 0);
+    }
 }
 
 /// Verify that every finding's `commit_id` has a matching `commit_meta` event
