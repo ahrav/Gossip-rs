@@ -174,7 +174,7 @@ Lease loss rule (hard):
 
 - If a worker loses its lease or ownership key, it must stop scanning and must not checkpoint/split/complete/park.
 
-Coordinator restart (contract for durable backends; not yet implemented):
+Coordinator restart (contract for durable backends):
 
 - Reload state from coordination backend via prefix scans + indexes.
 - Workers reacquire shards, `fence_epoch` bumps, and resume from last durable cursor.
