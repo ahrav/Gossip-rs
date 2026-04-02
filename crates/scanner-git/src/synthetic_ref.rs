@@ -1090,6 +1090,43 @@ mod tests {
     }
 
     #[test]
+    fn lookup_object_kind_resolves_commit_via_commit_graph_tier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+
+        // Write the commit-graph so Tier 0 has data to probe.
+        git(&mirror, &["commit-graph", "write", "--reachable"]);
+
+        let paths = GitRepoPaths::resolve::<RepoOpenError, _>(&mirror, &RepoOpenLimits::default())
+            .expect("resolve paths");
+
+        // Verify the commit-graph file exists before testing.
+        assert!(
+            paths.objects_dir.join("info").join("commit-graph").exists(),
+            "commit-graph file must be written by `git commit-graph write`"
+        );
+
+        let kind = lookup_object_kind(&paths, commit).expect("lookup succeeds");
+        assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
     fn lookup_object_kind_falls_back_to_build_when_ondisk_midx_is_corrupt() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_root = tmp.path().join("mirror.git");
