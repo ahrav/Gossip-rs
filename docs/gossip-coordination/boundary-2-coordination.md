@@ -837,7 +837,10 @@ Includes a watermark field for tracking convergence.
 ### RunTerminalEvaluation and evaluate_run_terminal (`run.rs`)
 
 `RunTerminalEvaluation` represents the result of evaluating whether a run has
-reached a terminal state (all shards Done, Split, or Parked).
+reached a terminal decision point based on shard progress:
+`StillActive` while any shard remains `Active`, `HasFailures` when all shards
+have settled but one or more are `Parked`, and `AllDone` only when all settled
+shards are `Done` or `Split`.
 `evaluate_run_terminal` is the pure function that performs this evaluation.
 
 ### ShardFilter (`run.rs`)
