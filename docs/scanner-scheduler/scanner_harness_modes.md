@@ -162,11 +162,14 @@ a sustained-green gate script (not yet implemented).
 
 ### Commands
 
+The parity gate is still deferred, so no runnable local command exists yet.
+Once `execution_mode_parity.rs` lands, the intended invocation is:
+
 ```bash
-# Run the parity gate locally (uses defaults: 9 iterations, 2%/5% thresholds)
+# Planned parity-gate invocation (uses defaults: 9 iterations, 2%/5% thresholds)
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 
-# Optional tuning knobs for local stress/debug
+# Optional tuning knobs for local stress/debug once the gate exists
 EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
