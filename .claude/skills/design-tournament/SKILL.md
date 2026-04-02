@@ -1,6 +1,6 @@
 ---
 name: design-tournament
-description: Run a parallel diverge-then-converge design tournament — 3-5 independent agents explore a problem, then 2 ranking agents evaluate and stack-rank the results with confidence scores
+description: Use when facing a design decision with multiple viable approaches, when you want competing proposals evaluated objectively, or when brainstorming needs structured diverge-then-converge evaluation. 3-5 independent design agents plus ranked synthesis.
 ---
 
 # Design Tournament

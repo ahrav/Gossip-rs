@@ -1,6 +1,6 @@
 ---
 name: review-dispatch
-description: Parallel specialist code review — 6 focused agents (correctness, design, performance, safety, docs, complexity) diverge independently, then a single ranker merges findings into an importance-ranked report with confidence scores
+description: Use when preparing to merge a feature branch, after completing a significant implementation, or when critical code paths need deeper review than a single pass. Six parallel specialist agents plus ranked synthesis.
 ---
 
 # Review Dispatch

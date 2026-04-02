@@ -8,8 +8,8 @@
 use std::cell::Cell;
 
 use scanner_git::{
-    FinalizeOutcome, FinalizeOutput, FinalizeStats, PersistError, PersistenceStore, WriteOp,
-    persist_finalize_output,
+    FinalizeOutcome, FinalizeOutput, FinalizeStats, OidBytes, PersistError, PersistenceStore,
+    SeenBitmapPersister, SpillError, WriteOp, persist_finalize_output,
 };
 
 /// Test double that records persisted ops and can simulate commit failures.
@@ -42,6 +42,12 @@ impl PersistenceStore for RecordingStore {
                 .borrow_mut()
                 .extend_from_slice(&output.watermark_ops);
         }
+        Ok(())
+    }
+}
+
+impl SeenBitmapPersister for RecordingStore {
+    fn persist_seen_delta(&self, _oids: &[OidBytes]) -> Result<(), SpillError> {
         Ok(())
     }
 }

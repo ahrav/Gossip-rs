@@ -4,8 +4,9 @@
 //! The adapter uses a single RocksDB instance with plain key/value pairs.
 //! Ref watermarks still use sorted `multi_get` access, while seen-blob queries
 //! are served from a lazily loaded in-memory bitmap snapshot.
-//! Finalize output is committed with a single `WriteBatch` so data writes and
-//! watermarks become visible atomically.
+//! Incremental seen-bitmap updates use single-key `put` writes during spill
+//! flushing. Finalize output is committed with a single `WriteBatch` so data
+//! writes and watermarks become visible atomically.
 //! When the feature is disabled, public constructors and methods return
 //! feature-not-available errors via the appropriate error variant.
 
@@ -27,7 +28,7 @@ use super::persist::PersistenceStore;
 use super::repo_open::RefWatermarkStore;
 #[cfg(feature = "rocksdb")]
 use super::roaring_seen::{RoaringSeenBitmap, RoaringSeenStore, SeenBitmapDelta};
-use super::seen_store::SeenBlobStore;
+use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::start_set::StartSetId;
 #[cfg(feature = "rocksdb")]
 use super::watermark_keys::decode_ref_watermark_value;
@@ -38,9 +39,9 @@ use rocksdb::{Options, WriteBatch, DB};
 /// RocksDB-backed store for Git scan persistence.
 ///
 /// All access is single-threaded: the scan pipeline calls `batch_check_seen`
-/// during the spill stage (before parallel pack execution) and
-/// `commit_finalize` once after all workers join. `RefCell` enforces this
-/// contract at runtime; a borrow panic indicates a caller bug.
+/// and `persist_seen_delta` during the spill stage (before parallel pack
+/// execution) and `commit_finalize` once after all workers join. `RefCell`
+/// enforces this contract at runtime; a borrow panic indicates a caller bug.
 ///
 /// The store retains the `repo_id` and `policy_hash` used to build
 /// the seen-bitmap scope key for the spill/dedupe stage.
@@ -131,6 +132,78 @@ impl RocksDbStore {
             Err(err) => Err(err.to_string()),
         }
     }
+
+    /// Writes the seen-bitmap delta to RocksDB outside the atomic `WriteBatch`
+    /// used by `commit_finalize`.
+    ///
+    /// # Crash-consistency trade-off
+    ///
+    /// This write advances the persisted seen-bitmap independently of ref
+    /// watermarks. If the process crashes after this `put` but before
+    /// `commit_finalize` atomically writes watermarks, recovery will observe
+    /// blobs marked as seen whose scan findings were never committed. Those
+    /// blobs will be skipped on the next run. This is intentional: it avoids
+    /// expensive re-scanning at the cost of potentially missing findings for
+    /// blobs processed during the incomplete run. The trade-off is acceptable
+    /// because the incremental bitmap is a best-effort deduplication hint, not
+    /// a correctness-critical data structure.
+    /// Merges `delta` into the in-memory bitmap in-place, serializes, and
+    /// writes the result to RocksDB.
+    ///
+    /// The bitmap is mutated before the `db.put` call. If `db.put` fails, the
+    /// in-memory bitmap contains mutations that are not persisted — the same
+    /// trade-off documented on `commit_finalize` for the atomic `WriteBatch`
+    /// path. This is acceptable because the seen-bitmap is a best-effort
+    /// deduplication hint, not a correctness-critical structure.
+    #[cfg(feature = "rocksdb")]
+    fn persist_seen_delta_inner(&self, delta: &SeenBitmapDelta) -> Result<(), SpillError> {
+        let scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
+        self.load_seen_store(delta.oid_len())
+            .map_err(|err| SpillError::Io(io::Error::other(err)))?;
+
+        // Mutate the bitmap in-place and serialize while holding the borrow.
+        // The borrow is dropped before the I/O call to avoid holding the
+        // RefCell across `db.put`.
+        let bytes = {
+            let mut guard = self.seen_store.borrow_mut();
+            let store = guard.as_mut().ok_or_else(|| {
+                SpillError::Io(io::Error::other(
+                    "incremental seen-bitmap persist failed: seen-store not initialized",
+                ))
+            })?;
+            store.bitmap_mut().merge_delta(delta)?;
+            store.bitmap().serialize()?
+        };
+
+        self.db.put(&scope_key, &bytes).map_err(|err| {
+            SpillError::Io(io::Error::other(format!(
+                "incremental seen-bitmap RocksDB put failed: {err}"
+            )))
+        })?;
+        Ok(())
+    }
+}
+
+impl SeenBitmapPersister for RocksDbStore {
+    fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError> {
+        #[cfg(feature = "rocksdb")]
+        {
+            if oids.is_empty() {
+                return Ok(());
+            }
+
+            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
+            self.persist_seen_delta_inner(&delta)
+        }
+
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            let _ = oids;
+            Err(SpillError::Io(io::Error::other(
+                "rocksdb support not enabled",
+            )))
+        }
+    }
 }
 
 impl PersistenceStore for RocksDbStore {
@@ -192,6 +265,11 @@ impl PersistenceStore for RocksDbStore {
                 }
             }
 
+            // Staged bitmap built from a clone of the cache. Applied to the
+            // in-memory cache only after db.write succeeds, so a write failure
+            // leaves the cache consistent with what is persisted.
+            let mut staged_bitmap: Option<RoaringSeenBitmap> = None;
+
             if !seen_oids.is_empty() {
                 // Multiple same-scope deltas may have individually sorted OID
                 // lists, but their concatenation is not necessarily globally
@@ -215,27 +293,30 @@ impl PersistenceStore for RocksDbStore {
                     ));
                 }
 
-                let mut guard = self.seen_store.borrow_mut();
-                let store = guard.get_or_insert_with(|| {
-                    RoaringSeenStore::new(RoaringSeenBitmap::new(delta.oid_len()))
-                });
-
-                store
-                    .bitmap_mut()
-                    .insert_batch(delta.oids())
+                // Build the merged bitmap in a separate clone so the in-memory
+                // cache is not mutated until db.write succeeds. This prevents
+                // divergence between the cache and the persisted state on write
+                // failure.
+                let merged = {
+                    let guard = self.seen_store.borrow();
+                    let base = guard.as_ref().map_or_else(
+                        || RoaringSeenBitmap::new(delta.oid_len()),
+                        |s| s.bitmap().clone(),
+                    );
+                    let mut staged = base;
+                    // The finalize-time merge may re-apply OIDs already present
+                    // from incremental persistence. This is harmless: merge_delta
+                    // is a set-union and the cost is bounded by the delta size.
+                    staged
+                        .merge_delta(&delta)
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                    staged
+                };
+                let serialized = merged
+                    .serialize()
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                batch.put(
-                    scope_key,
-                    store
-                        .bitmap()
-                        .serialize()
-                        .map_err(|err| PersistError::backend(err.to_string()))?,
-                );
-                // Drop the borrow before db.write so a panic in RocksDB does
-                // not leave the RefCell permanently borrowed. If db.write
-                // fails, the in-memory bitmap retains uncommitted mutations;
-                // the caller must discard the store.
-                drop(guard);
+                batch.put(scope_key, serialized);
+                staged_bitmap = Some(merged);
             }
 
             if matches!(output.outcome, FinalizeOutcome::Complete) {
@@ -246,6 +327,13 @@ impl PersistenceStore for RocksDbStore {
             self.db
                 .write(batch)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
+
+            // Promote the staged bitmap into the cache only after the write
+            // succeeds. On failure the cache retains the pre-finalize state.
+            if let Some(bitmap) = staged_bitmap {
+                *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+            }
+
             Ok(())
         }
 
@@ -582,6 +670,51 @@ mod tests {
         assert!(
             msg.contains("mismatch"),
             "error should mention mismatch, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_store_incremental_seen_delta_survives_reopen_without_watermarks() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 17;
+        let policy_hash = [0xAA; 32];
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+        let oid_c = OidBytes::sha1([0x33; 20]);
+        let start_set_id: StartSetId = [0x44; 32];
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("incremental persist");
+        let seen_scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&seen_scope_key)
+                .expect("seen scope lookup")
+                .is_some(),
+            "incremental persist should write the seen scope key"
+        );
+        let watermark_key =
+            build_ref_wm_key(repo_id, &policy_hash, &start_set_id, b"refs/heads/main");
+        assert!(
+            store
+                .db
+                .get(&watermark_key)
+                .expect("watermark lookup")
+                .is_none(),
+            "incremental persist must not write watermarks"
+        );
+        drop(store);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("batch check"),
+            vec![true, true, false]
         );
     }
 }
