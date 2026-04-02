@@ -40,6 +40,10 @@ doc = "docs/gossip-contracts/boundary-3-shard-algebra.md"
 dir = "crates/gossip-frontier/src/"
 
 [[scopes]]
+doc = "docs/gossip-frontier/shard-algebra.md"
+dir = "crates/gossip-frontier/src/"
+
+[[scopes]]
 doc = "specs/coordination/README.md"
 dir = "specs/coordination/"
 
@@ -135,6 +139,157 @@ dir = "crates/gossip-scanner-runtime/src/"
 [[scopes]]
 doc = "docs/scanner-core-parity.md"
 dir = "crates/gossip-scanner-runtime/src/"
+
+# Scanner engine design docs.
+[[scopes]]
+doc = "docs/scanner-engine/content-policy-and-caching.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/detection-engine.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/detection-rules.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-api-types.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-decode-state.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-internals.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-offline-validation.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-stream-decode.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-transforms.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-vectorscan-prefilter.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-window-validation.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/regex-to-anchor-extraction.md"
+dir = "crates/scanner-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-engine/transform-chain.md"
+dir = "crates/scanner-engine/src/"
+
+# Scanner git design docs.
+[[scopes]]
+doc = "docs/scanner-git/commit-walking.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/git-object-store.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/git-pack-execution.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/git-scanning.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/git_simulation_harness_guide.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/pack-internals.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/runner-orchestration.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/tree-diffing.md"
+dir = "crates/scanner-git/src/"
+
+# Scanner scheduler design docs.
+[[scopes]]
+doc = "docs/scanner-scheduler/archive-scanning.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/fs-persistence-pipeline.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scanner_harness_modes.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scanner_test_harness_guide.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-device-slots.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-engine-abstraction.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-engine-impl.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-executor.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-global-resource-pool.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-local-fs-uring.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-remote-backend.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-task-graph.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-ts-buffer-pool.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler_test_harness_guide.md"
+dir = "crates/scanner-scheduler/src/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/simulation-framework.md"
+dir = "crates/scanner-scheduler/src/"
 
 [[scopes]]
 doc = "docs/scanner-core-parity.md"
