@@ -443,8 +443,9 @@ mod borrowed_shard_bound_tests {
 }
 
 /// [`is_permanent_io_error`] treats structural filesystem failures
-/// (`PermissionDenied`, `NotFound`, `InvalidInput`, etc.) as permanent —
-/// they will not resolve on retry. All other `ErrorKind` variants are transient.
+/// (`PermissionDenied`, `NotFound`, `InvalidInput`, `ReadOnlyFilesystem`,
+/// etc.) as permanent — they will not resolve on retry. All other
+/// `ErrorKind` variants are transient.
 #[cfg(test)]
 mod is_permanent_io_error_tests {
     use super::*;
