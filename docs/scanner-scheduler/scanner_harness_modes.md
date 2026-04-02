@@ -155,8 +155,8 @@ Throughput sampling is expected to enforce a minimum of 5 iterations per case
 
 Defaulting decisions additionally require sustained-green policy
 evaluation across CI windows; see
-the migration-defaulting closeout process (not yet documented) and
-a sustained-green gate script (not yet implemented).
+the migration-defaulting closeout process (separate documentation) and
+a sustained-green gate script (separate implementation).
 
 ### Commands
 
