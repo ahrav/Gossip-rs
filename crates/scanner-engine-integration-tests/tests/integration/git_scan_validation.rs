@@ -22,8 +22,8 @@ use scanner_git::{
     ArtifactAcquireError, CommitLoadError, FinalizeOutcome, GitScanConfig, GitScanError,
     GitScanMode, GitScanReport, GitScanResult, InMemoryPersistenceStore, MappingCandidateKind,
     NeverSeenStore, OidBytes, PersistError, PersistenceStore, RefWatermarkStore, RepoOpenError,
-    SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig, StartSetResolver, WriteOp,
-    run_git_scan,
+    SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig,
+    StartSetResolver, WriteOp, run_git_scan,
 };
 
 const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
@@ -203,9 +203,21 @@ impl SeenBitmapPersister for RetryStore {
 }
 
 impl PersistenceStore for RetryStore {
-    fn commit_finalize(&self, _output: &scanner_git::FinalizeOutput) -> Result<(), PersistError> {
+    fn commit_finalize(&self, output: &scanner_git::FinalizeOutput) -> Result<(), PersistError> {
         if self.fail_commit_once.replace(false) {
             return Err(PersistError::backend("injected finalize failure"));
+        }
+        // Model production behavior: extract seen OIDs from finalize data ops
+        // so subsequent scans observe them via `batch_check_seen`.
+        let mut seen = self.seen.borrow_mut();
+        for op in &output.data_ops {
+            if op.key.starts_with(&NS_SEEN_BLOB) {
+                if let Ok(delta) = SeenBitmapDelta::deserialize(&op.value) {
+                    for oid in delta.oids() {
+                        seen.insert(*oid);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -759,12 +771,33 @@ fn failed_finalize_retry_still_scans_blob() {
     )
     .expect("retry should succeed");
 
+    assert_eq!(second.0.finalize.outcome, FinalizeOutcome::Complete);
     assert_eq!(second.0.finalize.stats.unique_blobs, 1);
     if perf_stats_enabled() {
         assert_eq!(second.0.finalize.stats.total_findings, 1);
     } else {
         assert_eq!(second.0.finalize.stats.total_findings, 0);
     }
+
+    // Third run: the successful finalize persisted seen state, so the blob
+    // should now be skipped by `batch_check_seen`.
+    let third = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &store,
+        &watermark_store,
+        Some(&store),
+        &config,
+        std::sync::Arc::new(NullEventSink),
+    )
+    .expect("third run should succeed");
+
+    assert_eq!(third.0.finalize.outcome, FinalizeOutcome::Complete);
+    assert_eq!(
+        third.0.finalize.stats.unique_blobs, 0,
+        "blob should be skipped after successful finalize persisted seen state"
+    );
 }
 
 /// Verify that every finding's `commit_id` has a matching `commit_meta` event
