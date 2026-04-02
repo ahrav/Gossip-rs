@@ -23,8 +23,8 @@ deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
 | 7   | Shared sim infra        | `crates/scanner-scheduler/src/sim/` (9 files + `mutation/` subdir)          | `sim-harness`        | RNG, fault injection, minimization, executor                |
 | 8   | Offline validators      | `crates/scanner-engine/src/engine/offline_validate.rs` | None                 | Structural token validation                                 |
 | 9   | YAML unit tests         | `crates/scanner-engine/src/rules/yaml_unit_tests.rs`   | None                 | Rule parsing/scanning roundtrip                             |
-| 10  | Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 files)                        | `integration-tests`  | Handcrafted regression tests                                |
-| 11  | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (24 targets across 4 crates)                      | Nightly              | Coverage-guided mutation                                    |
+| 10  | Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (23 files)                        | `integration-tests`  | Handcrafted regression tests                                |
+| 11  | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (29 targets across 5 crates)                      | Nightly              | Coverage-guided mutation                                    |
 | 12  | Real-rules harness      | `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs`               | `real-rules-harness` | Golden baseline comparison                                  |
 | 13  | Smoke tests             | `crates/scanner-engine-integration-tests/tests/smoke/` (1 file)                                | `smoke-tests`        | End-to-end sanity                                           |
 | 14  | Diagnostic tests        | `crates/scanner-engine-integration-tests/tests/diagnostic/` (3 files)                          | `diagnostic-tests`   | Allocation and runtime diagnostics                          |
@@ -101,7 +101,7 @@ compiles it, and scans a test string. No mutation — inputs are string literals
 
 ### 1.9 Integration Tests
 
-Twenty-two files in `crates/scanner-engine-integration-tests/tests/integration/` covering handcrafted regression
+Twenty-three files in `crates/scanner-engine-integration-tests/tests/integration/` covering handcrafted regression
 scenarios. Each file targets a specific behavior area (chunking, dedup,
 transforms, multi-rule interaction). Gated behind `integration-tests`. Inputs
 are manually constructed byte sequences. Clear, readable, but labor-intensive to
@@ -109,7 +109,7 @@ extend.
 
 ### 1.10 Fuzz Targets
 
-Twenty-four targets across 4 crates (`scanner-engine`, `scanner-git`, `gossip-stdx`, `gossip-contracts`) in per-crate `fuzz/fuzz_targets/` using `cargo-fuzz`/libFuzzer.
+Twenty-nine targets across 5 crates (`scanner-engine`, `scanner-git`, `gossip-stdx`, `gossip-contracts`, `gossip-coordination-etcd`) in per-crate `fuzz/fuzz_targets/` using `cargo-fuzz`/libFuzzer.
 Coverage-guided mutation across anchor soundness, base64 gate ops, pack parsing,
 offline validators, SIMD classification, text sanitization, and more. Run on
 nightly; not in CI default gate.
@@ -260,9 +260,9 @@ fixtures are ever introduced:
 | Near-miss operators     | `crates/scanner-scheduler/src/sim/mutation/op.rs`                 | Near-miss mutation ops       | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/op.rs`       | Core new capability                                    |
 | Property tests          | `crates/scanner-engine-integration-tests/tests/property/` (20 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
 | Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in Phase 3                       |
-| Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
+| Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (23 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
 | Real-rules fixtures     | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in Phase 3                      |
-| Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (24 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
+| Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (29 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
 
 ---
 
