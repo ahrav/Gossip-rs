@@ -1095,7 +1095,8 @@ mod tests {
         let mut offset_table = Vec::with_capacity(sorted.len() * 4);
         for (oid, offset) in &sorted {
             oid_table.extend_from_slice(oid);
-            offset_table.extend_from_slice(&(*offset as u32).to_be_bytes());
+            let offset = u32::try_from(*offset).expect("test idx only supports 32-bit offsets");
+            offset_table.extend_from_slice(&offset.to_be_bytes());
         }
         let crc_table = vec![0u8; sorted.len() * 4];
         // Pack checksum (20 bytes) + idx checksum (20 bytes). Zeroed because
@@ -1141,7 +1142,7 @@ mod tests {
         let paths = GitRepoPaths::resolve::<RepoOpenError, _>(&mirror, &RepoOpenLimits::default())
             .expect("resolve paths");
 
-        // Verify the commit-graph file exists before testing.
+        // `git commit-graph write` should have materialized the graph file.
         assert!(
             paths.objects_dir.join("info").join("commit-graph").exists(),
             "commit-graph file must be written by `git commit-graph write`"
