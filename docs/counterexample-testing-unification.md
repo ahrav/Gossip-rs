@@ -109,7 +109,7 @@ extend.
 
 ### 1.10 Fuzz Targets
 
-Twenty-nine targets across 5 crates (`scanner-engine`, `scanner-git`, `gossip-stdx`, `gossip-contracts`, `gossip-coordination-etcd`) in per-crate `fuzz/fuzz_targets/` using `cargo-fuzz`/libFuzzer.
+Fuzz targets across `scanner-engine`, `scanner-git`, `gossip-stdx`, `gossip-contracts`, and `gossip-coordination-etcd` live in per-crate `fuzz/fuzz_targets/` directories and use `cargo-fuzz`/libFuzzer.
 Coverage-guided mutation across anchor soundness, base64 gate ops, pack parsing,
 offline validators, SIMD classification, text sanitization, and more. Run on
 nightly; not in CI default gate.
