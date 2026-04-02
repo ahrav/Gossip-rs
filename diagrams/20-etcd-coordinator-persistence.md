@@ -558,6 +558,7 @@ in-memory reference backend.
 | `crates/gossip-coordination-etcd/src/backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), etcd RPC wrappers, CAS retry loop, load/scan helpers |
 | `crates/gossip-coordination-etcd/src/backend/run_management.rs` | `RunManagement` and `AsyncRunManagement` implementations |
 | `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` implementations for acquire, renew, checkpoint, complete, park, and split operations |
+| `crates/gossip-coordination-etcd/src/backend/test_support.rs` | Test-support helpers for seeding, inspection, and deterministic fault injection in etcd backend coverage |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |
