@@ -229,18 +229,22 @@ pub fn materialize_synthetic_commit_ref(
 ///
 /// Uses a tiered resolution strategy to minimize I/O:
 ///
-/// 1. **Commit-graph** (Tier 0) — the on-disk commit-graph stores only commit
-///    OIDs. A hit is a commit hint, but the object database is still probed to
-///    confirm the object exists because commit-graph entries can outlive
-///    pruned objects. A miss is inconclusive (the graph may be incomplete or
-///    absent).
-/// 2. **On-disk MIDX** (Tier 1) — if `<pack>/multi-pack-index` exists, it is
+/// 1. **On-disk MIDX** (Tier 1) — if `<pack>/multi-pack-index` exists, it is
 ///    mmapped and used directly. This avoids the O(N log P) k-way merge that
 ///    `build_midx_bytes` performs when building an in-memory MIDX from scratch.
-/// 3. **In-memory MIDX build** (Tier 2) — when no on-disk MIDX is present,
+///    When the on-disk MIDX is stale (missing packs added after the last
+///    `git multi-pack-index write`), a full rebuild from `.idx` files is
+///    triggered before falling back to loose.
+/// 2. **In-memory MIDX build** (Tier 2) — when no on-disk MIDX is present,
 ///    the MIDX is built from pack idx files.
-/// 4. **Loose objects** (fallback) — probed when packs are absent or when pack
+/// 3. **Loose objects** (fallback) — probed when packs are absent or when pack
 ///    resolution fails.
+///
+/// The commit-graph is **not** consulted here because a hit only proves the
+/// OID was once a commit — it cannot guarantee the object still exists
+/// (entries outlive pruned objects). [`lookup_commit_graph_kind`] is available
+/// for callers that need a fast commit-identity hint and can independently
+/// verify liveness.
 ///
 /// When a pack/MIDX error occurs and the subsequent loose probe also misses,
 /// the original pack error is surfaced rather than silently returning `None`
@@ -255,10 +259,6 @@ fn lookup_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
-    // Tier 0: commit-graph — confirms commit identity, but not object
-    // liveness. The packed/loose tiers below still verify existence.
-    let _commit_graph_hit = lookup_commit_graph_kind(paths, oid).is_some();
-
     // Tier 1+2: on-disk MIDX (zero-copy mmap) or in-memory MIDX build.
     //
     // `load_or_build_midx` returns raw bytes plus a flag indicating
@@ -271,56 +271,14 @@ fn lookup_object_kind(
         Ok((midx_bytes, from_disk)) => {
             match resolve_via_midx_bytes(midx_bytes.as_slice(), paths, oid) {
                 Ok(Some(kind)) => Ok(Some(kind)),
-                Ok(None) if from_disk => {
-                    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
-                        Ok(built) => match resolve_via_midx_bytes(built.as_slice(), paths, oid) {
-                            Ok(Some(kind)) => Ok(Some(kind)),
-                            Ok(None) => lookup_loose_object_kind(paths, oid),
-                            Err(pack_err) => match lookup_loose_object_kind(paths, oid) {
-                                Ok(Some(kind)) => Ok(Some(kind)),
-                                Ok(None) => Err(pack_err),
-                                Err(_) => Err(pack_err),
-                            },
-                        },
-                        Err(build_err) => {
-                            let err = SyntheticCommitRefError::ObjectLookup {
-                                detail: build_err.to_string(),
-                            };
-                            match lookup_loose_object_kind(paths, oid) {
-                                Ok(Some(kind)) => Ok(Some(kind)),
-                                _ => Err(err),
-                            }
-                        }
-                    }
-                }
+                Ok(None) if from_disk => rebuild_midx_and_resolve(paths, oid),
                 Ok(None) => lookup_loose_object_kind(paths, oid),
                 Err(first_err) if from_disk => {
                     tracing::debug!(
                         error = %first_err,
                         "on-disk MIDX failed, rebuilding from pack idx files"
                     );
-                    // Default limits are intentional for this transient
-                    // single-OID probe (see `load_or_build_midx` doc).
-                    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
-                        Ok(built) => match resolve_via_midx_bytes(built.as_slice(), paths, oid) {
-                            Ok(Some(kind)) => Ok(Some(kind)),
-                            Ok(None) => lookup_loose_object_kind(paths, oid),
-                            Err(pack_err) => match lookup_loose_object_kind(paths, oid) {
-                                Ok(Some(kind)) => Ok(Some(kind)),
-                                Ok(None) => Err(pack_err),
-                                Err(_) => Err(pack_err),
-                            },
-                        },
-                        Err(build_err) => {
-                            let err = SyntheticCommitRefError::ObjectLookup {
-                                detail: build_err.to_string(),
-                            };
-                            match lookup_loose_object_kind(paths, oid) {
-                                Ok(Some(kind)) => Ok(Some(kind)),
-                                _ => Err(err),
-                            }
-                        }
-                    }
+                    rebuild_midx_and_resolve(paths, oid)
                 }
                 // Pack header resolution failed — try loose objects before
                 // hard-failing, since the object may exist outside packs.
@@ -345,6 +303,40 @@ fn lookup_object_kind(
     }
 }
 
+/// Rebuild the MIDX from all current `.idx` files and re-resolve `oid`.
+///
+/// Used when the on-disk MIDX is stale (returns `None` for an OID that
+/// exists in a newer pack) or corrupt (fails to parse). Falls back to
+/// loose-object lookup when the rebuilt MIDX still misses or the build
+/// itself fails.
+fn rebuild_midx_and_resolve(
+    paths: &GitRepoPaths,
+    oid: OidBytes,
+) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
+    // Default limits are intentional for this transient single-OID probe
+    // (see `load_or_build_midx` doc).
+    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
+        Ok(built) => match resolve_via_midx_bytes(built.as_slice(), paths, oid) {
+            Ok(Some(kind)) => Ok(Some(kind)),
+            Ok(None) => lookup_loose_object_kind(paths, oid),
+            Err(pack_err) => match lookup_loose_object_kind(paths, oid) {
+                Ok(Some(kind)) => Ok(Some(kind)),
+                Ok(None) => Err(pack_err),
+                Err(_) => Err(pack_err),
+            },
+        },
+        Err(build_err) => {
+            let err = SyntheticCommitRefError::ObjectLookup {
+                detail: build_err.to_string(),
+            };
+            match lookup_loose_object_kind(paths, oid) {
+                Ok(Some(kind)) => Ok(Some(kind)),
+                _ => Err(err),
+            }
+        }
+    }
+}
+
 /// Probe the on-disk commit-graph for `oid`.
 ///
 /// The commit-graph stores only commit OIDs in a fanout-indexed sorted array.
@@ -360,6 +352,7 @@ fn lookup_object_kind(
 /// The graph is opened and parsed on every call. Callers that need to probe
 /// multiple OIDs should hoist the `Graph::from_info_dir` call to avoid
 /// repeated I/O and parsing overhead.
+#[allow(dead_code)] // Retained for tests and future batch-oriented callers.
 fn lookup_commit_graph_kind(paths: &GitRepoPaths, oid: OidBytes) -> Option<ObjectKind> {
     let info_dir = paths.objects_dir.join("info");
     let graph = gix_commitgraph::Graph::from_info_dir(&info_dir).ok()?;
@@ -1098,7 +1091,9 @@ mod tests {
             offset_table.extend_from_slice(&(*offset as u32).to_be_bytes());
         }
         let crc_table = vec![0u8; sorted.len() * 4];
-        // Pack checksum (20 bytes) + idx checksum (20 bytes).
+        // Pack checksum (20 bytes) + idx checksum (20 bytes). Zeroed because
+        // neither `IdxView::parse` nor the MIDX builder currently validates
+        // these; update if checksum enforcement is added.
         let checksums = vec![0u8; 40];
 
         let mut out = Vec::new();
