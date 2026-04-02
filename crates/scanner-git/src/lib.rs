@@ -129,6 +129,7 @@ pub mod midx_build;
 pub mod midx_error;
 #[cfg(test)]
 pub(crate) mod midx_test_builder;
+/// Native git-reference resolution backed by `gix-ref`.
 pub mod native_ref_resolver;
 /// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
 pub mod object_id;
@@ -160,6 +161,8 @@ pub mod pack_plan_model;
 pub mod pack_reader;
 /// Implements a path policy classifier for tree diff candidates.
 pub mod path_policy;
+/// Synthetic commit-ref materialization for explicit-commit lowering.
+mod synthetic_ref;
 use gossip_stdx::perf_stats;
 /// Defines the write-only persistence store contract and helpers.
 pub mod persist;
@@ -274,6 +277,9 @@ pub use repo_open::{
 };
 pub use repo_paths::{parse_hex_oid, HexOidParseError};
 pub use start_set::{StartSetConfig, StartSetId};
+pub use synthetic_ref::{
+    materialize_synthetic_commit_ref, synthetic_commit_ref_name, SyntheticCommitRefError,
+};
 
 // ── Stage 2: Commit loading & graph construction ────────────────────────
 pub use commit_graph::CommitGraphIndex;

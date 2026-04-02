@@ -47,7 +47,10 @@ pub mod setup;
 #[cfg(test)]
 mod test_support;
 
-pub use git_payload::{GitShardPayload, GitShardPayloadDecodeError, GitShardPayloadEncodeError};
+pub use git_payload::{
+    GitSelectionLoweringError, GitShardPayload, GitShardPayloadDecodeError,
+    GitShardPayloadEncodeError,
+};
 pub use git_planner::{
     GitInitialShardPlan, GitInitialShardPlanEntry, GitPlannerError, plan_git_initial_shards,
 };

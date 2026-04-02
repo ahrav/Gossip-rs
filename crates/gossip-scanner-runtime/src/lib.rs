@@ -64,6 +64,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 
 use gossip_connectors::FilesystemConnector;
 pub use gossip_contracts::connector::git::GitDebugLevel;
+use gossip_contracts::connector::git::GitRefSelection;
 use gossip_contracts::identity::{ConnectorInstanceIdHash, ItemIdentityKey, StableItemId};
 use gossip_contracts::{
     connector::{Budgets, ConnectorInputError, Cursor, FILESYSTEM_CONNECTOR_TAG},
@@ -432,6 +433,13 @@ pub struct GitScanConfig {
     pub scan_mode: GitScanMode,
     /// Merge-diff strategy for merge commits.
     pub merge_mode: MergeDiffMode,
+    /// Ref-selection policy that determines which refs form the scan start set.
+    ///
+    /// Translated into a `scanner_git::StartSetConfig` at dispatch time.
+    /// Explicit-commit selections are lowered to `ExplicitRefs` containing a
+    /// synthetic ref before reaching this field — `GitRefSelection` is always
+    /// ref-backed.
+    pub ref_selection: GitRefSelection,
     /// Optional tree delta cache size override in MiB.
     pub tree_delta_cache_mb: Option<u32>,
     /// Optional engine chunk size override in MiB.
@@ -459,6 +467,7 @@ impl GitScanConfig {
             repo_id: 1,
             scan_mode: GitScanMode::OdbBlobFast,
             merge_mode: MergeDiffMode::AllParents,
+            ref_selection: GitRefSelection::DefaultBranchOnly,
             tree_delta_cache_mb: None,
             engine_chunk_mb: None,
             execution_mode: ExecutionMode::Direct,
@@ -540,6 +549,18 @@ impl GitScanConfig {
     #[must_use]
     pub fn with_merge_mode(mut self, merge_mode: MergeDiffMode) -> Self {
         self.merge_mode = merge_mode;
+        self
+    }
+
+    /// Sets the lowered ref-selection policy for the Git start set.
+    ///
+    /// The selection controls which refs the scanner walks. For explicit-commit
+    /// scans, callers should pass the `ExplicitRefs` variant containing the
+    /// synthetic ref name produced by
+    /// [`materialize_synthetic_commit_ref`](scanner_git::materialize_synthetic_commit_ref).
+    #[must_use]
+    pub fn with_ref_selection(mut self, ref_selection: GitRefSelection) -> Self {
+        self.ref_selection = ref_selection;
         self
     }
 

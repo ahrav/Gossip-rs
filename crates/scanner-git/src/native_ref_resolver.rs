@@ -5,6 +5,10 @@
 //! avoiding the `git` CLI entirely. The resolved pairs feed into the scan
 //! pipeline as the initial commit set ("start set") for object traversal.
 //!
+//! Synthetic commit-ref materialization (the write path) lives in the sibling
+//! [`crate::synthetic_ref`] module. This module provides [`open_ref_store`] as
+//! shared infrastructure for both reading and writing refs.
+//!
 //! # Algorithm
 //!
 //! 1. Open a [`gix_ref::file::Store`] for the repository (handling linked
@@ -448,7 +452,7 @@ fn try_read_loose_tag_target(
     oid: &OidBytes,
     objects_dir: &Path,
 ) -> Result<Option<OidBytes>, RepoOpenError> {
-    let hex = oid_to_hex(oid);
+    let hex = oid.to_string();
     let (dir, file) = hex.split_at(2);
     let path = objects_dir.join(dir).join(file);
 
@@ -504,25 +508,12 @@ fn try_read_loose_tag_target(
     Ok(Some(oid_from_hash(target_id.as_bytes())))
 }
 
-/// Encode an OID as lowercase hex for loose-object path construction.
-///
-/// The resulting string is split by the caller as `XX` / `YYY...` to form the
-/// git loose object path `$GIT_DIR/objects/XX/YYY...`.
-fn oid_to_hex(oid: &OidBytes) -> String {
-    let mut out = String::with_capacity(oid.len() as usize * 2);
-    for &b in oid.as_slice() {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
 /// Open a `gix_ref::file::Store` appropriate for the repository layout.
 ///
 /// Linked worktrees have a per-worktree `git_dir` (containing `HEAD` and
 /// worktree-specific refs) plus a shared `common_dir` (containing branches,
 /// tags, and packed-refs). Normal repos and bare repos only need `git_dir`.
-fn open_ref_store(
+pub(crate) fn open_ref_store(
     paths: &GitRepoPaths,
     limits: &RepoOpenLimits,
 ) -> Result<gix_ref::file::Store, RepoOpenError> {
@@ -538,22 +529,47 @@ fn open_ref_store(
     })
 }
 
-/// Build store options from the detected object format.
+/// Open a ref store when the caller has already detected the object format.
 ///
-/// Reflogs are disabled because the scanner is read-only and never creates
-/// refs. `precompose_unicode` is left off because ref names are treated as
+/// Avoids re-reading the git config that [`open_ref_store`] performs internally
+/// via [`detect_object_format`]. Useful in paths that detect the format for
+/// their own validation (e.g., `materialize_synthetic_commit_ref`).
+pub(crate) fn open_ref_store_with_format(
+    paths: &GitRepoPaths,
+    format: ObjectFormat,
+) -> gix_ref::file::Store {
+    let options = gix_store_options_for(format);
+    if paths.is_linked_worktree() {
+        gix_ref::file::Store::for_linked_worktree(
+            paths.git_dir.clone(),
+            paths.common_dir.clone(),
+            options,
+        )
+    } else {
+        gix_ref::file::Store::at(paths.git_dir.clone(), options)
+    }
+}
+
+/// Build store options for the given object format.
+///
+/// Reflogs are disabled because synthetic ref writes do not need history
+/// tracking, and the scan pipeline's read path never creates refs.
+/// `precompose_unicode` is left off because ref names are treated as
 /// opaque bytes throughout the scan pipeline.
+fn gix_store_options_for(format: ObjectFormat) -> gix_ref::store::init::Options {
+    gix_ref::store::init::Options {
+        write_reflog: gix_ref::store::WriteReflog::Disable,
+        object_hash: map_object_format(format),
+        precompose_unicode: false,
+        prohibit_windows_device_names: false,
+    }
+}
+
 fn gix_store_options(
     paths: &GitRepoPaths,
     limits: &RepoOpenLimits,
 ) -> Result<gix_ref::store::init::Options, RepoOpenError> {
-    let object_hash = map_object_format(detect_object_format(paths, limits)?);
-    Ok(gix_ref::store::init::Options {
-        write_reflog: gix_ref::store::WriteReflog::Disable,
-        object_hash,
-        precompose_unicode: false,
-        prohibit_windows_device_names: false,
-    })
+    Ok(gix_store_options_for(detect_object_format(paths, limits)?))
 }
 
 /// Map the crate-level [`ObjectFormat`] enum to the `gix_hash::Kind` that
@@ -582,7 +598,8 @@ fn gix_error(context: &str, err: impl std::fmt::Display) -> RepoOpenError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -590,7 +607,7 @@ mod tests {
 
     use super::*;
 
-    fn init_repo(tmp: &tempfile::TempDir) -> PathBuf {
+    pub(crate) fn init_repo(tmp: &tempfile::TempDir) -> PathBuf {
         let output = Command::new("git")
             .args(["init", "--initial-branch=main"])
             .arg(tmp.path())
@@ -607,7 +624,7 @@ mod tests {
         repo
     }
 
-    fn git(repo: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo)
@@ -626,7 +643,16 @@ mod tests {
             .to_owned()
     }
 
-    fn resolve_with(repo: &Path, config: StartSetConfig) -> Vec<(Vec<u8>, OidBytes)> {
+    pub(crate) fn try_git(repo: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git command")
+    }
+
+    pub(crate) fn resolve_with(repo: &Path, config: StartSetConfig) -> Vec<(Vec<u8>, OidBytes)> {
         try_resolve_with(repo, config).expect("resolve")
     }
 
@@ -644,7 +670,7 @@ mod tests {
         resolve_with(repo, StartSetConfig::DefaultBranchOnly)
     }
 
-    fn parse_oid(hex: &str) -> OidBytes {
+    pub(crate) fn parse_oid(hex: &str) -> OidBytes {
         let id = gix_hash::ObjectId::from_hex(hex.as_bytes()).expect("hex object id");
         OidBytes::from_slice(id.as_bytes())
     }
