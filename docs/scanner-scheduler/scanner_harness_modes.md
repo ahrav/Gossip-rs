@@ -143,11 +143,10 @@ The canonical identity tuple is:
 
 ### Reduced matrix for the deferred CI gate
 
-The integration gate is still deferred. `crates/scanner-engine-integration-tests/tests/integration/main.rs`
-currently comments out `mod execution_mode_parity;` until the scanner-rs-cli
-binary name is settled, so there is no live `execution_mode_parity.rs`
-integration module and no `execution-mode-parity` CI job. The reduced matrix
-for this gate covers:
+The integration gate is deferred. `crates/scanner-engine-integration-tests/tests/integration/main.rs`
+comments out `mod execution_mode_parity;`, so there is no live
+`execution_mode_parity.rs` integration module and no `execution-mode-parity`
+CI job. The reduced matrix for this gate covers:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
