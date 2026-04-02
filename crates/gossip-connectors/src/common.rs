@@ -216,6 +216,7 @@ pub fn is_permanent_io_error(err: &io::Error) -> bool {
             | io::ErrorKind::InvalidFilename
             | io::ErrorKind::NotADirectory
             | io::ErrorKind::IsADirectory
+            | io::ErrorKind::ReadOnlyFilesystem
     ) || is_symlink_loop(err)
 }
 
