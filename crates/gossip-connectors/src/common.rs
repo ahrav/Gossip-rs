@@ -204,9 +204,9 @@ pub(crate) fn deadline_expired(deadline: Option<Instant>) -> bool {
 /// Returns `true` for I/O errors that are deterministically permanent.
 ///
 /// Structural filesystem errors — missing files, permission denials, type
-/// mismatches, and symlink loops — will not resolve on retry. Everything
-/// else (interrupted, would-block, connection-reset, etc.) is assumed
-/// transient and therefore retryable.
+/// mismatches, read-only mounts, and symlink loops — will not resolve on
+/// retry. Everything else (interrupted, would-block, connection-reset, etc.)
+/// is assumed transient and therefore retryable.
 pub fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
