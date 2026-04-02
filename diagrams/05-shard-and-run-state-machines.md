@@ -104,10 +104,11 @@ Key observations from the source code:
 A run aggregates multiple shards into a single scan job. Its lifecycle is derived
 from the collective state of its shards. The run progresses from `Initializing`
 (manifest validated, initial shards materialized) through `Active` (workers
-processing shards) to either `Done` (all shards terminal and successful),
-`Failed` (timeout or unrecoverable error), or `Cancelled` (explicitly
-cancelled before completion). Run completion requires recursive terminal checks:
-if a shard was split, all its descendant shards must also be terminal.
+processing shards) to either `Done` (all shards settled with zero parked
+shards), `Failed` (timeout, unrecoverable error, or a settled run that still
+contains parked shards), or `Cancelled` (explicitly cancelled before
+completion). Run completion requires recursive terminal checks: if a shard was
+split, all its descendant shards must also be terminal.
 
 ```mermaid
 %% Diagram: run-state-machine
@@ -119,8 +120,8 @@ stateDiagram-v2
     Initializing --> Active : register_shards<br/>(shard registration activates run)
     Initializing --> Cancelled : cancelled before any work starts
     Active --> Active : shard operations<br/>(checkpoint, split, complete, park)
-    Active --> Done : all shards in terminal state<br/>(Done, Split, or Parked)
-    Active --> Failed : timeout or unrecoverable error
+    Active --> Done : all shards settled<br/>(Done or Split; no Parked shards)
+    Active --> Failed : timeout, unrecoverable error,<br/>or settled run with Parked shards
     Active --> Cancelled : explicitly cancelled
 
     Done --> [*]
@@ -141,15 +142,16 @@ stateDiagram-v2
     end note
 
     note right of Done
-        All shards reached terminal state.
+        All shards settled with zero parked shards.
         Run succeeded. Results available
         for downstream consumers.
     end note
 
     note left of Failed
-        Run aborted. Workers must stop
-        processing. Shards may be in
-        any state at failure time.
+        Run aborted or settled with failures.
+        Workers must stop processing.
+        Parked shards force failure unless
+        they are explicitly unparked first.
     end note
 
     note left of Cancelled
