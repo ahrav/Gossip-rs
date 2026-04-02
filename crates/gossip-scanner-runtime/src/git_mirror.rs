@@ -152,8 +152,8 @@ impl LocalMirrorManager {
     }
 
     fn sync_local_path(&self, path: &Path) -> Result<LocalMirror, GitRunError> {
-        let report = preflight(path, self.preflight_limits)
-            .map_err(|err| classify_preflight_error(path, err))?;
+        let locator = RepoLocator::local_path(path);
+        let report = self.preflight_local_repo(&locator)?;
 
         // Only active lock contention blocks mirror sync. Missing performance
         // indexes (commit-graph, multi-pack-index) degrade traversal speed but
@@ -502,9 +502,11 @@ mod tests {
         let mirror_root = tempdir().expect("mirror root");
         let mut manager = LocalMirrorManager::new(mirror_root.path()).expect("manager");
 
+        let before = wall_clock_now_ms();
         let mirror = manager
             .sync_mirror(&RepoLocator::local_path(repo_dir.path()))
             .expect("sync mirror");
+        let after = wall_clock_now_ms();
 
         assert_eq!(
             mirror.path(),
@@ -512,7 +514,11 @@ mod tests {
                 .expect("canonical repo")
                 .as_path()
         );
-        assert!(mirror.last_synced_at_ms().is_some());
+        let ts = mirror.last_synced_at_ms().expect("timestamp populated");
+        assert!(
+            ts >= before && ts <= after,
+            "timestamp {ts} not in [{before}, {after}]"
+        );
     }
 
     #[test]
