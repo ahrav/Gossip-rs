@@ -129,7 +129,7 @@ pub mod midx_build;
 pub mod midx_error;
 #[cfg(test)]
 pub(crate) mod midx_test_builder;
-/// Native git-reference resolution and synthetic commit-ref lowering.
+/// Native git-reference resolution backed by `gix-ref`.
 pub mod native_ref_resolver;
 /// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
 pub mod object_id;
@@ -161,6 +161,8 @@ pub mod pack_plan_model;
 pub mod pack_reader;
 /// Implements a path policy classifier for tree diff candidates.
 pub mod path_policy;
+/// Synthetic commit-ref materialization for explicit-commit lowering.
+mod synthetic_ref;
 use gossip_stdx::perf_stats;
 /// Defines the write-only persistence store contract and helpers.
 pub mod persist;
@@ -258,15 +260,7 @@ pub use artifact_acquire::{
 pub use limits::RepoOpenLimits;
 pub use midx::MidxView;
 pub use midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
-pub use native_ref_resolver::{
-    materialize_synthetic_commit_ref, synthetic_commit_ref_name, NativeRefResolver,
-    SyntheticCommitRefError,
-};
-// Explicit-commit lowering: `materialize_synthetic_commit_ref` creates a
-// private ref (`refs/gossip/scan-targets/commits/...`) inside a mirror,
-// allowing the normal `ExplicitRefs` start-set resolver to pick up a
-// bare commit OID. `synthetic_commit_ref_name` exposes the deterministic
-// naming scheme for callers that need the ref name without writing it.
+pub use native_ref_resolver::NativeRefResolver;
 pub use object_id::{ObjectFormat, OidBytes};
 pub use preflight::{
     preflight, ArtifactPaths, ArtifactStatus, PreflightMaintenance, PreflightReport,
@@ -283,6 +277,9 @@ pub use repo_open::{
 };
 pub use repo_paths::{parse_hex_oid, HexOidParseError};
 pub use start_set::{StartSetConfig, StartSetId};
+pub use synthetic_ref::{
+    materialize_synthetic_commit_ref, synthetic_commit_ref_name, SyntheticCommitRefError,
+};
 
 // ── Stage 2: Commit loading & graph construction ────────────────────────
 pub use commit_graph::CommitGraphIndex;

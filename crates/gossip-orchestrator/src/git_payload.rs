@@ -1580,6 +1580,37 @@ mod tests {
     }
 
     #[test]
+    fn lowering_default_branch_passes_through_unchanged() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+
+        let (_, payload) = payload_from_request(
+            GitRequest::single_repo(
+                tenant(0x37),
+                dir.path(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+
+        let mirror = LocalMirror::new(dir.path());
+        let lowered = payload
+            .lower_selection_for_local_mirror(&mirror, RepoOpenLimits::default())
+            .expect("lower default branch selection");
+
+        assert_eq!(
+            lowered,
+            GitSelection::new(
+                GitRefSelection::DefaultBranchOnly,
+                default_scan_mode(),
+                default_merge_strategy(),
+            )
+        );
+    }
+
+    #[test]
     fn payload_round_trips_through_metadata_envelope() {
         let dir = tempdir().expect("tempdir");
         init_repo(dir.path());

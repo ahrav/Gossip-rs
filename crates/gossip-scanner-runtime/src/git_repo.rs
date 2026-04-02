@@ -474,4 +474,50 @@ mod tests {
         let built = build_git_scan_config(&cfg).expect("build runtime git config");
         assert_eq!(built.start_set, StartSetConfig::ExplicitRefs { refs });
     }
+
+    /// Default `GitRefSelection` (i.e. `DefaultBranchOnly`) maps to
+    /// `StartSetConfig::DefaultBranchOnly`.
+    #[test]
+    fn build_git_scan_config_uses_default_branch_only_start_set() {
+        let cfg = GitScanConfig::new("/tmp");
+
+        let built = build_git_scan_config(&cfg).expect("build config");
+        assert_eq!(built.start_set, StartSetConfig::DefaultBranchOnly);
+    }
+
+    /// `AllRemoteBranches` with a specific remote propagates the remote filter.
+    #[test]
+    fn build_git_scan_config_uses_all_remote_branches_start_set() {
+        let cfg =
+            GitScanConfig::new("/tmp").with_ref_selection(GitRefSelection::AllRemoteBranches {
+                remote: Some(b"upstream".to_vec()),
+            });
+
+        let built = build_git_scan_config(&cfg).expect("build config");
+        assert_eq!(
+            built.start_set,
+            StartSetConfig::AllRemoteBranches {
+                remote: Some(b"upstream".to_vec()),
+            }
+        );
+    }
+
+    /// `BranchesAndTags` with remote branches enabled and no remote filter
+    /// propagates both fields.
+    #[test]
+    fn build_git_scan_config_uses_branches_and_tags_start_set() {
+        let cfg = GitScanConfig::new("/tmp").with_ref_selection(GitRefSelection::BranchesAndTags {
+            include_remote_branches: true,
+            remote: None,
+        });
+
+        let built = build_git_scan_config(&cfg).expect("build config");
+        assert_eq!(
+            built.start_set,
+            StartSetConfig::BranchesAndTags {
+                include_remote_branches: true,
+                remote: None,
+            }
+        );
+    }
 }
