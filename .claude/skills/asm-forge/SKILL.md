@@ -1,6 +1,6 @@
 ---
 name: asm-forge
-description: ASM-guided deep performance optimization. Collects assembly, audits codegen quality, applies targeted transforms, validates with benchmarks. Uses cargo-show-asm + Criterion as ground truth.
+description: Use when /performance-analyzer identifies a hot function, when /bench-compare shows regression and you need instruction-level analysis, or when you suspect bounds checks or register spills in a tight loop. ASM-guided optimization with cargo-show-asm + Criterion.
 user-invocable: true
 ---
 

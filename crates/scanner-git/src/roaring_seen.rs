@@ -383,7 +383,7 @@ impl RoaringSeenBitmap {
         self.merge_positions(&other.oids, |idx| bitmap_contains(&other.seen, idx))
     }
 
-    fn merge_delta(&mut self, delta: &SeenBitmapDelta) -> Result<(), SeenBitmapError> {
+    pub(crate) fn merge_delta(&mut self, delta: &SeenBitmapDelta) -> Result<(), SeenBitmapError> {
         if self.oid_len != delta.oid_len {
             return Err(SeenBitmapError::MixedOidLengths);
         }

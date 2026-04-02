@@ -1,6 +1,6 @@
 ---
 name: perf-regression
-description: Performance regression testing workflow for hot path changes
+description: Use when modifying hot-path code in coordination or scanner engine, before merging performance-sensitive changes, or when CI benchmarks flag a regression. Performance regression testing with before/after comparison.
 user-invocable: false
 ---
 

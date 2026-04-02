@@ -1,6 +1,6 @@
 ---
 name: deep-research
-description: Deep research before design — 3-5 parallel research agents survey papers, production systems, failure modes, and prior art, then a synthesizer compiles evidence, and an integrator maps findings to a concrete codebase plan with citations
+description: Use when designing safety-critical code, distributed protocols, or novel algorithms where getting the design wrong is expensive. Parallel research agents survey papers, production systems, and prior art, then synthesize into an evidence-backed codebase plan.
 ---
 
 # Deep Research

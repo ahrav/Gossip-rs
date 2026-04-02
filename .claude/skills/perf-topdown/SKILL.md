@@ -1,6 +1,6 @@
 ---
 name: perf-topdown
-description: Top-Down Microarchitecture Analysis (TMA) with branch tracing on x86-64 (LBR) and AArch64 (SPE) — classifies bottlenecks and maps them to concrete Rust-level fixes
+description: Use when you need to classify why code is slow (front-end vs back-end vs speculation), when hunting branch misprediction sites, after /bench-compare or /perf-regression finds a regression needing root cause, or when building an isolated hot-loop harness. Cross-arch TMA and branch tracing.
 user-invocable: true
 ---
 

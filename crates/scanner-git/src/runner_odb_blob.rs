@@ -55,7 +55,7 @@ use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPla
 use super::runner::{
     GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
 };
-use super::seen_store::SeenBlobStore;
+use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::{SpillStats, Spiller};
 use super::tree_delta_cache::TreeDeltaCache;
 use super::tree_diff::TreeDiffStats;
@@ -110,6 +110,7 @@ use crate::perf_set;
 /// - `repo`: opened repository job state (paths, object format, artifacts).
 /// - `engine`: detection engine instance for scanning blob contents.
 /// - `seen_store`: seen-blob store for deduplication during spill retry.
+/// - `seen_persister`: incremental seen-bitmap writer used after each flush.
 /// - `cg_index`: commit graph index built from the commit graph.
 /// - `plan`: commit plan (planned commits from `introduced_by_plan`).
 /// - `config`: scan configuration (limits, worker counts, etc.).
@@ -124,6 +125,7 @@ pub(super) fn run_odb_blob(
     repo: &RepoJobState,
     engine: Arc<Engine>,
     seen_store: &dyn SeenBlobStore,
+    seen_persister: &dyn SeenBitmapPersister,
     cg_index: &CommitGraphIndex,
     plan: &[PlannedCommit],
     config: &GitScanConfig,
@@ -247,6 +249,7 @@ pub(super) fn run_odb_blob(
                         &oid_index,
                         &mapping_cfg,
                         seen_store,
+                        seen_persister,
                         &mut object_store,
                         &mut stage_nanos,
                         intro_start,
@@ -321,6 +324,7 @@ pub(super) fn run_odb_blob(
                         &oid_index,
                         &mapping_cfg,
                         seen_store,
+                        seen_persister,
                         &mut object_store,
                         &mut stage_nanos,
                         intro_start,
@@ -613,9 +617,9 @@ type IntroResult = (
 ///    this time emitting candidates into a `Spiller` (disk-backed) instead
 ///    of the in-memory `PackCandidateCollector`.
 /// 2. **Finalize + map**: the spiller is finalized through `seen_store`
-///    dedup and piped into a `MappingBridge` which maps OIDs to pack
-///    offsets and produces the final `PackCandidate` / `LooseCandidate`
-///    vectors.
+///    dedup plus `seen_persister` durability and piped into a
+///    `MappingBridge` which maps OIDs to pack offsets and produces the
+///    final `PackCandidate` / `LooseCandidate` vectors.
 ///
 /// A fresh introducer is needed because the prior one's seen sets may
 /// have accumulated partial state from the failed fast-path attempt.
@@ -637,6 +641,7 @@ fn run_serial_spill_retry(
     oid_index: &OidIndex,
     mapping_cfg: &MappingBridgeConfig,
     seen_store: &dyn SeenBlobStore,
+    seen_persister: &dyn SeenBitmapPersister,
     object_store: &mut ObjectStore<'_>,
     stage_nanos: &mut GitScanStageNanos,
     intro_start: Instant,
@@ -672,7 +677,7 @@ fn run_serial_spill_retry(
         ),
         *mapping_cfg,
     );
-    let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
+    let spill_stats = spiller.finalize(seen_store, seen_persister, &mut bridge)?;
     perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
     let packed = std::mem::take(&mut sink.packed);
