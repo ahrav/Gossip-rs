@@ -972,9 +972,8 @@ mod tests {
             ],
         );
 
-        // Repack the mirror so all objects live exclusively in packs,
-        // then prune loose objects. This forces the kind-resolution
-        // path through the MIDX + pack-header walker.
+        // Repack leaves the mirror's reachable objects in packfiles;
+        // prune-packed removes duplicate loose copies.
         git(&mirror, &["repack", "-a", "-d"]);
         git(&mirror, &["prune-packed"]);
 
@@ -1070,8 +1069,8 @@ mod tests {
 
     /// Build minimal pack index v2 bytes for a single pack.
     ///
-    /// Only supports SHA-1 OIDs and offsets that fit in 4 bytes. Sufficient
-    /// for testing the `build_midx_bytes` fallback path.
+    /// Supports only SHA-1 OIDs and offsets that fit in 4 bytes, which matches
+    /// the synthetic pack fixtures in this module.
     fn build_test_idx(objects: &[([u8; 20], u64)]) -> Vec<u8> {
         const IDX_MAGIC: [u8; 4] = [0xff, b't', b'O', b'c'];
         const IDX_VERSION: u32 = 2;
@@ -1216,12 +1215,10 @@ mod tests {
         let idx_bytes = build_test_idx(&[(commit_oid_bytes, offsets[entry_idx])]);
         fs::write(paths.pack_dir.join(format!("{pack_name}.idx")), &idx_bytes).expect("write idx");
 
-        // Write corrupt bytes to multi-pack-index so the on-disk path fails.
+        // Corrupt on-disk MIDX bytes leave the pack and idx files untouched.
         fs::write(paths.pack_dir.join("multi-pack-index"), b"CORRUPT GARBAGE")
             .expect("write corrupt midx");
 
-        // lookup_object_kind should detect the corrupt on-disk MIDX, fall
-        // back to building from the .idx file, and resolve the commit.
         let kind = lookup_object_kind(&paths, commit_oid).expect("lookup succeeds via fallback");
         assert_eq!(kind, Some(ObjectKind::Commit));
     }
