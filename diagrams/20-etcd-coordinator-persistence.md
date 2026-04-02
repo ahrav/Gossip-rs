@@ -529,9 +529,8 @@ graph TB
 
 The keyspace and codec are shared infrastructure used by the CAS transaction
 logic in `backend.rs` and the `backend/` submodules. The sync wrapper
-(`EtcdCoordinator`) and async core (`AsyncEtcdCoordinator`) now persist the
-full shard-lifecycle hot path directly in etcd rather than delegating terminal
-operations back to the in-memory reference backend.
+(`EtcdCoordinator`) and async core (`AsyncEtcdCoordinator`) persist the full
+shard-lifecycle hot path directly in etcd.
 
 ---
 
