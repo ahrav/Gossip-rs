@@ -1,8 +1,8 @@
 //! Deterministic initial shard geometry planning for filesystem requests.
 //!
 //! The planner deliberately emits one startup shard per normalized request.
-//! Any later fan-out comes from coordination split flows after the worker
-//! makes progress, not from submission-time pre-sharding.
+//! Any later fan-out comes from coordination split flows after a worker makes
+//! progress, not from submission-time pre-sharding.
 
 use crate::payload::FilesystemShardPayload;
 use crate::request::NormalizedFilesystemRequest;
@@ -20,26 +20,26 @@ use crate::request::NormalizedFilesystemRequest;
 ///
 /// [`ShardSpec`]: gossip_coordination::ShardSpec
 /// [`InitialShardInput`]: gossip_coordination::InitialShardInput
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitialShardGeometry {
-    key_range_start: &'static [u8],
-    key_range_end: &'static [u8],
+    key_range_start: Vec<u8>,
+    key_range_end: Vec<u8>,
 }
 
 impl InitialShardGeometry {
-    /// Geometry covering the full connector keyspace (unbounded).
-    ///
-    /// Empty slices follow the [`ShardSpec::unbounded()`] convention: no lower
-    /// bound and no upper bound. See the struct-level docs for lowering
-    /// requirements.
-    ///
-    /// [`ShardSpec::unbounded()`]: gossip_coordination::ShardSpec::unbounded
+    /// Create geometry from explicit byte-range bounds.
     #[must_use]
-    pub const fn full_connector_keyspace() -> Self {
+    pub fn new(start: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) -> Self {
         Self {
-            key_range_start: &[],
-            key_range_end: &[],
+            key_range_start: start.into(),
+            key_range_end: end.into(),
         }
+    }
+
+    /// Geometry covering the full connector keyspace (unbounded).
+    #[must_use]
+    pub fn full_connector_keyspace() -> Self {
+        Self::new(Vec::new(), Vec::new())
     }
 
     /// Returns `true` if the lower bound is unbounded (empty).
@@ -57,13 +57,13 @@ impl InitialShardGeometry {
     /// Inclusive lower bound of the planned key range, or empty for unbounded.
     #[must_use]
     pub fn key_range_start(&self) -> &[u8] {
-        self.key_range_start
+        self.key_range_start.as_slice()
     }
 
     /// Exclusive upper bound of the planned key range, or empty for unbounded.
     #[must_use]
     pub fn key_range_end(&self) -> &[u8] {
-        self.key_range_end
+        self.key_range_end.as_slice()
     }
 }
 
@@ -88,8 +88,8 @@ impl FilesystemInitialShardPlan {
 
     /// The single startup shard geometry.
     #[must_use]
-    pub fn initial_shard(&self) -> InitialShardGeometry {
-        self.initial_shard
+    pub fn initial_shard(&self) -> &InitialShardGeometry {
+        &self.initial_shard
     }
 
     /// Build the typed shard payload from the underlying normalized request.

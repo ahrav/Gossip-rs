@@ -57,12 +57,12 @@ pub struct FilesystemRunSetupResult {
 
 impl FilesystemRunSetupResult {
     fn from_run(run: RunRecord) -> Self {
-        debug_assert!(
+        assert!(
             run.status() == RunStatus::Active,
             "FilesystemRunSetupResult requires Active status, got {:?}",
             run.status()
         );
-        debug_assert!(
+        assert!(
             !run.root_shards().is_empty(),
             "FilesystemRunSetupResult requires non-empty root shards"
         );
@@ -92,7 +92,7 @@ impl FilesystemRunSetupResult {
 #[derive(Clone, Copy)]
 pub struct FilesystemRunSetupInput<'a> {
     request: &'a NormalizedFilesystemRequest,
-    geometry: InitialShardGeometry,
+    geometry: &'a InitialShardGeometry,
     payload: &'a FilesystemShardPayload,
 }
 
@@ -103,7 +103,7 @@ impl fmt::Debug for FilesystemRunSetupInput<'_> {
         f.debug_struct("FilesystemRunSetupInput")
             .field("mode", &self.request.mode())
             .field("canonical_root", &"<redacted>")
-            .field("geometry", &self.geometry)
+            .field("geometry", self.geometry)
             .field("payload", &self.payload)
             .finish()
     }
@@ -121,7 +121,7 @@ impl<'a> FilesystemRunSetupInput<'a> {
     #[must_use]
     pub fn new(
         request: &'a NormalizedFilesystemRequest,
-        geometry: InitialShardGeometry,
+        geometry: &'a InitialShardGeometry,
         payload: &'a FilesystemShardPayload,
     ) -> Self {
         Self {
@@ -133,19 +133,19 @@ impl<'a> FilesystemRunSetupInput<'a> {
 
     /// Normalized filesystem request to register.
     #[must_use]
-    pub fn request(self) -> &'a NormalizedFilesystemRequest {
+    pub fn request(&self) -> &'a NormalizedFilesystemRequest {
         self.request
     }
 
     /// Planned startup shard geometry.
     #[must_use]
-    pub fn geometry(self) -> InitialShardGeometry {
+    pub fn geometry(&self) -> &'a InitialShardGeometry {
         self.geometry
     }
 
     /// Typed payload to encode into shard metadata.
     #[must_use]
-    pub fn payload(self) -> &'a FilesystemShardPayload {
+    pub fn payload(&self) -> &'a FilesystemShardPayload {
         self.payload
     }
 }
@@ -270,7 +270,7 @@ where
     validate_request_payload(request, payload)?;
 
     let encoded_payload = payload.encode()?;
-    let (start, end) = lower_geometry_bounds(&geometry);
+    let (start, end) = lower_geometry_bounds(geometry);
 
     // The arena makes three individual ByteSlab allocations: start bound,
     // end bound, and encoded shard metadata.  ByteSlab rounds each to
@@ -279,7 +279,7 @@ where
     //
     // The metadata envelope wraps the encoded payload in a ShardMetadata
     // frame: 4-byte hint-length prefix + 1-byte Range hint + payload bytes.
-    let metadata_raw = 5 + encoded_payload.len();
+    let metadata_raw = SHARD_METADATA_ENVELOPE_OVERHEAD + encoded_payload.len();
     let byte_capacity = slab_alloc_bound(start.len())
         + slab_alloc_bound(end.len())
         + slab_alloc_bound(metadata_raw);
@@ -344,12 +344,15 @@ fn lower_geometry_bounds(geometry: &InitialShardGeometry) -> (&[u8], &[u8]) {
     (start, end)
 }
 
+/// ShardMetadata frame overhead: 4-byte hint-length prefix + 1-byte Range hint.
+pub(crate) const SHARD_METADATA_ENVELOPE_OVERHEAD: usize = 5;
+
 /// Upper-bound a single ByteSlab allocation.
 ///
 /// ByteSlab rounds each allocation to `max(n, 16).next_power_of_two()`.
 /// Zero-length inputs allocate zero bytes.
 #[inline]
-fn slab_alloc_bound(n: usize) -> usize {
+pub(crate) fn slab_alloc_bound(n: usize) -> usize {
     if n == 0 {
         return 0;
     }
