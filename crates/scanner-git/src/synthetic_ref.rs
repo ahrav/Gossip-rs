@@ -17,23 +17,21 @@
 
 use std::fs;
 use std::io::{self, Read as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gix_ref::bstr::ByteSlice;
 use gix_ref::transaction::{Change, LogChange, PreviousValue, RefEdit};
 use gix_ref::{FullName, Target};
 
 use crate::commit_loader::resolve_pack_paths_from_midx;
-use crate::midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
+use crate::midx_build::{build_midx_bytes, MidxBuildLimits};
 use crate::native_ref_resolver::open_ref_store_with_format;
-use crate::pack_decode::PackDecodeLimits;
 use flate2::bufread::ZlibDecoder;
 
-use crate::pack_inflate::ObjectKind;
-use crate::pack_io::{PackIo, PackIoLimits};
+use crate::pack_inflate::{EntryKind, ObjectKind, PackFile};
 use crate::repo_open::detect_object_format;
 use crate::repo_paths::{collect_loose_dirs, collect_pack_dirs};
-use crate::{GitRepoPaths, ObjectFormat, OidBytes, RepoOpenError, RepoOpenLimits};
+use crate::{GitRepoPaths, MidxView, ObjectFormat, OidBytes, RepoOpenError, RepoOpenLimits};
 
 /// Private ref namespace for synthetic commit refs created by explicit-commit
 /// lowering. The full ref name is
@@ -225,63 +223,187 @@ pub fn materialize_synthetic_commit_ref(
 
 /// Determine the object type of `oid` in the mirror's object database.
 ///
-/// Tries the pack index first (via MIDX), falling back to loose object lookup
-/// when no packs exist. Returns `Ok(None)` when the OID is not found in either
+/// Tries the pack index first (via MIDX header-only resolution), falling back
+/// to loose object lookup when packs are absent or when any MIDX/pack
+/// operation fails. Returns `Ok(None)` when the OID is not found in either
 /// store.
 ///
-/// The pack path decompresses the full object (up to 8 MiB) via `load_object`
-/// because `PackIo` does not expose a header-only query. Only the kind is
-/// retained; the payload is discarded.
+/// The pack path reads only entry headers (no payload decompression). For
+/// non-delta entries the kind is embedded directly in the header. For delta
+/// entries the chain is followed via headers until a non-delta base is reached.
 fn lookup_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
     match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
         Ok(midx_bytes) => {
-            let midx =
-                crate::MidxView::parse(midx_bytes.as_slice(), oid.format()).map_err(|err| {
-                    SyntheticCommitRefError::ObjectLookup {
-                        detail: err.to_string(),
-                    }
-                })?;
+            let midx = MidxView::parse(midx_bytes.as_slice(), oid.format()).map_err(|err| {
+                SyntheticCommitRefError::ObjectLookup {
+                    detail: err.to_string(),
+                }
+            })?;
             let pack_dirs = collect_pack_dirs(paths);
             let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).map_err(|err| {
                 SyntheticCommitRefError::ObjectLookup {
                     detail: err.to_string(),
                 }
             })?;
-            let loose_dirs = collect_loose_dirs(paths);
-            // Full decompression up to 8 MiB — PackIo lacks a header-only API,
-            // so we decode the entire object and discard the payload.
-            let pack_decode = PackDecodeLimits::new(64, 8 * 1024 * 1024, 8 * 1024 * 1024);
-            let pack_io_limits = PackIoLimits::new(
-                pack_decode,
-                crate::pack_plan::PackPlanConfig::default().max_delta_depth,
-            );
-            let mut pack_io = PackIo::from_parts(midx, pack_paths, loose_dirs, pack_io_limits)
-                .map_err(|err| SyntheticCommitRefError::ObjectLookup {
-                    detail: err.to_string(),
-                })?;
-            Ok(pack_io
-                .load_object(&oid)
-                .map_err(|err| SyntheticCommitRefError::ObjectLookup {
-                    detail: err.to_string(),
-                })?
-                .map(|(kind, _)| kind))
+            match lookup_packed_object_kind(&midx, &pack_paths, oid) {
+                Ok(Some(kind)) => Ok(Some(kind)),
+                // OID not in pack index — try loose objects.
+                Ok(None) => lookup_loose_object_kind(paths, oid),
+                // Pack header resolution failed — try loose objects before
+                // hard-failing, since the object may exist outside packs.
+                Err(_) => lookup_loose_object_kind(paths, oid),
+            }
         }
-        Err(MidxBuildError::NoPacksFound) => lookup_loose_object_kind(paths, oid),
-        Err(err) => Err(SyntheticCommitRefError::ObjectLookup {
+        // Any MIDX build failure (missing packs, corrupt idx, too many
+        // packs, etc.) falls back to loose object lookup rather than
+        // hard-failing. The object may exist as a loose file even when
+        // pack index enumeration cannot complete.
+        Err(_) => lookup_loose_object_kind(paths, oid),
+    }
+}
+
+/// Maximum entry-header bytes parsed per pack entry. 64 bytes covers the
+/// variable-length size encoding, OFS negative-offset varint, and REF_DELTA
+/// base OID for any realistic entry.
+const PACK_ENTRY_HEADER_MAX_BYTES: usize = 64;
+
+/// Maximum delta chain depth when following pack entry headers for kind
+/// resolution. Matches the default `max_delta_depth` used elsewhere in the
+/// codebase; resolving kind from headers is cheap so this is generous.
+const KIND_RESOLVE_MAX_DELTA_DEPTH: u8 = 64;
+
+/// Resolve the object kind for `oid` from packed objects using only entry
+/// headers — no payload decompression is performed.
+///
+/// For non-delta entries the kind is embedded in the pack entry header. For
+/// delta entries (`OFS_DELTA` / `REF_DELTA`) the chain is followed via
+/// headers until a non-delta base is reached.
+///
+/// Returns `Ok(None)` when `oid` is not present in the MIDX index.
+fn lookup_packed_object_kind(
+    midx: &MidxView<'_>,
+    pack_paths: &[PathBuf],
+    oid: OidBytes,
+) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
+    let idx = match midx
+        .find_oid(&oid)
+        .map_err(|err| SyntheticCommitRefError::ObjectLookup {
             detail: err.to_string(),
-        }),
+        })? {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+    let (pack_id, offset) =
+        midx.offset_at(idx)
+            .map_err(|err| SyntheticCommitRefError::ObjectLookup {
+                detail: err.to_string(),
+            })?;
+    resolve_kind_at(
+        midx,
+        pack_paths,
+        pack_id,
+        offset,
+        KIND_RESOLVE_MAX_DELTA_DEPTH,
+    )
+}
+
+/// Follow pack entry headers starting at `(pack_id, offset)` until a
+/// non-delta base is reached, returning its [`ObjectKind`].
+///
+/// `OFS_DELTA` entries reference a base within the same pack file;
+/// `REF_DELTA` entries require a MIDX re-lookup to locate the base pack.
+/// Each hop decrements `remaining_depth` to bound runaway chains.
+fn resolve_kind_at(
+    midx: &MidxView<'_>,
+    pack_paths: &[PathBuf],
+    pack_id: u16,
+    offset: u64,
+    remaining_depth: u8,
+) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
+    let pack_path =
+        pack_paths
+            .get(pack_id as usize)
+            .ok_or(SyntheticCommitRefError::ObjectLookup {
+                detail: format!(
+                    "pack id {pack_id} out of range (have {} packs)",
+                    pack_paths.len()
+                ),
+            })?;
+    let data = mmap_pack(pack_path)?;
+    let pack = PackFile::parse(&data, midx.oid_len().into()).map_err(|err| {
+        SyntheticCommitRefError::ObjectLookup {
+            detail: format!("pack parse failed: {err}"),
+        }
+    })?;
+    let header = pack
+        .entry_header_at(offset, PACK_ENTRY_HEADER_MAX_BYTES)
+        .map_err(|err| SyntheticCommitRefError::ObjectLookup {
+            detail: format!("pack entry header read failed: {err}"),
+        })?;
+    match header.kind {
+        EntryKind::NonDelta { kind } => Ok(Some(kind)),
+        EntryKind::OfsDelta { base_offset } => {
+            if remaining_depth == 0 {
+                return Err(SyntheticCommitRefError::ObjectLookup {
+                    detail: "delta chain depth exceeded during kind resolution".to_string(),
+                });
+            }
+            resolve_kind_at(midx, pack_paths, pack_id, base_offset, remaining_depth - 1)
+        }
+        EntryKind::RefDelta { base_oid } => {
+            if remaining_depth == 0 {
+                return Err(SyntheticCommitRefError::ObjectLookup {
+                    detail: "delta chain depth exceeded during kind resolution".to_string(),
+                });
+            }
+            let base_idx = match midx.find_oid(&base_oid).map_err(|err| {
+                SyntheticCommitRefError::ObjectLookup {
+                    detail: err.to_string(),
+                }
+            })? {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            let (base_pack_id, base_offset) =
+                midx.offset_at(base_idx)
+                    .map_err(|err| SyntheticCommitRefError::ObjectLookup {
+                        detail: err.to_string(),
+                    })?;
+            resolve_kind_at(
+                midx,
+                pack_paths,
+                base_pack_id,
+                base_offset,
+                remaining_depth - 1,
+            )
+        }
+    }
+}
+
+/// Memory-map a pack file for read-only header inspection.
+fn mmap_pack(path: &Path) -> Result<memmap2::Mmap, SyntheticCommitRefError> {
+    let file = fs::File::open(path).map_err(|err| SyntheticCommitRefError::ObjectLookup {
+        detail: format!("pack open failed: {err}"),
+    })?;
+    // SAFETY: pack files are immutable for the duration of a mirror job.
+    unsafe {
+        memmap2::Mmap::map(&file).map_err(|err| SyntheticCommitRefError::ObjectLookup {
+            detail: format!("pack mmap failed: {err}"),
+        })
     }
 }
 
 /// Probe loose object directories for `oid` and return its type.
 ///
-/// Reads the zlib-compressed loose object at `objects/<xx>/<yy...>` and
-/// decompresses only the first [`LOOSE_OBJECT_HEADER_MAX_BYTES`] (64 bytes)
-/// via a bounded `ZlibDecoder` read loop — enough to cover the
+/// Opens the zlib-compressed loose object at `objects/<xx>/<yy...>` and
+/// streams only the first [`LOOSE_OBJECT_HEADER_MAX_BYTES`] (64 bytes)
+/// through a `ZlibDecoder` backed by a `BufReader` — enough to cover the
 /// `"<type> <size>\0"` header that [`parse_loose_object_kind`] inspects.
+/// The compressed file is never fully read into memory.
+///
 /// Returns `Ok(None)` when the file does not exist in any object directory
 /// (alternates-aware via [`collect_loose_dirs`]).
 fn lookup_loose_object_kind(
@@ -293,22 +415,20 @@ fn lookup_loose_object_kind(
 
     for base in collect_loose_dirs(paths) {
         let path = base.join(dir).join(file);
-        let data = match fs::read(&path) {
-            Ok(data) => data,
+        let file_handle = match fs::File::open(&path) {
+            Ok(f) => f,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => {
                 return Err(SyntheticCommitRefError::ObjectLookup {
-                    detail: format!("loose object read failed: {err}"),
+                    detail: format!("loose object open failed: {err}"),
                 });
             }
         };
 
-        // Only the `"<type> <size>\0"` header is needed for kind detection;
-        // 64 bytes is sufficient for any valid git object header. Use a
-        // bounded ZlibDecoder read loop so decompression stops cleanly after
-        // filling the buffer — `inflate_limited` would return `LimitExceeded`
-        // for objects larger than the limit, which is most real commits.
-        let mut decoder = ZlibDecoder::new(&data[..]);
+        // Stream through a BufReader so only the bytes needed to produce
+        // the first 64 decompressed bytes are read from disk, regardless
+        // of the compressed object's total size.
+        let mut decoder = ZlibDecoder::new(io::BufReader::new(file_handle));
         let mut buf = [0u8; LOOSE_OBJECT_HEADER_MAX_BYTES];
         let mut total = 0;
         loop {
