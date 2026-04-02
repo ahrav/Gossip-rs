@@ -16,7 +16,7 @@
 //! exists and is a commit. Non-commit objects and missing OIDs are rejected.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::Path;
 
 use gix_ref::bstr::ByteSlice;
@@ -25,9 +25,11 @@ use gix_ref::{FullName, Target};
 
 use crate::commit_loader::resolve_pack_paths_from_midx;
 use crate::midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
-use crate::native_ref_resolver::open_ref_store;
+use crate::native_ref_resolver::open_ref_store_with_format;
 use crate::pack_decode::PackDecodeLimits;
-use crate::pack_inflate::{inflate_limited, ObjectKind};
+use flate2::bufread::ZlibDecoder;
+
+use crate::pack_inflate::ObjectKind;
 use crate::pack_io::{PackIo, PackIoLimits};
 use crate::repo_open::detect_object_format;
 use crate::repo_paths::{collect_loose_dirs, collect_pack_dirs};
@@ -187,7 +189,7 @@ pub fn materialize_synthetic_commit_ref(
     }
 
     let ref_name = synthetic_commit_ref_name(commit);
-    let store = open_ref_store(&paths, &limits).map_err(SyntheticCommitRefError::RepoOpen)?;
+    let store = open_ref_store_with_format(&paths, object_format);
     let full_name = FullName::try_from(ref_name.as_slice().as_bstr()).map_err(|err| {
         SyntheticCommitRefError::InvalidRefName {
             detail: err.to_string(),
@@ -276,8 +278,9 @@ fn lookup_object_kind(
 
 /// Probe loose object directories for `oid` and return its type.
 ///
-/// Reads the zlib-compressed loose object at `objects/<xx>/<yy...>`, inflates
-/// only [`LOOSE_OBJECT_HEADER_MAX_BYTES`] (64 bytes) — enough to cover the
+/// Reads the zlib-compressed loose object at `objects/<xx>/<yy...>` and
+/// decompresses only the first [`LOOSE_OBJECT_HEADER_MAX_BYTES`] (64 bytes)
+/// via a bounded `ZlibDecoder` read loop — enough to cover the
 /// `"<type> <size>\0"` header that [`parse_loose_object_kind`] inspects.
 /// Returns `Ok(None)` when the file does not exist in any object directory
 /// (alternates-aware via [`collect_loose_dirs`]).
@@ -301,15 +304,31 @@ fn lookup_loose_object_kind(
         };
 
         // Only the `"<type> <size>\0"` header is needed for kind detection;
-        // 64 bytes is sufficient for any valid git object header.
-        let mut out = Vec::with_capacity(LOOSE_OBJECT_HEADER_MAX_BYTES);
-        inflate_limited(&data, &mut out, LOOSE_OBJECT_HEADER_MAX_BYTES).map_err(|err| {
-            SyntheticCommitRefError::ObjectLookup {
-                detail: format!("loose object inflate failed: {err}"),
+        // 64 bytes is sufficient for any valid git object header. Use a
+        // bounded ZlibDecoder read loop so decompression stops cleanly after
+        // filling the buffer — `inflate_limited` would return `LimitExceeded`
+        // for objects larger than the limit, which is most real commits.
+        let mut decoder = ZlibDecoder::new(&data[..]);
+        let mut buf = [0u8; LOOSE_OBJECT_HEADER_MAX_BYTES];
+        let mut total = 0;
+        loop {
+            match decoder.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    if total >= LOOSE_OBJECT_HEADER_MAX_BYTES {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    return Err(SyntheticCommitRefError::ObjectLookup {
+                        detail: format!("loose object inflate failed: {err}"),
+                    });
+                }
             }
-        })?;
+        }
 
-        return Ok(Some(parse_loose_object_kind(&out)?));
+        return Ok(Some(parse_loose_object_kind(&buf[..total])?));
     }
 
     Ok(None)
@@ -354,6 +373,7 @@ mod tests {
 
     use super::*;
     use crate::native_ref_resolver::tests::{git, init_repo, parse_oid, resolve_with, try_git};
+    use crate::StartSetConfig;
 
     #[test]
     fn synthetic_commit_ref_name_is_stable_and_distinct_across_formats() {
@@ -486,6 +506,25 @@ mod tests {
         assert!(matches!(
             err,
             SyntheticCommitRefError::ObjectNotCommit { commit } if commit == blob_oid
+        ));
+    }
+
+    #[test]
+    fn materialize_synthetic_commit_ref_rejects_format_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mirror = init_repo(&tmp);
+        git(&mirror, &["commit", "--allow-empty", "-m", "first"]);
+
+        // SHA-256 OID against a SHA-1 mirror triggers the format guard.
+        let sha256_oid =
+            parse_oid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+
+        let err = materialize_synthetic_commit_ref(&mirror, sha256_oid, RepoOpenLimits::default())
+            .expect_err("format mismatch must fail");
+
+        assert!(matches!(
+            err,
+            SyntheticCommitRefError::ObjectFormatMismatch { .. }
         ));
     }
 

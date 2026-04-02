@@ -529,23 +529,47 @@ pub(crate) fn open_ref_store(
     })
 }
 
-/// Build store options from the detected object format.
+/// Open a ref store when the caller has already detected the object format.
+///
+/// Avoids re-reading the git config that [`open_ref_store`] performs internally
+/// via [`detect_object_format`]. Useful in paths that detect the format for
+/// their own validation (e.g., `materialize_synthetic_commit_ref`).
+pub(crate) fn open_ref_store_with_format(
+    paths: &GitRepoPaths,
+    format: ObjectFormat,
+) -> gix_ref::file::Store {
+    let options = gix_store_options_for(format);
+    if paths.is_linked_worktree() {
+        gix_ref::file::Store::for_linked_worktree(
+            paths.git_dir.clone(),
+            paths.common_dir.clone(),
+            options,
+        )
+    } else {
+        gix_ref::file::Store::at(paths.git_dir.clone(), options)
+    }
+}
+
+/// Build store options for the given object format.
 ///
 /// Reflogs are disabled because synthetic ref writes do not need history
 /// tracking, and the scan pipeline's read path never creates refs.
 /// `precompose_unicode` is left off because ref names are treated as
 /// opaque bytes throughout the scan pipeline.
+fn gix_store_options_for(format: ObjectFormat) -> gix_ref::store::init::Options {
+    gix_ref::store::init::Options {
+        write_reflog: gix_ref::store::WriteReflog::Disable,
+        object_hash: map_object_format(format),
+        precompose_unicode: false,
+        prohibit_windows_device_names: false,
+    }
+}
+
 fn gix_store_options(
     paths: &GitRepoPaths,
     limits: &RepoOpenLimits,
 ) -> Result<gix_ref::store::init::Options, RepoOpenError> {
-    let object_hash = map_object_format(detect_object_format(paths, limits)?);
-    Ok(gix_ref::store::init::Options {
-        write_reflog: gix_ref::store::WriteReflog::Disable,
-        object_hash,
-        precompose_unicode: false,
-        prohibit_windows_device_names: false,
-    })
+    Ok(gix_store_options_for(detect_object_format(paths, limits)?))
 }
 
 /// Map the crate-level [`ObjectFormat`] enum to the `gix_hash::Kind` that
