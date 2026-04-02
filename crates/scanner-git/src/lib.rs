@@ -257,7 +257,10 @@ pub use artifact_acquire::{
 pub use limits::RepoOpenLimits;
 pub use midx::MidxView;
 pub use midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
-pub use native_ref_resolver::NativeRefResolver;
+pub use native_ref_resolver::{
+    materialize_synthetic_commit_ref, synthetic_commit_ref_name, NativeRefResolver,
+    SyntheticCommitRefError,
+};
 pub use object_id::{ObjectFormat, OidBytes};
 pub use preflight::{
     preflight, ArtifactPaths, ArtifactStatus, PreflightMaintenance, PreflightReport,

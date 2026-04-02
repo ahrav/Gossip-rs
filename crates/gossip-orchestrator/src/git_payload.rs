@@ -56,11 +56,14 @@ use gossip_contracts::connector::ConnectorInputError;
 use gossip_contracts::connector::ToxicDigest;
 use gossip_contracts::connector::git::{
     GitDebugLevel, GitExecutionLimits, GitMergeStrategy, GitRefSelection, GitRepoTarget,
-    GitScanMode, GitSelection, RepoKey, RepoKeyDecodeError, RepoLocator,
+    GitScanMode, GitSelection, LocalMirror, RepoKey, RepoKeyDecodeError, RepoLocator,
 };
 use gossip_contracts::coordination::shard_spec::MAX_METADATA_SIZE;
 use gossip_contracts::identity::TenantId;
-use scanner_git::{ObjectFormat, OidBytes, derive_repo_id};
+use scanner_git::{
+    ObjectFormat, OidBytes, RepoOpenLimits, SyntheticCommitRefError, derive_repo_id,
+    materialize_synthetic_commit_ref,
+};
 
 use crate::git_request::{
     ExplicitRefValidationError, NormalizedGitRequest, NormalizedGitSelection, NormalizedGitTarget,
@@ -145,6 +148,14 @@ impl fmt::Debug for GitShardPayload {
             .field("execution_limits", &self.execution_limits)
             .finish()
     }
+}
+
+/// Errors returned while lowering payload selection into mirror-local execution.
+#[derive(Debug, thiserror::Error)]
+pub enum GitSelectionLoweringError {
+    /// Explicit-commit lowering failed inside the prepared mirror.
+    #[error("explicit commit selection could not be lowered in the prepared mirror: {0}")]
+    ExplicitCommit(#[from] SyntheticCommitRefError),
 }
 
 impl GitShardPayload {
@@ -266,6 +277,38 @@ impl GitShardPayload {
             NormalizedGitSelection::ExplicitCommit { .. } => return None,
         };
         Some(GitSelection::new(refs, self.scan_mode, self.merge_strategy))
+    }
+
+    /// Lower request-side selection intent into a mirror-local execution selection.
+    ///
+    /// Explicit-commit selections are converted into one stable synthetic ref
+    /// inside `mirror`, while ref-backed selections pass through unchanged.
+    pub fn lower_selection_for_local_mirror(
+        &self,
+        mirror: &LocalMirror,
+        limits: RepoOpenLimits,
+    ) -> Result<GitSelection, GitSelectionLoweringError> {
+        if let Some(selection) = self.git_selection() {
+            return Ok(selection);
+        }
+
+        let ref_name = match &self.selection {
+            NormalizedGitSelection::ExplicitCommit { commit } => {
+                materialize_synthetic_commit_ref(mirror.path(), *commit, limits)?
+            }
+            NormalizedGitSelection::DefaultBranchOnly
+            | NormalizedGitSelection::ExplicitRefs { .. } => {
+                unreachable!("git_selection() returns Some for ref-backed selection variants")
+            }
+        };
+
+        Ok(GitSelection::new(
+            GitRefSelection::ExplicitRefs {
+                refs: vec![ref_name],
+            },
+            self.scan_mode,
+            self.merge_strategy,
+        ))
     }
 
     /// Return the deterministic encoded payload size in bytes.
@@ -1145,11 +1188,14 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use gossip_frontier::hint::{ShardSpecScratch, decode_connector_extra, range_shard_ref};
+    use scanner_git::{
+        NativeRefResolver, RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
+    };
     use tempfile::tempdir;
 
     use super::*;
     use crate::git_request::{GitRequest, GitRequestSelection, GitRequestTarget};
-    use crate::test_support::{init_git_repo, run_config};
+    use crate::test_support::{init_git_repo, run_config, run_git_in};
 
     fn tenant(byte: u8) -> TenantId {
         TenantId::from_bytes([byte; 32])
@@ -1165,6 +1211,28 @@ mod tests {
 
     fn init_repo(dir: &Path) {
         init_git_repo(dir, "git-payload-tests@example.com", "Git Payload Tests");
+    }
+
+    fn current_commit_oid(repo: &Path) -> OidBytes {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(
+            output.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        scanner_git::parse_hex_oid(
+            String::from_utf8(output.stdout)
+                .expect("utf-8 oid")
+                .trim()
+                .as_bytes(),
+            ObjectFormat::Sha1,
+        )
+        .expect("parse commit oid")
     }
 
     fn execution_limits() -> GitExecutionLimits {
@@ -1362,6 +1430,120 @@ mod tests {
         assert!(matches!(
             decoded.selection(),
             NormalizedGitSelection::ExplicitCommit { .. }
+        ));
+    }
+
+    #[test]
+    fn lowering_explicit_commit_creates_explicit_refs_selection() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        fs::write(dir.path().join("tracked.txt"), "v1\n").expect("write tracked file");
+        run_git_in(dir.path(), &["add", "."]);
+        run_git_in(dir.path(), &["commit", "-m", "first"]);
+        let commit = current_commit_oid(dir.path());
+
+        let (_, payload) = payload_from_request(
+            GitRequest::repo_with_explicit_commit(
+                tenant(0x34),
+                dir.path(),
+                commit.to_string().as_bytes(),
+                run_config(),
+                GitScanMode::DiffHistory,
+                GitMergeStrategy::FirstParentOnly,
+            ),
+            GitExecutionLimits::default(),
+        );
+
+        let mirror = LocalMirror::new(dir.path());
+        let lowered = payload
+            .lower_selection_for_local_mirror(&mirror, RepoOpenLimits::default())
+            .expect("lower selection");
+
+        assert_eq!(
+            lowered,
+            GitSelection::new(
+                GitRefSelection::ExplicitRefs {
+                    refs: vec![scanner_git::synthetic_commit_ref_name(commit)],
+                },
+                GitScanMode::DiffHistory,
+                GitMergeStrategy::FirstParentOnly,
+            )
+        );
+    }
+
+    #[test]
+    fn lowering_explicit_commit_preserves_start_set_identity_and_resolution() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        fs::write(dir.path().join("tracked.txt"), "v1\n").expect("write tracked file");
+        run_git_in(dir.path(), &["add", "."]);
+        run_git_in(dir.path(), &["commit", "-m", "first"]);
+        let commit = current_commit_oid(dir.path());
+
+        let (_, payload) = payload_from_request(
+            GitRequest::repo_with_explicit_commit(
+                tenant(0x35),
+                dir.path(),
+                commit.to_string().as_bytes(),
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+
+        let mirror = LocalMirror::new(dir.path());
+        let lowered = payload
+            .lower_selection_for_local_mirror(&mirror, RepoOpenLimits::default())
+            .expect("lower selection");
+
+        let GitRefSelection::ExplicitRefs { refs } = lowered.refs() else {
+            panic!("lowered selection must be explicit refs");
+        };
+        let a = StartSetConfig::ExplicitRefs { refs: refs.clone() };
+        let b = StartSetConfig::ExplicitRefs {
+            refs: vec![refs[0].clone(), refs[0].clone()],
+        };
+        assert_eq!(a.id(), b.id(), "start-set identity should stay stable");
+
+        let resolver = NativeRefResolver::new(a);
+        let paths = scanner_git::GitRepoPaths::resolve::<RepoOpenError, _>(
+            mirror.path(),
+            &RepoOpenLimits::default(),
+        )
+        .expect("resolve mirror paths");
+        let resolved = resolver.resolve(&paths).expect("resolve lowered ref");
+        assert_eq!(resolved, vec![(refs[0].clone(), commit)]);
+    }
+
+    #[test]
+    fn lowering_explicit_commit_rejects_missing_commit() {
+        let dir = tempdir().expect("tempdir");
+        init_repo(dir.path());
+        run_git_in(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+
+        let (_, payload) = payload_from_request(
+            GitRequest::repo_with_explicit_commit(
+                tenant(0x36),
+                dir.path(),
+                b"1111111111111111111111111111111111111111",
+                run_config(),
+                default_scan_mode(),
+                default_merge_strategy(),
+            ),
+            GitExecutionLimits::default(),
+        );
+
+        let mirror = LocalMirror::new(dir.path());
+        let err = payload
+            .lower_selection_for_local_mirror(&mirror, RepoOpenLimits::default())
+            .expect_err("missing commit must fail");
+
+        assert!(matches!(
+            err,
+            GitSelectionLoweringError::ExplicitCommit(
+                SyntheticCommitRefError::CommitNotFound { .. }
+            )
         ));
     }
 

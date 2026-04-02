@@ -27,7 +27,9 @@ use std::sync::mpsc::sync_channel;
 
 use anyhow::anyhow;
 use gossip_contracts::connector::ToxicDigest;
-use gossip_contracts::connector::git::{GitMirrorManager, GitRepoDiscoverySource, GitRepoExecutor};
+use gossip_contracts::connector::git::{
+    GitMirrorManager, GitRefSelection, GitRepoDiscoverySource, GitRepoExecutor,
+};
 use scanner_git::{
     GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanResult, NativeRefResolver,
     NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig, run_git_scan,
@@ -214,7 +216,7 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
         merge_diff_mode: config.merge_mode,
         pack_exec_workers: config.workers.max(1),
         enrich_identities: config.enrich_identities,
-        start_set: StartSetConfig::DefaultBranchOnly,
+        start_set: start_set_from_ref_selection(&config.ref_selection),
         ..RuntimeGitScanConfig::default()
     };
     git_cfg.engine_adapter.scan_binary = config.scan_binary;
@@ -229,6 +231,25 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
     }
 
     Ok(git_cfg)
+}
+
+fn start_set_from_ref_selection(selection: &GitRefSelection) -> StartSetConfig {
+    match selection {
+        GitRefSelection::DefaultBranchOnly => StartSetConfig::DefaultBranchOnly,
+        GitRefSelection::AllRemoteBranches { remote } => StartSetConfig::AllRemoteBranches {
+            remote: remote.clone(),
+        },
+        GitRefSelection::BranchesAndTags {
+            include_remote_branches,
+            remote,
+        } => StartSetConfig::BranchesAndTags {
+            include_remote_branches: *include_remote_branches,
+            remote: remote.clone(),
+        },
+        GitRefSelection::ExplicitRefs { refs } => {
+            StartSetConfig::ExplicitRefs { refs: refs.clone() }
+        }
+    }
 }
 
 /// Map `scanner_git` metrics into the crate-level [`ScanReport`].
@@ -386,6 +407,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 mod tests {
     use super::*;
     use crate::GitScanConfig;
+    use gossip_contracts::connector::git::GitRefSelection;
 
     /// Zero-valued `tree_delta_cache_mb` produces a `ZeroBudget` error.
     #[test]
@@ -429,5 +451,15 @@ mod tests {
             matches!(err, ScanRuntimeError::Driver(_)),
             "expected Driver (overflow), got: {err:?}"
         );
+    }
+
+    #[test]
+    fn build_git_scan_config_uses_explicit_refs_start_set() {
+        let refs = vec![b"refs/gossip/scan-targets/commits/sha1/abc".to_vec()];
+        let cfg = GitScanConfig::new("/tmp")
+            .with_ref_selection(GitRefSelection::ExplicitRefs { refs: refs.clone() });
+
+        let built = build_git_scan_config(&cfg).expect("build runtime git config");
+        assert_eq!(built.start_set, StartSetConfig::ExplicitRefs { refs });
     }
 }

@@ -31,14 +31,23 @@
 //!   (`^` lines); the slow path decompresses loose tag objects and follows
 //!   the `object` header. Nested tags are followed up to a depth limit.
 
+use std::fs;
 use std::io::{self, Read as _};
 use std::path::Path;
 
 use flate2::bufread::ZlibDecoder;
 use gix_ref::bstr::ByteSlice;
 use gix_ref::file::ReferenceExt;
+use gix_ref::transaction::{Change, LogChange, PreviousValue, RefEdit};
+use gix_ref::{FullName, Target};
 
+use crate::commit_loader::resolve_pack_paths_from_midx;
+use crate::midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
+use crate::pack_decode::PackDecodeLimits;
+use crate::pack_inflate::{inflate_limited, ObjectKind};
+use crate::pack_io::{PackIo, PackIoLimits};
 use crate::repo_open::detect_object_format;
+use crate::repo_paths::{collect_loose_dirs, collect_pack_dirs};
 use crate::{
     GitRepoPaths, ObjectFormat, OidBytes, RepoOpenError, RepoOpenLimits, StartSetConfig,
     StartSetResolver,
@@ -47,6 +56,140 @@ use crate::{
 const REFS_HEADS_PREFIX: &[u8] = b"refs/heads/";
 const REFS_TAGS_PREFIX: &[u8] = b"refs/tags/";
 const REFS_REMOTES_PREFIX: &[u8] = b"refs/remotes/";
+const EXPLICIT_COMMIT_REF_NAMESPACE: &[u8] = b"refs/gossip/scan-targets/commits/";
+const LOOSE_OBJECT_HEADER_MAX_BYTES: usize = 64;
+
+/// Errors returned while lowering one explicit commit into a mirror-local ref.
+#[derive(Debug, thiserror::Error)]
+pub enum SyntheticCommitRefError {
+    /// The mirror repository could not be opened or its layout was invalid.
+    #[error("mirror repository open failed: {0}")]
+    RepoOpen(#[from] RepoOpenError),
+    /// The requested OID format cannot exist in this mirror.
+    #[error(
+        "requested commit {commit} uses {requested:?}, but the mirror object database uses {mirror:?}"
+    )]
+    ObjectFormatMismatch {
+        /// Requested explicit commit.
+        commit: OidBytes,
+        /// Format carried by the explicit commit selection.
+        requested: ObjectFormat,
+        /// Format detected from the mirror repository.
+        mirror: ObjectFormat,
+    },
+    /// The requested OID did not resolve to any local object.
+    #[error("requested commit {commit} was not found in the mirror object database")]
+    CommitNotFound {
+        /// Requested explicit commit.
+        commit: OidBytes,
+    },
+    /// The requested OID exists locally but is not a commit object.
+    #[error("requested object {commit} exists in the mirror object database but is not a commit")]
+    ObjectNotCommit {
+        /// Requested explicit commit.
+        commit: OidBytes,
+    },
+    /// The deterministic synthetic ref name failed validation.
+    #[error("synthetic ref name is invalid: {detail}")]
+    InvalidRefName {
+        /// Validation detail from `gix-validate`.
+        detail: String,
+    },
+    /// Resolving or decoding the mirror object database failed.
+    #[error("synthetic ref object lookup failed: {detail}")]
+    ObjectLookup {
+        /// Human-readable detail from lower-level lookup helpers.
+        detail: String,
+    },
+    /// Writing the synthetic ref in the mirror failed.
+    #[error("synthetic ref update failed: {detail}")]
+    RefUpdate {
+        /// Human-readable detail from the ref-transaction layer.
+        detail: String,
+    },
+}
+
+/// Derive the stable private ref name used for explicit-commit lowering.
+#[must_use]
+pub fn synthetic_commit_ref_name(commit: OidBytes) -> Vec<u8> {
+    let format_component = match commit.format() {
+        ObjectFormat::Sha1 => b"sha1".as_slice(),
+        ObjectFormat::Sha256 => b"sha256".as_slice(),
+    };
+
+    let mut name = Vec::with_capacity(
+        EXPLICIT_COMMIT_REF_NAMESPACE.len()
+            + format_component.len()
+            + 1
+            + commit.len() as usize * 2,
+    );
+    name.extend_from_slice(EXPLICIT_COMMIT_REF_NAMESPACE);
+    name.extend_from_slice(format_component);
+    name.push(b'/');
+    name.extend_from_slice(commit.to_string().as_bytes());
+    name
+}
+
+/// Ensure a stable synthetic ref exists for `commit` inside `mirror_root`.
+///
+/// The returned ref name is deterministic for `(object_format, commit_oid)`.
+/// The helper validates that the requested commit exists locally before
+/// writing the ref, and all ref mutations stay inside the prepared mirror.
+pub fn materialize_synthetic_commit_ref(
+    mirror_root: &Path,
+    commit: OidBytes,
+    limits: RepoOpenLimits,
+) -> Result<Vec<u8>, SyntheticCommitRefError> {
+    let paths = GitRepoPaths::resolve::<RepoOpenError, _>(mirror_root, &limits)?;
+    let object_format = detect_object_format(&paths, &limits)?;
+    if object_format != commit.format() {
+        return Err(SyntheticCommitRefError::ObjectFormatMismatch {
+            commit,
+            requested: commit.format(),
+            mirror: object_format,
+        });
+    }
+
+    match lookup_object_kind(&paths, commit)? {
+        Some(ObjectKind::Commit) => {}
+        Some(_) => return Err(SyntheticCommitRefError::ObjectNotCommit { commit }),
+        None => return Err(SyntheticCommitRefError::CommitNotFound { commit }),
+    }
+
+    let ref_name = synthetic_commit_ref_name(commit);
+    let store = open_ref_store(&paths, &limits).map_err(SyntheticCommitRefError::RepoOpen)?;
+    let full_name = FullName::try_from(ref_name.as_slice().as_bstr()).map_err(|err| {
+        SyntheticCommitRefError::InvalidRefName {
+            detail: err.to_string(),
+        }
+    })?;
+    let target = Target::Object(
+        gix_hash::ObjectId::try_from(commit.as_slice())
+            .expect("OidBytes always has a valid length"),
+    );
+    let edit = RefEdit {
+        change: Change::Update {
+            log: LogChange::default(),
+            expected: PreviousValue::Any,
+            new: target,
+        },
+        name: full_name,
+        deref: false,
+    };
+
+    store
+        .transaction()
+        .prepare([edit], Default::default(), Default::default())
+        .map_err(|err| SyntheticCommitRefError::RefUpdate {
+            detail: err.to_string(),
+        })?
+        .commit(None)
+        .map_err(|err| SyntheticCommitRefError::RefUpdate {
+            detail: err.to_string(),
+        })?;
+
+    Ok(ref_name)
+}
 
 /// Resolves start-set refs using the native `gix-ref` reference store.
 ///
@@ -216,6 +359,110 @@ fn resolve_explicit_refs(
     }
 
     Ok(out)
+}
+
+fn lookup_object_kind(
+    paths: &GitRepoPaths,
+    oid: OidBytes,
+) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
+    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
+        Ok(midx_bytes) => {
+            let midx =
+                crate::MidxView::parse(midx_bytes.as_slice(), oid.format()).map_err(|err| {
+                    SyntheticCommitRefError::ObjectLookup {
+                        detail: err.to_string(),
+                    }
+                })?;
+            let pack_dirs = collect_pack_dirs(paths);
+            let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).map_err(|err| {
+                SyntheticCommitRefError::ObjectLookup {
+                    detail: err.to_string(),
+                }
+            })?;
+            let loose_dirs = collect_loose_dirs(paths);
+            let pack_decode = PackDecodeLimits::new(64, 8 * 1024 * 1024, 8 * 1024 * 1024);
+            let pack_io_limits = PackIoLimits::new(
+                pack_decode,
+                crate::pack_plan::PackPlanConfig::default().max_delta_depth,
+            );
+            let mut pack_io = PackIo::from_parts(midx, pack_paths, loose_dirs, pack_io_limits)
+                .map_err(|err| SyntheticCommitRefError::ObjectLookup {
+                    detail: err.to_string(),
+                })?;
+            Ok(pack_io
+                .load_object(&oid)
+                .map_err(|err| SyntheticCommitRefError::ObjectLookup {
+                    detail: err.to_string(),
+                })?
+                .map(|(kind, _)| kind))
+        }
+        Err(MidxBuildError::NoPacksFound) => lookup_loose_object_kind(paths, oid),
+        Err(err) => Err(SyntheticCommitRefError::ObjectLookup {
+            detail: err.to_string(),
+        }),
+    }
+}
+
+fn lookup_loose_object_kind(
+    paths: &GitRepoPaths,
+    oid: OidBytes,
+) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
+    let hex = oid.to_string();
+    let (dir, file) = hex.split_at(2);
+
+    for base in collect_loose_dirs(paths) {
+        let path = base.join(dir).join(file);
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(SyntheticCommitRefError::ObjectLookup {
+                    detail: format!("loose object read failed: {err}"),
+                });
+            }
+        };
+
+        let mut out = Vec::with_capacity(8 * 1024 * 1024 + LOOSE_OBJECT_HEADER_MAX_BYTES);
+        inflate_limited(
+            &data,
+            &mut out,
+            8 * 1024 * 1024 + LOOSE_OBJECT_HEADER_MAX_BYTES,
+        )
+        .map_err(|err| SyntheticCommitRefError::ObjectLookup {
+            detail: format!("loose object inflate failed: {err}"),
+        })?;
+
+        return Ok(Some(parse_loose_object_kind(&out)?));
+    }
+
+    Ok(None)
+}
+
+fn parse_loose_object_kind(bytes: &[u8]) -> Result<ObjectKind, SyntheticCommitRefError> {
+    let Some(nul) = bytes.iter().position(|&b| b == 0) else {
+        return Err(SyntheticCommitRefError::ObjectLookup {
+            detail: "loose object header is missing a NUL terminator".to_string(),
+        });
+    };
+    let header = &bytes[..nul];
+    let Some(space) = header.iter().position(|&b| b == b' ') else {
+        return Err(SyntheticCommitRefError::ObjectLookup {
+            detail: "loose object header is missing its type/size separator".to_string(),
+        });
+    };
+
+    match &header[..space] {
+        b"commit" => Ok(ObjectKind::Commit),
+        b"tree" => Ok(ObjectKind::Tree),
+        b"blob" => Ok(ObjectKind::Blob),
+        b"tag" => Ok(ObjectKind::Tag),
+        other => Err(SyntheticCommitRefError::ObjectLookup {
+            detail: format!(
+                "loose object type is unknown: {}",
+                String::from_utf8_lossy(other)
+            ),
+        }),
+    }
 }
 
 /// Iterate all refs in the store and collect those accepted by `matches`.
@@ -583,6 +830,7 @@ fn gix_error(context: &str, err: impl std::fmt::Display) -> RepoOpenError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -624,6 +872,15 @@ mod tests {
             .expect("utf-8 stdout")
             .trim()
             .to_owned()
+    }
+
+    fn try_git(repo: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git command")
     }
 
     fn resolve_with(repo: &Path, config: StartSetConfig) -> Vec<(Vec<u8>, OidBytes)> {
@@ -1063,5 +1320,172 @@ mod tests {
             .resolve(&paths)
             .expect("resolver with custom limits should succeed for config within those limits");
         assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn synthetic_commit_ref_name_is_stable_and_distinct_across_formats() {
+        let sha1 = parse_oid("0123456789abcdef0123456789abcdef01234567");
+        let sha1_again = parse_oid("0123456789abcdef0123456789abcdef01234567");
+        let sha1_other = parse_oid("fedcba9876543210fedcba9876543210fedcba98");
+        let sha256 = parse_oid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+
+        assert_eq!(
+            synthetic_commit_ref_name(sha1),
+            synthetic_commit_ref_name(sha1_again)
+        );
+        assert_ne!(
+            synthetic_commit_ref_name(sha1),
+            synthetic_commit_ref_name(sha1_other)
+        );
+        assert_ne!(
+            synthetic_commit_ref_name(sha1),
+            synthetic_commit_ref_name(sha256)
+        );
+        assert_eq!(
+            synthetic_commit_ref_name(sha1),
+            b"refs/gossip/scan-targets/commits/sha1/0123456789abcdef0123456789abcdef01234567"
+                .to_vec()
+        );
+        assert_eq!(
+            synthetic_commit_ref_name(sha256),
+            b"refs/gossip/scan-targets/commits/sha256/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn materialize_synthetic_commit_ref_writes_only_inside_mirror() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+
+        let ref_name = materialize_synthetic_commit_ref(&mirror, commit, RepoOpenLimits::default())
+            .expect("materialize ref");
+        let ref_name_str = String::from_utf8(ref_name.clone()).expect("utf-8 ref name");
+
+        assert_eq!(
+            git(&mirror, &["rev-parse", &ref_name_str]),
+            commit.to_string(),
+            "mirror synthetic ref should point at the requested commit"
+        );
+
+        let source_show_ref = try_git(&source, &["show-ref", "--verify", &ref_name_str]);
+        assert!(
+            !source_show_ref.status.success(),
+            "source repository must not gain a synthetic ref"
+        );
+    }
+
+    #[test]
+    fn materialize_synthetic_commit_ref_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+
+        let first = materialize_synthetic_commit_ref(&mirror, commit, RepoOpenLimits::default())
+            .expect("first materialization");
+        let second = materialize_synthetic_commit_ref(&mirror, commit, RepoOpenLimits::default())
+            .expect("second materialization");
+
+        assert_eq!(first, second);
+        let ref_name = String::from_utf8(first).expect("utf-8 ref name");
+        assert_eq!(git(&mirror, &["rev-parse", &ref_name]), commit.to_string());
+    }
+
+    #[test]
+    fn materialize_synthetic_commit_ref_rejects_missing_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mirror = init_repo(&tmp);
+        git(&mirror, &["commit", "--allow-empty", "-m", "first"]);
+
+        let missing = parse_oid("1111111111111111111111111111111111111111");
+        let err = materialize_synthetic_commit_ref(&mirror, missing, RepoOpenLimits::default())
+            .expect_err("missing commit must fail");
+
+        assert!(matches!(
+            err,
+            SyntheticCommitRefError::CommitNotFound { commit } if commit == missing
+        ));
+    }
+
+    #[test]
+    fn materialize_synthetic_commit_ref_rejects_non_commit_object() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mirror = init_repo(&tmp);
+        git(&mirror, &["commit", "--allow-empty", "-m", "first"]);
+
+        fs::write(mirror.join("blob.txt"), "test-blob\n").expect("write blob source");
+        let blob_oid = parse_oid(&git(&mirror, &["hash-object", "-w", "blob.txt"]));
+
+        let err = materialize_synthetic_commit_ref(&mirror, blob_oid, RepoOpenLimits::default())
+            .expect_err("blob oid must fail");
+
+        assert!(matches!(
+            err,
+            SyntheticCommitRefError::ObjectNotCommit { commit } if commit == blob_oid
+        ));
+    }
+
+    #[test]
+    fn synthetic_commit_ref_resolves_through_explicit_refs_start_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+
+        let ref_name = materialize_synthetic_commit_ref(&mirror, commit, RepoOpenLimits::default())
+            .expect("materialize ref");
+        let resolved = resolve_with(
+            &mirror,
+            StartSetConfig::ExplicitRefs {
+                refs: vec![ref_name.clone()],
+            },
+        );
+
+        assert_eq!(resolved, vec![(ref_name, commit)]);
     }
 }
