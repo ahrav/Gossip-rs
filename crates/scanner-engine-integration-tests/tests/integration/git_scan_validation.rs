@@ -237,8 +237,7 @@ fn run_scan_with_config(
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
-    let persist_store =
-        InMemoryPersistenceStore::with_seen_scope(config.repo_id, config.policy_hash);
+    let persist_store = InMemoryPersistenceStore::default();
 
     run_git_scan(
         repo,
@@ -682,8 +681,7 @@ fn run_scan_with_events(
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
-    let persist_store =
-        InMemoryPersistenceStore::with_seen_scope(config.repo_id, config.policy_hash);
+    let persist_store = InMemoryPersistenceStore::default();
     let sink = std::sync::Arc::new(VecEventSink::new());
 
     let result = run_git_scan(
