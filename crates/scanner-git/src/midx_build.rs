@@ -263,10 +263,6 @@ fn enumerate_idx_files(
         });
 
         for path in dir_idx_paths {
-            if all_idx_paths.len() >= max_packs {
-                break;
-            }
-
             // Dedupe by basename (first dir wins)
             let basename = path
                 .file_name()
@@ -276,10 +272,13 @@ fn enumerate_idx_files(
             if seen_basenames.insert(basename) {
                 all_idx_paths.push(path);
             }
-        }
 
-        if all_idx_paths.len() >= max_packs {
-            break;
+            // Stop collecting after enough paths for the caller to detect
+            // the overflow. One past `max_packs` is sufficient — the caller
+            // checks `len() > max_packs` and returns `TooManyPacks`.
+            if all_idx_paths.len() > max_packs {
+                return Ok(all_idx_paths);
+            }
         }
     }
 
