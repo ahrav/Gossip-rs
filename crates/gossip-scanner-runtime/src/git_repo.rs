@@ -27,7 +27,9 @@ use std::sync::mpsc::sync_channel;
 
 use anyhow::anyhow;
 use gossip_contracts::connector::ToxicDigest;
-use gossip_contracts::connector::git::{GitMirrorManager, GitRepoDiscoverySource, GitRepoExecutor};
+use gossip_contracts::connector::git::{
+    GitMirrorManager, GitRefSelection, GitRepoDiscoverySource, GitRepoExecutor,
+};
 use scanner_git::{
     GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanResult, NativeRefResolver,
     NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig, run_git_scan,
@@ -214,7 +216,10 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
         merge_diff_mode: config.merge_mode,
         pack_exec_workers: config.workers.max(1),
         enrich_identities: config.enrich_identities,
-        start_set: StartSetConfig::DefaultBranchOnly,
+        // Translate the lowered ref-selection policy into the scanner-level
+        // start-set config. By this point, explicit-commit selections have
+        // already been lowered to ExplicitRefs with a synthetic ref name.
+        start_set: start_set_from_ref_selection(&config.ref_selection),
         ..RuntimeGitScanConfig::default()
     };
     git_cfg.engine_adapter.scan_binary = config.scan_binary;
@@ -229,6 +234,34 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
     }
 
     Ok(git_cfg)
+}
+
+/// Map a contract-level [`GitRefSelection`] to the scanner-level
+/// [`StartSetConfig`] consumed by [`NativeRefResolver`].
+///
+/// This is a mechanical translation — each `GitRefSelection` variant maps 1:1
+/// to a `StartSetConfig` variant. The function exists to isolate the runtime
+/// from the scanner crate's internal config types. Explicit-commit selections
+/// should be lowered to `ExplicitRefs` (via
+/// [`materialize_synthetic_commit_ref`](scanner_git::materialize_synthetic_commit_ref))
+/// before reaching this function; `GitRefSelection` has no commit variant.
+fn start_set_from_ref_selection(selection: &GitRefSelection) -> StartSetConfig {
+    match selection {
+        GitRefSelection::DefaultBranchOnly => StartSetConfig::DefaultBranchOnly,
+        GitRefSelection::AllRemoteBranches { remote } => StartSetConfig::AllRemoteBranches {
+            remote: remote.clone(),
+        },
+        GitRefSelection::BranchesAndTags {
+            include_remote_branches,
+            remote,
+        } => StartSetConfig::BranchesAndTags {
+            include_remote_branches: *include_remote_branches,
+            remote: remote.clone(),
+        },
+        GitRefSelection::ExplicitRefs { refs } => {
+            StartSetConfig::ExplicitRefs { refs: refs.clone() }
+        }
+    }
 }
 
 /// Map `scanner_git` metrics into the crate-level [`ScanReport`].
@@ -386,6 +419,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 mod tests {
     use super::*;
     use crate::GitScanConfig;
+    use gossip_contracts::connector::git::GitRefSelection;
 
     /// Zero-valued `tree_delta_cache_mb` produces a `ZeroBudget` error.
     #[test]
@@ -428,6 +462,62 @@ mod tests {
         assert!(
             matches!(err, ScanRuntimeError::Driver(_)),
             "expected Driver (overflow), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_refs_selection_maps_to_start_set_config() {
+        let refs = vec![b"refs/gossip/scan-targets/commits/sha1/abc".to_vec()];
+        let cfg = GitScanConfig::new("/tmp")
+            .with_ref_selection(GitRefSelection::ExplicitRefs { refs: refs.clone() });
+
+        let built = build_git_scan_config(&cfg).expect("build runtime git config");
+        assert_eq!(built.start_set, StartSetConfig::ExplicitRefs { refs });
+    }
+
+    /// Default `GitRefSelection` (i.e. `DefaultBranchOnly`) maps to
+    /// `StartSetConfig::DefaultBranchOnly`.
+    #[test]
+    fn build_git_scan_config_uses_default_branch_only_start_set() {
+        let cfg = GitScanConfig::new("/tmp");
+
+        let built = build_git_scan_config(&cfg).expect("build config");
+        assert_eq!(built.start_set, StartSetConfig::DefaultBranchOnly);
+    }
+
+    /// `AllRemoteBranches` with a specific remote propagates the remote filter.
+    #[test]
+    fn build_git_scan_config_uses_all_remote_branches_start_set() {
+        let cfg =
+            GitScanConfig::new("/tmp").with_ref_selection(GitRefSelection::AllRemoteBranches {
+                remote: Some(b"upstream".to_vec()),
+            });
+
+        let built = build_git_scan_config(&cfg).expect("build config");
+        assert_eq!(
+            built.start_set,
+            StartSetConfig::AllRemoteBranches {
+                remote: Some(b"upstream".to_vec()),
+            }
+        );
+    }
+
+    /// `BranchesAndTags` with remote branches enabled and no remote filter
+    /// propagates both fields.
+    #[test]
+    fn build_git_scan_config_uses_branches_and_tags_start_set() {
+        let cfg = GitScanConfig::new("/tmp").with_ref_selection(GitRefSelection::BranchesAndTags {
+            include_remote_branches: true,
+            remote: None,
+        });
+
+        let built = build_git_scan_config(&cfg).expect("build config");
+        assert_eq!(
+            built.start_set,
+            StartSetConfig::BranchesAndTags {
+                include_remote_branches: true,
+                remote: None,
+            }
         );
     }
 }
