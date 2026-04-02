@@ -143,8 +143,8 @@ The canonical identity tuple is:
 ### Reduced matrix and CI gate
 
 The parity gate is currently **deferred**, not live. `crates/scanner-engine-integration-tests/tests/integration/main.rs`
-keeps `execution_mode_parity` commented out until the `scanner-rs-cli` binary name is settled, so there is
-no checked-in `execution_mode_parity.rs` module and no CI job named `execution-mode-parity` on current HEAD.
+keeps `execution_mode_parity` commented out, so there is no checked-in `execution_mode_parity.rs`
+module and no CI job named `execution-mode-parity` on current HEAD.
 When that gate is restored, the intended reduced matrix covers:
 - FS flat fixture
 - FS nested fixture
