@@ -525,7 +525,7 @@ graph TB
 | `keyspace.rs` | Complete | Deterministic paths, buffer-reuse API, scan isolation |
 | `codec.rs` | Complete | Binary encode/decode, staged rollback, fuzz-tested |
 | `error.rs` | Complete | Full error hierarchy with operation labels |
-| `backend.rs` + `backend/*.rs` | Complete | Direct etcd persistence via CAS transactions for both `EtcdCoordinator` (sync) and `AsyncEtcdCoordinator` (async), including run management, shard acquisition, checkpointing, completion, parking, and split operations |
+| `backend.rs` + `backend/*.rs` | Complete | Direct etcd persistence via CAS transactions for the sync and async coordination backends; see the source-code reference table below for the run-management and shard-lifecycle implementation split |
 
 The keyspace and codec are shared infrastructure used by the CAS transaction
 logic in `backend.rs` and the `backend/` submodules. `EtcdCoordinator` and
