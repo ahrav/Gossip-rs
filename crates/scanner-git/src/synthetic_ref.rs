@@ -247,6 +247,8 @@ pub fn materialize_synthetic_commit_ref(
 /// The pack path reads only entry headers (no payload decompression). For
 /// non-delta entries the kind is embedded directly in the header. For delta
 /// entries the chain is followed via headers until a non-delta base is reached.
+/// `REF_DELTA` bases missing from the MIDX fall back to loose-object lookup for
+/// the base OID because delta entries inherit their base object's type.
 fn lookup_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
@@ -270,7 +272,7 @@ fn lookup_object_kind(
                     detail: err.to_string(),
                 }
             })?;
-            match lookup_packed_object_kind(&midx, &pack_paths, oid) {
+            match lookup_packed_object_kind(&midx, &pack_paths, paths, oid) {
                 Ok(Some(kind)) => Ok(Some(kind)),
                 // OID not in pack index — try loose objects.
                 Ok(None) => lookup_loose_object_kind(paths, oid),
@@ -371,6 +373,7 @@ const KIND_RESOLVE_MAX_DELTA_DEPTH: u8 = 64;
 fn lookup_packed_object_kind(
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
+    paths: &GitRepoPaths,
     oid: OidBytes,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
     let idx = match midx
@@ -389,6 +392,7 @@ fn lookup_packed_object_kind(
     resolve_kind_at(
         midx,
         pack_paths,
+        paths,
         pack_id,
         offset,
         KIND_RESOLVE_MAX_DELTA_DEPTH,
@@ -408,6 +412,7 @@ fn lookup_packed_object_kind(
 fn resolve_kind_at(
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
+    paths: &GitRepoPaths,
     pack_id: u16,
     offset: u64,
     remaining_depth: u8,
@@ -455,6 +460,7 @@ fn resolve_kind_at(
             resolve_kind_at(
                 midx,
                 pack_paths,
+                paths,
                 pack_id,
                 base_offset,
                 remaining_depth - 1,
@@ -473,7 +479,7 @@ fn resolve_kind_at(
                 }
             })? {
                 Some(idx) => idx,
-                None => return Ok(None),
+                None => return lookup_loose_object_kind(paths, base_oid),
             };
             let (base_pack_id, base_offset) =
                 midx.offset_at(base_idx)
@@ -489,6 +495,7 @@ fn resolve_kind_at(
             resolve_kind_at(
                 midx,
                 pack_paths,
+                paths,
                 base_pack_id,
                 base_offset,
                 remaining_depth - 1,
@@ -612,11 +619,58 @@ fn parse_loose_object_kind(bytes: &[u8]) -> Result<ObjectKind, SyntheticCommitRe
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::delta_test_helpers::{make_add_delta, zlib_compress, SyntheticPackBuilder};
+    use crate::midx_test_builder::MidxBuilder;
     use crate::native_ref_resolver::tests::{git, init_repo, parse_oid, resolve_with, try_git};
+    use crate::repo::RepoKind;
     use crate::StartSetConfig;
+
+    fn write_loose_object(objects_dir: &Path, oid: OidBytes, kind: &str, payload: &[u8]) {
+        let mut object = Vec::new();
+        object.extend_from_slice(kind.as_bytes());
+        object.push(b' ');
+        object.extend_from_slice(payload.len().to_string().as_bytes());
+        object.push(0);
+        object.extend_from_slice(payload);
+
+        let compressed = zlib_compress(&object);
+        let hex = oid.to_string();
+        let (dir, file) = hex.split_at(2);
+        let dir_path = objects_dir.join(dir);
+        fs::create_dir_all(&dir_path).expect("create loose object shard");
+        fs::write(dir_path.join(file), compressed).expect("write loose object");
+    }
+
+    fn bare_repo_paths(repo_root: &Path) -> GitRepoPaths {
+        let repo_root = repo_root.to_path_buf();
+        let objects_dir = repo_root.join("objects");
+        let pack_dir = objects_dir.join("pack");
+        GitRepoPaths {
+            kind: RepoKind::Bare,
+            worktree_root: None,
+            git_dir: repo_root.clone(),
+            common_dir: repo_root,
+            objects_dir,
+            pack_dir,
+            alternate_object_dirs: Vec::new(),
+        }
+    }
+
+    fn write_pack_and_midx(
+        paths: &GitRepoPaths,
+        pack_name: &str,
+        pack_bytes: &[u8],
+        midx: &[u8],
+    ) -> PathBuf {
+        fs::create_dir_all(&paths.pack_dir).expect("create pack dir");
+        let pack_path = paths.pack_dir.join(format!("{pack_name}.pack"));
+        fs::write(&pack_path, pack_bytes).expect("write pack");
+        fs::write(paths.pack_dir.join("multi-pack-index"), midx).expect("write midx");
+        pack_path
+    }
 
     #[test]
     fn synthetic_commit_ref_name_is_stable_and_distinct_across_formats() {
@@ -838,5 +892,86 @@ mod tests {
             git(&mirror, &["rev-parse", &ref_name_str]),
             commit.to_string(),
         );
+    }
+
+    #[test]
+    fn lookup_object_kind_resolves_ref_delta_base_from_loose_object() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+        fs::create_dir_all(&paths.objects_dir).expect("create objects dir");
+
+        let base_oid_bytes = [0x66; 20];
+        let delta_oid_bytes = [0x77; 20];
+        let base_oid = OidBytes::sha1(base_oid_bytes);
+        let delta_oid = OidBytes::sha1(delta_oid_bytes);
+        let base_payload = b"base commit";
+        let delta = make_add_delta(base_payload.len(), b"!");
+
+        write_loose_object(&paths.objects_dir, base_oid, "commit", base_payload);
+
+        let mut pack = SyntheticPackBuilder::new();
+        let delta_idx = pack.add_ref_delta(base_oid, &delta);
+        let (pack_bytes, offsets) = pack.build();
+
+        let mut midx = MidxBuilder::new();
+        midx.add_pack(b"delta");
+        midx.add_object(delta_oid_bytes, 0, offsets[delta_idx]);
+        write_pack_and_midx(&paths, "delta", &pack_bytes, &midx.build());
+
+        let kind = lookup_object_kind(&paths, delta_oid).expect("lookup succeeds");
+        assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
+    fn lookup_object_kind_resolves_ref_delta_base_from_midx() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+
+        let base_oid_bytes = [0x44; 20];
+        let delta_oid_bytes = [0x45; 20];
+        let base_oid = OidBytes::sha1(base_oid_bytes);
+        let delta_oid = OidBytes::sha1(delta_oid_bytes);
+        let base_payload = b"packed commit";
+        let delta = make_add_delta(base_payload.len(), b"!");
+
+        let mut pack = SyntheticPackBuilder::new();
+        let base_idx = pack.add_non_delta(1, base_payload);
+        let delta_idx = pack.add_ref_delta(base_oid, &delta);
+        let (pack_bytes, offsets) = pack.build();
+
+        let mut midx = MidxBuilder::new();
+        midx.add_pack(b"delta");
+        midx.add_object(base_oid_bytes, 0, offsets[base_idx]);
+        midx.add_object(delta_oid_bytes, 0, offsets[delta_idx]);
+        write_pack_and_midx(&paths, "delta", &pack_bytes, &midx.build());
+
+        let kind = lookup_object_kind(&paths, delta_oid).expect("lookup succeeds");
+        assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
+    fn lookup_object_kind_returns_none_when_ref_delta_base_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+
+        let base_oid = OidBytes::sha1([0x88; 20]);
+        let delta_oid_bytes = [0x99; 20];
+        let delta_oid = OidBytes::sha1(delta_oid_bytes);
+        let delta = make_add_delta(0, b"!");
+
+        let mut pack = SyntheticPackBuilder::new();
+        let delta_idx = pack.add_ref_delta(base_oid, &delta);
+        let (pack_bytes, offsets) = pack.build();
+
+        let mut midx = MidxBuilder::new();
+        midx.add_pack(b"delta");
+        midx.add_object(delta_oid_bytes, 0, offsets[delta_idx]);
+        write_pack_and_midx(&paths, "delta", &pack_bytes, &midx.build());
+
+        let kind = lookup_object_kind(&paths, delta_oid).expect("lookup succeeds");
+        assert_eq!(kind, None);
     }
 }
