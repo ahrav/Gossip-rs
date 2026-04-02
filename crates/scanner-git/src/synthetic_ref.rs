@@ -231,6 +231,10 @@ pub fn materialize_synthetic_commit_ref(
 /// operation fails. Returns `Ok(None)` when the OID is not found in either
 /// store.
 ///
+/// When a pack/MIDX error occurs and the subsequent loose probe also misses,
+/// the original pack error is surfaced rather than silently returning `None`
+/// (which the caller would interpret as `CommitNotFound`).
+///
 /// The pack path reads only entry headers (no payload decompression). For
 /// non-delta entries the kind is embedded directly in the header. For delta
 /// entries the chain is followed via headers until a non-delta base is reached.
@@ -257,14 +261,28 @@ fn lookup_object_kind(
                 Ok(None) => lookup_loose_object_kind(paths, oid),
                 // Pack header resolution failed — try loose objects before
                 // hard-failing, since the object may exist outside packs.
-                Err(_) => lookup_loose_object_kind(paths, oid),
+                // If loose also misses, surface the original pack error.
+                Err(pack_err) => match lookup_loose_object_kind(paths, oid) {
+                    Ok(Some(kind)) => Ok(Some(kind)),
+                    Ok(None) => Err(pack_err),
+                    Err(_) => Err(pack_err),
+                },
             }
         }
         // Any MIDX build failure (missing packs, corrupt idx, too many
         // packs, etc.) falls back to loose object lookup rather than
         // hard-failing. The object may exist as a loose file even when
-        // pack index enumeration cannot complete.
-        Err(_) => lookup_loose_object_kind(paths, oid),
+        // pack index enumeration cannot complete. If loose also misses,
+        // surface the original MIDX error.
+        Err(midx_err) => match lookup_loose_object_kind(paths, oid) {
+            Ok(Some(kind)) => Ok(Some(kind)),
+            Ok(None) => Err(SyntheticCommitRefError::ObjectLookup {
+                detail: midx_err.to_string(),
+            }),
+            Err(_) => Err(SyntheticCommitRefError::ObjectLookup {
+                detail: midx_err.to_string(),
+            }),
+        },
     }
 }
 
@@ -310,6 +328,7 @@ fn lookup_packed_object_kind(
         pack_id,
         offset,
         KIND_RESOLVE_MAX_DELTA_DEPTH,
+        None,
     )
 }
 
@@ -319,24 +338,37 @@ fn lookup_packed_object_kind(
 /// `OFS_DELTA` entries reference a base within the same pack file;
 /// `REF_DELTA` entries require a MIDX re-lookup to locate the base pack.
 /// Each hop decrements `remaining_depth` to bound runaway chains.
+///
+/// When `cached_pack` matches `pack_id`, the already-mapped bytes are reused
+/// to avoid repeated `mmap` syscalls during intra-pack delta chain walks.
 fn resolve_kind_at(
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
     pack_id: u16,
     offset: u64,
     remaining_depth: u8,
+    cached_pack: Option<(u16, &memmap2::Mmap)>,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
-    let pack_path =
-        pack_paths
-            .get(pack_id as usize)
-            .ok_or(SyntheticCommitRefError::ObjectLookup {
-                detail: format!(
-                    "pack id {pack_id} out of range (have {} packs)",
-                    pack_paths.len()
-                ),
-            })?;
-    let data = mmap_pack(pack_path)?;
-    let pack = PackFile::parse(&data, midx.oid_len().into()).map_err(|err| {
+    // Reuse the cached mmap when following OFS_DELTA chains within the
+    // same pack; only open a new mapping when crossing pack boundaries.
+    let fresh_map;
+    let (data, this_mmap): (&[u8], Option<&memmap2::Mmap>) = match cached_pack {
+        Some((cached_id, mmap)) if cached_id == pack_id => (mmap.as_ref(), Some(mmap)),
+        _ => {
+            let pack_path =
+                pack_paths
+                    .get(pack_id as usize)
+                    .ok_or(SyntheticCommitRefError::ObjectLookup {
+                        detail: format!(
+                            "pack id {pack_id} out of range (have {} packs)",
+                            pack_paths.len()
+                        ),
+                    })?;
+            fresh_map = mmap_pack(pack_path)?;
+            (fresh_map.as_ref(), Some(&fresh_map))
+        }
+    };
+    let pack = PackFile::parse(data, midx.oid_len().into()).map_err(|err| {
         SyntheticCommitRefError::ObjectLookup {
             detail: format!("pack parse failed: {err}"),
         }
@@ -354,7 +386,16 @@ fn resolve_kind_at(
                     detail: "delta chain depth exceeded during kind resolution".to_string(),
                 });
             }
-            resolve_kind_at(midx, pack_paths, pack_id, base_offset, remaining_depth - 1)
+            // OFS_DELTA bases are always in the same pack — pass the
+            // current mapping to avoid re-mmapping on the next hop.
+            resolve_kind_at(
+                midx,
+                pack_paths,
+                pack_id,
+                base_offset,
+                remaining_depth - 1,
+                this_mmap.map(|m| (pack_id, m)),
+            )
         }
         EntryKind::RefDelta { base_oid } => {
             if remaining_depth == 0 {
@@ -375,12 +416,19 @@ fn resolve_kind_at(
                     .map_err(|err| SyntheticCommitRefError::ObjectLookup {
                         detail: err.to_string(),
                     })?;
+            // Pass the cached mmap if the base is in the same pack.
+            let carry = if base_pack_id == pack_id {
+                this_mmap.map(|m| (pack_id, m))
+            } else {
+                None
+            };
             resolve_kind_at(
                 midx,
                 pack_paths,
                 base_pack_id,
                 base_offset,
                 remaining_depth - 1,
+                carry,
             )
         }
     }
@@ -460,8 +508,10 @@ fn lookup_loose_object_kind(
 /// Parse the object type from a decompressed loose object header.
 ///
 /// The git loose format is `<type> <size>\0<body>`. This function extracts
-/// the type keyword before the first space and maps it to [`ObjectKind`].
-/// Returns an error for malformed headers or unrecognized type strings.
+/// the type keyword before the first space, validates the size field between
+/// the space and the NUL terminator, and maps the type to [`ObjectKind`].
+/// Returns an error for malformed headers, invalid size fields, or
+/// unrecognized type strings.
 fn parse_loose_object_kind(bytes: &[u8]) -> Result<ObjectKind, SyntheticCommitRefError> {
     let Some(nul) = bytes.iter().position(|&b| b == 0) else {
         return Err(SyntheticCommitRefError::ObjectLookup {
@@ -474,6 +524,12 @@ fn parse_loose_object_kind(bytes: &[u8]) -> Result<ObjectKind, SyntheticCommitRe
             detail: "loose object header is missing its type/size separator".to_string(),
         });
     };
+    let size_bytes = &header[space + 1..];
+    if size_bytes.is_empty() || !size_bytes.iter().all(u8::is_ascii_digit) {
+        return Err(SyntheticCommitRefError::ObjectLookup {
+            detail: "loose object header has an invalid size field".to_string(),
+        });
+    }
 
     match &header[..space] {
         b"commit" => Ok(ObjectKind::Commit),
@@ -682,5 +738,41 @@ mod tests {
         );
 
         assert_eq!(resolved, vec![(ref_name, commit)]);
+    }
+
+    #[test]
+    fn materialize_synthetic_commit_ref_resolves_pack_only_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+
+        // Repack the mirror so all objects live exclusively in packs,
+        // then prune loose objects. This forces the kind-resolution
+        // path through the MIDX + pack-header walker.
+        git(&mirror, &["repack", "-a", "-d"]);
+        git(&mirror, &["prune-packed"]);
+
+        let ref_name = materialize_synthetic_commit_ref(&mirror, commit, RepoOpenLimits::default())
+            .expect("pack-only commit should materialize");
+        let ref_name_str = String::from_utf8(ref_name).expect("utf-8 ref name");
+        assert_eq!(
+            git(&mirror, &["rev-parse", &ref_name_str]),
+            commit.to_string(),
+        );
     }
 }
