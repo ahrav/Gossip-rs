@@ -138,6 +138,7 @@ and `types.rs`.
 | `crates/gossip-contracts/src/connector/types.rs` | Toxic-byte wrappers, cursor, budgets |
 | `crates/gossip-contracts/src/connector/api.rs` | Error taxonomy, capabilities |
 | `crates/gossip-contracts/src/connector/mod.rs` | Re-export hub, canonical connector tags |
+| `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem, Git, and in-memory connector implementations |
 | `crates/gossip-connectors/src/filesystem.rs` | Filesystem ordered-content connector |
 | `crates/gossip-connectors/src/git.rs` | Git `ls-files` ordered-content connector |
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
@@ -153,6 +154,7 @@ and `types.rs`.
 | `crates/gossip-orchestrator/src/payload.rs` | Typed filesystem shard payload wire format (encode/decode) |
 | `crates/gossip-orchestrator/src/setup.rs` | Coordination-backed filesystem run setup and shard registration |
 | `crates/gossip-orchestrator/src/test_support.rs` | Shared test fixtures for orchestrator unit tests |
+| `crates/gossip-scanner-runtime/src/lib.rs` | Runtime crate root: public family entrypoints, execution-mode selection, validation, and shared scan report/config types |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
