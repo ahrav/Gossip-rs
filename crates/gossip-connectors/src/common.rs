@@ -462,6 +462,12 @@ mod is_permanent_io_error_tests {
     }
 
     #[test]
+    fn read_only_filesystem_is_permanent() {
+        let err = io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "test");
+        assert!(is_permanent_io_error(&err));
+    }
+
+    #[test]
     fn would_block_is_retryable() {
         let err = io::Error::new(io::ErrorKind::WouldBlock, "test");
         assert!(!is_permanent_io_error(&err));
