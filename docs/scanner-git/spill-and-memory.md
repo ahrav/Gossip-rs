@@ -389,6 +389,8 @@ are approximate.
 | Loose OID hash set | `crates/scanner-git/src/blob_introducer.rs` |
 | Blob intro stats | `crates/scanner-git/src/blob_introducer.rs` |
 | Seen-blob store trait | `crates/scanner-git/src/seen_store.rs` |
+| Seen-bitmap persister trait | `crates/scanner-git/src/seen_store.rs` |
+| No-op seen-bitmap persister | `crates/scanner-git/src/seen_store.rs` |
 | Unique blob sink trait | `crates/scanner-git/src/unique_blob.rs` |
 | Tree diff limits | `crates/scanner-git/src/tree_diff_limits.rs` |
 

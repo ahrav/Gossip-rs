@@ -299,7 +299,7 @@ effects. It transforms scan results into stably-ordered write operations.
    - Emit a `blob_ctx` (`bc\0`) write op with the encoded context.
    - Gather findings across all contexts for this OID, sort + dedupe by
      identity `(start, end, rule_id, norm_hash)`, emit `finding` (`fn\0`) ops.
-   - Emit a `seen_blob` (`sb\0`) marker.
+   - Accumulate this OID into the scope-scoped seen-bitmap delta (`sb\0`).
 3. Assemble data ops in namespace order: `bc\0` < `fn\0` < `sb\0`.
 4. If the run is complete (no skipped candidates), emit ref watermark (`rw`)
    ops. If partial, watermark ops are empty.

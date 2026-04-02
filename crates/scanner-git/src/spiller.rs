@@ -474,9 +474,13 @@ impl Spiller {
     ///
     /// Unseen blobs are forwarded to the sink *before* `persist_seen_delta`
     /// records them durably. This produces at-least-once delivery semantics:
-    /// if the process crashes after `sink.emit` but before the bitmap is
-    /// persisted, those OIDs will not be marked as seen and will be
-    /// re-scanned on the next run.
+    ///
+    /// - **Crash between emit and persist**: already-emitted OIDs are not
+    ///   marked as seen, so the next run re-scans and re-emits them.
+    /// - **Mid-batch `sink.emit` failure**: if emit succeeds for OIDs 1..k
+    ///   then fails on k+1, `persist_seen_delta` is never reached. OIDs
+    ///   1..k were emitted but not persisted, so they will be re-emitted on
+    ///   the next run — the same at-least-once guarantee as the crash path.
     ///
     /// See `persist_seen_delta_inner` in `persist_rocksdb.rs` for the full
     /// crash-consistency contract: the incremental bitmap may advance

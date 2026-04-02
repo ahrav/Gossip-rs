@@ -156,9 +156,10 @@ impl RocksDbStore {
     /// path. This is acceptable because the seen-bitmap is a best-effort
     /// deduplication hint, not a correctness-critical structure.
     #[cfg(feature = "rocksdb")]
-    fn persist_seen_delta_inner(&self, delta: &SeenBitmapDelta) -> Result<(), String> {
+    fn persist_seen_delta_inner(&self, delta: &SeenBitmapDelta) -> Result<(), SpillError> {
         let scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
-        self.load_seen_store(delta.oid_len())?;
+        self.load_seen_store(delta.oid_len())
+            .map_err(|err| SpillError::Io(io::Error::other(err)))?;
 
         // Mutate the bitmap in-place and serialize while holding the borrow.
         // The borrow is dropped before the I/O call to avoid holding the
@@ -166,21 +167,19 @@ impl RocksDbStore {
         let bytes = {
             let mut guard = self.seen_store.borrow_mut();
             let store = guard.as_mut().ok_or_else(|| {
-                "incremental seen-bitmap persist failed: seen-store not initialized".to_string()
+                SpillError::Io(io::Error::other(
+                    "incremental seen-bitmap persist failed: seen-store not initialized",
+                ))
             })?;
-            store
-                .bitmap_mut()
-                .merge_delta(delta)
-                .map_err(|err| format!("incremental seen-bitmap merge failed: {err}"))?;
-            store
-                .bitmap()
-                .serialize()
-                .map_err(|err| format!("incremental seen-bitmap serialization failed: {err}"))?
+            store.bitmap_mut().merge_delta(delta)?;
+            store.bitmap().serialize()?
         };
 
-        self.db
-            .put(&scope_key, &bytes)
-            .map_err(|err| format!("incremental seen-bitmap RocksDB put failed: {err}"))?;
+        self.db.put(&scope_key, &bytes).map_err(|err| {
+            SpillError::Io(io::Error::other(format!(
+                "incremental seen-bitmap RocksDB put failed: {err}"
+            )))
+        })?;
         Ok(())
     }
 }
@@ -193,14 +192,8 @@ impl SeenBitmapPersister for RocksDbStore {
                 return Ok(());
             }
 
-            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec()).map_err(|err| {
-                SpillError::Io(io::Error::other(format!(
-                    "seen-bitmap delta construction failed: {err}"
-                )))
-            })?;
+            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
             self.persist_seen_delta_inner(&delta)
-                .map_err(|err| SpillError::Io(io::Error::other(err)))?;
-            Ok(())
         }
 
         #[cfg(not(feature = "rocksdb"))]

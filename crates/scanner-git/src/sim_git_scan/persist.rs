@@ -14,8 +14,8 @@ use std::cell::RefCell;
 use std::io;
 
 use crate::{
-    FinalizeOutcome, FinalizeOutput, OidBytes, PersistError, PersistenceStore, SeenBitmapPersister,
-    SpillError,
+    roaring_seen::SeenBitmapDelta, FinalizeOutcome, FinalizeOutput, OidBytes, PersistError,
+    PersistenceStore, SeenBitmapPersister, SpillError,
 };
 
 use super::fault::{GitFaultInjector, GitFaultPlan, GitIoFault, GitResourceId};
@@ -107,6 +107,16 @@ impl Default for SimPersistStore {
 
 impl SeenBitmapPersister for SimPersistStore {
     fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError> {
+        // Mirror production short-circuit: empty slices are no-ops and must
+        // not consume a fault-plan read.
+        if oids.is_empty() {
+            return Ok(());
+        }
+
+        // Validate the same sorted-and-unique contract enforced by the
+        // production persisters.
+        let _delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
+
         let (fault, _idx) = self
             .faults
             .borrow_mut()
