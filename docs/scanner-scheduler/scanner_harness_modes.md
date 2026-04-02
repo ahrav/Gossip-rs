@@ -162,13 +162,13 @@ a sustained-green gate script (not yet implemented).
 
 ```bash
 # Planned parity gate command once the test exists
-cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 
 # Optional tuning knobs for local stress/debug
 EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
-cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 ```
 
 ## Mode 4: FS Enumeration Conformance Matrix (Phase 4)
