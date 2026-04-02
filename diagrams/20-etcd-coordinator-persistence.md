@@ -554,11 +554,19 @@ implementation across both sync and async entrypoints.
 | File | Purpose |
 |:---|:---|
 | `crates/gossip-coordination-etcd/src/lib.rs` | Crate root, public re-exports |
-| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), CAS transaction logic, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend.rs` | Shared backend helpers, CAS utilities, record loading, and transaction-building glue used by the submodules |
+| `crates/gossip-coordination-etcd/src/backend/coordinator.rs` | `EtcdCoordinator` / `AsyncEtcdCoordinator` entrypoints, etcd transport wrappers, and CAS retry infrastructure |
+| `crates/gossip-coordination-etcd/src/backend/run_management.rs` | Run lifecycle trait implementations (`create_run`, `register_shards`, terminal run transitions, unpark) |
+| `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | Shard coordination and lifecycle trait implementations (`acquire`, `renew`, `checkpoint`, `complete`, `park_shard`, split ops) |
+| `crates/gossip-coordination-etcd/src/backend/test_support.rs` | Test-only backend fault injection and helpers compiled under tests / `test-support` |
+| `crates/gossip-coordination-etcd/src/behavioral_conformance.rs` | Behavioral conformance tests for the real etcd-backed coordinator |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |
 | `crates/gossip-coordination-etcd/src/error.rs` | `EtcdCoordinatorError` and `EtcdOperation` |
+| `crates/gossip-coordination-etcd/src/sim_coordinator.rs` | Deterministic in-memory coordinator adapter over the simulated etcd KV model |
+| `crates/gossip-coordination-etcd/src/sim_etcd_kv.rs` | In-memory model of the etcd KV and lease subset used by the coordinator |
+| `crates/gossip-coordination-etcd/src/test_support.rs` | Testcontainers helpers and shared etcd test-environment setup |
 | `crates/gossip-coordination-etcd/src/tests.rs` | Config, keyspace, property tests, integration test |
 | `crates/gossip-coordination-etcd/src/codec_tests.rs` | Codec round-trip and error-case tests |
 | `crates/gossip-coordination-etcd/fuzz/fuzz_targets/` | 4 libfuzzer targets for decode/round-trip |
