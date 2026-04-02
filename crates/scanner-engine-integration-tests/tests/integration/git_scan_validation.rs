@@ -211,11 +211,11 @@ impl PersistenceStore for RetryStore {
         // so subsequent scans observe them via `batch_check_seen`.
         let mut seen = self.seen.borrow_mut();
         for op in &output.data_ops {
-            if op.key.starts_with(&NS_SEEN_BLOB) {
-                if let Ok(delta) = SeenBitmapDelta::deserialize(&op.value) {
-                    for oid in delta.oids() {
-                        seen.insert(*oid);
-                    }
+            if op.key.starts_with(&NS_SEEN_BLOB)
+                && let Ok(delta) = SeenBitmapDelta::deserialize(&op.value)
+            {
+                for oid in delta.oids() {
+                    seen.insert(*oid);
                 }
             }
         }
