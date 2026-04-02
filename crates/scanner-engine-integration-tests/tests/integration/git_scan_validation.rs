@@ -193,11 +193,9 @@ impl SeenBlobStore for RetryStore {
 }
 
 impl SeenBitmapPersister for RetryStore {
-    fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError> {
-        let mut seen = self.seen.borrow_mut();
-        for &oid in oids {
-            seen.insert(oid);
-        }
+    fn persist_seen_delta(&self, _oids: &[OidBytes]) -> Result<(), SpillError> {
+        // No-op: spill checkpoints must not update the live seen set.
+        // Only commit_finalize folds OIDs into the set atomically.
         Ok(())
     }
 }
