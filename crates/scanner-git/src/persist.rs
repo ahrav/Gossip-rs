@@ -117,10 +117,10 @@ impl SeenBitmapPersister for InMemoryPersistenceStore {
             }
 
             let Some(scope_key) = self.active_seen_scope_key() else {
-                return Err(SpillError::Io(std::io::Error::other(
-                    "InMemoryPersistenceStore: no seen scope key configured; \
-                     use with_seen_scope() for incremental persistence",
-                )));
+                // No scope key configured: silently succeed, matching the
+                // staging no-op contract. Callers that need incremental
+                // persistence must use `with_seen_scope()`.
+                return Ok(());
             };
             let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
             let mut scopes = self.seen_scopes.borrow_mut();

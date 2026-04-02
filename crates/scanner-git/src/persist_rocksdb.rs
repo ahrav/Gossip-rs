@@ -92,7 +92,7 @@ impl RocksDbStore {
                 seen_store: RefCell::new(None),
                 finalizing: Cell::new(false),
             };
-            store.cleanup_orphaned_staging();
+            store.cleanup_orphaned_staging()?;
             Ok(store)
         }
 
@@ -178,10 +178,16 @@ impl RocksDbStore {
     }
 
     /// Deletes any orphaned staging key left by a crashed previous run.
+    ///
+    /// Returns an error if the RocksDB delete fails, since a surviving
+    /// staging key would cause the next `commit_finalize` to fold
+    /// never-committed OIDs into the live bitmap.
     #[cfg(feature = "rocksdb")]
-    fn cleanup_orphaned_staging(&self) {
+    fn cleanup_orphaned_staging(&self) -> Result<(), PersistError> {
         let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
-        let _ = self.db.delete(&staging_key);
+        self.db
+            .delete(&staging_key)
+            .map_err(|err| PersistError::backend(err.to_string()))
     }
 }
 
@@ -274,12 +280,25 @@ impl PersistenceStore for RocksDbStore {
             // Fold spill-stage staging bitmap (if any) into seen_oids so
             // the finalize merge produces a single authoritative bitmap.
             let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
-            if let Ok(Some(staging_bytes)) = self.db.get(&staging_key) {
-                if let Ok(staging_bitmap) = RoaringSeenBitmap::deserialize(&staging_bytes) {
+            match self.db.get(&staging_key) {
+                Ok(Some(staging_bytes)) => {
+                    // All OIDs in the staging bitmap are marked seen because
+                    // persist_seen_delta_inner only ever merges via merge_delta,
+                    // which uses `other_contains = |_| true`.
+                    let staging_bitmap =
+                        RoaringSeenBitmap::deserialize(&staging_bytes).map_err(|err| {
+                            PersistError::backend(format!("corrupt staging bitmap: {err}"))
+                        })?;
                     seen_oids.extend_from_slice(staging_bitmap.all_oids());
+                    // Delete the staging key in the same WriteBatch.
+                    batch.delete(&staging_key);
                 }
-                // Delete the staging key in the same WriteBatch.
-                batch.delete(&staging_key);
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(PersistError::backend(format!(
+                        "staging bitmap read failed: {err}"
+                    )));
+                }
             }
 
             if !seen_oids.is_empty() {

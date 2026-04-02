@@ -205,18 +205,17 @@ impl PersistenceStore for RetryStore {
         if self.fail_commit_once.replace(false) {
             return Err(PersistError::backend("injected finalize failure"));
         }
-        // Model production behavior: extract seen OIDs from finalize data ops
-        // so subsequent scans observe them via `batch_check_seen`.
-        let mut seen = self.seen.borrow_mut();
+        // Model production behavior: decode all finalize seen ops first, then
+        // publish them atomically into the live seen set.
+        let mut staged_oids = Vec::new();
         for op in &output.data_ops {
-            if op.key.starts_with(&NS_SEEN_BLOB)
-                && let Ok(delta) = SeenBitmapDelta::deserialize(&op.value)
-            {
-                for oid in delta.oids() {
-                    seen.insert(*oid);
-                }
+            if op.key.starts_with(&NS_SEEN_BLOB) {
+                let delta = SeenBitmapDelta::deserialize(&op.value)
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                staged_oids.extend(delta.oids().iter().copied());
             }
         }
+        self.seen.borrow_mut().extend(staged_oids);
         Ok(())
     }
 }

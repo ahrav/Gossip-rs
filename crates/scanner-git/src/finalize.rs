@@ -69,6 +69,11 @@ const _: () = {
     assert!(NS_BLOB_CTX[0] < NS_FINDING[0]);
     assert!(NS_FINDING[0] < NS_SEEN_BLOB[0]);
 };
+#[cfg(feature = "rocksdb")]
+const _: () = {
+    // Staging namespace must sort after the live seen namespace.
+    assert!(NS_SEEN_BLOB[1] < NS_SEEN_STAGING[1]);
+};
 
 /// A ref entry from the start set.
 #[derive(Clone, Debug)]
