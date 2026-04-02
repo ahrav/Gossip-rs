@@ -449,40 +449,34 @@ mod borrowed_shard_bound_tests {
 #[cfg(test)]
 mod is_permanent_io_error_tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn permission_denied_is_permanent() {
-        let err = io::Error::new(io::ErrorKind::PermissionDenied, "test");
-        assert!(is_permanent_io_error(&err));
+    #[rstest]
+    #[case::not_found(io::ErrorKind::NotFound)]
+    #[case::permission_denied(io::ErrorKind::PermissionDenied)]
+    #[case::invalid_input(io::ErrorKind::InvalidInput)]
+    #[case::invalid_filename(io::ErrorKind::InvalidFilename)]
+    #[case::not_a_directory(io::ErrorKind::NotADirectory)]
+    #[case::is_a_directory(io::ErrorKind::IsADirectory)]
+    #[case::read_only_filesystem(io::ErrorKind::ReadOnlyFilesystem)]
+    fn permanent_error_kinds(#[case] kind: io::ErrorKind) {
+        let err = io::Error::new(kind, "test");
+        assert!(
+            is_permanent_io_error(&err),
+            "{kind:?} should be classified as permanent"
+        );
     }
 
-    #[test]
-    fn not_found_is_permanent() {
-        let err = io::Error::new(io::ErrorKind::NotFound, "test");
-        assert!(is_permanent_io_error(&err));
-    }
-
-    #[test]
-    fn read_only_filesystem_is_permanent() {
-        let err = io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "test");
-        assert!(is_permanent_io_error(&err));
-    }
-
-    #[test]
-    fn would_block_is_retryable() {
-        let err = io::Error::new(io::ErrorKind::WouldBlock, "test");
-        assert!(!is_permanent_io_error(&err));
-    }
-
-    #[test]
-    fn timed_out_is_retryable() {
-        let err = io::Error::new(io::ErrorKind::TimedOut, "test");
-        assert!(!is_permanent_io_error(&err));
-    }
-
-    #[test]
-    fn interrupted_is_retryable() {
-        let err = io::Error::new(io::ErrorKind::Interrupted, "test");
-        assert!(!is_permanent_io_error(&err));
+    #[rstest]
+    #[case::would_block(io::ErrorKind::WouldBlock)]
+    #[case::timed_out(io::ErrorKind::TimedOut)]
+    #[case::interrupted(io::ErrorKind::Interrupted)]
+    #[case::connection_reset(io::ErrorKind::ConnectionReset)]
+    fn transient_error_kinds(#[case] kind: io::ErrorKind) {
+        let err = io::Error::new(kind, "test");
+        assert!(
+            !is_permanent_io_error(&err),
+            "{kind:?} should be classified as transient"
+        );
     }
 }
