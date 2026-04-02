@@ -525,13 +525,12 @@ graph TB
 | `keyspace.rs` | Complete | Deterministic paths, buffer-reuse API, scan isolation |
 | `codec.rs` | Complete | Binary encode/decode, staged rollback, fuzz-tested |
 | `error.rs` | Complete | Full error hierarchy with operation labels |
-| `backend.rs` | Mostly complete | Direct etcd persistence via CAS transactions for both `EtcdCoordinator` (sync) and `AsyncEtcdCoordinator` (async); `complete` and `park_shard` not yet implemented in either entrypoint |
+| `backend.rs` | Complete | Direct etcd persistence via CAS transactions for both `EtcdCoordinator` (sync) and `AsyncEtcdCoordinator` (async), including `complete` and `park_shard` terminal transitions in both entrypoints |
 
 The keyspace and codec are shared infrastructure used by the CAS transaction
-logic in `backend.rs`. Operations that are not yet implemented panic with
-`fail_unimplemented` — they have clear protocol semantics from the in-memory
-reference implementation and will be ported as the distributed runtime requires
-them.
+logic in `backend.rs`. The sync and async entrypoints both persist the full
+coordination mutation surface directly in etcd rather than falling back to
+unimplemented terminal operations.
 
 ---
 
