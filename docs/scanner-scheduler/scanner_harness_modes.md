@@ -162,10 +162,8 @@ a sustained-green gate script (not yet implemented).
 
 ### Commands
 
-```bash
-# No runnable command. The integration test is deferred until
-# scanner-rs-cli binary invocation is wired into the integration harness.
-```
+> No runnable command: the integration test is deferred until
+> `scanner-rs-cli` binary invocation is wired into the integration harness.
 
 ## Mode 4: FS Enumeration Conformance Matrix (Phase 4)
 
