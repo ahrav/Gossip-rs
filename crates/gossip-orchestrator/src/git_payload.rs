@@ -150,10 +150,20 @@ impl fmt::Debug for GitShardPayload {
     }
 }
 
-/// Errors returned while lowering payload selection into mirror-local execution.
+/// Errors from lowering a [`GitShardPayload`]'s selection into mirror-local
+/// execution form.
+///
+/// Lowering bridges the gap between request-side selection intent (which may
+/// reference a bare commit OID) and the ref-backed selection that the scanner
+/// pipeline expects. Only the `ExplicitCommit` variant requires lowering;
+/// ref-backed selections pass through unchanged.
 #[derive(Debug, thiserror::Error)]
 pub enum GitSelectionLoweringError {
     /// Explicit-commit lowering failed inside the prepared mirror.
+    ///
+    /// Wraps the underlying [`SyntheticCommitRefError`], which distinguishes
+    /// format mismatches, missing objects, non-commit objects, and ref-store
+    /// I/O failures.
     #[error("explicit commit selection could not be lowered in the prepared mirror: {0}")]
     ExplicitCommit(#[from] SyntheticCommitRefError),
 }
@@ -265,8 +275,12 @@ impl GitShardPayload {
     /// Convert the payload into a contract-level [`GitSelection`] when the
     /// request-side selection is already ref-backed.
     ///
-    /// Explicit-commit payloads return `None` because synthetic-ref lowering is
-    /// a later control-plane step.
+    /// Returns `None` for `ExplicitCommit` payloads because those require
+    /// a lowering step (writing a synthetic ref into the mirror) that this
+    /// pure accessor cannot perform. Callers that need a `GitSelection` for
+    /// every payload variant should use
+    /// [`lower_selection_for_local_mirror`](Self::lower_selection_for_local_mirror)
+    /// instead.
     #[must_use]
     pub fn git_selection(&self) -> Option<GitSelection> {
         let refs = match &self.selection {
@@ -279,36 +293,54 @@ impl GitShardPayload {
         Some(GitSelection::new(refs, self.scan_mode, self.merge_strategy))
     }
 
-    /// Lower request-side selection intent into a mirror-local execution selection.
+    /// Lower request-side selection intent into a mirror-local [`GitSelection`].
     ///
-    /// Explicit-commit selections are converted into one stable synthetic ref
-    /// inside `mirror`, while ref-backed selections pass through unchanged.
+    /// The scanner pipeline expects all scan targets to be expressed as
+    /// ref-backed [`GitSelection`] values. This method bridges that contract:
+    ///
+    /// - **`DefaultBranchOnly` / `ExplicitRefs`** — already ref-backed, returned
+    ///   unchanged via [`git_selection()`](Self::git_selection).
+    /// - **`ExplicitCommit`** — the commit OID is materialized as a synthetic
+    ///   ref inside `mirror` via [`materialize_synthetic_commit_ref`], then
+    ///   wrapped as an `ExplicitRefs` selection containing that single ref.
+    ///
+    /// The synthetic ref is deterministic and idempotent: re-lowering the same
+    /// commit produces the same ref name without error, so retry loops and
+    /// concurrent workers converge safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitSelectionLoweringError::ExplicitCommit`] when the commit
+    /// OID cannot be validated or the synthetic ref cannot be written in the
+    /// mirror (e.g., format mismatch, missing object, non-commit object, or
+    /// ref-store I/O failure).
     pub fn lower_selection_for_local_mirror(
         &self,
         mirror: &LocalMirror,
         limits: RepoOpenLimits,
     ) -> Result<GitSelection, GitSelectionLoweringError> {
-        if let Some(selection) = self.git_selection() {
-            return Ok(selection);
-        }
-
-        let ref_name = match &self.selection {
+        match &self.selection {
+            NormalizedGitSelection::DefaultBranchOnly => Ok(GitSelection::new(
+                GitRefSelection::DefaultBranchOnly,
+                self.scan_mode,
+                self.merge_strategy,
+            )),
+            NormalizedGitSelection::ExplicitRefs { refs } => Ok(GitSelection::new(
+                GitRefSelection::ExplicitRefs { refs: refs.clone() },
+                self.scan_mode,
+                self.merge_strategy,
+            )),
             NormalizedGitSelection::ExplicitCommit { commit } => {
-                materialize_synthetic_commit_ref(mirror.path(), *commit, limits)?
+                let ref_name = materialize_synthetic_commit_ref(mirror.path(), *commit, limits)?;
+                Ok(GitSelection::new(
+                    GitRefSelection::ExplicitRefs {
+                        refs: vec![ref_name],
+                    },
+                    self.scan_mode,
+                    self.merge_strategy,
+                ))
             }
-            NormalizedGitSelection::DefaultBranchOnly
-            | NormalizedGitSelection::ExplicitRefs { .. } => {
-                unreachable!("git_selection() returns Some for ref-backed selection variants")
-            }
-        };
-
-        Ok(GitSelection::new(
-            GitRefSelection::ExplicitRefs {
-                refs: vec![ref_name],
-            },
-            self.scan_mode,
-            self.merge_strategy,
-        ))
+        }
     }
 
     /// Return the deterministic encoded payload size in bytes.

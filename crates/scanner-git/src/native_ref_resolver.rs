@@ -56,7 +56,16 @@ use crate::{
 const REFS_HEADS_PREFIX: &[u8] = b"refs/heads/";
 const REFS_TAGS_PREFIX: &[u8] = b"refs/tags/";
 const REFS_REMOTES_PREFIX: &[u8] = b"refs/remotes/";
+/// Private ref namespace for synthetic commit refs created by explicit-commit
+/// lowering. The full ref name is
+/// `refs/gossip/scan-targets/commits/<format>/<hex-oid>`, giving a
+/// deterministic, collision-free name that the existing `ExplicitRefs`
+/// start-set resolver can look up without special casing.
 const EXPLICIT_COMMIT_REF_NAMESPACE: &[u8] = b"refs/gossip/scan-targets/commits/";
+
+/// Maximum bytes to inflate when probing a loose object's type in
+/// [`lookup_loose_object_kind`]. 64 bytes is more than enough for the
+/// `"<type> <size>\0"` header of any git object format.
 const LOOSE_OBJECT_HEADER_MAX_BYTES: usize = 64;
 
 /// Errors returned while lowering one explicit commit into a mirror-local ref.
@@ -109,7 +118,21 @@ pub enum SyntheticCommitRefError {
     },
 }
 
-/// Derive the stable private ref name used for explicit-commit lowering.
+/// Derive the deterministic ref name for explicit-commit lowering.
+///
+/// The name encodes both the hash algorithm and the hex OID:
+///
+/// ```text
+/// refs/gossip/scan-targets/commits/<sha1|sha256>/<hex-oid>
+/// ```
+///
+/// Determinism is critical: the same `(format, oid)` pair always produces
+/// the same ref name, so repeated lowerings are idempotent and watermark
+/// keys remain stable across retries.
+///
+/// The returned bytes are a valid git ref name — no component starts with
+/// `.`, no consecutive slashes, no control characters, and no `..` or `@{`
+/// sequences.
 #[must_use]
 pub fn synthetic_commit_ref_name(commit: OidBytes) -> Vec<u8> {
     let format_component = match commit.format() {
@@ -130,11 +153,41 @@ pub fn synthetic_commit_ref_name(commit: OidBytes) -> Vec<u8> {
     name
 }
 
-/// Ensure a stable synthetic ref exists for `commit` inside `mirror_root`.
+/// Materialize a synthetic ref pointing at `commit` inside `mirror_root`.
 ///
-/// The returned ref name is deterministic for `(object_format, commit_oid)`.
-/// The helper validates that the requested commit exists locally before
-/// writing the ref, and all ref mutations stay inside the prepared mirror.
+/// This is the core "lowering" step for explicit-commit selections: the caller
+/// specifies a commit OID, and this function creates a private ref in the
+/// mirror that the normal `ExplicitRefs` start-set resolver can then look up.
+///
+/// # Algorithm
+///
+/// 1. Open the mirror repository and detect its object format (SHA-1 vs SHA-256).
+/// 2. Validate the format matches `commit.format()` — a SHA-256 OID cannot
+///    exist in a SHA-1 object database.
+/// 3. Probe the mirror's object database (pack index + loose objects) to confirm
+///    the OID exists and is a commit. Non-commit objects and missing OIDs are
+///    rejected with specific error variants.
+/// 4. Derive the deterministic ref name via [`synthetic_commit_ref_name`].
+/// 5. Write the ref using a `gix_ref` transaction with `PreviousValue::Any`,
+///    making the operation idempotent — repeated calls for the same commit
+///    succeed without error.
+///
+/// # Invariants
+///
+/// - All ref mutations are confined to `mirror_root`. The source repository
+///   (if any) is never touched.
+/// - The ref name is deterministic for `(object_format, commit_oid)`, so
+///   watermark keys and start-set identities remain stable across retries.
+///
+/// # Cleanup
+///
+/// Callers are responsible for periodic cleanup of the
+/// `refs/gossip/scan-targets/commits/` namespace in long-lived mirrors.
+///
+/// # Errors
+///
+/// Returns [`SyntheticCommitRefError`] for format mismatches, missing objects,
+/// non-commit objects, ref-name validation failures, or ref-store I/O errors.
 pub fn materialize_synthetic_commit_ref(
     mirror_root: &Path,
     commit: OidBytes,
@@ -361,6 +414,15 @@ fn resolve_explicit_refs(
     Ok(out)
 }
 
+/// Determine the object type of `oid` in the mirror's object database.
+///
+/// Tries the pack index first (via MIDX), falling back to loose object lookup
+/// when no packs exist. Returns `Ok(None)` when the OID is not found in either
+/// store.
+///
+/// The pack path decompresses the full object (up to 8 MiB) via `load_object`
+/// because `PackIo` does not expose a header-only query. Only the kind is
+/// retained; the payload is discarded.
 fn lookup_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
@@ -380,6 +442,8 @@ fn lookup_object_kind(
                 }
             })?;
             let loose_dirs = collect_loose_dirs(paths);
+            // Full decompression up to 8 MiB — PackIo lacks a header-only API,
+            // so we decode the entire object and discard the payload.
             let pack_decode = PackDecodeLimits::new(64, 8 * 1024 * 1024, 8 * 1024 * 1024);
             let pack_io_limits = PackIoLimits::new(
                 pack_decode,
@@ -403,6 +467,13 @@ fn lookup_object_kind(
     }
 }
 
+/// Probe loose object directories for `oid` and return its type.
+///
+/// Reads the zlib-compressed loose object at `objects/<xx>/<yy...>`, inflates
+/// only [`LOOSE_OBJECT_HEADER_MAX_BYTES`] (64 bytes) — enough to cover the
+/// `"<type> <size>\0"` header that [`parse_loose_object_kind`] inspects.
+/// Returns `Ok(None)` when the file does not exist in any object directory
+/// (alternates-aware via [`collect_loose_dirs`]).
 fn lookup_loose_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
@@ -422,14 +493,13 @@ fn lookup_loose_object_kind(
             }
         };
 
-        let mut out = Vec::with_capacity(8 * 1024 * 1024 + LOOSE_OBJECT_HEADER_MAX_BYTES);
-        inflate_limited(
-            &data,
-            &mut out,
-            8 * 1024 * 1024 + LOOSE_OBJECT_HEADER_MAX_BYTES,
-        )
-        .map_err(|err| SyntheticCommitRefError::ObjectLookup {
-            detail: format!("loose object inflate failed: {err}"),
+        // Only the `"<type> <size>\0"` header is needed for kind detection;
+        // 64 bytes is sufficient for any valid git object header.
+        let mut out = Vec::with_capacity(LOOSE_OBJECT_HEADER_MAX_BYTES);
+        inflate_limited(&data, &mut out, LOOSE_OBJECT_HEADER_MAX_BYTES).map_err(|err| {
+            SyntheticCommitRefError::ObjectLookup {
+                detail: format!("loose object inflate failed: {err}"),
+            }
         })?;
 
         return Ok(Some(parse_loose_object_kind(&out)?));
@@ -438,6 +508,11 @@ fn lookup_loose_object_kind(
     Ok(None)
 }
 
+/// Parse the object type from a decompressed loose object header.
+///
+/// The git loose format is `<type> <size>\0<body>`. This function extracts
+/// the type keyword before the first space and maps it to [`ObjectKind`].
+/// Returns an error for malformed headers or unrecognized type strings.
 fn parse_loose_object_kind(bytes: &[u8]) -> Result<ObjectKind, SyntheticCommitRefError> {
     let Some(nul) = bytes.iter().position(|&b| b == 0) else {
         return Err(SyntheticCommitRefError::ObjectLookup {
@@ -695,7 +770,7 @@ fn try_read_loose_tag_target(
     oid: &OidBytes,
     objects_dir: &Path,
 ) -> Result<Option<OidBytes>, RepoOpenError> {
-    let hex = oid_to_hex(oid);
+    let hex = oid.to_string();
     let (dir, file) = hex.split_at(2);
     let path = objects_dir.join(dir).join(file);
 
@@ -751,19 +826,6 @@ fn try_read_loose_tag_target(
     Ok(Some(oid_from_hash(target_id.as_bytes())))
 }
 
-/// Encode an OID as lowercase hex for loose-object path construction.
-///
-/// The resulting string is split by the caller as `XX` / `YYY...` to form the
-/// git loose object path `$GIT_DIR/objects/XX/YYY...`.
-fn oid_to_hex(oid: &OidBytes) -> String {
-    let mut out = String::with_capacity(oid.len() as usize * 2);
-    for &b in oid.as_slice() {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
 /// Open a `gix_ref::file::Store` appropriate for the repository layout.
 ///
 /// Linked worktrees have a per-worktree `git_dir` (containing `HEAD` and
@@ -787,8 +849,9 @@ fn open_ref_store(
 
 /// Build store options from the detected object format.
 ///
-/// Reflogs are disabled because the scanner is read-only and never creates
-/// refs. `precompose_unicode` is left off because ref names are treated as
+/// Reflogs are disabled because synthetic ref writes do not need history
+/// tracking, and the scan pipeline's read path never creates refs.
+/// `precompose_unicode` is left off because ref names are treated as
 /// opaque bytes throughout the scan pipeline.
 fn gix_store_options(
     paths: &GitRepoPaths,

@@ -129,6 +129,7 @@ pub mod midx_build;
 pub mod midx_error;
 #[cfg(test)]
 pub(crate) mod midx_test_builder;
+/// Native git-reference resolution and synthetic commit-ref lowering.
 pub mod native_ref_resolver;
 /// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
 pub mod object_id;
@@ -261,6 +262,11 @@ pub use native_ref_resolver::{
     materialize_synthetic_commit_ref, synthetic_commit_ref_name, NativeRefResolver,
     SyntheticCommitRefError,
 };
+// Explicit-commit lowering: `materialize_synthetic_commit_ref` creates a
+// private ref (`refs/gossip/scan-targets/commits/...`) inside a mirror,
+// allowing the normal `ExplicitRefs` start-set resolver to pick up a
+// bare commit OID. `synthetic_commit_ref_name` exposes the deterministic
+// naming scheme for callers that need the ref name without writing it.
 pub use object_id::{ObjectFormat, OidBytes};
 pub use preflight::{
     preflight, ArtifactPaths, ArtifactStatus, PreflightMaintenance, PreflightReport,

@@ -433,7 +433,12 @@ pub struct GitScanConfig {
     pub scan_mode: GitScanMode,
     /// Merge-diff strategy for merge commits.
     pub merge_mode: MergeDiffMode,
-    /// Ref-selection policy lowered into `scanner-git` start-set config.
+    /// Ref-selection policy that determines which refs form the scan start set.
+    ///
+    /// Translated into a `scanner_git::StartSetConfig` at dispatch time.
+    /// Explicit-commit selections are lowered to `ExplicitRefs` containing a
+    /// synthetic ref before reaching this field — `GitRefSelection` is always
+    /// ref-backed.
     pub ref_selection: GitRefSelection,
     /// Optional tree delta cache size override in MiB.
     pub tree_delta_cache_mb: Option<u32>,
@@ -548,6 +553,11 @@ impl GitScanConfig {
     }
 
     /// Sets the lowered ref-selection policy for the Git start set.
+    ///
+    /// The selection controls which refs the scanner walks. For explicit-commit
+    /// scans, callers should pass the `ExplicitRefs` variant containing the
+    /// synthetic ref name produced by
+    /// [`materialize_synthetic_commit_ref`](scanner_git::materialize_synthetic_commit_ref).
     #[must_use]
     pub fn with_ref_selection(mut self, ref_selection: GitRefSelection) -> Self {
         self.ref_selection = ref_selection;

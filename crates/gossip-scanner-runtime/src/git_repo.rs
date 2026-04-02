@@ -216,6 +216,9 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
         merge_diff_mode: config.merge_mode,
         pack_exec_workers: config.workers.max(1),
         enrich_identities: config.enrich_identities,
+        // Translate the lowered ref-selection policy into the scanner-level
+        // start-set config. By this point, explicit-commit selections have
+        // already been lowered to ExplicitRefs with a synthetic ref name.
         start_set: start_set_from_ref_selection(&config.ref_selection),
         ..RuntimeGitScanConfig::default()
     };
@@ -233,6 +236,15 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
     Ok(git_cfg)
 }
 
+/// Map a contract-level [`GitRefSelection`] to the scanner-level
+/// [`StartSetConfig`] consumed by [`NativeRefResolver`].
+///
+/// This is a mechanical translation — each `GitRefSelection` variant maps 1:1
+/// to a `StartSetConfig` variant. The function exists to isolate the runtime
+/// from the scanner crate's internal config types. Explicit-commit selections
+/// should be lowered to `ExplicitRefs` (via
+/// [`materialize_synthetic_commit_ref`](scanner_git::materialize_synthetic_commit_ref))
+/// before reaching this function; `GitRefSelection` has no commit variant.
 fn start_set_from_ref_selection(selection: &GitRefSelection) -> StartSetConfig {
     match selection {
         GitRefSelection::DefaultBranchOnly => StartSetConfig::DefaultBranchOnly,
@@ -454,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn build_git_scan_config_uses_explicit_refs_start_set() {
+    fn explicit_refs_selection_maps_to_start_set_config() {
         let refs = vec![b"refs/gossip/scan-targets/commits/sha1/abc".to_vec()];
         let cfg = GitScanConfig::new("/tmp")
             .with_ref_selection(GitRefSelection::ExplicitRefs { refs: refs.clone() });
