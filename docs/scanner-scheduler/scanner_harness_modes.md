@@ -142,8 +142,10 @@ The canonical identity tuple is:
 
 ### Reduced matrix and CI gate
 
-The integration gate lives in `crates/scanner-engine-integration-tests/tests/integration/execution_mode_parity.rs` and
-is scheduled in CI as job `execution-mode-parity`. The matrix currently covers:
+The parity gate has not landed yet. `crates/scanner-engine-integration-tests/tests/integration/main.rs`
+still carries `execution_mode_parity` as a deferred module, and there is no
+`execution-mode-parity` CI job in `.github/workflows/ci.yml` today. When the
+gate is implemented, the reduced matrix should cover:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
@@ -157,13 +159,13 @@ evaluation across CI windows; see
 the migration-defaulting closeout process (not yet documented) and
 a sustained-green gate script (not yet implemented).
 
-### Commands
+### Planned command shape
 
 ```bash
-# Run the parity gate locally (uses defaults: 9 iterations, 2%/5% thresholds)
+# Intended local invocation once the gate is implemented
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 
-# Optional tuning knobs for local stress/debug
+# Intended tuning knobs once the gate is implemented
 EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
@@ -193,15 +195,16 @@ The matrix validates:
 | Non-UTF8 path bytes   | raw bytes file name                                  | Byte-identical inclusion when filesystem supports creation |
 | Ordering              | full connector listing                               | Deterministic key-sorted order                             |
 
-The implementation lives in
-`crates/scanner-scheduler/src/scheduler/parallel_scan.rs` as
-`filesystem_enumeration_conformance_matrix_matches_connector` and is gated
-behind `connector-pipeline` because it exercises the real connector crate.
+No `connector-pipeline` feature flag or
+`filesystem_enumeration_conformance_matrix_matches_connector` test exists in
+the repository today. `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
+is the likely integration point once the connector-backed parity check is
+implemented, but that wiring has not landed yet.
 
-### Commands
+### Planned command shape
 
 ```bash
-# Run only the FS enumeration conformance test
+# Intended invocation once the conformance test exists
 cargo test --features connector-pipeline filesystem_enumeration_conformance_matrix_matches_connector
 ```
 
