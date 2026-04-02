@@ -1,6 +1,6 @@
 ---
 name: sim-review
-description: Simulation-testability code review — enforces DST-compatible patterns in coordination, gossip, and pipeline code based on FoundationDB, TigerBeetle, sled, and Firezone evidence
+description: Use when modifying gossip-coordination or coordination contracts, after adding trait methods to CoordinationBackend, after changing state machine transitions, or before marking coordination PRs ready. DST-compatibility code review.
 user-invocable: true
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: doc-verify
-description: Verify documentation accuracy against code reality and external claims — runs as a fresh agent after /doc-rigor to prevent confirmation bias
+description: Use when /doc-rigor has written or updated documentation and you need independent accuracy verification, or when existing docs may contain stale API claims or wrong command examples. Fresh-agent verification against code reality.
 user-invocable: true
 ---
 

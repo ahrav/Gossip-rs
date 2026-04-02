@@ -1,6 +1,6 @@
 ---
 name: pr-comment-response
-description: Respond to PR review comments by building the smallest proof that confirms or refutes the claim before changing code or docs — never blindly trust a reviewer
+description: Use when PR review comments claim a bug or incorrect behavior, when multiple reviewer comments need systematic triage, or when a correctness claim needs proof before changing code. Verify-first PR comment response with evidence-based fixes.
 ---
 
 # PR Comment Response

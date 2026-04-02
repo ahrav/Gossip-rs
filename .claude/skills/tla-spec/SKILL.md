@@ -1,6 +1,6 @@
 ---
 name: tla-spec
-description: TLA+ specification correctness guide — evidence-backed methodology for writing correct temporal logic specs, covering canonical form, abstraction selection, safety/liveness decomposition, fairness, TLC soundness, and distributed systems patterns, with every rule grounded in literature
+description: Use when writing or reviewing TLA+ specifications for coordination protocols, when verifying safety/liveness properties of distributed algorithms, or when TLC model checking fails and you need diagnostic guidance. Evidence-backed TLA+ correctness methodology.
 user-invocable: true
 ---
 

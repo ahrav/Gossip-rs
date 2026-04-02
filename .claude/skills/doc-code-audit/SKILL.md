@@ -1,6 +1,6 @@
 ---
 name: doc-code-audit
-description: Audit documentation and diagrams against actual codebase for consistency. Verifies type names, function signatures, invariants, state machines, dependency edges, field lists, and prose claims against code reality. Supports incremental (since last docs update) and full audit modes, with domain scoping.
+description: Use when design docs in docs/ may be stale after code changes, when verifying diagrams match current types, or when checking that prose claims about invariants and APIs still hold. Audits documentation against code reality with incremental and full modes.
 ---
 
 # Doc-Code Audit

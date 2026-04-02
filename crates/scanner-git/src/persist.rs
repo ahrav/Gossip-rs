@@ -116,7 +116,10 @@ impl SeenBitmapPersister for InMemoryPersistenceStore {
             }
 
             let Some(scope_key) = self.active_seen_scope_key() else {
-                return Ok(());
+                return Err(SpillError::Io(std::io::Error::other(
+                    "InMemoryPersistenceStore: no seen scope key configured; \
+                     use with_seen_scope() for incremental persistence",
+                )));
             };
             let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
             let mut scopes = self.seen_scopes.borrow_mut();
@@ -542,5 +545,67 @@ mod tests {
         assert!(bitmap.contains(&oid_a));
         assert!(bitmap.contains(&oid_b));
         assert!(bitmap.contains(&oid_c));
+    }
+
+    /// Incremental `persist_seen_delta` writes during spill followed by
+    /// `commit_finalize` (which carries its own seen-bitmap ops) must produce
+    /// the union of both OID sets in the final bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn incremental_deltas_merged_with_finalize_seen_ops() {
+        use crate::seen_store::SeenBlobStore;
+
+        let store = InMemoryPersistenceStore::with_seen_scope(42, [0xAB; 32]);
+        let scope_key = build_seen_scope_key(42, &[0xAB; 32]);
+
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+        let oid_c = OidBytes::sha1([0x33; 20]);
+        let oid_d = OidBytes::sha1([0x44; 20]);
+
+        // Simulate two incremental spill-time writes.
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("first incremental write");
+        store
+            .persist_seen_delta(&[oid_c])
+            .expect("second incremental write");
+
+        // Build a finalize output with seen-bitmap ops that overlap (oid_b)
+        // and introduce a new OID (oid_d).
+        let finalize_delta = SeenBitmapDelta::from_oids(&[oid_b, oid_d]).expect("finalize delta");
+        let output = FinalizeOutput {
+            data_ops: vec![WriteOp {
+                key: scope_key.clone(),
+                value: finalize_delta.serialize(),
+            }],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&output)
+            .expect("finalize with seen-bitmap ops");
+
+        // The final bitmap must contain the union: {A, B, C, D}.
+        let scopes = store.seen_scopes.borrow();
+        let bitmap = scopes.get(&scope_key).expect("scope must exist");
+        assert!(
+            bitmap.contains(&oid_a),
+            "OID A from first incremental write"
+        );
+        assert!(bitmap.contains(&oid_b), "OID B present in both paths");
+        assert!(
+            bitmap.contains(&oid_c),
+            "OID C from second incremental write"
+        );
+        assert!(bitmap.contains(&oid_d), "OID D from finalize ops");
+        drop(scopes);
+
+        // batch_check_seen must agree with the bitmap state.
+        let flags = store
+            .batch_check_seen(&[oid_a, oid_b, oid_c, oid_d])
+            .expect("batch check");
+        assert_eq!(flags, vec![true, true, true, true]);
     }
 }

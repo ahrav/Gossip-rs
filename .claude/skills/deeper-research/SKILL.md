@@ -1,6 +1,6 @@
 ---
 name: deeper-research
-description: Comprehensive 6-phase research funnel — 8-10 parallel survey agents sweep wide, a synthesizer compiles evidence, deep-dive and adversarial agents run in parallel to elaborate and challenge findings, a final synthesizer reconciles everything, and an integrator maps verified findings to a concrete codebase plan with full traceability
+description: Use when /deep-research isn't thorough enough, when a topic needs adversarial challenge and deep-dive elaboration, or when producing a polished research report for a complex design decision. 6-phase funnel with 8-10 parallel survey agents plus adversarial review.
 ---
 
 # Deeper Research
