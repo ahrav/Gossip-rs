@@ -511,7 +511,7 @@ impl Spiller {
             });
         }
 
-        let mut unseen_oids: Vec<OidBytes> = Vec::new();
+        let mut unseen_oids: Vec<OidBytes> = Vec::with_capacity(batch.len());
         for (idx, blob) in batch.blobs().iter().enumerate() {
             if seen_flags[idx] {
                 perf_stats::sat_add_u64(&mut stats.seen_blobs, 1);
