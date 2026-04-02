@@ -857,4 +857,44 @@ mod tests {
 
         assert_eq!(bytes.len() as u64, exact_size_limit);
     }
+
+    #[test]
+    fn build_midx_bytes_returns_too_many_packs_when_limit_exceeded() {
+        // Create 3 distinct pack idx files in a single repo, but set
+        // max_packs = 2.  The builder must return TooManyPacks rather
+        // than silently indexing only the first 2 packs.
+        let temp = tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        let objects_dir = git_dir.join("objects");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+
+        let repo = GitRepoPaths {
+            kind: RepoKind::Worktree,
+            worktree_root: Some(temp.path().to_path_buf()),
+            git_dir: git_dir.clone(),
+            common_dir: git_dir,
+            objects_dir,
+            pack_dir: pack_dir.clone(),
+            alternate_object_dirs: Vec::new(),
+        };
+
+        for i in 0u8..3 {
+            let mut builder = TestIdxBuilder::new();
+            builder.add_object(test_oid(i, i.wrapping_mul(7)), (i as u64) * 100);
+            let idx_path = pack_dir.join(format!("pack-{i:040x}.idx"));
+            fs::write(&idx_path, builder.build()).unwrap();
+        }
+
+        let limits = MidxBuildLimits {
+            max_packs: 2,
+            ..MidxBuildLimits::default()
+        };
+        let err = build_midx_bytes(&repo, ObjectFormat::Sha1, &limits)
+            .expect_err("3 packs with max_packs=2 must return TooManyPacks");
+        assert!(
+            matches!(err, MidxBuildError::TooManyPacks { count: 3, max: 2 }),
+            "expected TooManyPacks {{ count: 3, max: 2 }}, got {err:?}"
+        );
+    }
 }
