@@ -194,8 +194,11 @@ pub fn materialize_synthetic_commit_ref(
         }
     })?;
     let target = Target::Object(
-        gix_hash::ObjectId::try_from(commit.as_slice())
-            .expect("OidBytes always has a valid length"),
+        gix_hash::ObjectId::try_from(commit.as_slice()).map_err(|_| {
+            SyntheticCommitRefError::ObjectLookup {
+                detail: format!("OID conversion failed for {commit} (unexpected length mismatch)"),
+            }
+        })?,
     );
     let edit = RefEdit {
         change: Change::Update {
