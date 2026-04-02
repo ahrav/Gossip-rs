@@ -41,7 +41,7 @@ Parse findings from any source into a uniform list. Each normalized finding has:
 | Field | Description |
 |-------|-------------|
 | `id` | Sequential number (F1, F2, ...) |
-| `severity` | MUST FIX / SHOULD FIX / CONSIDER / NIT |
+| `severity` | CRITICAL / SHOULD FIX / CONSIDER / NIT |
 | `type` | bug, performance, safety, documentation, design, complexity |
 | `file` | File path(s) affected |
 | `line` | Line number(s) or range |
@@ -51,7 +51,7 @@ Parse findings from any source into a uniform list. Each normalized finding has:
 
 **Parsing rules by source:**
 
-- **`/review-dispatch` output**: Parse the ranked tables directly. Map importance 9-10 → MUST FIX, 7-8 → SHOULD FIX, 5-6 → CONSIDER, 1-4 → NIT.
+- **`/review-dispatch` output**: Parse the ranked tables directly. Map importance 9-10 → CRITICAL, 7-8 → SHOULD FIX, 5-6 → CONSIDER, 1-4 → NIT.
 - **PR comments**: Fetch via `gh api repos/{owner}/{repo}/pulls/{number}/comments`. Categorize each: bug claim → bug type, style suggestion → design/complexity, question → skip (reply only).
 - **Markdown document**: Look for severity markers, tables, or heading-based grouping. Map to standard severities.
 
@@ -62,23 +62,23 @@ four canonical levels before filtering:
 
 | External Label | Canonical Severity |
 |----------------|-------------------|
-| CRITICAL, P0, Blocker, MUST FIX | **MUST FIX** |
+| CRITICAL, P0, Blocker, MUST FIX | **CRITICAL** |
 | HIGH, P1, Major, SHOULD FIX | **SHOULD FIX** |
 | MEDIUM, P2, Moderate, CONSIDER | **CONSIDER** |
 | LOW, P3, Minor, NIT, Trivial, Style, INFO | **NIT** |
 
 When a finding lacks an explicit severity label, infer from type:
 - Bug → default SHOULD FIX (unless clearly cosmetic)
-- Safety / Security → default MUST FIX
+- Safety / Security → default CRITICAL
 - Performance → default SHOULD FIX
 - Documentation / Design / Complexity → default CONSIDER
 
 Present the normalized table to the user for confirmation before proceeding.
 
-### Severity Filter (Default: MUST FIX + SHOULD FIX + CONSIDER)
+### Severity Filter (Default: CRITICAL + SHOULD FIX + CONSIDER)
 
 After normalization, **discard NIT-severity findings by default**.
-Only MUST FIX, SHOULD FIX, and CONSIDER proceed to Phase 2.
+Only CRITICAL, SHOULD FIX, and CONSIDER proceed to Phase 2.
 
 In reviewer terms: CRITICAL and HIGH are always addressed. MEDIUM is addressed
 (maps to CONSIDER). LOW, Minor, NIT, Trivial, Style, and INFO are skipped — these
@@ -181,7 +181,7 @@ Create one `bd create` per finding. Each task description must be **fully self-c
 
 | Severity | bd priority |
 |----------|-------------|
-| MUST FIX | 1 |
+| CRITICAL | 1 |
 | SHOULD FIX | 2 |
 | CONSIDER | 3 |
 | NIT | 4 |
@@ -217,7 +217,7 @@ Two tasks conflict if they **write to the same file**. Read-read and read-write 
 Within each severity wave, group non-conflicting tasks:
 
 ```
-Wave 1 (MUST FIX):
+Wave 1 (CRITICAL):
   Group A (parallel): F1, F4  — no file overlap
   Group B (sequential after A): F3  — conflicts with F1 on core.rs
 
@@ -233,7 +233,7 @@ bd dep add <F3-id> <F1-id>   # F3 depends on F1 (same file)
 
 ## Phase 4: Execute in Priority Waves
 
-Execute findings wave by wave: MUST FIX → SHOULD FIX → CONSIDER.
+Execute findings wave by wave: CRITICAL → SHOULD FIX → CONSIDER.
 NIT and INFO findings are skipped by default (see Phase 1 severity filter).
 
 ### Within Each Wave
@@ -355,7 +355,7 @@ After all waves complete, present:
 
 | # | Finding | Severity | Status | Task ID | Notes |
 |---|---------|----------|--------|---------|-------|
-| F1 | Off-by-one in window check | MUST FIX | Resolved | beads-xxx | TDD: test added + fix |
+| F1 | Off-by-one in window check | CRITICAL | Resolved | beads-xxx | TDD: test added + fix |
 | F2 | Missing capacity hint | SHOULD FIX | Resolved | beads-yyy | 12% alloc reduction |
 | F3 | Unclear doc comment | CONSIDER | Resolved | beads-zzz | Updated doc |
 | F4 | Rename variable | NIT | Skipped | - | User opted out |
@@ -386,7 +386,7 @@ After all waves complete, present:
 | Skipping documentation findings | Doc debt compounds silently | Documentation findings are never optional |
 | Dispatching agents that write to the same file | Merge conflicts and lost work | Concurrency analysis in Phase 3 |
 | Task description says "see review for details" | Fresh agent can't work it — context is lost | Self-contained descriptions with full context |
-| Running all severities in parallel | A MUST FIX might invalidate a NIT | Execute in priority waves |
+| Running all severities in parallel | A CRITICAL might invalidate a NIT | Execute in priority waves |
 | Skipping the quality gate between waves | Broken state cascades into subsequent fixes | `cargo test` + clippy between every wave |
 | Writing a new standalone test when rstest cases exist | Test proliferation, maintenance burden, inconsistent patterns | Add a `#[case]` to the existing rstest instead |
 | Ignoring existing proptest coverage for a bug | Duplicates coverage, misses the property violation | Tighten the property assertion or add a targeted `prop_assert` |
@@ -397,10 +397,10 @@ After all waves complete, present:
 | Flag | Effect |
 |------|--------|
 | `--plan-only` | Stop after Phase 3 — show tasks and execution plan, don't execute |
-| `--wave=N` | Execute only wave N (1=MUST FIX, 2=SHOULD FIX, 3=CONSIDER) |
+| `--wave=N` | Execute only wave N (1=CRITICAL, 2=SHOULD FIX, 3=CONSIDER) |
 | `--include=nit` | Include NIT findings (skipped by default) |
 | `--include=nit,info` | Include both NIT and INFO findings |
-| `--skip=consider` | Also skip CONSIDER findings (only MUST FIX and SHOULD FIX) |
+| `--skip=consider` | Also skip CONSIDER findings (only CRITICAL and SHOULD FIX) |
 | `--dry-run` | Parse and normalize findings without creating beads tasks |
 | `--skip-doc-verify` | Skip Phase 5 doc verification |
 
