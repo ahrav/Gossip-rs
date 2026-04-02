@@ -123,7 +123,8 @@ flowchart TD
 ## Mode 3: Direct-vs-Connector Parity Gate (Phase 1)
 
 > **Status: Not yet implemented** — This mode describes a planned test
-> gate. The files referenced below do not yet exist in the codebase.
+> gate. The dedicated parity module and CI job referenced below do not yet
+> exist in the codebase.
 
 ### What it tests
 
@@ -140,10 +141,13 @@ The canonical identity tuple is:
 - span (`start`, `end`)
 - git commit metadata (`oid`, `timestamp`) joined from `commit_meta`
 
-### Reduced matrix and CI gate
+### Planned reduced matrix and CI gate
 
-The integration gate lives in `crates/scanner-engine-integration-tests/tests/integration/execution_mode_parity.rs` and
-is scheduled in CI as job `execution-mode-parity`. The matrix currently covers:
+The integration gate is still deferred. `crates/scanner-engine-integration-tests/tests/integration/main.rs`
+currently comments out `mod execution_mode_parity;` until the scanner-rs-cli
+binary name is settled, so there is no live `execution_mode_parity.rs`
+integration module and no `execution-mode-parity` CI job yet. The intended reduced matrix
+for that future gate covers:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
@@ -157,13 +161,13 @@ evaluation across CI windows; see
 the migration-defaulting closeout process (not yet documented) and
 a sustained-green gate script (not yet implemented).
 
-### Commands
+### Intended commands once implemented
 
 ```bash
-# Run the parity gate locally (uses defaults: 9 iterations, 2%/5% thresholds)
+# Planned local parity gate invocation (uses defaults: 9 iterations, 2%/5% thresholds)
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 
-# Optional tuning knobs for local stress/debug
+# Planned tuning knobs for local stress/debug
 EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \

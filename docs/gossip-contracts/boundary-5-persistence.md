@@ -179,9 +179,10 @@ Coordinator restart (contract for durable backends; not yet implemented):
 - Reload state from coordination backend via prefix scans + indexes.
 - Workers reacquire shards, `fence_epoch` bumps, and resume from last durable cursor.
 
-> **Note:** The `EtcdCoordinator` currently delegates to an `InMemoryCoordinator`,
-> so state is lost on process restart. The recovery protocol above describes the
-> required contract for durable backends, not current behavior.
+> **Note:** The etcd backend now persists coordination state directly in etcd
+> (run/shard records, owner bindings, and active indexes). The recovery
+> protocol above therefore describes the durable-backend contract that restart
+> handling must satisfy against persisted etcd state.
 
 ---
 
