@@ -55,7 +55,7 @@ graph TD
     FW[17-filesystem-walk-state-machine.md<br/>DFS walk, WalkToken,<br/>pruning, safety<br/>5 diagrams]
     SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
     PCC[19-persistence-contracts.md<br/>Traits, data model, lattice,<br/>OVID, receipts<br/>6 diagrams]
-    ECP[20-etcd-coordinator-persistence.md<br/>Keyspace, codec, backend,<br/>delegation, wire format<br/>6 diagrams]
+    ECP[20-etcd-coordinator-persistence.md<br/>Keyspace, codec, backend,<br/>direct persistence, wire format<br/>6 diagrams]
     FPD[21-findings-postgres-dedup.md<br/>Batch dedup, observation merge,<br/>dual convergence, read API<br/>5 diagrams]
     DLP[22-done-ledger-postgres.md<br/>Backend architecture, upsert<br/>pipeline, provenance merge,<br/>schema, errors<br/>7 diagrams]
 
@@ -141,7 +141,7 @@ graph TD
 15. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
 
 **Deep dive into etcd coordination persistence** (after persistence):
-16. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
+16. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, direct persistence
 
 **Cross-cutting concerns** (after any deep dive):
 17. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
@@ -175,7 +175,7 @@ graph TD
 | 17  | `17-filesystem-walk-state-machine.md`| 5        | B4               | DFS walk, WalkFrame stack, subtree pruning, WalkToken, safety mechanisms  |
 | 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |
 | 19  | `19-persistence-contracts.md`        | 6        | B5               | Trait hierarchy, findings data model, done-ledger lattice, OVID, receipts |
-| 20  | `20-etcd-coordinator-persistence.md` | 6        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
+| 20  | `20-etcd-coordinator-persistence.md` | 6        | B2               | Keyspace design, codec wire format, direct persistence, sync-async bridge |
 | 21  | `21-findings-postgres-dedup.md`      | 5        | B5               | Batch dedup pipeline, per-layer conflict rules, observation merge, dual convergence, read API surface |
 | 22  | `22-done-ledger-postgres.md`         | 7        | B5               | Backend architecture, batch upsert pipeline, provenance winner-selection, SQL schema/indexes, BIGINT encoding, error hierarchy |
 |     | **Total**                            | **111**  |                  |                                                                           |
