@@ -730,8 +730,15 @@ mod tests {
         fs::write(dir_path.join(file), compressed).expect("write loose object");
     }
 
+    /// Build a [`GitRepoPaths`] for a bare repo rooted at `repo_root`.
+    ///
+    /// Creates the directory and canonicalizes the path so the returned
+    /// struct satisfies the "all paths canonicalized" invariant.
     fn bare_repo_paths(repo_root: &Path) -> GitRepoPaths {
-        let repo_root = repo_root.to_path_buf();
+        fs::create_dir_all(repo_root).expect("create bare repo root");
+        let repo_root = repo_root
+            .canonicalize()
+            .expect("canonicalize bare repo root");
         let objects_dir = repo_root.join("objects");
         let pack_dir = objects_dir.join("pack");
         GitRepoPaths {
