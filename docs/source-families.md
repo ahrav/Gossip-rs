@@ -154,6 +154,7 @@ and `types.rs`.
 | `crates/gossip-orchestrator/src/setup.rs` | Coordination-backed filesystem run setup and shard registration |
 | `crates/gossip-orchestrator/src/test_support.rs` | Shared test fixtures for orchestrator unit tests |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
+| `crates/gossip-scanner-runtime/src/git_mirror.rs` | Worker-local Git mirror lifecycle and deterministic mirror-cache naming |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
 | `crates/gossip-scanner-runtime/src/commit_sink.rs` | Commit-sink trait and bridge record types for scan-loop lifecycle |
