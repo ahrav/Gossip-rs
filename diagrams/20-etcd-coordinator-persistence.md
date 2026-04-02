@@ -373,10 +373,18 @@ graph TB
     RTB["RuntimeBuild(io::Error)<br/>Tokio runtime creation failure"]
     CODEC_ERR["Codec { operation, source }<br/>Encode/decode failures"]
     ETCD["Etcd { operation, source }<br/>gRPC failures"]
+    SIM["Simulated { operation, source }<br/>Feature-gated simulated etcd failures"]
     KSE["Keyspace(EtcdKeyspaceError)<br/>Namespace prefix validation"]
 
     OP_CONNECT["EtcdOperation::Connect"]
     OP_STATUS["EtcdOperation::Status"]
+    OP_GET["EtcdOperation::Get"]
+    OP_PUT["EtcdOperation::Put"]
+    OP_DELETE["EtcdOperation::Delete"]
+    OP_TXN["EtcdOperation::Txn"]
+    OP_LEASE_GRANT["EtcdOperation::LeaseGrant"]
+    OP_LEASE_KEEP_ALIVE["EtcdOperation::LeaseKeepAlive"]
+    OP_LEASE_REVOKE["EtcdOperation::LeaseRevoke"]
 
     CFGE_NE["NoEndpoints"]
     CFGE_EE["EmptyEndpoint { index }"]
@@ -392,10 +400,18 @@ graph TB
     ECE --> RTB
     ECE --> CODEC_ERR
     ECE --> ETCD
+    ECE --> SIM
     ECE --> KSE
 
     ETCD --> OP_CONNECT
     ETCD --> OP_STATUS
+    ETCD --> OP_GET
+    ETCD --> OP_PUT
+    ETCD --> OP_DELETE
+    ETCD --> OP_TXN
+    ETCD --> OP_LEASE_GRANT
+    ETCD --> OP_LEASE_KEEP_ALIVE
+    ETCD --> OP_LEASE_REVOKE
 
     CFG --> CFGE_NE
     CFG --> CFGE_EE
@@ -409,10 +425,18 @@ graph TB
     style CFG fill:#DCFCE7,stroke:#166534,color:#166534
     style RTB fill:#F3F4F6,stroke:#374151,color:#374151
     style ETCD fill:#DCFCE7,stroke:#166534,color:#166534
+    style SIM fill:#F3F4F6,stroke:#374151,color:#374151
     style KSE fill:#DCFCE7,stroke:#166534,color:#166534
 
     style OP_CONNECT fill:#F3F4F6,stroke:#374151,color:#374151
     style OP_STATUS fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_GET fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_PUT fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_DELETE fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_TXN fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_LEASE_GRANT fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_LEASE_KEEP_ALIVE fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_LEASE_REVOKE fill:#F3F4F6,stroke:#374151,color:#374151
 
     style CFGE_NE fill:#F3F4F6,stroke:#374151,color:#374151
     style CFGE_EE fill:#F3F4F6,stroke:#374151,color:#374151
