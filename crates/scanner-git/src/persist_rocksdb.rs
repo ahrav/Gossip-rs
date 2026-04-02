@@ -133,24 +133,54 @@ impl RocksDbStore {
         }
     }
 
+    /// Writes the seen-bitmap delta to RocksDB outside the atomic `WriteBatch`
+    /// used by `commit_finalize`.
+    ///
+    /// # Crash-consistency trade-off
+    ///
+    /// This write advances the persisted seen-bitmap independently of ref
+    /// watermarks. If the process crashes after this `put` but before
+    /// `commit_finalize` atomically writes watermarks, recovery will observe
+    /// blobs marked as seen whose scan findings were never committed. Those
+    /// blobs will be skipped on the next run. This is intentional: it avoids
+    /// expensive re-scanning at the cost of potentially missing findings for
+    /// blobs processed during the incomplete run. The trade-off is acceptable
+    /// because the incremental bitmap is a best-effort deduplication hint, not
+    /// a correctness-critical data structure.
+    /// Merges `delta` into the in-memory bitmap in-place, serializes, and
+    /// writes the result to RocksDB.
+    ///
+    /// The bitmap is mutated before the `db.put` call. If `db.put` fails, the
+    /// in-memory bitmap contains mutations that are not persisted — the same
+    /// trade-off documented on `commit_finalize` for the atomic `WriteBatch`
+    /// path. This is acceptable because the seen-bitmap is a best-effort
+    /// deduplication hint, not a correctness-critical structure.
     #[cfg(feature = "rocksdb")]
     fn persist_seen_delta_inner(&self, delta: &SeenBitmapDelta) -> Result<(), String> {
         let scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
         self.load_seen_store(delta.oid_len())?;
-        let next_bitmap = {
-            let guard = self.seen_store.borrow();
-            let Some(store) = guard.as_ref() else {
-                return Err("seen-store not initialized".to_string());
-            };
-            let mut bitmap = store.bitmap().clone();
-            bitmap.merge_delta(delta).map_err(|err| err.to_string())?;
-            bitmap
+
+        // Mutate the bitmap in-place and serialize while holding the borrow.
+        // The borrow is dropped before the I/O call to avoid holding the
+        // RefCell across `db.put`.
+        let bytes = {
+            let mut guard = self.seen_store.borrow_mut();
+            let store = guard.as_mut().ok_or_else(|| {
+                "incremental seen-bitmap persist failed: seen-store not initialized".to_string()
+            })?;
+            store
+                .bitmap_mut()
+                .merge_delta(delta)
+                .map_err(|err| format!("incremental seen-bitmap merge failed: {err}"))?;
+            store
+                .bitmap()
+                .serialize()
+                .map_err(|err| format!("incremental seen-bitmap serialization failed: {err}"))?
         };
-        let bytes = next_bitmap.serialize().map_err(|err| err.to_string())?;
+
         self.db
             .put(&scope_key, &bytes)
-            .map_err(|err| err.to_string())?;
-        *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(next_bitmap));
+            .map_err(|err| format!("incremental seen-bitmap RocksDB put failed: {err}"))?;
         Ok(())
     }
 }
@@ -163,8 +193,11 @@ impl SeenBitmapPersister for RocksDbStore {
                 return Ok(());
             }
 
-            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())
-                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
+            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec()).map_err(|err| {
+                SpillError::Io(io::Error::other(format!(
+                    "seen-bitmap delta construction failed: {err}"
+                )))
+            })?;
             self.persist_seen_delta_inner(&delta)
                 .map_err(|err| SpillError::Io(io::Error::other(err)))?;
             Ok(())
@@ -239,6 +272,11 @@ impl PersistenceStore for RocksDbStore {
                 }
             }
 
+            // Staged bitmap built from a clone of the cache. Applied to the
+            // in-memory cache only after db.write succeeds, so a write failure
+            // leaves the cache consistent with what is persisted.
+            let mut staged_bitmap: Option<RoaringSeenBitmap> = None;
+
             if !seen_oids.is_empty() {
                 // Multiple same-scope deltas may have individually sorted OID
                 // lists, but their concatenation is not necessarily globally
@@ -262,27 +300,30 @@ impl PersistenceStore for RocksDbStore {
                     ));
                 }
 
-                let mut guard = self.seen_store.borrow_mut();
-                let store = guard.get_or_insert_with(|| {
-                    RoaringSeenStore::new(RoaringSeenBitmap::new(delta.oid_len()))
-                });
-
-                store
-                    .bitmap_mut()
-                    .merge_delta(&delta)
+                // Build the merged bitmap in a separate clone so the in-memory
+                // cache is not mutated until db.write succeeds. This prevents
+                // divergence between the cache and the persisted state on write
+                // failure.
+                let merged = {
+                    let guard = self.seen_store.borrow();
+                    let base = guard.as_ref().map_or_else(
+                        || RoaringSeenBitmap::new(delta.oid_len()),
+                        |s| s.bitmap().clone(),
+                    );
+                    let mut staged = base;
+                    // The finalize-time merge may re-apply OIDs already present
+                    // from incremental persistence. This is harmless: merge_delta
+                    // is a set-union and the cost is bounded by the delta size.
+                    staged
+                        .merge_delta(&delta)
+                        .map_err(|err| PersistError::backend(err.to_string()))?;
+                    staged
+                };
+                let serialized = merged
+                    .serialize()
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                batch.put(
-                    scope_key,
-                    store
-                        .bitmap()
-                        .serialize()
-                        .map_err(|err| PersistError::backend(err.to_string()))?,
-                );
-                // Drop the borrow before db.write so a panic in RocksDB does
-                // not leave the RefCell permanently borrowed. If db.write
-                // fails, the in-memory bitmap retains uncommitted mutations;
-                // the caller must discard the store.
-                drop(guard);
+                batch.put(scope_key, serialized);
+                staged_bitmap = Some(merged);
             }
 
             if matches!(output.outcome, FinalizeOutcome::Complete) {
@@ -293,6 +334,13 @@ impl PersistenceStore for RocksDbStore {
             self.db
                 .write(batch)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
+
+            // Promote the staged bitmap into the cache only after the write
+            // succeeds. On failure the cache retains the pre-finalize state.
+            if let Some(bitmap) = staged_bitmap {
+                *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+            }
+
             Ok(())
         }
 

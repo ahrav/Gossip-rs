@@ -148,7 +148,7 @@ flowchart TD
 
 | Type                       | Description                                                    |
 | -------------------------- | -------------------------------------------------------------- |
-| `PersistenceStore` (trait) | Incremental seen-delta writer plus atomic finalize commit interface |
+| `PersistenceStore` (trait) | Atomic finalize commit interface; extends `SeenBitmapPersister` for incremental scope updates |
 | `InMemoryPersistenceStore` | Test-only in-memory store for inspection and scoped seen-bitmap tests |
 
 ## Engine Adapter
@@ -326,9 +326,9 @@ Ref watermark keys are null-terminated for prefix-safe scans.
 
 ### Persistence
 
-During spill flushing, the runner forwards sorted OID batches to the
-`PersistenceStore`'s incremental seen-delta path so the scope bitmap is warmed
-before finalize. `persist_finalize_output` (`persist.rs`) then forwards the
+During spill flushing, the spiller forwards sorted unseen-OID batches to the
+`SeenBitmapPersister` (which may be the persistence store or a no-op) so the
+scope bitmap is warmed before finalize. `persist_finalize_output` (`persist.rs`) then forwards the
 `FinalizeOutput` to the same store. The finalize commit must write `data_ops`
 and (when complete) `watermark_ops` atomically, so readers never observe
 watermarks without corresponding data writes.

@@ -470,10 +470,23 @@ impl Spiller {
 
     /// Flushes a batch: queries the seen store and emits unseen blobs.
     ///
+    /// # Emit-before-persist ordering
+    ///
+    /// Unseen blobs are forwarded to the sink *before* `persist_seen_delta`
+    /// records them durably. This produces at-least-once delivery semantics:
+    /// if the process crashes after `sink.emit` but before the bitmap is
+    /// persisted, those OIDs will not be marked as seen and will be
+    /// re-scanned on the next run.
+    ///
+    /// See `persist_seen_delta_inner` in `persist_rocksdb.rs` for the full
+    /// crash-consistency contract: the incremental bitmap may advance
+    /// independently of ref watermarks, so blobs processed in an incomplete
+    /// run may be skipped on recovery.
+    ///
     /// # Errors
     /// - `SpillError::SeenResponseMismatch` if the seen store returns a
     ///   mismatched number of flags.
-    /// - Propagates errors from the seen store or sink.
+    /// - Propagates errors from the seen store, persister, or sink.
     fn flush_batch<
         S: SeenBlobStore + ?Sized,
         P: SeenBitmapPersister + ?Sized,
@@ -498,16 +511,20 @@ impl Spiller {
             });
         }
 
+        let mut unseen_oids: Vec<OidBytes> = Vec::new();
         for (idx, blob) in batch.blobs().iter().enumerate() {
             if seen_flags[idx] {
                 perf_stats::sat_add_u64(&mut stats.seen_blobs, 1);
             } else {
+                unseen_oids.push(batch.oids()[idx]);
                 sink.emit(blob, batch.paths())?;
                 perf_stats::sat_add_u64(&mut stats.emitted_blobs, 1);
             }
         }
 
-        seen_persister.persist_seen_delta(batch.oids())?;
+        if !unseen_oids.is_empty() {
+            seen_persister.persist_seen_delta(&unseen_oids)?;
+        }
 
         Ok(())
     }
@@ -578,7 +595,7 @@ fn is_more_canonical(a_ctx: RunContext, a_path: &[u8], b_ctx: RunContext, b_path
 /// Stores sorted unique OIDs plus interned paths in a bounded arena.
 ///
 /// # Invariants
-/// - OIDs are appended in non-decreasing order.
+/// - OIDs are appended in strictly increasing order.
 /// - `blobs.len() == oids.len()`.
 /// - `path_ref` values point into `path_arena` and are invalid after `clear`.
 struct BatchBuffer {
@@ -646,8 +663,8 @@ impl BatchBuffer {
     /// - `SpillError::PathTooLong` if the path exceeds `ByteRef::MAX_LEN`.
     fn push(&mut self, oid: OidBytes, ctx: RunContext, path: &[u8]) -> Result<(), SpillError> {
         debug_assert!(
-            self.oids.last().map(|prev| prev <= &oid).unwrap_or(true),
-            "batch OIDs must be sorted"
+            self.oids.last().map(|prev| prev < &oid).unwrap_or(true),
+            "batch OIDs must be strictly increasing"
         );
 
         if self.oids.len() >= self.max_oids {
@@ -689,5 +706,190 @@ impl BatchBuffer {
         self.oids.clear();
         self.blobs.clear();
         self.path_arena = ByteArena::with_capacity(self.max_path_bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use super::*;
+    use crate::seen_store::NeverSeenStore;
+    use crate::unique_blob::CollectingUniqueBlobSink;
+
+    /// Persister that returns `Err` on the Nth call to `persist_seen_delta`.
+    ///
+    /// Calls before the Nth succeed silently; calls at or after the threshold
+    /// return `SpillError::Io` with `ErrorKind::Other`.
+    struct FailingSeenBitmapPersister {
+        fail_on_call: usize,
+        call_count: AtomicUsize,
+    }
+
+    impl FailingSeenBitmapPersister {
+        fn new(fail_on_call: usize) -> Self {
+            Self {
+                fail_on_call,
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SeenBitmapPersister for FailingSeenBitmapPersister {
+        fn persist_seen_delta(&self, _oids: &[OidBytes]) -> Result<(), SpillError> {
+            let n = self.call_count.fetch_add(1, AtomicOrdering::Relaxed);
+            if n >= self.fail_on_call {
+                Err(SpillError::Io(io::Error::other("injected persist failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Generates sorted, distinct SHA-1 OIDs for deterministic tests.
+    ///
+    /// Each OID has `idx` in the first byte to ensure strictly increasing order.
+    fn make_oid(idx: u8) -> OidBytes {
+        let mut raw = [0u8; 20];
+        raw[0] = idx;
+        OidBytes::sha1(raw)
+    }
+
+    #[test]
+    fn finalize_aborts_on_persist_error_and_emits_only_preceding_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        // Batch size of 2 OIDs means 4 unique OIDs produce exactly 2 flush_batch calls.
+        let limits = SpillLimits {
+            seen_batch_max_oids: 2,
+            seen_batch_max_path_bytes: 64 * 1024,
+            max_chunk_candidates: 1_000,
+            max_chunk_path_bytes: 1024 * 1024,
+            max_spill_bytes: 512 * 1024 * 1024,
+            max_spill_runs: 16,
+            max_path_len: 4096,
+        };
+
+        let mut spiller = Spiller::new(limits, 20, dir.path()).unwrap();
+        // Push 4 unique OIDs in sorted order. With seen_batch_max_oids=2 the
+        // spiller will flush after OIDs 0x01/0x02 (batch 1) and again after
+        // OIDs 0x03/0x04 (batch 2).
+        for i in 1..=4u8 {
+            let path = format!("file_{i}.txt");
+            spiller
+                .push(
+                    make_oid(i),
+                    path.as_bytes(),
+                    1, // commit_id
+                    0, // parent_idx
+                    ChangeKind::Add,
+                    0, // ctx_flags
+                    0, // cand_flags
+                )
+                .unwrap();
+        }
+
+        let seen_store = NeverSeenStore;
+        // Fail on the second persist_seen_delta call (batch 2).
+        let persister = FailingSeenBitmapPersister::new(1);
+        let mut sink = CollectingUniqueBlobSink::default();
+
+        let result = spiller.finalize(&seen_store, &persister, &mut sink);
+        assert!(result.is_err(), "finalize must propagate persist error");
+
+        // The first batch (2 OIDs) was emitted before the persister was called
+        // for the second batch. Only those first-batch blobs should appear in
+        // the sink; the second batch's emit preceded the failing persist call,
+        // so those blobs also appear (emit-before-persist ordering).
+        //
+        // With 4 OIDs and batch size 2:
+        //   batch 1: emit OIDs 0x01,0x02 -> persist (ok)
+        //   batch 2: emit OIDs 0x03,0x04 -> persist (FAIL)
+        // All 4 blobs are emitted because emit happens before persist.
+        // The error propagates from the second persist call.
+        let emitted_oids: Vec<OidBytes> = sink.blobs.iter().map(|b| b.oid).collect();
+        assert_eq!(
+            emitted_oids.len(),
+            4,
+            "all 4 blobs emitted (emit precedes persist); got {emitted_oids:?}"
+        );
+        assert_eq!(emitted_oids[0], make_oid(1));
+        assert_eq!(emitted_oids[1], make_oid(2));
+        assert_eq!(emitted_oids[2], make_oid(3));
+        assert_eq!(emitted_oids[3], make_oid(4));
+    }
+
+    #[test]
+    fn finalize_succeeds_when_persister_never_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = SpillLimits {
+            seen_batch_max_oids: 2,
+            seen_batch_max_path_bytes: 64 * 1024,
+            max_chunk_candidates: 1_000,
+            max_chunk_path_bytes: 1024 * 1024,
+            max_spill_bytes: 512 * 1024 * 1024,
+            max_spill_runs: 16,
+            max_path_len: 4096,
+        };
+
+        let mut spiller = Spiller::new(limits, 20, dir.path()).unwrap();
+        for i in 1..=4u8 {
+            let path = format!("file_{i}.txt");
+            spiller
+                .push(make_oid(i), path.as_bytes(), 1, 0, ChangeKind::Add, 0, 0)
+                .unwrap();
+        }
+
+        let seen_store = NeverSeenStore;
+        // Large threshold so the persister never fails.
+        let persister = FailingSeenBitmapPersister::new(usize::MAX);
+        let mut sink = CollectingUniqueBlobSink::default();
+
+        let _stats = spiller
+            .finalize(&seen_store, &persister, &mut sink)
+            .expect("finalize should succeed when persister does not fail");
+
+        assert_eq!(sink.blobs.len(), 4);
+    }
+
+    #[test]
+    fn finalize_aborts_on_first_batch_persist_error_emits_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = SpillLimits {
+            seen_batch_max_oids: 2,
+            seen_batch_max_path_bytes: 64 * 1024,
+            max_chunk_candidates: 1_000,
+            max_chunk_path_bytes: 1024 * 1024,
+            max_spill_bytes: 512 * 1024 * 1024,
+            max_spill_runs: 16,
+            max_path_len: 4096,
+        };
+
+        let mut spiller = Spiller::new(limits, 20, dir.path()).unwrap();
+        for i in 1..=4u8 {
+            let path = format!("file_{i}.txt");
+            spiller
+                .push(make_oid(i), path.as_bytes(), 1, 0, ChangeKind::Add, 0, 0)
+                .unwrap();
+        }
+
+        let seen_store = NeverSeenStore;
+        // Fail on the very first persist call.
+        let persister = FailingSeenBitmapPersister::new(0);
+        let mut sink = CollectingUniqueBlobSink::default();
+
+        let result = spiller.finalize(&seen_store, &persister, &mut sink);
+        assert!(result.is_err(), "finalize must propagate persist error");
+
+        // Emit-before-persist: the first batch's 2 blobs were emitted before
+        // the persist call that fails.
+        let emitted_oids: Vec<OidBytes> = sink.blobs.iter().map(|b| b.oid).collect();
+        assert_eq!(
+            emitted_oids.len(),
+            2,
+            "only first batch emitted before failure; got {emitted_oids:?}"
+        );
+        assert_eq!(emitted_oids[0], make_oid(1));
+        assert_eq!(emitted_oids[1], make_oid(2));
     }
 }

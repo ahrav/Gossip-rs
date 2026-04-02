@@ -29,7 +29,7 @@ pub trait SeenBlobStore {
 /// - Inputs are expected to be sorted and unique.
 /// - Implementations must not write ref watermarks through this path.
 pub trait SeenBitmapPersister {
-    /// Persists one batch of scanned OIDs into the seen-bitmap scope.
+    /// Persists one batch of processed OIDs into the seen-bitmap scope.
     fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError>;
 }
 

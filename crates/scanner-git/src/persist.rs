@@ -13,8 +13,6 @@
 
 #[cfg(feature = "rocksdb")]
 use std::collections::HashMap;
-#[cfg(feature = "rocksdb")]
-use std::io;
 
 use super::errors::{PersistError, SpillError};
 #[cfg(feature = "rocksdb")]
@@ -31,6 +29,12 @@ use super::seen_store::SeenBlobStore;
 /// Implementations must commit `data_ops` and (when complete) `watermark_ops`
 /// in a single atomic write. On partial runs, `watermark_ops` must be ignored,
 /// ensuring ref tips never advance past unscanned content.
+///
+/// The `SeenBitmapPersister` supertrait is required because the spill-flush
+/// pipeline dispatches the persistence store as a seen-bitmap persister to
+/// write incremental bitmap deltas between finalize calls. Any
+/// `PersistenceStore` implementation must therefore also provide durable
+/// seen-bitmap writes.
 pub trait PersistenceStore: SeenBitmapPersister {
     /// Commits finalize output atomically.
     ///
@@ -114,27 +118,22 @@ impl SeenBitmapPersister for InMemoryPersistenceStore {
             let Some(scope_key) = self.active_seen_scope_key() else {
                 return Ok(());
             };
-            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())
-                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
-            let mut staged_scopes = self.seen_scopes.borrow().clone();
-            let mut bitmap = staged_scopes
-                .remove(&scope_key)
-                .unwrap_or_else(|| RoaringSeenBitmap::new(delta.oid_len()));
+            let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
+            let mut scopes = self.seen_scopes.borrow_mut();
+            let bitmap = scopes
+                .entry(scope_key.clone())
+                .or_insert_with(|| RoaringSeenBitmap::new(delta.oid_len()));
             if bitmap.oid_len() != delta.oid_len() {
-                return Err(SpillError::Io(io::Error::other(format!(
+                return Err(SpillError::Io(std::io::Error::other(format!(
                     "seen-bitmap OID length mismatch: stored={}, incoming={}",
                     bitmap.oid_len(),
                     delta.oid_len()
                 ))));
             }
-            bitmap
-                .merge_delta(&delta)
-                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
-            let serialized = bitmap
-                .serialize()
-                .map_err(|err| SpillError::Io(io::Error::other(err.to_string())))?;
-            staged_scopes.insert(scope_key.clone(), bitmap);
-            *self.seen_scopes.borrow_mut() = staged_scopes;
+            bitmap.merge_delta(&delta)?;
+            let serialized = bitmap.serialize()?;
+            // Drop the borrow before mutating data_ops.
+            drop(scopes);
             self.data_ops.borrow_mut().push(WriteOp {
                 key: scope_key,
                 value: serialized,
@@ -168,7 +167,7 @@ impl SeenBlobStore for InMemoryPersistenceStore {
             return Ok(vec![false; oids.len()]);
         };
         if bitmap.oid_len() != oids[0].len() {
-            return Err(SpillError::Io(io::Error::other(format!(
+            return Err(SpillError::Io(std::io::Error::other(format!(
                 "seen-bitmap OID length mismatch: stored={}, requested={}",
                 bitmap.oid_len(),
                 oids[0].len()
