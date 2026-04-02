@@ -553,7 +553,10 @@ shard-lifecycle hot path directly in etcd.
 | File | Purpose |
 |:---|:---|
 | `crates/gossip-coordination-etcd/src/lib.rs` | Crate root, public re-exports |
-| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), CAS transaction logic, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend.rs` | Module root, coordinator re-exports, shared CAS helpers, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core) definitions and connection/runtime glue |
+| `crates/gossip-coordination-etcd/src/backend/run_management.rs` | `RunManagement` / `AsyncRunManagement` lifecycle impls and shard-claim candidate flow |
+| `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | `CoordinationBackend` hot-path and shard-lifecycle impls, including `complete` and `park_shard` |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |
