@@ -142,15 +142,16 @@ The canonical identity tuple is:
 
 ### Reduced matrix and CI gate
 
-The integration gate lives in `crates/scanner-engine-integration-tests/tests/integration/execution_mode_parity.rs` and
-is scheduled in CI as job `execution-mode-parity`. The matrix currently covers:
+The planned integration gate is expected to land as a future
+`execution_mode_parity` integration test module and to run under a CI job
+named `execution-mode-parity`. The intended matrix would cover:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
 - Git branch-and-merge fixture
 
-Throughput sampling enforces a minimum of 5 iterations per case (with warmup)
-to reduce startup jitter before threshold evaluation.
+Throughput sampling is expected to enforce a minimum of 5 iterations per case
+(with warmup) to reduce startup jitter before threshold evaluation.
 
 Phase-6 defaulting decisions additionally require sustained-green policy
 evaluation across CI windows; see
@@ -160,7 +161,7 @@ a sustained-green gate script (not yet implemented).
 ### Commands
 
 ```bash
-# Run the parity gate locally (uses defaults: 9 iterations, 2%/5% thresholds)
+# Planned parity gate command once the test exists
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 
 # Optional tuning knobs for local stress/debug
@@ -193,15 +194,15 @@ The matrix validates:
 | Non-UTF8 path bytes   | raw bytes file name                                  | Byte-identical inclusion when filesystem supports creation |
 | Ordering              | full connector listing                               | Deterministic key-sorted order                             |
 
-The implementation lives in
+The planned implementation is expected to live in
 `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` as
-`filesystem_enumeration_conformance_matrix_matches_connector` and is gated
-behind `connector-pipeline` because it exercises the real connector crate.
+`filesystem_enumeration_conformance_matrix_matches_connector`, gated behind
+`connector-pipeline` because it exercises the real connector crate.
 
 ### Commands
 
 ```bash
-# Run only the FS enumeration conformance test
+# Planned command once the conformance test exists
 cargo test --features connector-pipeline filesystem_enumeration_conformance_matrix_matches_connector
 ```
 
