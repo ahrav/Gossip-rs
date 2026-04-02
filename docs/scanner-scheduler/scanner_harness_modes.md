@@ -198,8 +198,9 @@ currently no `connector-pipeline` feature flag and no
 ### Commands
 
 ```bash
-# No runnable command exists yet. Add the feature gate and test before
-# documenting an invocation here.
+# No runnable command exists yet. Neither the `connector-pipeline` feature
+# flag nor `filesystem_enumeration_conformance_matrix_matches_connector`
+# exist in `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`.
 ```
 
 ## Recommendation
