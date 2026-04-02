@@ -64,11 +64,12 @@ pub fn persist_finalize_output(
 /// thread-safe.
 ///
 /// Each successful `persist_seen_delta` call accumulates OIDs in an internal
-/// staging buffer. `commit_finalize` folds staging into the live bitmap
-/// atomically, matching the `RocksDbStore` staging-key pattern. Under the
-/// `rocksdb` feature, finalize-time seen bitmap scope ops are merged per key
-/// before being recorded so the log matches what a stateful key/value backend
-/// would persist.
+/// staging buffer. On a complete finalize, `commit_finalize` folds staging
+/// into the live bitmap atomically; on a partial finalize, staging is
+/// discarded so that skipped blobs can be re-emitted on the next run.
+/// Under the `rocksdb` feature, finalize-time seen bitmap scope ops are
+/// merged per key before being recorded so the log matches what a stateful
+/// key/value backend would persist.
 #[derive(Debug, Default)]
 pub struct InMemoryPersistenceStore {
     /// Recorded data writes from successful persistence calls.
@@ -687,5 +688,55 @@ mod tests {
             .batch_check_seen(&[oid_a, oid_b, oid_c, oid_d])
             .expect("batch check");
         assert_eq!(flags, vec![true, true, true, true]);
+    }
+
+    /// Partial finalize discards staging so that skipped blobs are
+    /// re-emittable on the next run. Only the `data_ops` seen delta
+    /// (successfully scanned blobs) enters the live bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn partial_finalize_discards_staging() {
+        use crate::seen_store::SeenBlobStore;
+
+        let store = InMemoryPersistenceStore::with_seen_scope(42, [0xAB; 32]);
+        let scope_key = build_seen_scope_key(42, &[0xAB; 32]);
+
+        let oid_staged = OidBytes::sha1([0x11; 20]);
+        let oid_scanned = OidBytes::sha1([0x22; 20]);
+
+        // Simulate spill: stage oid_staged.
+        store
+            .persist_seen_delta(&[oid_staged])
+            .expect("spill write");
+
+        // Partial finalize: only oid_scanned appears in data_ops.
+        let delta = SeenBitmapDelta::from_oids(&[oid_scanned]).expect("delta");
+        let output = FinalizeOutput {
+            data_ops: vec![WriteOp {
+                key: scope_key.clone(),
+                value: delta.serialize(),
+            }],
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+            stats: FinalizeStats::default(),
+        };
+        store.commit_finalize(&output).expect("partial finalize");
+
+        // oid_scanned should be seen (from data_ops).
+        // oid_staged should NOT be seen (staging discarded on partial).
+        let flags = store
+            .batch_check_seen(&[oid_staged, oid_scanned])
+            .expect("check after partial finalize");
+        assert_eq!(
+            flags,
+            vec![false, true],
+            "staged OID must not be promoted on partial finalize"
+        );
+
+        // Staging buffer must be cleared.
+        assert!(
+            store.seen_staging.borrow().is_empty(),
+            "staging must be cleared after partial finalize"
+        );
     }
 }
