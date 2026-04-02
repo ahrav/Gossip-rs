@@ -142,10 +142,10 @@ The canonical identity tuple is:
 
 ### Reduced matrix and CI gate
 
-The parity gate is still deferred. The integration test module is commented out
+The parity gate is deferred. The integration test module is commented out
 in `crates/scanner-engine-integration-tests/tests/integration/main.rs` with the
-note that binary invocation remains blocked until the `scanner-rs-cli` binary
-name is settled, and there is no `execution-mode-parity` CI job yet. The
+note that binary invocation is blocked until the `scanner-rs-cli` binary
+name is settled, and no `execution-mode-parity` CI job exists. The
 planned matrix covers:
 - FS flat fixture
 - FS nested fixture
@@ -163,7 +163,7 @@ a sustained-green gate script (not yet implemented).
 ### Commands
 
 ```bash
-# No runnable command yet. The integration test remains deferred until
+# No runnable command. The integration test is deferred until
 # scanner-rs-cli binary invocation is wired into the integration harness.
 ```
 
