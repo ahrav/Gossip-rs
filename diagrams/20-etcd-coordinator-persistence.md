@@ -554,7 +554,10 @@ them.
 | File | Purpose |
 |:---|:---|
 | `crates/gossip-coordination-etcd/src/lib.rs` | Crate root, public re-exports |
-| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), CAS transaction logic, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend.rs` | Module root, shared CAS helpers, transaction builder, and public re-exports |
+| `crates/gossip-coordination-etcd/src/backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), etcd RPC wrappers, CAS retry loop, load/scan helpers |
+| `crates/gossip-coordination-etcd/src/backend/run_management.rs` | `RunManagement` and `AsyncRunManagement` implementations |
+| `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` implementations for acquire, renew, checkpoint, complete, park, and split operations |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |
