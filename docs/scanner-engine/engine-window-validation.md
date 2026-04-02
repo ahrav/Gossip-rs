@@ -323,7 +323,7 @@ emission time, before the finding consumes a `max_findings_per_chunk` slot.
 - Only **root-semantic** findings are validated (`parent_step_id == STEP_ROOT`).
   This includes root-level UTF-16 findings whose own `step_id` is a
   `Utf16Window` decode step — the check uses the **parent** step ID.
-- Suppression requires both an [`Invalid`](OfflineVerdict::Invalid) verdict
+- Suppression requires both an `OfflineVerdict::Invalid` verdict
   and the spec's `suppresses_on_invalid` flag.
 - `Valid` and `Indeterminate` verdicts always pass through.
 - Suppressed findings increment `ScanScratch::offline_suppressed` in instrumentation builds.
