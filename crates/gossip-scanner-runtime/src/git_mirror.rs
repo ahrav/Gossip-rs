@@ -8,16 +8,17 @@
 //! Mirror cache naming is defined independently from local-path validation so
 //! every locator kind has one bounded, redaction-safe filesystem layout. Cache
 //! paths use the `GIT_MIRROR_PATH_V1` hash domain and the layout
-//! `<mirror_root>/v1/local/<prefix>/<digest>.git`, where `digest` is the
-//! 256-bit hash of the canonical repo identity bytes.
+//! `<mirror_root>/local/<prefix>/<digest>.git`, where `digest` is the
+//! 256-bit hash of the canonical `RepoKey` encoding (locator-kind tag followed
+//! by canonical repo path).
 //!
 //! Cache mutation control files live beside the authoritative mirror directory:
 //! `<digest>.git.initializing` marks first-create publication and
 //! `<digest>.git.lock` serializes mirror mutation. Construction removes stale
 //! control files left behind by dead processes or files older than the
-//! configured age backstop. The cleanup logic is forward-compatible
-//! infrastructure — the write path for control files lands with remote-mirror
-//! support.
+//! configured age backstop. The cleanup logic removes stale control files but
+//! does not itself create them; the write path depends on mirror mutation
+//! operations not yet implemented for this locator kind.
 //!
 //! Error classification follows the connector I/O policy: structural
 //! filesystem failures are permanent, concurrent maintenance remains
@@ -31,8 +32,9 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use gossip_connectors::is_permanent_io_error;
 use gossip_contracts::connector::git::{
     GitMirrorManager, GitRunError, LocalMirror, RepoKey, RepoLocator,
 };
@@ -43,7 +45,6 @@ use scanner_git::{ArtifactStatus, PreflightError, PreflightLimits, preflight};
 
 use crate::git_repo::digest_repo_path as redacted_path_digest;
 
-const MIRROR_LAYOUT_VERSION_DIR: &str = "v1";
 const MIRROR_LOCAL_LOCATOR_DIR: &str = "local";
 const DEFAULT_STALE_CONTROL_AGE: Duration = Duration::from_secs(30 * 60);
 
@@ -64,7 +65,6 @@ const DEFAULT_STALE_CONTROL_AGE: Duration = Duration::from_secs(30 * 60);
 ///   locks inside repository directories.
 /// - `&mut self` on [`GitMirrorManager`] provides single-owner access, so this
 ///   type does not need internal mutexes or lock maps.
-#[derive(Clone)]
 pub struct LocalMirrorManager {
     mirror_root: PathBuf,
     preflight_limits: PreflightLimits,
@@ -96,9 +96,7 @@ impl LocalMirrorManager {
         preflight_limits: PreflightLimits,
         stale_control_age: Duration,
     ) -> Result<Self, GitRunError> {
-        let layout_root = mirror_root
-            .join(MIRROR_LAYOUT_VERSION_DIR)
-            .join(MIRROR_LOCAL_LOCATOR_DIR);
+        let layout_root = mirror_root.join(MIRROR_LOCAL_LOCATOR_DIR);
         fs::create_dir_all(&layout_root)
             .map_err(|err| classify_io_git_run_error("create mirror root", &layout_root, &err))?;
         let canonical_root = fs::canonicalize(&mirror_root).map_err(|err| {
@@ -113,6 +111,7 @@ impl LocalMirrorManager {
         if let Err(err) = manager.cleanup_stale_control_files() {
             tracing::warn!(
                 error = %err,
+                mirror_root = %redacted_path_digest(manager.mirror_root()),
                 "stale control-file cleanup failed, proceeding with manager construction"
             );
         }
@@ -175,14 +174,12 @@ impl LocalMirrorManager {
 
         Ok(
             LocalMirror::new(report.repo.canonical_repo_root().to_path_buf())
-                .with_last_synced_at_ms(wall_clock_now_ms()),
+                .with_last_synced_at_ms(crate::epoch_millis_now()),
         )
     }
 
     fn layout_root(&self) -> PathBuf {
-        self.mirror_root
-            .join(MIRROR_LAYOUT_VERSION_DIR)
-            .join(MIRROR_LOCAL_LOCATOR_DIR)
+        self.mirror_root.join(MIRROR_LOCAL_LOCATOR_DIR)
     }
 
     fn cache_path_for_repo_key(&self, repo_key: &RepoKey) -> PathBuf {
@@ -197,7 +194,7 @@ impl LocalMirrorManager {
     fn cleanup_stale_control_files(&self) -> Result<(), GitRunError> {
         let layout_root = self.layout_root();
         let mut stack = vec![layout_root.clone()];
-        let now_ms = wall_clock_now_ms();
+        let now_ms = crate::epoch_millis_now();
         while let Some(dir) = stack.pop() {
             let entries = match fs::read_dir(&dir) {
                 Ok(entries) => entries,
@@ -220,9 +217,10 @@ impl LocalMirrorManager {
                 })?;
                 let path = entry.path();
                 if file_type.is_dir() {
-                    // Only recurse into hash-prefix directories (2-4 char hex
-                    // names), never into `.git` mirror directories or other
-                    // nested trees that could contain thousands of entries.
+                    // Only recurse into hash-prefix directories (4-character
+                    // hex names), never into `.git` mirror directories or
+                    // other nested trees that could contain thousands of
+                    // entries.
                     if dir == layout_root {
                         stack.push(path);
                     }
@@ -234,10 +232,14 @@ impl LocalMirrorManager {
 
                 match control_file_is_stale(&path, now_ms, self.stale_control_age) {
                     Ok(true) => {
+                        tracing::debug!(
+                            path_digest = %redacted_path_digest(&path),
+                            "removing stale or unparseable control file"
+                        );
                         // TOCTOU: a concurrent process could replace this file between the
-                        // staleness check and removal. The 30-minute age backstop makes this
-                        // window practically unreachable — a freshly written file would not
-                        // pass the age test.
+                        // staleness check and removal. The configurable age backstop
+                        // (`stale_control_age`) makes this window practically unreachable
+                        // — a freshly written file would not pass the age test.
                         if let Err(err) = fs::remove_file(&path)
                             && err.kind() != io::ErrorKind::NotFound
                         {
@@ -385,21 +387,6 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
-/// Returns the current wall-clock time as epoch milliseconds (minimum 1).
-///
-/// Parallel implementation exists in `distributed.rs::wall_clock_now`, but
-/// that version wraps the result in `LogicalTime` which is a coordination
-/// type. Extracting the raw u64 logic into `gossip-stdx` would save ~5 lines
-/// at the cost of a new public API surface for a trivial helper.
-fn wall_clock_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-        .unwrap_or(1)
-        .max(1)
-}
-
 fn classify_preflight_error(path: &Path, err: PreflightError) -> GitRunError {
     match err {
         PreflightError::Io(source) | PreflightError::Canonicalization(source) => {
@@ -471,28 +458,6 @@ fn classify_io_git_run_error(op: &str, path: &Path, err: &io::Error) -> GitRunEr
     }
 }
 
-fn is_permanent_io_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::PermissionDenied
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::InvalidFilename
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::IsADirectory
-    ) || is_symlink_loop(err)
-}
-
-#[cfg(unix)]
-fn is_symlink_loop(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ELOOP)
-}
-
-#[cfg(not(unix))]
-fn is_symlink_loop(_err: &io::Error) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,11 +495,11 @@ mod tests {
         let mirror_root = tempdir().expect("mirror root");
         let mut manager = LocalMirrorManager::new(mirror_root.path()).expect("manager");
 
-        let before = wall_clock_now_ms();
+        let before = crate::epoch_millis_now();
         let mirror = manager
             .sync_mirror(&RepoLocator::local_path(repo_dir.path()))
             .expect("sync mirror");
-        let after = wall_clock_now_ms();
+        let after = crate::epoch_millis_now();
 
         assert_eq!(
             mirror.path(),
@@ -584,6 +549,58 @@ mod tests {
     }
 
     #[test]
+    fn sync_mirror_succeeds_when_maintenance_needed_without_lock() {
+        // Create a repo with at least one pack file so that preflight inspects
+        // pack-level artifacts, then remove the commit-graph to trigger
+        // `NeedsMaintenance { lock_present: false }`. The mirror manager
+        // accepts repos that lack performance indexes (commit-graph, MIDX)
+        // because they only affect traversal speed, not correctness.
+        let repo_dir = tempdir().expect("repo tempdir");
+        init_repo(repo_dir.path());
+
+        // Create a commit so `git gc` has objects to pack.
+        let sentinel = repo_dir.path().join("sentinel.txt");
+        fs::write(&sentinel, b"data").expect("write sentinel");
+        run_git_in(repo_dir.path(), &["add", "sentinel.txt"]);
+        run_git_in(
+            repo_dir.path(),
+            &["-c", "gc.auto=0", "commit", "-m", "seed"],
+        );
+        run_git_in(repo_dir.path(), &["-c", "gc.auto=0", "repack", "-a", "-d"]);
+
+        // Remove the commit-graph (if created) so preflight reports
+        // `missing_commit_graph = true`.
+        let commit_graph = repo_dir.path().join(".git/objects/info/commit-graph");
+        let _ = fs::remove_file(&commit_graph);
+
+        // Also remove the multi-pack-index to guarantee at least one
+        // `missing_*` flag is set.
+        let midx = repo_dir.path().join(".git/objects/pack/multi-pack-index");
+        let _ = fs::remove_file(&midx);
+
+        let mirror_root = tempdir().expect("mirror root");
+        let mut manager = LocalMirrorManager::new(mirror_root.path()).expect("manager");
+
+        let before = crate::epoch_millis_now();
+        let mirror = manager
+            .sync_mirror(&RepoLocator::local_path(repo_dir.path()))
+            .expect("maintenance without locks must not block sync");
+        let after = crate::epoch_millis_now();
+
+        assert_eq!(
+            mirror.path(),
+            fs::canonicalize(repo_dir.path())
+                .expect("canonical repo")
+                .as_path()
+        );
+        let ts = mirror.last_synced_at_ms().expect("timestamp populated");
+        assert!(
+            ts >= before && ts <= after,
+            "timestamp {ts} not in [{before}, {after}]"
+        );
+    }
+
+    #[test]
     fn authoritative_cache_path_uses_canonical_repo_identity() {
         let repo_dir = tempdir().expect("repo tempdir");
         init_repo(repo_dir.path());
@@ -613,7 +630,7 @@ mod tests {
     #[test]
     fn constructor_removes_stale_manager_control_files() {
         let mirror_root = tempdir().expect("mirror root");
-        let layout_dir = mirror_root.path().join("v1/local/abcd");
+        let layout_dir = mirror_root.path().join("local/abcd");
         fs::create_dir_all(&layout_dir).expect("create layout dir");
         let stale_lock = layout_dir.join("0123.git.lock");
         let stale_init = layout_dir.join("0123.git.initializing");
@@ -634,12 +651,12 @@ mod tests {
     #[test]
     fn constructor_keeps_live_manager_control_files() {
         let mirror_root = tempdir().expect("mirror root");
-        let layout_dir = mirror_root.path().join("v1/local/abcd");
+        let layout_dir = mirror_root.path().join("local/abcd");
         fs::create_dir_all(&layout_dir).expect("create layout dir");
         let live_lock = layout_dir.join("live.git.lock");
         let live = ControlFileMetadata {
             pid: std::process::id(),
-            created_at_ms: wall_clock_now_ms(),
+            created_at_ms: crate::epoch_millis_now(),
         };
         fs::write(&live_lock, live.encode()).expect("write live lock");
 
@@ -666,7 +683,7 @@ mod tests {
     #[test]
     fn constructor_removes_unparseable_control_files() {
         let mirror_root = tempdir().expect("mirror root");
-        let layout_dir = mirror_root.path().join("v1/local/abcd");
+        let layout_dir = mirror_root.path().join("local/abcd");
         fs::create_dir_all(&layout_dir).expect("create layout dir");
         let garbage = layout_dir.join("bad.git.lock");
         fs::write(&garbage, b"not-a-control-file").expect("write garbage");

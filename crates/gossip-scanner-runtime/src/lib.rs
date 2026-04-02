@@ -114,6 +114,26 @@ pub mod result_committer;
 // Deterministic translation from scan results into persistence-layer rows.
 pub mod result_translation;
 
+/// Returns the current wall-clock time as epoch milliseconds (minimum 1).
+///
+/// The minimum of 1 avoids zero-valued timestamps, which some coordination
+/// backends treat as sentinel values. Logs a warning if the system clock
+/// returns a pre-epoch or overflow value.
+pub(crate) fn epoch_millis_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+    {
+        Some(ms) => ms.max(1),
+        None => {
+            tracing::warn!("system clock pre-epoch or overflow; using fallback timestamp 1");
+            1
+        }
+    }
+}
+
 /// How the runtime acquires source items.
 ///
 /// `Direct` dispatches via the local scan implementation. `Connector`

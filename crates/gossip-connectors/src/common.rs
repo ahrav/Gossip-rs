@@ -207,7 +207,7 @@ pub(crate) fn deadline_expired(deadline: Option<Instant>) -> bool {
 /// mismatches, and symlink loops — will not resolve on retry. Everything
 /// else (interrupted, would-block, connection-reset, etc.) is assumed
 /// transient and therefore retryable.
-pub(crate) fn is_permanent_io_error(err: &io::Error) -> bool {
+pub fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::NotFound
@@ -221,13 +221,13 @@ pub(crate) fn is_permanent_io_error(err: &io::Error) -> bool {
 
 /// Detect `ELOOP` (too many levels of symbolic links) on Unix.
 #[cfg(unix)]
-pub(crate) fn is_symlink_loop(err: &io::Error) -> bool {
+pub fn is_symlink_loop(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ELOOP)
 }
 
 /// Non-Unix stub: symlink loops cannot be detected via `raw_os_error`.
 #[cfg(not(unix))]
-pub(crate) fn is_symlink_loop(_err: &io::Error) -> bool {
+pub fn is_symlink_loop(_err: &io::Error) -> bool {
     false
 }
 
@@ -438,5 +438,43 @@ mod borrowed_shard_bound_tests {
             "error should mention 'end': {}",
             err.message()
         );
+    }
+}
+
+/// Direct tests for [`is_permanent_io_error`] covering the `ErrorKind`-based
+/// classification boundary. Permanent errors are structural filesystem failures
+/// that will not resolve on retry; everything else is treated as transient.
+#[cfg(test)]
+mod is_permanent_io_error_tests {
+    use super::*;
+
+    #[test]
+    fn permission_denied_is_permanent() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "test");
+        assert!(is_permanent_io_error(&err));
+    }
+
+    #[test]
+    fn not_found_is_permanent() {
+        let err = io::Error::new(io::ErrorKind::NotFound, "test");
+        assert!(is_permanent_io_error(&err));
+    }
+
+    #[test]
+    fn would_block_is_retryable() {
+        let err = io::Error::new(io::ErrorKind::WouldBlock, "test");
+        assert!(!is_permanent_io_error(&err));
+    }
+
+    #[test]
+    fn timed_out_is_retryable() {
+        let err = io::Error::new(io::ErrorKind::TimedOut, "test");
+        assert!(!is_permanent_io_error(&err));
+    }
+
+    #[test]
+    fn interrupted_is_retryable() {
+        let err = io::Error::new(io::ErrorKind::Interrupted, "test");
+        assert!(!is_permanent_io_error(&err));
     }
 }

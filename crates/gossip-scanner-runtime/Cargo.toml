@@ -24,7 +24,6 @@ gossip-contracts.workspace = true
 gossip-frontier.workspace = true
 gossip-orchestrator.workspace = true
 gossip-stdx.workspace = true
-libc = "0.2"
 scanner-engine.workspace = true
 scanner-scheduler.workspace = true
 scanner-git.workspace = true
@@ -37,3 +36,6 @@ tracing.workspace = true
 gossip-persistence-inmemory.workspace = true
 rstest.workspace = true
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

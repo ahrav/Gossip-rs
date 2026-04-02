@@ -20,7 +20,7 @@ pub mod git;
 pub mod in_memory;
 mod split_estimator;
 
-pub use common::path_buf_from_bytes;
+pub use common::{is_permanent_io_error, is_symlink_loop, path_buf_from_bytes};
 #[cfg(unix)]
 pub use filesystem::FilesystemConnector;
 pub use git::GitConnector;
