@@ -5,8 +5,8 @@
 This document inventories every testing approach in the repository, maps
 overlap between encoding/mutation and infrastructure, records keep/merge/migrate
 decisions for each component, defines a deterministic contract for a shared
-mutation core, and lays out a phased rollout plan. It is the Phase 0
-deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
+mutation core, and lays out a phased rollout plan. It serves as the initial
+design deliverable for the Counterexample Testing Unification effort.
 
 ---
 
@@ -23,7 +23,7 @@ deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
 | 7   | Shared sim infra        | `crates/scanner-scheduler/src/sim/` (9 files + `mutation/` subdir)          | `sim-harness`        | RNG, fault injection, minimization, executor                |
 | 8   | Offline validators      | `crates/scanner-engine/src/engine/offline_validate.rs` | None                 | Structural token validation                                 |
 | 9   | YAML unit tests         | `crates/scanner-engine/src/rules/yaml_unit_tests.rs`   | None                 | Rule parsing/scanning roundtrip                             |
-| 10  | Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (23 files)                        | `integration-tests`  | Handcrafted regression tests                                |
+| 10  | Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 scenario files + `main.rs` harness) | `integration-tests`  | Handcrafted regression tests                                |
 | 11  | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (29 targets across 5 crates)                      | Nightly              | Coverage-guided mutation                                    |
 | 12  | Real-rules harness      | `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs`               | `real-rules-harness` | Golden baseline comparison                                  |
 | 13  | Smoke tests             | `crates/scanner-engine-integration-tests/tests/smoke/` (1 file)                                | `smoke-tests`        | End-to-end sanity                                           |
@@ -101,7 +101,7 @@ compiles it, and scans a test string. No mutation — inputs are string literals
 
 ### 1.9 Integration Tests
 
-Twenty-three files in `crates/scanner-engine-integration-tests/tests/integration/` covering handcrafted regression
+Scenario files in `crates/scanner-engine-integration-tests/tests/integration/` cover handcrafted regression
 scenarios. Each file targets a specific behavior area (chunking, dedup,
 transforms, multi-rule interaction). Gated behind `integration-tests`. Inputs
 are manually constructed byte sequences. Clear, readable, but labor-intensive to
@@ -397,7 +397,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ## 6. Phase-by-Phase Rollout
 
-### Phase 1: Extract Shared Mutation Core (`scratch-gs8l.2`) — **Completed**
+### Phase 1: Extract Shared Mutation Core — **Completed**
 
 - Created `crates/scanner-scheduler/src/sim/mutation/` as a submodule directory
   with 7 files:
