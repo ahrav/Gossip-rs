@@ -13,7 +13,10 @@
 use std::cell::RefCell;
 use std::io;
 
-use crate::{FinalizeOutcome, FinalizeOutput, PersistError, PersistenceStore};
+use crate::{
+    roaring_seen::SeenBitmapDelta, FinalizeOutcome, FinalizeOutput, OidBytes, PersistError,
+    PersistenceStore, SeenBitmapPersister, SpillError,
+};
 
 use super::fault::{GitFaultInjector, GitFaultPlan, GitIoFault, GitResourceId};
 
@@ -22,6 +25,8 @@ use super::fault::{GitFaultInjector, GitFaultPlan, GitIoFault, GitResourceId};
 pub enum PersistPhase {
     Data,
     Watermark,
+    /// Incremental seen-bitmap delta during spill flushing.
+    SeenDelta,
 }
 
 /// Logged persistence operation for simulation inspection.
@@ -100,10 +105,62 @@ impl Default for SimPersistStore {
     }
 }
 
+impl SeenBitmapPersister for SimPersistStore {
+    fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError> {
+        // Mirror production short-circuit: empty slices are no-ops and must
+        // not consume a fault-plan read.
+        if oids.is_empty() {
+            return Ok(());
+        }
+
+        // Validate the same sorted-and-unique contract enforced by the
+        // production persisters.
+        let _delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
+
+        let (fault, _idx) = self
+            .faults
+            .borrow_mut()
+            .next_read(&GitResourceId::SeenPersist);
+        if let Some(io_fault) = &fault.fault {
+            return Err(seen_fault_to_error(io_fault));
+        }
+        if fault.corruption.is_some() {
+            return Err(SpillError::Io(io::Error::other(
+                "simulated seen-bitmap persistence corruption",
+            )));
+        }
+
+        let mut log = self.log.borrow_mut();
+        for oid in oids {
+            log.push(SimPersistOp {
+                phase: PersistPhase::SeenDelta,
+                key: oid.as_slice().to_vec(),
+                value: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl PersistenceStore for SimPersistStore {
     fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
         self.apply_finalize(output)
     }
+}
+
+fn seen_fault_to_error(fault: &GitIoFault) -> SpillError {
+    SpillError::Io(match fault {
+        GitIoFault::ErrKind { kind } => {
+            io::Error::other(format!("simulated seen-persist fault kind {kind}"))
+        }
+        GitIoFault::EIntrOnce => io::Error::new(
+            io::ErrorKind::Interrupted,
+            "simulated seen-persist interrupt",
+        ),
+        GitIoFault::PartialRead { max_len } => io::Error::other(format!(
+            "simulated seen-persist partial write (max_len {max_len})"
+        )),
+    })
 }
 
 fn fault_to_error(fault: &GitIoFault) -> PersistError {

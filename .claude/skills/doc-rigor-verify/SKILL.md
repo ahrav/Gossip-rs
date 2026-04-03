@@ -1,6 +1,6 @@
 ---
 name: doc-rigor-verify
-description: Write-then-verify documentation pipeline — a doc-rigor agent writes/improves docs, then a separate fresh doc-verify agent checks accuracy of API claims, command examples, units, and platform assumptions against code reality with zero confirmation bias
+description: Use when writing or updating documentation that makes API claims, includes command examples, or states platform-specific behavior. Write-then-verify pipeline where a fresh agent checks accuracy against code reality with zero confirmation bias.
 user-invocable: true
 ---
 

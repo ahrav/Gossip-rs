@@ -4,6 +4,8 @@
 //! presence, and missing objects. They rely on the `git` CLI to create repos,
 //! generate commit-graph/MIDX artifacts, and mutate the object store.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +21,8 @@ use scanner_git::events::{NullEventSink, VecEventSink};
 use scanner_git::{
     ArtifactAcquireError, CommitLoadError, FinalizeOutcome, GitScanConfig, GitScanError,
     GitScanMode, GitScanReport, GitScanResult, InMemoryPersistenceStore, MappingCandidateKind,
-    NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig,
+    NeverSeenStore, OidBytes, PersistError, PersistenceStore, RefWatermarkStore, RepoOpenError,
+    SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig,
     StartSetResolver, WriteOp, run_git_scan,
 };
 
@@ -176,6 +179,47 @@ impl RefWatermarkStore for TestWatermarkStore {
     }
 }
 
+#[derive(Default)]
+struct RetryStore {
+    seen: RefCell<HashSet<OidBytes>>,
+    fail_commit_once: Cell<bool>,
+}
+
+impl SeenBlobStore for RetryStore {
+    fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
+        let seen = self.seen.borrow();
+        Ok(oids.iter().map(|oid| seen.contains(oid)).collect())
+    }
+}
+
+impl SeenBitmapPersister for RetryStore {
+    fn persist_seen_delta(&self, _oids: &[OidBytes]) -> Result<(), SpillError> {
+        // No-op: spill checkpoints must not update the live seen set.
+        // Only commit_finalize folds OIDs into the set atomically.
+        Ok(())
+    }
+}
+
+impl PersistenceStore for RetryStore {
+    fn commit_finalize(&self, output: &scanner_git::FinalizeOutput) -> Result<(), PersistError> {
+        if self.fail_commit_once.replace(false) {
+            return Err(PersistError::backend("injected finalize failure"));
+        }
+        // Model production behavior: decode all finalize seen ops first, then
+        // publish them atomically into the live seen set.
+        let mut staged_oids = Vec::new();
+        for op in &output.data_ops {
+            if op.key.starts_with(&NS_SEEN_BLOB) {
+                let delta = SeenBitmapDelta::deserialize(&op.value)
+                    .map_err(|err| PersistError::backend(err.to_string()))?;
+                staged_oids.extend(delta.oids().iter().copied());
+            }
+        }
+        self.seen.borrow_mut().extend(staged_oids);
+        Ok(())
+    }
+}
+
 /// Run a Git scan for the repo with an optional watermark.
 ///
 /// The config pins `repo_id`, `policy_hash`, and `start_set` to keep the
@@ -202,6 +246,10 @@ fn run_scan_with_config(
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
+    #[cfg(feature = "rocksdb")]
+    let persist_store =
+        InMemoryPersistenceStore::with_seen_scope(config.repo_id, config.policy_hash);
+    #[cfg(not(feature = "rocksdb"))]
     let persist_store = InMemoryPersistenceStore::default();
 
     run_git_scan(
@@ -646,6 +694,10 @@ fn run_scan_with_events(
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
+    #[cfg(feature = "rocksdb")]
+    let persist_store =
+        InMemoryPersistenceStore::with_seen_scope(config.repo_id, config.policy_hash);
+    #[cfg(not(feature = "rocksdb"))]
     let persist_store = InMemoryPersistenceStore::default();
     let sink = std::sync::Arc::new(VecEventSink::new());
 
@@ -669,6 +721,88 @@ fn run_scan_with_events(
         .map(String::from)
         .collect();
     (result, lines)
+}
+
+#[test]
+fn failed_finalize_retry_still_scans_blob() {
+    if !git_available() {
+        eprintln!("git not available, skipping");
+        return;
+    }
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+    commit_file(
+        repo,
+        "secret.txt",
+        "prefix TOK_ABCDEFGH suffix",
+        "add secret",
+    );
+    ensure_artifacts(repo);
+
+    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let resolver = TestResolver { tip };
+    let watermark_store = TestWatermarkStore { watermark: None };
+    let store = RetryStore {
+        seen: RefCell::new(HashSet::new()),
+        fail_commit_once: Cell::new(true),
+    };
+    let config = base_config();
+
+    let first = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &store,
+        &watermark_store,
+        Some(&store),
+        &config,
+        std::sync::Arc::new(NullEventSink),
+    );
+    assert!(
+        matches!(first, Err(GitScanError::Persist(_))),
+        "expected finalize persistence failure, got {first:?}"
+    );
+
+    let second = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &store,
+        &watermark_store,
+        Some(&store),
+        &config,
+        std::sync::Arc::new(NullEventSink),
+    )
+    .expect("retry should succeed");
+
+    assert_eq!(second.0.finalize.outcome, FinalizeOutcome::Complete);
+    assert_eq!(second.0.finalize.stats.unique_blobs, 1);
+    if perf_stats_enabled() {
+        assert_eq!(second.0.finalize.stats.total_findings, 1);
+    } else {
+        assert_eq!(second.0.finalize.stats.total_findings, 0);
+    }
+
+    // Third run: the successful finalize persisted seen state, so the blob
+    // should now be skipped by `batch_check_seen`.
+    let third = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &store,
+        &watermark_store,
+        Some(&store),
+        &config,
+        std::sync::Arc::new(NullEventSink),
+    )
+    .expect("third run should succeed");
+
+    assert_eq!(third.0.finalize.outcome, FinalizeOutcome::Complete);
+    assert_eq!(
+        third.0.finalize.stats.unique_blobs, 0,
+        "blob should be skipped after successful finalize persisted seen state"
+    );
 }
 
 /// Verify that every finding's `commit_id` has a matching `commit_meta` event

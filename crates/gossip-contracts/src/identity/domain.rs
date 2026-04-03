@@ -146,6 +146,11 @@ pub const COORDINATION_TELEMETRY_V1: &str = "gossip/worker/v1/coordination-telem
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const GIT_REPO_ID_V1: &str = "gossip/git/v1/repo-id";
 
+/// Stable 256-bit mirror-cache path derivation for repo-native Git scans.
+///
+/// Hash mode: BLAKE3 derive-key via `domain_hasher`.
+pub const GIT_MIRROR_PATH_V1: &str = "gossip/git/v1/mirror-path";
+
 // =========================================================================
 // Authoritative constant list
 // =========================================================================
@@ -155,7 +160,7 @@ pub const GIT_REPO_ID_V1: &str = "gossip/git/v1/repo-id";
 /// The array length is checked at compile time — adding a constant without
 /// updating `ALL` is a compile error. Tests use this for uniqueness and
 /// coverage checks.
-pub const ALL: [&str; 17] = [
+pub const ALL: [&str; 18] = [
     SPLIT_ID_V1,
     OP_PAYLOAD_V1,
     FINDING_ID_V1,
@@ -173,6 +178,7 @@ pub const ALL: [&str; 17] = [
     TRIAGE_GROUP_KEY_V1,
     COORDINATION_TELEMETRY_V1,
     GIT_REPO_ID_V1,
+    GIT_MIRROR_PATH_V1,
 ];
 
 // =========================================================================
@@ -208,6 +214,7 @@ pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static str)> {
         ("TRIAGE_GROUP_KEY_V1", TRIAGE_GROUP_KEY_V1),
         ("COORDINATION_TELEMETRY_V1", COORDINATION_TELEMETRY_V1),
         ("GIT_REPO_ID_V1", GIT_REPO_ID_V1),
+        ("GIT_MIRROR_PATH_V1", GIT_MIRROR_PATH_V1),
     ]
 }
 

@@ -1,6 +1,6 @@
 ---
 name: dist-sys-auditor
-description: Distributed systems design and implementation auditor — enforces evidence-backed coordination decisions, citation requirements, invariant tracking, and correctness verification against academic literature, battle-tested systems, and the project's locked architectural decisions
+description: Use when adding or modifying coordination protocols, implementing consensus or gossip mechanisms, or changing distributed state management. Audits designs against academic literature and battle-tested systems with citation requirements.
 ---
 
 # Distributed Systems Auditor

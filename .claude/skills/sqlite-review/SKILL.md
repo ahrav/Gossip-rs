@@ -1,6 +1,6 @@
 ---
 name: sqlite-review
-description: Review and tune SQLite schemas, queries, indexes, and pragmas. Connects to the actual database to gather concrete evidence (EXPLAIN QUERY PLAN, page counts, table stats) before recommending changes.
+description: Use when designing or auditing SQLite schemas, investigating slow queries, tuning indexes or pragmas, or reviewing WAL/journal configuration. Connects to the database for concrete evidence via EXPLAIN QUERY PLAN and page stats.
 ---
 
 # SQLite Review & Tuning
