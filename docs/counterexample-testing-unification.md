@@ -5,7 +5,7 @@
 This document inventories every testing approach in the repository, maps
 overlap between encoding/mutation and infrastructure, records keep/merge/migrate
 decisions for each component, defines a deterministic contract for a shared
-mutation core, and lays out a phased rollout plan. It serves as the initial
+mutation core, and lays out a staged rollout plan. It serves as the initial
 design deliverable for the Counterexample Testing Unification effort.
 
 ---
@@ -259,9 +259,9 @@ fixtures are ever introduced:
 | Git corpus              | `crates/scanner-engine-integration-tests/tests/corpus/git_scan/` (11 cases)                               | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
 | Near-miss operators     | `crates/scanner-scheduler/src/sim/mutation/op.rs`                 | Near-miss mutation ops       | **Done** | `crates/scanner-scheduler/src/sim/mutation/op.rs`       | Core new capability                                    |
 | Property tests          | `crates/scanner-engine-integration-tests/tests/property/` (20 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
-| Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in Phase 3                       |
+| Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in the fixture/validator augmentation section |
 | Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 scenario files + `main.rs` harness)      | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
-| Real-rules fixtures     | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in Phase 3                      |
+| Real-rules fixtures     | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in the fixture/validator augmentation section |
 | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (29 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
 
 ---
@@ -395,7 +395,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ---
 
-## 6. Phase-by-Phase Rollout
+## 6. Rollout Outline
 
 ### Extract Shared Mutation Core — **Completed**
 
@@ -448,13 +448,13 @@ structurally similar but invalid token, and has a clear expected outcome.
 - New fuzz target: `fuzz_mutation_pipeline.rs` for coverage-guided mutation
   op sequence exploration.
 
-### LLM Fixture Generation Contract (Optional, Future)
+### LLM Fixture Generation Contract (Optional)
 
 - Document the format for LLM-generated fixture files.
 - Provide a generation script that calls an LLM, serializes output, and
   writes `.fixture.json` files.
 - No CI dependency on LLM availability.
-- This phase is documentation-only; implementation deferred.
+- This section is documentation-only; implementation remains deferred.
 
 ---
 
@@ -505,24 +505,24 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 | Risk                          | Likelihood | Impact                      | Mitigation                                                                                                                                                      |
 | ----------------------------- | ---------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Serde compatibility break     | Low        | High (all corpus artifacts) | Variant names for `SecretRepr` unchanged during migration. `MutOp` is new, no existing artifacts to break. Add serde roundtrip test in Phase 1.            |
+| Serde compatibility break     | Low        | High (all corpus artifacts) | Variant names for `SecretRepr` unchanged during migration. `MutOp` is new, no existing artifacts to break. Add a serde roundtrip test alongside the shared mutation core extraction. |
 | False failures from near-miss | Medium     | Medium (CI noise)           | `near_miss_count` defaults to 0; existing tests unaffected. Near-miss tests are additive. New failures are always minimized before corpus addition.             |
 | Kitchen-sink module           | Medium     | Low (maintenance)           | Exceeded 500-line threshold; factored into submodule directory `mutation/` with 7 files (`mod.rs`, `op.rs`, `family.rs`, `encode.rs`, `plan.rs`, `plan_gen.rs`, `adapter.rs`). |
 
-**Rollback**: Each phase is independently revertible.
+**Rollback**: Each rollout slice is independently revertible.
 
-- Phase 1: **Completed.** Revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
+- Shared mutation core extraction: **Completed.** Revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
   `generator.rs`. No corpus changes.
-- Phase 2: remove `near_miss_count` from config, remove new oracle check.
+- Near-miss scanner-sim integration: remove `near_miss_count` from config, remove the new oracle check.
   Corpus additions are additive and can be deleted.
-- Phase 3: delete generated fixtures, revert baseline. Offline validator
+- Fixture and validator augmentation: delete generated fixtures, revert the baseline. Offline validator
   vector additions are additive.
 
 ---
 
 ## 9. Validation Commands
 
-### Phase 0 Validation (This Document)
+### Pre-Change Validation
 
 Verify that all existing test suites pass before any code changes:
 
@@ -549,9 +549,9 @@ cargo test --lib offline_validate
 cargo test --lib yaml_unit_tests
 ```
 
-Record pass counts as the baseline for Phase 1 regression checks.
+Record pass counts as the baseline for later regression checks.
 
-### Phase 0 Results
+### Baseline Results
 
 Property tests (2025-02-25, branch `feature/test-unification-doc`):
 ```
@@ -583,7 +583,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
 | `crates/scanner-scheduler/src/sim/minimize.rs`          | Scanner minimizer (greedy shrink passes)                             |
 | `crates/scanner-git/src/sim_git_scan/minimize.rs`       | Git minimizer (graph-aware shrink)                                   |
 | `crates/scanner-scheduler/src/sim/executor.rs`          | `SimExecutor` deterministic scheduler                                |
-| `crates/scanner-scheduler/src/sim/mutation/`            | Shared mutation core (Phase 1 output): 7 files                       |
+| `crates/scanner-scheduler/src/sim/mutation/`            | Shared mutation core output: 7 files                       |
 | `crates/scanner-engine/src/engine/offline_validate.rs`  | Structural token validators                                          |
 | `crates/scanner-engine/src/rules/yaml_unit_tests.rs`    | Rule parsing/scanning roundtrip                                      |
 | `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs`                | Real-rules golden baseline harness                                   |
