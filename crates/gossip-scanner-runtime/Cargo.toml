@@ -34,6 +34,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 gossip-persistence-inmemory.workspace = true
+proptest.workspace = true
 rstest.workspace = true
 tempfile = "3"
 
