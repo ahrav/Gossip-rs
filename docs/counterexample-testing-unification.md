@@ -397,7 +397,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ## 6. Rollout Outline
 
-### Extract Shared Mutation Core — **Completed**
+### Extract Shared Mutation Core
 
 - Created `crates/scanner-scheduler/src/sim/mutation/` as a submodule directory
   with 7 files:
@@ -440,7 +440,7 @@ structurally similar but invalid token, and has a clear expected outcome.
   for charset, length, and checksum boundary conditions.
 - Update golden baseline if new fixtures alter expected findings.
 
-### proptest Strategies + Fuzz Target (Optional)
+### proptest Strategies + Fuzz Target
 
 - Create `proptest` strategies that compose `MutOp` sequences.
 - Property: for any seed and op sequence, the output is deterministic.
@@ -448,13 +448,14 @@ structurally similar but invalid token, and has a clear expected outcome.
 - New fuzz target: `fuzz_mutation_pipeline.rs` for coverage-guided mutation
   op sequence exploration.
 
-### LLM Fixture Generation Contract (Optional)
+### LLM Fixture Generation Contract
 
 - Document the format for LLM-generated fixture files.
 - Provide a generation script that calls an LLM, serializes output, and
   writes `.fixture.json` files.
 - No CI dependency on LLM availability.
-- This section is documentation-only; implementation remains deferred.
+- This section specifies a fixture-generation contract and introduces no
+  CI-time runtime dependency.
 
 ---
 
@@ -511,7 +512,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 **Rollback**: Each rollout slice is independently revertible.
 
-- Shared mutation core extraction: **Completed.** Revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
+- Shared mutation core extraction: revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
   `generator.rs`. No corpus changes.
 - Near-miss scanner-sim integration: remove `near_miss_count` from config, remove the new oracle check.
   Corpus additions are additive and can be deleted.
