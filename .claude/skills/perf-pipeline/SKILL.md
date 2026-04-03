@@ -1,6 +1,6 @@
 ---
 name: perf-pipeline
-description: Two-phase performance pipeline — parallel triage agents diagnose issues from benchmark, static, and hotspot angles, then specialized optimization skills are dispatched based on finding classification
+description: Use when /bench-compare or /perf-regression identifies a regression needing root cause, when multiple performance dimensions need simultaneous triage, or when optimization work should be dispatched automatically. Two-phase diagnose-then-optimize pipeline.
 user-invocable: true
 ---
 

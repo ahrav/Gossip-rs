@@ -313,7 +313,10 @@ pub use unique_blob::{CollectedUniqueBlob, CollectingUniqueBlobSink, UniqueBlob,
 // ── Stage 4: Spill, dedup & mapping ─────────────────────────────────────
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use oid_index::OidIndex;
-pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
+pub use seen_store::{
+    AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, NullSeenBitmapPersister,
+    SeenBitmapPersister, SeenBlobStore,
+};
 pub use spill_chunk::CandidateChunk;
 pub use spill_limits::SpillLimits;
 pub use spill_merge::{merge_all, RunMerger};

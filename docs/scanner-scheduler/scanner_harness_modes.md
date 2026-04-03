@@ -120,10 +120,10 @@ flowchart TD
     D --> E[Golden baseline compare]
 ```
 
-## Mode 3: Direct-vs-Connector Parity Gate (Phase 1)
+## Mode 3: Direct-vs-Connector Parity Gate
 
-> **Status: Not yet implemented** — This mode describes a planned test
-> gate. The files referenced below do not yet exist in the codebase.
+> **Status: Planned** — This mode describes a planned test
+> gate. The files referenced below are not present in the codebase.
 
 ### What it tests
 
@@ -152,13 +152,13 @@ gate yet. The target matrix covers:
 - Git linear history fixture
 - Git branch-and-merge fixture
 
-Throughput sampling enforces a minimum of 5 iterations per case (with warmup)
-to reduce startup jitter before threshold evaluation.
+Throughput sampling is expected to enforce a minimum of 5 iterations per case
+(with warmup) to reduce startup jitter before threshold evaluation.
 
-Phase-6 defaulting decisions additionally require sustained-green policy
+Defaulting decisions additionally require sustained-green policy
 evaluation across CI windows; see
-the migration-defaulting closeout process (not yet documented) and
-a sustained-green gate script (not yet implemented).
+the migration-defaulting closeout process (separate documentation) and
+a sustained-green gate script (separate implementation).
 
 ### Commands
 
@@ -173,15 +173,15 @@ cargo test --features integration-tests --test integration execution_mode_parity
 EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
-cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 ```
 
-## Mode 4: FS Enumeration Conformance Matrix (Phase 4)
+## Mode 4: FS Enumeration Conformance Matrix
 
-> **Status: Not yet implemented** — This mode describes a planned
+> **Status: Planned** — This mode describes a planned
 > conformance test. The `connector-pipeline` feature flag and
 > `filesystem_enumeration_conformance_matrix_matches_connector` test
-> do not yet exist.
+> are not present in the codebase.
 
 ### What it tests
 
@@ -199,15 +199,15 @@ The matrix validates:
 | Non-UTF8 path bytes   | raw bytes file name                                  | Byte-identical inclusion when filesystem supports creation |
 | Ordering              | full connector listing                               | Deterministic key-sorted order                             |
 
-The implementation lives in
+The planned implementation is expected to live in
 `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` as
-`filesystem_enumeration_conformance_matrix_matches_connector` and is gated
-behind `connector-pipeline` because it exercises the real connector crate.
+`filesystem_enumeration_conformance_matrix_matches_connector`, gated behind
+`connector-pipeline` because it exercises the real connector crate.
 
 ### Commands
 
 ```bash
-# Run only the FS enumeration conformance test
+# Planned conformance test command
 cargo test --features connector-pipeline filesystem_enumeration_conformance_matrix_matches_connector
 ```
 

@@ -102,6 +102,10 @@ pub static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
 pub static REPO_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::GIT_REPO_ID_V1));
 
+/// Cached derive-key hasher for deterministic Git mirror-cache path derivation.
+pub static MIRROR_PATH_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::GIT_MIRROR_PATH_V1));
+
 /// Clone a cached hasher, feed canonical input, and finalize to 32 bytes.
 ///
 /// This is the hot-path helper used by `derive_*` functions across the

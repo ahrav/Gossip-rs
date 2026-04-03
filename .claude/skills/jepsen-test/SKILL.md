@@ -1,6 +1,6 @@
 ---
 name: jepsen-test
-description: Run Jepsen-style cluster tests using Maelstrom (lightweight) or full Jepsen (heavyweight) — validates correctness of the deployed gossip-rs system with real network behavior, complementing in-process DST
+description: Use when validating coordination correctness under real network partitions, when DST passes but you suspect distributed bugs, or before releasing coordination protocol changes. Runs Jepsen-style cluster tests via Maelstrom or full Jepsen.
 user-invocable: true
 ---
 

@@ -64,11 +64,11 @@ impl GitRepoRuntime {
         )))
     }
 
-    /// Execute one mirrored repository (not yet implemented).
+    /// Execute one mirrored repository.
     ///
-    /// Mirrored execution requires a local mirror managed by `GitMirrorManager`
-    /// and a scan executor. This path always returns an error until mirror
-    /// lifecycle and selection context are wired in.
+    /// [`crate::git_mirror::LocalMirrorManager`] provides the concrete mirror
+    /// lifecycle implementation. Returns an error because mirrored selection
+    /// and executor orchestration require runtime surface integration.
     pub fn execute_repo<M: GitMirrorManager, E: GitRepoExecutor>(
         _mirrors: &mut M,
         _executor: &mut E,
@@ -171,7 +171,7 @@ pub(crate) fn scan_local_repo(
 /// Uses `OsStr::as_encoded_bytes` on all platforms for consistency with
 /// `NormalizedLocalRepoIdentity`'s key derivation, so the digest
 /// correlates with the authoritative repo identity key.
-fn digest_repo_path(p: &std::path::Path) -> ToxicDigest {
+pub(crate) fn digest_repo_path(p: &std::path::Path) -> ToxicDigest {
     ToxicDigest::of_bytes(p.as_os_str().as_encoded_bytes())
 }
 
