@@ -416,6 +416,10 @@ doc = "docs/scanner-scheduler/scanner_harness_modes.md"
 dir = "crates/scanner-engine-integration-tests/tests/integration/main.rs"
 
 [[scopes]]
+doc = "docs/scanner-scheduler/scanner_harness_modes.md"
+dir = "crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs"
+
+[[scopes]]
 doc = "docs/scanner-scheduler/scanner_test_harness_guide.md"
 dir = "crates/scanner-scheduler/src/sim/"
 
