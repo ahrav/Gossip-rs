@@ -162,14 +162,15 @@ a sustained-green gate script (separate implementation).
 
 ### Commands for the deferred gate
 
-The parity gate is still deferred, so no runnable local command exists yet.
-Once `execution_mode_parity.rs` lands, the intended invocation is:
+No runnable local command exists in the current checkout because
+`execution_mode_parity.rs` is not present.
+Reference invocation for that module:
 
 ```bash
-# Planned local invocation once the deferred parity gate is restored
+# Reference local invocation for execution_mode_parity.rs
 cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 
-# Planned tuning knobs for that restored gate
+# Reference tuning knobs for execution_mode_parity.rs
 EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
