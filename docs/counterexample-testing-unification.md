@@ -5,8 +5,8 @@
 This document inventories every testing approach in the repository, maps
 overlap between encoding/mutation and infrastructure, records keep/merge/migrate
 decisions for each component, defines a deterministic contract for a shared
-mutation core, and lays out a phased rollout plan. It is the Phase 0
-deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
+mutation core, and lays out a staged rollout plan. It serves as the initial
+design deliverable for the Counterexample Testing Unification effort.
 
 ---
 
@@ -23,8 +23,8 @@ deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
 | 7   | Shared sim infra        | `crates/scanner-scheduler/src/sim/` (9 files + `mutation/` subdir)          | `sim-harness`        | RNG, fault injection, minimization, executor                |
 | 8   | Offline validators      | `crates/scanner-engine/src/engine/offline_validate.rs` | None                 | Structural token validation                                 |
 | 9   | YAML unit tests         | `crates/scanner-engine/src/rules/yaml_unit_tests.rs`   | None                 | Rule parsing/scanning roundtrip                             |
-| 10  | Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 files)                        | `integration-tests`  | Handcrafted regression tests                                |
-| 11  | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (24 targets across 4 crates)                      | Nightly              | Coverage-guided mutation                                    |
+| 10  | Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 scenario files + `main.rs` harness) | `integration-tests`  | Handcrafted regression tests                                |
+| 11  | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (29 targets across 5 crates)                      | Nightly              | Coverage-guided mutation                                    |
 | 12  | Real-rules harness      | `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs`               | `real-rules-harness` | Golden baseline comparison                                  |
 | 13  | Smoke tests             | `crates/scanner-engine-integration-tests/tests/smoke/` (1 file)                                | `smoke-tests`        | End-to-end sanity                                           |
 | 14  | Diagnostic tests        | `crates/scanner-engine-integration-tests/tests/diagnostic/` (3 files)                          | `diagnostic-tests`   | Allocation and runtime diagnostics                          |
@@ -101,7 +101,7 @@ compiles it, and scans a test string. No mutation — inputs are string literals
 
 ### 1.9 Integration Tests
 
-Twenty-two files in `crates/scanner-engine-integration-tests/tests/integration/` covering handcrafted regression
+Scenario files in `crates/scanner-engine-integration-tests/tests/integration/` cover handcrafted regression
 scenarios. Each file targets a specific behavior area (chunking, dedup,
 transforms, multi-rule interaction). Gated behind `integration-tests`. Inputs
 are manually constructed byte sequences. Clear, readable, but labor-intensive to
@@ -109,7 +109,7 @@ extend.
 
 ### 1.10 Fuzz Targets
 
-Twenty-four targets across 4 crates (`scanner-engine`, `scanner-git`, `gossip-stdx`, `gossip-contracts`) in per-crate `fuzz/fuzz_targets/` using `cargo-fuzz`/libFuzzer.
+Fuzz targets across `scanner-engine`, `scanner-git`, `gossip-stdx`, `gossip-contracts`, and `gossip-coordination-etcd` live in per-crate `fuzz/fuzz_targets/` directories and use `cargo-fuzz`/libFuzzer.
 Coverage-guided mutation across anchor soundness, base64 gate ops, pack parsing,
 offline validators, SIMD classification, text sanitization, and more. Run on
 nightly; not in CI default gate.
@@ -239,13 +239,13 @@ fixtures are ever introduced:
 
 | Current Component       | Location                                                          | Purpose                      | Action             | Target                                                  | Rationale                                              |
 | ----------------------- | ----------------------------------------------------------------- | ---------------------------- | ------------------ | ------------------------------------------------------- | ------------------------------------------------------ |
-| `encode_secret()`       | `generator.rs`                                            | Dispatch raw→representation  | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent; reusable by git sim and real-rules |
-| `base64_encode_std()`   | `generator.rs`                                            | Base64 standard encoding     | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `percent_encode_all()`  | `generator.rs`                                            | URL percent encoding         | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `encode_utf16()`        | `generator.rs`                                            | UTF-16 LE/BE widening        | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `encode_nested()`       | `generator.rs`                                            | Alternating layer nesting    | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `hex_nibble()`          | `generator.rs`                                            | Nibble→hex helper            | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Dependency of `percent_encode_all`                     |
-| `SecretRepr`            | `scenario.rs`                                              | Encoding representation enum | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent type                                |
+| `encode_secret()`       | `generator.rs`                                            | Dispatch raw→representation  | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent; reusable by git sim and real-rules |
+| `base64_encode_std()`   | `generator.rs`                                            | Base64 standard encoding     | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `percent_encode_all()`  | `generator.rs`                                            | URL percent encoding         | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_utf16()`        | `generator.rs`                                            | UTF-16 LE/BE widening        | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_nested()`       | `generator.rs`                                            | Alternating layer nesting    | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `hex_nibble()`          | `generator.rs`                                            | Nibble→hex helper            | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Dependency of `percent_encode_all`                     |
+| `SecretRepr`            | `scenario.rs`                                              | Encoding representation enum | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent type                                |
 | `make_token()`          | `generator.rs`                                            | Rule prefix + random tail    | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Scanner-specific format (SIM{id}_...)                  |
 | `generate_scenario()`   | `sim_scanner/generator.rs`                                        | Full scanner scenario        | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Domain-specific orchestration                          |
 | `generate_scenario()`   | `sim_git_scan/generator.rs`                                       | Full git scenario            | **Keep**           | `crates/scanner-git/src/sim_git_scan/generator.rs`      | Domain-specific orchestration                          |
@@ -257,12 +257,12 @@ fixtures are ever introduced:
 | Git minimizer           | `sim_git_scan/minimize.rs`                            | Graph-aware shrink           | **Keep**           | `crates/scanner-git/src/sim_git_scan/minimize.rs`       | Graph-aware, git-specific                              |
 | Scanner corpus          | `crates/scanner-engine-integration-tests/tests/corpus/scanner/` (71 cases)                                | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
 | Git corpus              | `crates/scanner-engine-integration-tests/tests/corpus/git_scan/` (11 cases)                               | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
-| Near-miss operators     | `crates/scanner-scheduler/src/sim/mutation/op.rs`                 | Near-miss mutation ops       | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/op.rs`       | Core new capability                                    |
+| Near-miss operators     | `crates/scanner-scheduler/src/sim/mutation/op.rs`                 | Near-miss mutation ops       | **Done** | `crates/scanner-scheduler/src/sim/mutation/op.rs`       | Core new capability                                    |
 | Property tests          | `crates/scanner-engine-integration-tests/tests/property/` (20 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
-| Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in Phase 3                       |
-| Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
-| Real-rules fixtures     | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in Phase 3                      |
-| Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (24 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
+| Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in the fixture/validator augmentation section |
+| Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 scenario files + `main.rs` harness)      | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
+| Real-rules fixtures     | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in the fixture/validator augmentation section |
+| Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (29 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
 
 ---
 
@@ -395,9 +395,9 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ---
 
-## 6. Phase-by-Phase Rollout
+## 6. Rollout Outline
 
-### Phase 1: Extract Shared Mutation Core (`scratch-gs8l.2`) — **Completed**
+### Extract Shared Mutation Core
 
 - Created `crates/scanner-scheduler/src/sim/mutation/` as a submodule directory
   with 7 files:
@@ -424,16 +424,15 @@ structurally similar but invalid token, and has a clear expected outcome.
 - All existing corpus artifacts and tests pass unchanged.
 - Acceptance: `cargo test --features sim-harness` passes with zero delta.
 
-### Phase 2: Integrate Near-Miss into Scanner Sim
+### Integrate Near-Miss into Scanner Sim
 
 - Add `near_miss_count: u32` field to `ScenarioGenConfig` (default 0).
-- Generator produces `MustNotFind`-disposition secrets using near-miss
-  operators when `near_miss_count > 0`.
+- Generator produces near-miss mutation cases whose expected outcome is `MustNotMatch` when `near_miss_count > 0`.
 - Runner validates that near-miss secrets are NOT found (new oracle check).
 - New random sim seeds exercise near-miss scenarios.
 - Minimized failures added to corpus.
 
-### Phase 3: Augment Real-Rules Fixtures and Offline Validators
+### Augment Real-Rules Fixtures and Offline Validators
 
 - Generate near-miss fixtures for `crates/scanner-engine-integration-tests/tests/corpus/real_rules/fixtures/` using
   the mutation core. Commit as static files.
@@ -441,7 +440,7 @@ structurally similar but invalid token, and has a clear expected outcome.
   for charset, length, and checksum boundary conditions.
 - Update golden baseline if new fixtures alter expected findings.
 
-### Phase 4 (Optional): Proptest Strategies + Fuzz Target
+### proptest Strategies + Fuzz Target
 
 - Create `proptest` strategies that compose `MutOp` sequences.
 - Property: for any seed and op sequence, the output is deterministic.
@@ -449,13 +448,14 @@ structurally similar but invalid token, and has a clear expected outcome.
 - New fuzz target: `fuzz_mutation_pipeline.rs` for coverage-guided mutation
   op sequence exploration.
 
-### Phase 5 (Optional, Future): LLM Fixture Generation Contract
+### LLM Fixture Generation Contract
 
 - Document the format for LLM-generated fixture files.
 - Provide a generation script that calls an LLM, serializes output, and
   writes `.fixture.json` files.
 - No CI dependency on LLM availability.
-- This phase is documentation-only; implementation deferred.
+- This section specifies a fixture-generation contract and introduces no
+  CI-time runtime dependency.
 
 ---
 
@@ -506,24 +506,24 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 | Risk                          | Likelihood | Impact                      | Mitigation                                                                                                                                                      |
 | ----------------------------- | ---------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Serde compatibility break     | Low        | High (all corpus artifacts) | Variant names for `SecretRepr` unchanged during migration. `MutOp` is new, no existing artifacts to break. Add serde roundtrip test in Phase 1.            |
+| Serde compatibility break     | Low        | High (all corpus artifacts) | Variant names for `SecretRepr` unchanged during migration. `MutOp` is new, no existing artifacts to break. Add a serde roundtrip test alongside the shared mutation core extraction. |
 | False failures from near-miss | Medium     | Medium (CI noise)           | `near_miss_count` defaults to 0; existing tests unaffected. Near-miss tests are additive. New failures are always minimized before corpus addition.             |
 | Kitchen-sink module           | Medium     | Low (maintenance)           | Exceeded 500-line threshold; factored into submodule directory `mutation/` with 7 files (`mod.rs`, `op.rs`, `family.rs`, `encode.rs`, `plan.rs`, `plan_gen.rs`, `adapter.rs`). |
 
-**Rollback**: Each phase is independently revertible.
+**Rollback**: Each rollout slice is independently reversible.
 
-- Phase 1: **Completed.** Revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
+- Shared mutation core extraction: revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
   `generator.rs`. No corpus changes.
-- Phase 2: remove `near_miss_count` from config, remove new oracle check.
+- Near-miss scanner-sim integration: remove `near_miss_count` from config, remove the new oracle check.
   Corpus additions are additive and can be deleted.
-- Phase 3: delete generated fixtures, revert baseline. Offline validator
+- Fixture and validator augmentation: delete generated fixtures, revert the baseline. Offline validator
   vector additions are additive.
 
 ---
 
 ## 9. Validation Commands
 
-### Phase 0 Validation (This Document)
+### Pre-Change Validation
 
 Verify that all existing test suites pass before any code changes:
 
@@ -550,21 +550,13 @@ cargo test --lib offline_validate
 cargo test --lib yaml_unit_tests
 ```
 
-Record pass counts as the baseline for Phase 1 regression checks.
+Record pass counts as the baseline for later regression checks.
 
-### Phase 0 Results
+### Baseline Capture
 
-Property tests (2025-02-25, branch `feature/test-unification-doc`):
-```
-test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-```
-
-Scanner corpus replay (2025-02-25):
-```
-test result: FAILED. 0 passed; 1 failed; 0 ignored
-  — b64_internal_newline.case.json: "overlap (512) must not exceed chunk_size (64)"
-  — Pre-existing failure; not introduced by this document.
-```
+- Run the command list above to capture a local baseline before changing code.
+- Keep command output with the run artifacts rather than embedding snapshots in
+  this design doc.
 
 ---
 
@@ -584,7 +576,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
 | `crates/scanner-scheduler/src/sim/minimize.rs`          | Scanner minimizer (greedy shrink passes)                             |
 | `crates/scanner-git/src/sim_git_scan/minimize.rs`       | Git minimizer (graph-aware shrink)                                   |
 | `crates/scanner-scheduler/src/sim/executor.rs`          | `SimExecutor` deterministic scheduler                                |
-| `crates/scanner-scheduler/src/sim/mutation/`            | Shared mutation core (Phase 1 output): 7 files                       |
+| `crates/scanner-scheduler/src/sim/mutation/`            | Shared mutation core output: 7 files                       |
 | `crates/scanner-engine/src/engine/offline_validate.rs`  | Structural token validators                                          |
 | `crates/scanner-engine/src/rules/yaml_unit_tests.rs`    | Rule parsing/scanning roundtrip                                      |
 | `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs`                | Real-rules golden baseline harness                                   |
