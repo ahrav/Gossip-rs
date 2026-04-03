@@ -36,6 +36,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
 | `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), ordered-content filesystem lease execution, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
+| `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_mirror.rs` | Worker-local Git mirror lifecycle, deterministic cache-path derivation, and stale control-file cleanup |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content page validation, explicit terminal page / exhausted-empty outcomes, scan-miss execution, and direct local filesystem execution helpers |
@@ -177,7 +178,9 @@ and done-ledger state.
 The runtime is organized around source families rather than driver traits:
 
 - `ordered_content` covers sources that behave like forward-only item streams
-- `git_repo` covers repository discovery and repository execution paths
+- `git_discovery` owns static payload-backed repository discovery for
+  repo-frontier shards
+- `git_repo` covers local repository execution paths
 - `distributed` exposes the worker-loop nouns for distributed shard execution
 
 This keeps the public orchestration types available without requiring the
@@ -791,6 +794,7 @@ and coordination-backend observations).
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
 | Distributed worker-loop foundation types | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
+| Static Git repo discovery source | `crates/gossip-scanner-runtime/src/git_discovery.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |
 | Frozen runtime commit vocabulary | `crates/gossip-scanner-runtime/src/commit_model.rs` |

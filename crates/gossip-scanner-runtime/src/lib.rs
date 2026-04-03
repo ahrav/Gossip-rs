@@ -101,6 +101,8 @@ pub mod coordination_sink;
 pub mod distributed;
 // Event sink implementations for CLI and runtime output.
 pub mod event_sink;
+// Static single-target Git repository discovery source.
+pub mod git_discovery;
 // Worker-local Git mirror lifecycle and deterministic cache-path helpers.
 pub mod git_mirror;
 // Git-repository runtime boundary for local scans.
