@@ -461,31 +461,12 @@ fn classify_io_git_run_error(op: &str, path: &Path, err: &io::Error) -> GitRunEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use crate::test_fixtures::{init_git_repo, run_git_in};
 
     use tempfile::tempdir;
 
-    fn run_git_in(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-            dir.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
     fn init_repo(dir: &Path) {
-        run_git_in(dir, &["init", "-q"]);
-        run_git_in(dir, &["config", "user.email", "mirror-tests@example.com"]);
-        run_git_in(dir, &["config", "user.name", "Mirror Tests"]);
+        init_git_repo(dir, "mirror-tests@example.com", "Mirror Tests");
     }
 
     #[test]

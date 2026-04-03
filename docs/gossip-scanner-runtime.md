@@ -49,7 +49,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
 | `src/lib_tests.rs` | Validation and local scan execution tests for the runtime core |
 | `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
-| `src/test_fixtures.rs` | Shared test fixtures (write contexts, timings, findings builders, rule fingerprints) used by runtime test modules |
+| `src/test_fixtures.rs` | Shared test fixtures (write contexts, timings, findings builders, rule fingerprints, and git repository setup helpers) used by runtime test modules |
 | `src/runtime_durability_tests.rs` | Integration tests that stitch together translation, findings -> done-ledger durability, and receipt-driven checkpoint aggregation to prove explicit-receipt gating, contiguous-prefix advancement, and reassignment-safe retry invariants |
 | `Cargo.toml` | Runtime crate dependencies and feature flags |
 

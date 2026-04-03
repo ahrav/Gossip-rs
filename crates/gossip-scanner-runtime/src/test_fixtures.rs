@@ -1,4 +1,10 @@
 //! Shared test fixtures for the gossip-scanner-runtime crate.
+//!
+//! This module centralizes reusable test data builders and git repository
+//! setup helpers so runtime test modules share one command/assertion path.
+
+use std::path::Path;
+use std::process::Command;
 
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
@@ -36,6 +42,31 @@ pub(crate) fn write_context_with_epoch(fence_epoch_raw: u64) -> WriteContext {
         ShardId::from_raw(44),
         FenceEpoch::from_raw(fence_epoch_raw),
     )
+}
+
+/// Run `git` inside `dir` and assert the command succeeds.
+pub(crate) fn run_git_in(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
+        dir.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Initialize a git repository with the configured author identity.
+pub(crate) fn init_git_repo(dir: &Path, email: &str, name: &str) {
+    run_git_in(dir, &["init", "-q"]);
+    run_git_in(dir, &["config", "user.email", email]);
+    run_git_in(dir, &["config", "user.name", name]);
 }
 
 pub(crate) fn timing() -> ScanTiming {
