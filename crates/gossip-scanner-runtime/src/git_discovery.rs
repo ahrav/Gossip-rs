@@ -105,6 +105,8 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
             return Ok(None);
         }
 
+        // Defensive: shard.contains_key already verified the target is in range,
+        // so try_new_validated should not reject the page under normal conditions.
         let page = PageBuf::try_new_validated(
             vec![self.target.clone()],
             PageState::Complete,
