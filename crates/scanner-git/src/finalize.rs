@@ -314,7 +314,7 @@ pub fn build_ref_wm_key(
     ref_name: &[u8],
 ) -> Vec<u8> {
     // The null terminator keeps keys prefix-safe for ref name scans.
-    debug_assert!(
+    assert!(
         !ref_name.contains(&0),
         "ref_name must not contain null bytes"
     );

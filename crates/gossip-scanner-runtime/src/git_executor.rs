@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 
+use gossip_connectors::is_permanent_io_error;
 use gossip_contracts::connector::git::{
     GitDebugLevel, GitExecutionLimits, GitMergeStrategy, GitRepoExecutor, GitRunError,
     GitRunOutcome, GitScanMode as ContractGitScanMode, GitSelection, LocalMirror,
@@ -257,8 +258,11 @@ fn maybe_log_debug_output(
 /// - **Transient I/O** (general I/O, persist, pack exec/IO, spill,
 ///   artifact I/O): retryable, a mirror refresh or retry may succeed.
 ///
-/// Unknown future `ArtifactAcquireError` variants default to permanent until
-/// explicitly classified.
+/// Unknown future `ArtifactAcquireError` variants default to retryable
+/// (consistent with `classify_preflight_error`) because a false permanent
+/// classification silently drops repos. The outer `GitScanError` match is
+/// exhaustive so the compiler forces classification of any new top-level
+/// variant.
 fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
     let repo = digest_repo_path(mirror_path);
 
@@ -275,53 +279,74 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
     // Classify each variant as retryable or permanent. Retryable means a
     // mirror refresh or simple retry has a reasonable chance of succeeding.
     //
+    // This uses an exhaustive `match` over `GitScanError` (which is NOT
+    // `#[non_exhaustive]`) so the compiler forces classification of any
+    // new variant. `ArtifactAcquireError` IS `#[non_exhaustive]`, so its
+    // inner classification uses `matches!` with a catch-all warning.
+    //
     // NOTE on `CommitLoadError::Io`: intentionally excluded from the
     // retryable set. Upstream overloads it for structural errors (InvalidData
     // for malformed shallow entries, NotFound for missing pack references),
     // so a blanket retryable classification would retry permanent failures.
-    let is_retryable = matches!(
-        &err,
-        GitScanError::RepoOpen(RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_))
-            | GitScanError::CommitPlan(CommitPlanError::TipNotFound)
-            | GitScanError::TreeDiff(
-                TreeDiffError::Aborted | TreeDiffError::ObjectStoreError { .. }
-            )
-            | GitScanError::ArtifactAcquire(
+    let is_retryable = match &err {
+        GitScanError::ConcurrentMaintenance => {
+            unreachable!("handled by early return above")
+        }
+        GitScanError::RepoOpen(RepoOpenError::Io(e)) => !is_permanent_io_error(e),
+        GitScanError::RepoOpen(RepoOpenError::Canonicalization(_)) => true,
+        GitScanError::RepoOpen(_) => false,
+        GitScanError::CommitPlan(CommitPlanError::TipNotFound) => true,
+        GitScanError::CommitPlan(_) => false,
+        GitScanError::TreeDiff(TreeDiffError::Aborted | TreeDiffError::ObjectStoreError { .. }) => {
+            true
+        }
+        GitScanError::TreeDiff(_) => false,
+        GitScanError::ArtifactAcquire(inner) => {
+            // ArtifactAcquireError is #[non_exhaustive]; log unrecognized
+            // variants so new additions surface in diagnostics. Unknown
+            // variants default to retryable — consistent with
+            // classify_preflight_error — because a false permanent
+            // classification silently drops repos.
+            let classified = matches!(
+                inner,
                 ArtifactAcquireError::MidxBuild(scanner_git::MidxBuildError::Io(_))
                     | ArtifactAcquireError::RepoOpen(
                         RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_),
                     )
                     | ArtifactAcquireError::Io(_)
-            )
-            | GitScanError::Io(_)
-            | GitScanError::Persist(_)
-            | GitScanError::PackExec(_)
-            | GitScanError::PackIo(_)
-            | GitScanError::Spill(_)
-    );
-
-    // ArtifactAcquireError is #[non_exhaustive]; log unrecognized variants
-    // so new additions surface in diagnostics instead of silently falling
-    // through as permanent.
-    if let GitScanError::ArtifactAcquire(ref inner) = err
-        && !matches!(
-            inner,
-            ArtifactAcquireError::ConcurrentMaintenance
-                | ArtifactAcquireError::MidxBuild(_)
-                | ArtifactAcquireError::MidxParse(_)
-                | ArtifactAcquireError::CommitLoad(_)
-                | ArtifactAcquireError::CommitGraphBuild(_)
-                | ArtifactAcquireError::RepoOpen(_)
-                | ArtifactAcquireError::EmptyStartSetWithRefs
-                | ArtifactAcquireError::Io(_)
-        )
-    {
-        tracing::warn!(
-            repo = %repo,
-            %err,
-            "unclassified artifact-acquire error variant defaulting to permanent"
-        );
-    }
+            );
+            let known_permanent = matches!(
+                inner,
+                ArtifactAcquireError::ConcurrentMaintenance
+                    | ArtifactAcquireError::MidxBuild(_)
+                    | ArtifactAcquireError::MidxParse(_)
+                    | ArtifactAcquireError::CommitLoad(_)
+                    | ArtifactAcquireError::CommitGraphBuild(_)
+                    | ArtifactAcquireError::RepoOpen(_)
+                    | ArtifactAcquireError::EmptyStartSetWithRefs
+                    | ArtifactAcquireError::Io(_)
+            );
+            if !classified && !known_permanent {
+                tracing::warn!(
+                    repo = %repo,
+                    %err,
+                    "unclassified artifact-acquire error variant defaulting to retryable"
+                );
+                true
+            } else {
+                classified
+            }
+        }
+        GitScanError::Io(_)
+        | GitScanError::Persist(_)
+        | GitScanError::PackExec(_)
+        | GitScanError::PackIo(_)
+        | GitScanError::Spill(_) => true,
+        GitScanError::Midx(_)
+        | GitScanError::PackPlan(_)
+        | GitScanError::ResourceLimit(_)
+        | GitScanError::UnsupportedMode(_) => false,
+    };
 
     let msg = format!("git repo execution failed for '{repo}': {err}");
     if is_retryable {

@@ -83,6 +83,12 @@ pub trait GitPersistenceBackend {
     }
 
     /// Load several raw keys, preserving input order.
+    ///
+    /// The default implementation calls [`get`](Self::get) in a loop and
+    /// short-circuits on the first error (the iterator collects into
+    /// `Result<Vec<_>, _>`). Override this if your backend supports a
+    /// native multi-get that can return partial results or better error
+    /// granularity.
     fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
         keys.iter().map(|key| self.get(key)).collect()
     }
@@ -280,30 +286,27 @@ where
         // Load or create the staging bitmap on first spill, then cache it
         // across subsequent calls. This avoids O(total_staged) re-reads per
         // spill batch, reducing aggregate cost from O(N²/B) to O(N).
+        //
+        // The merge is performed on a local clone so that a failed
+        // apply_batch does not leave stale OIDs in the cache.
         let mut guard = self.staging_seen.borrow_mut();
-        let bitmap = match guard.as_mut() {
-            Some(bitmap) => bitmap,
-            None => {
-                let loaded = match self.backend.get(&staging_key) {
-                    Ok(Some(existing)) => {
-                        RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
-                            SpillError::Io(io::Error::other(format!(
-                                "corrupt staging bitmap: {err}"
-                            )))
-                        })?
-                    }
-                    Ok(None) => RoaringSeenBitmap::new(delta.oid_len()),
-                    Err(err) => {
-                        return Err(SpillError::Io(io::Error::other(format!(
-                            "staging bitmap read failed: {err}"
-                        ))));
-                    }
-                };
-                guard.insert(loaded)
-            }
+        let base = match guard.as_ref() {
+            Some(bitmap) => bitmap.clone(),
+            None => match self.backend.get(&staging_key) {
+                Ok(Some(existing)) => RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
+                    SpillError::Io(io::Error::other(format!("corrupt staging bitmap: {err}")))
+                })?,
+                Ok(None) => RoaringSeenBitmap::new(delta.oid_len()),
+                Err(err) => {
+                    return Err(SpillError::Io(io::Error::other(format!(
+                        "staging bitmap read failed: {err}"
+                    ))));
+                }
+            },
         };
-        bitmap.merge_delta(&delta)?;
-        let bytes = bitmap.serialize()?;
+        let mut merged = base;
+        merged.merge_delta(&delta)?;
+        let bytes = merged.serialize()?;
 
         self.backend
             .apply_batch(&[GitPersistenceOp::Put {
@@ -314,7 +317,12 @@ where
                 SpillError::Io(io::Error::other(format!(
                     "staging seen-bitmap write failed: {err}"
                 )))
-            })
+            })?;
+
+        // Install the merged bitmap into the cache only after the
+        // backend write succeeds.
+        *guard = Some(merged);
+        Ok(())
     }
 }
 
@@ -333,6 +341,10 @@ where
         debug_assert!(
             oids.iter().all(|o| o.len() == oids[0].len()),
             "mixed OID lengths in batch_check_seen"
+        );
+        debug_assert!(
+            oids.windows(2).all(|w| w[0] < w[1]),
+            "batch_check_seen requires sorted unique OIDs"
         );
 
         self.load_seen_store(oids[0].len()).map_err(|err| {
@@ -365,13 +377,16 @@ where
         // (repo_id, policy_hash) identity. A mismatch would silently return
         // watermarks for a different scope than the seen-bitmap uses.
         if repo_id != self.repo_id || policy_hash != self.policy_hash {
-            return Err(RepoOpenError::io(io::Error::other(format!(
-                "load_watermarks identity mismatch: caller ({repo_id}, {:x?}) \
-                 vs adapter ({}, {:x?})",
-                &policy_hash[..4],
-                self.repo_id,
-                &self.policy_hash[..4]
-            ))));
+            return Err(RepoOpenError::io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "load_watermarks identity mismatch: caller ({repo_id}, {:x?}) \
+                     vs adapter ({}, {:x?})",
+                    &policy_hash[..4],
+                    self.repo_id,
+                    &self.policy_hash[..4]
+                ),
+            )));
         }
 
         let mut keys = Vec::with_capacity(ref_names.len());
@@ -530,15 +545,6 @@ where
             staged_bitmap = Some(merged);
         }
 
-        // Delete the staging key last among first-phase ops so that a
-        // non-atomic backend crash cannot lose staged OIDs before the
-        // merged seen scope key is written.
-        if has_staging {
-            first_phase_ops.push(GitPersistenceOp::Delete {
-                key: seen_staging_key.clone(),
-            });
-        }
-
         let watermark_ops: Vec<_> = if is_complete {
             output
                 .watermark_ops
@@ -551,6 +557,11 @@ where
 
         if self.backend.supports_atomic_batches() {
             let mut all_ops = first_phase_ops;
+            if has_staging {
+                all_ops.push(GitPersistenceOp::Delete {
+                    key: seen_staging_key.clone(),
+                });
+            }
             all_ops.extend(watermark_ops);
             if !all_ops.is_empty() {
                 self.backend
@@ -563,6 +574,10 @@ where
             return Ok(());
         }
 
+        // Non-atomic path: write data+seen first, then delete the staging
+        // key in a separate batch, then advance watermarks. The staging
+        // delete is structurally after the scope-key write so a crash
+        // between batches cannot lose staged OIDs.
         if !first_phase_ops.is_empty() {
             self.backend
                 .apply_batch(&first_phase_ops)
@@ -570,6 +585,13 @@ where
         }
         if let Some(bitmap) = staged_bitmap {
             *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
+        }
+        if has_staging {
+            self.backend
+                .apply_batch(&[GitPersistenceOp::Delete {
+                    key: seen_staging_key.clone(),
+                }])
+                .map_err(|err| PersistError::backend(err.to_string()))?;
         }
         if !watermark_ops.is_empty() {
             self.backend
@@ -1066,7 +1088,12 @@ mod tests {
         adapter
             .persist_seen_delta(&[oid])
             .expect("stage seen delta");
-        backend.set_fail_on_batch_call(3);
+        // Batch 1: persist_seen_delta staging write
+        // Batch 2: commit_finalize first-phase (data+seen scope)
+        // Batch 3: commit_finalize staging delete
+        // Batch 4: commit_finalize watermark phase
+        // Fail on batch 4 (watermarks) to prove the seen cache survives.
+        backend.set_fail_on_batch_call(4);
         let _ = adapter
             .commit_finalize(&FinalizeOutput {
                 data_ops: Vec::new(),
@@ -1240,9 +1267,52 @@ mod tests {
             Some(&[0xBB][..]),
             "watermarks must land on complete finalize"
         );
-        // Non-atomic: exactly 3 batches (staging persist, first-phase
-        // data+seen, second-phase watermarks).
-        assert_eq!(backend.batches().len(), 3);
+        // Non-atomic: exactly 4 batches (staging persist, first-phase
+        // data+seen, staging delete, second-phase watermarks).
+        assert_eq!(backend.batches().len(), 4);
+    }
+
+    #[test]
+    fn failed_staging_write_does_not_pollute_cache_for_finalize() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 24, [0x24; 32]);
+        let oid_a = OidBytes::sha1([0xAA; 20]);
+        let oid_b = OidBytes::sha1([0xBB; 20]);
+
+        // First persist succeeds — seeds the staging cache with oid_a.
+        adapter
+            .persist_seen_delta(&[oid_a])
+            .expect("first persist should succeed");
+
+        // Second persist fails at the backend write. The cache already
+        // has oid_a; if the bug exists, merge_delta adds oid_b to the
+        // cached bitmap before the write is attempted, leaving stale
+        // OIDs in the cache that were never durably staged.
+        backend.set_fail_on_batch_call(2);
+        adapter
+            .persist_seen_delta(&[oid_b])
+            .expect_err("second persist should fail on injected batch failure");
+
+        // Complete finalize: if the cache is polluted, oid_b will be
+        // folded into the committed seen scope despite never landing
+        // in durable staging.
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        let results = adapter
+            .batch_check_seen(&[oid_a, oid_b])
+            .expect("batch check after finalize");
+        assert_eq!(
+            results,
+            vec![true, false],
+            "oid_b must not be visible — it was never durably staged"
+        );
     }
 
     #[test]
