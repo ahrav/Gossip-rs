@@ -1,6 +1,6 @@
 ---
 name: postgres-review
-description: Review and tune PostgreSQL schemas, queries, indexes, partitioning, and configuration. Connects to the actual database to gather concrete evidence (EXPLAIN ANALYZE, pg_stat_* views, bloat metrics) before recommending changes. This skill should be used when designing, auditing, or optimizing PostgreSQL databases, reviewing migrations for lock safety, or investigating performance issues.
+description: Use when designing or auditing PostgreSQL schemas, reviewing migrations for lock safety, investigating query performance, or optimizing indexes and partitioning. Connects to the database for concrete evidence via EXPLAIN ANALYZE and pg_stat_* views.
 ---
 
 # PostgreSQL Review & Tuning

@@ -1,6 +1,6 @@
 ---
 name: security-reviewer
-description: Audit memory safety and security in unsafe code blocks, buffer handling, and security-sensitive operations
+description: Use when modifying unsafe blocks, adding parsing or decoding logic, changing buffer pool or scratch internals, or before merging changes to data structure implementations with raw pointers. Memory safety and security audit.
 ---
 
 # Security Reviewer

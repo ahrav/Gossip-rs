@@ -1,6 +1,6 @@
 ---
 name: performance-analyzer
-description: Analyze Rust code for performance issues, allocation hot spots, and optimization opportunities
+description: Use when writing hot-path code in coordination or scanner engine, before committing changes to scanner-engine modules, when benchmarks show unexpected regressions, or during optimization of gossip-stdx data structures. Static performance analysis.
 ---
 
 # Performance Analyzer
