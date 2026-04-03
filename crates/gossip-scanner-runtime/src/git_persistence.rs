@@ -205,6 +205,12 @@ impl<B> GitPersistenceAdapter<B> {
     }
 }
 
+/// Cloned adapters share the backend but start with an empty seen-bitmap
+/// cache; the clone will re-load from the backend on next access.
+///
+/// Two clones must not operate on the same `(repo_id, policy_hash)` scope
+/// concurrently because the staging key read-modify-write in
+/// `persist_seen_delta` is not atomic.
 impl<B> Clone for GitPersistenceAdapter<B>
 where
     B: Clone,
@@ -258,8 +264,14 @@ where
             return Ok(());
         }
 
+        debug_assert!(
+            oids.windows(2).all(|w| w[0] < w[1]),
+            "persist_seen_delta requires sorted unique OIDs"
+        );
         let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
         let staging_key = self.seen_staging_key();
+        // Each spill re-reads the full staging bitmap; acceptable for typical
+        // spill counts but O(total_staged) per call.
         let bytes = match self.backend.get(&staging_key) {
             Ok(Some(existing)) => {
                 let mut bitmap = RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
@@ -298,9 +310,17 @@ where
     B: GitPersistenceBackend,
 {
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
+        debug_assert!(
+            !self.finalizing.get(),
+            "batch_check_seen called during commit_finalize"
+        );
         if oids.is_empty() {
             return Ok(Vec::new());
         }
+        debug_assert!(
+            oids.iter().all(|o| o.len() == oids[0].len()),
+            "mixed OID lengths in batch_check_seen"
+        );
 
         self.load_seen_store(oids[0].len()).map_err(|err| {
             SpillError::Io(io::Error::other(format!(
@@ -328,6 +348,17 @@ where
         start_set_id: StartSetId,
         ref_names: &[&[u8]],
     ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+        // Watermark keys and seen-bitmap keys must be scoped to the same
+        // (repo_id, policy_hash) identity. A mismatch would silently return
+        // watermarks for a different scope than the seen-bitmap uses.
+        debug_assert!(
+            repo_id == self.repo_id && policy_hash == self.policy_hash,
+            "load_watermarks identity mismatch: caller ({repo_id}, {policy_hash:?}) \
+             vs adapter ({}, {:?})",
+            self.repo_id,
+            self.policy_hash
+        );
+
         let mut keys = Vec::with_capacity(ref_names.len());
         for name in ref_names {
             keys.push(build_ref_wm_key(repo_id, &policy_hash, &start_set_id, name));
@@ -401,6 +432,8 @@ where
 
         let seen_scope_key = self.seen_scope_key();
         let seen_staging_key = self.seen_staging_key();
+        // The seen-bitmap namespace prefix is 3 bytes (`sb\0`) — must match
+        // the `NS_SEEN_BLOB` constant in `scanner_git::finalize`.
         let seen_namespace = &seen_scope_key[..3];
         let mut first_phase_ops = Vec::with_capacity(output.data_ops.len() + 2);
         let mut seen_oids = Vec::new();
@@ -430,7 +463,7 @@ where
                     })?;
                     if staging_bitmap.len() != staging_bitmap.index_len() {
                         return Err(PersistError::backend(
-                            "staging bitmap contains unseen entries",
+                            "staging bitmap internal inconsistency: bit count does not match index length",
                         ));
                     }
                     seen_oids.extend_from_slice(staging_bitmap.all_oids());
@@ -449,6 +482,8 @@ where
 
         let mut staged_bitmap = None;
         if !seen_oids.is_empty() {
+            // Both sources are already sorted; `from_oids` re-sorts as a
+            // simplicity trade-off.
             let delta = SeenBitmapDelta::from_oids(&seen_oids)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
             let oid_len = delta.oid_len();
@@ -505,9 +540,9 @@ where
             self.backend
                 .apply_batch(&first_phase_ops)
                 .map_err(|err| PersistError::backend(err.to_string()))?;
-            if let Some(bitmap) = staged_bitmap {
-                *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
-            }
+        }
+        if let Some(bitmap) = staged_bitmap {
+            *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
         }
         if !watermark_ops.is_empty() {
             self.backend

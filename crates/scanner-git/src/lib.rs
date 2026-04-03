@@ -363,7 +363,6 @@ pub use finalize::{
     WriteOp,
 };
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
-#[cfg(feature = "rocksdb")]
 pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
 pub use roaring_seen::{SeenBitmapDelta, SeenBitmapError};
 pub use snapshot_plan::snapshot_plan;
