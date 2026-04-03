@@ -1,6 +1,6 @@
 ---
 name: sim-scaffold
-description: Scaffold simulation-testable modules with sans-IO pattern, proptest state machine tests, and fault injection points — prevents retrofitting costs by making code DST-ready from the start
+description: Use when creating a new module in gossip-coordination, adding a gossip protocol component, or building a pipeline stage that touches distributed state. Generates DST-ready boilerplate with sans-IO pattern and proptest harnesses.
 user-invocable: true
 ---
 

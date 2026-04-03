@@ -1,6 +1,6 @@
 ---
 name: test-pipeline
-description: Two-phase testing pipeline — parallel assessment agents evaluate test strategy, invariant strength, and redundancy, then specialized testing skills improve coverage based on finding classification
+description: Use when implementing a new feature and assessing coverage gaps, during periodic test hygiene, when test suites feel bloated, or before merging code that changes coordination or hot paths. Two-phase assess-then-improve testing pipeline.
 user-invocable: true
 ---
 

@@ -72,9 +72,9 @@ The module provides seven core capabilities:
   `gossip-contracts::connector` and `gossip-scanner-runtime` so CLI and
   distributed execution share one family-oriented orchestration surface.
 
-### Source files
+### Core source files
 
-#### `gossip-coordination` crate (`crates/gossip-coordination/src/`)
+#### `gossip-coordination` crate (`crates/gossip-coordination/src/`, excluding `*_tests.rs`; `src/sim/` is covered in [simulation-harness.md](simulation-harness.md))
 
 | File                 | Role                                                                                             |
 | -------------------- | ------------------------------------------------------------------------------------------------ |
@@ -94,7 +94,7 @@ The module provides seven core capabilities:
 | `conformance.rs`     | Feature-gated backend-agnostic coordination conformance harness for `SimulationBackend` impls    |
 | `lib.rs`             | Module root and public re-exports                                                                |
 
-#### `gossip-contracts` crate (`crates/gossip-contracts/src/coordination/`)
+#### `gossip-contracts` crate (`crates/gossip-contracts/src/coordination/`, excluding `*_tests.rs`)
 
 | File           | Role                                                                                                                       |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------- |

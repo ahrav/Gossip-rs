@@ -23,6 +23,7 @@ use gix_ref::bstr::ByteSlice;
 use gix_ref::transaction::{Change, LogChange, PreviousValue, RefEdit};
 use gix_ref::{FullName, Target};
 
+use crate::bytes::BytesView;
 use crate::commit_loader::resolve_pack_paths_from_midx;
 use crate::midx_build::{build_midx_bytes, MidxBuildLimits};
 use crate::native_ref_resolver::open_ref_store_with_format;
@@ -226,10 +227,24 @@ pub fn materialize_synthetic_commit_ref(
 
 /// Determine the object type of `oid` in the mirror's object database.
 ///
-/// Tries the pack index first (via MIDX header-only resolution), falling back
-/// to loose object lookup when packs are absent or when any MIDX/pack
-/// operation fails. Returns `Ok(None)` when the OID is not found in either
-/// store.
+/// Uses a tiered resolution strategy to minimize I/O:
+///
+/// 1. **On-disk MIDX** (Tier 1) — if `<pack>/multi-pack-index` exists, it is
+///    mmapped and used directly. This avoids the O(N log P) k-way merge that
+///    `build_midx_bytes` performs when building an in-memory MIDX from scratch.
+///    When the on-disk MIDX is stale (missing packs added after the last
+///    `git multi-pack-index write`), a full rebuild from `.idx` files is
+///    triggered before falling back to loose.
+/// 2. **In-memory MIDX build** (Tier 2) — when no on-disk MIDX is present,
+///    the MIDX is built from pack idx files.
+/// 3. **Loose objects** (fallback) — probed when packs are absent or when pack
+///    resolution fails.
+///
+/// The commit-graph is **not** consulted here because a hit only proves the
+/// OID was once a commit — it cannot guarantee the object still exists
+/// (entries outlive pruned objects). [`lookup_commit_graph_kind`] is available
+/// for callers that need a fast commit-identity hint and can independently
+/// verify liveness.
 ///
 /// When a pack/MIDX error occurs and the subsequent loose probe also misses,
 /// the original pack error is surfaced rather than silently returning `None`
@@ -238,27 +253,33 @@ pub fn materialize_synthetic_commit_ref(
 /// The pack path reads only entry headers (no payload decompression). For
 /// non-delta entries the kind is embedded directly in the header. For delta
 /// entries the chain is followed via headers until a non-delta base is reached.
+/// `REF_DELTA` bases missing from the MIDX fall back to loose-object lookup for
+/// the base OID because delta entries inherit their base object's type.
 fn lookup_object_kind(
     paths: &GitRepoPaths,
     oid: OidBytes,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
-    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
-        Ok(midx_bytes) => {
-            let midx = MidxView::parse(midx_bytes.as_slice(), oid.format()).map_err(|err| {
-                SyntheticCommitRefError::ObjectLookup {
-                    detail: err.to_string(),
-                }
-            })?;
-            let pack_dirs = collect_pack_dirs(paths);
-            let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).map_err(|err| {
-                SyntheticCommitRefError::ObjectLookup {
-                    detail: err.to_string(),
-                }
-            })?;
-            match lookup_packed_object_kind(&midx, &pack_paths, oid) {
+    // Tier 1+2: on-disk MIDX (zero-copy mmap) or in-memory MIDX build.
+    //
+    // `load_or_build_midx` returns raw bytes plus a flag indicating
+    // whether they came from an on-disk file. `resolve_via_midx_bytes`
+    // performs the single parse-and-lookup for each MIDX source, avoiding
+    // the redundant validation round-trip that a separate pre-check would
+    // require. When on-disk bytes fail to parse (corrupt / stale), we
+    // rebuild from pack idx files and retry.
+    match load_or_build_midx(paths, oid.format()) {
+        Ok((midx_bytes, from_disk)) => {
+            match resolve_via_midx_bytes(midx_bytes.as_slice(), paths, oid) {
                 Ok(Some(kind)) => Ok(Some(kind)),
-                // OID not in pack index — try loose objects.
+                Ok(None) if from_disk => rebuild_midx_and_resolve(paths, oid),
                 Ok(None) => lookup_loose_object_kind(paths, oid),
+                Err(first_err) if from_disk => {
+                    tracing::debug!(
+                        error = %first_err,
+                        "on-disk MIDX failed, rebuilding from pack idx files"
+                    );
+                    rebuild_midx_and_resolve(paths, oid)
+                }
                 // Pack header resolution failed — try loose objects before
                 // hard-failing, since the object may exist outside packs.
                 // If loose also misses, surface the original pack error.
@@ -269,21 +290,147 @@ fn lookup_object_kind(
                 },
             }
         }
-        // Any MIDX build failure (missing packs, corrupt idx, too many
+        // Any MIDX load/build failure (missing packs, corrupt idx, too many
         // packs, etc.) falls back to loose object lookup rather than
         // hard-failing. The object may exist as a loose file even when
         // pack index enumeration cannot complete. If loose also misses,
         // surface the original MIDX error.
         Err(midx_err) => match lookup_loose_object_kind(paths, oid) {
             Ok(Some(kind)) => Ok(Some(kind)),
-            Ok(None) => Err(SyntheticCommitRefError::ObjectLookup {
-                detail: midx_err.to_string(),
-            }),
-            Err(_) => Err(SyntheticCommitRefError::ObjectLookup {
-                detail: midx_err.to_string(),
-            }),
+            Ok(None) => Err(midx_err),
+            Err(_) => Err(midx_err),
         },
     }
+}
+
+/// Rebuild the MIDX from all current `.idx` files and re-resolve `oid`.
+///
+/// Used when the on-disk MIDX is stale (returns `None` for an OID that
+/// exists in a newer pack) or corrupt (fails to parse). Falls back to
+/// loose-object lookup when the rebuilt MIDX still misses or the build
+/// itself fails.
+fn rebuild_midx_and_resolve(
+    paths: &GitRepoPaths,
+    oid: OidBytes,
+) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
+    // Default limits are intentional for this transient single-OID probe
+    // (see `load_or_build_midx` doc).
+    match build_midx_bytes(paths, oid.format(), &MidxBuildLimits::default()) {
+        Ok(built) => match resolve_via_midx_bytes(built.as_slice(), paths, oid) {
+            Ok(Some(kind)) => Ok(Some(kind)),
+            Ok(None) => lookup_loose_object_kind(paths, oid),
+            Err(pack_err) => match lookup_loose_object_kind(paths, oid) {
+                Ok(Some(kind)) => Ok(Some(kind)),
+                Ok(None) => Err(pack_err),
+                Err(_) => Err(pack_err),
+            },
+        },
+        Err(build_err) => {
+            let err = SyntheticCommitRefError::ObjectLookup {
+                detail: build_err.to_string(),
+            };
+            match lookup_loose_object_kind(paths, oid) {
+                Ok(Some(kind)) => Ok(Some(kind)),
+                _ => Err(err),
+            }
+        }
+    }
+}
+
+/// Probe the on-disk commit-graph for `oid`.
+///
+/// The commit-graph stores only commit OIDs in a fanout-indexed sorted array.
+/// A hit means the graph recorded this OID as a commit, but callers still need
+/// to confirm the object exists in the object database because commit-graph
+/// entries can outlive pruned objects. A miss is inconclusive — the graph may
+/// be incomplete (not all commits are indexed) or absent entirely.
+///
+/// Tries `<objects>/info/commit-graph` first, then the split chain under
+/// `<objects>/info/commit-graphs/`. Errors (missing file, corrupt data) are
+/// silently swallowed — the caller falls through to pack-based resolution.
+///
+/// The graph is opened and parsed on every call. Callers that need to probe
+/// multiple OIDs should hoist the `Graph::from_info_dir` call to avoid
+/// repeated I/O and parsing overhead.
+#[allow(dead_code)] // Retained for tests and future batch-oriented callers.
+fn lookup_commit_graph_kind(paths: &GitRepoPaths, oid: OidBytes) -> Option<ObjectKind> {
+    let info_dir = paths.objects_dir.join("info");
+    let graph = gix_commitgraph::Graph::from_info_dir(&info_dir).ok()?;
+    let gix_oid = gix_hash::ObjectId::try_from(oid.as_slice()).ok()?;
+    graph.commit_by_id(gix_oid).map(|_| ObjectKind::Commit)
+}
+
+/// Parse MIDX bytes and resolve the object kind for `oid` from packed objects.
+///
+/// Performs a single `MidxView::parse` and full pack-header walk. Extracted
+/// so `lookup_object_kind` can call it on both on-disk and in-memory MIDX
+/// bytes without duplicating the parse + resolve sequence.
+fn resolve_via_midx_bytes(
+    midx_bytes: &[u8],
+    paths: &GitRepoPaths,
+    oid: OidBytes,
+) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
+    let midx = MidxView::parse(midx_bytes, oid.format()).map_err(|err| {
+        SyntheticCommitRefError::ObjectLookup {
+            detail: err.to_string(),
+        }
+    })?;
+    let pack_dirs = collect_pack_dirs(paths);
+    let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).map_err(|err| {
+        SyntheticCommitRefError::ObjectLookup {
+            detail: err.to_string(),
+        }
+    })?;
+    lookup_packed_object_kind(&midx, &pack_paths, paths, oid)
+}
+
+/// Load an existing on-disk MIDX or build one from pack idx files.
+///
+/// The on-disk MIDX at `<pack>/multi-pack-index` is produced by
+/// `git multi-pack-index write` or `git maintenance`. When present it is
+/// mmapped and returned as raw bytes — far cheaper than the O(N log P)
+/// k-way merge that `build_midx_bytes` performs from scratch. The caller
+/// is responsible for the single `MidxView::parse` call (via
+/// [`resolve_via_midx_bytes`]) on the returned bytes, avoiding a redundant
+/// validation round-trip.
+///
+/// Returns `(bytes, from_disk)` where `from_disk` is `true` when the bytes
+/// came from the on-disk MIDX file. The caller uses this to decide whether
+/// a parse failure should trigger a rebuild from pack idx files.
+///
+/// Falls back to `build_midx_bytes` when the on-disk file is absent or
+/// when the mmap fails.
+fn load_or_build_midx(
+    paths: &GitRepoPaths,
+    format: ObjectFormat,
+) -> Result<(BytesView, bool), SyntheticCommitRefError> {
+    let ondisk = paths.pack_dir.join("multi-pack-index");
+    if let Ok(file) = fs::File::open(&ondisk) {
+        // SAFETY: The mirror directory is under exclusive access by the scan
+        // coordinator for the duration of the scan job; no concurrent process
+        // modifies or truncates pack metadata while this mapping is live.
+        // The mapping is read-only.
+        let mmap = unsafe { memmap2::Mmap::map(&file) };
+        match mmap {
+            Ok(mmap) => return Ok((BytesView::from_mmap(mmap), true)),
+            Err(err) => {
+                tracing::debug!(
+                    path = %ondisk.display(),
+                    error = %err,
+                    "on-disk MIDX mmap failed, falling back to in-memory build"
+                );
+            }
+        }
+    }
+
+    // Default limits are intentional: this is a private lookup path where
+    // the MIDX is built transiently for a single OID probe, not cached.
+    let built = build_midx_bytes(paths, format, &MidxBuildLimits::default()).map_err(|err| {
+        SyntheticCommitRefError::ObjectLookup {
+            detail: err.to_string(),
+        }
+    })?;
+    Ok((built, false))
 }
 
 /// Maximum entry-header bytes parsed per pack entry. 64 bytes covers the
@@ -307,6 +454,7 @@ const KIND_RESOLVE_MAX_DELTA_DEPTH: u8 = 64;
 fn lookup_packed_object_kind(
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
+    paths: &GitRepoPaths,
     oid: OidBytes,
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
     let idx = match midx
@@ -325,6 +473,7 @@ fn lookup_packed_object_kind(
     resolve_kind_at(
         midx,
         pack_paths,
+        paths,
         pack_id,
         offset,
         KIND_RESOLVE_MAX_DELTA_DEPTH,
@@ -344,6 +493,7 @@ fn lookup_packed_object_kind(
 fn resolve_kind_at(
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
+    paths: &GitRepoPaths,
     pack_id: u16,
     offset: u64,
     remaining_depth: u8,
@@ -351,6 +501,8 @@ fn resolve_kind_at(
 ) -> Result<Option<ObjectKind>, SyntheticCommitRefError> {
     // Reuse the cached mmap when following OFS_DELTA chains within the
     // same pack; only open a new mapping when crossing pack boundaries.
+    // Cross-pack hops re-mmap, but chain depth is bounded by
+    // `KIND_RESOLVE_MAX_DELTA_DEPTH` so the worst-case mmap count is small.
     let fresh_map;
     let (data, this_mmap): (&[u8], Option<&memmap2::Mmap>) = match cached_pack {
         Some((cached_id, mmap)) if cached_id == pack_id => (mmap.as_ref(), Some(mmap)),
@@ -391,6 +543,7 @@ fn resolve_kind_at(
             resolve_kind_at(
                 midx,
                 pack_paths,
+                paths,
                 pack_id,
                 base_offset,
                 remaining_depth - 1,
@@ -409,7 +562,7 @@ fn resolve_kind_at(
                 }
             })? {
                 Some(idx) => idx,
-                None => return Ok(None),
+                None => return lookup_loose_object_kind(paths, base_oid),
             };
             let (base_pack_id, base_offset) =
                 midx.offset_at(base_idx)
@@ -425,6 +578,7 @@ fn resolve_kind_at(
             resolve_kind_at(
                 midx,
                 pack_paths,
+                paths,
                 base_pack_id,
                 base_offset,
                 remaining_depth - 1,
@@ -439,7 +593,10 @@ fn mmap_pack(path: &Path) -> Result<memmap2::Mmap, SyntheticCommitRefError> {
     let file = fs::File::open(path).map_err(|err| SyntheticCommitRefError::ObjectLookup {
         detail: format!("pack open failed: {err}"),
     })?;
-    // SAFETY: pack files are immutable for the duration of a mirror job.
+    // SAFETY: The mirror directory is under exclusive access by the scan
+    // coordinator for the duration of the scan job; no concurrent process
+    // modifies or truncates pack files while this mapping is live. The
+    // mapping is read-only.
     unsafe {
         memmap2::Mmap::map(&file).map_err(|err| SyntheticCommitRefError::ObjectLookup {
             detail: format!("pack mmap failed: {err}"),
@@ -548,11 +705,65 @@ fn parse_loose_object_kind(bytes: &[u8]) -> Result<ObjectKind, SyntheticCommitRe
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::delta_test_helpers::{make_add_delta, zlib_compress, SyntheticPackBuilder};
+    use crate::midx_test_builder::MidxBuilder;
     use crate::native_ref_resolver::tests::{git, init_repo, parse_oid, resolve_with, try_git};
+    use crate::repo::RepoKind;
     use crate::StartSetConfig;
+
+    fn write_loose_object(objects_dir: &Path, oid: OidBytes, kind: &str, payload: &[u8]) {
+        let mut object = Vec::new();
+        object.extend_from_slice(kind.as_bytes());
+        object.push(b' ');
+        object.extend_from_slice(payload.len().to_string().as_bytes());
+        object.push(0);
+        object.extend_from_slice(payload);
+
+        let compressed = zlib_compress(&object);
+        let hex = oid.to_string();
+        let (dir, file) = hex.split_at(2);
+        let dir_path = objects_dir.join(dir);
+        fs::create_dir_all(&dir_path).expect("create loose object shard");
+        fs::write(dir_path.join(file), compressed).expect("write loose object");
+    }
+
+    /// Build a [`GitRepoPaths`] for a bare repo rooted at `repo_root`.
+    ///
+    /// Creates the directory and canonicalizes the path so the returned
+    /// struct satisfies the "all paths canonicalized" invariant.
+    fn bare_repo_paths(repo_root: &Path) -> GitRepoPaths {
+        fs::create_dir_all(repo_root).expect("create bare repo root");
+        let repo_root = repo_root
+            .canonicalize()
+            .expect("canonicalize bare repo root");
+        let objects_dir = repo_root.join("objects");
+        let pack_dir = objects_dir.join("pack");
+        GitRepoPaths {
+            kind: RepoKind::Bare,
+            worktree_root: None,
+            git_dir: repo_root.clone(),
+            common_dir: repo_root,
+            objects_dir,
+            pack_dir,
+            alternate_object_dirs: Vec::new(),
+        }
+    }
+
+    fn write_pack_and_midx(
+        paths: &GitRepoPaths,
+        pack_name: &str,
+        pack_bytes: &[u8],
+        midx: &[u8],
+    ) -> PathBuf {
+        fs::create_dir_all(&paths.pack_dir).expect("create pack dir");
+        let pack_path = paths.pack_dir.join(format!("{pack_name}.pack"));
+        fs::write(&pack_path, pack_bytes).expect("write pack");
+        fs::write(paths.pack_dir.join("multi-pack-index"), midx).expect("write midx");
+        pack_path
+    }
 
     #[test]
     fn synthetic_commit_ref_name_is_stable_and_distinct_across_formats() {
@@ -761,9 +972,8 @@ mod tests {
             ],
         );
 
-        // Repack the mirror so all objects live exclusively in packs,
-        // then prune loose objects. This forces the kind-resolution
-        // path through the MIDX + pack-header walker.
+        // Repack leaves the mirror's reachable objects in packfiles;
+        // prune-packed removes duplicate loose copies.
         git(&mirror, &["repack", "-a", "-d"]);
         git(&mirror, &["prune-packed"]);
 
@@ -774,5 +984,296 @@ mod tests {
             git(&mirror, &["rev-parse", &ref_name_str]),
             commit.to_string(),
         );
+    }
+
+    #[test]
+    fn lookup_object_kind_resolves_ref_delta_base_from_loose_object() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+        fs::create_dir_all(&paths.objects_dir).expect("create objects dir");
+
+        let base_oid_bytes = [0x66; 20];
+        let delta_oid_bytes = [0x77; 20];
+        let base_oid = OidBytes::sha1(base_oid_bytes);
+        let delta_oid = OidBytes::sha1(delta_oid_bytes);
+        let base_payload = b"base commit";
+        let delta = make_add_delta(base_payload.len(), b"!");
+
+        write_loose_object(&paths.objects_dir, base_oid, "commit", base_payload);
+
+        let mut pack = SyntheticPackBuilder::new();
+        let delta_idx = pack.add_ref_delta(base_oid, &delta);
+        let (pack_bytes, offsets) = pack.build();
+
+        let mut midx = MidxBuilder::new();
+        midx.add_pack(b"delta");
+        midx.add_object(delta_oid_bytes, 0, offsets[delta_idx]);
+        write_pack_and_midx(&paths, "delta", &pack_bytes, &midx.build());
+
+        let kind = lookup_object_kind(&paths, delta_oid).expect("lookup succeeds");
+        assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
+    fn lookup_object_kind_resolves_ref_delta_base_from_midx() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+
+        let base_oid_bytes = [0x44; 20];
+        let delta_oid_bytes = [0x45; 20];
+        let base_oid = OidBytes::sha1(base_oid_bytes);
+        let delta_oid = OidBytes::sha1(delta_oid_bytes);
+        let base_payload = b"packed commit";
+        let delta = make_add_delta(base_payload.len(), b"!");
+
+        let mut pack = SyntheticPackBuilder::new();
+        let base_idx = pack.add_non_delta(1, base_payload);
+        let delta_idx = pack.add_ref_delta(base_oid, &delta);
+        let (pack_bytes, offsets) = pack.build();
+
+        let mut midx = MidxBuilder::new();
+        midx.add_pack(b"delta");
+        midx.add_object(base_oid_bytes, 0, offsets[base_idx]);
+        midx.add_object(delta_oid_bytes, 0, offsets[delta_idx]);
+        write_pack_and_midx(&paths, "delta", &pack_bytes, &midx.build());
+
+        let kind = lookup_object_kind(&paths, delta_oid).expect("lookup succeeds");
+        assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
+    fn lookup_object_kind_returns_none_when_ref_delta_base_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+
+        let base_oid = OidBytes::sha1([0x88; 20]);
+        let delta_oid_bytes = [0x99; 20];
+        let delta_oid = OidBytes::sha1(delta_oid_bytes);
+        let delta = make_add_delta(0, b"!");
+
+        let mut pack = SyntheticPackBuilder::new();
+        let delta_idx = pack.add_ref_delta(base_oid, &delta);
+        let (pack_bytes, offsets) = pack.build();
+
+        let mut midx = MidxBuilder::new();
+        midx.add_pack(b"delta");
+        midx.add_object(delta_oid_bytes, 0, offsets[delta_idx]);
+        write_pack_and_midx(&paths, "delta", &pack_bytes, &midx.build());
+
+        let kind = lookup_object_kind(&paths, delta_oid).expect("lookup succeeds");
+        assert_eq!(kind, None);
+    }
+
+    /// Build minimal pack index v2 bytes for a single pack.
+    ///
+    /// Supports only SHA-1 OIDs and offsets that fit in 4 bytes, which matches
+    /// the synthetic pack fixtures in this module.
+    fn build_test_idx(objects: &[([u8; 20], u64)]) -> Vec<u8> {
+        const IDX_MAGIC: [u8; 4] = [0xff, b't', b'O', b'c'];
+        const IDX_VERSION: u32 = 2;
+
+        let mut sorted = objects.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Fanout table: 256 entries of u32 cumulative counts.
+        let mut fanout = vec![0u8; 256 * 4];
+        let mut counts = [0u32; 256];
+        for (oid, _) in &sorted {
+            counts[oid[0] as usize] += 1;
+        }
+        let mut running = 0u32;
+        for (i, count) in counts.iter().enumerate() {
+            running += count;
+            let off = i * 4;
+            fanout[off..off + 4].copy_from_slice(&running.to_be_bytes());
+        }
+
+        let mut oid_table = Vec::with_capacity(sorted.len() * 20);
+        let mut offset_table = Vec::with_capacity(sorted.len() * 4);
+        for (oid, offset) in &sorted {
+            oid_table.extend_from_slice(oid);
+            let offset = u32::try_from(*offset).expect("test idx only supports 32-bit offsets");
+            offset_table.extend_from_slice(&offset.to_be_bytes());
+        }
+        let crc_table = vec![0u8; sorted.len() * 4];
+        // Pack checksum (20 bytes) + idx checksum (20 bytes). Zeroed because
+        // neither `IdxView::parse` nor the MIDX builder currently validates
+        // these; update if checksum enforcement is added.
+        let checksums = vec![0u8; 40];
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&IDX_MAGIC);
+        out.extend_from_slice(&IDX_VERSION.to_be_bytes());
+        out.extend_from_slice(&fanout);
+        out.extend_from_slice(&oid_table);
+        out.extend_from_slice(&crc_table);
+        out.extend_from_slice(&offset_table);
+        out.extend_from_slice(&checksums);
+        out
+    }
+
+    #[test]
+    fn lookup_commit_graph_kind_reads_commit_from_commit_graph() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+
+        // Write the commit-graph so Tier 0 has data to probe.
+        git(&mirror, &["commit-graph", "write", "--reachable"]);
+
+        let paths = GitRepoPaths::resolve::<RepoOpenError, _>(&mirror, &RepoOpenLimits::default())
+            .expect("resolve paths");
+
+        // `git commit-graph write` should have materialized the graph file.
+        assert!(
+            paths.objects_dir.join("info").join("commit-graph").exists(),
+            "commit-graph file must be written by `git commit-graph write`"
+        );
+
+        assert_eq!(
+            lookup_commit_graph_kind(&paths, commit),
+            Some(ObjectKind::Commit)
+        );
+    }
+
+    #[test]
+    fn lookup_object_kind_rejects_commit_graph_hits_when_the_object_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+
+        fs::write(source.join("tracked.txt"), "v1\n").expect("write tracked file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        let commit = parse_oid(&git(&source, &["rev-parse", "HEAD"]));
+
+        let mirror = tmp.path().join("mirror.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--mirror",
+                source.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+        git(&mirror, &["commit-graph", "write", "--reachable"]);
+
+        let paths = GitRepoPaths::resolve::<RepoOpenError, _>(&mirror, &RepoOpenLimits::default())
+            .expect("resolve paths");
+
+        let hex = commit.to_string();
+        let (dir, file) = hex.split_at(2);
+        let object_path = paths.objects_dir.join(dir).join(file);
+        assert!(
+            object_path.exists(),
+            "commit object should exist before removal"
+        );
+        fs::remove_file(&object_path).expect("remove commit object");
+
+        let kind = lookup_object_kind(&paths, commit).expect("lookup succeeds");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn lookup_object_kind_falls_back_to_build_when_ondisk_midx_is_corrupt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+        fs::create_dir_all(&paths.pack_dir).expect("create pack dir");
+
+        // Build a valid pack containing a single commit object.
+        let commit_oid_bytes = [0xAA; 20];
+        let commit_oid = OidBytes::sha1(commit_oid_bytes);
+        let commit_payload = b"commit object data";
+
+        let mut pack = SyntheticPackBuilder::new();
+        let entry_idx = pack.add_non_delta(1, commit_payload); // type 1 = commit
+        let (pack_bytes, offsets) = pack.build();
+
+        // Write pack + matching idx so `build_midx_bytes` can rebuild.
+        let pack_name = "pack-test123";
+        fs::write(
+            paths.pack_dir.join(format!("{pack_name}.pack")),
+            &pack_bytes,
+        )
+        .expect("write pack");
+        let idx_bytes = build_test_idx(&[(commit_oid_bytes, offsets[entry_idx])]);
+        fs::write(paths.pack_dir.join(format!("{pack_name}.idx")), &idx_bytes).expect("write idx");
+
+        // Corrupt on-disk MIDX bytes leave the pack and idx files untouched.
+        fs::write(paths.pack_dir.join("multi-pack-index"), b"CORRUPT GARBAGE")
+            .expect("write corrupt midx");
+
+        let kind = lookup_object_kind(&paths, commit_oid).expect("lookup succeeds via fallback");
+        assert_eq!(kind, Some(ObjectKind::Commit));
+    }
+
+    #[test]
+    fn lookup_object_kind_rebuilds_stale_ondisk_midx_before_reporting_missing_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("mirror.git");
+        let paths = bare_repo_paths(&repo_root);
+        fs::create_dir_all(&paths.pack_dir).expect("create pack dir");
+
+        let indexed_oid_bytes = [0x10; 20];
+        let target_oid_bytes = [0x11; 20];
+        let target_oid = OidBytes::sha1(target_oid_bytes);
+
+        let mut first_pack = SyntheticPackBuilder::new();
+        let first_idx = first_pack.add_non_delta(1, b"indexed commit");
+        let (first_pack_bytes, first_offsets) = first_pack.build();
+        let first_pack_name = "pack-indexed";
+        fs::write(
+            paths.pack_dir.join(format!("{first_pack_name}.pack")),
+            &first_pack_bytes,
+        )
+        .expect("write indexed pack");
+        fs::write(
+            paths.pack_dir.join(format!("{first_pack_name}.idx")),
+            build_test_idx(&[(indexed_oid_bytes, first_offsets[first_idx])]),
+        )
+        .expect("write indexed idx");
+
+        let mut second_pack = SyntheticPackBuilder::new();
+        let second_idx = second_pack.add_non_delta(1, b"newer commit");
+        let (second_pack_bytes, second_offsets) = second_pack.build();
+        let second_pack_name = "pack-newer";
+        fs::write(
+            paths.pack_dir.join(format!("{second_pack_name}.pack")),
+            &second_pack_bytes,
+        )
+        .expect("write newer pack");
+        fs::write(
+            paths.pack_dir.join(format!("{second_pack_name}.idx")),
+            build_test_idx(&[(target_oid_bytes, second_offsets[second_idx])]),
+        )
+        .expect("write newer idx");
+
+        let mut stale_midx = MidxBuilder::new();
+        stale_midx.add_pack(first_pack_name.as_bytes());
+        stale_midx.add_object(indexed_oid_bytes, 0, first_offsets[first_idx]);
+        fs::write(paths.pack_dir.join("multi-pack-index"), stale_midx.build())
+            .expect("write stale midx");
+
+        let kind = lookup_object_kind(&paths, target_oid).expect("lookup succeeds via rebuild");
+        assert_eq!(kind, Some(ObjectKind::Commit));
     }
 }

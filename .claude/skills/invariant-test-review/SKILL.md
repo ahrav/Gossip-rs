@@ -1,6 +1,6 @@
 ---
 name: invariant-test-review
-description: Review tests to ensure they actually prove the claimed invariant, especially state-machine, simulation, oracle, and regression tests where extra setup, missing negative paths, or order-sensitive comparisons can hide the real signal
+description: Use when writing or reviewing state-machine tests, simulation tests, oracle tests, or regression tests to verify they actually prove the claimed invariant. Catches hidden weaknesses like missing negative paths and order-sensitive comparisons.
 user-invocable: true
 ---
 

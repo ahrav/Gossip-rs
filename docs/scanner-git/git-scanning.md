@@ -30,7 +30,7 @@ flowchart LR
 | Artifact Acquire      | `crates/scanner-git/src/artifact_acquire.rs`                                   | Build MIDX + commit-graph in memory and capture artifact fingerprint                                   |
 | Commit Walk           | `crates/scanner-git/src/commit_walk.rs`                                        | `(watermark, tip]` traversal and topo ordering                                                         |
 | Tree Diff             | `crates/scanner-git/src/tree_diff.rs`                                          | OID-only tree diffs that emit blob candidates                                                          |
-| Spill + Dedupe        | `crates/scanner-git/src/spiller.rs`                                            | Global dedupe + seen-blob filtering                                                                    |
+| Spill + Dedupe        | `crates/scanner-git/src/spiller.rs`                                            | Global dedupe + seen-blob filtering with incremental seen-bitmap checkpoints                           |
 | MIDX Mapping          | `crates/scanner-git/src/mapping_bridge.rs`                                     | Map unique blobs to pack offsets or loose fallback                                                     |
 | Pack Planning         | `crates/scanner-git/src/pack_plan.rs`                                          | Build per-pack decode plans with delta closure                                                         |
 | Pack Exec             | `crates/scanner-git/src/runner_exec.rs`, `crates/scanner-git/src/pack_exec.rs` | Scheduler-driven pack execution and decode with bounded buffers                                        |
@@ -56,7 +56,9 @@ flowchart LR
   race-winner based and can vary across worker counts.
 - Findings are deduped per blob and stored as `(start, end, rule_id, norm_hash)`.
 - No raw secret bytes are persisted; only hashes and metadata are stored.
-- Persistence is atomic: data ops and (when complete) watermark ops are committed together.
+- Persistence is atomic at finalize: data ops and (when complete) watermark ops are committed together.
+- When a persistence store is configured, spill flushing also writes the
+  seen-bitmap incrementally without advancing ref watermarks.
 - Incremental correctness depends on `seen_blob` markers and ref watermarks;
   `blob_ctx` is metadata and is not a deterministic contract in parallel
   ODB-blob mode.

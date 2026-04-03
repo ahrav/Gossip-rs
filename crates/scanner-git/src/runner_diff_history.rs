@@ -16,7 +16,8 @@
 //!    OIDs. Candidates stream directly into the spiller to bound memory.
 //! 2. **Spill / dedupe** – the spiller externalizes candidates to disk when the
 //!    in-memory budget is exceeded, then replays them through the seen-blob
-//!    store to drop already-scanned OIDs.
+//!    store to drop already-scanned OIDs while durably extending the
+//!    seen-bitmap after each flush.
 //! 3. **Mapping bridge** – maps surviving OIDs to pack locations via the MIDX,
 //!    partitioning into packed and loose candidate sets. Produces a `ByteArena`
 //!    of file paths that pack-exec and loose-scan reference by `ByteRef`.
@@ -71,7 +72,7 @@ use super::repo_open::RepoJobState;
 use super::runner::{
     GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
 };
-use super::seen_store::SeenBlobStore;
+use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::Spiller;
 use super::tree_delta_cache::TreeDeltaCache;
 use super::tree_diff::TreeDiffWalker;
@@ -133,6 +134,7 @@ pub(super) fn run_diff_history(
     repo: &RepoJobState,
     engine: Arc<Engine>,
     seen_store: &dyn SeenBlobStore,
+    seen_persister: &dyn SeenBitmapPersister,
     cg: &dyn CommitGraph,
     plan: &[PlannedCommit],
     config: &GitScanConfig,
@@ -282,7 +284,7 @@ pub(super) fn run_diff_history(
         ),
         mapping_cfg,
     );
-    let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
+    let spill_stats = spiller.finalize(seen_store, seen_persister, &mut bridge)?;
     perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
     let mapping_arena = Arc::new(mapping_arena);

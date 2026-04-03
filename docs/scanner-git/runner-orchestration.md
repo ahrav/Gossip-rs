@@ -26,7 +26,9 @@ The runner dispatches to one of two mode-specific pipelines after shared setup:
   spills/dedupes candidates, then batch-plans and executes pack decode + scan.
 
 Both pipelines produce a `ScanModeOutput` that the runner finalizes and
-optionally persists through a two-phase atomic write.
+optionally persists. When a persistence store is present, spill-stage
+seen-bitmap deltas are written incrementally during mode execution and finalize
+still ends with a two-phase atomic write.
 
 ## Execution Lifecycle
 
@@ -70,7 +72,8 @@ flowchart TD
    `AtomicBitSet` gates exactly-once `CommitMeta` emission across workers.
 6. **Mode dispatch** (`runner.rs`) -- delegates to
    `run_odb_blob` or `run_diff_history`. Both receive the shared engine,
-   seen store, commit plan, and `CommitMetaContext`.
+   seen store, optional seen-bitmap persister, commit plan, and
+   `CommitMetaContext`.
 7. **Post-execution stability check** (`runner.rs`) -- verifies pack
    artifacts have not changed during execution (detects concurrent `git gc`).
 8. **Finalize** (`runner.rs`) -- `build_finalize_ops` transforms
@@ -145,8 +148,8 @@ flowchart TD
 
 | Type                       | Description                                                    |
 | -------------------------- | -------------------------------------------------------------- |
-| `PersistenceStore` (trait) | Atomic commit interface for finalize output                    |
-| `InMemoryPersistenceStore` | Test-only in-memory store for inspection                       |
+| `PersistenceStore` (trait) | Atomic finalize commit interface; extends `SeenBitmapPersister` for incremental scope updates |
+| `InMemoryPersistenceStore` | Test-only in-memory store for inspection and scoped seen-bitmap tests |
 
 ## Engine Adapter
 
@@ -296,7 +299,7 @@ effects. It transforms scan results into stably-ordered write operations.
    - Emit a `blob_ctx` (`bc\0`) write op with the encoded context.
    - Gather findings across all contexts for this OID, sort + dedupe by
      identity `(start, end, rule_id, norm_hash)`, emit `finding` (`fn\0`) ops.
-   - Emit a `seen_blob` (`sb\0`) marker.
+   - Accumulate this OID into the scope-scoped seen-bitmap delta (`sb\0`).
 3. Assemble data ops in namespace order: `bc\0` < `fn\0` < `sb\0`.
 4. If the run is complete (no skipped candidates), emit ref watermark (`rw`)
    ops. If partial, watermark ops are empty.
@@ -307,7 +310,7 @@ effects. It transforms scan results into stably-ordered write operations.
 | ------ | -------------- | ------------------------------------ |
 | `bc\0` | blob_ctx       | Canonical context per scanned blob   |
 | `fn\0` | finding        | Individual finding records           |
-| `sb\0` | seen_blob      | Scanned marker per blob OID          |
+| `sb\0` | seen_blob      | Scope-scoped seen-bitmap delta       |
 | `rw`   | ref_watermark  | Ref tip watermarks (complete only)   |
 
 All keys use big-endian numeric fields to preserve lexicographic ordering.
@@ -323,9 +326,11 @@ Ref watermark keys are null-terminated for prefix-safe scans.
 
 ### Persistence
 
-`persist_finalize_output` (`persist.rs`) forwards the `FinalizeOutput`
-to a `PersistenceStore` implementation. The store must commit `data_ops` and
-(when complete) `watermark_ops` atomically, so readers never observe
+During spill flushing, the spiller forwards sorted unseen-OID batches to the
+`SeenBitmapPersister` (which may be the persistence store or a no-op) so the
+scope bitmap is warmed before finalize. `persist_finalize_output` (`persist.rs`) then forwards the
+`FinalizeOutput` to the same store. The finalize commit must write `data_ops`
+and (when complete) `watermark_ops` atomically, so readers never observe
 watermarks without corresponding data writes.
 
 ## Source of Truth

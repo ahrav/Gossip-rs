@@ -1,6 +1,6 @@
 ---
 name: unsafe-review
-description: Comprehensive review of unsafe code — audits safety invariants, demands benchmark+ASM proof of performance benefit, and verifies Miri/Kani/fuzz/property test coverage for every unsafe block
+description: Use when adding or modifying unsafe blocks, when reviewing code that uses raw pointers or transmute, or before merging changes to types with unsafe internals. Audits safety invariants and demands benchmark+ASM proof of performance benefit.
 user-invocable: true
 ---
 

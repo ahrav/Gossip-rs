@@ -373,10 +373,18 @@ graph TB
     RTB["RuntimeBuild(io::Error)<br/>Tokio runtime creation failure"]
     CODEC_ERR["Codec { operation, source }<br/>Encode/decode failures"]
     ETCD["Etcd { operation, source }<br/>gRPC failures"]
+    SIM["Simulated { operation, source }<br/>Feature-gated simulated etcd failures"]
     KSE["Keyspace(EtcdKeyspaceError)<br/>Namespace prefix validation"]
 
     OP_CONNECT["EtcdOperation::Connect"]
     OP_STATUS["EtcdOperation::Status"]
+    OP_GET["EtcdOperation::Get"]
+    OP_PUT["EtcdOperation::Put"]
+    OP_DELETE["EtcdOperation::Delete"]
+    OP_TXN["EtcdOperation::Txn"]
+    OP_LEASE_GRANT["EtcdOperation::LeaseGrant"]
+    OP_LEASE_KEEP_ALIVE["EtcdOperation::LeaseKeepAlive"]
+    OP_LEASE_REVOKE["EtcdOperation::LeaseRevoke"]
 
     CFGE_NE["NoEndpoints"]
     CFGE_EE["EmptyEndpoint { index }"]
@@ -392,10 +400,18 @@ graph TB
     ECE --> RTB
     ECE --> CODEC_ERR
     ECE --> ETCD
+    ECE --> SIM
     ECE --> KSE
 
     ETCD --> OP_CONNECT
     ETCD --> OP_STATUS
+    ETCD --> OP_GET
+    ETCD --> OP_PUT
+    ETCD --> OP_DELETE
+    ETCD --> OP_TXN
+    ETCD --> OP_LEASE_GRANT
+    ETCD --> OP_LEASE_KEEP_ALIVE
+    ETCD --> OP_LEASE_REVOKE
 
     CFG --> CFGE_NE
     CFG --> CFGE_EE
@@ -409,10 +425,18 @@ graph TB
     style CFG fill:#DCFCE7,stroke:#166534,color:#166534
     style RTB fill:#F3F4F6,stroke:#374151,color:#374151
     style ETCD fill:#DCFCE7,stroke:#166534,color:#166534
+    style SIM fill:#F3F4F6,stroke:#374151,color:#374151
     style KSE fill:#DCFCE7,stroke:#166534,color:#166534
 
     style OP_CONNECT fill:#F3F4F6,stroke:#374151,color:#374151
     style OP_STATUS fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_GET fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_PUT fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_DELETE fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_TXN fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_LEASE_GRANT fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_LEASE_KEEP_ALIVE fill:#F3F4F6,stroke:#374151,color:#374151
+    style OP_LEASE_REVOKE fill:#F3F4F6,stroke:#374151,color:#374151
 
     style CFGE_NE fill:#F3F4F6,stroke:#374151,color:#374151
     style CFGE_EE fill:#F3F4F6,stroke:#374151,color:#374151
@@ -463,7 +487,7 @@ graph TB
         MOD_KS["keyspace.rs<br/>Deterministic key paths<br/>Buffer-reuse API"]
         MOD_CODEC["codec.rs<br/>Binary encode/decode<br/>Staged slab rollback"]
         MOD_ERR["error.rs<br/>Error hierarchy<br/>Operation labels"]
-        MOD_BACK["backend.rs<br/>Direct etcd persistence +<br/>sync-async bridge"]
+        MOD_BACK["backend/<br/>coordinator.rs + run_management.rs +<br/>shard_coordination.rs"]
     end
 
     subgraph testing ["Testing Coverage"]
@@ -525,13 +549,13 @@ graph TB
 | `keyspace.rs` | Complete | Deterministic paths, buffer-reuse API, scan isolation |
 | `codec.rs` | Complete | Binary encode/decode, staged rollback, fuzz-tested |
 | `error.rs` | Complete | Full error hierarchy with operation labels |
-| `backend.rs` | Complete | Direct etcd persistence via CAS transactions for both `EtcdCoordinator` (sync) and `AsyncEtcdCoordinator` (async), including `complete`, `park_shard`, `checkpoint`, `renew`, `split_replace`, and `split_residual` |
+| `backend/` | Complete | `coordinator.rs` owns the entrypoints, etcd RPC wrappers, and CAS retry helpers; `run_management.rs` and `shard_coordination.rs` implement the full sync and async run/shard lifecycle, including `complete` and `park_shard` |
 
 The keyspace and codec are shared infrastructure used by the CAS transaction
-logic in `backend.rs`. The backend now persists the full shard-lifecycle write
-surface directly in etcd, while the in-memory implementation remains the
-reference executable specification for protocol semantics and deterministic
-simulation.
+logic in `backend/`. The durable path no longer delegates through an
+`InMemoryCoordinator`; both `EtcdCoordinator` and `AsyncEtcdCoordinator`
+persist coordination state directly in etcd and share the same validation and
+transaction shapes across the sync and async entrypoints.
 
 ---
 
@@ -554,11 +578,19 @@ simulation.
 | File | Purpose |
 |:---|:---|
 | `crates/gossip-coordination-etcd/src/lib.rs` | Crate root, public re-exports |
-| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), CAS transaction logic, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend.rs` | Module root for the `backend/` tree; shared free functions and backend-wide helpers |
+| `crates/gossip-coordination-etcd/src/backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper) and `AsyncEtcdCoordinator` (async core), sync-async bridge, low-level etcd RPC wrappers, CAS retry loop |
+| `crates/gossip-coordination-etcd/src/backend/run_management.rs` | Sync and async `RunManagement` implementations: run lifecycle, claim candidate collection, and `unpark_shard` |
+| `crates/gossip-coordination-etcd/src/backend/shard_coordination.rs` | Sync and async `CoordinationBackend` implementations: `acquire_and_restore_into`, `renew`, `checkpoint`, `complete`, `park_shard`, `split_replace`, and `split_residual` |
+| `crates/gossip-coordination-etcd/src/backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers |
+| `crates/gossip-coordination-etcd/src/behavioral_conformance.rs` | Real-etcd behavioral conformance scenarios that mirror the shared coordination harness using protocol operations plus persisted read-back oracles |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |
 | `crates/gossip-coordination-etcd/src/error.rs` | `EtcdCoordinatorError` and `EtcdOperation` |
+| `crates/gossip-coordination-etcd/src/sim_coordinator.rs` | Feature-gated deterministic simulation adapter that runs the sync etcd backend over the in-memory KV model |
+| `crates/gossip-coordination-etcd/src/sim_etcd_kv.rs` | Feature-gated in-memory model of the etcd KV subset used for deterministic simulation |
+| `crates/gossip-coordination-etcd/src/test_support.rs` | Testcontainers-backed lifecycle helpers plus namespace-isolated coordinator builders for integration tests |
 | `crates/gossip-coordination-etcd/src/tests.rs` | Config, keyspace, property tests, integration test |
 | `crates/gossip-coordination-etcd/src/codec_tests.rs` | Codec round-trip and error-case tests |
 | `crates/gossip-coordination-etcd/fuzz/fuzz_targets/` | 4 libfuzzer targets for decode/round-trip |

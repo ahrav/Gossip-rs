@@ -257,7 +257,13 @@ fn run_spiller(limits: SpillLimits, candidates: &[CandidateInput]) -> Vec<Canoni
     }
 
     let mut sink = CollectingUniqueBlobSink::default();
-    spiller.finalize(&NeverSeenStore, &mut sink).unwrap();
+    spiller
+        .finalize(
+            &NeverSeenStore,
+            &scanner_git::NullSeenBitmapPersister,
+            &mut sink,
+        )
+        .unwrap();
     sink.blobs.into_iter().map(CanonicalOut::from).collect()
 }
 
