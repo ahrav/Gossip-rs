@@ -376,7 +376,7 @@ impl RoaringSeenBitmap {
         self.merge_positions(&other.oids, |idx| bitmap_contains(&other.seen, idx))
     }
 
-    pub(crate) fn merge_delta(&mut self, delta: &SeenBitmapDelta) -> Result<(), SeenBitmapError> {
+    pub fn merge_delta(&mut self, delta: &SeenBitmapDelta) -> Result<(), SeenBitmapError> {
         if self.oid_len != delta.oid_len {
             return Err(SeenBitmapError::MixedOidLengths);
         }
@@ -601,6 +601,12 @@ impl RoaringSeenStore {
     /// Returns a mutable reference to the underlying bitmap.
     pub fn bitmap_mut(&mut self) -> &mut RoaringSeenBitmap {
         &mut self.bitmap
+    }
+
+    /// Consumes the store and returns the underlying bitmap.
+    #[must_use]
+    pub fn into_bitmap(self) -> RoaringSeenBitmap {
+        self.bitmap
     }
 }
 

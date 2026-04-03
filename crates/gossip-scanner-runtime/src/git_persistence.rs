@@ -206,7 +206,9 @@ impl<B> GitPersistenceAdapter<B> {
 }
 
 /// Cloned adapters share the backend but start with an empty seen-bitmap
-/// cache; the clone will re-load from the backend on next access.
+/// cache and a fresh `finalizing` flag. This deliberate reset enforces the
+/// single-writer invariant: each adapter instance independently loads its
+/// cache from the backend, preventing stale cache propagation.
 ///
 /// Two clones must not operate on the same `(repo_id, policy_hash)` scope
 /// concurrently because the staging key read-modify-write in
@@ -277,12 +279,12 @@ where
                 let mut bitmap = RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
                     SpillError::Io(io::Error::other(format!("corrupt staging bitmap: {err}")))
                 })?;
-                bitmap.insert_batch(delta.oids())?;
+                bitmap.merge_delta(&delta)?;
                 bitmap.serialize()?
             }
             Ok(None) => {
                 let mut bitmap = RoaringSeenBitmap::new(delta.oid_len());
-                bitmap.insert_batch(delta.oids())?;
+                bitmap.merge_delta(&delta)?;
                 bitmap.serialize()?
             }
             Err(err) => {
@@ -351,12 +353,13 @@ where
         // Watermark keys and seen-bitmap keys must be scoped to the same
         // (repo_id, policy_hash) identity. A mismatch would silently return
         // watermarks for a different scope than the seen-bitmap uses.
-        debug_assert!(
-            repo_id == self.repo_id && policy_hash == self.policy_hash,
-            "load_watermarks identity mismatch: caller ({repo_id}, {policy_hash:?}) \
-             vs adapter ({}, {:?})",
-            self.repo_id,
-            self.policy_hash
+        debug_assert_eq!(
+            repo_id, self.repo_id,
+            "load_watermarks called with mismatched repo_id"
+        );
+        debug_assert_eq!(
+            policy_hash, self.policy_hash,
+            "load_watermarks called with mismatched policy_hash"
         );
 
         let mut keys = Vec::with_capacity(ref_names.len());
@@ -455,7 +458,7 @@ where
         }
 
         let is_complete = matches!(output.outcome, FinalizeOutcome::Complete);
-        match self.backend.get(&seen_staging_key) {
+        let delete_staging_key = match self.backend.get(&seen_staging_key) {
             Ok(Some(bytes)) => {
                 if is_complete {
                     let staging_bitmap = RoaringSeenBitmap::deserialize(&bytes).map_err(|err| {
@@ -468,17 +471,15 @@ where
                     }
                     seen_oids.extend_from_slice(staging_bitmap.all_oids());
                 }
-                first_phase_ops.push(GitPersistenceOp::Delete {
-                    key: seen_staging_key.clone(),
-                });
+                true
             }
-            Ok(None) => {}
+            Ok(None) => false,
             Err(err) => {
                 return Err(PersistError::backend(format!(
                     "staging bitmap read failed: {err}"
                 )));
             }
-        }
+        };
 
         let mut staged_bitmap = None;
         if !seen_oids.is_empty() {
@@ -490,15 +491,16 @@ where
 
             self.load_seen_store(oid_len)
                 .map_err(PersistError::backend)?;
+            // Take ownership of the cached bitmap to avoid cloning. The
+            // cache is repopulated with the merged result below.
             let merged = {
-                let guard = self.seen_store.borrow();
-                let base = guard.as_ref().map_or_else(
+                let base = self.seen_store.borrow_mut().take().map_or_else(
                     || RoaringSeenBitmap::new(oid_len),
-                    |store| store.bitmap().clone(),
+                    RoaringSeenStore::into_bitmap,
                 );
                 let mut staged = base;
                 staged
-                    .insert_batch(delta.oids())
+                    .merge_delta(&delta)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
                 staged
             };
@@ -510,6 +512,15 @@ where
                 value: serialized,
             });
             staged_bitmap = Some(merged);
+        }
+
+        // Delete the staging key last among first-phase ops so that a
+        // non-atomic backend crash cannot lose staged OIDs before the
+        // merged seen scope key is written.
+        if delete_staging_key {
+            first_phase_ops.push(GitPersistenceOp::Delete {
+                key: seen_staging_key.clone(),
+            });
         }
 
         let watermark_ops: Vec<_> = if is_complete {
@@ -577,6 +588,9 @@ mod tests {
         batches: Vec<Vec<GitPersistenceOp>>,
         batch_call_count: usize,
         fail_on_batch_call: Option<usize>,
+        get_call_count: usize,
+        fail_on_get_call: Option<usize>,
+        multi_get_truncate: bool,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -616,6 +630,14 @@ mod tests {
             self.state.borrow_mut().fail_on_batch_call = Some(call_no);
         }
 
+        fn set_fail_on_get_call(&self, call_no: usize) {
+            self.state.borrow_mut().fail_on_get_call = Some(call_no);
+        }
+
+        fn set_multi_get_truncate(&self, truncate: bool) {
+            self.state.borrow_mut().multi_get_truncate = truncate;
+        }
+
         fn batches(&self) -> Vec<Vec<GitPersistenceOp>> {
             self.state.borrow().batches.clone()
         }
@@ -625,7 +647,14 @@ mod tests {
         type Error = TestBackendError;
 
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-            Ok(self.state.borrow().kv.get(key).cloned())
+            let mut state = self.state.borrow_mut();
+            state.get_call_count += 1;
+            if state.fail_on_get_call == Some(state.get_call_count) {
+                return Err(TestBackendError {
+                    message: "injected get failure",
+                });
+            }
+            Ok(state.kv.get(key).cloned())
         }
 
         fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
@@ -652,6 +681,19 @@ mod tests {
 
         fn supports_atomic_batches(&self) -> bool {
             self.atomic
+        }
+
+        fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+            let state = self.state.borrow();
+            let results: Vec<_> = keys
+                .iter()
+                .map(|key| state.kv.get(key.as_slice()).cloned())
+                .collect();
+            if state.multi_get_truncate && !results.is_empty() {
+                Ok(results[..results.len() - 1].to_vec())
+            } else {
+                Ok(results)
+            }
         }
     }
 
@@ -927,6 +969,139 @@ mod tests {
         assert!(
             backend.contains_key(&build_seen_scope_key(15, &[0xF0; 32])),
             "first-phase seen scope write must be durable"
+        );
+    }
+
+    #[test]
+    fn persist_seen_delta_returns_spill_error_on_backend_get_failure() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 16, [0xAA; 32]);
+        let oid = OidBytes::sha1([0x77; 20]);
+
+        // First persist succeeds (creates staging key).
+        adapter.persist_seen_delta(&[oid]).expect("first persist");
+
+        // Fail the get on the next persist_seen_delta call.
+        backend.set_fail_on_get_call(2);
+        let err = adapter
+            .persist_seen_delta(&[OidBytes::sha1([0x88; 20])])
+            .expect_err("backend get failure should propagate");
+        assert!(format!("{err}").contains("staging bitmap read failed"));
+    }
+
+    #[test]
+    fn commit_finalize_returns_persist_error_on_staging_read_failure() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 17, [0xBB; 32]);
+        let oid = OidBytes::sha1([0x99; 20]);
+
+        // Stage a seen delta so the staging key exists.
+        adapter.persist_seen_delta(&[oid]).expect("stage");
+
+        // Fail the get for the staging key read inside commit_finalize.
+        // 1st get was in persist_seen_delta.
+        backend.set_fail_on_get_call(2);
+        let err = adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect_err("staging read failure should propagate");
+        assert!(format!("{err}").contains("staging bitmap read failed"));
+    }
+
+    #[test]
+    fn load_watermarks_rejects_invalid_watermark_value_encoding() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 18, [0xCC; 32]);
+        let start_set_id = [0xDD; 32];
+        let ref_name = b"refs/heads/main".as_slice();
+
+        // Seed a key with invalid (too-short) watermark value.
+        let key = scanner_git::finalize::build_ref_wm_key(18, &[0xCC; 32], &start_set_id, ref_name);
+        backend.set(key, vec![0x01]);
+
+        let err = adapter
+            .load_watermarks(18, [0xCC; 32], start_set_id, &[ref_name])
+            .expect_err("invalid watermark value should fail");
+        let source_msg = std::error::Error::source(&err)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            source_msg.contains("invalid watermark value encoding"),
+            "expected inner source to mention invalid encoding, got: {source_msg}"
+        );
+    }
+
+    #[test]
+    fn non_atomic_complete_finalize_with_seen_data_lands_in_two_batches() {
+        let backend = TestBackend::non_atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 19, [0xEE; 32]);
+        let oid = OidBytes::sha1([0xAA; 20]);
+
+        // Stage a seen delta.
+        adapter.persist_seen_delta(&[oid]).expect("stage");
+
+        // Complete finalize with watermark ops.
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: vec![scanner_git::WriteOp {
+                    key: b"rw\0wm".to_vec(),
+                    value: vec![0xBB],
+                }],
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        // Verify seen OID is visible.
+        assert_eq!(
+            adapter.batch_check_seen(&[oid]).expect("seen check"),
+            vec![true]
+        );
+        // Verify staging key is cleared.
+        assert!(
+            !backend.contains_key(&scanner_git::finalize::build_seen_staging_key(
+                19,
+                &[0xEE; 32]
+            )),
+            "staging key must be cleared after complete finalize"
+        );
+        // Verify watermark landed.
+        assert_eq!(
+            backend.get_value(b"rw\0wm").as_deref(),
+            Some(&[0xBB][..]),
+            "watermarks must land on complete finalize"
+        );
+        // Non-atomic: exactly 3 batches (staging persist, first-phase
+        // data+seen, second-phase watermarks).
+        assert_eq!(backend.batches().len(), 3);
+    }
+
+    #[test]
+    fn load_watermarks_rejects_multi_get_result_count_mismatch() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 20, [0xFF; 32]);
+        let start_set_id = [0x11; 32];
+
+        backend.set_multi_get_truncate(true);
+        let err = adapter
+            .load_watermarks(
+                20,
+                [0xFF; 32],
+                start_set_id,
+                &[b"refs/heads/a".as_slice(), b"refs/heads/b".as_slice()],
+            )
+            .expect_err("truncated multi_get should fail");
+        let source_msg = std::error::Error::source(&err)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            source_msg.contains("returned") && source_msg.contains("results for"),
+            "expected inner source to mention count mismatch, got: {source_msg}"
         );
     }
 }
