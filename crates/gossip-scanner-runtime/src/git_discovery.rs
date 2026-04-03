@@ -74,18 +74,16 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
 
     /// Return the carried target exactly once when it still belongs to the remaining shard suffix.
     ///
-    /// Four outcomes are possible:
+    /// Three observable outcomes:
     ///
-    /// - first in-range call returns `Ok(Some(PageBuf))` with one terminal item;
-    /// - a source that already emitted returns `Ok(None)`;
-    /// - an out-of-range target returns `Ok(None)`;
-    /// - a cursor whose `last_key` is at or past the target returns `Ok(None)`
-    ///   regardless of token state.
+    /// - `Ok(Some(PageBuf))` with one terminal item on the first in-range call;
+    /// - `Ok(None)` when the target was already emitted, is outside the shard,
+    ///   or a cursor at/past the target key proves completion;
+    /// - `Err(EnumerateError)` (permanent) when [`PageBuf::try_new_validated`]
+    ///   rejects the page, indicating invalid local runtime state rather than a
+    ///   retryable remote condition.
     ///
-    /// Any opaque token on `cursor` is ignored. Validation failures from
-    /// [`PageBuf::try_new_validated`] are surfaced as permanent
-    /// [`EnumerateError`] values because they indicate invalid local runtime
-    /// state rather than a retryable remote condition.
+    /// Any opaque token on `cursor` is ignored.
     fn discover_page(
         &mut self,
         shard: &ShardSpec,
@@ -96,12 +94,14 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
             return Ok(None);
         }
 
+        // Cursor check is stateless: a covering cursor always yields Ok(None)
+        // without touching `emitted`, so the source stays reusable across
+        // cursor resets (e.g. shard reassignment with a fresh cursor).
         if cursor_covers_target(cursor, &self.target) {
-            self.emitted = true;
             return Ok(None);
         }
 
-        if !target_is_in_shard(shard, &self.target) {
+        if !shard.contains_key(self.target.repo_key().as_bytes()) {
             return Ok(None);
         }
 
@@ -137,21 +137,6 @@ fn cursor_covers_target(cursor: &Cursor, target: &GitRepoTarget) -> bool {
     cursor
         .last_key()
         .is_some_and(|last_key| last_key >= target.repo_key().as_item_key())
-}
-
-fn target_is_in_shard(shard: &ShardSpec, target: &GitRepoTarget) -> bool {
-    let key = target.repo_key().as_bytes();
-    let start = shard.key_range_start();
-    if !start.is_empty() && key < start {
-        return false;
-    }
-
-    let end = shard.key_range_end();
-    if !end.is_empty() && key >= end {
-        return false;
-    }
-
-    true
 }
 
 #[cfg(test)]
@@ -357,6 +342,48 @@ mod tests {
             .discover_page(&ShardSpec::unbounded(), &cursor, budgets())
             .expect("discover_page succeeds")
             .expect("key-authoritative resume should still emit");
+
+        assert_eq!(&page.items()[0], &target);
+    }
+
+    /// Shard mismatch does not consume the emit-once budget; a subsequent in-range
+    /// call on the same source still emits the target.
+    #[test]
+    fn discover_page_shard_mismatch_does_not_consume_emit_budget() {
+        let target = make_test_target(b"git:repo:j");
+        let mut discovery = StaticGitRepoDiscoverySource::new(target.clone());
+
+        let excluding_shard = ShardSpec::with_range(b"git:repo:z", vec![]);
+        let excluded = discovery
+            .discover_page(&excluding_shard, &Cursor::initial(), budgets())
+            .expect("discover_page succeeds");
+        assert!(excluded.is_none(), "out-of-range target must not emit");
+
+        let page = discovery
+            .discover_page(&ShardSpec::unbounded(), &Cursor::initial(), budgets())
+            .expect("discover_page succeeds")
+            .expect("re-emission should succeed after shard mismatch");
+
+        assert_eq!(&page.items()[0], &target);
+    }
+
+    /// A covering cursor returns `Ok(None)` without consuming the emit budget,
+    /// so the source remains reusable after a cursor reset.
+    #[test]
+    fn discover_page_covering_cursor_does_not_consume_emit_budget() {
+        let target = make_test_target(b"git:repo:k");
+        let mut discovery = StaticGitRepoDiscoverySource::new(target.clone());
+        let covering = Cursor::with_last_key(target.repo_key().clone().into_item_key());
+
+        let covered = discovery
+            .discover_page(&ShardSpec::unbounded(), &covering, budgets())
+            .expect("discover_page succeeds");
+        assert!(covered.is_none(), "covering cursor completes the source");
+
+        let page = discovery
+            .discover_page(&ShardSpec::unbounded(), &Cursor::initial(), budgets())
+            .expect("discover_page succeeds")
+            .expect("source should remain reusable after cursor reset");
 
         assert_eq!(&page.items()[0], &target);
     }
