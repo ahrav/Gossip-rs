@@ -321,9 +321,12 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
         }
 
         // Nested I/O inside artifact acquisition — transient, retryable.
+        // NOTE: `CommitLoadError::Io` is intentionally excluded. Upstream
+        // overloads it for structural errors (InvalidData for malformed
+        // shallow entries, NotFound for missing pack references), so a
+        // blanket retryable classification would retry permanent failures.
         GitScanError::ArtifactAcquire(
             ref error @ (ArtifactAcquireError::MidxBuild(scanner_git::MidxBuildError::Io(_))
-            | ArtifactAcquireError::CommitLoad(scanner_git::CommitLoadError::Io(_))
             | ArtifactAcquireError::RepoOpen(
                 RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_),
             )),
@@ -676,12 +679,6 @@ mod tests {
     #[case(
         GitScanError::ArtifactAcquire(ArtifactAcquireError::MidxBuild(
             scanner_git::MidxBuildError::Io(std::io::Error::other("midx build I/O"))
-        )),
-        ErrorClass::Retryable
-    )]
-    #[case(
-        GitScanError::ArtifactAcquire(ArtifactAcquireError::CommitLoad(
-            scanner_git::CommitLoadError::Io(std::io::Error::other("commit load I/O"))
         )),
         ErrorClass::Retryable
     )]
