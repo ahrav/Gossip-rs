@@ -7,7 +7,7 @@
 //!
 //! Mirror cache naming is defined independently from local-path validation so
 //! every locator kind has one bounded, redaction-safe filesystem layout. Cache
-//! paths use the [`MIRROR_PATH_HASHER`](gossip_contracts::identity::hashing::MIRROR_PATH_HASHER) and the layout
+//! paths use the [`MIRROR_PATH_HASHER`] and the layout
 //! `<mirror_root>/local/<prefix>/<digest>.git`, where `digest` is the
 //! 256-bit hash of the canonical `RepoKey` encoding (locator-kind tag followed
 //! by canonical repo path).
