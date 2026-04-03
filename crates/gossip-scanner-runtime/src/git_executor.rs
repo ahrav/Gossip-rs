@@ -21,8 +21,8 @@ use gossip_contracts::connector::git::{
 };
 use scanner_engine::Engine;
 use scanner_git::{
-    ArtifactAcquireError, GitEventOutput, GitScanConfig as ScannerGitScanConfig, GitScanError,
-    GitScanMode as ScannerGitScanMode, MergeDiffMode,
+    ArtifactAcquireError, CommitPlanError, GitEventOutput, GitScanConfig as ScannerGitScanConfig,
+    GitScanError, GitScanMode as ScannerGitScanMode, MergeDiffMode, RepoOpenError, TreeDiffError,
 };
 
 use crate::git_repo::{
@@ -121,15 +121,35 @@ impl ScannerGitExecutor {
             // of whether run_scan retained an Arc clone of the event sink.
             drop(event_tx);
 
-            // Check the scan result first so the root-cause error is not
-            // masked by a downstream forwarder failure.
-            let execution = execution.map_err(|error| classify_scan_error(error, mirror.path()))?;
-            join_scoped(event_forwarder, "git event forwarder thread").map_err(|error| {
-                GitRunError::permanent(format!(
-                    "git event forwarder panicked for '{}': {error}",
-                    digest_repo_path(mirror.path())
-                ))
-            })?;
+            // Join the forwarder explicitly before inspecting the scan result.
+            // If we returned early via `?` on the scan error, `std::thread::scope`
+            // would auto-join the forwarder — and if the forwarder panicked, that
+            // panic would mask the classified scan error.
+            let forwarder_result = join_scoped(event_forwarder, "git event forwarder thread")
+                .map_err(|error| {
+                    GitRunError::permanent(format!(
+                        "git event forwarder panicked for '{}': {error}",
+                        digest_repo_path(mirror.path())
+                    ))
+                });
+
+            // Prefer the scan error (root cause) over the forwarder error.
+            let execution = match (
+                execution.map_err(|error| classify_scan_error(error, mirror.path())),
+                forwarder_result,
+            ) {
+                (Err(scan_err), Err(fwd_err)) => {
+                    tracing::warn!(
+                        repo = %digest_repo_path(mirror.path()),
+                        forwarder_error = %fwd_err,
+                        "event forwarder also failed after scan error"
+                    );
+                    return Err(scan_err);
+                }
+                (Err(scan_err), Ok(())) => return Err(scan_err),
+                (Ok(_), Err(fwd_err)) => return Err(fwd_err),
+                (Ok(exec), Ok(())) => exec,
+            };
 
             maybe_log_debug_output(mirror.path(), debug_level, &execution.result.0);
             Ok(git_run_outcome(execution))
@@ -214,7 +234,9 @@ fn maybe_log_debug_output(
     report: &scanner_git::GitScanReport,
 ) {
     if let Some(debug_output) = format_git_debug_output(report, debug_level) {
-        tracing::debug!(
+        // Log at info level so explicitly-requested diagnostics are visible
+        // under the default production log filter.
+        tracing::info!(
             repo = %digest_repo_path(mirror_path),
             diagnostics = %debug_output,
             "git repo execution diagnostics"
@@ -224,14 +246,20 @@ fn maybe_log_debug_output(
 
 /// Classify one scanner-git failure onto the repo-executor error boundary.
 ///
-/// Four categories:
-/// - Concurrent maintenance: retryable, a mirror refresh resolves it.
-/// - Configuration / input errors (repo-open, unsupported mode, resource
-///   limit, empty start set): permanent, no retry will help.
-/// - Repository corruption (MIDX, pack plan, commit plan, tree diff,
-///   artifact-build failures): permanent, on-disk data is structurally invalid.
-/// - Transient I/O (general I/O, persist, pack exec/IO, spill, artifact
-///   I/O): retryable, a mirror refresh or retry may succeed.
+/// Categories:
+/// - **Concurrent maintenance**: retryable, a mirror refresh resolves it.
+/// - **Configuration / input errors** (unsupported mode, resource limit,
+///   empty start set): permanent, no retry will help.
+/// - **Repo-open errors**: I/O variants (`Io`, `Canonicalization`) are
+///   retryable; structural variants (`NotARepository`, etc.) are permanent.
+/// - **Structural corruption** (MIDX, pack plan, most commit-plan and
+///   tree-diff variants): permanent, on-disk data is invalid.
+/// - **Retryable sub-variants**: cooperative abort (`TreeDiff::Aborted`),
+///   ambiguous object-store errors (`TreeDiff::ObjectStoreError`), and
+///   missing tip refs (`CommitPlan::TipNotFound`) — a retry or mirror
+///   refresh may resolve the underlying condition.
+/// - **Transient I/O** (general I/O, persist, pack exec/IO, spill,
+///   artifact I/O): retryable, a mirror refresh or retry may succeed.
 ///
 /// Unknown future `ArtifactAcquireError` variants default to permanent until
 /// explicitly classified.
@@ -244,7 +272,11 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
             GitRunError::concurrent_maintenance()
         }
 
-        // Configuration / input errors — permanent, no retry will help.
+        // Repo-open errors: transient I/O is retryable (filesystem blip,
+        // interrupted read); everything else is a structural/config error.
+        GitScanError::RepoOpen(
+            ref error @ (RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_)),
+        ) => GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}")),
         GitScanError::RepoOpen(error) => {
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
@@ -260,16 +292,30 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
             ))
         }
 
-        // Repository corruption — permanent, the on-disk data is structurally invalid.
+        // Structural errors — MIDX and pack-plan failures indicate on-disk corruption.
         GitScanError::Midx(error) => {
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
         GitScanError::PackPlan(error) => {
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
+        // Missing tip ref can resolve after a mirror refresh.
+        GitScanError::CommitPlan(ref error @ CommitPlanError::TipNotFound) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        // Other commit-plan failures: corruption, resource limits, or structural errors.
         GitScanError::CommitPlan(error) => {
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
+        // Cooperative abort: another worker failed (possibly transiently).
+        GitScanError::TreeDiff(ref error @ TreeDiffError::Aborted) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        // Object-store errors wrap a String and can represent transient I/O.
+        GitScanError::TreeDiff(ref error @ TreeDiffError::ObjectStoreError { .. }) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        // Remaining tree-diff variants are structural corruption or resource limits.
         GitScanError::TreeDiff(error) => {
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
@@ -537,6 +583,17 @@ mod tests {
         GitScanError::RepoOpen(RepoOpenError::NotARepository),
         ErrorClass::Permanent
     )]
+    // Repo-open I/O variants are transient — retryable.
+    #[case(
+        GitScanError::RepoOpen(RepoOpenError::Io(std::io::Error::other("fs blip"))),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::RepoOpen(RepoOpenError::Canonicalization(std::io::Error::other(
+            "resolve"
+        ))),
+        ErrorClass::Retryable
+    )]
     #[case(
         GitScanError::UnsupportedMode(ScannerGitScanMode::DiffHistory),
         ErrorClass::Permanent
@@ -605,6 +662,19 @@ mod tests {
             RepoOpenError::NotARepository
         )),
         ErrorClass::Permanent
+    )]
+    // Tree-diff: cooperative abort and ambiguous object-store errors are retryable.
+    #[case(GitScanError::TreeDiff(TreeDiffError::Aborted), ErrorClass::Retryable)]
+    #[case(
+        GitScanError::TreeDiff(TreeDiffError::ObjectStoreError {
+            detail: "MIDX pack read".to_owned(),
+        }),
+        ErrorClass::Retryable
+    )]
+    // Commit-plan: missing tip ref can resolve after mirror refresh.
+    #[case(
+        GitScanError::CommitPlan(CommitPlanError::TipNotFound),
+        ErrorClass::Retryable
     )]
     // Transient I/O — retryable.
     #[case(

@@ -150,12 +150,31 @@ pub(crate) fn scan_local_repo(
                     "git scan failed for '{}': {error}",
                     digest_repo_path(&canonical_repo)
                 ))
-            })?;
+            });
 
         // Close the sender before joining so the forwarder thread sees EOF.
         drop(event_tx);
-        join_scoped(event_forwarder, "git event forwarder thread")
-            .map_err(ScanRuntimeError::Driver)?;
+
+        // Join the forwarder explicitly before inspecting the scan result.
+        // Returning early via `?` would let `std::thread::scope` auto-join
+        // the forwarder — and a forwarder panic would mask the scan error.
+        let forwarder_result = join_scoped(event_forwarder, "git event forwarder thread")
+            .map_err(ScanRuntimeError::Driver);
+
+        // Prefer the scan error (root cause) over the forwarder error.
+        let execution = match (execution, forwarder_result) {
+            (Err(scan_err), Err(fwd_err)) => {
+                tracing::warn!(
+                    repo = %digest_repo_path(&canonical_repo),
+                    forwarder_error = %fwd_err,
+                    "event forwarder also failed after scan error"
+                );
+                return Err(scan_err);
+            }
+            (Err(scan_err), Ok(())) => return Err(scan_err),
+            (Ok(_), Err(fwd_err)) => return Err(fwd_err),
+            (Ok(exec), Ok(())) => exec,
+        };
 
         let debug_output = format_git_debug_output(&execution.result.0, config.debug_level);
         Ok((
