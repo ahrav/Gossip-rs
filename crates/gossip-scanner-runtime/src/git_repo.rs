@@ -237,6 +237,32 @@ pub(crate) fn mebibytes_to_usize_bytes(
     })
 }
 
+/// Apply MiB-denominated size overrides and the binary-scan flag to a
+/// pre-built [`RuntimeGitScanConfig`].
+///
+/// Centralises the overflow-checked MiB-to-bytes conversion for
+/// `tree_delta_cache_mb` and `engine_chunk_mb` so callers that build
+/// their base config from different sources share a single code path
+/// for limit application.
+pub(crate) fn apply_scan_limit_overrides(
+    cfg: &mut RuntimeGitScanConfig,
+    tree_delta_cache_mb: Option<u32>,
+    engine_chunk_mb: Option<u32>,
+    scan_binary: bool,
+) -> Result<(), ScanRuntimeError> {
+    cfg.engine_adapter.scan_binary = scan_binary;
+
+    if let Some(value_mb) = tree_delta_cache_mb {
+        cfg.tree_diff.max_tree_delta_cache_bytes =
+            mebibytes_to_u32_bytes(value_mb, "git_tree_delta_cache_mb")?;
+    }
+    if let Some(value_mb) = engine_chunk_mb {
+        cfg.engine_adapter.chunk_bytes = mebibytes_to_usize_bytes(value_mb, "git_engine_chunk_mb")?;
+    }
+
+    Ok(())
+}
+
 /// Translate the crate-level [`GitScanConfig`] into the lower-level
 /// [`RuntimeGitScanConfig`] consumed by `scanner_git::run_git_scan`.
 ///
@@ -255,16 +281,13 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
         start_set: start_set_from_ref_selection(&config.ref_selection),
         ..RuntimeGitScanConfig::default()
     };
-    git_cfg.engine_adapter.scan_binary = config.scan_binary;
 
-    if let Some(value_mb) = config.tree_delta_cache_mb {
-        git_cfg.tree_diff.max_tree_delta_cache_bytes =
-            mebibytes_to_u32_bytes(value_mb, "git_tree_delta_cache_mb")?;
-    }
-    if let Some(value_mb) = config.engine_chunk_mb {
-        git_cfg.engine_adapter.chunk_bytes =
-            mebibytes_to_usize_bytes(value_mb, "git_engine_chunk_mb")?;
-    }
+    apply_scan_limit_overrides(
+        &mut git_cfg,
+        config.tree_delta_cache_mb,
+        config.engine_chunk_mb,
+        config.scan_binary,
+    )?;
 
     Ok(git_cfg)
 }

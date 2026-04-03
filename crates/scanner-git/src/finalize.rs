@@ -56,7 +56,7 @@ pub(crate) const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
 /// Namespace prefix for finding keys.
 pub(crate) const NS_FINDING: [u8; 3] = *b"fn\0";
 /// Namespace prefix for the seen bitmap scope key.
-pub(crate) const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
+pub const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
 /// Namespace prefix for the staging seen bitmap (spill checkpoints).
 ///
 /// Spill-stage deltas are written here and folded into the live `sb\0`

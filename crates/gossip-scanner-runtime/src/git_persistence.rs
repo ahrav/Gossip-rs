@@ -28,9 +28,9 @@ use gossip_contracts::{
     },
 };
 use scanner_git::{
-    FinalizeOutcome, FinalizeOutput, OidBytes, PersistError, PersistenceStore, RefWatermarkStore,
-    RepoOpenError, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError, StartSetId,
-    WriteOp, decode_ref_watermark_value,
+    FinalizeOutcome, FinalizeOutput, NS_SEEN_BLOB, OidBytes, PersistError, PersistenceStore,
+    RefWatermarkStore, RepoOpenError, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore,
+    SpillError, StartSetId, WriteOp, decode_ref_watermark_value,
     finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key},
     roaring_seen::{RoaringSeenBitmap, RoaringSeenStore},
 };
@@ -117,6 +117,7 @@ pub struct GitPersistenceAdapter<B> {
     repo_id: u64,
     policy_hash: [u8; 32],
     seen_store: RefCell<Option<RoaringSeenStore>>,
+    staging_seen: RefCell<Option<RoaringSeenBitmap>>,
     finalizing: Cell<bool>,
 }
 
@@ -129,6 +130,7 @@ impl<B> GitPersistenceAdapter<B> {
             repo_id,
             policy_hash,
             seen_store: RefCell::new(None),
+            staging_seen: RefCell::new(None),
             finalizing: Cell::new(false),
         }
     }
@@ -205,14 +207,16 @@ impl<B> GitPersistenceAdapter<B> {
     }
 }
 
-/// Cloned adapters share the backend but start with an empty seen-bitmap
-/// cache and a fresh `finalizing` flag. This deliberate reset enforces the
-/// single-writer invariant: each adapter instance independently loads its
-/// cache from the backend, preventing stale cache propagation.
+/// Cloned adapters share the backend but start with empty seen-bitmap and
+/// staging caches plus a fresh `finalizing` flag. This deliberate reset
+/// enforces the single-writer invariant: each adapter instance independently
+/// loads its cache from the backend, preventing stale cache propagation.
 ///
-/// Two clones must not operate on the same `(repo_id, policy_hash)` scope
-/// concurrently because the staging key read-modify-write in
-/// `persist_seen_delta` is not atomic.
+/// **Single-writer constraint**: at most one adapter instance may operate on
+/// a given `(repo_id, policy_hash)` scope at any time. The staging bitmap
+/// read-modify-write in `persist_seen_delta` is not atomic across instances.
+/// The scan lifecycle enforces this — one scan thread per repository — so
+/// callers do not need additional synchronization.
 impl<B> Clone for GitPersistenceAdapter<B>
 where
     B: Clone,
@@ -272,27 +276,34 @@ where
         );
         let delta = SeenBitmapDelta::from_canonical_oids(oids.to_vec())?;
         let staging_key = self.seen_staging_key();
-        // Each spill re-reads the full staging bitmap; acceptable for typical
-        // spill counts but O(total_staged) per call.
-        let bytes = match self.backend.get(&staging_key) {
-            Ok(Some(existing)) => {
-                let mut bitmap = RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
-                    SpillError::Io(io::Error::other(format!("corrupt staging bitmap: {err}")))
-                })?;
-                bitmap.merge_delta(&delta)?;
-                bitmap.serialize()?
-            }
-            Ok(None) => {
-                let mut bitmap = RoaringSeenBitmap::new(delta.oid_len());
-                bitmap.merge_delta(&delta)?;
-                bitmap.serialize()?
-            }
-            Err(err) => {
-                return Err(SpillError::Io(io::Error::other(format!(
-                    "staging bitmap read failed: {err}"
-                ))));
+
+        // Load or create the staging bitmap on first spill, then cache it
+        // across subsequent calls. This avoids O(total_staged) re-reads per
+        // spill batch, reducing aggregate cost from O(N²/B) to O(N).
+        let mut guard = self.staging_seen.borrow_mut();
+        let bitmap = match guard.as_mut() {
+            Some(bitmap) => bitmap,
+            None => {
+                let loaded = match self.backend.get(&staging_key) {
+                    Ok(Some(existing)) => {
+                        RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
+                            SpillError::Io(io::Error::other(format!(
+                                "corrupt staging bitmap: {err}"
+                            )))
+                        })?
+                    }
+                    Ok(None) => RoaringSeenBitmap::new(delta.oid_len()),
+                    Err(err) => {
+                        return Err(SpillError::Io(io::Error::other(format!(
+                            "staging bitmap read failed: {err}"
+                        ))));
+                    }
+                };
+                guard.insert(loaded)
             }
         };
+        bitmap.merge_delta(&delta)?;
+        let bytes = bitmap.serialize()?;
 
         self.backend
             .apply_batch(&[GitPersistenceOp::Put {
@@ -353,14 +364,15 @@ where
         // Watermark keys and seen-bitmap keys must be scoped to the same
         // (repo_id, policy_hash) identity. A mismatch would silently return
         // watermarks for a different scope than the seen-bitmap uses.
-        debug_assert_eq!(
-            repo_id, self.repo_id,
-            "load_watermarks called with mismatched repo_id"
-        );
-        debug_assert_eq!(
-            policy_hash, self.policy_hash,
-            "load_watermarks called with mismatched policy_hash"
-        );
+        if repo_id != self.repo_id || policy_hash != self.policy_hash {
+            return Err(RepoOpenError::io(io::Error::other(format!(
+                "load_watermarks identity mismatch: caller ({repo_id}, {:x?}) \
+                 vs adapter ({}, {:x?})",
+                &policy_hash[..4],
+                self.repo_id,
+                &self.policy_hash[..4]
+            ))));
+        }
 
         let mut keys = Vec::with_capacity(ref_names.len());
         for name in ref_names {
@@ -435,9 +447,7 @@ where
 
         let seen_scope_key = self.seen_scope_key();
         let seen_staging_key = self.seen_staging_key();
-        // The seen-bitmap namespace prefix is 3 bytes (`sb\0`) — must match
-        // the `NS_SEEN_BLOB` constant in `scanner_git::finalize`.
-        let seen_namespace = &seen_scope_key[..3];
+        let seen_namespace = NS_SEEN_BLOB.as_slice();
         let mut first_phase_ops = Vec::with_capacity(output.data_ops.len() + 2);
         let mut seen_oids = Vec::new();
         for op in &output.data_ops {
@@ -458,28 +468,34 @@ where
         }
 
         let is_complete = matches!(output.outcome, FinalizeOutcome::Complete);
-        let delete_staging_key = match self.backend.get(&seen_staging_key) {
-            Ok(Some(bytes)) => {
-                if is_complete {
-                    let staging_bitmap = RoaringSeenBitmap::deserialize(&bytes).map_err(|err| {
+
+        // Take the cached staging bitmap (populated by persist_seen_delta).
+        // Fall back to a backend read for adapters that were constructed
+        // after spill writes already landed (e.g., crash recovery).
+        let staging_bitmap = self.staging_seen.borrow_mut().take();
+        let staging_from_backend = if staging_bitmap.is_none() {
+            match self.backend.get(&seen_staging_key) {
+                Ok(Some(bytes)) => {
+                    let bitmap = RoaringSeenBitmap::deserialize(&bytes).map_err(|err| {
                         PersistError::backend(format!("corrupt staging bitmap: {err}"))
                     })?;
-                    if staging_bitmap.len() != staging_bitmap.index_len() {
-                        return Err(PersistError::backend(
-                            "staging bitmap internal inconsistency: bit count does not match index length",
-                        ));
-                    }
-                    seen_oids.extend_from_slice(staging_bitmap.all_oids());
+                    Some(bitmap)
                 }
-                true
+                Ok(None) => None,
+                Err(err) => {
+                    return Err(PersistError::backend(format!(
+                        "staging bitmap read failed: {err}"
+                    )));
+                }
             }
-            Ok(None) => false,
-            Err(err) => {
-                return Err(PersistError::backend(format!(
-                    "staging bitmap read failed: {err}"
-                )));
-            }
+        } else {
+            None
         };
+        let resolved_staging = staging_bitmap.or(staging_from_backend);
+        let has_staging = resolved_staging.is_some();
+        if is_complete && let Some(staging) = &resolved_staging {
+            seen_oids.extend_from_slice(staging.all_oids());
+        }
 
         let mut staged_bitmap = None;
         if !seen_oids.is_empty() {
@@ -517,7 +533,7 @@ where
         // Delete the staging key last among first-phase ops so that a
         // non-atomic backend crash cannot lose staged OIDs before the
         // merged seen scope key is written.
-        if delete_staging_key {
+        if has_staging {
             first_phase_ops.push(GitPersistenceOp::Delete {
                 key: seen_staging_key.clone(),
             });
@@ -765,6 +781,34 @@ mod tests {
     }
 
     #[test]
+    fn load_watermarks_rejects_identity_mismatch() {
+        use std::error::Error;
+
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend, 7, [0x55; 32]);
+
+        let err = adapter
+            .load_watermarks(99, [0x55; 32], [0x66; 32], &[b"refs/heads/main"])
+            .expect_err("mismatched repo_id must fail");
+        assert!(matches!(err, RepoOpenError::Io(_)));
+        let source_msg = err.source().expect("source").to_string();
+        assert!(
+            source_msg.contains("identity mismatch"),
+            "source should mention identity mismatch, got: {source_msg}"
+        );
+
+        let err = adapter
+            .load_watermarks(7, [0xAA; 32], [0x66; 32], &[b"refs/heads/main"])
+            .expect_err("mismatched policy_hash must fail");
+        assert!(matches!(err, RepoOpenError::Io(_)));
+        let source_msg = err.source().expect("source").to_string();
+        assert!(
+            source_msg.contains("identity mismatch"),
+            "source should mention identity mismatch, got: {source_msg}"
+        );
+    }
+
+    #[test]
     fn staged_seen_delta_is_invisible_until_complete_finalize() {
         let backend = TestBackend::atomic();
         let adapter = GitPersistenceAdapter::new(backend.clone(), 9, [0x99; 32]);
@@ -840,6 +884,81 @@ mod tests {
                 .expect("checkpoint input")
                 .is_none(),
             "partial finalize must not yield outer progress"
+        );
+    }
+
+    #[test]
+    fn multiple_spills_accumulate_in_staging_before_finalize() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend, 22, [0x22; 32]);
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+
+        adapter.persist_seen_delta(&[oid_a]).expect("first spill");
+        adapter.persist_seen_delta(&[oid_b]).expect("second spill");
+
+        // Neither OID is visible before finalize.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("check before finalize"),
+            vec![false, false]
+        );
+
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        // Both OIDs from separate spills must be visible after finalize.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("check after finalize"),
+            vec![true, true],
+            "sequential spill deltas must accumulate and survive finalize"
+        );
+    }
+
+    #[test]
+    fn complete_finalize_merges_staging_and_data_ops_seen_deltas() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend, 20, [0x20; 32]);
+        let staged_oid = OidBytes::sha1([0x11; 20]);
+        let delta_oid = OidBytes::sha1([0x22; 20]);
+
+        // Stage one OID via the spill path.
+        adapter
+            .persist_seen_delta(&[staged_oid])
+            .expect("stage seen delta");
+
+        // Finalize with a data_ops seen delta containing a different OID.
+        let delta = SeenBitmapDelta::from_oids(&[delta_oid]).expect("build finalize delta");
+        let scope_key = build_seen_scope_key(20, &[0x20; 32]);
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: vec![WriteOp {
+                    key: scope_key,
+                    value: delta.serialize(),
+                }],
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        // Both OIDs — from staging and from the finalize delta — must be
+        // visible after the merge.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[staged_oid, delta_oid])
+                .expect("batch check after merge"),
+            vec![true, true],
+            "complete finalize must merge staging and data_ops seen deltas"
         );
     }
 
@@ -973,18 +1092,58 @@ mod tests {
     }
 
     #[test]
+    fn non_atomic_first_phase_failure_leaves_seen_cache_unchanged() {
+        let backend = TestBackend::non_atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 23, [0x23; 32]);
+        let oid = OidBytes::sha1([0x77; 20]);
+
+        adapter
+            .persist_seen_delta(&[oid])
+            .expect("stage seen delta");
+
+        // Fail the first apply_batch inside commit_finalize (data/seen
+        // phase). persist_seen_delta already consumed batch call #1.
+        backend.set_fail_on_batch_call(2);
+        let _ = adapter
+            .commit_finalize(&finalize_output(FinalizeOutcome::Complete))
+            .expect_err("first-phase batch should fail");
+
+        // The seen cache must not reflect the failed finalize.
+        assert_eq!(
+            adapter
+                .batch_check_seen(&[oid])
+                .expect("cache should not reflect failed first phase"),
+            vec![false],
+            "first-phase failure must not update the seen cache"
+        );
+    }
+
+    #[test]
+    fn batch_check_seen_propagates_backend_get_failure() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 21, [0x21; 32]);
+
+        // Fail the first get so the seen-store load cannot read the scope key.
+        backend.set_fail_on_get_call(1);
+        let err = adapter
+            .batch_check_seen(&[OidBytes::sha1([0x11; 20])])
+            .expect_err("backend get failure should propagate through batch_check_seen");
+        assert!(
+            format!("{err}").contains("seen-store initialization failed"),
+            "error should mention seen-store init, got: {err}"
+        );
+    }
+
+    #[test]
     fn persist_seen_delta_returns_spill_error_on_backend_get_failure() {
         let backend = TestBackend::atomic();
         let adapter = GitPersistenceAdapter::new(backend.clone(), 16, [0xAA; 32]);
-        let oid = OidBytes::sha1([0x77; 20]);
 
-        // First persist succeeds (creates staging key).
-        adapter.persist_seen_delta(&[oid]).expect("first persist");
-
-        // Fail the get on the next persist_seen_delta call.
-        backend.set_fail_on_get_call(2);
+        // Fail the first get (cache is cold, so the first persist reads
+        // from backend to seed the staging cache).
+        backend.set_fail_on_get_call(1);
         let err = adapter
-            .persist_seen_delta(&[OidBytes::sha1([0x88; 20])])
+            .persist_seen_delta(&[OidBytes::sha1([0x77; 20])])
             .expect_err("backend get failure should propagate");
         assert!(format!("{err}").contains("staging bitmap read failed"));
     }
@@ -992,15 +1151,20 @@ mod tests {
     #[test]
     fn commit_finalize_returns_persist_error_on_staging_read_failure() {
         let backend = TestBackend::atomic();
-        let adapter = GitPersistenceAdapter::new(backend.clone(), 17, [0xBB; 32]);
+        // Pre-populate the staging key in the backend to simulate crash
+        // recovery where the staging cache is cold but a prior spill
+        // already wrote to the backend.
+        let staging_key = build_seen_staging_key(17, &[0xBB; 32]);
         let oid = OidBytes::sha1([0x99; 20]);
+        let mut staging_bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        staging_bitmap
+            .insert_batch(&[oid])
+            .expect("insert into staging bitmap");
+        backend.set(staging_key, staging_bitmap.serialize().expect("serialize"));
 
-        // Stage a seen delta so the staging key exists.
-        adapter.persist_seen_delta(&[oid]).expect("stage");
-
-        // Fail the get for the staging key read inside commit_finalize.
-        // 1st get was in persist_seen_delta.
-        backend.set_fail_on_get_call(2);
+        // Construct a fresh adapter (no staging cache) and fail the get.
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 17, [0xBB; 32]);
+        backend.set_fail_on_get_call(1);
         let err = adapter
             .commit_finalize(&FinalizeOutput {
                 data_ops: Vec::new(),

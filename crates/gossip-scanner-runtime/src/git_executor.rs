@@ -26,8 +26,8 @@ use scanner_git::{
 };
 
 use crate::git_repo::{
-    GitRunExecution, digest_repo_path, format_git_debug_output, mebibytes_to_u32_bytes,
-    mebibytes_to_usize_bytes, resolve_scan_ns, run_runtime_git_scan, start_set_from_ref_selection,
+    GitRunExecution, apply_scan_limit_overrides, digest_repo_path, format_git_debug_output,
+    resolve_scan_ns, run_runtime_git_scan, start_set_from_ref_selection,
 };
 use crate::{
     ChannelEventOutput, EVENT_CHANNEL_CAP, GitScanConfig as RuntimeGitScanConfig, ScanRuntimeError,
@@ -209,18 +209,14 @@ fn build_git_scan_config(
         start_set: start_set_from_ref_selection(selection.refs()),
         ..ScannerGitScanConfig::default()
     };
-    git_cfg.engine_adapter.scan_binary = limits.scan_binary();
 
-    if let Some(value_mb) = limits.tree_delta_cache_mb() {
-        git_cfg.tree_diff.max_tree_delta_cache_bytes =
-            mebibytes_to_u32_bytes(value_mb, "git_tree_delta_cache_mb")
-                .map_err(|error| GitRunError::permanent(error.to_string()))?;
-    }
-    if let Some(value_mb) = limits.engine_chunk_mb() {
-        git_cfg.engine_adapter.chunk_bytes =
-            mebibytes_to_usize_bytes(value_mb, "git_engine_chunk_mb")
-                .map_err(|error| GitRunError::permanent(error.to_string()))?;
-    }
+    apply_scan_limit_overrides(
+        &mut git_cfg,
+        limits.tree_delta_cache_mb(),
+        limits.engine_chunk_mb(),
+        limits.scan_binary(),
+    )
+    .map_err(|error| GitRunError::permanent(error.to_string()))?;
 
     Ok(ExecutorGitScanConfig {
         git_cfg,
