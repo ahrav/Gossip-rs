@@ -40,6 +40,10 @@ doc = "docs/gossip-contracts/boundary-3-shard-algebra.md"
 dir = "crates/gossip-frontier/src/"
 
 [[scopes]]
+doc = "docs/gossip-frontier/shard-algebra.md"
+dir = "crates/gossip-frontier/src/"
+
+[[scopes]]
 doc = "specs/coordination/README.md"
 dir = "specs/coordination/"
 
@@ -135,6 +139,329 @@ dir = "crates/gossip-scanner-runtime/src/"
 [[scopes]]
 doc = "docs/scanner-core-parity.md"
 dir = "crates/gossip-scanner-runtime/src/"
+
+# Scanner engine design docs.
+[[scopes]]
+doc = "docs/scanner-engine/content-policy-and-caching.md"
+dir = "crates/scanner-engine/src/content_policy/"
+
+[[scopes]]
+doc = "docs/scanner-engine/content-policy-and-caching.md"
+dir = "crates/scanner-engine/src/b64_yara_gate.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/content-policy-and-caching.md"
+dir = "crates/scanner-engine/src/lsm/"
+
+[[scopes]]
+doc = "docs/scanner-engine/detection-engine.md"
+dir = "crates/scanner-engine/src/engine/"
+
+[[scopes]]
+doc = "docs/scanner-engine/detection-rules.md"
+dir = "crates/scanner-engine/src/rules/"
+
+[[scopes]]
+doc = "docs/scanner-engine/detection-rules.md"
+dir = "crates/scanner-engine/src/demo.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/detection-rules.md"
+dir = "crates/scanner-scheduler/src/scheduler/parallel_scan.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-api-types.md"
+dir = "crates/scanner-engine/src/api.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-decode-state.md"
+dir = "crates/scanner-engine/src/engine/decode_state.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-internals.md"
+dir = "crates/scanner-engine/src/engine/"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-internals.md"
+dir = "crates/scanner-engine/src/perf_counters.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-offline-validation.md"
+dir = "crates/scanner-engine/src/api.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-offline-validation.md"
+dir = "crates/scanner-engine/src/engine/offline_validate.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-offline-validation.md"
+dir = "crates/scanner-engine/src/engine/window_validate.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-offline-validation.md"
+dir = "crates/scanner-engine/src/engine/core.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-offline-validation.md"
+dir = "crates/scanner-engine/src/engine/rule_repr.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-offline-validation.md"
+dir = "crates/scanner-engine/src/engine/scratch.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-stream-decode.md"
+dir = "crates/scanner-engine/src/engine/stream_decode.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-transforms.md"
+dir = "crates/scanner-engine/src/engine/transform.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-transforms.md"
+dir = "crates/scanner-engine/src/engine/stream_decode.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-transforms.md"
+dir = "crates/scanner-engine/src/engine/core.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-vectorscan-prefilter.md"
+dir = "crates/scanner-engine/src/engine/vectorscan_prefilter.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-vectorscan-prefilter.md"
+dir = "crates/scanner-engine/src/engine/vs_cache.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/engine-window-validation.md"
+dir = "crates/scanner-engine/src/engine/window_validate.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/regex-to-anchor-extraction.md"
+dir = "crates/scanner-engine/src/regex2anchor.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/transform-chain.md"
+dir = "crates/scanner-engine/src/engine/transform.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/transform-chain.md"
+dir = "crates/scanner-engine/src/engine/decode_state.rs"
+
+[[scopes]]
+doc = "docs/scanner-engine/transform-chain.md"
+dir = "crates/scanner-engine/src/engine/scratch.rs"
+
+# Scanner git design docs.
+[[scopes]]
+doc = "docs/scanner-git/commit-walking.md"
+dir = "crates/scanner-git/src/commit_"
+
+[[scopes]]
+doc = "docs/scanner-git/git-object-store.md"
+dir = "crates/scanner-git/src/object_store.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/git-object-store.md"
+dir = "crates/scanner-git/src/midx"
+
+[[scopes]]
+doc = "docs/scanner-git/git-object-store.md"
+dir = "crates/scanner-git/src/pack_cache.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/git-object-store.md"
+dir = "crates/scanner-git/src/oid_index.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/git-object-store.md"
+dir = "crates/scanner-git/src/tree_"
+
+[[scopes]]
+doc = "docs/scanner-git/git-object-store.md"
+dir = "crates/scanner-git/src/spill_"
+
+[[scopes]]
+doc = "docs/scanner-git/git-pack-execution.md"
+dir = "crates/scanner-git/src/pack_"
+
+[[scopes]]
+doc = "docs/scanner-git/git-pack-execution.md"
+dir = "crates/scanner-git/src/runner_exec"
+
+[[scopes]]
+doc = "docs/scanner-git/git-pack-execution.md"
+dir = "crates/scanner-git/src/blob_introducer.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/git-pack-execution.md"
+dir = "crates/scanner-git/src/object_store.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/git-scanning.md"
+dir = "crates/scanner-git/src/"
+
+[[scopes]]
+doc = "docs/scanner-git/git_simulation_harness_guide.md"
+dir = "crates/scanner-git/src/sim_git_scan/"
+
+[[scopes]]
+doc = "docs/scanner-git/pack-internals.md"
+dir = "crates/scanner-git/src/pack_"
+
+[[scopes]]
+doc = "docs/scanner-git/pack-internals.md"
+dir = "crates/scanner-git/src/midx"
+
+[[scopes]]
+doc = "docs/scanner-git/pack-internals.md"
+dir = "crates/scanner-git/src/object_store.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/runner-orchestration.md"
+dir = "crates/scanner-git/src/runner"
+
+[[scopes]]
+doc = "docs/scanner-git/runner-orchestration.md"
+dir = "crates/scanner-git/src/engine_adapter.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/runner-orchestration.md"
+dir = "crates/scanner-git/src/finalize.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/spill_"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/spiller.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/blob_spill.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/byte_arena.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/run_"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/seen_store.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/unique_blob.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/spill-and-memory.md"
+dir = "crates/scanner-git/src/blob_introducer.rs"
+
+[[scopes]]
+doc = "docs/scanner-git/tree-diffing.md"
+dir = "crates/scanner-git/src/tree_"
+
+# Scanner scheduler design docs.
+[[scopes]]
+doc = "docs/scanner-scheduler/archive-scanning.md"
+dir = "crates/scanner-scheduler/src/archive/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/archive-scanning.md"
+dir = "crates/scanner-scheduler/src/scheduler/local_fs_"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/fs-persistence-pipeline.md"
+dir = "crates/scanner-scheduler/src/store.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/fs-persistence-pipeline.md"
+dir = "crates/scanner-scheduler/src/scheduler/local_fs_owner.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/fs-persistence-pipeline.md"
+dir = "crates/scanner-scheduler/src/scheduler/parallel_scan.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scanner_harness_modes.md"
+dir = "crates/scanner-scheduler/src/sim_scanner/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scanner_harness_modes.md"
+dir = "crates/scanner-scheduler/src/scheduler/parallel_scan.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scanner_test_harness_guide.md"
+dir = "crates/scanner-scheduler/src/sim/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scanner_test_harness_guide.md"
+dir = "crates/scanner-scheduler/src/sim_scanner/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-device-slots.md"
+dir = "crates/scanner-scheduler/src/scheduler/device_slots.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-engine-abstraction.md"
+dir = "crates/scanner-scheduler/src/scheduler/engine_trait.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-engine-impl.md"
+dir = "crates/scanner-scheduler/src/scheduler/engine_impl.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-engine-impl.md"
+dir = "crates/scanner-scheduler/src/scheduler/engine_stub.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-executor.md"
+dir = "crates/scanner-scheduler/src/scheduler/executor"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-global-resource-pool.md"
+dir = "crates/scanner-scheduler/src/scheduler/global_resource_pool.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-local-fs-uring.md"
+dir = "crates/scanner-scheduler/src/scheduler/local_fs_uring.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-remote-backend.md"
+dir = "crates/scanner-scheduler/src/scheduler/remote"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-task-graph.md"
+dir = "crates/scanner-scheduler/src/scheduler/task_graph.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler-ts-buffer-pool.md"
+dir = "crates/scanner-scheduler/src/scheduler/ts_buffer_pool.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler_test_harness_guide.md"
+dir = "crates/scanner-scheduler/src/sim_scheduler/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/scheduler_test_harness_guide.md"
+dir = "crates/scanner-scheduler/src/scheduler/executor_core.rs"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/simulation-framework.md"
+dir = "crates/scanner-scheduler/src/sim/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/simulation-framework.md"
+dir = "crates/scanner-scheduler/src/sim_scanner/"
+
+[[scopes]]
+doc = "docs/scanner-scheduler/simulation-framework.md"
+dir = "crates/scanner-scheduler/src/sim_archive/"
 
 [[scopes]]
 doc = "docs/scanner-core-parity.md"
