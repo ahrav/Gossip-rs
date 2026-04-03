@@ -1,26 +1,20 @@
-//! Seen-bitmap delta and RocksDB bitmap encoding helpers.
+//! Seen-bitmap delta and persisted bitmap encoding helpers.
 //!
 //! `SeenBitmapDelta` is the finalize-time payload: it carries the sorted OIDs
 //! that were scanned during the current finalize call. The persisted on-disk
 //! format is `RoaringSeenBitmap`, which stores the scope's sorted OID index and
 //! a Roaring bitmap over that index.
 
-use super::object_id::OidBytes;
-
-#[cfg(feature = "rocksdb")]
 use super::errors::SpillError;
-#[cfg(feature = "rocksdb")]
+use super::object_id::OidBytes;
 use super::seen_store::SeenBlobStore;
-#[cfg(feature = "rocksdb")]
 use roaring::RoaringBitmap;
 
 const DELTA_MAGIC: [u8; 4] = *b"RSBD";
-#[cfg(feature = "rocksdb")]
 const BITMAP_MAGIC: [u8; 4] = *b"RSBM";
 /// Hard ceiling on the roaring bitmap payload size accepted during
 /// deserialization. 512 MiB is well beyond any realistic working set and
 /// prevents unbounded memory allocation from a corrupt or malicious payload.
-#[cfg(feature = "rocksdb")]
 const MAX_BITMAP_BYTES: usize = 512 * 1024 * 1024;
 
 /// Errors returned while encoding or decoding seen-bitmap payloads.
@@ -50,15 +44,12 @@ pub enum SeenBitmapError {
     #[error("seen-bitmap payload length mismatch")]
     LengthMismatch,
     /// The persisted roaring bitmap could not be decoded.
-    #[cfg(feature = "rocksdb")]
     #[error("invalid roaring bitmap payload: {0}")]
     InvalidBitmap(String),
     /// The roaring bitmap could not be serialized.
-    #[cfg(feature = "rocksdb")]
     #[error("bitmap serialization failed: {0}")]
     SerializationFailed(String),
     /// The serialized bitmap payload exceeds the maximum allowed size.
-    #[cfg(feature = "rocksdb")]
     #[error("bitmap payload too large: {size} bytes (max {max})")]
     BitmapTooLarge {
         /// Actual size of the bitmap payload in bytes.
@@ -239,19 +230,16 @@ impl SeenBitmapDelta {
     }
 }
 
-#[cfg(feature = "rocksdb")]
 fn insert_position(bitmap: &mut RoaringBitmap, pos: usize) -> Result<(), SeenBitmapError> {
     bitmap.insert(u32::try_from(pos).map_err(|_| SeenBitmapError::TooManyOids(pos + 1))?);
     Ok(())
 }
 
-#[cfg(feature = "rocksdb")]
 fn bitmap_contains(bitmap: &RoaringBitmap, pos: usize) -> bool {
     bitmap.contains(u32::try_from(pos).expect("bitmap position exceeds u32::MAX"))
 }
 
 /// Persisted seen bitmap for one `(repo_id, policy_hash)` scope.
-#[cfg(feature = "rocksdb")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoaringSeenBitmap {
     oid_len: u8,
@@ -259,7 +247,6 @@ pub struct RoaringSeenBitmap {
     seen: RoaringBitmap,
 }
 
-#[cfg(feature = "rocksdb")]
 impl RoaringSeenBitmap {
     /// Creates an empty bitmap for one repository object format.
     #[must_use]
@@ -389,7 +376,7 @@ impl RoaringSeenBitmap {
         self.merge_positions(&other.oids, |idx| bitmap_contains(&other.seen, idx))
     }
 
-    pub(crate) fn merge_delta(&mut self, delta: &SeenBitmapDelta) -> Result<(), SeenBitmapError> {
+    pub fn merge_delta(&mut self, delta: &SeenBitmapDelta) -> Result<(), SeenBitmapError> {
         if self.oid_len != delta.oid_len {
             return Err(SeenBitmapError::MixedOidLengths);
         }
@@ -593,13 +580,11 @@ impl RoaringSeenBitmap {
 }
 
 /// In-memory seen store backed by a roaring bitmap scope snapshot.
-#[cfg(feature = "rocksdb")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoaringSeenStore {
     bitmap: RoaringSeenBitmap,
 }
 
-#[cfg(feature = "rocksdb")]
 impl RoaringSeenStore {
     /// Builds a store from a persisted bitmap snapshot.
     #[must_use]
@@ -617,9 +602,14 @@ impl RoaringSeenStore {
     pub fn bitmap_mut(&mut self) -> &mut RoaringSeenBitmap {
         &mut self.bitmap
     }
+
+    /// Consumes the store and returns the underlying bitmap.
+    #[must_use]
+    pub fn into_bitmap(self) -> RoaringSeenBitmap {
+        self.bitmap
+    }
 }
 
-#[cfg(feature = "rocksdb")]
 impl SeenBlobStore for RoaringSeenStore {
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
         Ok(self.bitmap.batch_contains_sorted(oids))
@@ -652,7 +642,6 @@ mod tests {
         out
     }
 
-    #[cfg(feature = "rocksdb")]
     fn bitmap_bytes(
         magic: [u8; 4],
         oid_len: u8,
@@ -727,7 +716,6 @@ mod tests {
         assert_eq!(err, expected);
     }
 
-    #[cfg(feature = "rocksdb")]
     #[test]
     fn roaring_bitmap_round_trips() {
         let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
@@ -740,7 +728,6 @@ mod tests {
         assert_eq!(decoded, bitmap);
     }
 
-    #[cfg(feature = "rocksdb")]
     #[test]
     fn roaring_bitmap_serialization_golden_value() {
         let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
@@ -762,7 +749,6 @@ mod tests {
         assert_eq!(actual, EXPECTED, "roaring bitmap serialization changed");
     }
 
-    #[cfg(feature = "rocksdb")]
     #[test]
     fn roaring_bitmap_empty_query_is_all_false() {
         let bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
@@ -772,7 +758,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "rocksdb")]
     #[test]
     fn roaring_bitmap_batch_contains_sorted_matches_unsorted() {
         let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
@@ -789,7 +774,6 @@ mod tests {
         assert_eq!(sorted_result, vec![true, false, true, false, true]);
     }
 
-    #[cfg(feature = "rocksdb")]
     #[test]
     fn roaring_bitmap_merge_preserves_membership() {
         let mut left = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
@@ -808,7 +792,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "rocksdb")]
     #[rstest]
     #[case::truncated(vec![0; 12], SeenBitmapError::Truncated)]
     #[case::invalid_magic(
@@ -842,7 +825,6 @@ mod tests {
         assert_eq!(err, expected);
     }
 
-    #[cfg(feature = "rocksdb")]
     #[test]
     fn roaring_bitmap_deserialize_rejects_phantom_bits() {
         // A payload whose roaring bitmap has bit 5 set, but the OID index
@@ -875,7 +857,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "rocksdb")]
     #[test]
     fn roaring_bitmap_deserialize_rejects_invalid_bitmap_payload() {
         let bytes = bitmap_bytes(
@@ -892,7 +873,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "rocksdb", feature = "stdx-proptest"))]
+#[cfg(all(test, feature = "stdx-proptest"))]
 mod proptests {
     use super::*;
     use std::collections::HashSet;

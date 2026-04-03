@@ -3,7 +3,6 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use gossip_contracts::{
@@ -28,35 +27,15 @@ use super::*;
 use crate::{
     coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, StoredGitEvent},
     distributed::{DistributedPersistence, DistributedRuntimeConfig, WorkerIdentity, run_worker},
+    test_fixtures::{init_git_repo, run_git_in},
 };
-
-fn run_git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("git command should run");
-    assert!(
-        output.status.success(),
-        "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-        repo.display(),
-        args.join(" "),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
 fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let dir = tempdir().expect("tempdir");
-    run_git(dir.path(), &["init", "-q"]);
-    run_git(
+    init_git_repo(
         dir.path(),
-        &["config", "user.email", "scanner-runtime-tests@example.com"],
-    );
-    run_git(
-        dir.path(),
-        &["config", "user.name", "Scanner Runtime Tests"],
+        "scanner-runtime-tests@example.com",
+        "Scanner Runtime Tests",
     );
 
     for (path, contents) in files {
@@ -68,8 +47,8 @@ fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     }
 
     if !files.is_empty() {
-        run_git(dir.path(), &["add", "."]);
-        run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
+        run_git_in(dir.path(), &["add", "."]);
+        run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
     }
 
     dir
@@ -1230,7 +1209,7 @@ fn scan_git_with_perf_debug_handles_empty_pack_exec_reports() {
     // empty-vector path in format_git_debug_output's Perf branch.
     let repo = create_test_repo(&[]);
     // Create an empty commit so the repo has at least one ref.
-    run_git(
+    run_git_in(
         repo.path(),
         &["commit", "-q", "--allow-empty", "-m", "empty"],
     );

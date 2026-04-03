@@ -360,10 +360,9 @@ pub use events::{
 // ── Stage 7: Finalize & persist ─────────────────────────────────────────
 pub use finalize::{
     build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
-    WriteOp,
+    WriteOp, NS_SEEN_BLOB,
 };
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
-#[cfg(feature = "rocksdb")]
 pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
 pub use roaring_seen::{SeenBitmapDelta, SeenBitmapError};
 pub use snapshot_plan::snapshot_plan;

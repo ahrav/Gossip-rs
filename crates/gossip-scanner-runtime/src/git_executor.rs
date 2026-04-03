@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 
+use gossip_connectors::is_permanent_io_error;
 use gossip_contracts::connector::git::{
     GitDebugLevel, GitExecutionLimits, GitMergeStrategy, GitRepoExecutor, GitRunError,
     GitRunOutcome, GitScanMode as ContractGitScanMode, GitSelection, LocalMirror,
@@ -26,8 +27,8 @@ use scanner_git::{
 };
 
 use crate::git_repo::{
-    GitRunExecution, digest_repo_path, format_git_debug_output, mebibytes_to_u32_bytes,
-    mebibytes_to_usize_bytes, resolve_scan_ns, run_runtime_git_scan, start_set_from_ref_selection,
+    GitRunExecution, apply_scan_limit_overrides, digest_repo_path, format_git_debug_output,
+    resolve_scan_ns, run_runtime_git_scan, start_set_from_ref_selection,
 };
 use crate::{
     ChannelEventOutput, EVENT_CHANNEL_CAP, GitScanConfig as RuntimeGitScanConfig, ScanRuntimeError,
@@ -209,18 +210,14 @@ fn build_git_scan_config(
         start_set: start_set_from_ref_selection(selection.refs()),
         ..ScannerGitScanConfig::default()
     };
-    git_cfg.engine_adapter.scan_binary = limits.scan_binary();
 
-    if let Some(value_mb) = limits.tree_delta_cache_mb() {
-        git_cfg.tree_diff.max_tree_delta_cache_bytes =
-            mebibytes_to_u32_bytes(value_mb, "git_tree_delta_cache_mb")
-                .map_err(|error| GitRunError::permanent(error.to_string()))?;
-    }
-    if let Some(value_mb) = limits.engine_chunk_mb() {
-        git_cfg.engine_adapter.chunk_bytes =
-            mebibytes_to_usize_bytes(value_mb, "git_engine_chunk_mb")
-                .map_err(|error| GitRunError::permanent(error.to_string()))?;
-    }
+    apply_scan_limit_overrides(
+        &mut git_cfg,
+        limits.tree_delta_cache_mb(),
+        limits.engine_chunk_mb(),
+        limits.scan_binary(),
+    )
+    .map_err(|error| GitRunError::permanent(error.to_string()))?;
 
     Ok(ExecutorGitScanConfig {
         git_cfg,
@@ -261,116 +258,107 @@ fn maybe_log_debug_output(
 /// - **Transient I/O** (general I/O, persist, pack exec/IO, spill,
 ///   artifact I/O): retryable, a mirror refresh or retry may succeed.
 ///
-/// Unknown future `ArtifactAcquireError` variants default to permanent until
-/// explicitly classified.
+/// Unknown future `ArtifactAcquireError` variants default to retryable
+/// (consistent with `classify_preflight_error`) because a false permanent
+/// classification silently drops repos. The outer `GitScanError` match is
+/// exhaustive so the compiler forces classification of any new top-level
+/// variant.
 fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
     let repo = digest_repo_path(mirror_path);
-    match err {
-        // Concurrent maintenance — always retryable, mirror refresh resolves it.
+
+    // Concurrent maintenance bypasses the normal format string — the contract
+    // type carries its own message and is always retryable.
+    if matches!(
+        &err,
         GitScanError::ConcurrentMaintenance
-        | GitScanError::ArtifactAcquire(ArtifactAcquireError::ConcurrentMaintenance) => {
-            GitRunError::concurrent_maintenance()
-        }
+            | GitScanError::ArtifactAcquire(ArtifactAcquireError::ConcurrentMaintenance)
+    ) {
+        return GitRunError::concurrent_maintenance();
+    }
 
-        // Repo-open errors: transient I/O is retryable (filesystem blip,
-        // interrupted read); everything else is a structural/config error.
-        GitScanError::RepoOpen(
-            ref error @ (RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_)),
-        ) => GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}")),
-        GitScanError::RepoOpen(error) => {
-            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+    // Classify each variant as retryable or permanent. Retryable means a
+    // mirror refresh or simple retry has a reasonable chance of succeeding.
+    //
+    // This uses an exhaustive `match` over `GitScanError` (which is NOT
+    // `#[non_exhaustive]`) so the compiler forces classification of any
+    // new variant. `ArtifactAcquireError` IS `#[non_exhaustive]`, so its
+    // inner classification uses `matches!` with a catch-all warning.
+    //
+    // NOTE on `CommitLoadError::Io`: intentionally excluded from the
+    // retryable set. Upstream overloads it for structural errors (InvalidData
+    // for malformed shallow entries, NotFound for missing pack references),
+    // so a blanket retryable classification would retry permanent failures.
+    let is_retryable = match &err {
+        GitScanError::ConcurrentMaintenance => {
+            unreachable!("handled by early return above")
         }
-        GitScanError::UnsupportedMode(error) => {
-            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+        GitScanError::RepoOpen(RepoOpenError::Io(e)) => !is_permanent_io_error(e),
+        GitScanError::RepoOpen(RepoOpenError::Canonicalization(_)) => true,
+        GitScanError::RepoOpen(_) => false,
+        GitScanError::CommitPlan(CommitPlanError::TipNotFound) => true,
+        GitScanError::CommitPlan(_) => false,
+        GitScanError::TreeDiff(TreeDiffError::Aborted | TreeDiffError::ObjectStoreError { .. }) => {
+            true
         }
-        GitScanError::ResourceLimit(error) => GitRunError::permanent(format!(
-            "git repo execution failed for '{repo}': resource limit exceeded: {error}"
-        )),
-        GitScanError::ArtifactAcquire(ArtifactAcquireError::EmptyStartSetWithRefs) => {
-            GitRunError::permanent(format!(
-                "git repo execution failed for '{repo}': empty start set while repository refs exist (refusing silent no-op scan)"
-            ))
-        }
-
-        // Structural errors — MIDX and pack-plan failures indicate on-disk corruption.
-        GitScanError::Midx(error) => {
-            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        GitScanError::PackPlan(error) => {
-            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        // Missing tip ref can resolve after a mirror refresh.
-        GitScanError::CommitPlan(ref error @ CommitPlanError::TipNotFound) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        // Other commit-plan failures: corruption, resource limits, or structural errors.
-        GitScanError::CommitPlan(error) => {
-            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        // Cooperative abort: another worker failed (possibly transiently).
-        GitScanError::TreeDiff(ref error @ TreeDiffError::Aborted) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        // Object-store errors wrap a String and can represent transient I/O.
-        GitScanError::TreeDiff(ref error @ TreeDiffError::ObjectStoreError { .. }) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        // Remaining tree-diff variants are structural corruption or resource limits.
-        GitScanError::TreeDiff(error) => {
-            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
-        }
-
-        // Nested I/O inside artifact acquisition — transient, retryable.
-        // NOTE: `CommitLoadError::Io` is intentionally excluded. Upstream
-        // overloads it for structural errors (InvalidData for malformed
-        // shallow entries, NotFound for missing pack references), so a
-        // blanket retryable classification would retry permanent failures.
-        GitScanError::ArtifactAcquire(
-            ref error @ (ArtifactAcquireError::MidxBuild(scanner_git::MidxBuildError::Io(_))
-            | ArtifactAcquireError::RepoOpen(
-                RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_),
-            )),
-        ) => GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}")),
-
-        // Remaining artifact acquisition sub-errors: corruption or build failure.
-        GitScanError::ArtifactAcquire(
-            error @ (ArtifactAcquireError::MidxBuild(_)
-            | ArtifactAcquireError::MidxParse(_)
-            | ArtifactAcquireError::CommitLoad(_)
-            | ArtifactAcquireError::CommitGraphBuild(_)
-            | ArtifactAcquireError::RepoOpen(_)),
-        ) => GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}")),
-
-        // Transient I/O — retryable, a mirror refresh or retry may succeed.
-        GitScanError::Io(error) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        GitScanError::Persist(error) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        GitScanError::PackExec(error) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        GitScanError::PackIo(error) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        GitScanError::Spill(error) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-        GitScanError::ArtifactAcquire(ArtifactAcquireError::Io(error)) => {
-            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
-        }
-
-        // ArtifactAcquireError is #[non_exhaustive]; treat unknown future
-        // variants as permanent until explicitly classified.
-        GitScanError::ArtifactAcquire(error) => {
-            tracing::warn!(
-                repo = %repo,
-                %error,
-                "unclassified artifact-acquire error variant defaulting to permanent"
+        GitScanError::TreeDiff(_) => false,
+        GitScanError::ArtifactAcquire(inner) => {
+            // ArtifactAcquireError is #[non_exhaustive]; log unrecognized
+            // variants so new additions surface in diagnostics. Unknown
+            // variants default to retryable — consistent with
+            // classify_preflight_error — because a false permanent
+            // classification silently drops repos.
+            //
+            // Nested RepoOpen::Io and MidxBuild::Io use the same
+            // is_permanent_io_error check as the top-level RepoOpen arm
+            // so deterministic failures (PermissionDenied, InvalidInput)
+            // are not retried indefinitely.
+            let classified = match inner {
+                ArtifactAcquireError::MidxBuild(scanner_git::MidxBuildError::Io(e)) => {
+                    !is_permanent_io_error(e)
+                }
+                ArtifactAcquireError::RepoOpen(RepoOpenError::Io(e)) => !is_permanent_io_error(e),
+                ArtifactAcquireError::RepoOpen(RepoOpenError::Canonicalization(_)) => true,
+                ArtifactAcquireError::Io(_) => true,
+                _ => false,
+            };
+            let known_permanent = matches!(
+                inner,
+                ArtifactAcquireError::ConcurrentMaintenance
+                    | ArtifactAcquireError::MidxBuild(_)
+                    | ArtifactAcquireError::MidxParse(_)
+                    | ArtifactAcquireError::CommitLoad(_)
+                    | ArtifactAcquireError::CommitGraphBuild(_)
+                    | ArtifactAcquireError::RepoOpen(_)
+                    | ArtifactAcquireError::EmptyStartSetWithRefs
+                    | ArtifactAcquireError::Io(_)
             );
-            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+            if !classified && !known_permanent {
+                tracing::warn!(
+                    repo = %repo,
+                    %err,
+                    "unclassified artifact-acquire error variant defaulting to retryable"
+                );
+                true
+            } else {
+                classified
+            }
         }
+        GitScanError::Io(_)
+        | GitScanError::Persist(_)
+        | GitScanError::PackExec(_)
+        | GitScanError::PackIo(_)
+        | GitScanError::Spill(_) => true,
+        GitScanError::Midx(_)
+        | GitScanError::PackPlan(_)
+        | GitScanError::ResourceLimit(_)
+        | GitScanError::UnsupportedMode(_) => false,
+    };
+
+    let msg = format!("git repo execution failed for '{repo}': {err}");
+    if is_retryable {
+        GitRunError::retryable(msg)
+    } else {
+        GitRunError::permanent(msg)
     }
 }
 

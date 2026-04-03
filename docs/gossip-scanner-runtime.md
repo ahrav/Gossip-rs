@@ -13,6 +13,7 @@
   and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
 - contract-level mirror-backed Git execution via a concrete repo executor adapter
+- runtime-backed Git persistence adapters and repo-frontier durability helpers
 - distributed runtime worker-loop support: `WorkerIdentity`, concrete shard
   leases, direct coordination claim/complete helpers, persistence handles,
   runtime configuration, run reports, and error layering
@@ -39,6 +40,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config and reusing the shared runtime runner |
+| `src/git_persistence.rs` | Runtime-backed adapters for `scanner-git` watermark/seen/finalize seams plus repo-frontier receipt/checkpoint helpers. Non-atomic backends use a multi-phase commit (data+seen, then staging delete, then watermarks) so a mid-commit failure cannot expose watermarks without matching data writes |
 | `src/git_mirror.rs` | Worker-local Git mirror lifecycle, deterministic cache-path derivation, and stale control-file cleanup |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content page validation, explicit terminal page / exhausted-empty outcomes, scan-miss execution, and direct local filesystem execution helpers |
@@ -47,7 +49,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/parity.rs` | JSONL canonicalization and parity helpers |
 | `src/lib_tests.rs` | Validation and local scan execution tests for the runtime core |
 | `src/cli_tests.rs` | CLI parsing and summary-rendering tests |
-| `src/test_fixtures.rs` | Shared test fixtures (write contexts, timings, findings builders, rule fingerprints) used by runtime test modules |
+| `src/test_fixtures.rs` | Shared test fixtures (write contexts, timings, findings builders, rule fingerprints, and git repository setup helpers) used by runtime test modules |
 | `src/runtime_durability_tests.rs` | Integration tests that stitch together translation, findings -> done-ledger durability, and receipt-driven checkpoint aggregation to prove explicit-receipt gating, contiguous-prefix advancement, and reassignment-safe retry invariants |
 | `Cargo.toml` | Runtime crate dependencies and feature flags |
 
@@ -132,6 +134,12 @@ library APIs but are not wired into the live dispatcher.
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
+When the caller owns durable Git state, `git_persistence::GitPersistenceAdapter`
+implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
+plugs into `git_repo::run_runtime_git_scan_with_stores`. A complete finalize
+can then be mapped onto the existing repo-frontier `UnitCommitReceipt` and
+`CheckpointAggregatorInput` path without inventing a Git-only outer receipt
+stack.
 
 The distributed module exports the concrete worker-loop types and helpers:
 `WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
@@ -802,6 +810,7 @@ and coordination-backend observations).
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Static Git repo discovery source | `crates/gossip-scanner-runtime/src/git_discovery.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
+| Git persistence adapters and repo-frontier durability | `crates/gossip-scanner-runtime/src/git_persistence.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |
 | Frozen runtime commit vocabulary | `crates/gossip-scanner-runtime/src/commit_model.rs` |
 | Receipt-driven prefix checkpoint aggregation | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` |

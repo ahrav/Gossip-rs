@@ -42,6 +42,11 @@ pub trait PersistenceStore: SeenBitmapPersister {
     /// Implementations may assume ops are pre-sorted by key for performance
     /// diagnostics, but must not require ordering for correctness.
     /// Implementations must ignore `watermark_ops` when the outcome is partial.
+    ///
+    /// Staging seen-bitmap deltas accumulated via `persist_seen_delta` must be
+    /// folded into the live bitmap on complete finalize and discarded on partial
+    /// finalize. Discarding ensures that OIDs from skipped candidates do not
+    /// permanently hide blobs from future scan runs.
     fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError>;
 }
 
