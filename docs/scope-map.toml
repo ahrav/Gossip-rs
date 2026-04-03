@@ -314,6 +314,9 @@ dir = "crates/scanner-git/src/blob_introducer.rs"
 doc = "docs/scanner-git/git-pack-execution.md"
 dir = "crates/scanner-git/src/object_store.rs"
 
+# Intentionally broad: git-scanning.md is the crate-level pipeline overview
+# (15+ components in its table). 36 source files have no other design-doc
+# coverage; removing this scope would leave them untracked.
 [[scopes]]
 doc = "docs/scanner-git/git-scanning.md"
 dir = "crates/scanner-git/src/"
