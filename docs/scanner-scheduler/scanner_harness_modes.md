@@ -167,7 +167,7 @@ Once `execution_mode_parity.rs` lands, the intended invocation is:
 
 ```bash
 # Planned parity-gate invocation (uses defaults: 9 iterations, 2%/5% thresholds)
-cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 
 # Optional tuning knobs for local stress/debug once the gate exists
 EXECUTION_MODE_PARITY_ITERS=9 \
