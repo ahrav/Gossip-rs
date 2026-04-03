@@ -27,7 +27,7 @@ use scanner_git::{
 
 use crate::git_repo::{
     GitRunExecution, digest_repo_path, format_git_debug_output, mebibytes_to_u32_bytes,
-    mebibytes_to_usize_bytes, run_runtime_git_scan, start_set_from_ref_selection,
+    mebibytes_to_usize_bytes, resolve_scan_ns, run_runtime_git_scan, start_set_from_ref_selection,
 };
 use crate::{
     ChannelEventOutput, EVENT_CHANNEL_CAP, GitScanConfig as RuntimeGitScanConfig, ScanRuntimeError,
@@ -114,10 +114,15 @@ impl ScannerGitExecutor {
             let event_forwarder = scope.spawn(move || forward_git_events(out.as_ref(), event_rx));
 
             let git_sink: Arc<dyn scanner_git::EventSink> =
-                Arc::new(ChannelEventOutput::new(event_tx.clone()));
+                Arc::new(ChannelEventOutput::new(event_tx));
             let execution = run_scan(mirror.path(), Arc::clone(&self.engine), &git_cfg, git_sink);
 
-            drop(event_tx);
+            // Check the scan result first so the root-cause error is not
+            // masked by a downstream forwarder failure.  The sender is
+            // already dropped (moved into `ChannelEventOutput`, which was
+            // consumed by `run_scan`), so the forwarder will drain and exit
+            // when the scoped thread joins at scope exit.
+            let execution = execution.map_err(|error| classify_scan_error(error, mirror.path()))?;
             join_scoped(event_forwarder, "git event forwarder thread").map_err(|error| {
                 GitRunError::retryable(format!(
                     "git event forwarder failed for '{}': {error}",
@@ -125,7 +130,6 @@ impl ScannerGitExecutor {
                 ))
             })?;
 
-            let execution = execution.map_err(|error| classify_scan_error(error, mirror.path()))?;
             maybe_log_debug_output(mirror.path(), debug_level, &execution.result.0);
             Ok(git_run_outcome(execution))
         })
@@ -226,10 +230,13 @@ fn maybe_log_debug_output(
 fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
     let repo = digest_repo_path(mirror_path);
     match err {
+        // Concurrent maintenance — always retryable, mirror refresh resolves it.
         GitScanError::ConcurrentMaintenance
         | GitScanError::ArtifactAcquire(ArtifactAcquireError::ConcurrentMaintenance) => {
             GitRunError::concurrent_maintenance()
         }
+
+        // Configuration / input errors — permanent, no retry will help.
         GitScanError::RepoOpen(error) => {
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
@@ -244,18 +251,69 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
                 "git repo execution failed for '{repo}': empty start set while repository refs exist (refusing silent no-op scan)"
             ))
         }
-        other => GitRunError::retryable(format!("git repo execution failed for '{repo}': {other}")),
+
+        // Repository corruption — permanent, the on-disk data is structurally invalid.
+        GitScanError::Midx(error) => {
+            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::PackPlan(error) => {
+            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::CommitPlan(error) => {
+            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::TreeDiff(error) => {
+            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+        }
+
+        // Artifact acquisition sub-errors that indicate corruption or build failure.
+        GitScanError::ArtifactAcquire(
+            error @ (ArtifactAcquireError::MidxBuild(_)
+            | ArtifactAcquireError::MidxParse(_)
+            | ArtifactAcquireError::CommitLoad(_)
+            | ArtifactAcquireError::CommitGraphBuild(_)
+            | ArtifactAcquireError::RepoOpen(_)),
+        ) => GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}")),
+
+        // Transient I/O — retryable, a mirror refresh or retry may succeed.
+        GitScanError::Io(error) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::Persist(error) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::PackExec(error) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::PackIo(error) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::Spill(error) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::Io(error)) => {
+            GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}"))
+        }
+
+        // ArtifactAcquireError is #[non_exhaustive]; treat unknown future
+        // variants as permanent until explicitly classified.
+        GitScanError::ArtifactAcquire(error) => {
+            GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
+        }
     }
 }
 
+/// Convert a completed scan execution into the contract-level outcome.
+///
+/// Only the aggregate counters relevant to the contract boundary are
+/// propagated. Per-category skip counters (`binary_skipped`, `ext_skipped`,
+/// `lock_skipped`, `binary_extracted`) and per-stage breakdowns are
+/// intentionally excluded — they belong to the runtime diagnostic layer,
+/// not the executor contract.
 fn git_run_outcome(execution: GitRunExecution) -> GitRunOutcome {
     let report = execution.result.0;
     let metrics = report.common_metrics;
-    let scan_ns = if report.stage_nanos.scan > 0 {
-        report.stage_nanos.scan
-    } else {
-        u64::try_from(execution.scan_elapsed.as_nanos()).unwrap_or(u64::MAX)
-    };
+    let scan_ns = resolve_scan_ns(&report.stage_nanos, execution.scan_elapsed);
 
     GitRunOutcome {
         commit_count: u64::try_from(report.commit_count).unwrap_or(u64::MAX),
@@ -274,6 +332,7 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use gossip_contracts::connector::ErrorClass;
     use gossip_contracts::connector::git::{GitRefSelection, GitRepoExecutor};
@@ -467,8 +526,30 @@ mod tests {
         GitScanError::ArtifactAcquire(ArtifactAcquireError::EmptyStartSetWithRefs),
         ErrorClass::Permanent
     )]
+    // Corruption — permanent.
+    #[case(
+        GitScanError::CommitPlan(scanner_git::CommitPlanError::CommitGraphOpen {
+            reason: "corrupt".to_owned(),
+        }),
+        ErrorClass::Permanent
+    )]
+    #[case(
+        GitScanError::TreeDiff(scanner_git::TreeDiffError::TreeNotFound),
+        ErrorClass::Permanent
+    )]
+    // Transient I/O — retryable.
     #[case(
         GitScanError::Io(std::io::Error::other("temporary I/O failure")),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::PackExec(scanner_git::PackExecError::PackRead("read error".to_owned())),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::Io(std::io::Error::other(
+            "artifact I/O"
+        ))),
         ErrorClass::Retryable
     )]
     fn scan_error_classification_preserves_retry_posture(
@@ -486,5 +567,113 @@ mod tests {
 
         assert_send::<ScannerGitExecutor>();
         assert_executor::<ScannerGitExecutor>();
+    }
+
+    /// Build a minimal `GitRunExecution` with the given stage-nanos scan
+    /// value, wall-clock elapsed, and metric counters.
+    fn make_execution(
+        scan_stage_ns: u64,
+        wall_elapsed: Duration,
+        commit_count: usize,
+        objects_scanned: u64,
+        bytes_scanned: u64,
+        findings_emitted: u64,
+    ) -> GitRunExecution {
+        use scanner_git::{
+            FinalizeOutcome, FinalizeOutput, FinalizeStats, GitScanAllocStats,
+            GitScanCommonMetrics, GitScanReport, GitScanResult, GitScanStageNanos, MappingStats,
+            PackPlanConfig, SpillStats, TreeDiffStats,
+        };
+
+        let report = GitScanReport {
+            commit_count,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            pack_plan_stats: vec![],
+            pack_plan_config: PackPlanConfig::default(),
+            pack_plan_delta_deps_total: 0,
+            pack_plan_delta_deps_max: 0,
+            pack_exec_reports: vec![],
+            skipped_candidates: vec![],
+            finalize: FinalizeOutput {
+                data_ops: vec![],
+                watermark_ops: vec![],
+                outcome: FinalizeOutcome::Complete,
+                stats: FinalizeStats::default(),
+            },
+            common_metrics: GitScanCommonMetrics {
+                objects_scanned,
+                chunks_scanned: 0,
+                bytes_scanned,
+                findings_emitted,
+                binary_skipped: 0,
+                ext_skipped: 0,
+                lock_skipped: 0,
+                binary_extracted: 0,
+                errors: 0,
+            },
+            stage_nanos: GitScanStageNanos {
+                scan: scan_stage_ns,
+                ..GitScanStageNanos::default()
+            },
+            perf_stats: Default::default(),
+            alloc_stats: GitScanAllocStats::default(),
+            pack_cache_per_worker_bytes: 0,
+        };
+
+        GitRunExecution {
+            result: GitScanResult(report),
+            scan_elapsed: wall_elapsed,
+        }
+    }
+
+    #[test]
+    fn git_run_outcome_uses_stage_nanos_when_nonzero() {
+        let execution = make_execution(
+            5_000_000, // 5 ms stage timing
+            Duration::from_millis(10),
+            42,
+            100,
+            2048,
+            3,
+        );
+        let outcome = git_run_outcome(execution);
+
+        assert_eq!(outcome.scan_ns, 5_000_000);
+        assert_eq!(outcome.commit_count, 42);
+        assert_eq!(outcome.objects_scanned, 100);
+        assert_eq!(outcome.bytes_scanned, 2048);
+        assert_eq!(outcome.findings_emitted, 3);
+        assert_eq!(outcome.persist_ns, 0);
+    }
+
+    #[test]
+    fn git_run_outcome_falls_back_to_wall_clock_when_stage_nanos_zero() {
+        let wall = Duration::from_millis(7);
+        let execution = make_execution(0, wall, 10, 50, 1024, 1);
+        let outcome = git_run_outcome(execution);
+
+        assert_eq!(outcome.scan_ns, u64::try_from(wall.as_nanos()).unwrap());
+        assert_eq!(outcome.commit_count, 10);
+    }
+
+    #[test]
+    fn git_run_outcome_clamps_oversized_commit_count() {
+        let execution = make_execution(1, Duration::from_secs(1), usize::MAX, 0, 0, 0);
+        let outcome = git_run_outcome(execution);
+
+        // usize::MAX fits in u64 on 64-bit platforms; on 32-bit it would
+        // also fit. The key invariant is that the conversion never panics.
+        assert!(outcome.commit_count > 0);
+    }
+
+    #[test]
+    fn from_runtime_config_constructs_executor_with_repo_id() {
+        let config = RuntimeGitScanConfig::new("/tmp/test-repo");
+        let executor = ScannerGitExecutor::from_runtime_config(&config, Arc::new(NullEventSink))
+            .expect("from_runtime_config should succeed");
+
+        assert_eq!(executor.repo_id, config.repo_id);
     }
 }

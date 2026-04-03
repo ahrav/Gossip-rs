@@ -290,6 +290,23 @@ pub(crate) fn start_set_from_ref_selection(selection: &GitRefSelection) -> Start
     }
 }
 
+/// Resolve the authoritative scan duration in nanoseconds.
+///
+/// Prefers the scanner's own stage-level `scan` timing when available (> 0).
+/// Falls back to `wall_elapsed` (wall-clock measurement from the runtime)
+/// when the scanner did not record stage timing, which can happen with
+/// certain scan modes that bypass the stage-nanos pipeline.
+pub(crate) fn resolve_scan_ns(
+    stage_nanos: &scanner_git::GitScanStageNanos,
+    wall_elapsed: std::time::Duration,
+) -> u64 {
+    if stage_nanos.scan > 0 {
+        stage_nanos.scan
+    } else {
+        u64::try_from(wall_elapsed.as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Map `scanner_git` metrics into the crate-level [`ScanReport`].
 ///
 /// Prefers the scanner's own stage-level `scan` timing when available. Falls
@@ -305,11 +322,7 @@ fn git_report_to_scan_report(
 ) -> ScanReport {
     let report = result.0;
     let metrics = report.common_metrics;
-    let scan_ns = if report.stage_nanos.scan > 0 {
-        report.stage_nanos.scan
-    } else {
-        u64::try_from(scan_elapsed.as_nanos()).unwrap_or(u64::MAX)
-    };
+    let scan_ns = resolve_scan_ns(&report.stage_nanos, scan_elapsed);
 
     ScanReport {
         items_scanned: metrics.objects_scanned,
