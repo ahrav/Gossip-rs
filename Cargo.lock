@@ -1513,6 +1513,8 @@ dependencies = [
  "gossip-orchestrator",
  "gossip-persistence-inmemory",
  "gossip-stdx",
+ "libc",
+ "proptest",
  "regex",
  "rstest",
  "scanner-engine",
@@ -3235,6 +3237,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 ---
 name: test-dedup
-description: Review test suites for duplicate, redundant, or low-value tests — especially unit tests already subsumed by property-based tests. Remove noise, keep signal.
+description: Use when test suites feel bloated, when unit tests duplicate coverage already provided by property-based or simulation tests, or during periodic test hygiene. Identifies and removes redundant tests while keeping signal.
 ---
 
 # Test Deduplicator

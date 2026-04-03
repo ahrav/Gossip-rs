@@ -74,7 +74,7 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Error as AnyError, Result, anyhow};
 use gossip_connectors::FilesystemConnector;
@@ -1525,16 +1525,9 @@ fn build_lease_from_acquire(
 
 /// Convert the wall clock to [`LogicalTime`] (milliseconds since Unix epoch).
 ///
-/// Falls back to `1` if the system clock is before the epoch or if the
-/// millisecond count overflows `u64`. The minimum of `1` avoids zero-valued
-/// logical times, which some coordination backends treat as sentinel values.
+/// Delegates to [`crate::epoch_millis_now`] for the raw timestamp.
 fn wall_clock_now() -> LogicalTime {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-        .unwrap_or(1);
-    LogicalTime::from_raw(millis.max(1))
+    LogicalTime::from_raw(crate::epoch_millis_now())
 }
 
 /// Compute how long to sleep before retrying a shard claim.
