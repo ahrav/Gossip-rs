@@ -320,7 +320,16 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
 
-        // Artifact acquisition sub-errors that indicate corruption or build failure.
+        // Nested I/O inside artifact acquisition — transient, retryable.
+        GitScanError::ArtifactAcquire(
+            ref error @ (ArtifactAcquireError::MidxBuild(scanner_git::MidxBuildError::Io(_))
+            | ArtifactAcquireError::CommitLoad(scanner_git::CommitLoadError::Io(_))
+            | ArtifactAcquireError::RepoOpen(
+                RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_),
+            )),
+        ) => GitRunError::retryable(format!("git repo execution failed for '{repo}': {error}")),
+
+        // Remaining artifact acquisition sub-errors: corruption or build failure.
         GitScanError::ArtifactAcquire(
             error @ (ArtifactAcquireError::MidxBuild(_)
             | ArtifactAcquireError::MidxParse(_)
@@ -662,6 +671,25 @@ mod tests {
             RepoOpenError::NotARepository
         )),
         ErrorClass::Permanent
+    )]
+    // Nested I/O inside artifact acquisition — retryable.
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::MidxBuild(
+            scanner_git::MidxBuildError::Io(std::io::Error::other("midx build I/O"))
+        )),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::CommitLoad(
+            scanner_git::CommitLoadError::Io(std::io::Error::other("commit load I/O"))
+        )),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::RepoOpen(RepoOpenError::Io(
+            std::io::Error::other("artifact repo-open I/O")
+        ))),
+        ErrorClass::Retryable
     )]
     // Tree-diff: cooperative abort and ambiguous object-store errors are retryable.
     #[case(GitScanError::TreeDiff(TreeDiffError::Aborted), ErrorClass::Retryable)]
