@@ -70,9 +70,9 @@ impl GitRepoRuntime {
     ///
     /// [`crate::git_mirror::LocalMirrorManager`] provides the concrete mirror
     /// lifecycle implementation, and [`crate::git_executor::ScannerGitExecutor`]
-    /// provides the per-repository execution adapter. This entrypoint still
-    /// returns an error because higher-level runtime orchestration has not yet
-    /// wired mirror acquisition, selection, and execution together.
+    /// provides the per-repository execution adapter. Returns an error because
+    /// mirror acquisition, selection, and execution orchestration are not wired
+    /// into this entrypoint.
     pub fn execute_repo<M: GitMirrorManager, E: GitRepoExecutor>(
         _mirrors: &mut M,
         _executor: &mut E,

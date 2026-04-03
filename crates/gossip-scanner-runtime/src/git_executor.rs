@@ -42,7 +42,7 @@ use crate::{
 pub struct ScannerGitExecutor {
     repo_id: u64,
     engine: Arc<Engine>,
-    out: Arc<dyn GitEventOutput + Send + Sync>,
+    event_sink: Arc<dyn GitEventOutput + Send + Sync>,
 }
 
 #[derive(Debug)]
@@ -57,12 +57,12 @@ impl ScannerGitExecutor {
     pub fn new(
         repo_id: u64,
         engine: Arc<Engine>,
-        out: Arc<dyn GitEventOutput + Send + Sync>,
+        event_sink: Arc<dyn GitEventOutput + Send + Sync>,
     ) -> Self {
         Self {
             repo_id,
             engine,
-            out,
+            event_sink,
         }
     }
 
@@ -73,7 +73,7 @@ impl ScannerGitExecutor {
     /// execution limits continue to flow through [`GitRepoExecutor::run_repo`].
     pub fn from_runtime_config(
         config: &RuntimeGitScanConfig,
-        out: Arc<dyn GitEventOutput + Send + Sync>,
+        event_sink: Arc<dyn GitEventOutput + Send + Sync>,
     ) -> Result<Self, ScanRuntimeError> {
         let engine = build_runtime_engine(
             config.rules_file.as_deref(),
@@ -81,7 +81,7 @@ impl ScannerGitExecutor {
             config.decode_depth,
             config.anchor_mode,
         )?;
-        Ok(Self::new(config.repo_id, engine, out))
+        Ok(Self::new(config.repo_id, engine, event_sink))
     }
 
     fn run_repo_with<R>(
@@ -110,8 +110,8 @@ impl ScannerGitExecutor {
 
         std::thread::scope(|scope| {
             let (event_tx, event_rx) = sync_channel(EVENT_CHANNEL_CAP);
-            let out = Arc::clone(&self.out);
-            let event_forwarder = scope.spawn(move || forward_git_events(out.as_ref(), event_rx));
+            let sink = Arc::clone(&self.event_sink);
+            let event_forwarder = scope.spawn(move || forward_git_events(sink.as_ref(), event_rx));
 
             let git_sink: Arc<dyn scanner_git::EventSink> =
                 Arc::new(ChannelEventOutput::new(event_tx));
@@ -453,9 +453,19 @@ mod tests {
     }
 
     #[test]
-    fn mib_overflow_is_rejected_as_permanent_error() {
+    fn tree_delta_cache_mib_overflow_is_rejected_as_permanent_error() {
         let limits = GitExecutionLimits::default()
             .with_tree_delta_cache_mb(NonZeroU32::new(u32::MAX).expect("non-zero"));
+
+        let err = build_git_scan_config(1, &GitSelection::default(), limits)
+            .expect_err("overflow should fail");
+        assert_eq!(err.class(), ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn engine_chunk_mib_overflow_is_rejected_as_permanent_error() {
+        let limits = GitExecutionLimits::default()
+            .with_engine_chunk_mb(NonZeroU32::new(u32::MAX).expect("non-zero"));
 
         let err = build_git_scan_config(1, &GitSelection::default(), limits)
             .expect_err("overflow should fail");
