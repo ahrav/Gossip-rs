@@ -27,13 +27,14 @@ use gossip_contracts::{
 
 /// Minimal payload-backed [`GitRepoDiscoverySource`] for one-target shards.
 ///
-/// The source owns one normalized [`GitRepoTarget`] and an `emitted` flag that
-/// enforces an emit-once state machine. The target may be returned exactly
-/// once, and later calls return `Ok(None)` after either successful emission or
-/// a cursor that already proves the target is complete.
+/// The source owns one normalized [`GitRepoTarget`] and an `emitted` flag.
+/// After a successful emission, later calls return `Ok(None)`. A covering
+/// cursor also returns `Ok(None)`, but that exit is stateless — it does not
+/// consume the emit budget, so the same source can still emit if it is later
+/// called with a fresh cursor (e.g. after shard reassignment).
 ///
 /// `&mut self` on the trait provides the single-owner mutability needed for
-/// that state machine without interior synchronization.
+/// the `emitted` gate without interior synchronization.
 #[derive(Debug)]
 pub struct StaticGitRepoDiscoverySource {
     target: GitRepoTarget,
@@ -77,8 +78,8 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
     /// Three observable outcomes:
     ///
     /// - `Ok(Some(PageBuf))` with one terminal item on the first in-range call;
-    /// - `Ok(None)` when the target was already emitted, is outside the shard,
-    ///   or a cursor at/past the target key proves completion;
+    /// - `Ok(None)` when the target was already emitted, a cursor at/past the
+    ///   target key proves completion, or the target is outside the shard;
     /// - `Err(EnumerateError)` (permanent) when [`PageBuf::try_new_validated`]
     ///   rejects the page, indicating invalid local runtime state rather than a
     ///   retryable remote condition.
@@ -88,7 +89,7 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
-        _budgets: Budgets,
+        _budgets: Budgets, // one-target source always produces <= 1 item; any positive budget is satisfied
     ) -> Result<Option<PageBuf<GitRepoTarget>>, EnumerateError> {
         if self.emitted {
             return Ok(None);
@@ -145,7 +146,7 @@ fn cursor_covers_target(cursor: &Cursor, target: &GitRepoTarget) -> bool {
 mod tests {
     use gossip_contracts::{
         connector::git::{RepoKey, RepoLocator},
-        connector::{TokenBytes, validate_filled_page, validate_page_sequence},
+        connector::{validate_filled_page, validate_page_sequence, TokenBytes},
     };
     use proptest::prelude::*;
     use rstest::rstest;
@@ -252,6 +253,8 @@ mod tests {
         let target = make_test_target(b"git:repo:e");
         let mut discovery = StaticGitRepoDiscoverySource::new(target);
         let shard = ShardSpec::unbounded();
+        // Must be strictly less than the target key (b"git:repo:e") for
+        // validate_page_sequence to accept the cursor-advance ordering.
         let previous_last = RepoKey::try_from_slice(b"git:repo:d").expect("previous key");
 
         let page = discovery
