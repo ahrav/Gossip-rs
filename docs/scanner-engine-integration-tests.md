@@ -99,7 +99,7 @@ scanner-git boundaries.
 | -------------------------- | ----: | -------------------------------------------------- |
 | `anchor_optimization`      |    14 | Anchor derivation and optimization                 |
 | `archive_scanning`         |    49 | Archive expansion, virtual paths, budget limits    |
-| `bench_guards`             |     0 | Deferred benchmark guard (commented out pending benchmark migration) |
+| `bench_guards`             |     0 | Guards against benchmark execution without the benchmark feature gate (no active tests) |
 | `binary_awareness`         |    10 | Binary file detection                              |
 | `finding_json`             |     4 | JSONL finding parsing helpers used by integration assertions |
 | `git_commit_walk`          |     6 | Commit graph traversal                             |

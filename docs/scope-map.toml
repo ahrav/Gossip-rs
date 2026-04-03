@@ -108,7 +108,7 @@ dir = "crates/scanner-engine-integration-tests/"
 
 [[scopes]]
 doc = "docs/scanner-rs-cli.md"
-dir = "crates/scanner-rs-cli/src/"
+dir = "crates/scanner-rs-cli/"
 
 [[scopes]]
 doc = "docs/gossip-worker.md"
