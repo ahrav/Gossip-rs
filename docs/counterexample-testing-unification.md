@@ -510,7 +510,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 | False failures from near-miss | Medium     | Medium (CI noise)           | `near_miss_count` defaults to 0; existing tests unaffected. Near-miss tests are additive. New failures are always minimized before corpus addition.             |
 | Kitchen-sink module           | Medium     | Low (maintenance)           | Exceeded 500-line threshold; factored into submodule directory `mutation/` with 7 files (`mod.rs`, `op.rs`, `family.rs`, `encode.rs`, `plan.rs`, `plan_gen.rs`, `adapter.rs`). |
 
-**Rollback**: Each rollout slice is independently revertible.
+**Rollback**: Each rollout slice is independently reversible.
 
 - Shared mutation core extraction: revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
   `generator.rs`. No corpus changes.
