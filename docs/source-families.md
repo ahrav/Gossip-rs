@@ -108,10 +108,12 @@ operates on entire repositories rather than individual items.
    -> Result<GitRunOutcome, GitRunError>
 ```
 
-`gossip-scanner-runtime/src/git_discovery.rs` provides the payload-backed
-`StaticGitRepoDiscoverySource` used for one-target repo-frontier shards. It
+`gossip-scanner-runtime/src/git_discovery.rs` defines the payload-backed
+`StaticGitRepoDiscoverySource` for one-target repo-frontier shards. It
 emits one terminal page when the carried `RepoKey` is inside the assigned shard
 and otherwise relies on the ordered key boundary for replay-safe completion.
+The discovery runtime path is not yet wired; `GitRepoRuntime::execute_discovery`
+currently returns a not-implemented error.
 
 ---
 

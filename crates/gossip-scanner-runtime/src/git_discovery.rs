@@ -16,14 +16,15 @@
 //! |------|------|
 //! | [`StaticGitRepoDiscoverySource`] | Emit-once payload-backed discovery source |
 //! | [`StaticGitRepoDiscoverySource::new`] | Construct the source from one normalized target |
-//! | [`GitRepoDiscoverySource::discover_page`] | Return one validated terminal page or `Ok(None)` |
-//! | [`GitRepoDiscoverySource::choose_split_point`] | Always returns `Ok(None)` for one-target shards |
+//! | `discover_page` (impl) | Return one validated terminal page or `Ok(None)` |
+//! | `choose_split_point` (impl) | Always returns `Ok(None)` — one-target shards have no interior split geometry |
 
 use gossip_contracts::{
     connector::git::{GitDiscoveryCapabilities, GitRepoDiscoverySource, GitRepoTarget},
     connector::{Budgets, Cursor, EnumerateError, ItemKey, PageBuf, PageState, PagingCapabilities},
     coordination::ShardSpec,
 };
+use tracing::trace;
 
 /// Minimal payload-backed [`GitRepoDiscoverySource`] for one-target shards.
 ///
@@ -32,6 +33,9 @@ use gossip_contracts::{
 /// cursor also returns `Ok(None)`, but that exit is stateless — it does not
 /// consume the emit budget, so the same source can still emit if it is later
 /// called with a fresh cursor (e.g. after shard reassignment).
+///
+/// This type deliberately does not implement `Clone`; cloning would duplicate
+/// the emit-once state machine and violate the at-most-once delivery contract.
 ///
 /// `&mut self` on the trait provides the single-owner mutability needed for
 /// the `emitted` gate without interior synchronization.
@@ -60,7 +64,7 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
     /// Return static discovery capabilities for one-target payload-backed shards.
     ///
     /// Pages are ordered by the carried [`GitRepoTarget`]'s canonical
-    /// [`gossip_contracts::connector::git::RepoKey`], there is no opaque resume
+    /// [`RepoKey`](gossip_contracts::connector::git::RepoKey), there is no opaque resume
     /// token to preserve across calls, and the source never proposes split
     /// points because one-target shards have no interior split geometry.
     fn capabilities(&self) -> GitDiscoveryCapabilities {
@@ -92,17 +96,20 @@ impl GitRepoDiscoverySource for StaticGitRepoDiscoverySource {
         _budgets: Budgets, // one-target source always produces <= 1 item; any positive budget is satisfied
     ) -> Result<Option<PageBuf<GitRepoTarget>>, EnumerateError> {
         if self.emitted {
+            trace!("static git discovery: target already emitted");
             return Ok(None);
         }
 
-        // Cursor check is stateless: a covering cursor always yields Ok(None)
-        // without touching `emitted`, so the source stays reusable across
-        // cursor resets (e.g. shard reassignment with a fresh cursor).
+        // Cursor check is stateless: a covering cursor yields Ok(None) without
+        // setting `emitted`, so re-invocation with a fresh cursor still emits
+        // the target. Only successful emission (below) is terminal.
         if cursor_covers_target(cursor, &self.target) {
+            trace!("static git discovery: cursor covers target, skipping");
             return Ok(None);
         }
 
         if !shard.contains_key(self.target.repo_key().as_bytes()) {
+            trace!("static git discovery: target outside shard bounds");
             return Ok(None);
         }
 
@@ -146,7 +153,7 @@ fn cursor_covers_target(cursor: &Cursor, target: &GitRepoTarget) -> bool {
 mod tests {
     use gossip_contracts::{
         connector::git::{RepoKey, RepoLocator},
-        connector::{validate_filled_page, validate_page_sequence, TokenBytes},
+        connector::{TokenBytes, validate_filled_page, validate_page_sequence},
     };
     use proptest::prelude::*;
     use rstest::rstest;
@@ -393,6 +400,29 @@ mod tests {
         assert_eq!(&page.items()[0], &target);
     }
 
+    /// Successful emission is shard-independent: a second call with a different
+    /// shard that also contains the target still returns `Ok(None)`.
+    #[test]
+    fn discover_page_emit_is_shard_independent() {
+        let target = make_test_target(b"git:repo:l");
+        let mut discovery = StaticGitRepoDiscoverySource::new(target.clone());
+
+        let shard_a = ShardSpec::with_range(
+            target.repo_key().as_bytes(),
+            successor_bytes(target.repo_key().as_bytes()),
+        );
+        let first = discovery
+            .discover_page(&shard_a, &Cursor::initial(), budgets())
+            .expect("first call succeeds");
+        assert!(first.is_some(), "first call should emit");
+
+        let shard_b = ShardSpec::unbounded();
+        let second = discovery
+            .discover_page(&shard_b, &Cursor::initial(), budgets())
+            .expect("second call succeeds");
+        assert!(second.is_none(), "emitted flag is shard-independent");
+    }
+
     /// Targets outside `[start, end)` are never emitted for the current shard.
     #[rstest]
     #[case::below_start(
@@ -457,6 +487,23 @@ mod tests {
                     shard.key_range_start(),
                     shard.key_range_end(),
                 ).expect("emitted page should validate");
+
+                // Also verify page-sequence contract with a synthetic preceding key.
+                let mut preceding = key_bytes.clone();
+                let last_idx = preceding.len() - 1;
+                preceding[last_idx] = preceding[last_idx].wrapping_sub(1);
+                if preceding < key_bytes
+                    && let Ok(pk) = RepoKey::try_from_vec(preceding)
+                {
+                    validate_page_sequence(
+                        page.items(),
+                        page.state(),
+                        Some(pk.as_item_key()),
+                        shard.key_range_start(),
+                        shard.key_range_end(),
+                    )
+                    .expect("emitted page should satisfy sequence validation");
+                }
             } else {
                 prop_assert!(page.is_none());
             }

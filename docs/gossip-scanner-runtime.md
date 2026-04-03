@@ -178,7 +178,9 @@ and done-ledger state.
 The runtime is organized around source families rather than driver traits:
 
 - `ordered_content` covers sources that behave like forward-only item streams
-- `git_repo` covers repository discovery and repository execution paths
+- `git_discovery` owns static payload-backed repository discovery for
+  repo-frontier shards
+- `git_repo` covers local repository execution paths
 - `distributed` exposes the worker-loop nouns for distributed shard execution
 
 This keeps the public orchestration types available without requiring the
