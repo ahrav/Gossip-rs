@@ -164,7 +164,7 @@ a sustained-green gate script (separate implementation).
 
 ```bash
 # Local parity gate invocation for this deferred mode (uses defaults: 9 iterations, 2%/5% thresholds)
-cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 
 # Tuning knobs for local stress/debug
 EXECUTION_MODE_PARITY_ITERS=9 \
