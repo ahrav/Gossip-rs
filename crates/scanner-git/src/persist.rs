@@ -593,6 +593,11 @@ mod tests {
                 .expect("post-finalize check"),
             vec![true, true, false]
         );
+        // Staging must be cleared after a successful finalize.
+        assert!(
+            store.seen_staging.borrow().is_empty(),
+            "staging must be cleared after complete finalize"
+        );
 
         // Second round: more staging, then finalize again.
         store
@@ -606,6 +611,10 @@ mod tests {
                 .batch_check_seen(&[oid_a, oid_b, oid_c])
                 .expect("final check"),
             vec![true, true, true]
+        );
+        assert!(
+            store.seen_staging.borrow().is_empty(),
+            "staging must be cleared after second finalize"
         );
 
         // Each finalize produces a merged bitmap WriteOp for the scope key.
@@ -688,6 +697,12 @@ mod tests {
             .batch_check_seen(&[oid_a, oid_b, oid_c, oid_d])
             .expect("batch check");
         assert_eq!(flags, vec![true, true, true, true]);
+
+        // Staging must be cleared after a successful finalize.
+        assert!(
+            store.seen_staging.borrow().is_empty(),
+            "staging must be cleared after complete finalize"
+        );
     }
 
     /// Partial finalize discards staging so that skipped blobs are
