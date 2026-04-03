@@ -26,6 +26,7 @@
 //! |--------|--------|-------------|------------|
 //! | Ordered content (fs) | [`ordered_content`] | [`FsScanConfig`] | [`scan_fs`] |
 //! | Git repository | [`git_repo`] | [`GitScanConfig`] | [`scan_git`] |
+//! | Git repository executor | [`git_executor`] | `GitSelection + GitExecutionLimits` | [`git_executor::ScannerGitExecutor`] |
 //!
 //! # Execution modes
 //!
@@ -62,6 +63,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 
+pub use git_executor::ScannerGitExecutor;
 use gossip_connectors::FilesystemConnector;
 pub use gossip_contracts::connector::git::GitDebugLevel;
 use gossip_contracts::connector::git::GitRefSelection;
@@ -103,6 +105,8 @@ pub mod distributed;
 pub mod event_sink;
 // Static single-target Git repository discovery source.
 pub mod git_discovery;
+// Contract-level adapter for mirror-backed Git repository execution.
+pub mod git_executor;
 // Worker-local Git mirror lifecycle and deterministic cache-path helpers.
 pub mod git_mirror;
 // Git-repository runtime boundary for local scans.
