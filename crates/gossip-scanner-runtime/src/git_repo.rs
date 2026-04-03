@@ -57,15 +57,32 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct GitRepoRuntime;
 
+/// Aggregate outcome from executing one mirror-backed Git repository scan.
+///
+/// Bundles the scan metrics, an optional checkpoint input for the
+/// coordination layer, and the scanner's finalize outcome (complete vs.
+/// partial). Produced by [`GitRepoRuntime::execute_repo`] and consumed by
+/// the distributed Git worker loop to advance the shard.
 #[derive(Debug)]
 pub(crate) struct GitRepoExecutionOutcome {
+    /// Aggregate scan metrics (objects, bytes, findings, errors) translated
+    /// into the crate-level report format.
     pub(crate) report: ScanReport,
+    /// Checkpoint input synthesized from the persistence adapter's durable
+    /// state. `None` when the scan produced no persistence-backed progress.
     pub(crate) checkpoint_input: Option<CheckpointAggregatorInput>,
+    /// Whether the scanner fully traversed the configured start-set
+    /// (`Complete`) or stopped early due to resource limits or errors.
     pub(crate) finalize_outcome: FinalizeOutcome,
 }
 
 impl GitRepoRuntime {
     /// Execute one Git discovery step for the current shard suffix.
+    ///
+    /// Delegates to the discovery source's `discover_page` method and wraps
+    /// any discovery error into a [`ScanRuntimeError::Driver`] with the
+    /// concrete source type name for diagnostics. Returns `None` when no
+    /// page is available (the discovery source has no more targets).
     pub(crate) fn execute_discovery<D: GitRepoDiscoverySource>(
         discovery: &mut D,
         shard: &ShardSpec,
@@ -84,10 +101,26 @@ impl GitRepoRuntime {
 
     /// Execute one already-prepared mirror-backed repository scan.
     ///
-    /// The runtime lowers explicit-commit selections inside `mirror`, builds a
-    /// shard-scoped [`ScannerGitExecutor`] for event forwarding and error
-    /// classification, then runs `scanner-git` with a
-    /// [`GitPersistenceAdapter`] so the finalize result is already durable.
+    /// Orchestrates three phases:
+    ///
+    /// 1. **Selection lowering**: explicit-commit selections inside `mirror`
+    ///    are resolved to concrete ref names via `lower_selection_for_local_mirror`.
+    /// 2. **Executor construction**: a [`ScannerGitExecutor`] is built from the
+    ///    overlay of the scan template, payload settings, and lowered selection,
+    ///    then paired with a [`GitPersistenceAdapter`] so finalize results land
+    ///    durably.
+    /// 3. **Checkpoint synthesis**: after the scan completes, the persistence
+    ///    adapter produces a [`CheckpointAggregatorInput`] encoding the repo's
+    ///    frontier state for coordination-layer advancement.
+    ///
+    /// # Errors
+    ///
+    /// - Selection lowering failures (e.g., ref resolution) surface as
+    ///   `ScanRuntimeError::Driver`.
+    /// - Engine construction or scan execution failures propagate through
+    ///   the executor error boundary.
+    /// - Checkpoint synthesis failures indicate a persistence-layer
+    ///   inconsistency.
     pub(crate) fn execute_repo<B>(
         scan_template: &GitScanConfig,
         payload: &GitShardPayload,
@@ -125,6 +158,9 @@ impl GitRepoRuntime {
                 ))
             })?;
         let finalize_outcome = execution.result.0.finalize.outcome;
+        // Sequence number is always 0: each repo-frontier shard processes
+        // exactly one singleton repo target per lease, so the checkpoint
+        // aggregator never needs to distinguish multiple completed units.
         let checkpoint_input = persistence
             .repo_frontier_checkpoint_input(write_context, 0, payload.repo_key(), finalize_outcome)
             .map_err(|error| {
@@ -143,6 +179,8 @@ impl GitRepoRuntime {
     }
 }
 
+/// Wrap a [`GitSelectionLoweringError`] into a [`ScanRuntimeError::Driver`]
+/// with the mirror's digested path for log-safe diagnostics.
 fn lower_selection_error(
     mirror: &LocalMirror,
     error: GitSelectionLoweringError,
@@ -153,6 +191,20 @@ fn lower_selection_error(
     ))
 }
 
+/// Build a shard-specific Git scan config by overlaying payload and selection
+/// settings onto the worker's scan template.
+///
+/// The overlay semantics are:
+/// - **Template** provides the base rule file, transform filter, decode depth,
+///   and anchor mode inherited from the worker identity.
+/// - **Mirror path** replaces the template's `repo` field with the prepared
+///   mirror location.
+/// - **Payload** contributes `repo_id` and execution limits (worker count,
+///   binary scanning, identity enrichment, cache/chunk sizes, debug level).
+/// - **Selection** supplies scan mode, merge strategy, and ref selection
+///   (already lowered from explicit-commit form).
+///
+/// Fields not overridden by the payload retain the template's default values.
 fn distributed_git_scan_config(
     template: &GitScanConfig,
     mirror: &LocalMirror,
@@ -177,6 +229,13 @@ fn distributed_git_scan_config(
     config
 }
 
+/// Extract the single repo target from a discovery page, enforcing singleton
+/// shard invariants.
+///
+/// Returns `Ok(None)` when `page` is `None` (no discovery result).
+/// Returns `Ok(Some(target))` when the page is `Complete` with exactly one
+/// item. Returns an error if the page is non-terminal or contains zero or
+/// more than one target — both are protocol violations for a singleton shard.
 pub(crate) fn single_repo_target(
     page: Option<PageBuf<GitRepoTarget>>,
 ) -> Result<Option<GitRepoTarget>, ScanRuntimeError> {
@@ -199,9 +258,18 @@ pub(crate) fn single_repo_target(
     Ok(page.items().first().cloned())
 }
 
-/// Shared low-level `scanner-git` execution output.
+/// Shared low-level `scanner-git` execution output pairing the scan result
+/// with its wall-clock elapsed time.
+///
+/// Used by both the local and distributed scan paths. The `scan_elapsed`
+/// field provides a fallback duration when the scanner's stage-level nanos
+/// are unavailable (see [`resolve_scan_ns`]).
 pub(crate) struct GitRunExecution {
+    /// Raw scan result containing the report, finalize output, and per-stage
+    /// timing data.
     pub(crate) result: GitScanResult,
+    /// Wall-clock elapsed time measured from scan start to completion, used
+    /// as a fallback when stage-level nanos are zero.
     pub(crate) scan_elapsed: Duration,
 }
 
@@ -216,9 +284,22 @@ impl GitRunExecution {
 }
 
 /// Runtime-owned store bundle passed into the shared Git runner helper.
+///
+/// Callers control incremental behavior by choosing store implementations:
+/// - **Local scans** use no-op stores ([`EmptyWatermarkStore`] +
+///   [`NeverSeenStore`]) and `persist_store = None` for full scans.
+/// - **Distributed scans** inject a [`GitPersistenceAdapter`] that implements
+///   all three traits, enabling watermark-driven incremental scanning and
+///   durable finalize output.
 pub(crate) struct GitRuntimeStores<'a> {
+    /// Determines which blobs are considered "already seen" and can be
+    /// skipped during the object scan.
     pub(crate) seen_store: &'a dyn SeenBlobStore,
+    /// Provides per-ref watermark OIDs so the scanner can skip commits
+    /// already covered by a prior scan.
     pub(crate) watermark_store: &'a dyn RefWatermarkStore,
+    /// Optional persistence sink for durable finalize output (data ops,
+    /// watermark ops). `None` for local scans that do not persist state.
     pub(crate) persist_store: Option<&'a dyn PersistenceStore>,
 }
 
@@ -504,8 +585,10 @@ pub(crate) fn resolve_scan_ns(
 ///
 /// Scan duration is resolved by [`resolve_scan_ns`].
 ///
-/// Git scans have no persistence layer, so `dropped_findings`,
-/// `persist_emit_failures`, `persist_incomplete`, and `persist_ns` are zeroed.
+/// The `scanner_git` report does not track persistence-layer metrics (those
+/// flow through a separate `GitPersistenceAdapter` in the distributed path),
+/// so `dropped_findings`, `persist_emit_failures`, `persist_incomplete`, and
+/// `persist_ns` are zeroed at this translation boundary.
 fn git_report_to_scan_report(
     result: GitScanResult,
     scan_elapsed: std::time::Duration,

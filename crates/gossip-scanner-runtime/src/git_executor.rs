@@ -48,6 +48,13 @@ pub struct ScannerGitExecutor {
     event_sink: Arc<dyn GitEventOutput + Send + Sync>,
 }
 
+/// Resolved scanner-level Git configuration bundled with the requested
+/// debug verbosity.
+///
+/// Built by [`build_git_scan_config`] from contract-level selection and
+/// execution limits. The `git_cfg` field is passed directly to the
+/// `scanner-git` runner, while `debug_level` controls post-scan diagnostic
+/// output independently of the scanner's own logging.
 #[derive(Debug)]
 struct ExecutorGitScanConfig {
     git_cfg: ScannerGitScanConfig,
@@ -87,6 +94,23 @@ impl ScannerGitExecutor {
         Ok(Self::new(config.repo_id, engine, event_sink))
     }
 
+    /// Core dual-thread execution path shared by all Git scan entry points.
+    ///
+    /// Spawns a scoped event-forwarder thread alongside the caller-provided
+    /// `run_scan` closure:
+    ///
+    /// 1. A bounded `sync_channel` carries events from the scan thread to the
+    ///    forwarder, which replays them into the executor's [`GitEventOutput`]
+    ///    sink.
+    /// 2. After `run_scan` returns (success or failure), the sender handle is
+    ///    explicitly dropped so the forwarder observes EOF.
+    /// 3. The forwarder is joined before inspecting the scan result — this
+    ///    prevents a forwarder panic from masking the classified scan error.
+    /// 4. When both the scan and forwarder fail, the scan error is preferred
+    ///    because it is the root cause.
+    ///
+    /// The `policy_hash` flows into the scanner config for persistence
+    /// identity derivation; callers that do not persist pass `[0; 32]`.
     fn execute_repo_with<R>(
         &self,
         mirror: &LocalMirror,
@@ -160,6 +184,12 @@ impl ScannerGitExecutor {
         })
     }
 
+    /// Convenience wrapper that executes a scan without persistence and maps
+    /// the raw [`GitRunExecution`] into the contract-level [`GitRunOutcome`].
+    ///
+    /// Used by the [`GitRepoExecutor`] trait implementation for the
+    /// non-persistent local scan path. Passes a zeroed policy hash because
+    /// no persistence identity is derived.
     fn run_repo_with<R>(
         &self,
         mirror: &LocalMirror,
@@ -179,6 +209,14 @@ impl ScannerGitExecutor {
             .map(git_run_outcome)
     }
 
+    /// Execute a mirror-backed Git scan with an injected persistence adapter.
+    ///
+    /// The [`GitPersistenceAdapter`] is wired as the scanner's seen-blob
+    /// store, ref-watermark store, and persistence store, so finalize results
+    /// are durable by the time the scan completes. The distributed Git
+    /// worker path uses this method instead of [`run_repo_with`](Self::run_repo_with)
+    /// because it needs the raw [`GitRunExecution`] to extract the
+    /// finalize outcome and synthesize a checkpoint.
     pub(crate) fn run_repo_with_persistence<B>(
         &self,
         mirror: &LocalMirror,
@@ -247,6 +285,22 @@ pub(crate) fn map_merge_strategy(strategy: GitMergeStrategy) -> MergeDiffMode {
     }
 }
 
+/// Assemble a scanner-level Git config from contract-level selection and limits.
+///
+/// Translates contract enums (scan mode, merge strategy, ref selection) into
+/// their `scanner-git` equivalents and applies execution-limit overrides
+/// (worker count, binary scanning, tree-delta cache size, engine chunk size).
+///
+/// Non-obvious defaults:
+/// - `pack_exec_workers` defaults to [`available_workers`] when the limits do
+///   not specify a worker count, clamped to at least 1.
+/// - `debug_level` is extracted from execution limits and returned alongside
+///   the scanner config rather than embedded in it.
+///
+/// # Errors
+///
+/// Returns a permanent [`GitRunError`] when MiB-to-byte conversion overflows
+/// for `tree_delta_cache_mb` or `engine_chunk_mb`.
 fn build_git_scan_config(
     repo_id: u64,
     policy_hash: [u8; 32],
@@ -281,6 +335,12 @@ fn build_git_scan_config(
     })
 }
 
+/// Log scanner diagnostics at `info` level when the requested debug level
+/// is non-`Off`.
+///
+/// Uses `info` rather than `debug` so explicitly-requested diagnostics are
+/// visible under the default production log filter without needing a config
+/// change.
 fn maybe_log_debug_output(
     mirror_path: &Path,
     debug_level: GitDebugLevel,

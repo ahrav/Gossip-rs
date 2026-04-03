@@ -42,7 +42,7 @@
 //! | [`DistributedPersistence`]  | Cloneable persistence backend handles             |
 //! | [`DistributedRuntimeConfig`]| Budget and queue-sizing knobs                     |
 //! | [`DistributedRunReport`]    | Summary counters from one worker invocation       |
-//! | [`DistributedRuntimeError`] | Layered error: coordinator / runtime / durability |
+//! | [`DistributedRuntimeError`] | Layered error: coordinator / lease-uncertainty / runtime / durability |
 //!
 //! # Invariants
 //!
@@ -181,11 +181,9 @@ impl WorkerIdentity {
 
 /// Immutable worker identity for distributed Git repo-frontier execution.
 ///
-/// This mirrors [`WorkerIdentity`] but carries a Git scan template instead of
-/// a filesystem scan template. The Git distributed path is intentionally a
-/// sibling entrypoint so repo-frontier execution can compose discovery,
-/// mirror preparation, and durable Git finalize state without rewriting the
-/// filesystem worker loop into a generic abstraction.
+/// Bundles tenant/run/worker coordination identity, a Git scan template, and
+/// a shared recorder so each claimed repo-frontier shard can compose discovery,
+/// mirror preparation, and durable Git finalize state.
 #[derive(Clone)]
 pub struct GitWorkerIdentity {
     /// Tenant boundary for all coordination calls.
@@ -256,8 +254,8 @@ impl HydratedFilesystemSource {
 
 /// Lease payload consumed by the distributed runtime.
 ///
-/// One lease corresponds to one shard from the coordination layer. It carries
-/// everything needed to scan and commit that shard without additional lookups:
+/// One lease corresponds to one shard from the coordination layer. Key fields
+/// include:
 ///
 /// - **`shard_id`** — string label for telemetry routing.
 /// - **`lease`** — authoritative coordination lease used for terminal completion.
@@ -269,6 +267,8 @@ impl HydratedFilesystemSource {
 /// - **`write_context`** — numeric shard identity plus fencing epoch for all
 ///   persistence writes.
 /// - **`tenant_secret_key`** — key material for secret-hash derivation.
+/// - **`claim_wall_clock`** / **`claim_instant`** — wall-clock and monotonic
+///   timestamps captured at claim time, anchoring the lease-deadline watchdog.
 ///
 /// # Lifecycle
 ///
@@ -455,13 +455,28 @@ impl ShardLease {
 /// repo target and scan settings define the worker-side Git execution path.
 #[derive(Clone, Debug)]
 pub struct GitShardLease {
+    /// String shard label used for telemetry routing and log correlation.
     shard_id: Arc<str>,
+    /// Authoritative coordination-layer lease used for terminal completion
+    /// and shard advancement.
     lease: Lease,
+    /// Shard bounds, resume cursor, and cursor semantics restored from
+    /// the acquire/restore coordination payload.
     state: RestoredShardState,
+    /// Decoded Git shard payload carrying the repo target, selection policy,
+    /// and execution limits for this shard.
     payload: GitShardPayload,
+    /// Shared routing and fencing metadata for all writes emitted under
+    /// this lease.
     write_context: WriteContext,
+    /// Tenant secret key used for secret-hash derivation in persistence
+    /// identity computation.
     tenant_secret_key: TenantSecretKey,
+    /// Wall-clock timestamp captured at claim time, anchoring the monotonic
+    /// deadline calculation to the coordinator's view of time.
     claim_wall_clock: LogicalTime,
+    /// Monotonic instant captured alongside `claim_wall_clock` so elapsed
+    /// time can be measured without NTP skew.
     claim_instant: Instant,
 }
 
@@ -489,77 +504,96 @@ impl GitShardLease {
         }
     }
 
+    /// String shard label used for telemetry routing and log correlation.
     #[inline]
     #[must_use]
     pub fn shard_id(&self) -> &str {
         &self.shard_id
     }
 
+    /// Arc-wrapped shard label for zero-allocation sharing across subsystems.
     #[inline]
     #[must_use]
     pub fn shard_id_arc(&self) -> &Arc<str> {
         &self.shard_id
     }
 
+    /// Coordination-layer lease used for shard advancement and terminal
+    /// completion.
     #[inline]
     pub fn lease(&self) -> Lease {
         self.lease
     }
 
+    /// Restored coordination state (shard spec, resume cursor, cursor
+    /// semantics) from the acquire/restore payload.
     #[inline]
     #[must_use]
     pub fn restored_state(&self) -> &RestoredShardState {
         &self.state
     }
 
+    /// Inclusive lower bound of the shard's key range.
     #[inline]
     #[must_use]
     pub fn range_start(&self) -> &[u8] {
         self.state.shard_spec().key_range_start()
     }
 
+    /// Full authoritative shard specification restored from acquire/restore.
     #[inline]
     #[must_use]
     pub fn shard_spec(&self) -> &ShardSpec {
         self.state.shard_spec()
     }
 
+    /// Authoritative resume cursor restored from acquire/restore.
     #[inline]
     #[must_use]
     pub fn resume_cursor(&self) -> &Cursor {
         self.state.resume_cursor()
     }
 
+    /// Coordination cursor semantics governing how checkpoint cursors are
+    /// interpreted on re-claim.
     #[inline]
     #[must_use]
     pub fn cursor_semantics(&self) -> CursorSemantics {
         self.state.cursor_semantics()
     }
 
+    /// Decoded Git shard payload carrying the repo target, selection policy,
+    /// and execution limits for this shard.
     #[inline]
     #[must_use]
     pub fn payload(&self) -> &GitShardPayload {
         &self.payload
     }
 
+    /// Shared routing and fencing metadata for all writes emitted under
+    /// this lease.
     #[inline]
     #[must_use]
     pub fn write_context(&self) -> WriteContext {
         self.write_context
     }
 
+    /// Tenant secret key used for secret-hash derivation.
     #[inline]
     #[must_use]
     pub fn tenant_secret_key(&self) -> TenantSecretKey {
         self.tenant_secret_key
     }
 
+    /// Wall-clock timestamp captured at claim time, anchoring the monotonic
+    /// deadline calculation to the coordinator's view of time.
     #[inline]
     #[must_use]
     fn claim_wall_clock(&self) -> LogicalTime {
         self.claim_wall_clock
     }
 
+    /// Monotonic instant captured alongside `claim_wall_clock`.
     #[inline]
     #[must_use]
     fn claim_instant(&self) -> Instant {
@@ -567,11 +601,21 @@ impl GitShardLease {
     }
 }
 
+/// Common read-only view over both filesystem and Git shard leases.
+///
+/// Abstracts the shared subset of [`ShardLease`] and [`GitShardLease`] so
+/// generic helpers (e.g., `advance_shard`, `log_claim`) can operate on either
+/// lease family without monomorphizing the entire worker loop.
 trait LeaseView {
+    /// String shard label for telemetry and log correlation.
     fn shard_id(&self) -> &str;
+    /// Coordination-layer lease for shard advancement.
     fn lease(&self) -> Lease;
+    /// Restored shard state (spec, resume cursor, cursor semantics).
     fn restored_state(&self) -> &RestoredShardState;
+    /// Authoritative resume cursor from the acquire/restore payload.
     fn resume_cursor(&self) -> &Cursor;
+    /// Inclusive lower bound of the shard's key range.
     fn range_start(&self) -> &[u8];
 }
 
@@ -738,11 +782,22 @@ pub enum LeaseUncertainty {
 /// The signal can be sealed once the receipt drain finishes successfully so a
 /// later wall-clock expiry does not retroactively invalidate a completed local
 /// durability stage.
+///
+/// State transitions are one-way:
+/// - `Open` -> `Recorded` (deadline watcher fires)
+/// - `Open` -> `Closed` (drain completes successfully)
+/// - `Recorded` stays `Recorded` (drain success does not restore trust)
 #[derive(Clone, Debug, Default)]
 enum LeaseUncertaintyState {
+    /// No uncertainty observed; the lease is still trusted.
     #[default]
     Open,
+    /// The deadline watcher detected an expiry condition. The contained
+    /// [`LeaseUncertainty`] describes the specific reason.
     Recorded(LeaseUncertainty),
+    /// The local durability stage completed successfully and the signal was
+    /// sealed before any deadline expiry. No further uncertainty can be
+    /// recorded.
     Closed,
 }
 
@@ -876,8 +931,14 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 /// leaked item.
 #[derive(Debug)]
 struct InFlightItem {
+    /// Monotonic sequence number assigned at `begin_item`, used for
+    /// deterministic logical-time derivation and post-drain cross-check.
     sequence_no: u64,
+    /// Item metadata (stable ID, optional version, size hint) captured at
+    /// `begin_item` and used during `finish_item` translation.
     meta: ItemMeta,
+    /// Accumulated finding records appended by one or more `upsert_findings`
+    /// calls before `finish_item` translates them into persistence rows.
     findings: Vec<FsFindingRecord>,
 }
 
@@ -1317,6 +1378,13 @@ impl CommitSink for ReceiptCommitSink {
     }
 }
 
+/// Emit per-finding events for one ordered-content item execution.
+///
+/// Only items with a `Scanned` outcome produce events; skipped, truncated,
+/// and failed outcomes are silently ignored because their findings list is
+/// empty or absent. Each finding becomes one `CoreEvent::Finding` dispatched
+/// through the event output, carrying the rule name resolved from the
+/// pre-built detection engine.
 fn emit_ordered_item_findings(
     out: &dyn EventOutput,
     engine: &scanner_engine::Engine,
@@ -1341,6 +1409,12 @@ fn emit_ordered_item_findings(
     }
 }
 
+/// Emit a summary event for one completed ordered-content shard execution.
+///
+/// Derives elapsed milliseconds and throughput (MiB/s) from the accumulated
+/// `ScanReport`, then flushes the event output to ensure the summary is
+/// delivered promptly. Called once per shard after all pages have been
+/// processed (or the loop exits early with partial progress).
 fn emit_ordered_summary(out: &dyn EventOutput, report: ScanReport) {
     let elapsed_ms = report.scan_ns / 1_000_000;
     let throughput_mib_s = if report.scan_ns == 0 {
@@ -1364,15 +1438,17 @@ fn emit_ordered_summary(out: &dyn EventOutput, report: ScanReport) {
 /// Accumulated state from draining the commit-stage outcome stream.
 ///
 /// Produced by [`drain_commit_stage`] and consumed by
-/// [`run_filesystem_lease`] to build the checkpoint and verify that every
-/// submitted commit produced a durable outcome.
+/// [`run_filesystem_lease`] to build the receipt-driven checkpoint and verify
+/// that every submitted commit produced exactly one durable outcome.
 #[derive(Debug)]
 struct CommitStageDrainResult {
-    /// Receipt aggregator that tracks the contiguous committed prefix.
+    /// Receipt aggregator tracking the contiguous committed prefix. After
+    /// draining completes, its `prepare_checkpoint` method yields the
+    /// authoritative checkpoint cursor.
     aggregator: PrefixCheckpointAggregator,
     /// Sequence numbers of committed items, in drain order (not necessarily
     /// sorted). Compared against the submitted list by
-    /// [`wait_for_submitted_commits`].
+    /// [`wait_for_submitted_commits`] to detect lost or duplicated outcomes.
     committed_sequence_nos: Vec<u64>,
 }
 
@@ -1921,32 +1997,33 @@ macro_rules! map_advance_error {
 /// workers hold all shards) and `Throttled` (coordinator-imposed cooldown),
 /// sleeping until the earliest deadline expires. Terminal errors like
 /// `RunNotFound` or `BackendError` propagate immediately.
-fn claim_next_lease<C>(
+///
+/// `build_lease` converts a raw `AcquireResultView` into the caller's
+/// concrete lease type (filesystem or Git) so the retry loop is shared.
+fn claim_next<C, L, F>(
     coordinator: &mut C,
-    identity: &WorkerIdentity,
+    tenant: TenantId,
+    run: RunId,
+    worker: WorkerId,
     scratch: &mut AcquireScratch,
-) -> Result<Option<ShardLease>, DistributedRuntimeError>
+    build_lease: F,
+) -> Result<Option<L>, DistributedRuntimeError>
 where
     C: CoordinationFacade,
+    F: Fn(AcquireResultView<'_>, LogicalTime, Instant) -> Result<L>,
 {
     loop {
         let now = wall_clock_now();
         let claim_instant = Instant::now();
-        match coordinator.claim_next_available(
-            now,
-            identity.tenant,
-            identity.run,
-            identity.worker,
-            scratch,
-        ) {
+        match coordinator.claim_next_available(now, tenant, run, worker, scratch) {
             Ok(acquired) => {
-                return build_lease_from_acquire(acquired, identity, now, claim_instant)
+                return build_lease(acquired, now, claim_instant)
                     .map(Some)
                     .map_err(DistributedRuntimeError::Coordinator);
             }
             Err(ClaimError::NoneAvailable { earliest_deadline }) => {
                 let progress = coordinator
-                    .get_run_progress(now, identity.tenant, identity.run)
+                    .get_run_progress(now, tenant, run)
                     .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
                 if progress.active() == 0 {
                     return Ok(None);
@@ -1963,6 +2040,25 @@ where
     }
 }
 
+/// Claim the next available filesystem shard lease.
+fn claim_next_lease<C>(
+    coordinator: &mut C,
+    identity: &WorkerIdentity,
+    scratch: &mut AcquireScratch,
+) -> Result<Option<ShardLease>, DistributedRuntimeError>
+where
+    C: CoordinationFacade,
+{
+    claim_next(
+        coordinator,
+        identity.tenant,
+        identity.run,
+        identity.worker,
+        scratch,
+        |acquired, now, instant| build_lease_from_acquire(acquired, identity, now, instant),
+    )
+}
+
 /// Claim the next available Git repo-frontier shard lease.
 fn claim_next_git_lease<C>(
     coordinator: &mut C,
@@ -1972,38 +2068,14 @@ fn claim_next_git_lease<C>(
 where
     C: CoordinationFacade,
 {
-    loop {
-        let now = wall_clock_now();
-        let claim_instant = Instant::now();
-        match coordinator.claim_next_available(
-            now,
-            identity.tenant,
-            identity.run,
-            identity.worker,
-            scratch,
-        ) {
-            Ok(acquired) => {
-                return build_git_lease_from_acquire(acquired, identity, now, claim_instant)
-                    .map(Some)
-                    .map_err(DistributedRuntimeError::Coordinator);
-            }
-            Err(ClaimError::NoneAvailable { earliest_deadline }) => {
-                let progress = coordinator
-                    .get_run_progress(now, identity.tenant, identity.run)
-                    .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
-                if progress.active() == 0 {
-                    return Ok(None);
-                }
-                std::thread::sleep(claim_retry_delay(now, earliest_deadline));
-            }
-            Err(ClaimError::Throttled { retry_after }) => {
-                std::thread::sleep(claim_retry_delay(now, Some(retry_after)));
-            }
-            Err(error) => {
-                return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
-            }
-        }
-    }
+    claim_next(
+        coordinator,
+        identity.tenant,
+        identity.run,
+        identity.worker,
+        scratch,
+        |acquired, now, instant| build_git_lease_from_acquire(acquired, identity, now, instant),
+    )
 }
 
 /// Advance a claimed shard directly against the coordination backend.
@@ -2124,23 +2196,57 @@ where
 /// more `ExhaustedEmpty` outcome before the shard is fully enumerated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageLoopPhase {
+    /// Normal paging: the loop requests successive content pages from the
+    /// source until one returns `PageState::Complete`.
     Paging,
+    /// A terminal non-empty page has been observed. The loop expects one
+    /// more `ExhaustedEmpty` response to confirm the source has no
+    /// remaining items before marking the shard fully enumerated.
     AwaitingExhaustedEmpty,
 }
 
+/// How the ordered-content page loop terminated.
+///
+/// Determines whether the downstream shard-advance step can mark the shard
+/// as `Done` (exhausted-empty confirmed) or must preserve progress with a
+/// non-terminal checkpoint (partial).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageLoopTermination {
+    /// The source confirmed that no items remain after the terminal page.
+    /// The shard can be terminally completed.
     ExhaustedEmptyConfirmed,
+    /// The loop exited before observing the exhausted-empty suffix — due to
+    /// cancellation, a budget-deferred item, a retryable stop, or a
+    /// retryable item outcome. Progress is preserved via a non-terminal
+    /// checkpoint so the next claim resumes where this one stopped.
     Partial,
 }
 
+/// Accumulated result from scanning all pages of one ordered-content shard.
+///
+/// Produced by [`scan_ordered_source_with_engine`] and consumed by the
+/// enclosing `run_filesystem_lease` to select the shard-advance action.
 #[derive(Clone, Debug)]
 struct OrderedSourceAssignmentOutcome {
+    /// Aggregate scan metrics (items scanned, bytes, findings, errors)
+    /// accumulated across all submitted pages.
     report: ScanReport,
+    /// Whether the page loop fully enumerated the source or stopped early.
     termination: PageLoopTermination,
+    /// The cursor to resume from on the next claim. Reflects the last
+    /// committed item's key position when the loop stopped early, or the
+    /// source's own resume cursor when all pages were processed.
     resume_cursor: Cursor,
 }
 
+/// Execute ordered-content scanning for one filesystem shard using a
+/// [`FilesystemConnector`] as the content source.
+///
+/// Thin wrapper over [`scan_ordered_source_with_engine`] that constructs a
+/// filesystem connector from the shard's hydrated scan config path, then
+/// delegates to the generic page loop. Exists as a separate function so the
+/// production filesystem path is fully typed while the generic version
+/// remains available for test-double injection.
 fn scan_ordered_filesystem_lease_with_engine<D>(
     lease: &ShardLease,
     config: &FsScanConfig,
@@ -2168,6 +2274,20 @@ where
 }
 
 /// Source-generic ordered-content page loop.
+///
+/// Drives a two-phase enumeration and scan cycle:
+///
+/// 1. **Page enumeration**: requests successive content pages from `source`
+///    until the source reports `PageState::Complete` or the loop exits early.
+/// 2. **Scan and submit**: each page is pre-filtered against the done-ledger,
+///    scanned with the pre-built engine, and committed through
+///    `ReceiptCommitSink`. Items past a budget-deferred key or with a
+///    retryable outcome stop submission early to preserve checkpoint safety.
+///
+/// After a terminal non-empty page, the loop enters
+/// [`PageLoopPhase::AwaitingExhaustedEmpty`] and expects one confirming
+/// `ExhaustedEmpty` response before returning
+/// [`PageLoopTermination::ExhaustedEmptyConfirmed`].
 ///
 /// Identical to [`scan_ordered_filesystem_lease_with_engine`] but accepts any
 /// [`OrderedContentSource`], enabling injection of scripted test doubles for
@@ -2603,7 +2723,7 @@ fn run_git_repo_lease<M, B>(
     recorder: Arc<dyn CoordinationEventRecorder>,
     identity: &GitWorkerIdentity,
     mirrors: &mut M,
-    git_persistence_backend: B,
+    git_persistence_backend: &B,
     lease: &GitShardLease,
     config: DistributedRuntimeConfig,
 ) -> Result<(ScanReport, ShardCompletionOutcome), DistributedRuntimeError>
@@ -2661,6 +2781,13 @@ where
         )));
     }
 
+    // The cancellation token is consumed by the lease-deadline watchdog so
+    // it can signal expiry. Unlike the filesystem page loop, scanner-git
+    // does not accept a cooperative cancellation handle, so the token cannot
+    // currently interrupt a running Git scan. The pre-/post-mirror expiry
+    // checks below bound the unguarded window to the `execute_repo` call
+    // itself. True mid-scan cancellation requires scanner-git to accept an
+    // external stop signal.
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
@@ -2703,6 +2830,14 @@ where
             )
             .map_err(DistributedRuntimeError::Runtime)
         })();
+
+        // Seal the uncertainty signal after durable execution so a late
+        // deadline watchdog cannot retroactively poison already-committed
+        // persistence state. Mirrors the filesystem drain-then-close
+        // pattern in `drain_commit_stage`.
+        if execution.is_ok() {
+            lease_uncertainty.close();
+        }
 
         lease_watch_done.store(true, Ordering::Release);
         deadline_handle.thread().unpark();
@@ -2872,8 +3007,10 @@ where
 
 /// Run the distributed Git repo-frontier worker loop until no leases remain.
 ///
-/// This sibling entrypoint preserves the existing filesystem worker loop while
-/// adding the repo-frontier claim/execute/advance path for Git shards.
+/// Claims singleton repo-frontier shards, mirrors and executes the target
+/// repository, then advances the shard from the durable finalize receipt.
+/// The outer claim-execute-advance loop structure mirrors [`run_worker`]; both
+/// share the generic claim-retry core and shard-advance helper.
 pub fn run_git_repo_worker<C, M, B>(
     coordinator: &mut C,
     mirrors: &mut M,
@@ -2909,7 +3046,7 @@ where
             Arc::clone(&identity.recorder),
             &identity,
             mirrors,
-            git_persistence_backend.clone(),
+            &git_persistence_backend,
             &lease,
             config,
         ) {
