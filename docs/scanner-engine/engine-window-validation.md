@@ -325,7 +325,7 @@ emission time, before the finding consumes a `max_findings_per_chunk` slot.
   `Utf16Window` decode step — the check uses the **parent** step ID.
 - Suppression requires both an `OfflineVerdict::Invalid` verdict
   and the spec's `suppresses_on_invalid` flag.
-- `Valid` and `Indeterminate` verdicts always pass through.
+- `OfflineVerdict::Valid` and `OfflineVerdict::Indeterminate` verdicts always pass through.
 - Suppressed findings increment `ScanScratch::offline_suppressed` in instrumentation builds.
 
 ---

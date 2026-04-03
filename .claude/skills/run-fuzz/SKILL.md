@@ -1,6 +1,6 @@
 ---
 name: run-fuzz
-description: Run cargo-fuzz targets with proper nightly toolchain and options
+description: Use when testing gossip-contracts or gossip-stdx data structures for crashes, when verifying new Arbitrary impls, or when reproducing a fuzz crash artifact. Runs cargo-fuzz targets with nightly toolchain.
 disable-model-invocation: true
 ---
 

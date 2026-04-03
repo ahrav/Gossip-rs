@@ -1,10 +1,6 @@
 ---
 name: guide-sync
-description: Synchronize the external learning guide at /Users/ahrav/Projects/gossip-rs-learning-guide
-  with the current state of the Gossip-rs codebase. Detects removed types, renamed
-  APIs, deleted modules, stale code examples, wrong chapter cross-references, and
-  obsolete architecture descriptions. Produces a prioritized diff report and applies
-  fixes.
+description: Use when the learning guide may be stale after codebase changes, when types have been renamed or modules deleted, or when verifying guide code examples still compile. Synchronizes gossip-rs-learning-guide with current codebase state.
 user-invocable: true
 ---
 

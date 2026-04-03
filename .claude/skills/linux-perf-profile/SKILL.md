@@ -1,6 +1,6 @@
 ---
 name: linux-perf-profile
-description: Deep Linux perf profiling — PMU counters, topdown analysis, flamegraphs, and annotated hotspot drill-down on ARM/Graviton
+description: Use when profiling on Linux/ARM/Graviton targets, when you need PMU counter data beyond what flamegraphs show, or when /perf-topdown identifies a bottleneck class that needs source-level drill-down. Deep perf profiling with annotated hotspot analysis.
 ---
 
 # Linux Perf Profiling

@@ -101,6 +101,10 @@ pub mod coordination_sink;
 pub mod distributed;
 // Event sink implementations for CLI and runtime output.
 pub mod event_sink;
+// Static single-target Git repository discovery source.
+pub mod git_discovery;
+// Worker-local Git mirror lifecycle and deterministic cache-path helpers.
+pub mod git_mirror;
 // Git-repository runtime boundary for local scans.
 pub mod git_repo;
 // Ordered-content (filesystem) runtime boundary.
@@ -111,6 +115,26 @@ pub mod parity;
 pub mod result_committer;
 // Deterministic translation from scan results into persistence-layer rows.
 pub mod result_translation;
+
+/// Returns the current wall-clock time as epoch milliseconds (minimum 1).
+///
+/// The minimum of 1 avoids zero-valued timestamps, which some coordination
+/// backends treat as sentinel values. Logs a warning if the system clock
+/// returns a pre-epoch or overflow value.
+pub(crate) fn epoch_millis_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+    {
+        Some(ms) => ms.max(1),
+        None => {
+            tracing::warn!("system clock pre-epoch or overflow; using fallback timestamp 1");
+            1
+        }
+    }
+}
 
 /// How the runtime acquires source items.
 ///

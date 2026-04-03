@@ -1,6 +1,6 @@
 ---
 name: rule-optimize
-description: Workflow for modifying and benchmarking detection rules
+description: Use when adding or modifying rules in default_rules.yaml, when benchmarking rule performance against test corpuses, or when validating regex anchors and keyword choices. Detection rule edit-bench-compare workflow.
 user-invocable: true
 ---
 
