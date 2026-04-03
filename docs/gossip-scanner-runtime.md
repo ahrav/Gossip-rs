@@ -36,13 +36,13 @@ and validation, and Git connector mode uses the direct path.
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
-| `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), ordered-content filesystem lease execution, and direct `CoordinationFacade` claim/complete helpers |
+| `src/distributed.rs` | Distributed worker-loop runtime: filesystem `WorkerIdentity` / `ShardLease`, Git `GitWorkerIdentity` / `GitShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and the sibling lease loops `run_worker` (filesystem) plus `run_git_repo_worker` (repo-frontier Git). Internal helpers cover receipt-driven checkpoint building, singleton repo-frontier execution, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
-| `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config and reusing the shared runtime runner |
+| `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config, propagating repo/policy identity into persistence-aware runs, and reusing the shared runtime runner |
 | `src/git_persistence.rs` | Runtime-backed adapters for `scanner-git` watermark/seen/finalize seams plus repo-frontier receipt/checkpoint helpers. Non-atomic backends use a multi-phase commit (data+seen, then staging delete, then watermarks) so a mid-commit failure cannot expose watermarks without matching data writes |
 | `src/git_mirror.rs` | Worker-local Git mirror lifecycle, deterministic cache-path derivation, and stale control-file cleanup |
-| `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
+| `src/git_repo.rs` | Git-repository runtime boundary: direct local scan execution, singleton repo-frontier discovery execution, prepared-mirror repo execution, and durable repo-frontier checkpoint synthesis from Git finalize receipts |
 | `src/ordered_content.rs` | Ordered-content page validation, explicit terminal page / exhausted-empty outcomes, scan-miss execution, and direct local filesystem execution helpers |
 | `src/result_translation.rs` | Deterministic translation from completed item results into persistence rows (findings, occurrences, observations, done-ledger) |
 | `src/result_committer.rs` | Authoritative findings -> done-ledger durability stage for one completed unit, with request validation and `UnitCommitReceipt` construction |
@@ -659,8 +659,8 @@ imported from another crate.
 
 ## Distributed Runtime Foundation
 
-`src/distributed.rs` exposes the type layer that the receipt-driven worker loop
-builds on.
+`src/distributed.rs` exposes the type layer that the receipt-driven worker
+loops build on.
 
 ```rust
 pub struct WorkerIdentity {
@@ -675,6 +675,18 @@ pub struct WorkerIdentity {
 ```
 
 ```rust
+pub struct GitWorkerIdentity {
+    pub tenant: TenantId,
+    pub run: RunId,
+    pub worker: WorkerId,
+    pub policy_hash: PolicyHash,
+    pub tenant_secret_key: TenantSecretKey,
+    pub scan_template: GitScanConfig,
+    pub recorder: Arc<dyn CoordinationEventRecorder>,
+}
+```
+
+```rust
 pub struct ShardLease {
     /// String shard label used for routing recorder events.
     shard_id: Arc<str>,
@@ -684,6 +696,28 @@ pub struct ShardLease {
     state: RestoredShardState,
     /// Hydrated filesystem source configuration plus explicit source mode.
     filesystem_source: HydratedFilesystemSource,
+    /// Shared routing and fencing metadata for all writes emitted under the lease.
+    write_context: WriteContext,
+    /// Tenant secret key used for secret-hash derivation.
+    tenant_secret_key: TenantSecretKey,
+    /// Wall-clock timestamp captured at claim time, used to anchor the
+    /// lease deadline to the monotonic clock without NTP skew.
+    claim_wall_clock: LogicalTime,
+    /// Monotonic instant captured alongside `claim_wall_clock`.
+    claim_instant: Instant,
+}
+```
+
+```rust
+pub struct GitShardLease {
+    /// String shard label used for routing recorder events.
+    shard_id: Arc<str>,
+    /// Authoritative coordination-layer lease used for terminal completion.
+    lease: Lease,
+    /// Authoritative shard bounds, resume cursor, and cursor semantics.
+    state: RestoredShardState,
+    /// Decoded repo-frontier shard payload for the singleton repo target.
+    payload: GitShardPayload,
     /// Shared routing and fencing metadata for all writes emitted under the lease.
     write_context: WriteContext,
     /// Tenant secret key used for secret-hash derivation.
@@ -715,6 +749,23 @@ where
 ```
 
 ```rust
+pub fn run_git_repo_worker<C, M, B>(
+    coordinator: &mut C,
+    mirrors: &mut M,
+    identity: GitWorkerIdentity,
+    git_persistence_backend: B,
+    config: DistributedRuntimeConfig,
+) -> Result<DistributedRunReport, DistributedRuntimeError>
+where
+    C: CoordinationFacade,
+    M: GitMirrorManager,
+    B: GitPersistenceBackend + Clone,
+{
+    ...
+}
+```
+
+```rust
 pub struct DistributedRuntimeConfig {
     pub budgets: ScanBudgets,
     pub commit_queue_capacity: NonZeroUsize,
@@ -727,6 +778,11 @@ for `WriteContext`, the tenant secret key used during translation, a template
 filesystem config, and the shared coordination recorder into the claim and
 completion helpers.
 
+`GitWorkerIdentity` mirrors that bundle for repo-frontier execution. It swaps
+the filesystem scan template for a `GitScanConfig` template so the worker can
+overlay one shard payload's selection, repo identity, and prepared-mirror path
+without rewriting the filesystem lease loop into a generic abstraction.
+
 `ShardLease` is the hand-off object from `gossip-coordination` into the worker
 loop. It keeps the string shard label used for recorder routing separate from
 the numeric shard identity carried inside `Lease` and `WriteContext`, stores
@@ -735,20 +791,40 @@ bounds plus any resume cursor and cursor semantics), and carries the hydrated
 filesystem source state (`HydratedFilesystemSource`) that pairs the per-shard
 scan configuration with the explicit source mode decoded from shard metadata.
 
+`GitShardLease` is the sibling hand-off object for repo-frontier shards. It
+stores the decoded `GitShardPayload`, the restored shard state, and the same
+claim-time deadline anchors used by filesystem leases. The payload is
+authoritative for singleton repo discovery, selection lowering, and repo-local
+durability scoping.
+
 `DistributedPersistence<F, D>` (where `F` and `D` are `Clone + Send + Sync`)
 groups the findings sink and done-ledger handle that the worker loop clones
 per shard, while `DistributedRuntimeError`
 distinguishes coordinator failures, scan-runtime failures, and local
 durability pipeline failures. When scan execution and downstream submission or
-drain paths fail in the same lease, `run_filesystem_lease` reports the runtime
+drain paths fail in the same lease, the lease executors report the runtime
 failure first so the caller sees the closest cause instead of a cascaded
 durability symptom.
 
-`run_worker` ties those types together into the lease loop. It claims shards
-directly through `CoordinationFacade::claim_next_available`, retries on
-throttling or live-lease contention, executes one filesystem shard at a time,
-and completes successful shards through `CoordinationFacade::complete` with a
-deterministic `OpId`.
+`run_worker` ties the filesystem types together into the ordered-content lease
+loop. It claims shards directly through `CoordinationFacade::claim_next_available`,
+retries on throttling or live-lease contention, executes one filesystem shard
+at a time, and completes successful shards through `CoordinationFacade::complete`
+with a deterministic `OpId`.
+
+`run_git_repo_worker` is the sibling repo-frontier loop. Each claimed lease:
+
+1. decodes the singleton `GitShardPayload`,
+2. runs one static discovery step to prove whether the repo target is still in
+   the remaining shard suffix,
+3. syncs a worker-local mirror for the target locator,
+4. executes the mirror-backed Git scan through `GitRepoRuntime::execute_repo`,
+   using `GitPersistenceAdapter` as the scanner-git seen/watermark/finalize
+   store,
+5. derives the outer repo-frontier checkpoint cursor from the durable complete
+   finalize receipt, and
+6. re-runs singleton discovery against that checkpoint cursor to decide whether
+   the shard is terminally complete or should checkpoint for later replay.
 
 ---
 
@@ -771,6 +847,8 @@ The runtime tests focus on the behavior that exists today:
   scan and submission or drain failures race
 - distributed worker-loop lease accounting, claim retry, and receipt-derived
   completion
+- singleton repo-frontier Git worker execution, including cursor-covered
+  exhausted-empty completion and durable finalize-backed shard advancement
 - `gossip_coordination::InMemoryCoordinator` snapshots for completed shards
   and run progress
 - CLI parsing and summary formatting

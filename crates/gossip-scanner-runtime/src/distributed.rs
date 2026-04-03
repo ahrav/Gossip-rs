@@ -81,7 +81,7 @@ use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
     connector::{
         Budgets, Cursor, ItemKey, ItemRef, Location, PageState, ScanItem, VersionId,
-        ordered::OrderedContentSource,
+        git::GitMirrorManager, ordered::OrderedContentSource,
     },
     coordination::{CursorBoundsCheck, RestoredShardState, ShardSpec, check_cursor_bounds},
     identity::{
@@ -96,7 +96,10 @@ use gossip_coordination::{
     CoordinationFacade, CursorSemantics, Lease, OpKind,
 };
 use gossip_frontier::decode_connector_extra;
-use gossip_orchestrator::{FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode};
+use gossip_orchestrator::{
+    FilesystemPathKind, FilesystemShardPayload, FilesystemSourceMode, GitShardPayload,
+};
+use scanner_git::{FinalizeOutcome, GitEventOutput};
 use scanner_scheduler::store::FsFindingRecord;
 use scanner_scheduler::{
     events::{CoreEvent, EventOutput, FindingEvent, SummaryEvent},
@@ -104,7 +107,7 @@ use scanner_scheduler::{
 };
 
 use crate::{
-    CancellationToken, FsScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
+    CancellationToken, FsScanConfig, GitScanConfig, ScanBudgets, ScanReport, ScanRuntimeError,
     build_runtime_engine,
     checkpoint_aggregator::PrefixCheckpointAggregator,
     commit_model::CompletedUnit,
@@ -114,6 +117,9 @@ use crate::{
     },
     commit_sink::{CommitSink, FindingsBatch, ItemMeta},
     coordination_sink::{CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink},
+    git_discovery::StaticGitRepoDiscoverySource,
+    git_persistence::GitPersistenceBackend,
+    git_repo::{GitRepoRuntime, single_repo_target},
     join_scoped,
     ordered_content::{
         OrderedContentExecutionOutcome, OrderedContentItemExecution, OrderedContentItemOutcome,
@@ -159,6 +165,57 @@ impl WorkerIdentity {
         policy_hash: PolicyHash,
         tenant_secret_key: TenantSecretKey,
         scan_template: FsScanConfig,
+        recorder: Arc<dyn CoordinationEventRecorder>,
+    ) -> Self {
+        Self {
+            tenant,
+            run,
+            worker,
+            policy_hash,
+            tenant_secret_key,
+            scan_template,
+            recorder,
+        }
+    }
+}
+
+/// Immutable worker identity for distributed Git repo-frontier execution.
+///
+/// This mirrors [`WorkerIdentity`] but carries a Git scan template instead of
+/// a filesystem scan template. The Git distributed path is intentionally a
+/// sibling entrypoint so repo-frontier execution can compose discovery,
+/// mirror preparation, and durable Git finalize state without rewriting the
+/// filesystem worker loop into a generic abstraction.
+#[derive(Clone)]
+pub struct GitWorkerIdentity {
+    /// Tenant boundary for all coordination calls.
+    pub tenant: TenantId,
+    /// Run whose shards this worker claims.
+    pub run: RunId,
+    /// Worker identity recorded on claimed leases.
+    pub worker: WorkerId,
+    /// Detection policy scope for all writes emitted by this worker.
+    pub policy_hash: PolicyHash,
+    /// Tenant-scoped secret used when deriving stable persistence identity.
+    pub tenant_secret_key: TenantSecretKey,
+    /// Base Git scan configuration cloned per shard and overlaid with payload
+    /// settings plus the prepared mirror path.
+    pub scan_template: GitScanConfig,
+    /// Shared recorder used by event telemetry.
+    pub recorder: Arc<dyn CoordinationEventRecorder>,
+}
+
+impl GitWorkerIdentity {
+    /// Construct one distributed Git worker identity bundle.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant: TenantId,
+        run: RunId,
+        worker: WorkerId,
+        policy_hash: PolicyHash,
+        tenant_secret_key: TenantSecretKey,
+        scan_template: GitScanConfig,
         recorder: Arc<dyn CoordinationEventRecorder>,
     ) -> Self {
         Self {
@@ -388,6 +445,177 @@ impl ShardLease {
         budgets: Budgets,
     ) -> crate::ordered_content::OrderedContentRuntimeInput {
         crate::ordered_content::OrderedContentRuntimeInput::new(self.state.clone(), budgets)
+    }
+}
+
+/// Lease payload consumed by the distributed Git repo-frontier runtime.
+///
+/// One lease corresponds to one repo-frontier shard from the coordination
+/// layer. The shard metadata decodes into a single [`GitShardPayload`] whose
+/// repo target and scan settings define the worker-side Git execution path.
+#[derive(Clone, Debug)]
+pub struct GitShardLease {
+    shard_id: Arc<str>,
+    lease: Lease,
+    state: RestoredShardState,
+    payload: GitShardPayload,
+    write_context: WriteContext,
+    tenant_secret_key: TenantSecretKey,
+    claim_wall_clock: LogicalTime,
+    claim_instant: Instant,
+}
+
+impl GitShardLease {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        shard_id: Arc<str>,
+        lease: Lease,
+        state: RestoredShardState,
+        payload: GitShardPayload,
+        write_context: WriteContext,
+        tenant_secret_key: TenantSecretKey,
+        claim_wall_clock: LogicalTime,
+        claim_instant: Instant,
+    ) -> Self {
+        Self {
+            shard_id,
+            lease,
+            state,
+            payload,
+            write_context,
+            tenant_secret_key,
+            claim_wall_clock,
+            claim_instant,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn shard_id(&self) -> &str {
+        &self.shard_id
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn shard_id_arc(&self) -> &Arc<str> {
+        &self.shard_id
+    }
+
+    #[inline]
+    pub fn lease(&self) -> Lease {
+        self.lease
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn restored_state(&self) -> &RestoredShardState {
+        &self.state
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn range_start(&self) -> &[u8] {
+        self.state.shard_spec().key_range_start()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn shard_spec(&self) -> &ShardSpec {
+        self.state.shard_spec()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn resume_cursor(&self) -> &Cursor {
+        self.state.resume_cursor()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn cursor_semantics(&self) -> CursorSemantics {
+        self.state.cursor_semantics()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn payload(&self) -> &GitShardPayload {
+        &self.payload
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn write_context(&self) -> WriteContext {
+        self.write_context
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn tenant_secret_key(&self) -> TenantSecretKey {
+        self.tenant_secret_key
+    }
+
+    #[inline]
+    #[must_use]
+    fn claim_wall_clock(&self) -> LogicalTime {
+        self.claim_wall_clock
+    }
+
+    #[inline]
+    #[must_use]
+    fn claim_instant(&self) -> Instant {
+        self.claim_instant
+    }
+}
+
+trait LeaseView {
+    fn shard_id(&self) -> &str;
+    fn lease(&self) -> Lease;
+    fn restored_state(&self) -> &RestoredShardState;
+    fn resume_cursor(&self) -> &Cursor;
+    fn range_start(&self) -> &[u8];
+}
+
+impl LeaseView for ShardLease {
+    fn shard_id(&self) -> &str {
+        self.shard_id()
+    }
+
+    fn lease(&self) -> Lease {
+        self.lease()
+    }
+
+    fn restored_state(&self) -> &RestoredShardState {
+        self.restored_state()
+    }
+
+    fn resume_cursor(&self) -> &Cursor {
+        self.resume_cursor()
+    }
+
+    fn range_start(&self) -> &[u8] {
+        self.range_start()
+    }
+}
+
+impl LeaseView for GitShardLease {
+    fn shard_id(&self) -> &str {
+        self.shard_id()
+    }
+
+    fn lease(&self) -> Lease {
+        self.lease()
+    }
+
+    fn restored_state(&self) -> &RestoredShardState {
+        self.restored_state()
+    }
+
+    fn resume_cursor(&self) -> &Cursor {
+        self.resume_cursor()
+    }
+
+    fn range_start(&self) -> &[u8] {
+        self.range_start()
     }
 }
 
@@ -1523,6 +1751,67 @@ fn build_lease_from_acquire(
     ))
 }
 
+/// Decode the typed Git repo-frontier payload carried in shard metadata.
+fn hydrate_git_payload_from_spec(
+    spec: gossip_coordination::ShardSpecRef<'_>,
+    tenant: TenantId,
+) -> Result<GitShardPayload> {
+    let connector_extra = decode_connector_extra(spec)
+        .map_err(|err| anyhow!("failed to decode shard metadata envelope: {err}"))?;
+    let payload = GitShardPayload::decode(connector_extra)
+        .map_err(|err| anyhow!("failed to decode git shard payload: {err}"))?;
+    if payload.tenant_id() != tenant {
+        return Err(anyhow!(
+            "git shard payload tenant {:?} did not match worker tenant {:?}",
+            payload.tenant_id(),
+            tenant
+        ));
+    }
+    Ok(payload)
+}
+
+/// Convert an acquired coordination lease into the concrete Git runtime payload.
+fn build_git_lease_from_acquire(
+    acquired: AcquireResultView<'_>,
+    identity: &GitWorkerIdentity,
+    claim_wall_clock: LogicalTime,
+    claim_instant: Instant,
+) -> Result<GitShardLease> {
+    let snapshot = acquired.snapshot;
+    let spec = snapshot.spec();
+    let shard_spec = ShardSpec::try_from_ref(spec).with_context(|| {
+        format!(
+            "failed to restore shard spec for shard {}",
+            acquired.lease.shard()
+        )
+    })?;
+    let resume_cursor = Cursor::try_from_update(snapshot.cursor()).with_context(|| {
+        format!(
+            "failed to restore cursor for shard {}",
+            acquired.lease.shard()
+        )
+    })?;
+    let state = RestoredShardState::new(shard_spec, resume_cursor, snapshot.cursor_semantics());
+    let write_context = WriteContext::new(
+        acquired.lease.tenant(),
+        identity.policy_hash,
+        acquired.lease.run(),
+        acquired.lease.shard(),
+        acquired.lease.fence(),
+    );
+
+    Ok(GitShardLease::new(
+        Arc::from(acquired.lease.shard().to_string()),
+        acquired.lease,
+        state,
+        hydrate_git_payload_from_spec(spec, identity.tenant)?,
+        write_context,
+        identity.tenant_secret_key,
+        claim_wall_clock,
+        claim_instant,
+    ))
+}
+
 /// Convert the wall clock to [`LogicalTime`] (milliseconds since Unix epoch).
 ///
 /// Delegates to [`crate::epoch_millis_now`] for the raw timestamp.
@@ -1674,6 +1963,49 @@ where
     }
 }
 
+/// Claim the next available Git repo-frontier shard lease.
+fn claim_next_git_lease<C>(
+    coordinator: &mut C,
+    identity: &GitWorkerIdentity,
+    scratch: &mut AcquireScratch,
+) -> Result<Option<GitShardLease>, DistributedRuntimeError>
+where
+    C: CoordinationFacade,
+{
+    loop {
+        let now = wall_clock_now();
+        let claim_instant = Instant::now();
+        match coordinator.claim_next_available(
+            now,
+            identity.tenant,
+            identity.run,
+            identity.worker,
+            scratch,
+        ) {
+            Ok(acquired) => {
+                return build_git_lease_from_acquire(acquired, identity, now, claim_instant)
+                    .map(Some)
+                    .map_err(DistributedRuntimeError::Coordinator);
+            }
+            Err(ClaimError::NoneAvailable { earliest_deadline }) => {
+                let progress = coordinator
+                    .get_run_progress(now, identity.tenant, identity.run)
+                    .map_err(|error| DistributedRuntimeError::Coordinator(AnyError::new(error)))?;
+                if progress.active() == 0 {
+                    return Ok(None);
+                }
+                std::thread::sleep(claim_retry_delay(now, earliest_deadline));
+            }
+            Err(ClaimError::Throttled { retry_after }) => {
+                std::thread::sleep(claim_retry_delay(now, Some(retry_after)));
+            }
+            Err(error) => {
+                return Err(DistributedRuntimeError::Coordinator(AnyError::new(error)));
+            }
+        }
+    }
+}
+
 /// Advance a claimed shard directly against the coordination backend.
 ///
 /// `outcome` makes the coordination action explicit:
@@ -1701,16 +2033,17 @@ where
 /// `wall_clock_now()` (SystemTime). The local monotonic watchdog is a
 /// best-effort early-warning mechanism; the coordinator's server-side
 /// deadline and fence-epoch checks are authoritative.
-fn advance_shard<C>(
+fn advance_shard<C, L>(
     coordinator: &mut C,
-    identity: &WorkerIdentity,
-    lease: &ShardLease,
+    tenant: TenantId,
+    lease: &L,
     outcome: &ShardCompletionOutcome,
 ) -> Result<(), DistributedRuntimeError>
 where
     C: CoordinationFacade,
+    L: LeaseView,
 {
-    assert_eq!(lease.lease().tenant(), identity.tenant);
+    assert_eq!(lease.lease().tenant(), tenant);
 
     let (cursor, op_kind, operation_name) = match outcome {
         ShardCompletionOutcome::Checkpoint { checkpoint } => {
@@ -1764,23 +2097,11 @@ where
     let op_id = deterministic_op_id(lease.lease().shard_key(), lease.lease().fence(), op_kind);
     let applied = match outcome {
         ShardCompletionOutcome::Checkpoint { .. } => coordinator
-            .checkpoint(
-                wall_clock_now(),
-                identity.tenant,
-                &lease.lease(),
-                &cursor,
-                op_id,
-            )
+            .checkpoint(wall_clock_now(), tenant, &lease.lease(), &cursor, op_id)
             .map_err(|e| map_advance_error!(e, CheckpointError))?,
         ShardCompletionOutcome::Complete { .. } | ShardCompletionOutcome::ExhaustedEmpty => {
             coordinator
-                .complete(
-                    wall_clock_now(),
-                    identity.tenant,
-                    &lease.lease(),
-                    &cursor,
-                    op_id,
-                )
+                .complete(wall_clock_now(), tenant, &lease.lease(), &cursor, op_id)
                 .map_err(|e| map_advance_error!(e, CompleteError))?
         }
     };
@@ -2273,6 +2594,175 @@ where
     Ok((report, completion))
 }
 
+/// Execute one Git repo-frontier lease under the durable repo-receipt model.
+///
+/// The current shard contract is a singleton: discovery may yield zero targets
+/// (already complete) or exactly one in-scope repo target. A durable complete
+/// finalize produces the repo-frontier checkpoint cursor for shard advance.
+fn run_git_repo_lease<M, B>(
+    recorder: Arc<dyn CoordinationEventRecorder>,
+    identity: &GitWorkerIdentity,
+    mirrors: &mut M,
+    git_persistence_backend: B,
+    lease: &GitShardLease,
+    config: DistributedRuntimeConfig,
+) -> Result<(ScanReport, ShardCompletionOutcome), DistributedRuntimeError>
+where
+    M: GitMirrorManager,
+    B: GitPersistenceBackend + Clone,
+{
+    config.budgets.validate()?;
+    if lease.cursor_semantics() != CursorSemantics::Completed {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow!(
+                "git repo-frontier shard '{}' requires CursorSemantics::Completed, got {:?}",
+                lease.shard_id(),
+                lease.cursor_semantics()
+            ),
+        )));
+    }
+
+    let armed_lease_deadline = ArmedLeaseDeadline::arm_from(
+        lease.lease().deadline(),
+        lease.claim_wall_clock(),
+        lease.claim_instant(),
+    )
+    .map_err(DistributedRuntimeError::LeaseUncertain)?;
+    if let Some(reason) = armed_lease_deadline.expiry_reason() {
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
+
+    let discovery_budgets =
+        Budgets::try_new(config.budgets.max_items, config.budgets.max_bytes, None)
+            .map_err(ScanRuntimeError::from)
+            .map_err(DistributedRuntimeError::Runtime)?;
+    let mut discovery = StaticGitRepoDiscoverySource::new(lease.payload().repo_target().clone());
+    let page = GitRepoRuntime::execute_discovery(
+        &mut discovery,
+        lease.shard_spec(),
+        lease.resume_cursor(),
+        discovery_budgets,
+    )
+    .map_err(DistributedRuntimeError::Runtime)?;
+    let Some(target) = single_repo_target(page).map_err(DistributedRuntimeError::Runtime)? else {
+        return Ok((
+            ScanReport::default(),
+            ShardCompletionOutcome::ExhaustedEmpty,
+        ));
+    };
+    if target.repo_key() != lease.payload().repo_key() {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow!(
+                "git repo-frontier shard '{}' discovered repo key {:?}, expected {:?}",
+                lease.shard_id(),
+                target.repo_key(),
+                lease.payload().repo_key()
+            ),
+        )));
+    }
+
+    let cancel = CancellationToken::new();
+    let lease_uncertainty = LeaseUncertaintySignal::default();
+    let lease_watch_done = Arc::new(AtomicBool::new(false));
+    let event_sink: Arc<dyn GitEventOutput + Send + Sync> = Arc::new(CoordinationEventSink::new(
+        recorder,
+        Arc::clone(lease.shard_id_arc()),
+    ));
+    let (execution, watch_result) = std::thread::scope(|scope| {
+        let deadline_handle = scope.spawn({
+            let cancel = cancel.clone();
+            let done = Arc::clone(&lease_watch_done);
+            let signal = lease_uncertainty.clone();
+            move || watch_lease_deadline(armed_lease_deadline, cancel, done, signal)
+        });
+
+        let execution = (|| -> Result<_, DistributedRuntimeError> {
+            if let Some(reason) = armed_lease_deadline.expiry_reason() {
+                return Err(DistributedRuntimeError::LeaseUncertain(reason));
+            }
+
+            let mirror = mirrors.sync_mirror(target.locator()).map_err(|error| {
+                DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
+                    "git mirror sync failed for shard '{}' and repo key {:?}: {error}",
+                    lease.shard_id(),
+                    target.repo_key()
+                )))
+            })?;
+
+            if let Some(reason) = armed_lease_deadline.expiry_reason() {
+                return Err(DistributedRuntimeError::LeaseUncertain(reason));
+            }
+
+            GitRepoRuntime::execute_repo(
+                &identity.scan_template,
+                lease.payload(),
+                &mirror,
+                lease.write_context(),
+                Arc::clone(&event_sink),
+                git_persistence_backend.clone(),
+            )
+            .map_err(DistributedRuntimeError::Runtime)
+        })();
+
+        lease_watch_done.store(true, Ordering::Release);
+        deadline_handle.thread().unpark();
+        let watch_result = join_scoped(deadline_handle, "lease deadline watchdog");
+        (execution, watch_result)
+    });
+    watch_result
+        .map_err(|error| DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(error)))?;
+    if let Some(reason) = lease_uncertainty.current() {
+        return Err(DistributedRuntimeError::LeaseUncertain(reason));
+    }
+
+    let execution = execution?;
+    if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow!(
+                "git repo-frontier shard '{}' finalized partially; outer repo-frontier progress requires a complete durable repo receipt",
+                lease.shard_id()
+            ),
+        )));
+    }
+
+    let checkpoint = execution
+        .checkpoint_input
+        .as_ref()
+        .ok_or_else(|| {
+            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
+                "git repo-frontier shard '{}' completed without a durable repo receipt-backed checkpoint",
+                lease.shard_id()
+            )))
+        })?
+        .receipt()
+        .completed_unit()
+        .checkpoint_cursor()
+        .clone();
+
+    let mut post_discovery =
+        StaticGitRepoDiscoverySource::new(lease.payload().repo_target().clone());
+    let remaining = GitRepoRuntime::execute_discovery(
+        &mut post_discovery,
+        lease.shard_spec(),
+        &checkpoint,
+        discovery_budgets,
+    )
+    .map_err(DistributedRuntimeError::Runtime)?;
+    let completion = if single_repo_target(remaining)
+        .map_err(DistributedRuntimeError::Runtime)?
+        .is_some()
+    {
+        ShardCompletionOutcome::Checkpoint {
+            checkpoint: checkpoint.clone(),
+        }
+    } else {
+        ShardCompletionOutcome::Complete { checkpoint }
+    };
+
+    ensure_post_drain_lease_trust(&lease_uncertainty)?;
+    Ok((execution.report, completion))
+}
+
 /// Run the distributed worker loop until the coordinator has no more leases.
 ///
 /// This is the top-level entry point for distributed scanning. The loop:
@@ -2362,13 +2852,95 @@ where
             "shard scan complete",
         );
 
-        if let Err(error) = advance_shard(coordinator, &identity, &lease, &completion) {
+        if let Err(error) = advance_shard(coordinator, identity.tenant, &lease, &completion) {
             tracing::warn!(
                 error = %error,
                 leases_seen = report.leases_seen,
                 shards_scanned = report.shards_scanned,
                 shard_id = %lease.shard_id(),
                 "worker loop terminating: shard completion failed",
+            );
+            return Err(error);
+        }
+
+        report.shards_scanned = report.shards_scanned.saturating_add(1);
+    }
+
+    report.debug_assert_invariant();
+    Ok(report)
+}
+
+/// Run the distributed Git repo-frontier worker loop until no leases remain.
+///
+/// This sibling entrypoint preserves the existing filesystem worker loop while
+/// adding the repo-frontier claim/execute/advance path for Git shards.
+pub fn run_git_repo_worker<C, M, B>(
+    coordinator: &mut C,
+    mirrors: &mut M,
+    identity: GitWorkerIdentity,
+    git_persistence_backend: B,
+    config: DistributedRuntimeConfig,
+) -> Result<DistributedRunReport, DistributedRuntimeError>
+where
+    C: CoordinationFacade,
+    M: GitMirrorManager,
+    B: GitPersistenceBackend + Clone,
+{
+    let mut scratch = Box::new(AcquireScratch::new());
+    let mut report = DistributedRunReport::default();
+
+    loop {
+        let lease = match claim_next_git_lease(coordinator, &identity, &mut scratch) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    "git repo worker loop terminating: shard claim failed",
+                );
+                return Err(error);
+            }
+        };
+        report.leases_seen = report.leases_seen.saturating_add(1);
+
+        let (scan_report, completion) = match run_git_repo_lease(
+            Arc::clone(&identity.recorder),
+            &identity,
+            mirrors,
+            git_persistence_backend.clone(),
+            &lease,
+            config,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    leases_seen = report.leases_seen,
+                    shards_scanned = report.shards_scanned,
+                    shard_id = %lease.shard_id(),
+                    "git repo worker loop terminating: lease execution failed",
+                );
+                return Err(error);
+            }
+        };
+
+        tracing::debug!(
+            shard_id = %lease.shard_id(),
+            items_scanned = scan_report.items_scanned,
+            bytes_scanned = scan_report.bytes_scanned,
+            findings_emitted = scan_report.findings_emitted,
+            "git repo shard scan complete",
+        );
+
+        if let Err(error) = advance_shard(coordinator, identity.tenant, &lease, &completion) {
+            tracing::warn!(
+                error = %error,
+                leases_seen = report.leases_seen,
+                shards_scanned = report.shards_scanned,
+                shard_id = %lease.shard_id(),
+                "git repo worker loop terminating: shard completion failed",
             );
             return Err(error);
         }
@@ -2392,6 +2964,7 @@ pub fn secret_fixture() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -2401,6 +2974,10 @@ mod tests {
     use gossip_contracts::{
         connector::{
             Cursor, EnumerateError, ItemKey, ItemRef, PageBuf, ReadError,
+            git::{
+                GitExecutionLimits, GitMergeStrategy, GitRepoTarget, GitScanMode, RepoKey,
+                RepoLocator,
+            },
             ordered::OrderedContentCapabilities,
         },
         coordination::ShardSpec,
@@ -2417,8 +2994,11 @@ mod tests {
         RunManagement, ShardClaiming, ShardFilter, ShardStatus,
     };
     use gossip_frontier::{ShardSpecScratch, range_shard_ref};
-    use gossip_orchestrator::{FilesystemShardPayload, FilesystemSourceMode};
+    use gossip_orchestrator::{
+        FilesystemShardPayload, FilesystemSourceMode, GitShardPayload, NormalizedGitSelection,
+    };
     use gossip_persistence_inmemory::{CompletionOrder, InMemoryDoneLedger, InMemoryFindingsSink};
+    use scanner_git::derive_repo_id;
     use scanner_scheduler::events::NullEventOutput;
     use tempfile::tempdir;
 
@@ -2427,7 +3007,10 @@ mod tests {
         commit_pipeline::{CommitPipeline, CommitPipelineConfig, CommitStageOutput},
         commit_sink::{FindingRecord, FindingsBatch, ItemMeta},
         coordination_sink::{CommitProgressRecord, StoredGitEvent},
+        git_mirror::LocalMirrorManager,
+        git_persistence::GitPersistenceOp,
         ordered_content::OrderedContentSkipReason,
+        test_fixtures::{init_git_repo, run_git_in},
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2436,8 +3019,69 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct StubDoneLedger(u8);
 
+    #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+    #[error("{message}")]
+    struct TestGitBackendError {
+        message: &'static str,
+    }
+
+    #[derive(Debug, Default)]
+    struct TestGitBackendState {
+        kv: BTreeMap<Vec<u8>, Vec<u8>>,
+        batch_call_count: usize,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestGitBackend {
+        state: Arc<Mutex<TestGitBackendState>>,
+    }
+
+    impl TestGitBackend {
+        fn batch_call_count(&self) -> usize {
+            self.state
+                .lock()
+                .expect("git backend state lock")
+                .batch_call_count
+        }
+    }
+
+    impl GitPersistenceBackend for TestGitBackend {
+        type Error = TestGitBackendError;
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self
+                .state
+                .lock()
+                .expect("git backend state lock")
+                .kv
+                .get(key)
+                .cloned())
+        }
+
+        fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
+            let mut state = self.state.lock().expect("git backend state lock");
+            state.batch_call_count += 1;
+            for op in ops {
+                match op {
+                    GitPersistenceOp::Put { key, value } => {
+                        state.kv.insert(key.clone(), value.clone());
+                    }
+                    GitPersistenceOp::Delete { key } => {
+                        state.kv.remove(key);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn supports_atomic_batches(&self) -> bool {
+            true
+        }
+    }
+
     #[derive(Debug, Default)]
     struct Recorder {
+        git_events: Mutex<Vec<StoredGitEvent>>,
         progress: Mutex<Vec<CommitProgressRecord>>,
     }
 
@@ -2446,7 +3090,8 @@ mod tests {
             Ok(())
         }
 
-        fn record_git_event(&self, _shard_id: &str, _event: StoredGitEvent) -> Result<()> {
+        fn record_git_event(&self, _shard_id: &str, event: StoredGitEvent) -> Result<()> {
+            self.git_events.lock().expect("git events lock").push(event);
             Ok(())
         }
 
@@ -2527,6 +3172,71 @@ mod tests {
             base_scan_config(path),
             recorder(),
         )
+    }
+
+    fn base_git_scan_config(path: impl AsRef<Path>) -> GitScanConfig {
+        GitScanConfig::new(path.as_ref().to_path_buf())
+    }
+
+    fn git_worker_identity(path: &Path) -> GitWorkerIdentity {
+        GitWorkerIdentity::new(
+            tenant(),
+            run(),
+            worker(17),
+            policy_hash(),
+            tenant_secret_key(),
+            base_git_scan_config(path),
+            recorder(),
+        )
+    }
+
+    fn successor_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut next = bytes.to_vec();
+        next.push(0);
+        next
+    }
+
+    fn create_git_repo_fixture() -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        init_git_repo(
+            dir.path(),
+            "distributed-runtime-tests@example.com",
+            "Distributed Runtime Tests",
+        );
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+        run_git_in(dir.path(), &["add", "."]);
+        run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+        dir
+    }
+
+    fn git_repo_key(path: &Path) -> RepoKey {
+        let canonical = path.canonicalize().expect("canonical repo path");
+        RepoKey::for_local_path(canonical.as_os_str().as_encoded_bytes()).expect("repo key")
+    }
+
+    fn git_repo_target(path: &Path) -> GitRepoTarget {
+        let canonical = path.canonicalize().expect("canonical repo path");
+        GitRepoTarget::new(
+            git_repo_key(path),
+            RepoLocator::local_path(canonical.to_string_lossy().into_owned()),
+        )
+        .with_display_name("distributed/runtime-test-repo")
+    }
+
+    fn git_payload(path: &Path) -> Vec<u8> {
+        let repo_target = git_repo_target(path);
+        let repo_id = derive_repo_id(tenant(), repo_target.repo_key());
+        GitShardPayload::new(
+            tenant(),
+            repo_target,
+            repo_id,
+            NormalizedGitSelection::DefaultBranchOnly,
+            GitScanMode::OdbBlobFast,
+            GitMergeStrategy::AllParents,
+            GitExecutionLimits::default(),
+        )
+        .encode()
+        .expect("git shard payload")
     }
 
     fn item_key(path: &str) -> ItemKey {
@@ -2627,6 +3337,36 @@ mod tests {
                 InitialShardInput::new(*shard_id, spec.as_ref(), CoordCursorUpdate::initial())
             })
             .collect();
+        let _ = coordinator
+            .register_shards(now, tenant(), run(), &shards, OpId::from_raw(1))
+            .expect("register shards");
+
+        coordinator
+    }
+
+    fn setup_coordinator_with_git_shard(
+        path: &Path,
+        cursor: CoordCursorUpdate<'_>,
+        lease_duration_ms: u64,
+    ) -> CoordinationInMemoryCoordinator {
+        let mut coordinator = CoordinationInMemoryCoordinator::new(lease_duration_ms);
+        let now = wall_clock_now();
+        coordinator
+            .create_run(now, tenant(), run(), test_run_config(lease_duration_ms))
+            .expect("create run");
+
+        let repo_key = git_repo_key(path);
+        let range_end = successor_bytes(repo_key.as_bytes());
+        let payload = git_payload(path);
+        let mut scratch = ShardSpecScratch::new();
+        let spec_ref = range_shard_ref(repo_key.as_bytes(), &range_end, &payload, &mut scratch)
+            .expect("git range shard spec");
+        let shard_spec = ShardSpec::try_from_ref(spec_ref).expect("owned git shard spec");
+        let shards = [InitialShardInput::new(
+            ShardId::from_raw(1),
+            shard_spec.as_ref(),
+            cursor,
+        )];
         let _ = coordinator
             .register_shards(now, tenant(), run(), &shards, OpId::from_raw(1))
             .expect("register shards");
@@ -4140,7 +4880,7 @@ mod tests {
 
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::ExhaustedEmpty,
         )
@@ -4166,7 +4906,7 @@ mod tests {
 
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &claimed,
             &ShardCompletionOutcome::Checkpoint {
                 checkpoint: checkpoint.clone(),
@@ -4191,7 +4931,7 @@ mod tests {
 
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &resumed,
             &ShardCompletionOutcome::ExhaustedEmpty,
         )
@@ -4222,7 +4962,7 @@ mod tests {
 
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::Complete {
                 checkpoint: checkpoint.clone(),
@@ -4262,10 +5002,10 @@ mod tests {
         let lease = claim_lease(&mut coordinator, &identity);
         let outcome = ShardCompletionOutcome::ExhaustedEmpty;
 
-        advance_shard(&mut coordinator, &identity, &lease, &outcome)
+        advance_shard(&mut coordinator, identity.tenant, &lease, &outcome)
             .expect("first completion should succeed");
 
-        advance_shard(&mut coordinator, &identity, &lease, &outcome)
+        advance_shard(&mut coordinator, identity.tenant, &lease, &outcome)
             .expect("replayed completion with identical OpId should succeed");
 
         let summaries = shard_summaries(&coordinator);
@@ -4287,7 +5027,7 @@ mod tests {
 
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::Checkpoint {
                 checkpoint: checkpoint.clone(),
@@ -4359,7 +5099,7 @@ mod tests {
 
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::Complete {
                 checkpoint: checkpoint.clone(),
@@ -5055,6 +5795,70 @@ mod tests {
     }
 
     #[test]
+    fn run_git_repo_worker_completes_singleton_repo_frontier_shard() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let report = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend.clone(),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("git repo worker should succeed");
+
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 1);
+        assert_eq!(run_progress(&coordinator).done(), 1);
+        assert!(
+            shard_summaries(&coordinator)
+                .iter()
+                .all(|summary| summary.status() == ShardStatus::Done)
+        );
+        assert!(
+            backend.batch_call_count() > 0,
+            "git repo worker must durably persist repo state before advancing the shard"
+        );
+    }
+
+    #[test]
+    fn run_git_repo_worker_treats_cursor_covered_target_as_exhausted_empty() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let repo_key = git_repo_key(repo.path());
+        let mut coordinator = setup_coordinator_with_git_shard(
+            repo.path(),
+            CoordCursorUpdate::with_last_key(repo_key.as_bytes()),
+            30_000,
+        );
+
+        let report = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend.clone(),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("cursor-covered singleton shard should complete without execution");
+
+        assert_eq!(report.leases_seen, 1);
+        assert_eq!(report.shards_scanned, 1);
+        assert_eq!(run_progress(&coordinator).done(), 1);
+        assert_eq!(
+            backend.batch_call_count(),
+            0,
+            "no Git persistence writes should occur when discovery is already covered by the cursor"
+        );
+    }
+
+    #[test]
     fn run_worker_retries_until_live_lease_expires() {
         let dir = tempdir().expect("tempdir");
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
@@ -5537,7 +6341,7 @@ mod tests {
 
         let err = advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::ExhaustedEmpty,
         )
@@ -5566,7 +6370,7 @@ mod tests {
 
         let err = advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::ExhaustedEmpty,
         )
@@ -5597,7 +6401,7 @@ mod tests {
 
         let err = advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::Checkpoint {
                 checkpoint: checkpoint.clone(),
@@ -5627,7 +6431,7 @@ mod tests {
 
         let err = advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::Checkpoint { checkpoint },
         )
@@ -5654,7 +6458,7 @@ mod tests {
         // Complete the shard successfully first.
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::ExhaustedEmpty,
         )
@@ -5665,7 +6469,7 @@ mod tests {
         // validation rather than idempotent replay handling.
         let err = advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::Checkpoint {
                 checkpoint: Cursor::with_last_key(item_key("z.txt")),
@@ -6240,7 +7044,7 @@ mod tests {
 
         advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::ExhaustedEmpty,
         )
@@ -6280,7 +7084,7 @@ mod tests {
 
         let err = advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::ExhaustedEmpty,
         )
@@ -6320,7 +7124,7 @@ mod tests {
 
         let err = advance_shard(
             &mut coordinator,
-            &identity,
+            identity.tenant,
             &lease,
             &ShardCompletionOutcome::Complete {
                 checkpoint: Cursor::with_last_key(item_key("\x0F")),
