@@ -12,6 +12,7 @@
   result-translation, result-committer, checkpoint-aggregator, commit-sink,
   and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
+- contract-level mirror-backed Git execution via a concrete repo executor adapter
 - distributed runtime worker-loop support: `WorkerIdentity`, concrete shard
   leases, direct coordination claim/complete helpers, persistence handles,
   runtime configuration, run reports, and error layering
@@ -37,6 +38,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/distributed.rs` | Distributed worker-loop runtime: `WorkerIdentity`, concrete `ShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and `run_worker` (lease loop). Internal helpers: `drain_commit_stage` (receipt-driven checkpoint builder), ordered-content filesystem lease execution, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
+| `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config and reusing the shared runtime runner |
 | `src/git_mirror.rs` | Worker-local Git mirror lifecycle, deterministic cache-path derivation, and stale control-file cleanup |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content page validation, explicit terminal page / exhausted-empty outcomes, scan-miss execution, and direct local filesystem execution helpers |
@@ -85,6 +87,9 @@ Current behavior after validation:
   scan-miss execution are available as library APIs but are not wired into the
   live dispatcher)
 - git scans route to `git_repo::scan_local_repo`
+- contract-level mirror-backed repo execution routes through
+  `git_executor::ScannerGitExecutor`, which reuses the same lower-level runner
+  setup after mirror preparation
 - worker-local mirror preparation and deterministic mirror-cache naming live in `git_mirror::LocalMirrorManager`
 - distributed worker assembly uses the foundational types in `distributed.rs`
 
@@ -180,7 +185,8 @@ The runtime is organized around source families rather than driver traits:
 - `ordered_content` covers sources that behave like forward-only item streams
 - `git_discovery` owns static payload-backed repository discovery for
   repo-frontier shards
-- `git_repo` covers local repository execution paths
+- `git_repo` covers direct local repository execution helpers
+- `git_executor` adapts mirror-backed contract execution onto the shared git runner
 - `distributed` exposes the worker-loop nouns for distributed shard execution
 
 This keeps the public orchestration types available without requiring the

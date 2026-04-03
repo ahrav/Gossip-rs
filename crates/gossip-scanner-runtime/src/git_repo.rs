@@ -21,9 +21,10 @@
 //! treats every OID as unseen. Incremental behavior is reserved for the
 //! distributed runtime path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use gossip_contracts::connector::ToxicDigest;
@@ -31,8 +32,9 @@ use gossip_contracts::connector::git::{
     GitMirrorManager, GitRefSelection, GitRepoDiscoverySource, GitRepoExecutor,
 };
 use scanner_git::{
-    GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanResult, NativeRefResolver,
-    NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig, run_git_scan,
+    GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError, GitScanResult,
+    NativeRefResolver, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig,
+    run_git_scan,
 };
 
 use crate::{
@@ -67,8 +69,10 @@ impl GitRepoRuntime {
     /// Execute one mirrored repository.
     ///
     /// [`crate::git_mirror::LocalMirrorManager`] provides the concrete mirror
-    /// lifecycle implementation. Returns an error because mirrored selection
-    /// and executor orchestration require runtime surface integration.
+    /// lifecycle implementation, and [`crate::git_executor::ScannerGitExecutor`]
+    /// provides the per-repository execution adapter. Returns an error because
+    /// mirror acquisition, selection, and execution orchestration are not wired
+    /// into this entrypoint.
     pub fn execute_repo<M: GitMirrorManager, E: GitRepoExecutor>(
         _mirrors: &mut M,
         _executor: &mut E,
@@ -80,11 +84,27 @@ impl GitRepoRuntime {
     }
 }
 
+/// Shared low-level `scanner-git` execution output.
+pub(crate) struct GitRunExecution {
+    pub(crate) result: GitScanResult,
+    pub(crate) scan_elapsed: Duration,
+}
+
+impl GitRunExecution {
+    /// Pair a completed scan result with its wall-clock elapsed time.
+    pub(crate) fn new(result: GitScanResult, scan_elapsed: Duration) -> Self {
+        Self {
+            result,
+            scan_elapsed,
+        }
+    }
+}
+
 /// Run a full Git object scan against a local repository.
 ///
 /// This is the primary scan path for Git sources. It builds a detection engine,
-/// opens the repository at `canonical_repo`, and scans all reachable objects
-/// from the default branch.
+/// opens the repository at `canonical_repo`, and scans the configured
+/// start-set coverage described by [`GitScanConfig::ref_selection`].
 ///
 /// # Event forwarding
 ///
@@ -124,37 +144,41 @@ pub(crate) fn scan_local_repo(
         let git_sink: Arc<dyn scanner_git::EventSink> =
             Arc::new(ChannelEventOutput::new(event_tx.clone()));
         let git_cfg = build_git_scan_config(config)?;
-        let resolver = NativeRefResolver::new(git_cfg.start_set.clone());
-        let watermarks = EmptyWatermarkStore;
-        let seen = NeverSeenStore;
-
-        let scan_start = std::time::Instant::now();
-        let result = run_git_scan(
-            &canonical_repo,
-            engine,
-            &resolver,
-            &seen,
-            &watermarks,
-            None,
-            &git_cfg,
-            git_sink,
-        )
-        .map_err(|error| {
-            ScanRuntimeError::Driver(anyhow!(
-                "git scan failed for '{}': {error}",
-                digest_repo_path(&canonical_repo)
-            ))
-        })?;
-        let scan_elapsed = scan_start.elapsed();
+        let execution =
+            run_runtime_git_scan(&canonical_repo, engine, &git_cfg, git_sink).map_err(|error| {
+                ScanRuntimeError::Driver(anyhow!(
+                    "git scan failed for '{}': {error}",
+                    digest_repo_path(&canonical_repo)
+                ))
+            });
 
         // Close the sender before joining so the forwarder thread sees EOF.
         drop(event_tx);
-        join_scoped(event_forwarder, "git event forwarder thread")
-            .map_err(ScanRuntimeError::Driver)?;
 
-        let debug_output = format_git_debug_output(&result.0, config.debug_level);
+        // Join the forwarder explicitly before inspecting the scan result.
+        // Returning early via `?` would let `std::thread::scope` auto-join
+        // the forwarder — and a forwarder panic would mask the scan error.
+        let forwarder_result = join_scoped(event_forwarder, "git event forwarder thread")
+            .map_err(ScanRuntimeError::Driver);
+
+        // Prefer the scan error (root cause) over the forwarder error.
+        let execution = match (execution, forwarder_result) {
+            (Err(scan_err), Err(fwd_err)) => {
+                tracing::warn!(
+                    repo = %digest_repo_path(&canonical_repo),
+                    forwarder_error = %fwd_err,
+                    "event forwarder also failed after scan error"
+                );
+                return Err(scan_err);
+            }
+            (Err(scan_err), Ok(())) => return Err(scan_err),
+            (Ok(_), Err(fwd_err)) => return Err(fwd_err),
+            (Ok(exec), Ok(())) => exec,
+        };
+
+        let debug_output = format_git_debug_output(&execution.result.0, config.debug_level);
         Ok((
-            git_report_to_scan_report(result, scan_elapsed),
+            git_report_to_scan_report(execution.result, execution.scan_elapsed),
             debug_output,
         ))
     })?;
@@ -175,41 +199,43 @@ pub(crate) fn digest_repo_path(p: &std::path::Path) -> ToxicDigest {
     ToxicDigest::of_bytes(p.as_os_str().as_encoded_bytes())
 }
 
+/// Convert a MiB value to a byte count, rejecting zero and overflow.
+pub(crate) fn mebibytes_to_u32_bytes(
+    value_mb: u32,
+    label: &'static str,
+) -> Result<u32, ScanRuntimeError> {
+    const MIB: u32 = 1024 * 1024;
+
+    if value_mb == 0 {
+        return Err(ScanRuntimeError::ConnectorInput(
+            gossip_contracts::connector::ConnectorInputError::ZeroBudget { field: label },
+        ));
+    }
+    value_mb.checked_mul(MIB).ok_or_else(|| {
+        ScanRuntimeError::Driver(anyhow!(
+            "{label} value {value_mb} MiB overflows u32 byte count"
+        ))
+    })
+}
+
+/// Convert a MiB value to a platform-sized byte count, rejecting zero and overflow.
+pub(crate) fn mebibytes_to_usize_bytes(
+    value_mb: u32,
+    label: &'static str,
+) -> Result<usize, ScanRuntimeError> {
+    usize::try_from(mebibytes_to_u32_bytes(value_mb, label)?).map_err(|_| {
+        ScanRuntimeError::Driver(anyhow!(
+            "{label} value {value_mb} MiB exceeds platform usize"
+        ))
+    })
+}
+
 /// Translate the crate-level [`GitScanConfig`] into the lower-level
 /// [`RuntimeGitScanConfig`] consumed by `scanner_git::run_git_scan`.
 ///
 /// MiB-denominated size overrides are converted to byte counts with overflow
 /// checking. Zero-valued budgets are rejected as configuration errors.
 fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig, ScanRuntimeError> {
-    const MIB: u32 = 1024 * 1024;
-
-    /// Convert a MiB value to a byte count, rejecting zero and overflow.
-    fn mebibytes_to_u32_bytes(value_mb: u32, label: &'static str) -> Result<u32, ScanRuntimeError> {
-        if value_mb == 0 {
-            return Err(ScanRuntimeError::ConnectorInput(
-                gossip_contracts::connector::ConnectorInputError::ZeroBudget { field: label },
-            ));
-        }
-        value_mb.checked_mul(MIB).ok_or_else(|| {
-            ScanRuntimeError::Driver(anyhow!(
-                "{label} value {value_mb} MiB overflows u32 byte count"
-            ))
-        })
-    }
-
-    /// Same as `mebibytes_to_u32_bytes` but widens to `usize` for APIs that
-    /// require platform-sized byte counts.
-    fn mebibytes_to_usize_bytes(
-        value_mb: u32,
-        label: &'static str,
-    ) -> Result<usize, ScanRuntimeError> {
-        usize::try_from(mebibytes_to_u32_bytes(value_mb, label)?).map_err(|_| {
-            ScanRuntimeError::Driver(anyhow!(
-                "{label} value {value_mb} MiB exceeds platform usize"
-            ))
-        })
-    }
-
     let mut git_cfg = RuntimeGitScanConfig {
         repo_id: config.repo_id,
         scan_mode: config.scan_mode,
@@ -236,6 +262,32 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
     Ok(git_cfg)
 }
 
+/// Execute the shared `scanner-git` runner setup against `canonical_repo`.
+pub(crate) fn run_runtime_git_scan(
+    canonical_repo: &Path,
+    engine: Arc<scanner_engine::Engine>,
+    git_cfg: &RuntimeGitScanConfig,
+    git_sink: Arc<dyn scanner_git::EventSink>,
+) -> Result<GitRunExecution, GitScanError> {
+    let resolver = NativeRefResolver::new(git_cfg.start_set.clone());
+    let watermarks = EmptyWatermarkStore;
+    let seen = NeverSeenStore;
+
+    let scan_start = std::time::Instant::now();
+    let result = run_git_scan(
+        canonical_repo,
+        engine,
+        &resolver,
+        &seen,
+        &watermarks,
+        None,
+        git_cfg,
+        git_sink,
+    )?;
+
+    Ok(GitRunExecution::new(result, scan_start.elapsed()))
+}
+
 /// Map a contract-level [`GitRefSelection`] to the scanner-level
 /// [`StartSetConfig`] consumed by [`NativeRefResolver`].
 ///
@@ -245,7 +297,7 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
 /// should be lowered to `ExplicitRefs` (via
 /// [`materialize_synthetic_commit_ref`](scanner_git::materialize_synthetic_commit_ref))
 /// before reaching this function; `GitRefSelection` has no commit variant.
-fn start_set_from_ref_selection(selection: &GitRefSelection) -> StartSetConfig {
+pub(crate) fn start_set_from_ref_selection(selection: &GitRefSelection) -> StartSetConfig {
     match selection {
         GitRefSelection::DefaultBranchOnly => StartSetConfig::DefaultBranchOnly,
         GitRefSelection::AllRemoteBranches { remote } => StartSetConfig::AllRemoteBranches {
@@ -264,12 +316,26 @@ fn start_set_from_ref_selection(selection: &GitRefSelection) -> StartSetConfig {
     }
 }
 
+/// Resolve the authoritative scan duration in nanoseconds.
+///
+/// Prefers the scanner's own stage-level `scan` timing when available (> 0).
+/// Falls back to `wall_elapsed` (wall-clock measurement from the runtime)
+/// when the scanner did not record stage timing, which can happen with
+/// certain scan modes that bypass the stage-nanos pipeline.
+pub(crate) fn resolve_scan_ns(
+    stage_nanos: &scanner_git::GitScanStageNanos,
+    wall_elapsed: std::time::Duration,
+) -> u64 {
+    if stage_nanos.scan > 0 {
+        stage_nanos.scan
+    } else {
+        u64::try_from(wall_elapsed.as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Map `scanner_git` metrics into the crate-level [`ScanReport`].
 ///
-/// Prefers the scanner's own stage-level `scan` timing when available. Falls
-/// back to `scan_elapsed` (wall-clock measurement from the runtime) when the
-/// scanner did not record stage timing, which can happen with certain scan
-/// modes that bypass the stage-nanos pipeline.
+/// Scan duration is resolved by [`resolve_scan_ns`].
 ///
 /// Git scans have no persistence layer, so `dropped_findings`,
 /// `persist_emit_failures`, `persist_incomplete`, and `persist_ns` are zeroed.
@@ -279,11 +345,7 @@ fn git_report_to_scan_report(
 ) -> ScanReport {
     let report = result.0;
     let metrics = report.common_metrics;
-    let scan_ns = if report.stage_nanos.scan > 0 {
-        report.stage_nanos.scan
-    } else {
-        u64::try_from(scan_elapsed.as_nanos()).unwrap_or(u64::MAX)
-    };
+    let scan_ns = resolve_scan_ns(&report.stage_nanos, scan_elapsed);
 
     ScanReport {
         items_scanned: metrics.objects_scanned,
@@ -312,7 +374,7 @@ fn git_report_to_scan_report(
 /// - [`GitDebugLevel::Stats`] emits aggregate counters and stage timings.
 /// - [`GitDebugLevel::Perf`] additionally includes per-pack-exec cache and
 ///   resolve latency breakdowns.
-fn format_git_debug_output(
+pub(crate) fn format_git_debug_output(
     report: &scanner_git::GitScanReport,
     level: GitDebugLevel,
 ) -> Option<String> {
