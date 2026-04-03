@@ -428,8 +428,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 ### Integrate Near-Miss into Scanner Sim
 
 - Add `near_miss_count: u32` field to `ScenarioGenConfig` (default 0).
-- Generator produces `MustNotFind`-disposition secrets using near-miss
-  operators when `near_miss_count > 0`.
+- Generator produces near-miss mutation cases whose expected outcome is `MustNotMatch` when `near_miss_count > 0`.
 - Runner validates that near-miss secrets are NOT found (new oracle check).
 - New random sim seeds exercise near-miss scenarios.
 - Minimized failures added to corpus.
