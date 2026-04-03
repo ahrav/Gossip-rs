@@ -552,19 +552,11 @@ cargo test --lib yaml_unit_tests
 
 Record pass counts as the baseline for later regression checks.
 
-### Baseline Results
+### Baseline Capture
 
-Property tests (2025-02-25, branch `feature/test-unification-doc`):
-```
-test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-```
-
-Scanner corpus replay (2025-02-25):
-```
-test result: FAILED. 0 passed; 1 failed; 0 ignored
-  — b64_internal_newline.case.json: "overlap (512) must not exceed chunk_size (64)"
-  — Pre-existing failure; not introduced by this document.
-```
+- Run the command list above to capture a local baseline before changing code.
+- Keep command output with the run artifacts rather than embedding snapshots in
+  this design doc.
 
 ---
 
