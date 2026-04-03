@@ -22,6 +22,8 @@ pub enum GitResourceId {
     Pack { pack_id: u16 },
     /// Persistence store (watermarks/seen store).
     Persist,
+    /// Incremental seen-bitmap persistence during spill flushing.
+    SeenPersist,
     /// Catch-all for non-core resources (keep names stable for replay).
     Other(String),
 }
@@ -125,6 +127,7 @@ impl GitResourceId {
             Self::Midx => 2,
             Self::Pack { pack_id } => 1000 + (*pack_id as u32),
             Self::Persist => 2000,
+            Self::SeenPersist => 2001,
             Self::Other(name) => 3000 + stable_hash_u32(name.as_bytes()),
         }
     }

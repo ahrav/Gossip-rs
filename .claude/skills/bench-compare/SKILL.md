@@ -1,6 +1,6 @@
 ---
 name: bench-compare
-description: Run Criterion benchmarks with baseline comparison for performance optimization work
+description: Use when measuring optimization impact against a baseline, when validating that a code change didn't regress performance, or when comparing two implementation approaches. Criterion benchmark baseline comparison workflow.
 ---
 
 # Benchmark Comparison Workflow

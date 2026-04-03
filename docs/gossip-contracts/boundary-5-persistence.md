@@ -174,14 +174,14 @@ Lease loss rule (hard):
 
 - If a worker loses its lease or ownership key, it must stop scanning and must not checkpoint/split/complete/park.
 
-Coordinator restart (contract for durable backends; not yet implemented):
+Coordinator restart (durable etcd backend behavior):
 
-- Reload state from coordination backend via prefix scans + indexes.
-- Workers reacquire shards, `fence_epoch` bumps, and resume from last durable cursor.
-
-> **Note:** The `EtcdCoordinator` currently delegates to an `InMemoryCoordinator`,
-> so state is lost on process restart. The recovery protocol above describes the
-> required contract for durable backends, not current behavior.
+- `EtcdCoordinator` and `AsyncEtcdCoordinator` persist run and shard state
+  directly in etcd, then reload it through point reads, prefix scans, and
+  active-index walks.
+- After a coordinator process restart, workers reacquire shards against the
+  persisted records, `fence_epoch` still fences stale workers, and progress
+  resumes from the last durable cursor.
 
 ---
 
