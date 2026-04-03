@@ -473,19 +473,19 @@ impl Spiller {
     /// # Emit-before-persist ordering
     ///
     /// Unseen blobs are forwarded to the sink *before* `persist_seen_delta`
-    /// records them durably. This produces at-least-once delivery semantics:
+    /// writes to the staging key. This produces at-least-once delivery:
     ///
-    /// - **Crash between emit and persist**: already-emitted OIDs are not
-    ///   marked as seen, so the next run re-scans and re-emits them.
+    /// - **Crash between emit and staging**: already-emitted OIDs are not
+    ///   staged, so the next run re-scans and re-emits them.
     /// - **Mid-batch `sink.emit` failure**: if emit succeeds for OIDs 1..k
     ///   then fails on k+1, `persist_seen_delta` is never reached. OIDs
-    ///   1..k were emitted but not persisted, so they will be re-emitted on
+    ///   1..k were emitted but not staged, so they will be re-emitted on
     ///   the next run — the same at-least-once guarantee as the crash path.
     ///
-    /// See `persist_seen_delta_inner` in `persist_rocksdb.rs` for the full
-    /// crash-consistency contract: the incremental bitmap may advance
-    /// independently of ref watermarks, so blobs processed in an incomplete
-    /// run may be skipped on recovery.
+    /// Staging writes are invisible to `batch_check_seen` and only become
+    /// visible when `commit_finalize` folds them into the live bitmap.
+    /// If the process crashes before finalize, staging is discarded on the
+    /// next store open — no blobs are permanently hidden.
     ///
     /// # Errors
     /// - `SpillError::SeenResponseMismatch` if the seen store returns a

@@ -871,8 +871,10 @@ pub enum GitScanError {
 /// - `resolver` controls how the start set is chosen (default branch, refs, etc.).
 /// - `seen_store` is used to dedupe candidates across runs.
 /// - `watermark_store` supplies existing ref watermarks; it is not mutated here.
-/// - `persist_store` is optional; when `Some`, finalize output (including
-///   watermarks on complete runs) is committed atomically.
+/// - `persist_store` is optional; when `Some`, spill-stage seen-bitmap
+///   deltas are staged incrementally, and finalize output (including
+///   watermarks on complete runs and folded staging deltas) is committed
+///   atomically.
 ///
 /// If no persistence store is provided, the caller is responsible for
 /// interpreting `FinalizeOutcome` and storing watermarks as needed.
@@ -988,7 +990,10 @@ pub fn run_git_scan(
         identity_interner: identity_interner.clone(),
     };
     let null_seen_persister = NullSeenBitmapPersister;
-    let seen_persister: &dyn SeenBitmapPersister = &null_seen_persister;
+    let seen_persister: &dyn SeenBitmapPersister = match persist_store {
+        Some(store) => store,
+        None => &null_seen_persister,
+    };
     #[allow(unused_mut)]
     let mut output = match config.scan_mode {
         GitScanMode::OdbBlobFast => super::runner_odb_blob::run_odb_blob(

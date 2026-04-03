@@ -304,6 +304,12 @@ impl RoaringSeenBitmap {
         self.seen.is_empty()
     }
 
+    /// Returns a slice of all OIDs in the sorted index.
+    #[must_use]
+    pub fn all_oids(&self) -> &[OidBytes] {
+        &self.oids
+    }
+
     /// Returns the serialized byte length for the persisted bitmap payload.
     #[must_use]
     pub fn serialized_size(&self) -> usize {

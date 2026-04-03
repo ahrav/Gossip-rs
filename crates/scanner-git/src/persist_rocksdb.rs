@@ -4,9 +4,10 @@
 //! The adapter uses a single RocksDB instance with plain key/value pairs.
 //! Ref watermarks still use sorted `multi_get` access, while seen-blob queries
 //! are served from a lazily loaded in-memory bitmap snapshot.
-//! Incremental seen-bitmap updates use single-key `put` writes during spill
-//! flushing. Finalize output is committed with a single `WriteBatch` so data
-//! writes and watermarks become visible atomically.
+//! Incremental seen-bitmap updates during spill flushing write to a staging
+//! key (`ss\0`). `commit_finalize` folds staging into the live scope key
+//! atomically within the `WriteBatch`, so data writes, seen-bitmap merges,
+//! and watermarks become visible atomically.
 //! When the feature is disabled, public constructors and methods return
 //! feature-not-available errors via the appropriate error variant.
 
@@ -22,7 +23,7 @@ use super::finalize::FinalizeOutput;
 #[cfg(feature = "rocksdb")]
 use super::finalize::NS_SEEN_BLOB;
 #[cfg(feature = "rocksdb")]
-use super::finalize::{build_ref_wm_key, build_seen_scope_key};
+use super::finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key};
 use super::object_id::OidBytes;
 use super::persist::PersistenceStore;
 use super::repo_open::RefWatermarkStore;
@@ -85,13 +86,15 @@ impl RocksDbStore {
             let mut opts = Options::default();
             opts.create_if_missing(true);
             let db = DB::open(&opts, path).map_err(|err| PersistError::backend(err.to_string()))?;
-            Ok(Self {
+            let store = Self {
                 db,
                 repo_id,
                 policy_hash,
                 seen_store: RefCell::new(None),
                 finalizing: Cell::new(false),
-            })
+            };
+            store.cleanup_orphaned_staging()?;
+            Ok(store)
         }
 
         #[cfg(not(feature = "rocksdb"))]
@@ -133,54 +136,59 @@ impl RocksDbStore {
         }
     }
 
-    /// Writes the seen-bitmap delta to RocksDB outside the atomic `WriteBatch`
-    /// used by `commit_finalize`.
+    /// Writes a seen-bitmap delta to the staging key (`ss\0`).
     ///
-    /// # Crash-consistency trade-off
+    /// Staging writes are invisible to `batch_check_seen` — only
+    /// `commit_finalize` folds them into the live `sb\0` key. If the
+    /// process crashes before finalize, the staging key is orphaned
+    /// and cleaned up on the next `RocksDbStore::open`.
     ///
-    /// This write advances the persisted seen-bitmap independently of ref
-    /// watermarks. If the process crashes after this `put` but before
-    /// `commit_finalize` atomically writes watermarks, recovery will observe
-    /// blobs marked as seen whose scan findings were never committed. Those
-    /// blobs will be skipped on the next run. This is intentional: it avoids
-    /// expensive re-scanning at the cost of potentially missing findings for
-    /// blobs processed during the incomplete run. The trade-off is acceptable
-    /// because the incremental bitmap is a best-effort deduplication hint, not
-    /// a correctness-critical data structure.
-    /// Merges `delta` into the in-memory bitmap in-place, serializes, and
-    /// writes the result to RocksDB.
-    ///
-    /// The bitmap is mutated before the `db.put` call. If `db.put` fails, the
-    /// in-memory bitmap contains mutations that are not persisted — the same
-    /// trade-off documented on `commit_finalize` for the atomic `WriteBatch`
-    /// path. This is acceptable because the seen-bitmap is a best-effort
-    /// deduplication hint, not a correctness-critical structure.
+    /// The in-memory bitmap cache is NOT mutated here. This ensures
+    /// crash safety: a restart loads only committed state.
     #[cfg(feature = "rocksdb")]
     fn persist_seen_delta_inner(&self, delta: &SeenBitmapDelta) -> Result<(), SpillError> {
-        let scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
-        self.load_seen_store(delta.oid_len())
-            .map_err(|err| SpillError::Io(io::Error::other(err)))?;
+        let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
 
-        // Mutate the bitmap in-place and serialize while holding the borrow.
-        // The borrow is dropped before the I/O call to avoid holding the
-        // RefCell across `db.put`.
-        let bytes = {
-            let mut guard = self.seen_store.borrow_mut();
-            let store = guard.as_mut().ok_or_else(|| {
-                SpillError::Io(io::Error::other(
-                    "incremental seen-bitmap persist failed: seen-store not initialized",
-                ))
-            })?;
-            store.bitmap_mut().merge_delta(delta)?;
-            store.bitmap().serialize()?
+        // Load any existing staging bitmap, merge the new delta, write back.
+        let bytes = match self.db.get(&staging_key) {
+            Ok(Some(existing)) => {
+                let mut bitmap = RoaringSeenBitmap::deserialize(&existing).map_err(|err| {
+                    SpillError::Io(io::Error::other(format!("corrupt staging bitmap: {err}")))
+                })?;
+                bitmap.merge_delta(delta)?;
+                bitmap.serialize()?
+            }
+            Ok(None) => {
+                let mut bitmap = RoaringSeenBitmap::new(delta.oid_len());
+                bitmap.merge_delta(delta)?;
+                bitmap.serialize()?
+            }
+            Err(err) => {
+                return Err(SpillError::Io(io::Error::other(format!(
+                    "staging bitmap read failed: {err}"
+                ))));
+            }
         };
 
-        self.db.put(&scope_key, &bytes).map_err(|err| {
+        self.db.put(&staging_key, &bytes).map_err(|err| {
             SpillError::Io(io::Error::other(format!(
-                "incremental seen-bitmap RocksDB put failed: {err}"
+                "staging seen-bitmap RocksDB put failed: {err}"
             )))
         })?;
         Ok(())
+    }
+
+    /// Deletes any orphaned staging key left by a crashed previous run.
+    ///
+    /// Returns an error if the RocksDB delete fails, since a surviving
+    /// staging key would cause the next `commit_finalize` to fold
+    /// never-committed OIDs into the live bitmap.
+    #[cfg(feature = "rocksdb")]
+    fn cleanup_orphaned_staging(&self) -> Result<(), PersistError> {
+        let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
+        self.db
+            .delete(&staging_key)
+            .map_err(|err| PersistError::backend(err.to_string()))
     }
 }
 
@@ -270,43 +278,73 @@ impl PersistenceStore for RocksDbStore {
             // leaves the cache consistent with what is persisted.
             let mut staged_bitmap: Option<RoaringSeenBitmap> = None;
 
+            // Fold spill-stage staging bitmap into seen_oids only for
+            // complete runs. On partial finalize, staging may contain OIDs
+            // for blobs that were emitted but skipped (budget/corruption).
+            // Folding those would permanently hide them from future scans
+            // because `batch_check_seen` would suppress re-emission while
+            // watermarks remain un-advanced.
+            let staging_key = build_seen_staging_key(self.repo_id, &self.policy_hash);
+            let is_complete = matches!(output.outcome, FinalizeOutcome::Complete);
+            match self.db.get(&staging_key) {
+                Ok(Some(staging_bytes)) => {
+                    if is_complete {
+                        // All OIDs in the staging bitmap are marked seen because
+                        // persist_seen_delta_inner only ever merges via merge_delta,
+                        // which uses `other_contains = |_| true`.
+                        let staging_bitmap = RoaringSeenBitmap::deserialize(&staging_bytes)
+                            .map_err(|err| {
+                                PersistError::backend(format!("corrupt staging bitmap: {err}"))
+                            })?;
+                        if staging_bitmap.len() != staging_bitmap.index_len() {
+                            return Err(PersistError::backend(
+                                "staging bitmap contains unseen entries",
+                            ));
+                        }
+                        seen_oids.extend_from_slice(staging_bitmap.all_oids());
+                    }
+                    // Delete the staging key in both cases: complete folds
+                    // it into live; partial discards it so skipped blobs
+                    // can be re-emitted on the next run.
+                    batch.delete(&staging_key);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(PersistError::backend(format!(
+                        "staging bitmap read failed: {err}"
+                    )));
+                }
+            }
+
             if !seen_oids.is_empty() {
                 // Multiple same-scope deltas may have individually sorted OID
                 // lists, but their concatenation is not necessarily globally
                 // sorted. Use `from_oids` to sort and dedup the combined set.
                 let delta = SeenBitmapDelta::from_oids(&seen_oids)
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                self.load_seen_store(delta.oid_len())
-                    .map_err(PersistError::backend)?;
 
-                // Validate that the scope key matches this store's identity.
-                // The multi-scope check above ensures all ops share one key,
-                // but that key must also match the store's repo_id/policy_hash
-                // to prevent cross-scope pollution.
-                let scope_key = seen_scope_key
-                    .as_ref()
-                    .ok_or_else(|| PersistError::backend("seen-bitmap delta without scope key"))?;
+                let oid_len = delta.oid_len();
+                let scope_key_for_bitmap = seen_scope_key
+                    .unwrap_or_else(|| build_seen_scope_key(self.repo_id, &self.policy_hash));
+
                 let expected_scope_key = build_seen_scope_key(self.repo_id, &self.policy_hash);
-                if *scope_key != expected_scope_key {
+                if scope_key_for_bitmap != expected_scope_key {
                     return Err(PersistError::backend(
                         "seen-bitmap scope key does not match store identity",
                     ));
                 }
 
+                self.load_seen_store(oid_len)
+                    .map_err(PersistError::backend)?;
+
                 // Build the merged bitmap in a separate clone so the in-memory
-                // cache is not mutated until db.write succeeds. This prevents
-                // divergence between the cache and the persisted state on write
-                // failure.
+                // cache is not mutated until db.write succeeds.
                 let merged = {
                     let guard = self.seen_store.borrow();
-                    let base = guard.as_ref().map_or_else(
-                        || RoaringSeenBitmap::new(delta.oid_len()),
-                        |s| s.bitmap().clone(),
-                    );
+                    let base = guard
+                        .as_ref()
+                        .map_or_else(|| RoaringSeenBitmap::new(oid_len), |s| s.bitmap().clone());
                     let mut staged = base;
-                    // The finalize-time merge may re-apply OIDs already present
-                    // from incremental persistence. This is harmless: merge_delta
-                    // is a set-union and the cost is bounded by the delta size.
                     staged
                         .merge_delta(&delta)
                         .map_err(|err| PersistError::backend(err.to_string()))?;
@@ -315,7 +353,7 @@ impl PersistenceStore for RocksDbStore {
                 let serialized = merged
                     .serialize()
                     .map_err(|err| PersistError::backend(err.to_string()))?;
-                batch.put(scope_key, serialized);
+                batch.put(&scope_key_for_bitmap, serialized);
                 staged_bitmap = Some(merged);
             }
 
@@ -673,48 +711,246 @@ mod tests {
         );
     }
 
+    /// Spill-stage deltas go to the staging key, NOT the live scope key.
+    /// After `commit_finalize` folds them, the OIDs become visible.
     #[cfg(feature = "rocksdb")]
     #[test]
-    fn rocksdb_store_incremental_seen_delta_survives_reopen_without_watermarks() {
+    fn spill_delta_staged_then_folded_on_finalize() {
         let dir = tempdir().expect("tempdir");
         let repo_id = 17;
         let policy_hash = [0xAA; 32];
         let oid_a = OidBytes::sha1([0x11; 20]);
         let oid_b = OidBytes::sha1([0x22; 20]);
         let oid_c = OidBytes::sha1([0x33; 20]);
-        let start_set_id: StartSetId = [0x44; 32];
 
         let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
         store
             .persist_seen_delta(&[oid_a, oid_b])
-            .expect("incremental persist");
-        let seen_scope_key = build_seen_scope_key(repo_id, &policy_hash);
-        assert!(
-            store
-                .db
-                .get(&seen_scope_key)
-                .expect("seen scope lookup")
-                .is_some(),
-            "incremental persist should write the seen scope key"
-        );
-        let watermark_key =
-            build_ref_wm_key(repo_id, &policy_hash, &start_set_id, b"refs/heads/main");
-        assert!(
-            store
-                .db
-                .get(&watermark_key)
-                .expect("watermark lookup")
-                .is_none(),
-            "incremental persist must not write watermarks"
-        );
-        drop(store);
+            .expect("spill checkpoint");
 
+        // Staging key should exist; live scope key should NOT.
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        let scope_key = build_seen_scope_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging lookup")
+                .is_some(),
+            "spill delta should write the staging key"
+        );
+        assert!(
+            store.db.get(&scope_key).expect("scope lookup").is_none(),
+            "spill delta must not write the live scope key"
+        );
+
+        // batch_check_seen must not see staged OIDs.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("check before finalize"),
+            vec![false, false],
+            "staged OIDs must not be visible to batch_check_seen"
+        );
+
+        // Finalize with oid_b and oid_c via data ops. The staging delta
+        // (oid_a, oid_b) is folded in, so all three become seen.
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[oid_b, oid_c]))
+            .expect("finalize");
+
+        // Staging key should be deleted after finalize.
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging after finalize")
+                .is_none(),
+            "staging key must be deleted after finalize"
+        );
+
+        // Verify all three OIDs are seen in the current instance.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("check after finalize"),
+            vec![true, true, true],
+            "staging + finalize OIDs should all be seen"
+        );
+
+        // Verify the merged bitmap survives a restart.
+        drop(store);
         let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
         assert_eq!(
             store
                 .batch_check_seen(&[oid_a, oid_b, oid_c])
-                .expect("batch check"),
-            vec![true, true, false]
+                .expect("batch check after reopen"),
+            vec![true, true, true],
+            "staging + finalize OIDs should all be seen after reopen"
+        );
+    }
+
+    /// Spill-stage `persist_seen_delta` writes must not pollute the live
+    /// bitmap that `batch_check_seen` reads. Otherwise a crash between
+    /// spill and `commit_finalize` permanently hides blobs whose findings
+    /// were never committed.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn spill_checkpoint_without_finalize_must_not_pollute_live_bitmap() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 19;
+        let policy_hash = [0xBB; 32];
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+
+        // Simulate spill: persist_seen_delta writes OIDs during spill stage.
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("spill checkpoint");
+
+        // Simulate crash: drop without calling commit_finalize.
+        drop(store);
+
+        // Restart: the next run must NOT see these OIDs as "seen" because
+        // commit_finalize never ran — findings were never committed.
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("reopen");
+
+        // The orphaned staging key must have been deleted by open().
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging lookup")
+                .is_none(),
+            "open() must delete the orphaned staging key"
+        );
+
+        let seen = store
+            .batch_check_seen(&[oid_a, oid_b])
+            .expect("batch check after crash");
+
+        assert_eq!(
+            seen,
+            vec![false, false],
+            "spill-only checkpoint without finalize must not mark OIDs as seen"
+        );
+    }
+
+    /// Multiple `persist_seen_delta` calls accumulate in the staging key.
+    /// `commit_finalize` folds the union into the live bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn multiple_spill_deltas_accumulate_in_staging() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 20;
+        let policy_hash = [0xCC; 32];
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+        let oid_c = OidBytes::sha1([0x33; 20]);
+        let oid_d = OidBytes::sha1([0x44; 20]);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+
+        // Two separate spill checkpoints with disjoint OID sets.
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("first spill");
+        store.persist_seen_delta(&[oid_c]).expect("second spill");
+
+        // Staging key should contain the union {A, B, C}.
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        let staging_bytes = store
+            .db
+            .get(&staging_key)
+            .expect("staging read")
+            .expect("staging key must exist");
+        let staging_bitmap =
+            RoaringSeenBitmap::deserialize(&staging_bytes).expect("staging deserialize");
+        assert!(staging_bitmap.contains(&oid_a));
+        assert!(staging_bitmap.contains(&oid_b));
+        assert!(staging_bitmap.contains(&oid_c));
+        assert!(!staging_bitmap.contains(&oid_d));
+
+        // None are visible to batch_check_seen yet.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c])
+                .expect("check before finalize"),
+            vec![false, false, false],
+        );
+
+        // Finalize with oid_d only — staging {A,B,C} + finalize {D} → all seen.
+        store
+            .commit_finalize(&seen_finalize_output(repo_id, policy_hash, &[oid_d]))
+            .expect("finalize");
+
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b, oid_c, oid_d])
+                .expect("check after finalize"),
+            vec![true, true, true, true],
+            "staging accumulation + finalize should produce the full union"
+        );
+
+        // Staging key deleted after finalize.
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging after finalize")
+                .is_none(),
+            "staging key must be deleted after finalize"
+        );
+    }
+
+    /// When all candidates are already seen and no new blobs are scanned,
+    /// `commit_finalize` receives empty `data_ops` but the staging key
+    /// still exists. The staging OIDs must land in the live bitmap.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn staging_only_finalize_folds_without_data_ops() {
+        let dir = tempdir().expect("tempdir");
+        let repo_id = 21;
+        let policy_hash = [0xDD; 32];
+        let oid_a = OidBytes::sha1([0x11; 20]);
+        let oid_b = OidBytes::sha1([0x22; 20]);
+
+        let store = RocksDbStore::open(dir.path(), repo_id, policy_hash).expect("open");
+        store
+            .persist_seen_delta(&[oid_a, oid_b])
+            .expect("spill checkpoint");
+
+        // Finalize with empty data_ops — only staging contributes.
+        let empty_finalize = FinalizeOutput {
+            data_ops: Vec::new(),
+            watermark_ops: Vec::new(),
+            outcome: FinalizeOutcome::Complete,
+            stats: FinalizeStats::default(),
+        };
+        store
+            .commit_finalize(&empty_finalize)
+            .expect("empty finalize");
+
+        // Staging OIDs should now be visible.
+        assert_eq!(
+            store
+                .batch_check_seen(&[oid_a, oid_b])
+                .expect("check after empty finalize"),
+            vec![true, true],
+            "staging-only finalize must fold OIDs into the live bitmap"
+        );
+
+        // Staging key deleted.
+        let staging_key = build_seen_staging_key(repo_id, &policy_hash);
+        assert!(
+            store
+                .db
+                .get(&staging_key)
+                .expect("staging after finalize")
+                .is_none(),
+            "staging key must be deleted after finalize"
         );
     }
 }
