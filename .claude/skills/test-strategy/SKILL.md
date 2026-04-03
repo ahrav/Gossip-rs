@@ -1,6 +1,6 @@
 ---
 name: test-strategy
-description: Assess and recommend the appropriate testing strategy for Rust code - unit tests, parameterized tests (rstest), property-based tests, fuzz tests, Kani model checking, or simulation testing
+description: Use when writing tests for new code and unsure which test type fits, when choosing between unit/rstest/proptest/fuzz/kani/sim, or when coordination or unsafe code changes need test coverage guidance. Recommends the optimal testing approach per code characteristic.
 ---
 
 # Test Strategy Assessment

@@ -26,6 +26,7 @@ kgram-gate = ["scanner-engine/kgram-gate"]
 bench = ["scanner-engine/bench"]
 perf-stats = ["scanner-engine/perf-stats"]
 stdx-proptest = ["scanner-engine/stdx-proptest"]
+rocksdb = ["scanner-git/rocksdb"]
 
 [dev-dependencies]
 base64 = "0.22"

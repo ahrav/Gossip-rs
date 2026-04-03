@@ -1,6 +1,6 @@
 ---
 name: sim-run
-description: Run deterministic simulation tests with progressive difficulty levels (sunny/stormy/radioactive) inspired by TigerBeetle VOPR — orchestrates seed management, workload selection, and invariant verification
+description: Use when sanity-checking coordination changes before commit, before merging coordination PRs, when a coordination bug is suspected, or when verifying a simulation-found fix. Progressive DST execution with seed management and fault injection.
 user-invocable: true
 ---
 

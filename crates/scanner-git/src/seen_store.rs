@@ -22,6 +22,29 @@ pub trait SeenBlobStore {
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError>;
 }
 
+/// Incremental persistence interface for seen-bitmap scope updates.
+///
+/// # Contract
+/// - `persist_seen_delta` stages the provided OIDs for one scope.
+///   Whether these writes are immediately visible to `batch_check_seen`
+///   or deferred until `commit_finalize` is implementation-defined.
+/// - Inputs are expected to be sorted and unique.
+/// - Implementations must not write ref watermarks through this path.
+pub trait SeenBitmapPersister {
+    /// Persists one batch of processed OIDs into the seen-bitmap scope.
+    fn persist_seen_delta(&self, oids: &[OidBytes]) -> Result<(), SpillError>;
+}
+
+/// Persister that discards seen-bitmap deltas.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NullSeenBitmapPersister;
+
+impl SeenBitmapPersister for NullSeenBitmapPersister {
+    fn persist_seen_delta(&self, _oids: &[OidBytes]) -> Result<(), SpillError> {
+        Ok(())
+    }
+}
+
 /// Seen store that marks all blobs as unseen.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NeverSeenStore;

@@ -1,6 +1,6 @@
 ---
 name: interface-design-review
-description: Review Rust interfaces for ease of correct use and resistance to misuse, applying "make interfaces easy to use correctly and hard to use incorrectly"
+description: Use when designing new public APIs, adding trait methods, or refactoring type signatures to ensure they are easy to use correctly and hard to use incorrectly. Reviews Rust interfaces for misuse resistance.
 ---
 
 # Interface Design Review

@@ -17,6 +17,7 @@ use std::fmt;
 use std::io;
 
 use super::midx_error::MidxError;
+use super::roaring_seen::SeenBitmapError;
 
 /// Errors from repo discovery and open.
 ///
@@ -302,6 +303,9 @@ pub enum SpillError {
         /// Observed count when the cap was exceeded.
         observed: u32,
     },
+    /// Seen-bitmap encoding or decoding error.
+    #[error("seen-bitmap error: {0}")]
+    SeenBitmap(#[from] SeenBitmapError),
 }
 
 /// Errors from persistence operations.

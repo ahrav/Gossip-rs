@@ -33,6 +33,8 @@
 //! - Loose objects are decoded via `PackIo::load_loose_object`; failures are
 //!   recorded as skipped candidates.
 //! - Persistence is optional; callers can run the pipeline without a store.
+//! - When a persistence store is present, seen-bitmap progress is also written
+//!   incrementally during spill flushing.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -69,7 +71,7 @@ use super::pack_plan_model::PackPlanStats;
 use super::persist::{persist_finalize_output, PersistenceStore};
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::{repo_open, RefWatermarkStore, StartSetResolver};
-use super::seen_store::SeenBlobStore;
+use super::seen_store::{NullSeenBitmapPersister, SeenBitmapPersister, SeenBlobStore};
 use super::spill_limits::SpillLimits;
 use super::spiller::SpillStats;
 use super::start_set::StartSetConfig;
@@ -869,8 +871,10 @@ pub enum GitScanError {
 /// - `resolver` controls how the start set is chosen (default branch, refs, etc.).
 /// - `seen_store` is used to dedupe candidates across runs.
 /// - `watermark_store` supplies existing ref watermarks; it is not mutated here.
-/// - `persist_store` is optional; when `Some`, finalize output (including
-///   watermarks on complete runs) is committed atomically.
+/// - `persist_store` is optional; when `Some`, spill-stage seen-bitmap
+///   deltas are staged incrementally, and finalize output (including
+///   watermarks on complete runs and folded staging deltas) is committed
+///   atomically.
 ///
 /// If no persistence store is provided, the caller is responsible for
 /// interpreting `FinalizeOutcome` and storing watermarks as needed.
@@ -985,12 +989,18 @@ pub fn run_git_scan(
         commit_meta_seen: std::sync::Arc::clone(&commit_meta_seen),
         identity_interner: identity_interner.clone(),
     };
+    let null_seen_persister = NullSeenBitmapPersister;
+    let seen_persister: &dyn SeenBitmapPersister = match persist_store {
+        Some(store) => store,
+        None => &null_seen_persister,
+    };
     #[allow(unused_mut)]
     let mut output = match config.scan_mode {
         GitScanMode::OdbBlobFast => super::runner_odb_blob::run_odb_blob(
             &repo,
             std::sync::Arc::clone(&engine),
             seen_store,
+            seen_persister,
             &cg_index,
             &plan,
             config,
@@ -1000,6 +1010,7 @@ pub fn run_git_scan(
             &repo,
             std::sync::Arc::clone(&engine),
             seen_store,
+            seen_persister,
             &cg,
             &plan,
             config,

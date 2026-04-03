@@ -1,6 +1,6 @@
 ---
 name: review-pipeline
-description: Two-phase code review pipeline — dual-diagnostic agents identify issues in parallel, human approves findings, then execution agents fix them with file-ownership isolation
+description: Use when you want review AND automated fixes in one pass, when /review-dispatch alone would leave findings unaddressed, or before merging a feature branch that needs thorough diagnosis and remediation. Two-phase diagnose-then-fix pipeline.
 user-invocable: true
 ---
 

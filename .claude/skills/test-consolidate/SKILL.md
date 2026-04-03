@@ -1,6 +1,6 @@
 ---
 name: test-consolidate
-description: Consolidate verbose test suites by replacing repetitive unit tests with property-based tests, parameterized tests (rstest), or fuzz tests. Less code to maintain, same or better coverage.
+description: Use when a test module has many similar unit tests, when repetitive assertions could be replaced by property-based or parameterized tests, or when test maintenance cost is high. Consolidates verbose suites into rstest, proptest, or fuzz tests.
 ---
 
 # Test Consolidator
