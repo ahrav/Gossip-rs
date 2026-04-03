@@ -33,8 +33,8 @@ use gossip_contracts::connector::git::{
 };
 use scanner_git::{
     GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError, GitScanResult,
-    NativeRefResolver, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig,
-    run_git_scan,
+    NativeRefResolver, NeverSeenStore, OidBytes, PersistenceStore, RefWatermarkStore,
+    RepoOpenError, SeenBlobStore, StartSetConfig, run_git_scan,
 };
 
 use crate::{
@@ -98,6 +98,13 @@ impl GitRunExecution {
             scan_elapsed,
         }
     }
+}
+
+/// Runtime-owned store bundle passed into the shared Git runner helper.
+pub(crate) struct GitRuntimeStores<'a> {
+    pub(crate) seen_store: &'a dyn SeenBlobStore,
+    pub(crate) watermark_store: &'a dyn RefWatermarkStore,
+    pub(crate) persist_store: Option<&'a dyn PersistenceStore>,
 }
 
 /// Run a full Git object scan against a local repository.
@@ -269,18 +276,40 @@ pub(crate) fn run_runtime_git_scan(
     git_cfg: &RuntimeGitScanConfig,
     git_sink: Arc<dyn scanner_git::EventSink>,
 ) -> Result<GitRunExecution, GitScanError> {
-    let resolver = NativeRefResolver::new(git_cfg.start_set.clone());
     let watermarks = EmptyWatermarkStore;
     let seen = NeverSeenStore;
 
+    run_runtime_git_scan_with_stores(
+        canonical_repo,
+        engine,
+        git_cfg,
+        git_sink,
+        GitRuntimeStores {
+            seen_store: &seen,
+            watermark_store: &watermarks,
+            persist_store: None,
+        },
+    )
+}
+
+/// Execute the shared `scanner-git` runner setup against `canonical_repo`
+/// with caller-provided persistence adapters.
+pub(crate) fn run_runtime_git_scan_with_stores(
+    canonical_repo: &Path,
+    engine: Arc<scanner_engine::Engine>,
+    git_cfg: &RuntimeGitScanConfig,
+    git_sink: Arc<dyn scanner_git::EventSink>,
+    stores: GitRuntimeStores<'_>,
+) -> Result<GitRunExecution, GitScanError> {
+    let resolver = NativeRefResolver::new(git_cfg.start_set.clone());
     let scan_start = std::time::Instant::now();
     let result = run_git_scan(
         canonical_repo,
         engine,
         &resolver,
-        &seen,
-        &watermarks,
-        None,
+        stores.seen_store,
+        stores.watermark_store,
+        stores.persist_store,
         git_cfg,
         git_sink,
     )?;

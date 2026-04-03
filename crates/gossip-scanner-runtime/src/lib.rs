@@ -107,6 +107,8 @@ pub mod event_sink;
 pub mod git_discovery;
 // Contract-level adapter for mirror-backed Git repository execution.
 pub mod git_executor;
+// Runtime-backed persistence adapters for scanner-git durability seams.
+pub mod git_persistence;
 // Worker-local Git mirror lifecycle and deterministic cache-path helpers.
 pub mod git_mirror;
 // Git-repository runtime boundary for local scans.

@@ -31,7 +31,7 @@ memchr = "2.8"
 memmap2 = "0.9"
 regex = "1.12"
 rocksdb = { version = "0.24", optional = true }
-roaring = { version = "0.10", optional = true }
+roaring = { version = "0.10" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_norway = "0.9.42"
@@ -46,7 +46,7 @@ perf-stats = ["gossip-stdx/perf-stats", "scanner-engine/perf-stats"]
 stats = ["perf-stats"]
 git-perf = ["perf-stats", "scanner-engine/perf-counters"]
 bench = []
-rocksdb = ["dep:rocksdb", "dep:roaring"]
+rocksdb = ["dep:rocksdb"]
 stdx-proptest = []
 sim-harness = ["scanner-scheduler/sim-harness"]
 aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]

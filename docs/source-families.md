@@ -114,6 +114,10 @@ emits one terminal page when the carried `RepoKey` is inside the assigned shard
 and otherwise relies on the ordered key boundary for replay-safe completion.
 The discovery runtime path is not yet wired; `GitRepoRuntime::execute_discovery`
 currently returns a not-implemented error.
+`gossip-scanner-runtime/src/git_persistence.rs` defines the runtime-owned
+adapter that satisfies `scanner-git`'s ref-watermark, seen-blob, and finalize
+persistence seams and maps complete inner finalizes onto the shared
+repo-frontier receipt/checkpoint path.
 
 ---
 
@@ -162,6 +166,7 @@ and `types.rs`.
 | `crates/gossip-orchestrator/src/test_support.rs` | Shared test fixtures for orchestrator unit tests |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_discovery.rs` | Static single-target Git repository discovery source |
+| `crates/gossip-scanner-runtime/src/git_persistence.rs` | Runtime-backed Git persistence adapters and repo-frontier receipt helpers |
 | `crates/gossip-scanner-runtime/src/git_mirror.rs` | Worker-local Git mirror lifecycle and deterministic mirror-cache naming |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |

@@ -33,7 +33,7 @@
 //! | `bc\0` | blob_ctx      | Canonical context per scanned blob  |
 //! | `fn\0` | finding       | Individual finding records          |
 //! | `sb\0` | seen_blob     | Finalize delta for the seen bitmap  |
-//! | `ss\0` | seen_staging  | Spill-stage seen bitmap (rocksdb only) |
+//! | `ss\0` | seen_staging  | Spill-stage seen bitmap staging         |
 //!
 //! Watermark keys use the `rw` prefix from `watermark_keys`.
 
@@ -62,7 +62,6 @@ pub(crate) const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
 /// Spill-stage deltas are written here and folded into the live `sb\0`
 /// key only during `commit_finalize`. On crash, staging keys are orphaned
 /// and cleaned up on the next store open.
-#[cfg(feature = "rocksdb")]
 pub(crate) const NS_SEEN_STAGING: [u8; 3] = *b"ss\0";
 
 // Compile-time: verify namespace lexicographic ordering.
@@ -70,7 +69,6 @@ const _: () = {
     assert!(NS_BLOB_CTX[0] < NS_FINDING[0]);
     assert!(NS_FINDING[0] < NS_SEEN_BLOB[0]);
 };
-#[cfg(feature = "rocksdb")]
 const _: () = {
     // Staging namespace shares the first byte with the live namespace;
     // ordering is determined by the second byte (`b` < `s`).
@@ -239,7 +237,6 @@ fn ref_wm_key_len(ref_name: &[u8]) -> usize {
 /// Byte length of the fixed-width seen-bitmap scope key.
 const SEEN_SCOPE_KEY_LEN: usize = 43;
 /// Byte length of the fixed-width seen-bitmap staging key (same layout).
-#[cfg(feature = "rocksdb")]
 const SEEN_STAGING_KEY_LEN: usize = 43;
 
 /// Builds a key for blob-keyed namespaces.
@@ -262,7 +259,7 @@ pub(crate) fn build_blob_key(
 }
 
 /// Builds the scope key for the seen bitmap.
-pub(crate) fn build_seen_scope_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
+pub fn build_seen_scope_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
     let mut key = Vec::with_capacity(SEEN_SCOPE_KEY_LEN);
     key.extend_from_slice(&NS_SEEN_BLOB);
     key.extend_from_slice(&repo_id.to_be_bytes());
@@ -275,8 +272,7 @@ pub(crate) fn build_seen_scope_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<
 ///
 /// Same layout as the live scope key but under the `ss\0` namespace.
 /// Spill writes go here; `commit_finalize` folds into the live key.
-#[cfg(feature = "rocksdb")]
-pub(crate) fn build_seen_staging_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
+pub fn build_seen_staging_key(repo_id: u64, policy_hash: &[u8; 32]) -> Vec<u8> {
     let mut key = Vec::with_capacity(SEEN_STAGING_KEY_LEN);
     key.extend_from_slice(&NS_SEEN_STAGING);
     key.extend_from_slice(&repo_id.to_be_bytes());
@@ -311,7 +307,7 @@ fn build_finding_key(
 }
 
 /// Builds a ref watermark key (null-terminated ref name for prefix scans).
-pub(crate) fn build_ref_wm_key(
+pub fn build_ref_wm_key(
     repo_id: u64,
     policy_hash: &[u8; 32],
     start_set_id: &StartSetId,

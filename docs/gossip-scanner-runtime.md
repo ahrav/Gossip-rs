@@ -13,6 +13,7 @@
   and coordination-recorder types
 - local filesystem and git execution through family-oriented runtime modules
 - contract-level mirror-backed Git execution via a concrete repo executor adapter
+- runtime-backed Git persistence adapters and repo-frontier durability helpers
 - distributed runtime worker-loop support: `WorkerIdentity`, concrete shard
   leases, direct coordination claim/complete helpers, persistence handles,
   runtime configuration, run reports, and error layering
@@ -39,6 +40,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
 | `src/git_executor.rs` | Contract-level adapter that implements `GitRepoExecutor` for mirror-backed repo scans by translating `GitSelection` + `GitExecutionLimits` into `scanner-git` config and reusing the shared runtime runner |
+| `src/git_persistence.rs` | Runtime-backed adapters for `scanner-git` watermark/seen/finalize seams plus repo-frontier receipt/checkpoint helpers for durable Git execution |
 | `src/git_mirror.rs` | Worker-local Git mirror lifecycle, deterministic cache-path derivation, and stale control-file cleanup |
 | `src/git_repo.rs` | Git-repository local scan execution and generic-family marker types |
 | `src/ordered_content.rs` | Ordered-content page validation, explicit terminal page / exhausted-empty outcomes, scan-miss execution, and direct local filesystem execution helpers |
@@ -132,6 +134,12 @@ library APIs but are not wired into the live dispatcher.
 Git scans build the same runtime engine family, bridge git/core events
 through owned channel forwarding, invoke `run_git_scan`, and convert the
 git report into the local `ScanReport` plus optional debug output.
+When the caller owns durable Git state, `git_persistence::GitPersistenceAdapter`
+implements `scanner-git`'s ref-watermark, seen-blob, and finalize seams and
+plugs into `git_repo::run_runtime_git_scan_with_stores`. A complete finalize
+can then be mapped onto the existing repo-frontier `UnitCommitReceipt` and
+`CheckpointAggregatorInput` path without inventing a Git-only outer receipt
+stack.
 
 The distributed module exports the concrete worker-loop types and helpers:
 `WorkerIdentity`, `ShardLease`, `DistributedPersistence`,
