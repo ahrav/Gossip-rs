@@ -114,18 +114,19 @@ impl ScannerGitExecutor {
             let event_forwarder = scope.spawn(move || forward_git_events(sink.as_ref(), event_rx));
 
             let git_sink: Arc<dyn scanner_git::EventSink> =
-                Arc::new(ChannelEventOutput::new(event_tx));
+                Arc::new(ChannelEventOutput::new(event_tx.clone()));
             let execution = run_scan(mirror.path(), Arc::clone(&self.engine), &git_cfg, git_sink);
 
+            // Close our sender handle so the forwarder sees EOF regardless
+            // of whether run_scan retained an Arc clone of the event sink.
+            drop(event_tx);
+
             // Check the scan result first so the root-cause error is not
-            // masked by a downstream forwarder failure.  The sender is
-            // already dropped (moved into `ChannelEventOutput`, which was
-            // consumed by `run_scan`), so the forwarder will drain and exit
-            // when the scoped thread joins at scope exit.
+            // masked by a downstream forwarder failure.
             let execution = execution.map_err(|error| classify_scan_error(error, mirror.path()))?;
             join_scoped(event_forwarder, "git event forwarder thread").map_err(|error| {
-                GitRunError::retryable(format!(
-                    "git event forwarder failed for '{}': {error}",
+                GitRunError::permanent(format!(
+                    "git event forwarder panicked for '{}': {error}",
                     digest_repo_path(mirror.path())
                 ))
             })?;
@@ -223,10 +224,17 @@ fn maybe_log_debug_output(
 
 /// Classify one scanner-git failure onto the repo-executor error boundary.
 ///
-/// Repo-open and selection-shape failures are treated as permanent input or
-/// configuration errors. Concurrent maintenance remains retryable, and the
-/// remaining pipeline-stage failures stay retryable so callers can recover by
-/// refreshing the mirror or retrying later.
+/// Four categories:
+/// - Concurrent maintenance: retryable, a mirror refresh resolves it.
+/// - Configuration / input errors (repo-open, unsupported mode, resource
+///   limit, empty start set): permanent, no retry will help.
+/// - Repository corruption (MIDX, pack plan, commit plan, tree diff,
+///   artifact-build failures): permanent, on-disk data is structurally invalid.
+/// - Transient I/O (general I/O, persist, pack exec/IO, spill, artifact
+///   I/O): retryable, a mirror refresh or retry may succeed.
+///
+/// Unknown future `ArtifactAcquireError` variants default to permanent until
+/// explicitly classified.
 fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
     let repo = digest_repo_path(mirror_path);
     match err {
@@ -298,6 +306,11 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
         // ArtifactAcquireError is #[non_exhaustive]; treat unknown future
         // variants as permanent until explicitly classified.
         GitScanError::ArtifactAcquire(error) => {
+            tracing::warn!(
+                repo = %repo,
+                %error,
+                "unclassified artifact-acquire error variant defaulting to permanent"
+            );
             GitRunError::permanent(format!("git repo execution failed for '{repo}': {error}"))
         }
     }
@@ -547,6 +560,52 @@ mod tests {
         GitScanError::TreeDiff(scanner_git::TreeDiffError::TreeNotFound),
         ErrorClass::Permanent
     )]
+    #[case(
+        GitScanError::Midx(scanner_git::midx_error::MidxError::MidxCorrupt {
+            detail: "bad header",
+        }),
+        ErrorClass::Permanent
+    )]
+    #[case(
+        GitScanError::PackPlan(scanner_git::PackPlanError::PackIdOutOfRange {
+            pack_id: 0,
+            pack_count: 0,
+        }),
+        ErrorClass::Permanent
+    )]
+    // Artifact acquisition sub-errors indicating corruption — permanent.
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::MidxBuild(
+            scanner_git::MidxBuildError::NoPacksFound
+        )),
+        ErrorClass::Permanent
+    )]
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::MidxParse(
+            scanner_git::midx_error::MidxError::MidxCorrupt { detail: "bad fanout" }
+        )),
+        ErrorClass::Permanent
+    )]
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::CommitLoad(
+            scanner_git::CommitLoadError::TooManyCommits { count: 1, limit: 0 }
+        )),
+        ErrorClass::Permanent
+    )]
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::CommitGraphBuild(
+            scanner_git::CommitPlanError::CommitGraphOpen {
+                reason: "corrupt graph".to_owned(),
+            }
+        )),
+        ErrorClass::Permanent
+    )]
+    #[case(
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::RepoOpen(
+            RepoOpenError::NotARepository
+        )),
+        ErrorClass::Permanent
+    )]
     // Transient I/O — retryable.
     #[case(
         GitScanError::Io(std::io::Error::other("temporary I/O failure")),
@@ -554,6 +613,20 @@ mod tests {
     )]
     #[case(
         GitScanError::PackExec(scanner_git::PackExecError::PackRead("read error".to_owned())),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::Spill(scanner_git::SpillError::Io(std::io::Error::other("spill I/O"))),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::PackIo(scanner_git::PackIoError::Io(std::io::Error::other("pack read"))),
+        ErrorClass::Retryable
+    )]
+    #[case(
+        GitScanError::Persist(scanner_git::PersistError::Io(std::io::Error::other(
+            "write fail"
+        ))),
         ErrorClass::Retryable
     )]
     #[case(

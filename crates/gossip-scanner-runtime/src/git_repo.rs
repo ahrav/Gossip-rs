@@ -90,6 +90,16 @@ pub(crate) struct GitRunExecution {
     pub(crate) scan_elapsed: Duration,
 }
 
+impl GitRunExecution {
+    /// Pair a completed scan result with its wall-clock elapsed time.
+    pub(crate) fn new(result: GitScanResult, scan_elapsed: Duration) -> Self {
+        Self {
+            result,
+            scan_elapsed,
+        }
+    }
+}
+
 /// Run a full Git object scan against a local repository.
 ///
 /// This is the primary scan path for Git sources. It builds a detection engine,
@@ -256,10 +266,7 @@ pub(crate) fn run_runtime_git_scan(
         git_sink,
     )?;
 
-    Ok(GitRunExecution {
-        result,
-        scan_elapsed: scan_start.elapsed(),
-    })
+    Ok(GitRunExecution::new(result, scan_start.elapsed()))
 }
 
 /// Map a contract-level [`GitRefSelection`] to the scanner-level
@@ -309,10 +316,7 @@ pub(crate) fn resolve_scan_ns(
 
 /// Map `scanner_git` metrics into the crate-level [`ScanReport`].
 ///
-/// Prefers the scanner's own stage-level `scan` timing when available. Falls
-/// back to `scan_elapsed` (wall-clock measurement from the runtime) when the
-/// scanner did not record stage timing, which can happen with certain scan
-/// modes that bypass the stage-nanos pipeline.
+/// Scan duration is resolved by [`resolve_scan_ns`].
 ///
 /// Git scans have no persistence layer, so `dropped_findings`,
 /// `persist_emit_failures`, `persist_incomplete`, and `persist_ns` are zeroed.
