@@ -142,10 +142,10 @@ The canonical identity tuple is:
 
 ### Reduced matrix and CI gate
 
-The parity gate is currently **deferred**, not live. `crates/scanner-engine-integration-tests/tests/integration/main.rs`
-keeps `execution_mode_parity` commented out, so there is no checked-in `execution_mode_parity.rs`
-module and no CI job named `execution-mode-parity` on current HEAD.
-When that gate is restored, the intended reduced matrix covers:
+The parity gate is **deferred**. In `crates/scanner-engine-integration-tests/tests/integration/main.rs`,
+`execution_mode_parity` is commented out; there is no checked-in `execution_mode_parity.rs`
+module and no `execution-mode-parity` CI job.
+The intended reduced matrix for parity-gate enablement covers:
 - FS flat fixture
 - FS nested fixture
 - Git linear history fixture
@@ -163,7 +163,7 @@ a sustained-green gate script (separate implementation).
 
 ```bash
 # Planned local invocation once the deferred parity gate is restored
-cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+cargo test --features integration-tests --test integration execution_mode_parity -- --nocapture
 
 # Planned tuning knobs for that restored gate
 EXECUTION_MODE_PARITY_ITERS=9 \
