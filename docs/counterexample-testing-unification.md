@@ -440,7 +440,7 @@ structurally similar but invalid token, and has a clear expected outcome.
   for charset, length, and checksum boundary conditions.
 - Update golden baseline if new fixtures alter expected findings.
 
-### Proptest Strategies + Fuzz Target (Optional)
+### proptest Strategies + Fuzz Target (Optional)
 
 - Create `proptest` strategies that compose `MutOp` sequences.
 - Property: for any seed and op sequence, the output is deterministic.
