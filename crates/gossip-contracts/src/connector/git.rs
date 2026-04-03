@@ -304,7 +304,7 @@ impl fmt::Debug for RepoLocator {
                 .field("kind", &"LocalPath")
                 .field(
                     "path",
-                    &ToxicDigest::of_bytes(path.to_string_lossy().as_bytes()),
+                    &ToxicDigest::of_bytes(path.as_os_str().as_encoded_bytes()),
                 )
                 .finish(),
         }
@@ -604,7 +604,7 @@ impl fmt::Debug for LocalMirror {
         f.debug_struct("LocalMirror")
             .field(
                 "path",
-                &ToxicDigest::of_bytes(self.path.to_string_lossy().as_bytes()),
+                &ToxicDigest::of_bytes(self.path.as_os_str().as_encoded_bytes()),
             )
             .field("last_synced_at_ms", &self.last_synced_at_ms)
             .finish()
@@ -802,6 +802,13 @@ pub trait GitRepoDiscoverySource: Send {
 }
 
 /// Trait for acquiring or refreshing a local mirror suitable for Git execution.
+///
+/// Successful calls return a repository root that is ready for repo-native
+/// execution and populate [`LocalMirror::last_synced_at_ms`] with the wall
+/// clock used for that preparation step. Implementations should preserve
+/// permanent-versus-retryable classification on [`GitRunError`]: invalid
+/// locators and non-repositories are permanent, while transient mirror
+/// maintenance conflicts remain retryable.
 pub trait GitMirrorManager: Send {
     /// Acquire or refresh a local mirror for `locator`.
     fn sync_mirror(&mut self, locator: &RepoLocator) -> Result<LocalMirror, GitRunError>;

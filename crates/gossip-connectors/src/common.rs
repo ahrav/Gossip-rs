@@ -204,10 +204,10 @@ pub(crate) fn deadline_expired(deadline: Option<Instant>) -> bool {
 /// Returns `true` for I/O errors that are deterministically permanent.
 ///
 /// Structural filesystem errors — missing files, permission denials, type
-/// mismatches, and symlink loops — will not resolve on retry. Everything
-/// else (interrupted, would-block, connection-reset, etc.) is assumed
-/// transient and therefore retryable.
-pub(crate) fn is_permanent_io_error(err: &io::Error) -> bool {
+/// mismatches, read-only mounts, and symlink loops — will not resolve on
+/// retry. Everything else (interrupted, would-block, connection-reset, etc.)
+/// is assumed transient and therefore retryable.
+pub fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::NotFound
@@ -216,18 +216,19 @@ pub(crate) fn is_permanent_io_error(err: &io::Error) -> bool {
             | io::ErrorKind::InvalidFilename
             | io::ErrorKind::NotADirectory
             | io::ErrorKind::IsADirectory
+            | io::ErrorKind::ReadOnlyFilesystem
     ) || is_symlink_loop(err)
 }
 
 /// Detect `ELOOP` (too many levels of symbolic links) on Unix.
 #[cfg(unix)]
-pub(crate) fn is_symlink_loop(err: &io::Error) -> bool {
+pub fn is_symlink_loop(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ELOOP)
 }
 
 /// Non-Unix stub: symlink loops cannot be detected via `raw_os_error`.
 #[cfg(not(unix))]
-pub(crate) fn is_symlink_loop(_err: &io::Error) -> bool {
+pub fn is_symlink_loop(_err: &io::Error) -> bool {
     false
 }
 
@@ -437,6 +438,45 @@ mod borrowed_shard_bound_tests {
             err.message().contains("end"),
             "error should mention 'end': {}",
             err.message()
+        );
+    }
+}
+
+/// [`is_permanent_io_error`] treats structural filesystem failures
+/// (`PermissionDenied`, `NotFound`, `InvalidInput`, `ReadOnlyFilesystem`,
+/// etc.) as permanent — they will not resolve on retry. All other
+/// `ErrorKind` variants are transient.
+#[cfg(test)]
+mod is_permanent_io_error_tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::not_found(io::ErrorKind::NotFound)]
+    #[case::permission_denied(io::ErrorKind::PermissionDenied)]
+    #[case::invalid_input(io::ErrorKind::InvalidInput)]
+    #[case::invalid_filename(io::ErrorKind::InvalidFilename)]
+    #[case::not_a_directory(io::ErrorKind::NotADirectory)]
+    #[case::is_a_directory(io::ErrorKind::IsADirectory)]
+    #[case::read_only_filesystem(io::ErrorKind::ReadOnlyFilesystem)]
+    fn permanent_error_kinds(#[case] kind: io::ErrorKind) {
+        let err = io::Error::new(kind, "test");
+        assert!(
+            is_permanent_io_error(&err),
+            "{kind:?} should be classified as permanent"
+        );
+    }
+
+    #[rstest]
+    #[case::would_block(io::ErrorKind::WouldBlock)]
+    #[case::timed_out(io::ErrorKind::TimedOut)]
+    #[case::interrupted(io::ErrorKind::Interrupted)]
+    #[case::connection_reset(io::ErrorKind::ConnectionReset)]
+    fn transient_error_kinds(#[case] kind: io::ErrorKind) {
+        let err = io::Error::new(kind, "test");
+        assert!(
+            !is_permanent_io_error(&err),
+            "{kind:?} should be classified as transient"
         );
     }
 }
