@@ -7,7 +7,7 @@
 //!
 //! Mirror cache naming is defined independently from local-path validation so
 //! every locator kind has one bounded, redaction-safe filesystem layout. Cache
-//! paths use the `GIT_MIRROR_PATH_V1` hash domain and the layout
+//! paths use the [`MIRROR_PATH_HASHER`](gossip_contracts::identity::hashing::MIRROR_PATH_HASHER) and the layout
 //! `<mirror_root>/local/<prefix>/<digest>.git`, where `digest` is the
 //! 256-bit hash of the canonical `RepoKey` encoding (locator-kind tag followed
 //! by canonical repo path).
@@ -45,7 +45,13 @@ use scanner_git::{ArtifactStatus, PreflightError, PreflightLimits, preflight};
 
 use crate::git_repo::digest_repo_path as redacted_path_digest;
 
+/// Subdirectory under `mirror_root` for local-path locator mirrors.
+/// Each locator kind gets its own top-level subdirectory to avoid
+/// collisions between different key-derivation schemes.
 const MIRROR_LOCAL_LOCATOR_DIR: &str = "local";
+
+/// Control files older than this are considered abandoned by a dead or
+/// stuck process and will be cleaned up during manager construction.
 const DEFAULT_STALE_CONTROL_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// Concrete worker-local mirror manager for repo-native Git execution.
@@ -145,6 +151,12 @@ impl LocalMirrorManager {
         Ok(self.cache_path_for_repo_key(&repo_key))
     }
 
+    /// Run scanner-git preflight validation against a local-path locator.
+    ///
+    /// Preflight checks that the path is a valid Git repository, inspects
+    /// pack artifacts for maintenance state, and returns a report with the
+    /// canonical repo root and artifact status. Errors are classified into
+    /// permanent/retryable by [`classify_preflight_error`].
     fn preflight_local_repo(
         &self,
         locator: &RepoLocator,
@@ -155,13 +167,17 @@ impl LocalMirrorManager {
         }
     }
 
+    /// Validate a local-path repository and return it as a [`LocalMirror`].
+    ///
+    /// Local paths are validated in place (no clone/fetch). The only
+    /// blocking condition is active lock contention (`lock_present: true`
+    /// in the preflight report), which returns a retryable error. Missing
+    /// performance indexes (commit-graph, multi-pack-index) are tolerated
+    /// because they only affect traversal speed, not correctness.
     fn sync_local_path(&self, path: &Path) -> Result<LocalMirror, GitRunError> {
         let locator = RepoLocator::local_path(path);
         let report = self.preflight_local_repo(&locator)?;
 
-        // Only active lock contention blocks mirror sync. Missing performance
-        // indexes (commit-graph, multi-pack-index) degrade traversal speed but
-        // do not affect correctness, so repos without them are accepted.
         if matches!(
             report.status,
             ArtifactStatus::NeedsMaintenance {
@@ -178,10 +194,17 @@ impl LocalMirrorManager {
         )
     }
 
+    /// The `<mirror_root>/local/` directory that contains all hash-prefix
+    /// subdirectories for local-path locator mirrors.
     fn layout_root(&self) -> PathBuf {
         self.mirror_root.join(MIRROR_LOCAL_LOCATOR_DIR)
     }
 
+    /// Derive the deterministic on-disk path for a repo key.
+    ///
+    /// Layout: `<layout_root>/<4-char hex prefix>/<64-char hex digest>.git`.
+    /// The 4-character hex prefix distributes mirrors across ~65 536
+    /// buckets, keeping per-directory entry counts manageable.
     fn cache_path_for_repo_key(&self, repo_key: &RepoKey) -> PathBuf {
         let mut hasher = MIRROR_PATH_HASHER.clone();
         repo_key.as_bytes().write_canonical(&mut hasher);
@@ -191,6 +214,18 @@ impl LocalMirrorManager {
         self.layout_root().join(prefix).join(format!("{hex}.git"))
     }
 
+    /// Walk the layout directory tree and remove manager-owned control files
+    /// (`*.git.lock`, `*.git.initializing`) that are stale.
+    ///
+    /// A control file is considered stale when:
+    /// - its content cannot be parsed as `ControlFileMetadata`,
+    /// - its size exceeds [`MAX_CONTROL_FILE_BYTES`] (likely corrupt),
+    /// - the owning PID is no longer alive (Unix only), or
+    /// - it is older than `stale_control_age`.
+    ///
+    /// Only recurses one level deep (into 4-character hex prefix dirs),
+    /// never into `.git` mirror directories that may contain thousands of
+    /// Git-internal entries.
     fn cleanup_stale_control_files(&self) -> Result<(), GitRunError> {
         let layout_root = self.layout_root();
         let mut stack = vec![layout_root.clone()];
@@ -285,6 +320,9 @@ impl GitMirrorManager for LocalMirrorManager {
     }
 }
 
+/// Custom `Debug` that redacts the mirror-root filesystem path through
+/// [`ToxicDigest`](gossip_contracts::connector::ToxicDigest) to prevent
+/// leaking host-specific paths into logs.
 impl fmt::Debug for LocalMirrorManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalMirrorManager")
@@ -295,9 +333,16 @@ impl fmt::Debug for LocalMirrorManager {
     }
 }
 
+/// Metadata encoded in mirror control files (`*.git.lock`, `*.git.initializing`).
+///
+/// Wire format is `"{pid}:{created_at_ms}\n"` — a single ASCII line, typically
+/// ~25 bytes. Files exceeding [`MAX_CONTROL_FILE_BYTES`] or with unparseable
+/// content are treated as stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ControlFileMetadata {
+    /// OS process ID of the process that created the control file.
     pid: u32,
+    /// Epoch-millisecond timestamp when the control file was created.
     created_at_ms: u64,
 }
 
@@ -307,6 +352,11 @@ impl ControlFileMetadata {
         format!("{}:{}\n", self.pid, self.created_at_ms)
     }
 
+    /// Parse a control file's raw bytes into metadata.
+    ///
+    /// Returns `None` for any content that does not match the expected
+    /// `{pid}:{timestamp}` format, including non-UTF-8, missing colon,
+    /// non-numeric fields, zero PID, or multiple colons.
     fn decode(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?.trim();
         let (pid, created_at_ms) = text.split_once(':')?;
@@ -321,6 +371,12 @@ impl ControlFileMetadata {
     }
 }
 
+/// Build a [`RepoKey`] from a canonicalized local repository root.
+///
+/// The key uses the OS-encoded bytes of the path, matching the derivation
+/// in `NormalizedLocalRepoIdentity`. Errors are classified as permanent
+/// because a path that cannot produce a valid key will never succeed on
+/// retry.
 fn repo_key_for_local_root(canonical_repo_root: &Path) -> Result<RepoKey, GitRunError> {
     RepoKey::for_local_path(canonical_repo_root.as_os_str().as_encoded_bytes()).map_err(|err| {
         GitRunError::permanent(format!(
@@ -330,6 +386,11 @@ fn repo_key_for_local_root(canonical_repo_root: &Path) -> Result<RepoKey, GitRun
     })
 }
 
+/// Returns `true` when `path` names a manager-owned control file.
+///
+/// Only matches `*.git.lock` and `*.git.initializing` suffixes. This
+/// excludes Git's internal lock files (e.g. `HEAD.lock` inside a `.git`
+/// directory) which use different naming conventions.
 fn is_manager_control_file(path: &Path) -> bool {
     let Some(file_name) = path.file_name() else {
         return false;
@@ -342,6 +403,13 @@ fn is_manager_control_file(path: &Path) -> bool {
 /// anything larger is corrupt or adversarially placed.
 const MAX_CONTROL_FILE_BYTES: u64 = 256;
 
+/// Determine whether a control file should be removed.
+///
+/// Returns `true` (stale) when any of:
+/// - file exceeds [`MAX_CONTROL_FILE_BYTES`] (reject before reading body),
+/// - content cannot be decoded as [`ControlFileMetadata`],
+/// - owning PID is not alive (Unix: `kill(pid, 0)` probe),
+/// - file age exceeds `max_age`.
 fn control_file_is_stale(path: &Path, now_ms: u64, max_age: Duration) -> io::Result<bool> {
     // Reject oversized files before reading to avoid unbounded allocation.
     let metadata = fs::metadata(path)?;
@@ -357,6 +425,17 @@ fn control_file_is_stale(path: &Path, now_ms: u64, max_age: Duration) -> io::Res
     Ok(!pid_is_alive(metadata.pid) || now_ms.saturating_sub(metadata.created_at_ms) >= max_age_ms)
 }
 
+/// Check whether a process is still running using `kill(pid, 0)`.
+///
+/// Signal 0 does not deliver a signal; it only probes whether the process
+/// exists and the caller has permission to signal it. Returns `true` when
+/// the process exists (rc == 0) or when we lack permission to signal it
+/// (EPERM) — EPERM proves the process is alive but owned by another user.
+///
+/// # Safety
+///
+/// The `libc::kill` call with signal 0 is safe: it has no side effects
+/// beyond the return code / errno query.
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     let Ok(pid_i32) = i32::try_from(pid) else {
@@ -387,6 +466,21 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// Map a [`PreflightError`] onto the [`GitRunError`] boundary.
+///
+/// Classification policy:
+/// - **I/O and canonicalization**: delegated to [`classify_io_git_run_error`]
+///   which uses `is_permanent_io_error` to distinguish transient from
+///   structural filesystem failures.
+/// - **Structural repo problems** (not a repository, malformed gitdir,
+///   missing objects, oversized files): permanent. No retry will fix
+///   on-disk layout issues.
+/// - **Unknown variants** (`PreflightError` is `#[non_exhaustive]`):
+///   default to retryable. A false permanent classification silently drops
+///   repos, while a false retryable classification merely wastes one retry
+///   attempt.
+///
+/// All error messages use redacted path digests, never raw filesystem paths.
 fn classify_preflight_error(path: &Path, err: PreflightError) -> GitRunError {
     match err {
         PreflightError::Io(source) | PreflightError::Canonicalization(source) => {
@@ -442,6 +536,12 @@ fn classify_preflight_error(path: &Path, err: PreflightError) -> GitRunError {
     }
 }
 
+/// Classify a filesystem I/O error as permanent or retryable, with a
+/// redacted diagnostic message.
+///
+/// Uses `gossip_connectors::is_permanent_io_error` to distinguish
+/// structural errors (permission denied, not found for expected paths)
+/// from transient ones (interrupted, would-block, connection issues).
 fn classify_io_git_run_error(op: &str, path: &Path, err: &io::Error) -> GitRunError {
     let detail = match err.raw_os_error() {
         Some(code) => format!("kind={:?} raw_os_error={code}", err.kind()),

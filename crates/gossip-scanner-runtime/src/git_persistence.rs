@@ -1,19 +1,38 @@
 //! Git persistence adapters and repo-frontier durability helpers.
 //!
-//! `scanner-git` splits Git durability across several seams:
-//! ref-watermark loads, seen-blob queries, and finalize persistence. This
-//! module adapts those seams onto one runtime-owned backend so a later
-//! repo-frontier worker can:
+//! # Purpose
+//!
+//! `scanner-git` splits Git durability across several trait seams:
+//! [`SeenBlobStore`] for duplicate-OID queries, [`RefWatermarkStore`] for
+//! incremental-scan bookmarks, [`SeenBitmapPersister`] for spill-stage
+//! staging writes, and [`PersistenceStore`] for atomic finalize commits.
+//! This module unifies all four behind a single runtime-owned
+//! [`GitPersistenceBackend`] so a repo-frontier worker can:
 //!
 //! - load ref watermarks from durable state,
 //! - answer seen-blob queries from the committed seen-bitmap scope,
 //! - stage incremental seen deltas between finalize calls, and
 //! - convert a durably committed complete finalize into the shared
-//!   repo-frontier receipt/checkpoint path already used by the runtime.
+//!   repo-frontier receipt/checkpoint path consumed by the runtime.
 //!
-//! Complete finalizes may yield repo-frontier progress. Partial finalizes do
-//! not produce an outer receipt because their watermark ops are intentionally
-//! non-authoritative.
+//! # Seen-bitmap staging protocol
+//!
+//! Between finalize calls the scan pipeline spills processed OIDs through
+//! [`SeenBitmapPersister::persist_seen_delta`]. These land in a **staging
+//! key** that is invisible to [`SeenBlobStore::batch_check_seen`] — the
+//! query path reads only from the committed **scope key**. On a complete
+//! finalize, staging OIDs are merged into the scope key atomically (or in
+//! a crash-safe multi-phase write on non-atomic backends). On a partial
+//! finalize, staging OIDs are discarded because they may include blobs
+//! from skipped candidates.
+//!
+//! # Complete vs. partial finalizes
+//!
+//! Complete finalizes yield repo-frontier progress (a [`UnitCommitReceipt`]
+//! and [`CheckpointAggregatorInput`]). Partial finalizes commit data-ops
+//! seen deltas (genuinely scanned blobs) but suppress watermark advancement
+//! and outer checkpoint progress because their watermark state is
+//! intentionally non-authoritative.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -40,7 +59,11 @@ use crate::commit_model::{
     UnitCommitReceipt,
 };
 
-/// One backend operation applied by [`GitPersistenceBackend`].
+/// One backend operation applied by [`GitPersistenceBackend::apply_batch`].
+///
+/// Keys and values are opaque byte slices built by `scanner-git`'s
+/// finalize layer. Deterministic keys make `Put` and `Delete` idempotent,
+/// so replaying a batch after a crash is safe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitPersistenceOp {
     /// Store or overwrite the given value at `key`.
@@ -50,6 +73,9 @@ pub enum GitPersistenceOp {
 }
 
 impl GitPersistenceOp {
+    /// Convert a `scanner-git` [`WriteOp`] into a `Put` operation by cloning
+    /// the key and value. Used during finalize to translate scanner output
+    /// into backend-level operations.
     fn put_write_op(op: &WriteOp) -> Self {
         Self::Put {
             key: op.key.clone(),
@@ -108,15 +134,34 @@ pub enum GitRepoDurabilityError {
     KindMismatch(#[source] KindMismatchError),
 }
 
-/// Runtime adapter that satisfies `scanner-git` persistence traits.
+/// Runtime adapter that satisfies all four `scanner-git` persistence traits
+/// ([`SeenBlobStore`], [`RefWatermarkStore`], [`SeenBitmapPersister`], and
+/// [`PersistenceStore`]) by delegating to one [`GitPersistenceBackend`].
 ///
-/// The adapter keeps a lazily loaded cache of the committed seen-bitmap scope.
-/// Spill-stage `persist_seen_delta` writes go to a staging key and stay
-/// invisible to `batch_check_seen` until a complete finalize folds them into
-/// the live scope key.
+/// # Caching strategy
+///
+/// The adapter lazily loads the committed seen-bitmap from the backend on
+/// first `batch_check_seen` call and caches it for subsequent queries.
+/// Spill-stage `persist_seen_delta` writes target a separate staging key
+/// and accumulate in `staging_seen`; they remain invisible to
+/// `batch_check_seen` until a complete finalize merges them into the
+/// committed scope key.
+///
+/// # Single-writer constraint
 ///
 /// Access is single-threaded. `scanner-git` calls these methods on the scan
-/// thread before or after pack workers run, never concurrently.
+/// thread before or after pack workers run, never concurrently. At most one
+/// adapter instance may operate on a given `(repo_id, policy_hash)` scope
+/// because the staging bitmap read-modify-write in `persist_seen_delta` is
+/// not atomic across instances.
+///
+/// # Fields
+///
+/// - `seen_store`: cached committed scope bitmap (lazy-loaded from backend).
+/// - `staging_seen`: in-memory accumulator for spill-stage OIDs (written
+///   through to backend on each `persist_seen_delta`, merged into scope on
+///   complete finalize).
+/// - `finalizing`: re-entrancy guard for `commit_finalize`.
 #[derive(Debug)]
 pub struct GitPersistenceAdapter<B> {
     backend: B,
@@ -148,6 +193,12 @@ impl<B> GitPersistenceAdapter<B> {
     }
 
     /// Build the repo-frontier durable receipt for one already-committed finalize.
+    ///
+    /// Synthesizes the `CompletedUnit`, `CommitScope`, and `PageCommit`
+    /// chain that the runtime checkpoint path expects. The receipt records
+    /// zero findings (Git repos emit findings via the event sink, not via
+    /// the commit receipt) and exactly one done-ledger entry (the repo
+    /// itself).
     ///
     /// Complete finalizes yield a receipt. Partial finalizes return `None`
     /// because their watermark state is intentionally non-authoritative.
@@ -184,6 +235,9 @@ impl<B> GitPersistenceAdapter<B> {
 
     /// Build the outer repo-frontier checkpoint input for one already-committed finalize.
     ///
+    /// Wraps [`repo_frontier_receipt`](Self::repo_frontier_receipt) with a
+    /// [`CheckpointAggregatorInput`] that validates boundary-kind consistency.
+    ///
     /// Complete finalizes yield checkpoint input. Partial finalizes return
     /// `None` so outer progress remains unchanged.
     pub fn repo_frontier_checkpoint_input(
@@ -204,10 +258,15 @@ impl<B> GitPersistenceAdapter<B> {
             .map_err(GitRepoDurabilityError::KindMismatch)
     }
 
+    /// Backend key for the committed seen-bitmap (authoritative scope).
+    /// Queries in `batch_check_seen` read this key.
     fn seen_scope_key(&self) -> Vec<u8> {
         build_seen_scope_key(self.repo_id, &self.policy_hash)
     }
 
+    /// Backend key for the staging seen-bitmap (spill accumulator).
+    /// Written by `persist_seen_delta`, merged into the scope key on
+    /// complete finalize, deleted on both complete and partial finalize.
     fn seen_staging_key(&self) -> Vec<u8> {
         build_seen_staging_key(self.repo_id, &self.policy_hash)
     }
@@ -236,6 +295,11 @@ impl<B> GitPersistenceAdapter<B>
 where
     B: GitPersistenceBackend,
 {
+    /// Ensure the cached seen-store is populated and has the correct OID length.
+    ///
+    /// Reloads from the backend when the cache is empty or when the cached
+    /// bitmap's OID length does not match `oid_len` (which would indicate a
+    /// schema change between scan runs).
     fn load_seen_store(&self, oid_len: u8) -> Result<(), String> {
         let needs_load = self
             .seen_store
@@ -249,6 +313,9 @@ where
         Ok(())
     }
 
+    /// Cold-path: read and deserialize the committed scope bitmap from the
+    /// backend. Returns an empty bitmap when no scope key exists yet (first
+    /// scan of this repo/policy pair).
     fn load_seen_store_from_backend(&self, oid_len: u8) -> Result<RoaringSeenStore, String> {
         let scope_key = self.seen_scope_key();
         match self.backend.get(&scope_key) {
@@ -267,6 +334,27 @@ where
     }
 }
 
+/// Spill-stage persistence: accumulates processed OIDs in the staging bitmap.
+///
+/// Each call merges the supplied OIDs into a cached staging bitmap, then
+/// writes the merged result to the staging key. The staging bitmap is
+/// invisible to `batch_check_seen` and only folded into the committed scope
+/// on a complete finalize.
+///
+/// # Write-ahead caching
+///
+/// The merge is performed on a local clone of the cached bitmap. The cache
+/// is updated only after the backend write succeeds, so a failed
+/// `apply_batch` cannot leave stale (never-durably-staged) OIDs in memory.
+/// This prevents `commit_finalize` from folding phantom OIDs into the
+/// committed scope.
+///
+/// # Amortized cost
+///
+/// The staging bitmap is loaded from the backend on the first spill call,
+/// then cached for subsequent batches. This reduces aggregate I/O from
+/// O(N^2/B) (re-reading the growing bitmap per batch) to O(N) where N is
+/// total staged OIDs.
 impl<B> SeenBitmapPersister for GitPersistenceAdapter<B>
 where
     B: GitPersistenceBackend,
@@ -326,6 +414,18 @@ where
     }
 }
 
+/// Committed-scope queries: checks OIDs against the durable seen-bitmap only.
+///
+/// Staging OIDs are intentionally invisible here. The scan pipeline relies
+/// on this separation to avoid false positives from OIDs that may belong to
+/// skipped candidates (which would be discarded on partial finalize).
+///
+/// # Preconditions (debug-asserted)
+///
+/// - Must not be called during `commit_finalize` (the `finalizing` flag
+///   guards against this).
+/// - All OIDs must have the same byte length.
+/// - OIDs must be sorted in ascending order with no duplicates.
 impl<B> SeenBlobStore for GitPersistenceAdapter<B>
 where
     B: GitPersistenceBackend,
@@ -362,6 +462,15 @@ where
     }
 }
 
+/// Incremental-scan bookmark loading from the backend.
+///
+/// Watermark keys are scoped to `(repo_id, policy_hash, start_set_id, ref_name)`.
+/// The adapter validates that the caller's `repo_id` and `policy_hash` match
+/// the adapter's identity before issuing backend reads, because a mismatch
+/// would silently cross-pollinate watermarks between different scan scopes.
+///
+/// Returns one `Option<OidBytes>` per input ref name, preserving input order.
+/// `None` means no watermark exists for that ref (first scan or ref was pruned).
 impl<B> RefWatermarkStore for GitPersistenceAdapter<B>
 where
     B: GitPersistenceBackend,
@@ -425,6 +534,37 @@ where
     }
 }
 
+/// Atomic finalize commit: merges data ops, seen deltas, staging, and
+/// watermarks into durable state.
+///
+/// # Algorithm (high level)
+///
+/// 1. **Re-entrancy guard**: rejects concurrent `commit_finalize` calls via
+///    the `finalizing` flag (RAII-cleared on drop).
+/// 2. **Classify data ops**: separates seen-bitmap deltas (namespace
+///    `NS_SEEN_BLOB`) from non-seen data ops. Validates that any seen-bitmap
+///    op matches this adapter's scope key.
+/// 3. **Resolve staging**: takes the cached staging bitmap (populated by
+///    `persist_seen_delta`), falling back to a backend read for crash
+///    recovery when the cache is cold. On complete finalize, staging OIDs
+///    are merged into the seen set; on partial finalize, they are discarded.
+/// 4. **Merge seen bitmap**: loads the committed scope bitmap, merges all
+///    collected OIDs (from data ops and staging), serializes, and adds a
+///    `Put` for the scope key.
+/// 5. **Write phases**: either a single atomic batch (when the backend
+///    supports it) or a crash-safe multi-phase sequence:
+///    - Phase 1: data ops + merged seen scope key
+///    - Phase 2: delete staging key
+///    - Phase 3: watermark ops (complete finalize only)
+/// 6. **Cache update**: the seen-store cache is refreshed only after its
+///    corresponding backend write succeeds.
+///
+/// # Crash safety on non-atomic backends
+///
+/// Data and seen-bitmap writes land before watermarks. If a crash occurs
+/// between phases, the seen bitmap is already advanced but watermarks remain
+/// at the old position. The next scan re-walks the same commit range but
+/// skips already-seen blobs, producing no duplicate findings.
 impl<B> PersistenceStore for GitPersistenceAdapter<B>
 where
     B: GitPersistenceBackend,
@@ -469,6 +609,9 @@ where
         let seen_scope_key = self.seen_scope_key();
         let seen_staging_key = self.seen_staging_key();
         let seen_namespace = NS_SEEN_BLOB.as_slice();
+
+        // Step 2: partition data ops into non-seen ops (forwarded as-is)
+        // and seen-bitmap deltas (accumulated into `seen_oids` for merge).
         let mut first_phase_ops = Vec::with_capacity(output.data_ops.len() + 2);
         let mut seen_oids = Vec::new();
         for op in &output.data_ops {
@@ -1279,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn non_atomic_complete_finalize_with_seen_data_lands_in_two_batches() {
+    fn non_atomic_complete_finalize_with_staging_lands_in_four_batches() {
         let backend = TestBackend::non_atomic();
         let adapter = GitPersistenceAdapter::new(backend.clone(), 19, [0xEE; 32]);
         let oid = OidBytes::sha1([0xAA; 20]);

@@ -307,6 +307,14 @@ fn build_finding_key(
 }
 
 /// Builds a ref watermark key (null-terminated ref name for prefix scans).
+///
+/// # Panics (debug only)
+///
+/// Debug-asserts that `ref_name` contains no NUL bytes. Git ref names are
+/// NUL-terminated in the wire protocol and on-disk format, so embedded NULs
+/// are structurally impossible from well-formed repositories. The check
+/// catches programming errors during development without risking a
+/// process-wide panic in production on corrupt ref data.
 pub fn build_ref_wm_key(
     repo_id: u64,
     policy_hash: &[u8; 32],
@@ -314,7 +322,7 @@ pub fn build_ref_wm_key(
     ref_name: &[u8],
 ) -> Vec<u8> {
     // The null terminator keeps keys prefix-safe for ref name scans.
-    assert!(
+    debug_assert!(
         !ref_name.contains(&0),
         "ref_name must not contain null bytes"
     );
