@@ -1,4 +1,4 @@
-//! Seen-bitmap delta and RocksDB bitmap encoding helpers.
+//! Seen-bitmap delta and persisted bitmap encoding helpers.
 //!
 //! `SeenBitmapDelta` is the finalize-time payload: it carries the sorted OIDs
 //! that were scanned during the current finalize call. The persisted on-disk

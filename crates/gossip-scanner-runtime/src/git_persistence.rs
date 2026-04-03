@@ -1,6 +1,6 @@
 //! Git persistence adapters and repo-frontier durability helpers.
 //!
-//! `scanner-git` splits Git durability across three seams:
+//! `scanner-git` splits Git durability across several seams:
 //! ref-watermark loads, seen-blob queries, and finalize persistence. This
 //! module adapts those seams onto one runtime-owned backend so a later
 //! repo-frontier worker can:
@@ -407,11 +407,14 @@ where
         }
 
         let mut out = Vec::with_capacity(results.len());
-        for result in results {
+        for (i, result) in results.into_iter().enumerate() {
             match result {
                 Some(value) => {
-                    let decoded = decode_ref_watermark_value(value.as_ref()).ok_or_else(|| {
-                        RepoOpenError::io(io::Error::other("invalid watermark value encoding"))
+                    let decoded = decode_ref_watermark_value(&value).ok_or_else(|| {
+                        RepoOpenError::io(io::Error::other(format!(
+                            "invalid watermark value encoding for ref {i} ({} bytes)",
+                            value.len()
+                        )))
                     })?;
                     out.push(Some(decoded));
                 }
@@ -435,10 +438,11 @@ where
             }
         }
 
-        debug_assert!(
-            !self.finalizing.replace(true),
-            "re-entrant commit_finalize calls violate the single-writer invariant"
-        );
+        if self.finalizing.replace(true) {
+            return Err(PersistError::backend(
+                "re-entrant commit_finalize calls violate the single-writer invariant",
+            ));
+        }
         let _guard = FinalizingGuard(&self.finalizing);
 
         debug_assert!(
@@ -455,10 +459,12 @@ where
                 .all(|pair| pair[0].key <= pair[1].key),
             "watermark ops must be sorted by key"
         );
-        debug_assert!(
-            matches!(output.outcome, FinalizeOutcome::Complete) || output.watermark_ops.is_empty(),
-            "watermark ops present for partial outcome"
-        );
+        if !matches!(output.outcome, FinalizeOutcome::Complete) && !output.watermark_ops.is_empty()
+        {
+            return Err(PersistError::backend(
+                "watermark ops present for partial finalize outcome",
+            ));
+        }
 
         let seen_scope_key = self.seen_scope_key();
         let seen_staging_key = self.seen_staging_key();
@@ -559,7 +565,7 @@ where
             let mut all_ops = first_phase_ops;
             if has_staging {
                 all_ops.push(GitPersistenceOp::Delete {
-                    key: seen_staging_key.clone(),
+                    key: seen_staging_key,
                 });
             }
             all_ops.extend(watermark_ops);
@@ -578,6 +584,13 @@ where
         // key in a separate batch, then advance watermarks. The staging
         // delete is structurally after the scope-key write so a crash
         // between batches cannot lose staged OIDs.
+        //
+        // Recovery posture: if the watermark write fails, the seen bitmap
+        // is already durable and the in-memory cache reflects it. Callers
+        // that retry with a fresh adapter will re-load the advanced seen
+        // bitmap from the backend while watermarks remain at the old
+        // position. The next scan re-walks the same commit range but skips
+        // already-seen blobs, producing no duplicate findings.
         if !first_phase_ops.is_empty() {
             self.backend
                 .apply_batch(&first_phase_ops)
@@ -589,7 +602,7 @@ where
         if has_staging {
             self.backend
                 .apply_batch(&[GitPersistenceOp::Delete {
-                    key: seen_staging_key.clone(),
+                    key: seen_staging_key,
                 }])
                 .map_err(|err| PersistError::backend(err.to_string()))?;
         }
@@ -906,6 +919,45 @@ mod tests {
                 .expect("checkpoint input")
                 .is_none(),
             "partial finalize must not yield outer progress"
+        );
+    }
+
+    #[test]
+    fn partial_finalize_commits_data_ops_seen_deltas_but_discards_staging() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend, 30, [0x30; 32]);
+        let staged_oid = OidBytes::sha1([0x11; 20]);
+        let data_oid = OidBytes::sha1([0x22; 20]);
+
+        // Stage one OID via the spill path.
+        adapter.persist_seen_delta(&[staged_oid]).expect("stage");
+
+        // Partial finalize with a data_ops seen delta containing a different OID.
+        let delta = SeenBitmapDelta::from_oids(&[data_oid]).expect("delta");
+        let scope_key = build_seen_scope_key(30, &[0x30; 32]);
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: vec![WriteOp {
+                    key: scope_key,
+                    value: delta.serialize(),
+                }],
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect("partial finalize");
+
+        // data_ops OIDs are committed (they were genuinely scanned).
+        assert_eq!(
+            adapter.batch_check_seen(&[data_oid]).expect("data oid"),
+            vec![true],
+            "data_ops seen deltas are committed even on partial finalize"
+        );
+        // Staging OIDs are discarded (may include blobs from skipped candidates).
+        assert_eq!(
+            adapter.batch_check_seen(&[staged_oid]).expect("staged oid"),
+            vec![false],
+            "staging seen deltas are discarded on partial finalize"
         );
     }
 
