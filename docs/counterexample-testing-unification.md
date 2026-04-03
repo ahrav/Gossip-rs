@@ -239,13 +239,13 @@ fixtures are ever introduced:
 
 | Current Component       | Location                                                          | Purpose                      | Action             | Target                                                  | Rationale                                              |
 | ----------------------- | ----------------------------------------------------------------- | ---------------------------- | ------------------ | ------------------------------------------------------- | ------------------------------------------------------ |
-| `encode_secret()`       | `generator.rs`                                            | Dispatch raw→representation  | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent; reusable by git sim and real-rules |
-| `base64_encode_std()`   | `generator.rs`                                            | Base64 standard encoding     | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `percent_encode_all()`  | `generator.rs`                                            | URL percent encoding         | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `encode_utf16()`        | `generator.rs`                                            | UTF-16 LE/BE widening        | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `encode_nested()`       | `generator.rs`                                            | Alternating layer nesting    | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `hex_nibble()`          | `generator.rs`                                            | Nibble→hex helper            | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Dependency of `percent_encode_all`                     |
-| `SecretRepr`            | `scenario.rs`                                              | Encoding representation enum | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent type                                |
+| `encode_secret()`       | `generator.rs`                                            | Dispatch raw→representation  | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent; reusable by git sim and real-rules |
+| `base64_encode_std()`   | `generator.rs`                                            | Base64 standard encoding     | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `percent_encode_all()`  | `generator.rs`                                            | URL percent encoding         | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_utf16()`        | `generator.rs`                                            | UTF-16 LE/BE widening        | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_nested()`       | `generator.rs`                                            | Alternating layer nesting    | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `hex_nibble()`          | `generator.rs`                                            | Nibble→hex helper            | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Dependency of `percent_encode_all`                     |
+| `SecretRepr`            | `scenario.rs`                                              | Encoding representation enum | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent type                                |
 | `make_token()`          | `generator.rs`                                            | Rule prefix + random tail    | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Scanner-specific format (SIM{id}_...)                  |
 | `generate_scenario()`   | `sim_scanner/generator.rs`                                        | Full scanner scenario        | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Domain-specific orchestration                          |
 | `generate_scenario()`   | `sim_git_scan/generator.rs`                                       | Full git scenario            | **Keep**           | `crates/scanner-git/src/sim_git_scan/generator.rs`      | Domain-specific orchestration                          |
@@ -257,10 +257,10 @@ fixtures are ever introduced:
 | Git minimizer           | `sim_git_scan/minimize.rs`                            | Graph-aware shrink           | **Keep**           | `crates/scanner-git/src/sim_git_scan/minimize.rs`       | Graph-aware, git-specific                              |
 | Scanner corpus          | `crates/scanner-engine-integration-tests/tests/corpus/scanner/` (71 cases)                                | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
 | Git corpus              | `crates/scanner-engine-integration-tests/tests/corpus/git_scan/` (11 cases)                               | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
-| Near-miss operators     | `crates/scanner-scheduler/src/sim/mutation/op.rs`                 | Near-miss mutation ops       | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/op.rs`       | Core new capability                                    |
+| Near-miss operators     | `crates/scanner-scheduler/src/sim/mutation/op.rs`                 | Near-miss mutation ops       | **Done** | `crates/scanner-scheduler/src/sim/mutation/op.rs`       | Core new capability                                    |
 | Property tests          | `crates/scanner-engine-integration-tests/tests/property/` (20 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
 | Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in Phase 3                       |
-| Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (23 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
+| Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 scenario files + `main.rs` harness)      | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
 | Real-rules fixtures     | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in Phase 3                      |
 | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (29 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
 
@@ -397,7 +397,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ## 6. Phase-by-Phase Rollout
 
-### Phase 1: Extract Shared Mutation Core — **Completed**
+### Extract Shared Mutation Core — **Completed**
 
 - Created `crates/scanner-scheduler/src/sim/mutation/` as a submodule directory
   with 7 files:
@@ -424,7 +424,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 - All existing corpus artifacts and tests pass unchanged.
 - Acceptance: `cargo test --features sim-harness` passes with zero delta.
 
-### Phase 2: Integrate Near-Miss into Scanner Sim
+### Integrate Near-Miss into Scanner Sim
 
 - Add `near_miss_count: u32` field to `ScenarioGenConfig` (default 0).
 - Generator produces `MustNotFind`-disposition secrets using near-miss
@@ -433,7 +433,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 - New random sim seeds exercise near-miss scenarios.
 - Minimized failures added to corpus.
 
-### Phase 3: Augment Real-Rules Fixtures and Offline Validators
+### Augment Real-Rules Fixtures and Offline Validators
 
 - Generate near-miss fixtures for `crates/scanner-engine-integration-tests/tests/corpus/real_rules/fixtures/` using
   the mutation core. Commit as static files.
@@ -441,7 +441,7 @@ structurally similar but invalid token, and has a clear expected outcome.
   for charset, length, and checksum boundary conditions.
 - Update golden baseline if new fixtures alter expected findings.
 
-### Phase 4 (Optional): Proptest Strategies + Fuzz Target
+### Proptest Strategies + Fuzz Target (Optional)
 
 - Create `proptest` strategies that compose `MutOp` sequences.
 - Property: for any seed and op sequence, the output is deterministic.
@@ -449,7 +449,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 - New fuzz target: `fuzz_mutation_pipeline.rs` for coverage-guided mutation
   op sequence exploration.
 
-### Phase 5 (Optional, Future): LLM Fixture Generation Contract
+### LLM Fixture Generation Contract (Optional, Future)
 
 - Document the format for LLM-generated fixture files.
 - Provide a generation script that calls an LLM, serializes output, and
