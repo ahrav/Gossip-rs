@@ -723,10 +723,16 @@ where
             return Ok(());
         }
 
-        // Non-atomic path: write data+seen first, then delete the staging
-        // key in a separate batch, then advance watermarks. The staging
-        // delete is structurally after the scope-key write so a crash
-        // between batches cannot lose staged OIDs.
+        // Non-atomic path: write data+seen first, then advance watermarks.
+        //
+        // For complete finalize, the staging Delete is in a separate batch
+        // AFTER the seen scope Put so a crash between batches cannot lose
+        // staged OIDs (the scope key already contains them).
+        //
+        // For partial finalize, there is no seen scope Put — staging OIDs
+        // are discarded. The staging Delete goes in first_phase_ops (same
+        // batch as data ops) so a failed batch doesn't leave stale staging
+        // for a later complete run to fold.
         //
         // Recovery posture: if the watermark write fails, the seen bitmap
         // is already durable and the in-memory cache reflects it. Callers
@@ -734,6 +740,11 @@ where
         // bitmap from the backend while watermarks remain at the old
         // position. The next scan re-walks the same commit range but skips
         // already-seen blobs, producing no duplicate findings.
+        if has_staging && !is_complete {
+            first_phase_ops.push(GitPersistenceOp::Delete {
+                key: seen_staging_key.clone(),
+            });
+        }
         if !first_phase_ops.is_empty() {
             self.backend
                 .apply_batch(&first_phase_ops)
@@ -742,7 +753,7 @@ where
         if let Some(bitmap) = staged_bitmap {
             *self.seen_store.borrow_mut() = Some(RoaringSeenStore::new(bitmap));
         }
-        if has_staging {
+        if has_staging && is_complete {
             self.backend
                 .apply_batch(&[GitPersistenceOp::Delete {
                     key: seen_staging_key,
@@ -1310,6 +1321,45 @@ mod tests {
         assert!(
             backend.contains_key(&build_seen_scope_key(15, &[0xF0; 32])),
             "first-phase seen scope write must be durable"
+        );
+    }
+
+    #[test]
+    fn non_atomic_partial_finalize_does_not_leak_staging_into_later_complete() {
+        let backend = TestBackend::non_atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 25, [0x25; 32]);
+        let oid = OidBytes::sha1([0xCC; 20]);
+
+        // Stage an OID via the spill path.
+        adapter.persist_seen_delta(&[oid]).expect("stage");
+
+        // Partial finalize discards staging. On non-atomic backends, the
+        // staging Delete is in the same batch as data ops so a batch
+        // failure rolls back both together.
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Partial { skipped_count: 1 },
+                stats: Default::default(),
+            })
+            .expect("partial finalize");
+
+        // Staging must be gone — a subsequent complete finalize must not
+        // find stale staging to fold into the seen scope.
+        adapter
+            .commit_finalize(&FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: FinalizeOutcome::Complete,
+                stats: Default::default(),
+            })
+            .expect("complete finalize");
+
+        assert_eq!(
+            adapter.batch_check_seen(&[oid]).expect("check"),
+            vec![false],
+            "partial-discarded staging must not leak into a later complete finalize"
         );
     }
 

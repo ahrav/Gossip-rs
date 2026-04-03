@@ -307,14 +307,20 @@ fn classify_scan_error(err: GitScanError, mirror_path: &Path) -> GitRunError {
             // variants default to retryable — consistent with
             // classify_preflight_error — because a false permanent
             // classification silently drops repos.
-            let classified = matches!(
-                inner,
-                ArtifactAcquireError::MidxBuild(scanner_git::MidxBuildError::Io(_))
-                    | ArtifactAcquireError::RepoOpen(
-                        RepoOpenError::Io(_) | RepoOpenError::Canonicalization(_),
-                    )
-                    | ArtifactAcquireError::Io(_)
-            );
+            //
+            // Nested RepoOpen::Io and MidxBuild::Io use the same
+            // is_permanent_io_error check as the top-level RepoOpen arm
+            // so deterministic failures (PermissionDenied, InvalidInput)
+            // are not retried indefinitely.
+            let classified = match inner {
+                ArtifactAcquireError::MidxBuild(scanner_git::MidxBuildError::Io(e)) => {
+                    !is_permanent_io_error(e)
+                }
+                ArtifactAcquireError::RepoOpen(RepoOpenError::Io(e)) => !is_permanent_io_error(e),
+                ArtifactAcquireError::RepoOpen(RepoOpenError::Canonicalization(_)) => true,
+                ArtifactAcquireError::Io(_) => true,
+                _ => false,
+            };
             let known_permanent = matches!(
                 inner,
                 ArtifactAcquireError::ConcurrentMaintenance
