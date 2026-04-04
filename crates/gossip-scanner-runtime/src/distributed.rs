@@ -6162,6 +6162,71 @@ mod tests {
         );
     }
 
+    /// A shard whose key range excludes the payload repo key is rejected
+    /// with a `Runtime(Driver)` error rather than silently completing as
+    /// exhausted-empty.
+    #[test]
+    fn run_git_repo_worker_rejects_out_of_bounds_payload_repo_key() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+
+        // Build a shard whose range starts PAST the repo key so the payload
+        // target falls outside the shard bounds.
+        let repo_key = git_repo_key(repo.path());
+        let start = successor_bytes(repo_key.as_bytes());
+        let end = successor_bytes(&start);
+        let payload = git_payload(repo.path());
+
+        let mut coordinator = CoordinationInMemoryCoordinator::new(30_000);
+        let now = wall_clock_now();
+        coordinator
+            .create_run(now, tenant(), run(), test_run_config(30_000))
+            .expect("create run");
+
+        let mut scratch = ShardSpecScratch::new();
+        let spec_ref =
+            range_shard_ref(&start, &end, &payload, &mut scratch).expect("git range shard spec");
+        let shard_spec = ShardSpec::try_from_ref(spec_ref).expect("owned git shard spec");
+        let shards = [InitialShardInput::new(
+            ShardId::from_raw(1),
+            shard_spec.as_ref(),
+            CoordCursorUpdate::initial(),
+        )];
+        let _ = coordinator
+            .register_shards(now, tenant(), run(), &shards, OpId::from_raw(1))
+            .expect("register shards");
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend.clone(),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("out-of-bounds payload repo key must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(_))
+            ),
+            "expected Runtime(Driver), got: {err}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside shard bounds"),
+            "error should mention shard bounds: {msg}"
+        );
+
+        assert_eq!(
+            backend.batch_call_count(),
+            0,
+            "no persistence writes should occur for out-of-bounds shards"
+        );
+    }
+
     /// The repo-key guard at the discovery boundary passes for a correctly
     /// configured singleton shard where the discovered target matches the
     /// payload's repo key.
