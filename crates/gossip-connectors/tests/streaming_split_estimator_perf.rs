@@ -35,9 +35,9 @@ fn observe_allocation_upper_bound(sample_cap: usize, count: usize) -> u64 {
     (sample_cap as u64) * phases
 }
 
+// Verifies that the fixed-size streaming workload keeps allocator traffic
+// sublinear while still producing a split for one million observations.
 #[test]
-/// Verifies that the fixed-size streaming workload keeps allocator traffic
-/// sublinear while still producing a split for one million observations.
 fn observe_one_million_items_allocates_sublinearly() {
     let sample_cap = 128usize;
     let count = 1_000_000usize;
