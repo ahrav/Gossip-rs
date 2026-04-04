@@ -126,14 +126,15 @@ enum IndexState {
 ///   `key` in byte-lexicographic order, and never mutated again.
 /// - `repo` is validated once during indexing; a missing or non-directory
 ///   path latches a permanent failure.
-/// - When `emit_tokens` is true, cursors carry an 8-byte big-endian
-///   absolute index that enables O(1) resume. Token validity is always
-///   cross-checked against the last emitted key.
+/// - `emit_tokens` controls the advertised `token_resume` capability. Cursor
+///   resume is currently still `last_key`-authoritative over the frozen
+///   in-memory snapshot.
 pub struct GitConnector {
     /// Absolute path to the repository root (working directory).
     repo: PathBuf,
-    /// Whether pagination cursors include positional tokens for O(1)
-    /// resume. Defaults to `true`; set to `false` for key-only cursors.
+    /// Whether [`caps`](Self::caps) advertises `token_resume`. Defaults to
+    /// `true`; the current implementation still resumes from `Cursor::last_key`
+    /// in either mode.
     emit_tokens: bool,
     /// Optional upper bound on tracked files. When set, `ensure_indexed`
     /// rejects repositories that exceed this limit with a permanent error.
@@ -169,12 +170,11 @@ impl GitConnector {
         }
     }
 
-    /// Enable or disable pagination token emission and consumption.
+    /// Enable or disable advertising opaque token resume support.
     ///
-    /// When enabled, cursors may carry an 8-byte absolute index token that
-    /// allows O(1) resume after the caller proves it is still aligned with the
-    /// last emitted key. Disabling tokens forces key-only resume, which is more
-    /// portable across snapshots but requires binary-search recovery.
+    /// This toggles only the `token_resume` flag returned by
+    /// [`caps`](Self::caps). GitConnector resume remains `last_key`-based over
+    /// the indexed snapshot regardless of this setting.
     #[must_use]
     pub fn with_tokens(mut self, enabled: bool) -> Self {
         self.emit_tokens = enabled;
