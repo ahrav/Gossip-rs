@@ -535,15 +535,22 @@ graph TB
 
 ```rust
 pub struct Chunk {
-    pub file_id: FileId,
-    pub base_offset: u64,    // File offset where chunk starts
-    pub len: u32,            // Total bytes (prefix + payload)
-    pub prefix_len: u32,     // Overlap bytes from previous chunk
-    pub buf: BufferHandle,   // Owned buffer handle
-    pub buf_offset: u32,     // Start offset into buf where chunk data begins
+    file_id: FileId,
+    base_offset: u64,    // File offset where chunk starts
+    len: u32,            // Total bytes (prefix + payload)
+    prefix_len: u32,     // Overlap bytes from previous chunk
+    buf: BufferHandle,   // Owned buffer handle
+    buf_offset: u32,     // Start offset into buf where chunk data begins
 }
 
 impl Chunk {
+    pub fn file_id(&self) -> FileId { self.file_id }
+    pub fn base_offset(&self) -> u64 { self.base_offset }
+    pub fn total_len(&self) -> u32 { self.len }
+    pub fn prefix_len(&self) -> u32 { self.prefix_len }
+    pub fn buf(&self) -> &BufferHandle { &self.buf }
+    pub fn buf_offset(&self) -> u32 { self.buf_offset }
+
     // Full data including overlap prefix
     pub fn data(&self) -> &[u8] {
         let start = self.buf_offset as usize;
