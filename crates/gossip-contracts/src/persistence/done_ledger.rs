@@ -226,6 +226,30 @@ impl DoneLedgerStatus {
         matches!(self, Self::ScannedClean | Self::ScannedWithFindings)
     }
 
+    /// Returns `true` when the item no longer needs a rescan for this
+    /// `(tenant, policy, object-version)` scope.
+    ///
+    /// Terminal here means "the done-ledger can suppress future scans":
+    /// `ScannedClean`, `ScannedWithFindings`, `FailedPermanent`, and `Skipped`
+    /// all qualify. `FailedRetryable` remains non-terminal because the item is
+    /// still eligible for a later retry.
+    ///
+    /// This is distinct from coordination-layer terminal state. A shard can be
+    /// terminal because it has no further lifecycle transitions, while a
+    /// done-ledger row is terminal because no additional scan attempt is
+    /// required for the current scope.
+    #[inline]
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        match self {
+            Self::FailedRetryable => false,
+            Self::FailedPermanent
+            | Self::Skipped
+            | Self::ScannedClean
+            | Self::ScannedWithFindings => true,
+        }
+    }
+
     /// Returns `true` for failure states (`FailedRetryable` or `FailedPermanent`).
     #[inline]
     #[must_use]
@@ -786,6 +810,26 @@ pub trait DoneLedger: Send + Sync {
         policy_hash: PolicyHash,
         ovid_hashes: &[OvidHash],
     ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error>;
+
+    /// Enumerate all [`OvidHash`] keys in one tenant+policy scope whose
+    /// durable status is terminal.
+    ///
+    /// This is a COLD-tier operation used to bulk-load a probabilistic
+    /// prefilter. Backends may return keys in any order. Implementations must
+    /// exclude `FailedRetryable` rows because those items remain eligible for
+    /// a retry and cannot be suppressed by the filter.
+    ///
+    /// Backends that cannot enumerate efficiently may return `Ok(Vec::new())`.
+    /// A stale or empty prefilter only causes extra persistence lookups; it
+    /// never causes an incorrect scan skip.
+    fn list_done_hashes(
+        &self,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+    ) -> Result<Vec<OvidHash>, Self::Error> {
+        let _ = (tenant_id, policy_hash);
+        Ok(Vec::new())
+    }
 
     /// Submit a batch of done-ledger records for durable upsert, applying
     /// monotonic merge semantics for any keys that already exist.
