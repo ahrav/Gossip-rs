@@ -12,7 +12,7 @@ crates/scanner-engine-integration-tests/
   src/lib.rs                          # Marker crate (no library code)
   tests/
     chunked_file_scans.rs             # Standalone: overlap + transform provenance
-    integration/                      # ~162 tests: cross-crate integration
+    integration/                      # ~171 tests: cross-crate integration
     property/                         # ~100 tests + ~30 proptest cases
     simulation/                       # ~41 tests: deterministic sim replay
       corpus/                         # Scheduler simulation replay artifacts
@@ -34,7 +34,7 @@ Each category is a separate test binary gated behind a Cargo feature:
 
 | Binary          | Path                       | Feature Gate         | Tests |
 | --------------- | -------------------------- | -------------------- | ----: |
-| `integration`   | `tests/integration/main.rs`| `integration-tests`  |  ~162 |
+| `integration`   | `tests/integration/main.rs`| `integration-tests`  |  ~171 |
 | `property`      | `tests/property/main.rs`   | `property-tests`     |  ~130 |
 | `simulation`    | `tests/simulation/main.rs` | various (see below)  |   ~41 |
 | `diagnostic`    | `tests/diagnostic/main.rs` | `diagnostic-tests`   |     2 |
@@ -108,7 +108,7 @@ scanner-git boundaries.
 | `bench_guards`             |     0 | Guards against benchmark execution without the benchmark feature gate (no active tests) |
 | `binary_awareness`         |    10 | Binary file detection                              |
 | `finding_json`             |     4 | JSONL finding parsing helpers used by integration assertions |
-| `git_commit_walk`          |     6 | Commit graph traversal                             |
+| `git_commit_walk`          |     8 | Commit graph traversal                             |
 | `git_engine_adapter`       |     1 | Git-to-engine adapter                              |
 | `git_inmem_artifacts`      |    13 | In-memory git artifact handling                    |
 | `git_mapping_bridge`       |     3 | MIDX mapping bridge                                |
@@ -120,8 +120,8 @@ scanner-git boundaries.
 | `git_preflight`            |     4 | Git preflight checks                               |
 | `git_repo_open`            |     4 | Repository opening                                 |
 | `git_run_format`           |     1 | Run format validation                              |
-| `git_scan_validation`      |    10 | Git scan validation                                |
-| `git_seen_unique`          |     2 | Deduplication of seen objects                      |
+| `git_scan_validation`      |    15 | Git scan validation                                |
+| `git_seen_unique`          |     4 | Deduplication of seen objects                      |
 | `git_snapshot`             |     1 | Snapshot testing                                   |
 | `git_tree_diff`            |    10 | Tree diff computation                              |
 | `manual_anchors`           |     3 | Manual anchor specification                        |
@@ -222,8 +222,12 @@ All dependencies are dev-only (this crate has no library code):
 | `gossip-stdx`      | Shared data structures                         |
 | `proptest`         | Property-based testing framework               |
 | `base64`           | Transform test support                         |
+| `blake3`           | Stable hashing in archive and simulation assertions |
 | `flate2`           | Gzip compression for archive tests             |
+| `gix-commitgraph`  | Commit-graph positions and fixtures for git walk tests |
 | `zip`              | ZIP archive creation (deflate only)            |
 | `crc32fast`        | CRC32 for synthetic ZIP archives               |
+| `memchr`           | Fast byte-substring checks in regex anchor property tests |
+| `regex`            | Byte-regex construction for scanner and git integration fixtures |
 | `tempfile`         | Temporary files for integration tests          |
 | `serde` / `serde_json` | Corpus JSON parsing                       |
