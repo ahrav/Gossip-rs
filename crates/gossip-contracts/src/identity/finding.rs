@@ -56,8 +56,9 @@
 //!
 //! # Invariants
 //!
-//! - **Collision Resistance:** All derived identities guarantee cryptographic
-//!   collision resistance. Different inputs MUST produce different IDs.
+//! - **Collision Resistance:** All derived identities rely on cryptographic
+//!   collision resistance. Different inputs SHOULD produce different IDs,
+//!   except with cryptographically negligible probability.
 //! - **Determinism:** Identities are derived deterministically. Same inputs MUST
 //!   always yield the same output ID.
 //!
