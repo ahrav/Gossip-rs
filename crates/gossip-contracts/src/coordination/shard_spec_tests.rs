@@ -611,9 +611,10 @@ proptest! {
     }
 }
 
-/// Creates a constrained `ShardArena` for testing allocation limits.
+/// Creates a `ShardArena` with caller-specified slot and byte capacity.
 ///
-/// Ensures tests can predictably trigger slab capacity exhaustion and handle lifecycle events.
+/// Small capacities make slot exhaustion, slab exhaustion, and handle
+/// lifecycle transitions reachable with deterministic inputs.
 fn test_arena(slots: usize, bytes: usize) -> ShardArena {
     ShardArena::with_capacity(slots, bytes)
 }
