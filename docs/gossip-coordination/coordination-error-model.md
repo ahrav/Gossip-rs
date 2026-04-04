@@ -96,7 +96,8 @@ AcquireError (#[non_exhaustive])
 ├── ShardNotFound { shard: ShardKey }
 ├── TenantMismatch { expected: TenantId }
 ├── ShardTerminal { shard: ShardKey, status: ShardStatus }
-└── AlreadyLeased { current_owner: WorkerId, lease_deadline: LogicalTime }
+├── AlreadyLeased { current_owner: WorkerId, lease_deadline: LogicalTime }
+└── BackendError(InfraError)
 ```
 
 #### RenewError (error.rs)
@@ -110,7 +111,8 @@ RenewError (#[non_exhaustive])
 ├── TenantMismatch { expected: TenantId }
 ├── StaleFence { presented: FenceEpoch, current: FenceEpoch }
 ├── LeaseExpired { deadline: LogicalTime, now: LogicalTime }
-└── ShardTerminal { shard: ShardKey, status: ShardStatus }
+├── ShardTerminal { shard: ShardKey, status: ShardStatus }
+└── BackendError(InfraError)
 ```
 
 #### CheckpointError (error.rs)
@@ -132,7 +134,8 @@ CheckpointError (#[non_exhaustive])
 ├── CursorKeyTooLarge { size: usize, max: usize }
 ├── CursorTokenTooLarge { size: usize, max: usize }
 ├── CheckpointMissingKey
-└── ResourceExhausted(SlabFull)
+├── ResourceExhausted(SlabFull)
+└── BackendError(InfraError)
 ```
 
 #### CompleteError (error.rs)
@@ -153,7 +156,8 @@ CompleteError (#[non_exhaustive])
 ├── CursorKeyTooLarge { size: usize, max: usize }
 ├── CursorTokenTooLarge { size: usize, max: usize }
 ├── CheckpointMissingKey
-└── ResourceExhausted(SlabFull)
+├── ResourceExhausted(SlabFull)
+└── BackendError(InfraError)
 ```
 
 #### ParkError (error.rs)
@@ -169,7 +173,8 @@ ParkError (#[non_exhaustive])
 ├── StaleFence { presented: FenceEpoch, current: FenceEpoch }
 ├── LeaseExpired { deadline: LogicalTime, now: LogicalTime }
 ├── ShardTerminal { shard: ShardKey, status: ShardStatus }
-└── OpIdConflict { op_id: OpId, expected_hash: u64, actual_hash: u64 }
+├── OpIdConflict { op_id: OpId, expected_hash: u64, actual_hash: u64 }
+└── BackendError(InfraError)
 ```
 
 #### SplitError (error.rs)
@@ -186,7 +191,8 @@ SplitError (#[non_exhaustive])
 ├── ShardTerminal { shard: ShardKey, status: ShardStatus }
 ├── OpIdConflict { op_id: OpId, expected_hash: u64, actual_hash: u64 }
 ├── SplitInvalid(SplitValidationError)
-└── ResourceExhausted(SlabFull)
+├── ResourceExhausted(SlabFull)
+└── BackendError(InfraError)
 ```
 
 Type aliases (error.rs):
@@ -235,7 +241,8 @@ CreateRunError (#[non_exhaustive])
 ├── RunAlreadyExists { run: RunId }
 ├── RegisterShardsFailed(RegisterShardsError)
 ├── GetRunFailed(GetRunError)
-└── ConfigMismatch { run: RunId }
+├── ConfigMismatch { run: RunId }
+└── BackendError(InfraError)
 ```
 
 #### RegisterShardsError (run_errors.rs)
@@ -248,7 +255,8 @@ RegisterShardsError (#[non_exhaustive])
 ├── ManifestInvalid(ManifestValidationError)
 ├── OpIdConflict(RunOpIdConflict)
 ├── ShardLimitExceeded { current, additional, max, scope: ShardLimitScope }
-└── ResourceExhausted { resource: &'static str }
+├── ResourceExhausted { resource: &'static str }
+└── BackendError(InfraError)
 ```
 
 #### GetRunError (run_errors.rs)
@@ -256,7 +264,8 @@ RegisterShardsError (#[non_exhaustive])
 ```text
 GetRunError (#[non_exhaustive])
 ├── RunNotFound
-└── TenantMismatch { expected: TenantId }
+├── TenantMismatch { expected: TenantId }
+└── BackendError(InfraError)
 ```
 
 #### RunTransitionError (run_errors.rs)
@@ -269,7 +278,8 @@ RunTransitionError (#[non_exhaustive])
 ├── TenantMismatch { expected: TenantId }
 ├── RunTerminal { status: RunStatus }
 ├── WrongStatus { status: RunStatus, target: RunStatus }
-└── OpIdConflict(RunOpIdConflict)
+├── OpIdConflict(RunOpIdConflict)
+└── BackendError(InfraError)
 ```
 
 #### UnparkError (run_errors.rs)
@@ -280,7 +290,8 @@ UnparkError (#[non_exhaustive])
 ├── TenantMismatch { expected: TenantId }
 ├── RunTerminal { status: RunStatus }
 ├── NotParked { status: ShardStatus }
-└── OpIdConflict(RunOpIdConflict)
+├── OpIdConflict(RunOpIdConflict)
+└── BackendError(InfraError)
 ```
 
 ### 2.5 ClaimError (facade.rs)
@@ -294,7 +305,8 @@ ClaimError (#[non_exhaustive])
 ├── NoneAvailable { earliest_deadline: Option<LogicalTime> }
 ├── RunNotFound
 ├── TenantMismatch { expected: TenantId }
-└── Throttled { retry_after: LogicalTime }
+├── Throttled { retry_after: LogicalTime }
+└── BackendError(InfraError)
 ```
 
 Has `From<GetRunError>` mapping `RunNotFound` and `TenantMismatch` 1:1.
