@@ -94,7 +94,7 @@ absolute byte positions within the scanned object.
 │  root_hint_end: u64                  │  ◄── dedup region end (excl.)
 │  span_start: u64                     │  ◄── matched span start
 │  span_end: u64                       │  ◄── matched span end (excl.)
-│  norm_hash: [u8; 32]                 │  ◄── BLAKE3 of normalized secret
+│  norm_hash: NormHash                 │  ◄── BLAKE3 of normalized secret
 │  confidence_score: i8                │  ◄── additive 0–10 from gate signals
 └──────────────────────────────────────┘
 ```
@@ -114,6 +114,7 @@ archive entry).
 ├──────────────────────────────────────┤
 │  object_path: &'a [u8]              │  ◄── FS path or virtual archive path
 │  findings: &'a [FsFindingRecord]    │  ◄── deduplicated findings
+│  discovery_sequence: u32             │  ◄── monotonic discovery counter
 └──────────────────────────────────────┘
 ```
 
