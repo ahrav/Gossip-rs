@@ -1,3 +1,10 @@
+//! Tests for the done ledger persistence contracts.
+//!
+//! This module verifies the behavioral invariants of the done ledger records,
+//! including status lattice properties (monotonicity, associativity, idempotence),
+//! provenance temporal ordering, cross-field invariants during construction,
+//! and canonical digest generation.
+
 use rstest::rstest;
 
 use crate::test_util::{canonical_digest, ovid, policy, provenance, tenant};
@@ -194,8 +201,8 @@ fn done_ledger_error_code_accepts_bounded_safe_bytes() {
 }
 
 /// Consolidates four rejection paths (empty, invalid byte, oversized,
-/// all-whitespace) that previously lived in two separate tests with
-/// three inline assertions. Each case now runs as an independent sub-test.
+/// all-whitespace) into independent sub-tests.
+///
 #[rstest]
 #[case::empty(
     "".to_string(),
@@ -658,8 +665,8 @@ fn done_record_rejects_failure_status_without_error_code() {
 }
 
 // ---------------------------------------------------------------------------
-// Verify: merge rejects the unvalidated-error_code scenario that previously
-// broke associativity. With validated operands, the fallback path is
+// Verify: merge rejects the unvalidated-error_code scenario. With validated
+// operands, the fallback path is
 // unreachable for non-scanned statuses (validate() guarantees error_code is
 // Some), so associativity holds.
 // ---------------------------------------------------------------------------
@@ -668,7 +675,7 @@ fn done_record_rejects_failure_status_without_error_code() {
 fn merge_rejects_all_operands_in_associativity_counterexample() {
     let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
 
-    // The counterexample that broke associativity before the fix:
+    // Counterexample:
     // A: FailedRetryable, run_id=5, error_code=None (unvalidated).
     let a = DoneLedgerRecord::try_new(
         key,

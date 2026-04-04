@@ -3599,7 +3599,7 @@ fn concurrent_acquire_exactly_one_wins() {
     const N_WORKERS: usize = 5;
     let namespace = contention_namespace();
 
-    // Phase 1: Setup (single thread seeds the run and shard).
+    // Setup (single thread seeds the run and shard).
     let run = RunId::from_raw(0xCA01);
     let shard = ShardId::from_raw(0xCA02);
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -3619,7 +3619,7 @@ fn concurrent_acquire_exactly_one_wins() {
         assert!(reg.is_executed());
     } // Drop the setup coordinator (and its runtime) before spawning threads.
 
-    // Phase 2: Contention (N threads race to acquire the same shard).
+    // Contention (N threads race to acquire the same shard).
     let key = ShardKey::new(run, shard);
     let barrier = std::sync::Barrier::new(N_WORKERS);
     let results: Vec<Result<_, AcquireError>> = std::thread::scope(|s| {
@@ -3646,7 +3646,7 @@ fn concurrent_acquire_exactly_one_wins() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Phase 3: Assert exactly one winner, N-1 AlreadyLeased.
+    // Assert exactly one winner, N-1 AlreadyLeased.
     let successes = results.iter().filter(|r| r.is_ok()).count();
     let already_leased = results
         .iter()
@@ -3675,7 +3675,7 @@ fn concurrent_register_shards_respects_per_tenant_limit() {
     let run_b = RunId::from_raw(0xCB02);
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
 
-    // Phase 1: Setup — create two runs under the same tenant. Use a
+    // Setup — create two runs under the same tenant. Use a
     // setup coordinator with tight limits to create runs (runs don't
     // count toward shard limits, only shards do).
     {
@@ -3688,7 +3688,7 @@ fn concurrent_register_shards_respects_per_tenant_limit() {
             .expect("create_run B should succeed");
     }
 
-    // Phase 2: Two threads race to register 3 shards each.
+    // Two threads race to register 3 shards each.
     let barrier = std::sync::Barrier::new(2);
     let (result_a, result_b) = std::thread::scope(|s| {
         let b = &barrier;
@@ -3741,7 +3741,7 @@ fn concurrent_register_shards_respects_per_tenant_limit() {
         (ha.join().unwrap(), hb.join().unwrap())
     });
 
-    // Phase 3: At least one must fail with ShardLimitExceeded.
+    // At least one must fail with ShardLimitExceeded.
     let a_ok = result_a.is_ok();
     let b_ok = result_b.is_ok();
     assert!(
@@ -3764,7 +3764,7 @@ fn concurrent_register_shards_respects_per_tenant_limit() {
         "rejected registration must cite per-tenant limit: {rejected:?}"
     );
 
-    // Phase 4: Independent oracle — counter matches actual shard count.
+    // Independent oracle — counter matches actual shard count.
     let verifier = test_coordinator_in_namespace(&namespace);
     let counter = verifier
         .test_load_tenant_shard_count(test_tenant())
@@ -3796,7 +3796,7 @@ fn concurrent_split_replace_respects_per_tenant_limit() {
     // them, so exactly one split succeeds.
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
 
-    // Phase 1: Setup — seed two shards, acquire them.
+    // Setup — seed two shards, acquire them.
     let (lease_a, lease_b) = {
         let mut setup = test_coordinator_in_namespace_with_limits(&namespace, 4, 100);
         setup
@@ -3832,7 +3832,7 @@ fn concurrent_split_replace_respects_per_tenant_limit() {
         (la, lb)
     };
 
-    // Phase 2: Two threads race to split their respective shards.
+    // Two threads race to split their respective shards.
     let barrier = std::sync::Barrier::new(2);
     let (result_a, result_b) = std::thread::scope(|s| {
         let b = &barrier;
@@ -3867,7 +3867,7 @@ fn concurrent_split_replace_respects_per_tenant_limit() {
         (ha.join().unwrap(), hb.join().unwrap())
     });
 
-    // Phase 3: At most one split should succeed if combined children
+    // At most one split should succeed if combined children
     // would exceed the per-tenant limit.
     let a_ok = result_a.is_ok();
     let b_ok = result_b.is_ok();
@@ -3911,7 +3911,7 @@ fn concurrent_register_shards_bootstraps_counter_under_contention() {
     let run_b = RunId::from_raw(0xCD02);
     let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
 
-    // Phase 1: Setup — create two runs, register nothing yet (so the
+    // Setup — create two runs, register nothing yet (so the
     // counter key is absent for this tenant).
     {
         let mut setup = test_coordinator_in_namespace(&namespace);
@@ -3935,7 +3935,7 @@ fn concurrent_register_shards_bootstraps_counter_under_contention() {
         );
     }
 
-    // Phase 2: Two threads race to register_shards. Each targets a
+    // Two threads race to register_shards. Each targets a
     // different run (non-overlapping shard IDs, non-overlapping key
     // ranges). Both will attempt bootstrap because the counter is absent.
     let barrier = std::sync::Barrier::new(2);
@@ -3966,13 +3966,13 @@ fn concurrent_register_shards_bootstraps_counter_under_contention() {
         (ha.join().unwrap(), hb.join().unwrap())
     });
 
-    // Phase 3: Both must succeed. The CAS retry loop handles the
+    // Both must succeed. The CAS retry loop handles the
     // counter bootstrap race: one creates the key, the other retries
     // and reads the established counter.
     let _ = result_a.expect("register_shards A should succeed via bootstrap or retry");
     let _ = result_b.expect("register_shards B should succeed via bootstrap or retry");
 
-    // Phase 4: Independent oracle — counter matches actual shard count.
+    // Independent oracle — counter matches actual shard count.
     let verifier = test_coordinator_in_namespace(&namespace);
     let counter = verifier
         .test_load_tenant_shard_count(test_tenant())
@@ -4693,7 +4693,7 @@ fn async_park_shard_rejects_stale_fence() {
     });
 }
 
-/// Verifies that complete rejects a cursor that regresses from the previously checkpointed position.
+/// Verifies that complete rejects a cursor that regresses from the established cursor position.
 #[test]
 fn async_complete_rejects_cursor_regression() {
     let config = test_async_coordinator_config();
