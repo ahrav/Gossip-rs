@@ -8152,9 +8152,6 @@ mod tests {
     /// loop commits zero new receipts (`checkpoint_cursor = None`). If the
     /// page loop still advanced the resume cursor past the lease's original
     /// position, the recovered cursor provides the completion checkpoint.
-    ///
-    /// This exercises the `(ExhaustedEmptyConfirmed, None, Some(recovered))`
-    /// arm of the completion match in `run_filesystem_lease`.
     #[test]
     fn run_filesystem_lease_exhausted_with_zero_commits_uses_recovered_cursor_for_completion() {
         let dir = tempdir().expect("tempdir");
