@@ -112,12 +112,18 @@ operates on entire repositories rather than individual items.
 `StaticGitRepoDiscoverySource` for one-target repo-frontier shards. It
 emits one terminal page when the carried `RepoKey` is inside the assigned shard
 and otherwise relies on the ordered key boundary for replay-safe completion.
-The discovery runtime path is not yet wired; `GitRepoRuntime::execute_discovery`
-currently returns a not-implemented error.
+`gossip-scanner-runtime/src/git_repo.rs` wires that source into
+`GitRepoRuntime::execute_discovery`, which the distributed runtime uses before
+and after repo execution to decide whether a singleton shard is already covered
+by its cursor or is complete after a durable finalize-backed checkpoint.
 `gossip-scanner-runtime/src/git_persistence.rs` defines the runtime-owned
 adapter that satisfies `scanner-git`'s ref-watermark, seen-blob, and finalize
 persistence seams and maps complete inner finalizes onto the shared
-repo-frontier receipt/checkpoint path.
+repo-frontier receipt/checkpoint path. `run_git_repo_worker` in
+`gossip-scanner-runtime/src/distributed.rs` composes the full singleton path:
+static discovery, mirror sync, mirror-backed execution through
+`GitRepoRuntime::execute_repo`, then direct shard advancement from the durable
+repo-frontier checkpoint cursor.
 
 ---
 
