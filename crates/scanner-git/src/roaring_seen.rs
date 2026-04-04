@@ -643,9 +643,10 @@ impl RoaringSeenBitmap {
         let _ = u32_len(upper_bound)?;
 
         // Fast path: all incoming OIDs sort strictly after the existing
-        // maximum. Extends in-place, avoiding a full-buffer copy.
-        // The preflight u32_len check above already validated the sum.
-        if self.oids.len() > 0 && self.oids.oid_at(self.oids.len() - 1) < other_oid_at(0) {
+        // maximum, or the base is empty. Extends in-place, avoiding a
+        // full-buffer copy. The preflight u32_len check above already
+        // validated the sum.
+        if self.oids.len() == 0 || self.oids.oid_at(self.oids.len() - 1) < other_oid_at(0) {
             let base_len = self.oids.len();
             for idx in 0..other_len {
                 self.oids.push(other_oid_at(idx));
