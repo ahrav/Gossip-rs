@@ -355,7 +355,11 @@ impl ProductionRuntimeBackends {
 /// State does not survive process restarts. This backend is suitable for
 /// single-worker development and early integration where persistence
 /// across process restarts is not required.
-// Production development-mode backend; does not support failure injection.
+// Development-only in-memory backend; does not support failure injection.
+//
+// All Mutex accesses recover from lock poisoning because HashMap internals
+// remain structurally valid after a panic in user code. A warning is logged
+// when recovery occurs to surface upstream panics in diagnostics.
 #[derive(Debug, Clone, Default)]
 struct InMemoryGitPersistence {
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -365,11 +369,13 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
     type Error = std::convert::Infallible;
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        // Recover from lock poisoning: HashMap internals are valid even after a panic in user code.
         Ok(self
             .store
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("in-memory git persistence lock was poisoned; recovering");
+                poisoned.into_inner()
+            })
             .get(key)
             .cloned())
     }
@@ -380,10 +386,10 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
     /// acquire and release the Mutex N times. This override holds the lock
     /// once for the entire batch, avoiding O(keys) lock/unlock cycles.
     fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = self.store.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("in-memory git persistence lock was poisoned; recovering");
+            poisoned.into_inner()
+        });
         Ok(keys
             .iter()
             .map(|key| store.get(key.as_slice()).cloned())
@@ -391,10 +397,10 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
     }
 
     fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut store = self.store.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("in-memory git persistence lock was poisoned; recovering");
+            poisoned.into_inner()
+        });
         for op in ops {
             match op {
                 GitPersistenceOp::Put { key, value } => {
@@ -563,7 +569,8 @@ pub fn run_production_worker(
                 .map_err(ProductionBootstrapError::GitMirrorManager)?;
             tracing::warn!(
                 "git persistence backend is in-memory; ref watermarks and seen-bitmaps \
-                 will not survive process restarts — every lease starts a full rescan"
+                 live only for this worker process — restarting or replacing the worker \
+                 forces a full rescan"
             );
             let git_backend = InMemoryGitPersistence::default();
             backends

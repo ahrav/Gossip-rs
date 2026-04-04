@@ -2748,6 +2748,7 @@ where
 
 /// Bundled metadata for one completed Git repo scan, consumed by the
 /// done-ledger submission helper.
+#[derive(Debug)]
 struct GitRepoPersistenceInput<'a> {
     write_context: WriteContext,
     shard_id: &'a str,
@@ -2755,6 +2756,9 @@ struct GitRepoPersistenceInput<'a> {
     bytes_scanned: u64,
     detected_count: u64,
     claim_time: LogicalTime,
+    /// Wall-clock timestamp captured after scan execution *and* persistence
+    /// finalize complete. The `(claim_time, complete_time)` interval therefore
+    /// measures claim-to-durable-finalize, not claim-to-scan-completion alone.
     complete_time: LogicalTime,
 }
 
@@ -2779,16 +2783,20 @@ where
     D::Error: std::error::Error + Send + Sync + 'static,
 {
     // --- findings submission ---
-    // Durable Git finding translation is not yet implemented. The caller
-    // rejects leases with detected_count > 0, and the hard check below
-    // enforces this invariant in release builds as defense-in-depth.
+    // TODO(git-findings-persistence): replace this guard and the zero-count
+    // receipt with real findings translation — grep for the tag to find the
+    // other two sites that must change atomically.
+    //
+    // Durable Git finding persistence is unsupported. The caller rejects
+    // leases with detected_count > 0, and the hard check below enforces
+    // this invariant in release builds as defense-in-depth.
     // Synthesize a zero-count receipt to skip an unnecessary sink
     // round-trip for clean shards.
     if input.detected_count > 0 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
                 "submit_git_repo_done_ledger called with detected_count={}; \
-                 durable Git finding translation is not yet implemented",
+                 durable Git finding persistence is unsupported",
                 input.detected_count,
             ),
         )));
@@ -2796,8 +2804,11 @@ where
     let findings_receipt = FindingsCommitReceipt::new(0, 0, 0);
 
     // --- done-ledger submission ---
-    // The hard check above guarantees detected_count == 0. The u32 conversion
-    // will need real handling when findings persistence is implemented.
+    // TODO(git-findings-persistence): derive findings_count from the real
+    // findings receipt via u32::try_from — grep for the tag to find the
+    // other two sites that must change atomically.
+    //
+    // The hard check above guarantees detected_count == 0 on this path.
     let findings_count: u32 = 0;
     let record = crate::git_persistence::build_git_repo_done_ledger_record(
         input.write_context,
@@ -3026,6 +3037,10 @@ where
     let detected_count = capture_sink.detected_finding_count();
 
     if detected_count > 0 {
+        // TODO(git-findings-persistence): remove this guard once durable
+        // findings translation is wired in — grep for the tag to find the
+        // other two sites that must change atomically.
+        //
         // Durable findings translation is not yet available. Persisting an
         // empty batch while advancing the shard checkpoint would mark the
         // repo as ScannedClean, silently dropping detected findings from
@@ -6510,10 +6525,9 @@ mod tests {
         );
     }
 
-    /// Git events are emitted during the scan phase, before the findings
-    /// guard evaluates. The worker returns an error because the fixture
-    /// contains secrets, but this test only verifies that telemetry events
-    /// are recorded.
+    /// Git events are emitted during scan execution before the findings
+    /// durability guard runs, so telemetry remains observable even when the
+    /// lease is later rejected by that guard.
     #[test]
     fn run_git_repo_worker_records_git_events() {
         let repo = create_git_repo_fixture_with_secrets();
@@ -6528,9 +6542,8 @@ mod tests {
         let mut coordinator =
             setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
 
-        // The fixture contains secrets, so the worker fails at the findings guard.
-        // This test only verifies that telemetry events are recorded during the
-        // scan phase (before the guard evaluates).
+        // Secret-bearing fixtures trigger the findings durability guard after
+        // scan execution; emitted scan-phase telemetry remains recorded.
         let result = run_git_repo_worker(
             &mut coordinator,
             &mut mirrors,
