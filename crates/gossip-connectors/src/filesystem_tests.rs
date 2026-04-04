@@ -549,6 +549,8 @@ fn fill_page_emits_large_first_item_to_make_progress() {
 fn max_items_exactly_matching_file_count_yields_complete_page() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
+    // When the page limit exactly matches the remaining file count,
+    // `fill_page` can peek past the terminal item and return `Complete`.
     // The peek error is intentionally swallowed via `ok().is_some_and`
     // rather than propagated via `?` to avoid discarding already-collected items.
     let page = fill_page_with_limits(
@@ -569,6 +571,7 @@ fn max_items_exactly_matching_file_count_yields_complete_page() {
 fn max_items_less_than_file_count_yields_has_more() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
     let mut connector = FilesystemConnector::new(dir.path());
+    // Hitting `max_items` before exhausting the directory keeps pagination open.
     let page = fill_page_with_limits(
         &mut connector,
         &unbounded_shard(),
