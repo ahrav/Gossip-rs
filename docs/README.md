@@ -35,7 +35,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | Document                                               | Focus                            | Key Concepts                                           |
 | ------------------------------------------------------ | -------------------------------- | ------------------------------------------------------ |
 | [architecture-overview.md](architecture-overview.md)   | C4-style component diagram       | CLI, Engine, Pipeline, Memory, Data Structures         |
-| [architecture.md](architecture.md)                     | Data flow                        | Owner-compute filesystem flow, transform worklist       |
+| [architecture.md](architecture.md)                     | Data flow                        | Filesystem Flow (scan fs), Transform worklist            |
 | [data-types.md](data-types.md)                         | Class diagrams                   | Key type relationships across crates                   |
 | [pipeline-flow.md](pipeline-flow.md)                   | Pipeline execution flow          | Discovery, executor model, backpressure                |
 | [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Executor termination, `scan_local` states, worker tasks |
