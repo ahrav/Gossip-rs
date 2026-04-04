@@ -413,18 +413,17 @@ fn batch_range_cap_eliminates_split_drift() {
         .estimate_split_key()
         .expect("capped estimator should produce a split");
 
-    // This establishes the precondition for the batch-cap fix: default
-    // compaction drifts away from the exact midpoint on large ranges.
+    // This confirms the default cap can drift from the exact midpoint on
+    // sufficiently large materialized ranges.
     assert_ne!(
         index_from_key(exact_key),
         index_from_key(capped_key),
-        "expected capped estimator to drift from exact on n={n}, \
-         cap={LARGE_SAMPLE_CAP} — if this starts passing, the batch-cap \
-         fix may no longer be necessary"
+        "expected capped estimator to differ from exact on n={n}, \
+         cap={LARGE_SAMPLE_CAP}"
     );
 
-    // Batch connectors avoid that drift by setting `sample_cap = range.len()`,
-    // which disables compaction for materialized ranges.
+    // Setting `sample_cap = range.len()` disables compaction for materialized
+    // ranges and aligns the result with the exact estimator.
     let batch = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
     assert_eq!(
         batch.estimate_split_key(),
