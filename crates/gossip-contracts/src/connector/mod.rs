@@ -7,6 +7,16 @@
 //! enumeration/read flows, and a log-safe digest type ([`ToxicDigest`]) for
 //! redacting untrusted connector data in diagnostics.
 //!
+//! # Public Surface
+//!
+//! - [`common`] provides the shared paging vocabulary (`PageBuf`, `PageState`)
+//!   and page-shape validators.
+//! - [`ordered`] and [`git`] define the family-specific source traits.
+//! - [`Cursor`], [`Budgets`], [`ScanItem`], and [`VersionId`] model the paging
+//!   and item metadata exchanged between connectors and runtimes.
+//! - [`ConnectorCapabilities`], [`EnumerateError`], and [`ReadError`] describe
+//!   source capabilities and failure boundaries.
+//!
 //! The contract surface is split into focused, composable layers rather than a single
 //! universal connector model. It isolates connector value contracts, shared paging
 //! vocabulary, and family-specific trait surfaces from orchestration decisions
