@@ -67,7 +67,7 @@ use super::pack_decode::PackDecodeLimits;
 use super::pack_exec::{PackExecError, PackExecReport, SkipReason};
 use super::pack_io::{PackIoError, PackIoLimits};
 use super::pack_plan::{PackPlanConfig, PackPlanError};
-use super::pack_plan_model::PackPlanStats;
+use super::pack_plan_model::{CompletedPacksBitmap, PackPlanStats};
 use super::persist::{persist_finalize_output, PersistenceStore};
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::{repo_open, RefWatermarkStore, StartSetResolver};
@@ -778,6 +778,14 @@ pub(super) struct ScanModeOutput {
     // -- Execution reports: forwarded verbatim into GitScanReport. --
     /// Pack decode + scan reports, one per pack plan.
     pub pack_exec_reports: Vec<PackExecReport>,
+    /// Pack ids whose plans completed without error-class skips.
+    ///
+    /// Populated by the mode pipeline after scheduler outputs are reassembled
+    /// on the runner thread. Keeping the bitmap in `ScanModeOutput` keeps this
+    /// state in the runner-owned result bundle rather than in worker-local
+    /// scheduler state.
+    #[allow(dead_code)]
+    pub completed_packs: CompletedPacksBitmap,
     /// Per-pack-plan statistics.
     pub pack_plan_stats: Vec<PackPlanStats>,
     /// Pack plan configuration used for this run.

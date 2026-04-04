@@ -29,7 +29,8 @@ use super::object_id::OidBytes;
 use super::pack_candidates::PackCandidate;
 use super::pack_inflate::{EntryKind, PackFile, PackParseError};
 use super::pack_plan_model::{
-    BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats, NONE_U32,
+    BaseLoc, CandidateAtOffset, CompletedPacksBitmap, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
+    NONE_U32,
 };
 
 /// Default safety bound for pack entry headers.
@@ -234,6 +235,15 @@ pub fn build_pack_plans<'a, R: OidResolver>(
     }
 
     Ok(plans)
+}
+
+/// Removes plans whose pack ids are already marked complete.
+///
+/// This mutates `plans` in place via [`Vec::retain`]. An empty
+/// `completed` bitmap leaves `plans` unchanged; if every plan is already
+/// complete, `plans` becomes empty.
+pub fn filter_completed_packs(plans: &mut Vec<PackPlan>, completed: &CompletedPacksBitmap) {
+    plans.retain(|plan| !completed.is_complete(plan.pack_id()));
 }
 
 /// Build a pack plan for a single pack and its candidates.
@@ -1033,6 +1043,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use rstest::rstest;
+
     /// Shorthand for an OFS_DELTA dependency: `offset` depends on `base`.
     fn ofs_dep(offset: u64, base: u64) -> DeltaDep {
         DeltaDep {
@@ -1081,6 +1093,21 @@ mod tests {
             group.len(),
             "group {group:?} not contiguous in order {order:?}"
         );
+    }
+
+    fn synthetic_plan(pack_id: u16) -> PackPlan {
+        PackPlan {
+            pack_id,
+            oid_len: 20,
+            max_delta_depth: 0,
+            candidates: Vec::new(),
+            candidate_offsets: Vec::new(),
+            need_offsets: Vec::new(),
+            delta_deps: Vec::new(),
+            delta_dep_index: Vec::new(),
+            exec_order: None,
+            stats: PackPlanStats::empty(),
+        }
     }
 
     #[test]
@@ -1385,6 +1412,27 @@ mod tests {
 
         // Topological validity.
         assert_topo_valid(&order, &[(0, 1), (0, 2), (3, 4), (4, 5), (6, 7)]);
+    }
+
+    #[rstest]
+    #[case::all_completed(vec![0, 1, 2], vec![0, 1, 2], vec![])]
+    #[case::none_completed(vec![0, 1, 2], vec![], vec![0, 1, 2])]
+    #[case::partial(vec![0, 1, 2, 3], vec![1, 3], vec![0, 2])]
+    fn filter_completed_packs_removes_done_ids(
+        #[case] plan_ids: Vec<u16>,
+        #[case] completed_ids: Vec<u16>,
+        #[case] expected_remaining: Vec<u16>,
+    ) {
+        let mut plans: Vec<PackPlan> = plan_ids.into_iter().map(synthetic_plan).collect();
+        let mut completed = CompletedPacksBitmap::empty(8);
+        for pack_id in completed_ids {
+            completed.mark_complete(pack_id);
+        }
+
+        filter_completed_packs(&mut plans, &completed);
+
+        let remaining: Vec<u16> = plans.iter().map(PackPlan::pack_id).collect();
+        assert_eq!(remaining, expected_remaining);
     }
 }
 
