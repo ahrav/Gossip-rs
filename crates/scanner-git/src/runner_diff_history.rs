@@ -67,6 +67,7 @@ use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::pack_candidates::CappedPackCandidateSink;
 use super::pack_io::PackIo;
 use super::pack_plan::build_pack_plans;
+use super::pack_plan_model::CompletedPacksBitmap;
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
 use super::runner::{
@@ -81,7 +82,7 @@ use super::repo_paths::{
     collect_loose_dirs, collect_pack_dirs, list_pack_files, resolve_pack_paths,
 };
 use super::runner_exec::{
-    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views,
+    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_scheduler_outputs,
     execute_pack_plans_with_scheduler, load_midx, make_spill_dir, mmap_pack_files,
     per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
     summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
@@ -102,6 +103,11 @@ use super::runner_exec::{
 /// Output order is deterministic for identical inputs regardless of worker
 /// count. Parallel strategies reassemble results by planned sequence index,
 /// and loose candidates are always appended after all packed results.
+///
+/// The returned [`ScanModeOutput`] also carries a completed-pack bitmap sized
+/// to `midx.pack_count()`. The runner thread marks a pack only after its final
+/// post-scheduler report is assembled, so sharded execution sets the bit after
+/// all shards for that pack finish without error-class skips.
 ///
 /// # Lifetime of the returned path arena
 ///
@@ -159,6 +165,7 @@ pub(super) fn run_diff_history(
 
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
     let midx = load_midx(repo)?;
+    let mut completed_packs = CompletedPacksBitmap::empty(midx.pack_count() as usize);
     let object_store_layout = ObjectStoreLayout::from_midx(repo, midx)?;
     // Scale tree delta-cache to repo size to reduce repeated base decode work
     // while staying within the configured max cache budget.
@@ -291,6 +298,8 @@ pub(super) fn run_diff_history(
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
     perf_let!(pack_plan_start = Instant::now());
+    sink.packed
+        .retain(|cand| !completed_packs.is_complete(cand.pack_id));
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
@@ -374,6 +383,7 @@ pub(super) fn run_diff_history(
             .midx
             .clone()
             .ok_or_else(|| GitScanError::Io(io::Error::other("midx bytes missing")))?;
+        let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
         let outputs = execute_pack_plans_with_scheduler(
             Arc::clone(&engine),
             event_sink.clone(),
@@ -394,12 +404,15 @@ pub(super) fn run_diff_history(
             Arc::clone(&commit_graph_index),
             Arc::clone(&commit_meta_seen),
         )?;
-        for output in outputs {
-            pack_exec_reports.push(output.report);
-            skipped_candidates.extend(output.skipped);
-            common_metrics.merge_from(&output.common_metrics);
-            append_scanned_blobs(&mut scanned, output.scanned);
-        }
+        collect_scheduler_outputs(
+            &plan_pack_ids,
+            outputs,
+            &mut completed_packs,
+            &mut pack_exec_reports,
+            &mut skipped_candidates,
+            &mut common_metrics,
+            &mut scanned,
+        )?;
     }
     if !sink.loose.is_empty() {
         let mut adapter = EngineAdapter::new_with_event_sink(
@@ -448,6 +461,7 @@ pub(super) fn run_diff_history(
             .map_err(|_| GitScanError::Io(io::Error::other("path arena still shared")))?,
         skipped_candidates,
         pack_exec_reports,
+        completed_packs,
         pack_plan_stats,
         pack_plan_config: config.pack_plan,
         pack_plan_delta_deps_total,

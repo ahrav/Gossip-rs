@@ -8,15 +8,17 @@ integration, and finalization.
 
 The runner subsystem is the top-level orchestrator for git scans. It owns the
 end-to-end pipeline from repository open through finalize and optional
-persistence. The subsystem is split across five source files:
+persistence. The subsystem is split across seven source files:
 
 | Module                   | Location                                              | Responsibility                                          |
 | ------------------------ | ----------------------------------------------------- | ------------------------------------------------------- |
 | `runner`                 | `crates/scanner-git/src/runner.rs`                    | Public types, configuration, and `run_git_scan` entry   |
-| `runner_exec`            | `crates/scanner-git/src/runner_exec.rs`               | Shared pack execution helpers (mmap, cache, sharding)   |
-| `runner_exec_scheduler`  | `crates/scanner-git/src/runner_exec_scheduler.rs`     | Scheduler-driven parallel plan/shard dispatch           |
+| `runner_odb_blob`        | `crates/scanner-git/src/runner_odb_blob.rs`           | ODB-blob fast-path mode pipeline                        |
+| `runner_diff_history`    | `crates/scanner-git/src/runner_diff_history.rs`       | Diff-history mode pipeline                              |
+| `runner_exec`            | `crates/scanner-git/src/runner_exec.rs`               | Shared pack execution helpers and scheduler dispatch    |
 | `engine_adapter`         | `crates/scanner-git/src/engine_adapter.rs`            | Bridge from decoded blobs to the core `Engine`          |
 | `finalize`               | `crates/scanner-git/src/finalize.rs`                  | Deterministic write-op builder for persistence          |
+| `persist`                | `crates/scanner-git/src/persist.rs`                   | Atomic finalize commit and incremental seen-bitmap ops  |
 
 The runner dispatches to one of two mode-specific pipelines after shared setup:
 
@@ -26,9 +28,16 @@ The runner dispatches to one of two mode-specific pipelines after shared setup:
   spills/dedupes candidates, then batch-plans and executes pack decode + scan.
 
 Both pipelines produce a `ScanModeOutput` that the runner finalizes and
-optionally persists. When a persistence store is present, spill-stage
-seen-bitmap deltas are written incrementally during mode execution and finalize
-still ends with a two-phase atomic write.
+optionally persists. The mode output also carries a completed-pack bitmap
+indexed by MIDX `pack_id`; the runner thread marks a bit only after the
+scheduler has reassembled that plan's final `PackExecReport`, so sharded
+execution flips the bit only after every shard succeeds without error-class
+skips. Seen-bitmap persistence depends on the caller-supplied
+`SeenBitmapPersister`: when no persistence store is provided, `run_git_scan`
+uses a `NullSeenBitmapPersister` that discards deltas, so the seen bitmap is
+persisted only via the atomic finalize batch. When a `PersistenceStore` is
+present, spill-stage seen-bitmap deltas are written incrementally during mode
+execution in addition to the finalize batch.
 
 ## Execution Lifecycle
 
@@ -94,7 +103,7 @@ flowchart TD
 | `GitScanResult`       | Newtype wrapper around `GitScanReport`                              |
 | `GitScanReport`       | Summary report with per-stage stats, findings, and finalize output  |
 | `GitScanError`        | Error taxonomy organized by pipeline stage                          |
-| `ScanModeOutput`      | Common output struct produced by both mode pipelines                |
+| `ScanModeOutput`      | Common output struct produced by both mode pipelines, including completed-pack state |
 | `GitScanStageNanos`   | Per-stage nanosecond timings (populated with `git-perf` feature)    |
 | `GitScanAllocStats`   | Allocation deltas for hot stages                                    |
 | `PackMmapLimits`      | Pack file mmap count and byte budget                                |
@@ -251,16 +260,16 @@ PackCache 32 MiB floor each).
 
 ### Scheduler dispatch
 
-The scheduler implementation lives in `runner_exec_scheduler.rs`. It wraps
+The scheduler implementation lives in `runner_exec.rs`. It wraps
 the `scanner_scheduler::Executor` work-queue:
 
-1. `execute_pack_plans_with_scheduler` (`runner_exec_scheduler.rs`)
+1. `execute_pack_plans_with_scheduler` (`runner_exec.rs`)
    selects a `PackExecStrategy` and delegates to either `execute_plan_tasks`
    or `execute_sharded_tasks`.
-2. **Plan tasks** (`runner_exec_scheduler.rs`) -- one `SchedulerPackTask::ExecPlan`
+2. **Plan tasks** (`runner_exec.rs`) -- one `SchedulerPackTask::ExecPlan`
    per plan, dispatched as a batch. Outputs are stored in sequence-indexed
    mutex slots for deterministic reassembly.
-3. **Shard tasks** (`runner_exec_scheduler.rs`) -- `build_shard_dispatch_plan`
+3. **Shard tasks** (`runner_exec.rs`) -- `build_shard_dispatch_plan`
    pre-computes `SchedulerShardMeta` (execution plan, hot deps, candidate
    ranges, shard ranges) for each plan. Tasks are
    `SchedulerPackTask::ExecShard { plan_idx, shard_idx }`. Outputs are stored
@@ -348,10 +357,10 @@ watermarks without corresponding data writes.
 | Pack cache sizing             | `runner_exec.rs`                     |
 | Mmap management               | `runner_exec.rs`                     |
 | Loose candidate scanning      | `runner_exec.rs`                     |
-| Scheduler dispatch entry      | `runner_exec_scheduler.rs`           |
-| Plan task execution           | `runner_exec_scheduler.rs`           |
-| Shard task execution          | `runner_exec_scheduler.rs`           |
-| Shard dispatch plan builder   | `runner_exec_scheduler.rs`           |
+| Scheduler dispatch entry      | `runner_exec.rs`                     |
+| Plan task execution           | `runner_exec.rs`                     |
+| Shard task execution          | `runner_exec.rs`                     |
+| Shard dispatch plan builder   | `runner_exec.rs`                     |
 | `EngineAdapter` definition    | `engine_adapter.rs`                  |
 | Per-blob scan pipeline        | `engine_adapter.rs`                  |
 | Exactly-once CommitMeta       | `engine_adapter.rs`                  |

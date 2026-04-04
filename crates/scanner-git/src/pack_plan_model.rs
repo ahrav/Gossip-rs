@@ -16,6 +16,7 @@
 
 use super::object_id::OidBytes;
 use super::pack_candidates::PackCandidate;
+use gossip_stdx::bitset::DynamicBitSet;
 
 /// Sentinel for missing `u32` indices.
 pub const NONE_U32: u32 = u32::MAX;
@@ -156,7 +157,7 @@ impl PackPlanStats {
     }
 
     /// Number of indegree-0 nodes with dependents (delta tree roots).
-    /// Only populated when `perf-stats` is enabled.
+    /// Only populated when both `perf-stats` feature and `debug_assertions` are active.
     #[inline]
     #[must_use]
     pub const fn delta_tree_roots(&self) -> u32 {
@@ -164,11 +165,90 @@ impl PackPlanStats {
     }
 
     /// Maximum depth of the dependency DAG.
-    /// Only populated when `perf-stats` is enabled.
+    /// Only populated when both `perf-stats` feature and `debug_assertions` are active.
     #[inline]
     #[must_use]
     pub const fn delta_tree_max_depth(&self) -> u32 {
         self.delta_tree_max_depth
+    }
+}
+
+/// Bitmap of packs that completed pack execution in the current scan epoch.
+///
+/// A bit is set only after the runner thread has reassembled the final
+/// [`PackExecReport`](crate::pack_exec::PackExecReport) for that pack and
+/// confirmed it contains no error-class skips. This means sharded execution
+/// marks a pack complete only after every shard succeeds. The bitmap is sized
+/// to the repository's MIDX pack count, so `pack_id` can be used directly as
+/// the bit index.
+///
+/// The bitmap is mutated only in the runner's post-scheduler assembly loop and
+/// carried forward in [`ScanModeOutput`](crate::runner::ScanModeOutput), so it
+/// intentionally has no internal synchronization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedPacksBitmap {
+    bits: DynamicBitSet,
+}
+
+impl CompletedPacksBitmap {
+    /// Creates an empty completed-pack bitmap sized to the repository pack count.
+    #[inline]
+    #[must_use]
+    pub fn empty(pack_count: usize) -> Self {
+        Self {
+            bits: DynamicBitSet::empty(pack_count),
+        }
+    }
+
+    /// Number of packs this bitmap was sized for.
+    #[inline]
+    #[must_use]
+    pub fn pack_count(&self) -> usize {
+        self.bits.bit_length()
+    }
+
+    /// Number of packs marked complete. O(words) via popcount.
+    #[inline]
+    #[must_use]
+    pub fn count_completed(&self) -> usize {
+        self.bits.count()
+    }
+
+    /// Marks `pack_id` as fully processed for this scan epoch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pack_id >= pack_count`. Pack ids originate from the MIDX
+    /// which also determines the bitmap capacity, so out-of-range values
+    /// indicate a logic error.
+    #[inline]
+    pub fn mark_complete(&mut self, pack_id: u16) {
+        let idx = pack_id as usize;
+        assert!(
+            idx < self.bits.bit_length(),
+            "pack_id {pack_id} out of range for bitmap with capacity {}",
+            self.bits.bit_length()
+        );
+        self.bits.set(idx);
+    }
+
+    /// Returns whether `pack_id` completed without error-class skips.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pack_id >= pack_count`. Pack ids originate from the MIDX
+    /// which also determines the bitmap capacity, so out-of-range values
+    /// indicate a logic error.
+    #[inline]
+    #[must_use]
+    pub fn is_complete(&self, pack_id: u16) -> bool {
+        let idx = pack_id as usize;
+        assert!(
+            idx < self.bits.bit_length(),
+            "pack_id {pack_id} out of range for bitmap with capacity {}",
+            self.bits.bit_length()
+        );
+        self.bits.is_set(idx)
     }
 }
 

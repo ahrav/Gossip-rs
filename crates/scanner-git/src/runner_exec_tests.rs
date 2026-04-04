@@ -4,7 +4,9 @@ use std::path::Path;
 use crate::delta_test_helpers::zlib_compress;
 use crate::object_id::OidBytes;
 use crate::pack_decode::PackDecodeLimits;
-use crate::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats, NONE_U32};
+use crate::pack_plan_model::{
+    BaseLoc, CompletedPacksBitmap, DeltaDep, DeltaKind, PackPlanStats, NONE_U32,
+};
 use crate::{
     demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId, TransformMode,
     ValidatorKind,
@@ -112,6 +114,18 @@ fn synthetic_locality_plan(
     plan.delta_deps = delta_deps;
     plan.delta_dep_index = delta_dep_index;
     plan
+}
+
+fn scheduler_output_with_report(report: PackExecReport) -> SchedulerPackExecOutput {
+    SchedulerPackExecOutput {
+        report,
+        scanned: ScannedBlobs {
+            blobs: Vec::new(),
+            finding_arena: Vec::new(),
+        },
+        skipped: Vec::new(),
+        common_metrics: GitScanCommonMetrics::default(),
+    }
 }
 
 #[test]
@@ -376,6 +390,304 @@ fn count_pack_exec_skip_errors_deduplicates_by_offset() {
 
     // Two unique broken offsets (100, 200), not 4 skip events.
     assert_eq!(count_pack_exec_skip_errors(&skips), 2);
+}
+
+#[test]
+fn completion_bitmap_marks_successful_plan() {
+    let plans = [synthetic_plan(7, 1, 1, 0, 0)];
+    let report = PackExecReport::default();
+    let mut completed = CompletedPacksBitmap::empty(16);
+
+    assert!(plan_completed_cleanly(&report));
+    if plan_completed_cleanly(&report) {
+        completed.mark_complete(plans[0].pack_id());
+    }
+
+    assert!(completed.is_complete(7));
+}
+
+#[test]
+fn completion_bitmap_skips_fatal_error_plan() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![SkipRecord {
+            offset: 42,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        }],
+    };
+    let mut completed = CompletedPacksBitmap::empty(16);
+
+    assert!(!plan_completed_cleanly(&report));
+    if plan_completed_cleanly(&report) {
+        completed.mark_complete(3);
+    }
+
+    assert!(!completed.is_complete(3));
+}
+
+#[test]
+fn completion_bitmap_treats_non_error_skips_as_clean() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+        ],
+    };
+    let mut completed = CompletedPacksBitmap::empty(16);
+
+    assert!(
+        plan_completed_cleanly(&report),
+        "NotBlob skips are non-error; plan should be considered clean"
+    );
+    if plan_completed_cleanly(&report) {
+        completed.mark_complete(4);
+    }
+
+    assert!(completed.is_complete(4));
+}
+
+#[test]
+fn completion_bitmap_rejects_mixed_error_and_non_error_skips() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::PackParse(
+                    crate::pack_inflate::PackParseError::Truncated,
+                ),
+            },
+        ],
+    };
+
+    assert!(
+        !plan_completed_cleanly(&report),
+        "any error-class skip makes the plan incomplete"
+    );
+}
+
+#[test]
+fn plan_completed_cleanly_with_only_non_error_skips() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+        ],
+    };
+    assert!(plan_completed_cleanly(&report));
+}
+
+#[test]
+fn plan_completed_cleanly_mixed_error_and_non_error_skips() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::PackParse(
+                    crate::pack_inflate::PackParseError::Truncated,
+                ),
+            },
+        ],
+    };
+    assert!(!plan_completed_cleanly(&report));
+}
+
+#[test]
+fn merge_shard_outputs_marks_completion() {
+    let plans = vec![synthetic_plan(5, 2, 2, 0, 0)];
+    let shard_meta = vec![SchedulerShardMeta {
+        exec_plan: SchedulerShardExecPlan::Natural { len: 2 },
+        plan_hot_deps: PackPlanHotDeps::from_plan(&plans[0]),
+        candidate_ranges: Vec::new(),
+        shard_ranges: vec![(0, 1), (1, 2)],
+    }];
+    let shard_slots = vec![
+        std::sync::Mutex::new(Some(
+            scheduler_output_with_report(PackExecReport::default()),
+        )),
+        std::sync::Mutex::new(Some(
+            scheduler_output_with_report(PackExecReport::default()),
+        )),
+    ];
+    let shard_slot_base = vec![0usize];
+
+    let outputs = merge_shard_outputs(&plans, &shard_meta, &shard_slots, &shard_slot_base)
+        .expect("shard merge should succeed");
+    let mut completed = CompletedPacksBitmap::empty(16);
+    let report = &outputs[0].report;
+
+    assert!(plan_completed_cleanly(report));
+    if plan_completed_cleanly(report) {
+        completed.mark_complete(plans[0].pack_id());
+    }
+
+    assert!(completed.is_complete(5));
+}
+
+#[test]
+fn merge_shard_outputs_mixed_error_prevents_completion() {
+    let plans = vec![synthetic_plan(5, 2, 2, 0, 0)];
+    let shard_meta = vec![SchedulerShardMeta {
+        exec_plan: SchedulerShardExecPlan::Natural { len: 2 },
+        plan_hot_deps: PackPlanHotDeps::from_plan(&plans[0]),
+        candidate_ranges: Vec::new(),
+        shard_ranges: vec![(0, 1), (1, 2)],
+    }];
+    // Shard 0 succeeds; shard 1 has a fatal parse error. The merged report
+    // must surface the error, preventing the pack from being marked complete.
+    let shard_slots = vec![
+        std::sync::Mutex::new(Some(
+            scheduler_output_with_report(PackExecReport::default()),
+        )),
+        std::sync::Mutex::new(Some(scheduler_output_with_report(PackExecReport {
+            stats: Default::default(),
+            skips: vec![SkipRecord {
+                offset: 99,
+                reason: crate::pack_exec::SkipReason::PackParse(
+                    crate::pack_inflate::PackParseError::Truncated,
+                ),
+            }],
+        }))),
+    ];
+    let shard_slot_base = vec![0usize];
+
+    let outputs = merge_shard_outputs(&plans, &shard_meta, &shard_slots, &shard_slot_base)
+        .expect("shard merge should succeed");
+    let mut completed = CompletedPacksBitmap::empty(16);
+    let report = &outputs[0].report;
+
+    assert!(
+        !plan_completed_cleanly(report),
+        "merged report with one failing shard must not be clean"
+    );
+    if plan_completed_cleanly(report) {
+        completed.mark_complete(plans[0].pack_id());
+    }
+
+    assert!(
+        !completed.is_complete(5),
+        "pack with a failing shard must not be marked complete"
+    );
+}
+
+#[test]
+fn collect_scheduler_outputs_mismatched_lengths_returns_error() {
+    let plan_pack_ids: Vec<u16> = vec![0, 1];
+    let outputs = vec![scheduler_output_with_report(PackExecReport::default())];
+    let mut completed = CompletedPacksBitmap::empty(4);
+    let mut reports = Vec::new();
+    let mut skipped = Vec::new();
+    let mut metrics = GitScanCommonMetrics::default();
+    let mut scanned = ScannedBlobs {
+        blobs: Vec::new(),
+        finding_arena: Vec::new(),
+    };
+
+    let err = collect_scheduler_outputs(
+        &plan_pack_ids,
+        outputs,
+        &mut completed,
+        &mut reports,
+        &mut skipped,
+        &mut metrics,
+        &mut scanned,
+    )
+    .expect_err("mismatched lengths must return an error");
+
+    assert!(
+        matches!(
+            err,
+            crate::pack_exec::PackExecError::SchedulerOutputCountMismatch {
+                expected: 2,
+                got: 1
+            }
+        ),
+        "expected SchedulerOutputCountMismatch, got: {err:?}"
+    );
+}
+
+#[test]
+fn collect_scheduler_outputs_mixed_completion() {
+    let plan_pack_ids: Vec<u16> = vec![0, 1, 2];
+    let clean_report = PackExecReport::default();
+    let error_report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![SkipRecord {
+            offset: 42,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        }],
+    };
+    let not_blob_report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![SkipRecord {
+            offset: 10,
+            reason: crate::pack_exec::SkipReason::NotBlob,
+        }],
+    };
+    let outputs = vec![
+        scheduler_output_with_report(clean_report),
+        scheduler_output_with_report(error_report),
+        scheduler_output_with_report(not_blob_report),
+    ];
+    let mut completed = CompletedPacksBitmap::empty(4);
+    let mut reports = Vec::new();
+    let mut skipped = Vec::new();
+    let mut metrics = GitScanCommonMetrics::default();
+    let mut scanned = ScannedBlobs {
+        blobs: Vec::new(),
+        finding_arena: Vec::new(),
+    };
+
+    collect_scheduler_outputs(
+        &plan_pack_ids,
+        outputs,
+        &mut completed,
+        &mut reports,
+        &mut skipped,
+        &mut metrics,
+        &mut scanned,
+    )
+    .expect("equal lengths should succeed");
+
+    // Pack 0 (clean) and pack 2 (NotBlob only) marked complete.
+    // Pack 1 (error skip) not marked.
+    assert!(completed.is_complete(0), "clean plan should be complete");
+    assert!(
+        !completed.is_complete(1),
+        "error-skip plan should not be complete"
+    );
+    assert!(
+        completed.is_complete(2),
+        "NotBlob-only plan should be complete"
+    );
+    assert_eq!(reports.len(), 3, "all reports should be accumulated");
 }
 
 #[test]
@@ -709,10 +1021,6 @@ fn estimate_locality_pressure_known_deps() {
         "all deps cross shard boundaries"
     );
 }
-
-// NOTE: The field-ordering assertion for SchedulerPackWorkerRuntime is now a
-// compile-time `const` assertion in runner_exec.rs (next to the struct
-// definition). It catches reordering at build time rather than at test time.
 
 /// Exercises the full lifecycle of `SchedulerPackWorkerRuntime`:
 /// construction (with the same `transmute` pattern used in production),

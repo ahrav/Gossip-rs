@@ -154,6 +154,9 @@ pub enum PackExecError {
     /// Scheduler finished but did not produce a shard output slot.
     #[error("scheduler shard output missing: plan_idx={plan_idx}, shard_idx={shard_idx}")]
     SchedulerShardOutputMissing { plan_idx: usize, shard_idx: usize },
+    /// Scheduler produced a different number of outputs than planned packs.
+    #[error("scheduler output count mismatch: expected {expected}, got {got}")]
+    SchedulerOutputCountMismatch { expected: usize, got: usize },
     /// Scheduler rejected enqueuing pack-plan tasks.
     #[error("scheduler task queue rejected work")]
     SchedulerTaskQueueRejected,

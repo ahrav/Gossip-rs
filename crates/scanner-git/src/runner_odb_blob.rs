@@ -52,6 +52,7 @@ use super::pack_candidates::{
 };
 use super::pack_io::PackIo;
 use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPlanError};
+use super::pack_plan_model::CompletedPacksBitmap;
 use super::runner::{
     GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
 };
@@ -64,7 +65,7 @@ use super::repo_paths::{
     collect_loose_dirs, collect_pack_dirs, list_pack_files, resolve_pack_paths,
 };
 use super::runner_exec::{
-    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views,
+    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_scheduler_outputs,
     estimate_path_arena_capacity, execute_pack_plans_with_scheduler, load_midx, make_spill_dir,
     mmap_pack_files, per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
     PackExecStrategy, SpillCandidateSink,
@@ -94,6 +95,11 @@ use crate::perf_set;
 /// In parallel blob introduction mode, the selected blob context may vary with
 /// scheduling. Consumers must not treat `commit_id`/`path` attribution in this
 /// mode as deterministic across worker counts.
+///
+/// The returned [`ScanModeOutput`] also carries a completed-pack bitmap sized
+/// to `midx.pack_count()`. The runner thread marks a pack only after its final
+/// post-scheduler report is assembled, so sharded execution sets the bit after
+/// all shards for that pack finish without error-class skips.
 ///
 /// # Commit-meta emission
 ///
@@ -148,6 +154,7 @@ pub(super) fn run_odb_blob(
     };
 
     let midx = load_midx(repo)?;
+    let mut completed_packs = CompletedPacksBitmap::empty(midx.pack_count() as usize);
     let mut mapping_cfg = config.mapping;
     let default_mapping_cfg = MappingBridgeConfig::default();
     if mapping_cfg.max_packed_candidates >= default_mapping_cfg.max_packed_candidates {
@@ -336,6 +343,8 @@ pub(super) fn run_odb_blob(
 
     // ── Stage 2 + 3: pack planning + execution ──────────────────────
     let pack_plan_start = Instant::now();
+    packed.retain(|cand| !completed_packs.is_complete(cand.pack_id));
+
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
@@ -428,6 +437,10 @@ pub(super) fn run_odb_blob(
             pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
             plans.push(plan);
         }
+        // No plan-level filter needed: the candidate-level retain above
+        // already removed every candidate belonging to a completed pack, so
+        // bucket_pack_candidates never produces those pack_ids and no plan is
+        // built for them.
         perf_set!(
             stage_nanos,
             pack_plan,
@@ -437,6 +450,7 @@ pub(super) fn run_odb_blob(
         if !plans.is_empty() {
             #[cfg(feature = "git-perf")]
             start_pack_exec();
+            let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
             let strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
             let scheduler_workers = match strategy {
                 PackExecStrategy::Serial => 1,
@@ -469,12 +483,15 @@ pub(super) fn run_odb_blob(
                 Arc::clone(&commit_graph_index),
                 Arc::clone(&commit_meta_seen),
             )?;
-            for output in outputs {
-                pack_exec_reports.push(output.report);
-                skipped_candidates.extend(output.skipped);
-                common_metrics.merge_from(&output.common_metrics);
-                append_scanned_blobs(&mut scanned, output.scanned);
-            }
+            collect_scheduler_outputs(
+                &plan_pack_ids,
+                outputs,
+                &mut completed_packs,
+                &mut pack_exec_reports,
+                &mut skipped_candidates,
+                &mut common_metrics,
+                &mut scanned,
+            )?;
         }
 
         if !loose.is_empty() {
@@ -574,6 +591,7 @@ pub(super) fn run_odb_blob(
             .map_err(|_| GitScanError::Io(io::Error::other("path arena still shared")))?,
         skipped_candidates,
         pack_exec_reports,
+        completed_packs,
         pack_plan_stats,
         pack_plan_config: pack_plan_cfg,
         pack_plan_delta_deps_total,
