@@ -561,6 +561,9 @@ pub fn run_production_worker(
         } => {
             let mut mirrors = LocalMirrorManager::new(mirror_root)
                 .map_err(ProductionBootstrapError::GitMirrorManager)?;
+            // Ephemeral: state lost on restart. Replace with a durable
+            // GitPersistenceBackend (e.g. PostgreSQL-backed) before
+            // production rollout.
             let git_backend = InMemoryGitPersistence::default();
             backends
                 .run_git(&mut mirrors, git_backend, identity, runtime)
