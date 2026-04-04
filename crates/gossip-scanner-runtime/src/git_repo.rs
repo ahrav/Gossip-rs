@@ -155,9 +155,15 @@ impl GitRepoRuntime {
             &persistence,
         ) {
             Ok(exec) => exec,
-            Err(_) if abort.load(Ordering::Relaxed) => {
+            Err(error) if abort.load(Ordering::Relaxed) => {
                 // Abort was signalled — treat as clean cancellation rather
-                // than surfacing an opaque driver error.
+                // than surfacing an opaque driver error. Log the original
+                // error so coincidental non-abort failures remain observable.
+                tracing::debug!(
+                    repo = %digest_repo_path(mirror.path()),
+                    %error,
+                    "scan error with abort signalled; treating as cancellation",
+                );
                 return Ok(GitRepoExecutionOutcome {
                     report: ScanReport::default(),
                     checkpoint_input: None,
@@ -386,8 +392,16 @@ pub(crate) fn scan_local_repo(
 
         // If cancellation was signalled mid-scan, convert the opaque driver
         // error into a clean early return so callers can distinguish abort
-        // from real failures.
-        if execution.is_err() && cancel.is_cancelled() {
+        // from real failures. Log the original error so coincidental
+        // non-abort failures remain observable.
+        if let Err(ref err) = execution
+            && cancel.is_cancelled()
+        {
+            tracing::debug!(
+                repo = %digest_repo_path(&canonical_repo),
+                error = %err,
+                "scan error with cancellation signalled; treating as cancellation",
+            );
             drop(event_tx);
             let _ = join_scoped(event_forwarder, "git event forwarder thread");
             return Ok((ScanReport::default(), None));

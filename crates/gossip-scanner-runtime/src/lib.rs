@@ -262,7 +262,7 @@ impl CancellationToken {
     /// `cancel()` returns. The amortized check interval dominates this delay
     /// in practice.
     #[must_use]
-    pub fn as_atomic(&self) -> &AtomicBool {
+    pub(crate) fn as_atomic(&self) -> &AtomicBool {
         self.cancelled.as_ref()
     }
 

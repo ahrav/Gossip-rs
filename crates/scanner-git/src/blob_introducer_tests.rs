@@ -1,6 +1,6 @@
 use super::{
-    merge_worker_results, per_worker_loose_limit, BlobIntroStats, BlobIntroducer, SeenSets,
-    WorkerResult,
+    merge_worker_results, per_worker_loose_limit, BlobIntroStats, BlobIntroWorker, BlobIntroducer,
+    SeenSets, WorkerResult,
 };
 use crate::byte_arena::{ByteArena, ByteRef};
 use crate::commit_graph::CommitGraphIndex;
@@ -15,6 +15,7 @@ use crate::pack_candidates::{LooseCandidate, PackCandidate};
 use crate::tree_candidate::{CandidateBuffer, CandidateContext, ChangeKind};
 use crate::tree_diff_limits::TreeDiffLimits;
 use crate::TreeSource;
+use gossip_stdx::atomic_seen_sets::AtomicSeenSets;
 
 use gix_commitgraph::Position;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -386,4 +387,38 @@ fn introduce_aborts_immediately_when_flag_is_preset() {
         sink.is_empty(),
         "no candidates should be emitted when aborting"
     );
+}
+
+/// Verifies that `is_aborted()` returns `true` when either or both abort
+/// flags are set, and `false` only when neither is set.
+#[test]
+fn blob_intro_worker_is_aborted_checks_both_flags() {
+    let external_abort = AtomicBool::new(false);
+    let error_abort = AtomicBool::new(false);
+    let seen = AtomicSeenSets::new(1, 1);
+    let limits = TreeDiffLimits::default();
+
+    let worker = BlobIntroWorker::new(&limits, 20, 16, &seen, &external_abort, &error_abort, false);
+
+    // Neither flag set.
+    assert!(
+        !worker.is_aborted(),
+        "expected false when both flags are clear"
+    );
+
+    // Only external_abort set.
+    external_abort.store(true, Ordering::Relaxed);
+    assert!(
+        worker.is_aborted(),
+        "expected true when external_abort is set"
+    );
+
+    // Reset external, set error_abort only.
+    external_abort.store(false, Ordering::Relaxed);
+    error_abort.store(true, Ordering::Release);
+    assert!(worker.is_aborted(), "expected true when error_abort is set");
+
+    // Both flags set.
+    external_abort.store(true, Ordering::Relaxed);
+    assert!(worker.is_aborted(), "expected true when both flags are set");
 }

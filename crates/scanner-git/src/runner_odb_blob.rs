@@ -687,6 +687,7 @@ fn run_serial_spill_retry(
     intro_start: Instant,
 ) -> Result<IntroResult, GitScanError> {
     let first_elapsed = intro_start.elapsed().as_nanos() as u64;
+    check_abort(abort)?;
 
     // Build a fresh serial introducer for the retry.
     let mut introducer = BlobIntroducer::new(

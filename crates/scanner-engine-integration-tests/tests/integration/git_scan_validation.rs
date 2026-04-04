@@ -946,3 +946,239 @@ fn extract_commit_id(line: &str) -> Option<u64> {
         .unwrap_or(rest.len());
     rest[..end].parse::<u64>().ok()
 }
+
+/// Verify that a delayed abort signal propagates through the parallel blob
+/// introduction path and prevents finalize persistence.
+///
+/// Unlike `aborted_scan_skips_finalize_persistence` which pre-sets the flag
+/// before calling `run_git_scan`, this test starts with `abort = false` and
+/// flips it from a background thread after a short delay. This exercises the
+/// cooperative cancellation check inside `introduce_parallel`'s worker loop.
+///
+/// The test is inherently timing-dependent: on very fast machines the scan
+/// may complete before the abort fires. Both outcomes are accepted — the key
+/// property is that when abort *is* observed, no finalize data is persisted.
+#[test]
+fn parallel_blob_intro_aborts_on_delayed_flag() {
+    if !git_available() {
+        eprintln!("git not available, skipping");
+        return;
+    }
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+
+    // Create enough commits to keep the parallel blob introduction busy
+    // long enough for the delayed abort to fire.
+    for i in 0..16 {
+        let name = format!("secret-{i}.txt");
+        let content = format!("prefix TOK_{i:08X} suffix\n");
+        let msg = format!("c{i}");
+        commit_file(repo, &name, &content, &msg);
+    }
+    ensure_artifacts(repo);
+
+    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let resolver = TestResolver { tip };
+    let watermark_store = TestWatermarkStore { watermark: None };
+    let persist_store = InMemoryPersistenceStore::default();
+
+    let mut config = base_config();
+    config.blob_intro_workers = 4;
+
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let abort_setter = std::sync::Arc::clone(&abort);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        abort_setter.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    let result = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &NeverSeenStore,
+        &watermark_store,
+        Some(&persist_store),
+        &config,
+        &abort,
+        std::sync::Arc::new(NullEventSink),
+    );
+
+    match result {
+        Err(ref err) => {
+            // The scan observed the abort — verify no finalize data leaked.
+            eprintln!("scan aborted as expected: {err}");
+            assert!(
+                persist_store.data_ops.borrow().is_empty(),
+                "aborted scan must not persist data ops"
+            );
+            assert!(
+                persist_store.watermark_ops.borrow().is_empty(),
+                "aborted scan must not persist watermark ops"
+            );
+        }
+        Ok(_) => {
+            // The scan completed before the background thread set the flag.
+            // This is acceptable on fast machines; the abort path is still
+            // covered by `aborted_scan_skips_finalize_persistence`.
+            eprintln!(
+                "scan completed before abort fired — timing-dependent, \
+                 still validates no crash under concurrent flag flip"
+            );
+        }
+    }
+}
+
+/// Verify that flipping the abort flag mid-scan causes a clean abort and
+/// prevents finalize persistence.
+///
+/// Unlike `aborted_scan_skips_finalize_persistence` which pre-sets the flag,
+/// this test starts with `abort = false` and flips it from a scoped thread
+/// after a short delay. This exercises the cooperative `check_abort` calls
+/// at stage boundaries inside the scan pipeline.
+///
+/// Timing-dependent: on fast machines the scan may complete before the abort
+/// fires. Both outcomes are accepted.
+#[test]
+fn mid_scan_abort_stops_execution_and_skips_finalize() {
+    if !git_available() {
+        eprintln!("git not available, skipping");
+        return;
+    }
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+
+    // Create enough commits to keep the scan busy long enough for the
+    // delayed abort to fire on most machines.
+    for i in 0..25 {
+        commit_file(
+            repo,
+            &format!("file_{i:03}.txt"),
+            &format!("line1\nprefix TOK_SECRET_{i:03} suffix\nline3\n"),
+            &format!("commit {i}"),
+        );
+    }
+    ensure_artifacts(repo);
+
+    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let resolver = TestResolver { tip };
+    let watermark_store = TestWatermarkStore { watermark: None };
+    let persist_store = InMemoryPersistenceStore::default();
+    let config = base_config();
+    let abort = AtomicBool::new(false);
+
+    // `std::thread::scope` guarantees the setter thread joins before `abort`
+    // is dropped, so the `&AtomicBool` reference remains valid for the
+    // entire scan duration.
+    let result = std::thread::scope(|s| {
+        let abort_ref: &AtomicBool = &abort;
+        s.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            abort_ref.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        run_git_scan(
+            repo,
+            std::sync::Arc::new(test_engine()),
+            &resolver,
+            &NeverSeenStore,
+            &watermark_store,
+            Some(&persist_store),
+            &config,
+            abort_ref,
+            std::sync::Arc::new(NullEventSink),
+        )
+    });
+
+    match result {
+        Err(ref e) => {
+            assert!(
+                matches!(
+                    e,
+                    GitScanError::TreeDiff(scanner_git::TreeDiffError::Aborted)
+                ),
+                "expected Aborted, got {e:?}"
+            );
+            assert!(persist_store.data_ops.borrow().is_empty());
+            assert!(persist_store.watermark_ops.borrow().is_empty());
+        }
+        Ok(_) => {
+            // Scan completed before the abort fired — acceptable on fast machines.
+        }
+    }
+}
+
+/// Verify that the abort flag is checked at stage boundaries in the
+/// DiffHistory scan mode.
+///
+/// This exercises the `check_abort` call added after `bridge.finish()` in
+/// `runner_diff_history.rs`. Timing-dependent: both abort and completion
+/// are accepted.
+#[test]
+fn stage_boundary_abort_in_diff_history_mode() {
+    if !git_available() {
+        eprintln!("git not available, skipping");
+        return;
+    }
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+
+    // Create enough commits for meaningful work in diff-history mode.
+    for i in 0..15 {
+        commit_file(
+            repo,
+            &format!("src_{i:02}.txt"),
+            &format!("content TOK_DIFFHIST_{i:02} here\n"),
+            &format!("diff-history commit {i}"),
+        );
+    }
+    ensure_artifacts(repo);
+
+    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let resolver = TestResolver { tip };
+    let watermark_store = TestWatermarkStore { watermark: None };
+    let persist_store = InMemoryPersistenceStore::default();
+    let mut config = base_config();
+    config.scan_mode = GitScanMode::DiffHistory;
+    let abort = AtomicBool::new(false);
+
+    let result = std::thread::scope(|s| {
+        let abort_ref: &AtomicBool = &abort;
+        s.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            abort_ref.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        run_git_scan(
+            repo,
+            std::sync::Arc::new(test_engine()),
+            &resolver,
+            &NeverSeenStore,
+            &watermark_store,
+            Some(&persist_store),
+            &config,
+            abort_ref,
+            std::sync::Arc::new(NullEventSink),
+        )
+    });
+
+    match result {
+        Err(ref e) => {
+            assert!(
+                matches!(
+                    e,
+                    GitScanError::TreeDiff(scanner_git::TreeDiffError::Aborted)
+                ),
+                "expected Aborted, got {e:?}"
+            );
+            assert!(persist_store.data_ops.borrow().is_empty());
+            assert!(persist_store.watermark_ops.borrow().is_empty());
+        }
+        Ok(_) => {
+            // Scan completed before abort fired — acceptable on fast machines.
+        }
+    }
+}

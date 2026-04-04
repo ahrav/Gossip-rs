@@ -1062,6 +1062,21 @@ fn estimate_locality_pressure_known_deps() {
     );
 }
 
+#[test]
+fn abort_signal_tracks_underlying_atomic() {
+    let flag = AtomicBool::new(false);
+    // SAFETY: flag lives for the duration of this test; no threads are spawned.
+    let signal = unsafe { AbortSignal::new(&flag) };
+
+    assert!(!signal.is_set(), "signal should be unset initially");
+
+    flag.store(true, Ordering::Release);
+    assert!(
+        signal.is_set(),
+        "signal should reflect the underlying atomic"
+    );
+}
+
 /// Exercises the full lifecycle of `SchedulerPackWorkerRuntime`:
 /// construction (with the same `transmute` pattern used in production),
 /// borrowing field access, and destruction via the custom `Drop` impl.

@@ -304,10 +304,12 @@ pub(super) fn run_diff_history(
         ),
         mapping_cfg,
     );
+    check_abort(abort)?;
     let spill_stats = spiller.finalize(seen_store, seen_persister, &mut bridge)?;
     perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
     let mapping_arena = Arc::new(mapping_arena);
+    check_abort(abort)?;
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
     perf_let!(pack_plan_start = Instant::now());

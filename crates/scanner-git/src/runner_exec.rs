@@ -1735,12 +1735,16 @@ fn execute_plan_tasks(
     let tasks: Vec<SchedulerPackTask> = (0..plan_count)
         .map(|seq| SchedulerPackTask::ExecPlan { seq })
         .collect();
-    ex.spawn_external_batch(tasks)
-        .map_err(|_| scheduler_queue_rejected_error(false))?;
+    let spawn_result = ex.spawn_external_batch(tasks);
     // SAFETY: This join is load-bearing for `AbortSignal` soundness — all worker
     // threads must complete before the caller's `&AtomicBool` borrow can expire.
+    // The join MUST run even when `spawn_external_batch` fails, because the
+    // `Executor` has no `Drop` impl and dropping a detached `JoinHandle`
+    // would let worker threads outlive the borrowed flag.
     // See the `AbortSignal` definition above.
     ex.join();
+
+    spawn_result.map_err(|_| scheduler_queue_rejected_error(false))?;
 
     // Order matters: check scheduler error first (may have set the abort flag),
     // then check external abort before collecting outputs, because aborted
@@ -1951,12 +1955,16 @@ fn execute_sharded_tasks(
         },
     );
 
-    ex.spawn_external_batch(tasks)
-        .map_err(|_| scheduler_queue_rejected_error(true))?;
+    let spawn_result = ex.spawn_external_batch(tasks);
     // SAFETY: This join is load-bearing for `AbortSignal` soundness — all worker
     // threads must complete before the caller's `&AtomicBool` borrow can expire.
+    // The join MUST run even when `spawn_external_batch` fails, because the
+    // `Executor` has no `Drop` impl and dropping a detached `JoinHandle`
+    // would let worker threads outlive the borrowed flag.
     // See the `AbortSignal` definition above.
     ex.join();
+
+    spawn_result.map_err(|_| scheduler_queue_rejected_error(true))?;
 
     // Order matters: check scheduler error first (may have set the abort flag),
     // then check external abort before collecting outputs, because aborted
