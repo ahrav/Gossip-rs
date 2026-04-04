@@ -21,8 +21,8 @@ use scanner_git::events::{NullEventSink, VecEventSink};
 use scanner_git::{
     ArtifactAcquireError, CommitLoadError, FinalizeOutcome, GitScanConfig, GitScanError,
     GitScanMode, GitScanReport, GitScanResult, InMemoryPersistenceStore, MappingCandidateKind,
-    NeverSeenStore, OidBytes, PersistError, PersistenceStore, RefWatermarkStore, RepoOpenError,
-    SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig,
+    NeverSeenStore, OidBytes, PersistError, PersistenceStore, RefWatermark, RefWatermarkStore,
+    RepoOpenError, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig,
     StartSetResolver, WriteOp, run_git_scan,
 };
 
@@ -164,7 +164,7 @@ impl StartSetResolver for TestResolver {
 
 /// Watermark store that returns a fixed optional watermark for all refs.
 struct TestWatermarkStore {
-    watermark: Option<OidBytes>,
+    watermark: Option<scanner_git::RefWatermark>,
 }
 
 impl RefWatermarkStore for TestWatermarkStore {
@@ -174,7 +174,7 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         Ok(ref_names.iter().map(|_| self.watermark).collect())
     }
 }
@@ -225,7 +225,15 @@ impl PersistenceStore for RetryStore {
 /// The config pins `repo_id`, `policy_hash`, and `start_set` to keep the
 /// test inputs deterministic. Persistence is routed to an in-memory store.
 fn run_scan(repo: &Path, watermark: Option<OidBytes>) -> GitScanResult {
-    run_scan_with_config(repo, watermark, base_config()).unwrap()
+    run_scan_with_config(
+        repo,
+        watermark.map(|oid| RefWatermark {
+            oid,
+            generation: None,
+        }),
+        base_config(),
+    )
+    .unwrap()
 }
 
 fn base_config() -> GitScanConfig {
@@ -239,7 +247,7 @@ fn base_config() -> GitScanConfig {
 
 fn run_scan_with_config(
     repo: &Path,
-    watermark: Option<OidBytes>,
+    watermark: Option<RefWatermark>,
     config: GitScanConfig,
 ) -> Result<GitScanResult, GitScanError> {
     let engine = test_engine();
@@ -693,7 +701,12 @@ fn run_scan_with_events(
     let engine = test_engine();
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
-    let watermark_store = TestWatermarkStore { watermark };
+    let watermark_store = TestWatermarkStore {
+        watermark: watermark.map(|oid| RefWatermark {
+            oid,
+            generation: None,
+        }),
+    };
     #[cfg(feature = "rocksdb")]
     let persist_store =
         InMemoryPersistenceStore::with_seen_scope(config.repo_id, config.policy_hash);

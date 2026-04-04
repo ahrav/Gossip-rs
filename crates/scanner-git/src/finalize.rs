@@ -84,6 +84,11 @@ pub struct RefEntry {
     pub ref_name: Vec<u8>,
     /// Current tip OID for this ref.
     pub tip_oid: OidBytes,
+    /// Current tip generation captured by the runner from the commit graph.
+    ///
+    /// Finalize is a pure builder, so it persists the value it is given
+    /// instead of consulting the commit graph directly.
+    pub tip_generation: u32,
 }
 
 /// Input to the finalize builder.
@@ -449,6 +454,10 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
                 a.tip_oid, b.tip_oid,
                 "duplicate ref_name with different tip_oid"
             );
+            debug_assert_eq!(
+                a.tip_generation, b.tip_generation,
+                "duplicate ref_name with different tip_generation"
+            );
         }
         same
     });
@@ -551,7 +560,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
     if complete {
         watermark_ops.reserve(input.refs.len());
         for r in &input.refs {
-            let (val_buf, val_len) = encode_ref_watermark_value(&r.tip_oid);
+            let (val_buf, val_len) = encode_ref_watermark_value(&r.tip_oid, r.tip_generation);
             watermark_ops.push(WriteOp {
                 key: build_ref_wm_key(
                     input.repo_id,
@@ -674,6 +683,7 @@ mod tests {
             refs: vec![RefEntry {
                 ref_name: b"refs/heads/main".to_vec(),
                 tip_oid: test_oid(0x01),
+                tip_generation: 1,
             }],
             scanned_blobs: vec![
                 ScannedBlob {
@@ -934,14 +944,17 @@ mod tests {
                 RefEntry {
                     ref_name: b"refs/heads/z-branch".to_vec(),
                     tip_oid: test_oid(0x01),
+                    tip_generation: 10,
                 },
                 RefEntry {
                     ref_name: b"refs/heads/a-branch".to_vec(),
                     tip_oid: test_oid(0x02),
+                    tip_generation: 20,
                 },
                 RefEntry {
                     ref_name: b"refs/heads/main".to_vec(),
                     tip_oid: test_oid(0x03),
+                    tip_generation: 30,
                 },
             ],
             scanned_blobs: vec![],
@@ -969,6 +982,7 @@ mod tests {
             refs: vec![RefEntry {
                 ref_name: b"refs/heads/main".to_vec(),
                 tip_oid: tip,
+                tip_generation: 41,
             }],
             scanned_blobs: vec![],
             finding_arena: &finding_arena,
@@ -980,5 +994,6 @@ mod tests {
         let wm = &out.watermark_ops[0];
         assert_eq!(wm.value[0], 20);
         assert_eq!(&wm.value[1..21], tip.as_slice());
+        assert_eq!(&wm.value[21..25], &41u32.to_le_bytes());
     }
 }

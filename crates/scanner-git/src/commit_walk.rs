@@ -38,6 +38,7 @@ use super::commit_walk_limits::CommitWalkLimits;
 use super::errors::CommitPlanError;
 use super::object_id::OidBytes;
 use super::repo_open::{RepoJobState, StartSetRef};
+use super::watermark_keys::RefWatermark;
 
 // =========================================================================
 // Constants
@@ -543,6 +544,23 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
         })
     }
 
+    /// Resolves a persisted watermark OID and rejects stale generation data
+    /// before any ancestry walk.
+    fn resolve_current_watermark(
+        &self,
+        watermark: RefWatermark,
+    ) -> Result<Option<Position>, CommitPlanError> {
+        let Some(wm_pos) = self.cg.lookup(&watermark.oid)? else {
+            return Ok(None);
+        };
+        if let Some(stored_generation) = watermark.generation {
+            if self.cg.generation(wm_pos) != stored_generation {
+                return Ok(None);
+            }
+        }
+        Ok(Some(wm_pos))
+    }
+
     fn init_next_ref(&mut self) -> Result<bool, CommitPlanError> {
         if self.ref_idx >= self.refs.len() {
             return Ok(false);
@@ -571,10 +589,10 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
                 if checks >= self.limits.max_new_ref_skip_checks {
                     break;
                 }
-                let Some(wm_oid) = other.watermark else {
+                let Some(watermark) = other.watermark else {
                     continue;
                 };
-                let Some(wm_pos) = self.cg.lookup(&wm_oid)? else {
+                let Some(wm_pos) = self.resolve_current_watermark(watermark)? else {
                     continue;
                 };
                 checks += 1;
@@ -596,10 +614,12 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
         }
 
         // Resolve and validate watermark. Non-ancestor watermarks are ignored,
-        // which falls back to a full-history walk for that ref.
+        // which falls back to a full-history walk for that ref. A generation
+        // mismatch is an O(1) force-push detector, but matching generations
+        // still require an ancestry walk because siblings can share a generation.
         let mut wm_pos_opt: Option<Position> = None;
-        if let Some(wm_oid) = r.watermark {
-            if let Some(wm_pos) = self.cg.lookup(&wm_oid)? {
+        if let Some(watermark) = r.watermark {
+            if let Some(wm_pos) = self.resolve_current_watermark(watermark)? {
                 if is_ancestor(
                     self.cg,
                     wm_pos,
@@ -961,7 +981,106 @@ impl PosQueue {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::byte_arena::ByteRef;
+
+    struct MockGraph {
+        oids: Vec<OidBytes>,
+        lookup: HashMap<OidBytes, Position>,
+        generations: Vec<u32>,
+        parents: Vec<Vec<Position>>,
+        collect_parents_calls: Cell<u32>,
+    }
+
+    impl MockGraph {
+        fn linear(count: u32) -> Self {
+            let mut oids = Vec::with_capacity(count as usize);
+            let mut lookup = HashMap::with_capacity(count as usize);
+            let mut generations = Vec::with_capacity(count as usize);
+            let mut parents = Vec::with_capacity(count as usize);
+
+            for idx in 0..count {
+                let oid = test_oid(idx as u8);
+                let pos = Position(idx);
+                oids.push(oid);
+                lookup.insert(oid, pos);
+                generations.push(idx + 1);
+                parents.push(if idx == 0 {
+                    Vec::new()
+                } else {
+                    vec![Position(idx - 1)]
+                });
+            }
+
+            Self {
+                oids,
+                lookup,
+                generations,
+                parents,
+                collect_parents_calls: Cell::new(0),
+            }
+        }
+
+        fn oid(&self, pos: Position) -> OidBytes {
+            self.oids[pos.0 as usize]
+        }
+    }
+
+    impl CommitGraph for MockGraph {
+        fn num_commits(&self) -> u32 {
+            self.oids.len() as u32
+        }
+
+        fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, CommitPlanError> {
+            Ok(self.lookup.get(oid).copied())
+        }
+
+        fn generation(&self, pos: Position) -> u32 {
+            self.generations[pos.0 as usize]
+        }
+
+        fn collect_parents(
+            &self,
+            pos: Position,
+            max_parents: u32,
+            scratch: &mut ParentScratch,
+        ) -> Result<(), CommitPlanError> {
+            self.collect_parents_calls
+                .set(self.collect_parents_calls.get() + 1);
+            scratch.clear();
+            for &parent in &self.parents[pos.0 as usize] {
+                scratch.push(parent, max_parents)?;
+            }
+            Ok(())
+        }
+
+        fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+            Ok(self.oid(pos))
+        }
+
+        fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+            Ok(self.oid(pos))
+        }
+
+        fn committer_timestamp(&self, pos: Position) -> u64 {
+            u64::from(pos.0)
+        }
+    }
+
+    fn test_oid(seed: u8) -> OidBytes {
+        OidBytes::sha1([seed; 20])
+    }
+
+    fn test_ref(tip: OidBytes, watermark: Option<RefWatermark>) -> StartSetRef {
+        StartSetRef {
+            name: ByteRef::new(0, 0),
+            tip,
+            watermark,
+        }
+    }
 
     #[test]
     fn bitset_initially_unset() {
@@ -1096,5 +1215,70 @@ mod tests {
         }
         let err = scratch.push(Position(4), 4).unwrap_err();
         assert!(matches!(err, CommitPlanError::TooManyParents { .. }));
+    }
+
+    #[test]
+    fn generation_mismatch_skips_ancestry_walk() {
+        let graph = MockGraph::linear(3);
+        let watermark_pos = Position(1);
+        let refs = vec![test_ref(
+            graph.oid(Position(2)),
+            Some(RefWatermark {
+                oid: graph.oid(watermark_pos),
+                generation: Some(graph.generation(watermark_pos) + 10),
+            }),
+        )];
+        let mut iter = CommitPlanIter::new_from_refs(&refs, &graph, CommitWalkLimits::DEFAULT)
+            .expect("iterator");
+
+        assert!(iter.init_next_ref().expect("init"));
+        assert_eq!(iter.cur_wm, None);
+        assert_eq!(graph.collect_parents_calls.get(), 0);
+    }
+
+    #[test]
+    fn generation_match_still_checks_ancestry() {
+        let graph = MockGraph::linear(3);
+        let watermark_pos = Position(1);
+        let refs = vec![test_ref(
+            graph.oid(Position(2)),
+            Some(RefWatermark {
+                oid: graph.oid(watermark_pos),
+                generation: Some(graph.generation(watermark_pos)),
+            }),
+        )];
+        let mut iter = CommitPlanIter::new_from_refs(&refs, &graph, CommitWalkLimits::DEFAULT)
+            .expect("iterator");
+
+        assert!(iter.init_next_ref().expect("init"));
+        assert_eq!(iter.cur_wm, Some(watermark_pos));
+        assert!(
+            graph.collect_parents_calls.get() > 0,
+            "matching generations must still run the ancestry check"
+        );
+    }
+
+    #[test]
+    fn new_ref_skip_ignores_stale_generation_mismatch() {
+        let graph = MockGraph::linear(3);
+        let stale_watermark = RefWatermark {
+            oid: graph.oid(Position(2)),
+            generation: Some(graph.generation(Position(2)) + 1),
+        };
+        let refs = vec![
+            test_ref(graph.oid(Position(1)), None),
+            test_ref(graph.oid(Position(2)), Some(stale_watermark)),
+        ];
+        let mut iter = CommitPlanIter::new_from_refs(&refs, &graph, CommitWalkLimits::DEFAULT)
+            .expect("iterator");
+
+        assert!(iter.init_next_ref().expect("init"));
+        assert_eq!(iter.cur_tip, Some(Position(1)));
+        assert_eq!(iter.ref_idx, 1);
+        assert_eq!(
+            graph.collect_parents_calls.get(),
+            0,
+            "stale generations must not trigger the new-ref skip ancestry walk"
+        );
     }
 }

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use gix_commitgraph::Position;
 
+use crate::watermark_keys::RefWatermark;
 use crate::{CommitGraph, CommitPlanError, OidBytes, ParentScratch};
 
 use super::convert::{to_object_format, to_oid_bytes};
@@ -223,7 +224,10 @@ mod tests {
         let mut arena = ByteArena::with_capacity(128);
         let name = arena.intern(b"refs/heads/main").expect("ref name");
         let tip = OidBytes::from_slice(&oid(3));
-        let watermark = Some(OidBytes::from_slice(&oid(9)));
+        let watermark = Some(RefWatermark {
+            oid: OidBytes::from_slice(&oid(9)),
+            generation: Some(1),
+        });
         let refs = vec![StartSetRef {
             name,
             tip,

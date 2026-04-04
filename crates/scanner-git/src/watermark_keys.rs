@@ -19,6 +19,16 @@
 //! Big-endian repo_id ensures lexicographic key ordering groups by repo.
 //! Trailing null byte terminates the variable-length ref_name unambiguously
 //! (Git ref names cannot contain NUL bytes per `git-check-ref-format`).
+//!
+//! # Value Format
+//!
+//! ```text
+//! old ref_watermark value:
+//!   oid_len (1B) || oid (20B or 32B)
+//!
+//! current ref_watermark value:
+//!   oid_len (1B) || oid (20B or 32B) || generation_le (4B)
+//! ```
 
 use super::object_id::OidBytes;
 use super::start_set::StartSetId;
@@ -33,6 +43,19 @@ pub const NS_REF_WATERMARK: [u8; 2] = *b"rw";
 ///
 /// `2 (ns) + 8 (repo_id) + 32 (policy_hash) + 32 (start_set_id) + 1 (null) = 75`
 const RW_KEY_FIXED_OVERHEAD: usize = 2 + 8 + 32 + 32 + 1;
+
+/// Persisted ref watermark state.
+///
+/// `generation` is `None` for watermarks written before generation numbers
+/// were stored alongside the OID. The struct is `Copy` because both fields
+/// are fixed-width value types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefWatermark {
+    /// Commit OID captured at the last completed scan frontier.
+    pub oid: OidBytes,
+    /// Commit generation number captured with the OID, when available.
+    pub generation: Option<u32>,
+}
 
 /// A reference to a key within a `KeyArena`.
 ///
@@ -216,24 +239,26 @@ impl KeyArena {
     }
 }
 
-/// Encodes a ref watermark value (OID) into a fixed buffer.
+/// Encodes a ref watermark value into a fixed buffer.
 ///
-/// Value format: `oid_len (u8) + oid bytes (20 or 32)`
+/// Value format: `oid_len (u8) + oid bytes (20 or 32) + generation_le (4B)`
 ///
 /// Returns `(buffer, used_len)` where `buffer[..used_len]` is the encoded value.
-/// Maximum `used_len` is 33 (1 + 32 for SHA-256).
-pub fn encode_ref_watermark_value(oid: &OidBytes) -> ([u8; 33], usize) {
-    let mut out = [0u8; 33];
+/// Maximum `used_len` is 37.
+pub fn encode_ref_watermark_value(oid: &OidBytes, generation: u32) -> ([u8; 37], usize) {
+    debug_assert!(generation > 0, "generation 0 should not be stored");
+    let mut out = [0u8; 37];
     let n = oid.len() as usize;
 
     debug_assert!(n == 20 || n == 32, "OID len must be 20 or 32, got {n}");
 
     out[0] = oid.len();
     out[1..1 + n].copy_from_slice(oid.as_slice());
-    (out, 1 + n)
+    out[1 + n..1 + n + 4].copy_from_slice(&generation.to_le_bytes());
+    (out, 1 + n + 4)
 }
 
-/// Decodes a ref watermark value back to an `OidBytes`.
+/// Decodes a ref watermark value.
 ///
 /// The input slice must be exactly the encoded value (no trailing bytes).
 /// This matches the semantics of KV store point lookups (MultiGet), where
@@ -242,8 +267,9 @@ pub fn encode_ref_watermark_value(oid: &OidBytes) -> ([u8; 33], usize) {
 /// Returns `None` if the value is malformed:
 /// - Empty input
 /// - OID length is not 20 or 32
-/// - Actual byte count does not match declared length
-pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<OidBytes> {
+/// - Actual byte count is neither the legacy OID-only length nor the current
+///   OID-plus-generation length
+pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<RefWatermark> {
     if bytes.is_empty() {
         return None;
     }
@@ -251,10 +277,25 @@ pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<OidBytes> {
     if oid_len != 20 && oid_len != 32 {
         return None;
     }
-    if bytes.len() != 1 + oid_len {
+    let legacy_len = 1 + oid_len;
+    let current_len = legacy_len + 4;
+    if bytes.len() != legacy_len && bytes.len() != current_len {
         return None;
     }
-    OidBytes::try_from_slice(&bytes[1..])
+    let oid = OidBytes::try_from_slice(&bytes[1..legacy_len])?;
+    match bytes.len() {
+        len if len == legacy_len => Some(RefWatermark {
+            oid,
+            generation: None,
+        }),
+        len if len == current_len => Some(RefWatermark {
+            oid,
+            generation: Some(u32::from_le_bytes(
+                bytes[legacy_len..current_len].try_into().ok()?,
+            )),
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -370,25 +411,58 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_sha1() {
         let oid = test_oid_sha1(0xab);
-        let (buf, len) = encode_ref_watermark_value(&oid);
+        let generation = 17;
+        let (buf, len) = encode_ref_watermark_value(&oid, generation);
 
-        assert_eq!(len, 21);
+        assert_eq!(len, 25);
         assert_eq!(buf[0], 20);
+        assert_eq!(&buf[21..25], &generation.to_le_bytes());
 
         let decoded = decode_ref_watermark_value(&buf[..len]).unwrap();
-        assert_eq!(decoded, oid);
+        assert_eq!(
+            decoded,
+            RefWatermark {
+                oid,
+                generation: Some(generation),
+            }
+        );
     }
 
     #[test]
     fn encode_decode_roundtrip_sha256() {
         let oid = test_oid_sha256(0xcd);
-        let (buf, len) = encode_ref_watermark_value(&oid);
+        let generation = 99;
+        let (buf, len) = encode_ref_watermark_value(&oid, generation);
 
-        assert_eq!(len, 33);
+        assert_eq!(len, 37);
         assert_eq!(buf[0], 32);
+        assert_eq!(&buf[33..37], &generation.to_le_bytes());
 
         let decoded = decode_ref_watermark_value(&buf[..len]).unwrap();
-        assert_eq!(decoded, oid);
+        assert_eq!(
+            decoded,
+            RefWatermark {
+                oid,
+                generation: Some(generation),
+            }
+        );
+    }
+
+    #[test]
+    fn decode_legacy_value_sets_generation_none() {
+        let oid = test_oid_sha1(0xab);
+        let mut buf = [0u8; 21];
+        buf[0] = oid.len();
+        buf[1..21].copy_from_slice(oid.as_slice());
+
+        let decoded = decode_ref_watermark_value(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            RefWatermark {
+                oid,
+                generation: None,
+            }
+        );
     }
 
     #[test]
@@ -412,7 +486,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized() {
-        let mut buf = [0u8; 33];
+        let mut buf = [0u8; 38];
         buf[0] = 20;
         assert!(decode_ref_watermark_value(&buf).is_none());
     }
@@ -420,11 +494,11 @@ mod tests {
     #[test]
     fn decode_rejects_trailing_bytes() {
         let oid = test_oid_sha1(0xab);
-        let (buf, len) = encode_ref_watermark_value(&oid);
+        let (buf, len) = encode_ref_watermark_value(&oid, 5);
 
         assert!(decode_ref_watermark_value(&buf[..len]).is_some());
 
-        let mut extended = [0u8; 34];
+        let mut extended = [0u8; 38];
         extended[..len].copy_from_slice(&buf[..len]);
         assert!(decode_ref_watermark_value(&extended[..len + 1]).is_none());
     }

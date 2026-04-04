@@ -48,8 +48,8 @@ use gossip_contracts::{
 };
 use scanner_git::{
     FinalizeOutcome, FinalizeOutput, NS_SEEN_BLOB, OidBytes, PersistError, PersistenceStore,
-    RefWatermarkStore, RepoOpenError, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore,
-    SpillError, StartSetId, WriteOp, decode_ref_watermark_value,
+    RefWatermark, RefWatermarkStore, RepoOpenError, SeenBitmapDelta, SeenBitmapPersister,
+    SeenBlobStore, SpillError, StartSetId, WriteOp, decode_ref_watermark_value,
     finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key},
     roaring_seen::{RoaringSeenBitmap, RoaringSeenStore},
 };
@@ -469,7 +469,7 @@ where
 /// the adapter's identity before issuing backend reads, because a mismatch
 /// would silently cross-pollinate watermarks between different scan scopes.
 ///
-/// Returns one `Option<OidBytes>` per input ref name, preserving input order.
+/// Returns one `Option<RefWatermark>` per input ref name, preserving input order.
 /// `None` means no watermark exists for that ref (first scan or ref was pruned).
 impl<B> RefWatermarkStore for GitPersistenceAdapter<B>
 where
@@ -481,7 +481,7 @@ where
         policy_hash: [u8; 32],
         start_set_id: StartSetId,
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<RefWatermark>>, RepoOpenError> {
         // Watermark keys and seen-bitmap keys must be scoped to the same
         // (repo_id, policy_hash) identity. A mismatch would silently return
         // watermarks for a different scope than the seen-bitmap uses.
@@ -948,8 +948,8 @@ mod tests {
         let ref_a = b"refs/heads/main".as_slice();
         let ref_b = b"refs/tags/v1".as_slice();
 
-        let value_a = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x11; 20]));
-        let value_b = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x22; 20]));
+        let value_a = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x11; 20]), 11);
+        let value_b = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x22; 20]), 22);
         backend.set(
             build_ref_wm_key(7, &[0x55; 32], &start_set_id, ref_a),
             value_a.0[..value_a.1].to_vec(),
@@ -971,10 +971,43 @@ mod tests {
         assert_eq!(
             loaded,
             vec![
-                Some(OidBytes::sha1([0x22; 20])),
+                Some(RefWatermark {
+                    oid: OidBytes::sha1([0x22; 20]),
+                    generation: Some(22),
+                }),
                 None,
-                Some(OidBytes::sha1([0x11; 20])),
+                Some(RefWatermark {
+                    oid: OidBytes::sha1([0x11; 20]),
+                    generation: Some(11),
+                }),
             ]
+        );
+    }
+
+    #[test]
+    fn load_watermarks_decodes_legacy_values_without_generation() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 7, [0x77; 32]);
+        let start_set_id = [0x88; 32];
+        let ref_name = b"refs/heads/main".as_slice();
+        let oid = OidBytes::sha1([0x33; 20]);
+        let mut legacy = vec![oid.len()];
+        legacy.extend_from_slice(oid.as_slice());
+        backend.set(
+            build_ref_wm_key(7, &[0x77; 32], &start_set_id, ref_name),
+            legacy,
+        );
+
+        let loaded = adapter
+            .load_watermarks(7, [0x77; 32], start_set_id, &[ref_name])
+            .expect("load legacy watermark");
+
+        assert_eq!(
+            loaded,
+            vec![Some(RefWatermark {
+                oid,
+                generation: None,
+            })]
         );
     }
 

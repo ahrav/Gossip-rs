@@ -12,7 +12,7 @@
 
 use proptest::prelude::*;
 
-use scanner_git::{ByteRef, OidBytes};
+use scanner_git::{ByteRef, OidBytes, RefWatermark};
 use scanner_git::{
     CommitGraph, CommitPlanError, CommitPlanIter, CommitWalkLimits, ParentScratch, StartSetRef,
 };
@@ -184,7 +184,10 @@ proptest! {
             refs.push(StartSetRef {
                 name: ByteRef::new(0, 0),
                 tip: TestCommitGraph::oid_for_pos(tip.0),
-                watermark: Some(TestCommitGraph::oid_for_pos(wm.0)),
+                watermark: Some(RefWatermark {
+                    oid: TestCommitGraph::oid_for_pos(wm.0),
+                    generation: Some(graph.generation(wm)),
+                }),
             });
         }
 

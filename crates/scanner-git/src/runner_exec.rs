@@ -37,6 +37,7 @@ use memmap2::Mmap;
 
 use super::byte_arena::ByteArena;
 use super::bytes::BytesView;
+use super::commit_walk::CommitGraph;
 use super::engine_adapter::{
     CommitMetaContext, EngineAdapter, EngineAdapterConfig, GitScanCommonMetrics, ScannedBlobs,
 };
@@ -310,12 +311,17 @@ pub(super) fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanErro
 /// (populated during repo discovery). Each entry's ref name is resolved
 /// through the repo's shared name table so the resulting `RefEntry` vector
 /// carries owned byte names suitable for the finalize stage.
-pub(super) fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
+pub(super) fn build_ref_entries<CG: CommitGraph>(repo: &RepoJobState, cg: &CG) -> Vec<RefEntry> {
     let mut refs = Vec::with_capacity(repo.start_set.len());
     for r in &repo.start_set {
+        let tip_pos = cg
+            .lookup(&r.tip)
+            .expect("start set tips must exist in the commit graph")
+            .expect("start set tips must resolve in the commit graph");
         refs.push(RefEntry {
             ref_name: repo.ref_names.get(r.name).to_vec(),
             tip_oid: r.tip,
+            tip_generation: cg.generation(tip_pos),
         });
     }
     refs

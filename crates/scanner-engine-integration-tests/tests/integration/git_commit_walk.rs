@@ -150,7 +150,7 @@ impl StartSetResolver for TestResolver {
 }
 
 struct TestWatermarkStore {
-    watermarks: Vec<(Vec<u8>, Option<OidBytes>)>,
+    watermarks: Vec<(Vec<u8>, Option<scanner_git::RefWatermark>)>,
 }
 
 impl RefWatermarkStore for TestWatermarkStore {
@@ -160,7 +160,7 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         let mut out = Vec::with_capacity(ref_names.len());
         for name in ref_names {
             let mut found = None;
@@ -208,7 +208,13 @@ fn commit_walk_linear_history() {
         refs: vec![(b"refs/heads/main".to_vec(), tip_oid)],
     };
     let watermark_store = TestWatermarkStore {
-        watermarks: vec![(b"refs/heads/main".to_vec(), Some(watermark_oid))],
+        watermarks: vec![(
+            b"refs/heads/main".to_vec(),
+            Some(scanner_git::RefWatermark {
+                oid: watermark_oid,
+                generation: None,
+            }),
+        )],
     };
 
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
@@ -302,7 +308,13 @@ fn commit_walk_watermark_not_ancestor_scans_full_history() {
         refs: vec![(b"refs/heads/main".to_vec(), tip_oid)],
     };
     let watermark_store = TestWatermarkStore {
-        watermarks: vec![(b"refs/heads/main".to_vec(), Some(other_oid))],
+        watermarks: vec![(
+            b"refs/heads/main".to_vec(),
+            Some(scanner_git::RefWatermark {
+                oid: other_oid,
+                generation: None,
+            }),
+        )],
     };
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 

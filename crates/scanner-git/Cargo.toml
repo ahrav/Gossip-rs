@@ -66,6 +66,10 @@ name = "commit_graph_generation"
 harness = false
 
 [[bench]]
+name = "commit_walk_watermark"
+harness = false
+
+[[bench]]
 name = "git_scan_parse"
 harness = false
 
