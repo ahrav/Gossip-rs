@@ -1,5 +1,6 @@
 use super::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::delta_test_helpers::zlib_compress;
 use crate::object_id::OidBytes;
@@ -902,12 +903,14 @@ fn loose_blob_with_secret_is_scanned() {
     let path_ref = paths.intern(b"src/lib.rs").unwrap();
     let candidate = loose_candidate(path_ref, oid);
     let mut skipped = Vec::new();
+    let abort = AtomicBool::new(false);
 
     scan_loose_candidates(
         &[candidate],
         &paths,
         &mut adapter,
         &mut pack_io,
+        &abort,
         &mut skipped,
     )
     .unwrap();
@@ -931,12 +934,14 @@ fn missing_loose_object_is_skipped() {
     let path_ref = paths.intern(b"src/lib.rs").unwrap();
     let candidate = loose_candidate(path_ref, oid);
     let mut skipped = Vec::new();
+    let abort = AtomicBool::new(false);
 
     scan_loose_candidates(
         &[candidate],
         &paths,
         &mut adapter,
         &mut pack_io,
+        &abort,
         &mut skipped,
     )
     .unwrap();
@@ -946,6 +951,41 @@ fn missing_loose_object_is_skipped() {
     assert_eq!(skipped[0].reason, CandidateSkipReason::LooseMissing);
     let scanned = adapter.take_results();
     assert!(scanned.blobs.is_empty());
+}
+
+#[test]
+fn loose_scan_returns_aborted_when_abort_is_set() {
+    let engine = test_engine();
+    let temp = tempdir().unwrap();
+    let objects_dir = temp.path().join("objects");
+
+    let oid = OidBytes::sha1([0xEF; 20]);
+    write_loose_blob(&objects_dir, oid, b"hello TOK_ABCDEFGH");
+
+    let mut pack_io = build_pack_io(&objects_dir);
+    let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+    let mut paths = ByteArena::with_capacity(64);
+    let path_ref = paths.intern(b"src/lib.rs").unwrap();
+    let candidate = loose_candidate(path_ref, oid);
+    let mut skipped = Vec::new();
+    let abort = AtomicBool::new(true);
+
+    let err = scan_loose_candidates(
+        &[candidate],
+        &paths,
+        &mut adapter,
+        &mut pack_io,
+        &abort,
+        &mut skipped,
+    )
+    .expect_err("pre-cancelled loose scan should abort");
+
+    assert!(matches!(
+        err,
+        GitScanError::TreeDiff(TreeDiffError::Aborted)
+    ));
+    assert!(skipped.is_empty());
+    assert!(adapter.take_results().blobs.is_empty());
 }
 
 #[test]
@@ -1019,6 +1059,21 @@ fn estimate_locality_pressure_known_deps() {
     assert_eq!(
         p4.cross_shard_offset_deps, 4,
         "all deps cross shard boundaries"
+    );
+}
+
+#[test]
+fn abort_signal_tracks_underlying_atomic() {
+    let flag = AtomicBool::new(false);
+    // SAFETY: flag lives for the duration of this test; no threads are spawned.
+    let signal = unsafe { AbortSignal::new(&flag) };
+
+    assert!(!signal.is_set(), "signal should be unset initially");
+
+    flag.store(true, Ordering::Release);
+    assert!(
+        signal.is_set(),
+        "signal should reflect the underlying atomic"
     );
 }
 

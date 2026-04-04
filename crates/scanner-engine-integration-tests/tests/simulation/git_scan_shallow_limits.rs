@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use regex::bytes::Regex;
 use tempfile::TempDir;
@@ -157,6 +158,7 @@ fn shallow_root_limit_failure_is_covered_by_sim_harness() {
         ..Default::default()
     };
     config.artifact_build.commit_load.max_shallow_roots = 0;
+    let abort = AtomicBool::new(false);
 
     let err = run_git_scan(
         &shallow_repo,
@@ -166,6 +168,7 @@ fn shallow_root_limit_failure_is_covered_by_sim_harness() {
         &TestWatermarkStore,
         Some(&persist),
         &config,
+        &abort,
         std::sync::Arc::new(NullEventSink),
     )
     .unwrap_err();

@@ -7,6 +7,7 @@
 //! truncated to 20 bytes) so we can compare structure without invoking `git`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicBool;
 
 use proptest::prelude::*;
 
@@ -14,6 +15,8 @@ use scanner_git::{
     CandidateBuffer, ChangeKind, OidBytes, TreeBytes, TreeDiffError, TreeDiffLimits,
     TreeDiffWalker, TreeSource, git_tree_name_cmp,
 };
+
+static NEVER_ABORT: AtomicBool = AtomicBool::new(false);
 
 /// In-memory tree store keyed by synthetic OIDs.
 #[derive(Default)]
@@ -137,7 +140,15 @@ fn collect_candidates_map(
     let mut candidates = CandidateBuffer::new(limits, 20);
 
     walker
-        .diff_trees(source, &mut candidates, new_root, old_root, 0, 0)
+        .diff_trees(
+            source,
+            &mut candidates,
+            new_root,
+            old_root,
+            0,
+            0,
+            &NEVER_ABORT,
+        )
         .unwrap();
 
     let mut out = BTreeMap::new();
@@ -222,6 +233,7 @@ proptest! {
                 old_root.as_ref(),
                 0,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 

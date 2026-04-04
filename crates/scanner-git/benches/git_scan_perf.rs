@@ -12,6 +12,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -228,6 +229,7 @@ fn run_git_scan_once(
 ) -> Result<IterSample, GitScanError> {
     let seen_store = NeverSeenStore;
     let watermark_store = EmptyWatermarkStore;
+    let abort = AtomicBool::new(false);
 
     let start = Instant::now();
     let result = run_git_scan(
@@ -238,6 +240,7 @@ fn run_git_scan_once(
         &watermark_store,
         None,
         scan_config,
+        &abort,
         std::sync::Arc::new(NullEventSink),
     )?;
     let wall_nanos = start.elapsed().as_nanos() as u64;

@@ -38,6 +38,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "git-perf")]
 use std::time::Instant;
 
@@ -80,6 +81,18 @@ use super::tree_diff_limits::TreeDiffLimits;
 
 use super::runner_exec::build_ref_entries;
 use crate::{perf_let, perf_set};
+
+/// Checks the cooperative cancellation flag and returns an abort error if set.
+///
+/// Used at stage boundaries across the scan pipeline to bail out early when
+/// the caller requests cancellation.
+#[inline]
+pub(super) fn check_abort(abort: &AtomicBool) -> Result<(), GitScanError> {
+    if abort.load(Ordering::Relaxed) {
+        return Err(TreeDiffError::Aborted.into());
+    }
+    Ok(())
+}
 
 /// Limits for pack file mmapping during scan execution.
 #[derive(Clone, Copy, Debug)]
@@ -923,6 +936,13 @@ pub enum GitScanError {
 /// workers: `commit_meta` and `finding` events may interleave across commits,
 /// and a finding may appear before its matching commit metadata.
 ///
+/// # Cancellation
+///
+/// `abort` is checked at runner phase boundaries and inside the mode-specific
+/// hot loops. When it is set, the scan returns
+/// `GitScanError::TreeDiff(TreeDiffError::Aborted)` and skips finalize
+/// persistence.
+///
 /// # Caveats
 /// - Loose object decode failures are recorded as skipped candidates and may
 ///   yield a `FinalizeOutcome::Partial`, suppressing watermark writes.
@@ -935,8 +955,10 @@ pub fn run_git_scan(
     watermark_store: &dyn RefWatermarkStore,
     persist_store: Option<&dyn PersistenceStore>,
     config: &GitScanConfig,
+    abort: &AtomicBool,
     event_sink: std::sync::Arc<dyn crate::events::EventSink>,
 ) -> Result<GitScanResult, GitScanError> {
+    check_abort(abort)?;
     scanner_engine::perf_counters::reset();
 
     let start_set_id = config.start_set.id();
@@ -989,6 +1011,7 @@ pub fn run_git_scan(
     if let Some(ref interner) = identity_interner {
         emit_identity_dictionary(&*event_sink, interner);
     }
+    check_abort(abort)?;
 
     // Dispatch to mode-specific pipeline.
     let mk_commit_meta = || CommitMetaContext {
@@ -1012,6 +1035,7 @@ pub fn run_git_scan(
             &cg_index,
             &plan,
             config,
+            abort,
             mk_commit_meta(),
         )?,
         GitScanMode::DiffHistory => super::runner_diff_history::run_diff_history(
@@ -1022,6 +1046,7 @@ pub fn run_git_scan(
             &cg,
             &plan,
             config,
+            abort,
             mk_commit_meta(),
         )?,
     };
@@ -1031,6 +1056,7 @@ pub fn run_git_scan(
     if !repo.artifacts_unchanged()? {
         return Err(GitScanError::ConcurrentMaintenance);
     }
+    check_abort(abort)?;
 
     // Finalize + persist.
     let refs = build_ref_entries(&repo, &cg)?;
@@ -1051,6 +1077,10 @@ pub fn run_git_scan(
         skipped_candidate_oids,
         path_arena: &output.path_arena,
     });
+
+    // Re-check after building FinalizeInput: for large repos the
+    // collect + build can take non-trivial time.
+    check_abort(abort)?;
 
     if let Some(store) = persist_store {
         persist_finalize_output(store, &finalize)?;

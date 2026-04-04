@@ -237,7 +237,7 @@ pub enum TreeDiffError {
     /// Object store failure (MIDX, pack, or loose object decode).
     #[error("object store error: {detail}")]
     ObjectStoreError { detail: String },
-    /// Cooperative abort signalled by another worker.
+    /// Cooperative abort from an external cancellation signal or a sibling worker.
     #[error("aborted by cooperative cancellation")]
     Aborted,
 }

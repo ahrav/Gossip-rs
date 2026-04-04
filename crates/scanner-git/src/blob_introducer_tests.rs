@@ -1,9 +1,24 @@
-use super::{merge_worker_results, per_worker_loose_limit, BlobIntroStats, SeenSets, WorkerResult};
+use super::{
+    merge_worker_results, per_worker_loose_limit, BlobIntroStats, BlobIntroWorker, BlobIntroducer,
+    SeenSets, WorkerResult,
+};
 use crate::byte_arena::{ByteArena, ByteRef};
-use crate::errors::{MappingCandidateKind, TreeDiffError};
-use crate::object_id::OidBytes;
+use crate::commit_graph::CommitGraphIndex;
+use crate::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
+use crate::errors::{CommitPlanError, MappingCandidateKind, TreeDiffError};
+use crate::midx::MidxView;
+use crate::midx_test_builder::MidxBuilder;
+use crate::object_id::{ObjectFormat, OidBytes};
+use crate::object_store::TreeBytes;
+use crate::oid_index::OidIndex;
 use crate::pack_candidates::{LooseCandidate, PackCandidate};
-use crate::tree_candidate::{CandidateContext, ChangeKind};
+use crate::tree_candidate::{CandidateBuffer, CandidateContext, ChangeKind};
+use crate::tree_diff_limits::TreeDiffLimits;
+use crate::TreeSource;
+use gossip_stdx::atomic_seen_sets::AtomicSeenSets;
+
+use gix_commitgraph::Position;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn oid(byte: u8) -> OidBytes {
     OidBytes::sha1([byte; 20])
@@ -239,6 +254,67 @@ fn merge_loose_dedup_is_input_order_invariant() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Stub infrastructure for abort-path coverage
+// ---------------------------------------------------------------------------
+
+/// Minimal commit graph: each entry maps a commit OID to its root tree OID.
+struct StubCommitGraph {
+    commit_oids: Vec<OidBytes>,
+    root_trees: Vec<OidBytes>,
+}
+
+impl StubCommitGraph {
+    fn single(commit_oid: OidBytes, root_tree_oid: OidBytes) -> Self {
+        Self {
+            commit_oids: vec![commit_oid],
+            root_trees: vec![root_tree_oid],
+        }
+    }
+}
+
+impl CommitGraph for StubCommitGraph {
+    fn num_commits(&self) -> u32 {
+        self.commit_oids.len() as u32
+    }
+    fn lookup(&self, _oid: &OidBytes) -> Result<Option<Position>, CommitPlanError> {
+        Ok(None)
+    }
+    fn generation(&self, _pos: Position) -> u32 {
+        0
+    }
+    fn collect_parents(
+        &self,
+        _pos: Position,
+        _max: u32,
+        scratch: &mut ParentScratch,
+    ) -> Result<(), CommitPlanError> {
+        scratch.clear();
+        Ok(())
+    }
+    fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        Ok(self.root_trees[pos.0 as usize])
+    }
+    fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        Ok(self.commit_oids[pos.0 as usize])
+    }
+    fn committer_timestamp(&self, _pos: Position) -> u64 {
+        0
+    }
+}
+
+/// Tree source that always returns `TreeNotFound`.
+///
+/// No valid tree data is needed when the abort check fires before any
+/// tree load attempt.
+struct NeverLoadTreeSource;
+
+impl TreeSource for NeverLoadTreeSource {
+    fn load_tree(&mut self, _oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
+        Err(TreeDiffError::TreeNotFound)
+    }
+}
+
 #[test]
 fn merge_loose_dedup_prefers_lowest_commit_id() {
     let path = b"same/path";
@@ -254,4 +330,93 @@ fn merge_loose_dedup_prefers_lowest_commit_id() {
         merged.loose[0].ctx.commit_id, 10,
         "dedup should keep the entry with the lowest commit_id"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Abort-path tests
+// ---------------------------------------------------------------------------
+
+/// Pre-set abort flag causes `introduce` to return `Aborted` before loading
+/// any trees. Seen sets that were marked before the call are preserved, and
+/// no candidates are emitted to the sink.
+#[test]
+fn introduce_aborts_immediately_when_flag_is_preset() {
+    // Build a minimal MIDX with one object so the OidIndex is non-empty.
+    let mut midx_builder = MidxBuilder::new();
+    midx_builder.add_pack(b"pack-test");
+    midx_builder.add_object([0xAA; 20], 0, 0);
+    let midx_data = midx_builder.build();
+    let midx = MidxView::parse(&midx_data, ObjectFormat::Sha1).expect("parse test midx");
+    let oid_index = OidIndex::from_midx(&midx);
+
+    // Build a CommitGraphIndex with one commit whose root tree is the MIDX object.
+    let tree_oid = OidBytes::sha1([0xAA; 20]);
+    let commit_oid = OidBytes::sha1([0xBB; 20]);
+    let graph = StubCommitGraph::single(commit_oid, tree_oid);
+    let cg = CommitGraphIndex::build(&graph).expect("build test graph");
+
+    let plan = [PlannedCommit {
+        pos: Position(0),
+        snapshot_root: false,
+    }];
+
+    let limits = TreeDiffLimits::default();
+    let mut introducer = BlobIntroducer::new(&limits, 20, midx.object_count(), 16, false);
+
+    // Pre-mark a tree index so we can verify seen state survives the abort.
+    introducer.seen.mark_tree(0);
+    assert!(introducer.seen.is_tree_seen(0));
+
+    let abort = AtomicBool::new(true);
+    let mut sink = CandidateBuffer::new(&limits, 20);
+    let mut source = NeverLoadTreeSource;
+
+    let result = introducer.introduce(&mut source, &cg, &plan, &oid_index, &abort, &mut sink);
+
+    assert!(
+        matches!(result, Err(TreeDiffError::Aborted)),
+        "expected Aborted, got {result:?}"
+    );
+    assert!(
+        introducer.seen.is_tree_seen(0),
+        "seen sets must be preserved after abort"
+    );
+    assert!(
+        sink.is_empty(),
+        "no candidates should be emitted when aborting"
+    );
+}
+
+/// `is_aborted()` returns `true` when either or both abort flags are set,
+/// and `false` only when neither is set.
+#[test]
+fn blob_intro_worker_is_aborted_checks_both_flags() {
+    let external_abort = AtomicBool::new(false);
+    let error_abort = AtomicBool::new(false);
+    let seen = AtomicSeenSets::new(1, 1);
+    let limits = TreeDiffLimits::default();
+
+    let worker = BlobIntroWorker::new(&limits, 20, 16, &seen, &external_abort, &error_abort, false);
+
+    // Neither flag set.
+    assert!(
+        !worker.is_aborted(),
+        "expected false when both flags are clear"
+    );
+
+    // Only external_abort set.
+    external_abort.store(true, Ordering::Relaxed);
+    assert!(
+        worker.is_aborted(),
+        "expected true when external_abort is set"
+    );
+
+    // Reset external, set error_abort only.
+    external_abort.store(false, Ordering::Relaxed);
+    error_abort.store(true, Ordering::Release);
+    assert!(worker.is_aborted(), "expected true when error_abort is set");
+
+    // Both flags set.
+    external_abort.store(true, Ordering::Relaxed);
+    assert!(worker.is_aborted(), "expected true when both flags are set");
 }

@@ -30,6 +30,7 @@ use std::num::NonZeroU32;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1130,6 +1131,50 @@ struct SchedulerPackShared {
     commit_meta_seen: Arc<gossip_stdx::AtomicBitSet>,
 }
 
+/// Thin, copyable handle to a caller-owned cooperative abort flag.
+///
+/// Scheduler worker closures must be `'static`, so they cannot borrow the
+/// caller's `&AtomicBool` directly. This wrapper erases the borrow lifetime
+/// into a raw `NonNull` pointer so it can cross the `'static` boundary.
+///
+/// # Safety
+///
+/// All threads that hold an `AbortSignal` must be joined before the
+/// referenced `AtomicBool` is dropped. The type is `Copy`, so the compiler
+/// cannot enforce this — callers of [`AbortSignal::new`] accept responsibility
+/// for the join-before-drop invariant.
+#[derive(Clone, Copy)]
+struct AbortSignal {
+    ptr: NonNull<AtomicBool>,
+}
+
+impl AbortSignal {
+    /// Create an `AbortSignal` from a borrowed `AtomicBool`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that every thread which receives a copy of this
+    /// signal is joined before the borrow `flag` can expire.
+    unsafe fn new(flag: &AtomicBool) -> Self {
+        Self {
+            ptr: NonNull::from(flag),
+        }
+    }
+
+    #[inline]
+    fn is_set(self) -> bool {
+        // SAFETY: `ptr` comes from a live caller borrow, and executor workers
+        // are joined before that borrow can end.
+        unsafe { self.ptr.as_ref().load(Ordering::Relaxed) }
+    }
+}
+
+// SAFETY: `AbortSignal` points at an `AtomicBool`, which is `Sync`; the
+// scheduler joins all worker threads before the borrowed flag can expire.
+unsafe impl Send for AbortSignal {}
+// SAFETY: See `Send` above.
+unsafe impl Sync for AbortSignal {}
+
 /// Pre-allocate adapter result capacity for a shard's execution slice.
 ///
 /// Sums the candidate counts across all offsets in `exec_slice` so the
@@ -1542,6 +1587,7 @@ struct SchedulerExecEnv {
     pack_cache_bytes: u32,
     exec_workers: usize,
     pin_threads: bool,
+    external_abort: AbortSignal,
     commit_graph: Arc<crate::commit_graph::CommitGraphIndex>,
     commit_meta_seen: Arc<gossip_stdx::AtomicBitSet>,
 }
@@ -1651,6 +1697,12 @@ fn collect_plan_outputs(
     Ok(merged)
 }
 
+/// Execute one scheduler task per pack plan.
+///
+/// Scheduler workers observe both the internal error latch and the
+/// caller-provided external abort signal before starting each task. When the
+/// external signal trips, this helper returns `TreeDiffError::Aborted`
+/// instead of draining partial outputs.
 fn execute_plan_tasks(
     env: SchedulerExecEnv,
     plans: Arc<Vec<PackPlan>>,
@@ -1664,6 +1716,7 @@ fn execute_plan_tasks(
     let abort_flag = Arc::new(AtomicBool::new(false));
 
     let pack_cache_bytes = env.pack_cache_bytes;
+    let external_abort = env.external_abort;
     let ex = Executor::<SchedulerPackTask>::new(
         env.executor_config(),
         move |_wid| scheduler_worker_scratch(pack_cache_bytes),
@@ -1673,7 +1726,7 @@ fn execute_plan_tasks(
             let first_error = Arc::clone(&first_error);
             let abort_flag = Arc::clone(&abort_flag);
             move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
-                if abort_flag.load(Ordering::Acquire) {
+                if abort_flag.load(Ordering::Acquire) || external_abort.is_set() {
                     return;
                 }
                 let seq = match task {
@@ -1701,12 +1754,25 @@ fn execute_plan_tasks(
     let tasks: Vec<SchedulerPackTask> = (0..plan_count)
         .map(|seq| SchedulerPackTask::ExecPlan { seq })
         .collect();
-    ex.spawn_external_batch(tasks)
-        .map_err(|_| scheduler_queue_rejected_error(false))?;
+    let spawn_result = ex.spawn_external_batch(tasks);
+    // SAFETY: This join is load-bearing for `AbortSignal` soundness — all worker
+    // threads must complete before the caller's `&AtomicBool` borrow can expire.
+    // The join MUST run even when `spawn_external_batch` fails, because the
+    // `Executor` has no `Drop` impl and dropping a detached `JoinHandle`
+    // would let worker threads outlive the borrowed flag.
+    // See the `AbortSignal` definition above.
     ex.join();
 
+    spawn_result.map_err(|_| scheduler_queue_rejected_error(false))?;
+
+    // Order matters: check scheduler error first (may have set the abort flag),
+    // then check external abort before collecting outputs, because aborted
+    // workers may leave output slots empty.
     if let Some(err) = take_scheduler_error(first_error.as_ref()) {
         return Err(err);
+    }
+    if external_abort.is_set() {
+        return Err(TreeDiffError::Aborted.into());
     }
 
     collect_plan_outputs(shared.plans.as_slice(), output_slots.as_ref())
@@ -1834,6 +1900,11 @@ fn merge_shard_outputs(
     Ok(merged)
 }
 
+/// Execute one scheduler task per `(plan, shard)` pair.
+///
+/// Like [`execute_plan_tasks`], this keeps the internal error latch separate
+/// from the caller-owned external abort signal and treats either one as a stop
+/// condition before dispatching more work.
 fn execute_sharded_tasks(
     env: SchedulerExecEnv,
     plans: Arc<Vec<PackPlan>>,
@@ -1860,6 +1931,7 @@ fn execute_sharded_tasks(
     let abort_flag = Arc::new(AtomicBool::new(false));
 
     let pack_cache_bytes = env.pack_cache_bytes;
+    let external_abort = env.external_abort;
     let ex = Executor::<SchedulerPackTask>::new(
         env.executor_config(),
         move |_wid| scheduler_worker_scratch(pack_cache_bytes),
@@ -1870,7 +1942,7 @@ fn execute_sharded_tasks(
             let first_error = Arc::clone(&first_error);
             let abort_flag = Arc::clone(&abort_flag);
             move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
-                if abort_flag.load(Ordering::Acquire) {
+                if abort_flag.load(Ordering::Acquire) || external_abort.is_set() {
                     return;
                 }
                 let (plan_idx, shard_idx) = match task {
@@ -1902,12 +1974,25 @@ fn execute_sharded_tasks(
         },
     );
 
-    ex.spawn_external_batch(tasks)
-        .map_err(|_| scheduler_queue_rejected_error(true))?;
+    let spawn_result = ex.spawn_external_batch(tasks);
+    // SAFETY: This join is load-bearing for `AbortSignal` soundness — all worker
+    // threads must complete before the caller's `&AtomicBool` borrow can expire.
+    // The join MUST run even when `spawn_external_batch` fails, because the
+    // `Executor` has no `Drop` impl and dropping a detached `JoinHandle`
+    // would let worker threads outlive the borrowed flag.
+    // See the `AbortSignal` definition above.
     ex.join();
 
+    spawn_result.map_err(|_| scheduler_queue_rejected_error(true))?;
+
+    // Order matters: check scheduler error first (may have set the abort flag),
+    // then check external abort before collecting outputs, because aborted
+    // workers may leave output slots empty.
     if let Some(err) = take_scheduler_error(first_error.as_ref()) {
         return Err(err);
+    }
+    if external_abort.is_set() {
+        return Err(TreeDiffError::Aborted.into());
     }
 
     let shard_meta = shared.shard_meta.as_ref().ok_or(GitScanError::PackExec(
@@ -1943,6 +2028,7 @@ struct SchedulerExecRequest {
     pack_cache_bytes: u32,
     workers: usize,
     pin_threads: bool,
+    external_abort: AbortSignal,
     commit_graph: Arc<super::commit_graph::CommitGraphIndex>,
     commit_meta_seen: Arc<gossip_stdx::AtomicBitSet>,
 }
@@ -1967,6 +2053,7 @@ fn execute_pack_plans_with_scheduler_request(
         pack_cache_bytes,
         workers,
         pin_threads,
+        external_abort,
         commit_graph,
         commit_meta_seen,
     } = request;
@@ -1997,6 +2084,7 @@ fn execute_pack_plans_with_scheduler_request(
         pack_cache_bytes,
         exec_workers,
         pin_threads,
+        external_abort,
         commit_graph,
         commit_meta_seen,
     };
@@ -2027,6 +2115,7 @@ type ExecutePackPlansWithSchedulerFn = fn(
     u32,
     usize,
     bool,
+    &AtomicBool,
     Arc<super::commit_graph::CommitGraphIndex>,
     Arc<gossip_stdx::AtomicBitSet>,
 ) -> Result<Vec<SchedulerPackExecOutput>, GitScanError>;
@@ -2054,6 +2143,7 @@ pub(super) static EXECUTE_PACK_PLANS_WITH_SCHEDULER: ExecutePackPlansWithSchedul
      pack_cache_bytes,
      workers,
      pin_threads,
+     external_abort,
      commit_graph,
      commit_meta_seen| {
         execute_pack_plans_with_scheduler_request(SchedulerExecRequest {
@@ -2073,6 +2163,9 @@ pub(super) static EXECUTE_PACK_PLANS_WITH_SCHEDULER: ExecutePackPlansWithSchedul
             pack_cache_bytes,
             workers,
             pin_threads,
+            // SAFETY: `Executor::join()` is called before this borrow expires
+            // in both `execute_plan_tasks` and `execute_sharded_tasks`.
+            external_abort: unsafe { AbortSignal::new(external_abort) },
             commit_graph,
             commit_meta_seen,
         })
@@ -2085,7 +2178,8 @@ pub(super) use EXECUTE_PACK_PLANS_WITH_SCHEDULER as execute_pack_plans_with_sche
 /// For each candidate the loose object is decoded via `pack_io`. Blobs are
 /// forwarded to `adapter.emit_loose`; non-blobs, missing objects, and decode
 /// failures are recorded in `skipped` so the run can complete with partial
-/// results.
+/// results. The abort flag is checked before each candidate so the caller can
+/// stop the loose scan without starting another object decode.
 ///
 /// # Errors
 ///
@@ -2097,9 +2191,13 @@ pub(super) fn scan_loose_candidates(
     paths: &ByteArena,
     adapter: &mut EngineAdapter,
     pack_io: &mut PackIo<'_>,
+    abort: &AtomicBool,
     skipped: &mut Vec<SkippedCandidate>,
 ) -> Result<(), GitScanError> {
     for candidate in candidates {
+        if abort.load(Ordering::Relaxed) {
+            return Err(TreeDiffError::Aborted.into());
+        }
         let path = paths.get(candidate.ctx.path_ref);
         match pack_io.load_loose_object(&candidate.oid) {
             Ok(Some((ObjectKind::Blob, bytes))) => {

@@ -38,6 +38,11 @@ overall git scanning pipeline:
 
 ```mermaid
 flowchart TD
+    Cancel["Abort Flag"] -.-> BI
+    Cancel -.-> SE
+    Cancel -.-> PX1
+    Cancel -.-> PX2
+    Cancel -.-> PX3
     CW["Commit Walk"] --> Mode{"Scan Mode"}
     Mode -->|"diff-history"| TD["Tree Diff → Spill → Mapping"]
     Mode -->|"odb-blob"| BI["Blob Introduction"]
@@ -242,6 +247,25 @@ Execution strategy selected by `select_pack_exec_strategy`:
 | `Serial` | `workers ≤ 1`, no plans, or total need < 512 | Single-threaded |
 | `PackParallel` | `plan_count ≥ workers` | One plan per worker |
 | `IntraPackSharded` | Fewer plans than workers | Large plans split into index-range shards |
+
+## Cooperative Cancellation
+
+Pack execution does not own cancellation state. Instead, the caller passes a
+borrowed abort flag down from `run_git_scan`, and the pack-exec subsystem
+observes it at the boundaries where starting more work would be wasteful:
+
+- `BlobIntroducer::introduce` checks before each commit, and its serial walk
+  samples the flag every 4096 processed tree entries.
+- `introduce_parallel` shares the external abort flag with every worker while
+  keeping a separate local error latch for intra-worker failure fan-out.
+- `execute_plan_tasks` and `execute_sharded_tasks` combine the external abort
+  signal with the scheduler's internal error latch before starting each task.
+- `scan_loose_candidates` checks before each loose-object decode, so
+  cancellation does not begin another filesystem read once the caller has
+  abandoned the scan.
+
+An abort returns `TreeDiffError::Aborted` to the runner, which in turn skips
+finalize persistence.
 
 ## Delta Resolution
 

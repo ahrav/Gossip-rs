@@ -2833,13 +2833,11 @@ where
         )));
     }
 
-    // The cancellation token is consumed by the lease-deadline watchdog so
-    // it can signal expiry. Unlike the filesystem page loop, scanner-git
-    // does not accept a cooperative cancellation handle, so the token cannot
-    // currently interrupt a running Git scan. The pre-/post-mirror expiry
-    // checks below bound the unguarded window to the `execute_repo` call
-    // itself. True mid-scan cancellation requires scanner-git to accept an
-    // external stop signal.
+    // The lease-deadline watchdog flips this token when the lease expires.
+    // Scanner-git borrows the underlying flag, so mid-scan cancellation
+    // can stop tree walks, blob introduction, and pack-exec scheduling before
+    // finalize persistence begins. The pre-/post-mirror expiry checks still
+    // guard the mirror-sync window around the scan itself.
     let cancel = CancellationToken::new();
     let lease_uncertainty = LeaseUncertaintySignal::default();
     let lease_watch_done = Arc::new(AtomicBool::new(false));
@@ -2881,6 +2879,7 @@ where
                 lease.payload(),
                 &mirror,
                 lease.write_context(),
+                cancel.as_atomic(),
                 Arc::clone(&event_sink),
                 git_persistence_backend.clone(),
             )
