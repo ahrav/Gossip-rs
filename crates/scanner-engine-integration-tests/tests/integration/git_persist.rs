@@ -1,9 +1,12 @@
-//! Integration tests for persistence ordering and atomicity.
+//! Integration tests for persistence ordering, atomicity, and state round-trips.
 //!
 //! These tests exercise the finalize persistence contract:
 //! - Data ops are always written.
 //! - Watermark ops are only written on complete runs.
 //! - Errors surface without recording partial writes.
+//! - RocksDB-backed seen-bitmap state persists across scan invocations
+//!   and suppresses re-scanning of already-seen blobs (requires the
+//!   `rocksdb` feature).
 
 use std::cell::Cell;
 #[cfg(feature = "rocksdb")]
@@ -20,8 +23,8 @@ use scanner_git::{NullEventSink, run_git_scan};
 
 #[cfg(feature = "rocksdb")]
 use super::git_scan_validation::{
-    TestResolver, base_config, commit_file, ensure_artifacts, git_available, git_output, init_repo,
-    oid_from_hex, test_engine,
+    TestResolver, TestWatermarkStore, base_config, commit_file, ensure_artifacts, git_available,
+    git_output, init_repo, oid_from_hex, perf_stats_enabled, test_engine,
 };
 
 /// Test double that records persisted ops and can simulate commit failures.
@@ -64,10 +67,16 @@ impl SeenBitmapPersister for RecordingStore {
     }
 }
 
+/// RocksDB-backed test double that delegates all persistence to a real
+/// `RocksDbStore` while counting `persist_seen_delta` calls for
+/// spill-stage verification.
 #[cfg(feature = "rocksdb")]
 #[derive(Debug)]
 struct CountingPersistStore {
     inner: RocksDbStore,
+    /// Spill-stage call counter. `Relaxed` ordering suffices: writes happen
+    /// in the single-threaded spill pipeline, reads happen after
+    /// `run_git_scan` returns (implicit synchronization via thread join).
     incremental_calls: AtomicUsize,
 }
 
@@ -223,12 +232,16 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let mut config = base_config();
+    // DiffHistory mode walks commits through the spill pipeline, which triggers
+    // `persist_seen_delta` when the batch size (`seen_batch_max_oids = 2`) is
+    // exceeded — exercising incremental seen-bitmap persistence.
     config.scan_mode = scanner_git::GitScanMode::DiffHistory;
     config.spill.seen_batch_max_oids = 2;
     let db_dir = tempfile::tempdir().expect("temp RocksDB dir");
-    let store =
-        CountingPersistStore::open(db_dir.path(), config.repo_id, config.policy_hash).unwrap();
+    let store = CountingPersistStore::open(db_dir.path(), config.repo_id, config.policy_hash)
+        .expect("open RocksDB counting store");
     let abort = AtomicBool::new(false);
+    let engine = std::sync::Arc::new(test_engine());
 
     assert_eq!(
         scanner_git::SeenBlobStore::batch_check_seen(&store, &blob_oids).unwrap(),
@@ -238,7 +251,7 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
 
     let first = run_git_scan(
         repo,
-        std::sync::Arc::new(test_engine()),
+        engine.clone(),
         &resolver,
         &store,
         &store,
@@ -250,6 +263,17 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
     .expect("first scan should succeed");
 
     assert_eq!(first.0.finalize.outcome, FinalizeOutcome::Complete);
+    if perf_stats_enabled() {
+        assert_eq!(
+            first.0.finalize.stats.unique_blobs,
+            blob_oids.len() as u64,
+            "first scan should process all 5 committed blobs"
+        );
+        assert!(
+            first.0.finalize.stats.total_findings >= 5,
+            "each blob contains a detectable TOK_ secret"
+        );
+    }
     assert!(
         first
             .0
@@ -262,8 +286,8 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
 
     let first_calls = store.incremental_calls();
     assert!(
-        first_calls > 0,
-        "expected spill-stage persist_seen_delta calls during the first scan"
+        first_calls >= 2,
+        "5 blobs with seen_batch_max_oids=2 must produce multiple incremental persist calls"
     );
     assert_eq!(
         scanner_git::SeenBlobStore::batch_check_seen(&store, &blob_oids).unwrap(),
@@ -271,12 +295,15 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
         "finalize should commit the staged bitmap into the live seen scope"
     );
 
+    // Null watermarks force a full commit re-walk so the seen-bitmap is
+    // the sole dedup mechanism for the second scan.
+    let no_watermarks = TestWatermarkStore { watermark: None };
     let second = run_git_scan(
         repo,
-        std::sync::Arc::new(test_engine()),
+        engine.clone(),
         &resolver,
         &store,
-        &store,
+        &no_watermarks,
         Some(&store),
         &config,
         &abort,
@@ -285,10 +312,20 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
     .expect("second scan should succeed");
 
     assert_eq!(second.0.finalize.outcome, FinalizeOutcome::Complete);
-    assert_eq!(
-        second.0.finalize.data_ops.len(),
-        0,
-        "persisted seen state should suppress all data writes on the second scan"
+    if perf_stats_enabled() {
+        assert_eq!(
+            second.0.finalize.stats.unique_blobs, 0,
+            "all blobs should be skipped as already seen"
+        );
+    }
+    assert!(
+        !second
+            .0
+            .finalize
+            .data_ops
+            .iter()
+            .any(|op| op.key.starts_with(&scanner_git::NS_SEEN_BLOB)),
+        "second scan should not emit seen-bitmap ops"
     );
     assert_eq!(
         store.incremental_calls(),
