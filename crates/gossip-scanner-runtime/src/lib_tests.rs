@@ -1091,6 +1091,16 @@ fn owned_core_event_finding_with_norm_hash_round_trips() {
     });
 
     let owned = OwnedCoreEvent::from_core(original);
+    match &owned {
+        OwnedCoreEvent::Finding { norm_hash, .. } => {
+            assert_eq!(
+                *norm_hash,
+                Some([0xAB; 32]),
+                "from_core must preserve norm_hash in memory"
+            );
+        }
+        other => panic!("expected Finding, got {other:?}"),
+    }
     let out = scanner_scheduler::events::VecEventOutput::new();
     owned.emit_into(&out);
 
@@ -1127,6 +1137,15 @@ fn owned_core_event_finding_without_norm_hash_round_trips() {
     });
 
     let owned = OwnedCoreEvent::from_core(original);
+    match &owned {
+        OwnedCoreEvent::Finding { norm_hash, .. } => {
+            assert_eq!(
+                *norm_hash, None,
+                "from_core must preserve None norm_hash in memory"
+            );
+        }
+        other => panic!("expected Finding, got {other:?}"),
+    }
     let out = scanner_scheduler::events::VecEventOutput::new();
     owned.emit_into(&out);
 

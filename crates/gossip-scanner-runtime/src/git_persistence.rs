@@ -835,6 +835,8 @@ pub(crate) fn build_git_repo_done_ledger_record(
             },
         ));
     }
+    // Equal timestamps are valid: a scan can complete within the clock
+    // granularity, producing a zero-duration provenance interval.
 
     // See "OvidHash derivation" in the doc comment above.
     let ovid = {
@@ -1810,5 +1812,37 @@ mod tests {
             record_1, record_2,
             "identical inputs must produce identical records"
         );
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_rejects_reversed_timestamps() {
+        let wc = write_context();
+        let err = build_git_repo_done_ledger_record(
+            wc,
+            42,
+            1024,
+            0,
+            LogicalTime::from_raw(500),
+            LogicalTime::from_raw(100),
+        )
+        .expect_err("reversed timestamps must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                GitRepoDurabilityError::InvalidDoneLedgerRecord(
+                    PersistenceInputError::ProvenanceOrdering { .. }
+                )
+            ),
+            "expected InvalidDoneLedgerRecord(ProvenanceOrdering), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_accepts_equal_timestamps() {
+        let t = LogicalTime::from_raw(100);
+        let record = build_git_repo_done_ledger_record(write_context(), 42, 0, 0, t, t)
+            .expect("equal timestamps (zero-duration scan) must be accepted");
+        assert_eq!(record.status(), DoneLedgerStatus::ScannedClean);
     }
 }

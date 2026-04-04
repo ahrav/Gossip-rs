@@ -38,9 +38,13 @@ pub struct FindingEvent<'a> {
     pub rule_id: u32,
     /// Human-readable rule name resolved from `rule_id`.
     pub rule_name: &'a str,
-    /// BLAKE3 digest of the normalized secret content. Present for Git findings
-    /// and ordered-content persistence-backed findings, `None` for generic FS
-    /// emission paths where the hash is not carried on the event surface.
+    /// Normalized content hash for deduplication. `None` for filesystem findings
+    /// where the scanner does not produce a content-derived digest.
+    ///
+    /// The `Option<[u8; 32]>` representation adds 33 bytes per event. This is
+    /// acceptable because `FindingEvent` is constructed on WARM paths (per-finding,
+    /// not per-chunk), and moving the hash out-of-band would complicate the event
+    /// flow without measurable benefit.
     pub norm_hash: Option<[u8; 32]>,
     /// Commit-graph position for Git findings.
     pub commit_id: Option<u32>,
@@ -50,20 +54,22 @@ pub struct FindingEvent<'a> {
     pub confidence_score: i8,
 }
 
+/// Debug-format wrapper that prints `[redacted]` when a secret-derived digest
+/// is present and `None` otherwise. Prevents accidental hash leakage in logs.
+pub struct RedactedNormHash(pub bool);
+
+impl fmt::Debug for RedactedNormHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 {
+            f.write_str("[redacted]")
+        } else {
+            f.write_str("None")
+        }
+    }
+}
+
 impl fmt::Debug for FindingEvent<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct RedactedNormHash(bool);
-
-        impl fmt::Debug for RedactedNormHash {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                if self.0 {
-                    f.write_str("[redacted]")
-                } else {
-                    f.write_str("None")
-                }
-            }
-        }
-
         f.debug_struct("FindingEvent")
             .field("source", &self.source)
             .field("object_path", &self.object_path)

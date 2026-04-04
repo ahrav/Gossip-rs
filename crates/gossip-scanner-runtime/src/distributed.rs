@@ -2746,22 +2746,21 @@ where
     Ok((report, completion))
 }
 
-/// Submit findings and a done-ledger entry for one completed Git repo scan.
+/// Submit a done-ledger entry for one completed Git repo scan.
 ///
-/// Persists captured findings first, then constructs and submits the
-/// done-ledger record. Returns both receipts so the caller can build a
-/// durable checkpoint.
+/// Constructs the done-ledger record from the scan metadata and submits it
+/// through the ledger backend. Returns both receipts (a synthesized
+/// zero-count findings receipt and the real done-ledger receipt) so the
+/// caller can build a durable checkpoint.
 ///
 /// # Partial write window
 ///
-/// If findings upsert succeeds but the done-ledger submit fails, orphaned
-/// findings rows persist in the sink. This is safe because
-/// `FindingsSink::upsert_batch` uses upsert (idempotent) semantics: on
-/// re-claim the repo is re-scanned and findings are re-submitted, with
-/// duplicates deduplicated by the sink's primary key.
+/// If the done-ledger submit fails, the shard checkpoint is not advanced and
+/// the repo stays reclaimable. On re-claim the repo is re-scanned, so
+/// partial done-ledger writes are harmless.
 #[allow(clippy::too_many_arguments)]
-fn persist_git_repo_findings_and_done_ledger<F, D>(
-    persistence: &DistributedPersistence<F, D>,
+fn submit_git_repo_done_ledger<D>(
+    done_ledger: &D,
     write_context: WriteContext,
     shard_id: &str,
     repo_id: u64,
@@ -2771,37 +2770,29 @@ fn persist_git_repo_findings_and_done_ledger<F, D>(
     complete_time: LogicalTime,
 ) -> Result<(FindingsCommitReceipt, DoneLedgerCommitReceipt), DistributedRuntimeError>
 where
-    F: FindingsSink + Clone + Send + Sync + 'static,
     D: DoneLedger + Clone + Send + Sync + 'static,
-    F::Error: std::error::Error + Send + Sync + 'static,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
     // --- findings submission ---
-    // TODO: Translate captured OwnedCoreEvent::Finding entries into
-    // FindingRecord/OccurrenceRecord/ObservationRecord for real persistence.
-    // The caller rejects leases with detected_count > 0, so this path is
-    // only reached when the scan produced zero findings. Synthesize a
-    // zero-count receipt to avoid an unnecessary sink round-trip that could
-    // fail an otherwise-clean shard.
-    debug_assert_eq!(
-        detected_count, 0,
-        "non-zero findings must be rejected before this helper is called"
-    );
+    // Durable Git finding translation is not yet implemented. The caller
+    // rejects leases with detected_count > 0, and the hard check below
+    // enforces this invariant in release builds as defense-in-depth.
+    // Synthesize a zero-count receipt to skip an unnecessary sink
+    // round-trip for clean shards.
+    if detected_count > 0 {
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow::anyhow!(
+                "submit_git_repo_done_ledger called with detected_count={detected_count}; \
+                 durable Git finding translation is not yet implemented"
+            ),
+        )));
+    }
     let findings_receipt = FindingsCommitReceipt::new(0, 0, 0);
 
     // --- done-ledger submission ---
-    let findings_count = match u32::try_from(detected_count) {
-        Ok(count) => count,
-        Err(_) => {
-            tracing::warn!(
-                shard_id,
-                actual_count = detected_count,
-                saturated_to = u32::MAX,
-                "findings count exceeds u32::MAX; done-ledger record clamped"
-            );
-            u32::MAX
-        }
-    };
+    // The hard check above guarantees detected_count == 0. The u32 conversion
+    // will need real handling when findings persistence is implemented.
+    let findings_count: u32 = 0;
     let record = crate::git_persistence::build_git_repo_done_ledger_record(
         write_context,
         repo_id,
@@ -2815,14 +2806,11 @@ where
             anyhow::Error::new(error).context("git repo done-ledger record construction"),
         )
     })?;
-    let handle = persistence
-        .done_ledger
-        .batch_upsert(&[record])
-        .map_err(|error| {
-            DistributedRuntimeError::Durability(anyhow::Error::new(error).context(format!(
-                "git repo-frontier shard '{shard_id}' done-ledger submit failed",
-            )))
-        })?;
+    let handle = done_ledger.batch_upsert(&[record]).map_err(|error| {
+        DistributedRuntimeError::Durability(anyhow::Error::new(error).context(format!(
+            "git repo-frontier shard '{shard_id}' done-ledger submit failed",
+        )))
+    })?;
     let done_ledger_receipt = handle.wait().map_err(|error| {
         DistributedRuntimeError::Durability(anyhow::Error::new(error).context(format!(
             "git repo-frontier shard '{shard_id}' done-ledger wait failed",
@@ -3012,6 +3000,7 @@ where
     }
 
     let execution = execution?;
+    let complete_time = wall_clock_now();
     if !matches!(execution.finalize_outcome, FinalizeOutcome::Complete) {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
@@ -3044,9 +3033,8 @@ where
         )));
     }
 
-    let complete_time = wall_clock_now();
-    let (findings_receipt, done_ledger_receipt) = persist_git_repo_findings_and_done_ledger(
-        persistence,
+    let (findings_receipt, done_ledger_receipt) = submit_git_repo_done_ledger(
+        &persistence.done_ledger,
         execution.write_context,
         lease.shard_id(),
         lease.payload().repo_id(),
@@ -3615,7 +3603,8 @@ mod tests {
         next
     }
 
-    fn create_git_repo_fixture() -> tempfile::TempDir {
+    /// Git repo fixture seeded with a secret so scans produce at least one finding.
+    fn create_git_repo_fixture_with_secrets() -> tempfile::TempDir {
         let dir = tempdir().expect("tempdir");
         init_git_repo(
             dir.path(),
@@ -6308,7 +6297,7 @@ mod tests {
 
     #[test]
     fn run_git_repo_worker_treats_cursor_covered_target_as_exhausted_empty() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6344,7 +6333,7 @@ mod tests {
     /// `Dispatched` semantics are rejected before any scan work begins.
     #[test]
     fn run_git_repo_worker_rejects_dispatched_cursor_semantics() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6378,7 +6367,7 @@ mod tests {
     /// exhausted-empty.
     #[test]
     fn run_git_repo_worker_rejects_out_of_bounds_payload_repo_key() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6468,7 +6457,7 @@ mod tests {
     /// propagates the error without advancing the shard.
     #[test]
     fn run_git_repo_worker_fails_cleanly_on_persistence_error() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6513,11 +6502,12 @@ mod tests {
     }
 
     /// Git events are emitted during the scan phase, before the findings
-    /// guard evaluates. The result is discarded because this test only
-    /// verifies that telemetry events are recorded.
+    /// guard evaluates. The worker returns an error because the fixture
+    /// contains secrets, but this test only verifies that telemetry events
+    /// are recorded.
     #[test]
     fn run_git_repo_worker_records_git_events() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6529,13 +6519,20 @@ mod tests {
         let mut coordinator =
             setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
 
-        let _result = run_git_repo_worker(
+        // The fixture contains secrets, so the worker fails at the findings guard.
+        // This test only verifies that telemetry events are recorded during the
+        // scan phase (before the guard evaluates).
+        let result = run_git_repo_worker(
             &mut coordinator,
             &mut mirrors,
             identity,
             backend,
             DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
             DistributedRuntimeConfig::default(),
+        );
+        assert!(
+            result.is_err(),
+            "fixture with secrets should trigger the findings guard"
         );
 
         let events = test_recorder.git_events.lock().expect("git events lock");
@@ -6680,7 +6677,7 @@ mod tests {
     /// suppressing future rescans of repos with active secrets.
     #[test]
     fn git_repo_worker_rejects_lease_when_findings_detected_without_durable_translation() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -8655,7 +8652,7 @@ mod tests {
     /// programmatically distinguish permission denials from network timeouts.
     #[test]
     fn run_git_repo_worker_preserves_mirror_sync_error_chain() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let backend = TestGitBackend::default();
         let mut mirrors = FailingMirrorManager;
         let mut coordinator =
@@ -8728,7 +8725,7 @@ mod tests {
     /// correlate the failure with a specific shard assignment.
     #[test]
     fn run_git_repo_worker_budget_validation_includes_shard_context() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -8763,7 +8760,7 @@ mod tests {
     /// in the coordinator and no persistence writes should occur.
     #[test]
     fn run_git_repo_worker_mirror_failure_does_not_advance_shard_or_persist() {
-        let repo = create_git_repo_fixture();
+        let repo = create_git_repo_fixture_with_secrets();
         let backend = TestGitBackend::default();
         let mut mirrors = FailingMirrorManager;
         let mut coordinator =

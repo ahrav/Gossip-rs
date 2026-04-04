@@ -81,7 +81,7 @@ use scanner_git::{
 };
 use scanner_scheduler::events::{
     CoreEvent, DiagnosticEvent, EventOutput, FindingEvent, NullEventOutput, ProgressEvent,
-    SummaryEvent,
+    RedactedNormHash, SummaryEvent,
 };
 use scanner_scheduler::source_kind::SourceKind;
 use scanner_scheduler::store::{
@@ -1682,18 +1682,6 @@ pub enum OwnedCoreEvent {
 
 impl fmt::Debug for OwnedCoreEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct RedactedNormHash(bool);
-
-        impl fmt::Debug for RedactedNormHash {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                if self.0 {
-                    f.write_str("[redacted]")
-                } else {
-                    f.write_str("None")
-                }
-            }
-        }
-
         match self {
             Self::Finding {
                 source,

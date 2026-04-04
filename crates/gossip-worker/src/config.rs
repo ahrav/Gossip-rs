@@ -441,7 +441,7 @@ impl GitDistributedSourceSettings {
     #[must_use]
     pub fn new(git: GitSourceSettings, mirror_root: impl Into<PathBuf>) -> Self {
         let mirror_root: PathBuf = mirror_root.into();
-        debug_assert!(
+        assert!(
             !mirror_root.as_os_str().is_empty(),
             "mirror_root must not be empty"
         );
@@ -826,7 +826,7 @@ impl DistributedWorkerConfig {
             ));
         }
         if let DistributedSourceSettings::Git(source) = &source {
-            validate_path_exists("mirror_root", source.mirror_root())?;
+            validate_directory_exists("mirror_root", source.mirror_root())?;
         }
         Ok(Self {
             backends,
@@ -2303,6 +2303,25 @@ mod tests {
         assert!(
             message.contains("does not exist"),
             "error must explain the path does not exist: {message}"
+        );
+    }
+
+    #[test]
+    fn connector_git_source_rejects_file_as_mirror_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("not-a-directory");
+        std::fs::write(&file_path, "block").expect("create file");
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_MIRROR_ROOT, file_path.to_str().expect("utf-8 path"));
+
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("file-as-mirror-root must be rejected");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("not a directory"),
+            "error must explain the path is not a directory: {message}"
         );
     }
 

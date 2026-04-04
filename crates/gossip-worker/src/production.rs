@@ -355,8 +355,7 @@ impl ProductionRuntimeBackends {
 /// State does not survive process restarts. This backend is suitable for
 /// single-worker development and early integration where persistence
 /// across process restarts is not required.
-// Structurally similar to `TestGitBackend` in the `distributed.rs` test module.
-// This is production (development-mode) code; that is test-only with failure injection.
+// Production development-mode backend; does not support failure injection.
 #[derive(Debug, Clone, Default)]
 struct InMemoryGitPersistence {
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -561,6 +560,10 @@ pub fn run_production_worker(
         } => {
             let mut mirrors = LocalMirrorManager::new(mirror_root)
                 .map_err(ProductionBootstrapError::GitMirrorManager)?;
+            tracing::warn!(
+                "git persistence backend is in-memory; ref watermarks and seen-bitmaps \
+                 will not survive process restarts — every lease starts a full rescan"
+            );
             let git_backend = InMemoryGitPersistence::default();
             backends
                 .run_git(&mut mirrors, git_backend, identity, runtime)

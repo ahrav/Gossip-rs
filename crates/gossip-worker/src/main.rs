@@ -236,7 +236,8 @@ mod tests {
     };
     use gossip_worker::config::{
         DistributedWorkerLaunch, DistributedWorkerRuntimeSettings, FsSourceSettings,
-        GitSourceSettings, ProductionBackendConfig, WorkerIdentityConfig,
+        GitDistributedSourceSettings, GitSourceSettings, ProductionBackendConfig,
+        WorkerIdentityConfig,
     };
     use gossip_worker::production::ProductionStartupSettings;
     use tempfile::tempdir;
@@ -555,6 +556,59 @@ mod tests {
         assert!(
             !error.to_string().to_ascii_lowercase().contains("in-memory"),
             "production bootstrap failure must not mention in-memory fallbacks: {error}"
+        );
+    }
+
+    #[test]
+    fn git_distributed_dispatch_produces_git_launch_variant() {
+        let mirror_dir = tempdir().expect("tempdir for mirror root");
+        let defaults = gossip_scanner_runtime::distributed::DistributedRuntimeConfig::default();
+        let identity = WorkerIdentityConfig::new(
+            tenant(),
+            run_id(),
+            worker_id(),
+            policy_hash(),
+            tenant_secret_key(),
+        )
+        .expect("test worker identity config should be valid");
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "postgresql://scanner@localhost/done_ledger",
+            "postgresql://scanner@localhost/findings",
+        )
+        .expect("test production backend config should be valid");
+        let cfg = DistributedWorkerConfig::new(
+            backends,
+            ProductionStartupSettings::validate_only(),
+            identity,
+            DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
+                GitSourceSettings::new("/tmp/repo"),
+                mirror_dir.path(),
+            )),
+            DistributedWorkerRuntimeSettings::new(
+                ScanBudgets::default(),
+                defaults.commit_queue_capacity,
+            ),
+        )
+        .expect("git distributed worker config should be valid");
+        let resolved = ResolvedWorkerConfig::Distributed(Box::new(cfg));
+
+        let mut received_git_variant = false;
+        let _ = execute_resolved_worker_with(&resolved, |cfg| {
+            let launch = cfg.worker_launch();
+            let DistributedWorkerLaunch::Git { mirror_root, .. } = &launch else {
+                panic!("expected Git launch variant, got {launch:?}");
+            };
+            assert_eq!(mirror_root, mirror_dir.path());
+            received_git_variant = true;
+            Err(ProductionWorkerError::from(
+                DistributedRuntimeError::Coordinator(anyhow::anyhow!("stub error for test")),
+            ))
+        });
+
+        assert!(
+            received_git_variant,
+            "Git distributed config must dispatch through the distributed runner with a Git launch variant"
         );
     }
 }
