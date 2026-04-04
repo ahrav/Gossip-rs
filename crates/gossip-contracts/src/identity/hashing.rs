@@ -49,6 +49,9 @@ use blake3::Hasher;
 
 use super::domain;
 
+// BLAKE3 derive-key mode performs domain-specific key-schedule setup once.
+// Cloning a cached post-setup hasher is cheaper than rebuilding that state for
+// every same-domain derivation.
 /// Cached derive-key hasher for [`FindingId`](super::FindingId) derivation.
 pub(crate) static FINDING_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::FINDING_ID_V1));
