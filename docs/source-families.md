@@ -152,16 +152,23 @@ and `types.rs`.
 | `crates/gossip-contracts/src/connector/ordered.rs` | Ordered-content family contract |
 | `crates/gossip-contracts/src/connector/git.rs` | Git family contract (three traits + supporting types) |
 | `crates/gossip-contracts/src/connector/common.rs` | Shared paging vocabulary |
+| `crates/gossip-contracts/src/connector/common_tests.rs` | Shared paging vocabulary tests |
 | `crates/gossip-contracts/src/connector/types.rs` | Toxic-byte wrappers, cursor, budgets |
+| `crates/gossip-contracts/src/connector/types_tests.rs` | Connector value-type validation tests |
 | `crates/gossip-contracts/src/connector/api.rs` | Error taxonomy, capabilities |
+| `crates/gossip-contracts/src/connector/api_tests.rs` | Connector error and capability tests |
 | `crates/gossip-contracts/src/connector/conformance.rs` | Ordered-content conformance harness shared by concrete connector implementations |
 | `crates/gossip-contracts/src/connector/mod.rs` | Re-export hub, canonical connector tags |
 | `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem, Git, and in-memory connector implementations |
 | `crates/gossip-connectors/src/filesystem.rs` | Filesystem ordered-content connector |
+| `crates/gossip-connectors/src/filesystem_tests.rs` | Filesystem connector tests |
 | `crates/gossip-connectors/src/git.rs` | Git `ls-files` ordered-content connector |
+| `crates/gossip-connectors/src/git_tests.rs` | Git ordered-content connector tests |
 | `crates/gossip-connectors/src/in_memory.rs` | Deterministic in-memory test connector |
+| `crates/gossip-connectors/src/in_memory_tests.rs` | In-memory deterministic connector tests |
 | `crates/gossip-connectors/src/common.rs` | Shared connector utilities |
 | `crates/gossip-connectors/src/split_estimator.rs` | Streaming byte-weighted split-point estimator (internal; used by `common.rs` and `FilesystemConnector`) |
+| `crates/gossip-connectors/src/split_estimator_tests.rs` | Split-estimator unit tests |
 | `crates/gossip-orchestrator/src/lib.rs` | Re-export hub for filesystem and Git request normalization, planning, and run setup |
 | `crates/gossip-orchestrator/src/git_payload.rs` | Typed Git shard payload wire format for repo-frontier shards (encode/decode) |
 | `crates/gossip-orchestrator/src/git_planner.rs` | Deterministic Git initial shard geometry planner |
@@ -173,7 +180,9 @@ and `types.rs`.
 | `crates/gossip-orchestrator/src/setup.rs` | Coordination-backed filesystem run setup and shard registration |
 | `crates/gossip-orchestrator/src/test_support.rs` | Shared test fixtures for orchestrator unit tests |
 | `crates/gossip-scanner-runtime/src/lib.rs` | Runtime crate root: public family entrypoints, execution-mode selection, validation, and shared scan report/config types |
+| `crates/gossip-scanner-runtime/src/lib_tests.rs` | Runtime crate-root tests |
 | `crates/gossip-scanner-runtime/src/cli.rs` | CLI/runtime flag mapping and entrypoint wiring for filesystem and Git scans |
+| `crates/gossip-scanner-runtime/src/cli_tests.rs` | CLI/runtime entrypoint tests |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_discovery.rs` | Static single-target Git repository discovery source |
 | `crates/gossip-scanner-runtime/src/git_executor.rs` | Contract-level adapter that runs scanner-git against a local mirror |
@@ -191,6 +200,8 @@ and `types.rs`.
 | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregation |
 | `crates/gossip-scanner-runtime/src/coordination_sink.rs` | Coordination event recorder payloads for distributed scans |
 | `crates/gossip-scanner-runtime/src/distributed.rs` | Distributed worker-loop runtime and receipt-backed commit plumbing |
+| `crates/gossip-scanner-runtime/src/runtime_durability_tests.rs` | End-to-end runtime durability tests |
+| `crates/gossip-scanner-runtime/src/test_fixtures.rs` | Shared runtime test fixtures |
 
 ---
 
