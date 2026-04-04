@@ -127,8 +127,8 @@ enum IndexState {
 /// - `repo` is validated once during indexing; a missing or non-directory
 ///   path latches a permanent failure.
 /// - `emit_tokens` controls the advertised `token_resume` capability. Cursor
-///   resume is `last_key`-authoritative over the frozen
-///   in-memory snapshot.
+///   resume uses the frozen in-memory snapshot's `last_key` and ignores
+///   connector tokens.
 pub struct GitConnector {
     /// Absolute path to the repository root (working directory).
     repo: PathBuf,
