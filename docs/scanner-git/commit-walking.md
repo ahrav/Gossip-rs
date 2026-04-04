@@ -35,6 +35,7 @@ flowchart TD
 | `ParentScratch` | struct | Reusable scratch buffer for parent collection. Stores up to 16 parents inline (no allocation); spills to `Vec` for octopus merges. | `commit_walk.rs` |
 | `VisitedCommitBitset` | struct | 1-bit-per-commit bitset for cross-ref emission dedup. `test_and_set` returns whether the bit was newly marked. | `commit_walk.rs` |
 | `CommitPlanIter` | struct | Iterator over `(watermark, tip]` commits for all refs. Uses two generation-ordered heaps and per-ref scratch. Deduplicates across refs via `VisitedCommitBitset`. | `commit_walk.rs` |
+| `RefWatermark` | struct | Persisted watermark state: `oid: OidBytes` + `generation: Option<NonZeroU32>`. The generation enables O(1) force-push detection before the ancestry walk. `None` when the persisted value lacks a generation trailer. | `watermark_keys.rs` |
 | `CommitWalkLimits` | struct | Hard caps for traversal: max graph size, heap entries, parents per commit, new-ref skip checks. 16 bytes, compile-time validated. | `commit_walk_limits.rs` |
 
 ### Commit Loading (`commit_loader.rs`)
@@ -85,6 +86,7 @@ flowchart TD
 | `TooManyParents` | Commit exceeds `max_parents_per_commit`. | `errors.rs` |
 | `TopoSortCycle` | Kahn's algorithm could not drain all commits. | `errors.rs` |
 | `IdentityLengthMismatch` | Identity-ID vector length does not match commit count. | `errors.rs` |
+| `InvalidGeneration` | Commit-graph returned generation 0, which violates the spec (generation numbers start at 1). | `errors.rs` |
 
 ## Walking Algorithm
 

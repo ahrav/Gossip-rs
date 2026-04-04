@@ -440,8 +440,9 @@ impl RefWatermarkStore for RocksDbStore {
             for res in results {
                 match res {
                     Ok(Some(val)) => {
-                        // Legacy payloads decode with `generation = None`;
-                        // current payloads include the LE generation trailer.
+                        // Payloads without a generation trailer decode with
+                        // `generation = None`; payloads with the 4-byte LE
+                        // trailer include the stored generation.
                         let decoded =
                             decode_ref_watermark_value(val.as_ref()).ok_or_else(|| {
                                 RepoOpenError::io(io::Error::other(

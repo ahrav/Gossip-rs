@@ -781,6 +781,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::num::NonZeroU32;
 
     use gossip_contracts::{
         connector::git::RepoKey,
@@ -948,8 +949,14 @@ mod tests {
         let ref_a = b"refs/heads/main".as_slice();
         let ref_b = b"refs/tags/v1".as_slice();
 
-        let value_a = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x11; 20]), 11);
-        let value_b = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x22; 20]), 22);
+        let value_a = scanner_git::encode_ref_watermark_value(
+            &OidBytes::sha1([0x11; 20]),
+            NonZeroU32::new(11).unwrap(),
+        );
+        let value_b = scanner_git::encode_ref_watermark_value(
+            &OidBytes::sha1([0x22; 20]),
+            NonZeroU32::new(22).unwrap(),
+        );
         backend.set(
             build_ref_wm_key(7, &[0x55; 32], &start_set_id, ref_a),
             value_a.0[..value_a.1].to_vec(),
@@ -973,12 +980,12 @@ mod tests {
             vec![
                 Some(RefWatermark {
                     oid: OidBytes::sha1([0x22; 20]),
-                    generation: Some(22),
+                    generation: NonZeroU32::new(22),
                 }),
                 None,
                 Some(RefWatermark {
                     oid: OidBytes::sha1([0x11; 20]),
-                    generation: Some(11),
+                    generation: NonZeroU32::new(11),
                 }),
             ]
         );

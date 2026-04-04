@@ -178,6 +178,7 @@ mod tests {
     use super::*;
     use crate::{ByteArena, OidBytes};
     use crate::{CommitPlanIter, CommitWalkLimits, StartSetRef};
+    use std::num::NonZeroU32;
 
     fn oid(val: u8) -> Vec<u8> {
         vec![val; 20]
@@ -226,7 +227,7 @@ mod tests {
         let tip = OidBytes::from_slice(&oid(3));
         let watermark = Some(RefWatermark {
             oid: OidBytes::from_slice(&oid(9)),
-            generation: Some(1),
+            generation: NonZeroU32::new(1),
         });
         let refs = vec![StartSetRef {
             name,

@@ -23,12 +23,20 @@
 //! # Value Format
 //!
 //! ```text
-//! old ref_watermark value:
+//! ref_watermark value (OID only):
 //!   oid_len (1B) || oid (20B or 32B)
 //!
-//! current ref_watermark value:
+//! ref_watermark value (with generation):
 //!   oid_len (1B) || oid (20B or 32B) || generation_le (4B)
 //! ```
+//!
+//! The decoder distinguishes formats by total payload length:
+//! `1 + oid_len` bytes is the OID-only layout (no generation),
+//! `1 + oid_len + 4` bytes is the OID-plus-generation layout.
+//! Adding new trailing fields requires a new length class or an
+//! explicit version byte.
+
+use std::num::NonZeroU32;
 
 use super::object_id::OidBytes;
 use super::start_set::StartSetId;
@@ -46,8 +54,8 @@ const RW_KEY_FIXED_OVERHEAD: usize = 2 + 8 + 32 + 32 + 1;
 
 /// Persisted ref watermark state.
 ///
-/// `generation` is `None` for watermarks written before generation numbers
-/// were stored alongside the OID. The struct is `Copy` because both fields
+/// `generation` is `None` when the persisted value contains only the OID
+/// without a generation trailer. The struct is `Copy` because both fields
 /// are fixed-width value types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefWatermark {
@@ -245,8 +253,7 @@ impl KeyArena {
 ///
 /// Returns `(buffer, used_len)` where `buffer[..used_len]` is the encoded value.
 /// Maximum `used_len` is 37.
-pub fn encode_ref_watermark_value(oid: &OidBytes, generation: u32) -> ([u8; 37], usize) {
-    debug_assert!(generation > 0, "generation 0 should not be stored");
+pub fn encode_ref_watermark_value(oid: &OidBytes, generation: NonZeroU32) -> ([u8; 37], usize) {
     let mut out = [0u8; 37];
     let n = oid.len() as usize;
 
@@ -254,7 +261,7 @@ pub fn encode_ref_watermark_value(oid: &OidBytes, generation: u32) -> ([u8; 37],
 
     out[0] = oid.len();
     out[1..1 + n].copy_from_slice(oid.as_slice());
-    out[1 + n..1 + n + 4].copy_from_slice(&generation.to_le_bytes());
+    out[1 + n..1 + n + 4].copy_from_slice(&generation.get().to_le_bytes());
     (out, 1 + n + 4)
 }
 
@@ -267,7 +274,7 @@ pub fn encode_ref_watermark_value(oid: &OidBytes, generation: u32) -> ([u8; 37],
 /// Returns `None` if the value is malformed:
 /// - Empty input
 /// - OID length is not 20 or 32
-/// - Actual byte count is neither the legacy OID-only length nor the current
+/// - Actual byte count is neither the OID-only length nor the
 ///   OID-plus-generation length
 pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<RefWatermark> {
     if bytes.is_empty() {
@@ -290,7 +297,7 @@ pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<RefWatermark> {
         }),
         len if len == current_len => Some(RefWatermark {
             oid,
-            generation: Some(u32::from_le_bytes(
+            generation: NonZeroU32::new(u32::from_le_bytes(
                 bytes[legacy_len..current_len].try_into().ok()?,
             )),
         }),
@@ -411,12 +418,12 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_sha1() {
         let oid = test_oid_sha1(0xab);
-        let generation = 17;
+        let generation = NonZeroU32::new(17).unwrap();
         let (buf, len) = encode_ref_watermark_value(&oid, generation);
 
         assert_eq!(len, 25);
         assert_eq!(buf[0], 20);
-        assert_eq!(&buf[21..25], &generation.to_le_bytes());
+        assert_eq!(&buf[21..25], &generation.get().to_le_bytes());
 
         let decoded = decode_ref_watermark_value(&buf[..len]).unwrap();
         assert_eq!(
@@ -431,12 +438,12 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_sha256() {
         let oid = test_oid_sha256(0xcd);
-        let generation = 99;
+        let generation = NonZeroU32::new(99).unwrap();
         let (buf, len) = encode_ref_watermark_value(&oid, generation);
 
         assert_eq!(len, 37);
         assert_eq!(buf[0], 32);
-        assert_eq!(&buf[33..37], &generation.to_le_bytes());
+        assert_eq!(&buf[33..37], &generation.get().to_le_bytes());
 
         let decoded = decode_ref_watermark_value(&buf[..len]).unwrap();
         assert_eq!(
@@ -454,6 +461,23 @@ mod tests {
         let mut buf = [0u8; 21];
         buf[0] = oid.len();
         buf[1..21].copy_from_slice(oid.as_slice());
+
+        let decoded = decode_ref_watermark_value(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            RefWatermark {
+                oid,
+                generation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_legacy_value_sha256_sets_generation_none() {
+        let oid = test_oid_sha256(0xcd);
+        let mut buf = [0u8; 33];
+        buf[0] = oid.len();
+        buf[1..33].copy_from_slice(oid.as_slice());
 
         let decoded = decode_ref_watermark_value(&buf).unwrap();
         assert_eq!(
@@ -494,7 +518,7 @@ mod tests {
     #[test]
     fn decode_rejects_trailing_bytes() {
         let oid = test_oid_sha1(0xab);
-        let (buf, len) = encode_ref_watermark_value(&oid, 5);
+        let (buf, len) = encode_ref_watermark_value(&oid, NonZeroU32::new(5).unwrap());
 
         assert!(decode_ref_watermark_value(&buf[..len]).is_some());
 

@@ -38,6 +38,7 @@
 //! Watermark keys use the `rw` prefix from `watermark_keys`.
 
 use std::cmp::Ordering;
+use std::num::NonZeroU32;
 
 use crate::perf_stats;
 
@@ -88,7 +89,7 @@ pub struct RefEntry {
     ///
     /// Finalize is a pure builder, so it persists the value it is given
     /// instead of consulting the commit graph directly.
-    pub tip_generation: u32,
+    pub tip_generation: NonZeroU32,
 }
 
 /// Input to the finalize builder.
@@ -683,7 +684,7 @@ mod tests {
             refs: vec![RefEntry {
                 ref_name: b"refs/heads/main".to_vec(),
                 tip_oid: test_oid(0x01),
-                tip_generation: 1,
+                tip_generation: NonZeroU32::new(1).unwrap(),
             }],
             scanned_blobs: vec![
                 ScannedBlob {
@@ -944,17 +945,17 @@ mod tests {
                 RefEntry {
                     ref_name: b"refs/heads/z-branch".to_vec(),
                     tip_oid: test_oid(0x01),
-                    tip_generation: 10,
+                    tip_generation: NonZeroU32::new(10).unwrap(),
                 },
                 RefEntry {
                     ref_name: b"refs/heads/a-branch".to_vec(),
                     tip_oid: test_oid(0x02),
-                    tip_generation: 20,
+                    tip_generation: NonZeroU32::new(20).unwrap(),
                 },
                 RefEntry {
                     ref_name: b"refs/heads/main".to_vec(),
                     tip_oid: test_oid(0x03),
-                    tip_generation: 30,
+                    tip_generation: NonZeroU32::new(30).unwrap(),
                 },
             ],
             scanned_blobs: vec![],
@@ -982,7 +983,7 @@ mod tests {
             refs: vec![RefEntry {
                 ref_name: b"refs/heads/main".to_vec(),
                 tip_oid: tip,
-                tip_generation: 41,
+                tip_generation: NonZeroU32::new(41).unwrap(),
             }],
             scanned_blobs: vec![],
             finding_arena: &finding_arena,

@@ -5,8 +5,14 @@
 //! - matching watermark generation (ancestry walk still required),
 //! - stale generation mismatch (force-push fast path),
 //! - missing watermark.
+//!
+//! Each iteration includes iterator construction (scratch allocation) plus
+//! the first `next()` call (ref initialization + watermark resolution).
+//! The allocation overhead is constant across all three cases, so the delta
+//! between cases isolates the watermark validation cost.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use gix_commitgraph::Position;
@@ -102,21 +108,21 @@ fn benchmark_commit_walk_watermarks(c: &mut Criterion) {
             "ancestor_match",
             Some(RefWatermark {
                 oid: graph.oid(watermark_pos),
-                generation: Some(graph.generation(watermark_pos)),
+                generation: NonZeroU32::new(graph.generation(watermark_pos)),
             }),
         ),
         (
             "generation_mismatch",
             Some(RefWatermark {
                 oid: graph.oid(watermark_pos),
-                generation: Some(graph.generation(watermark_pos) + 1),
+                generation: NonZeroU32::new(graph.generation(watermark_pos) + 1),
             }),
         ),
         ("missing_watermark", None),
     ];
 
     let mut group = c.benchmark_group("commit_walk_watermark");
-    group.sample_size(10);
+    group.sample_size(50);
 
     for (label, watermark) in cases {
         group.bench_with_input(

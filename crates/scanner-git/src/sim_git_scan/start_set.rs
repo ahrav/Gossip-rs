@@ -4,6 +4,7 @@
 //! and `RefWatermarkStore` traits used by `repo_open`.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use crate::watermark_keys::RefWatermark;
 use crate::StartSetId;
@@ -91,7 +92,7 @@ fn convert_ref(
                         })?;
                 Some(RefWatermark {
                     oid,
-                    generation: Some(generation),
+                    generation: NonZeroU32::new(generation),
                 })
             }
             None => None,
@@ -142,7 +143,12 @@ mod tests {
                 tip: super::super::scenario::GitOid { bytes: oid(1) },
                 watermark: Some(super::super::scenario::GitOid { bytes: oid(2) }),
             }],
-            commits: Vec::new(),
+            commits: vec![super::super::scenario::GitCommitSpec {
+                oid: super::super::scenario::GitOid { bytes: oid(2) },
+                parents: Vec::new(),
+                tree: super::super::scenario::GitOid { bytes: oid(99) },
+                generation: 1,
+            }],
             trees: Vec::new(),
             blobs: Vec::new(),
         };

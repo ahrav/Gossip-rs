@@ -1033,7 +1033,7 @@ pub fn run_git_scan(
     }
 
     // Finalize + persist.
-    let refs = build_ref_entries(&repo, &cg);
+    let refs = build_ref_entries(&repo, &cg)?;
     // Finalize uses only candidate OIDs for watermark/progress semantics;
     // reason taxonomy remains in the report payload.
     let skipped_candidate_oids = output

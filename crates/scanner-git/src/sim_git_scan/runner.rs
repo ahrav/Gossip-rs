@@ -11,6 +11,7 @@
 //! `RunState` and validated at the end of the run before a `RunReport` is
 //! emitted.
 //!
+use std::num::NonZeroU32;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use blake3::Hasher;
@@ -445,7 +446,7 @@ fn stage_repo_open(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
                     .ok_or_else(|| failure_inv(6, "watermark commit missing from commit graph"))?;
                 Some(RefWatermark {
                     oid,
-                    generation: Some(commit_graph.generation(pos)),
+                    generation: NonZeroU32::new(commit_graph.generation(pos)),
                 })
             }
             None => None,
