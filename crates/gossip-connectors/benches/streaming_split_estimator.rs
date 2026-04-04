@@ -14,15 +14,20 @@ mod unix_bench {
     use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group};
     use gossip_connectors::benchmark_streaming_split_estimator_observe_fixed_size;
 
-    /// Measure steady-state `observe` cost across sample-cap settings.
+    /// Benchmarks the split estimator's steady-state `observe` loop across
+    /// representative sample-cap settings.
+    ///
+    /// The workload shape is fixed to the same one-million-item stream used by
+    /// the allocation regression test so throughput and allocation regressions
+    /// can be compared against the same estimator inputs over time.
     pub fn bench_observe(c: &mut Criterion) {
         let mut group = c.benchmark_group("streaming_split_estimator_observe");
-        // Match the perf regression test's 1M-item workload so throughput numbers
-        // can be compared against the allocation guard on the same stream shape.
+        // Keep the benchmark's stream shape pinned to the allocation guard so
+        // changes in throughput can be evaluated against the same workload.
         let count = 1_000_000usize;
 
-        // 30 samples balances CI wall-clock (~10s per param) against
-        // statistical power for detecting 10-15% regressions.
+        // Thirty samples keeps CI runtime bounded while still giving enough
+        // signal to catch moderate regressions in this hot loop.
         group.sample_size(30);
         group.throughput(Throughput::Elements(count as u64));
 
@@ -32,6 +37,8 @@ mod unix_bench {
                 &sample_cap,
                 |b, &sample_cap| {
                     b.iter(|| {
+                        // Black-box both inputs and outputs so the optimizer
+                        // cannot elide the estimator work we are timing.
                         black_box(benchmark_streaming_split_estimator_observe_fixed_size(
                             black_box(sample_cap),
                             black_box(count),

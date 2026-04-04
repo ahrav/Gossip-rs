@@ -9,6 +9,15 @@
 //! - property tests fuzz the bounded-memory and monotonicity invariants over
 //!   randomized streams.
 //!
+//! Across those layers, the suite reinforces three invariants that the
+//! production estimator relies on:
+//! - split keys must always be drawn from the observed stream and must never
+//!   collapse either shard to empty,
+//! - retained samples must remain rank-sorted and byte-monotone even after
+//!   compaction, saturation, or plateau redistribution,
+//! - batch-style construction and incremental observation must agree on the
+//!   same retained sample set and estimated midpoint.
+//!
 //! The separate 1M-item allocation guard lives in
 //! `tests/streaming_split_estimator_perf.rs` because it needs a process-wide
 //! counting allocator and the doc-hidden benchmark hook exported from `lib.rs`.
@@ -17,23 +26,32 @@ use proptest::prelude::*;
 
 use super::{MIN_SAMPLE_CAP, Sample, StreamingSplitEstimator};
 
+/// Smallest sampling budget accepted by the estimator.
 const SMALL_SAMPLE_CAP: usize = MIN_SAMPLE_CAP;
+/// Mid-sized budget used by tests that want a stable cap without forcing the
+/// default constructor path.
 const MEDIUM_SAMPLE_CAP: usize = 512;
+/// Default production sampling budget.
 const LARGE_SAMPLE_CAP: usize = StreamingSplitEstimator::DEFAULT_SAMPLE_CAP;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Encodes a test ordinal as the fixed-width big-endian key shape used by the
+/// estimator.
 fn key_for_index(idx: usize) -> [u8; 8] {
     (idx as u64).to_be_bytes()
 }
 
+/// Decodes a fixed-width test key back into its ordinal for assertions.
 fn index_from_key(key: &[u8]) -> usize {
     let bytes: [u8; 8] = key.try_into().expect("keys must be fixed-width u64 bytes");
     usize::try_from(u64::from_be_bytes(bytes)).expect("index conversion")
 }
 
+/// Returns the cumulative byte weight through `idx`, saturating in the same way
+/// as the estimator's internal byte accounting.
 fn cumulative_at(sizes: &[u64], idx: usize) -> u64 {
     sizes[..=idx]
         .iter()
@@ -41,6 +59,7 @@ fn cumulative_at(sizes: &[u64], idx: usize) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
+/// Measures how far a chosen split is from a perfect 50/50 byte partition.
 fn relative_weight_error(sizes: &[u64], idx: usize) -> f64 {
     let total = sizes.iter().copied().fold(0u64, u64::saturating_add);
     if total == 0 {
@@ -51,6 +70,8 @@ fn relative_weight_error(sizes: &[u64], idx: usize) -> f64 {
     (observed - half).abs() / total as f64
 }
 
+/// Asserts the retained sample sketch preserves the monotone ordering expected
+/// by split estimation and compaction.
 fn assert_samples_sorted(estimator: &StreamingSplitEstimator) {
     let samples = estimator.sample_debug_view();
     assert!(
@@ -320,7 +341,6 @@ fn from_sorted_entries_compacts_when_exceeding_sample_cap() {
             .map(|(k, &s)| (k.as_slice(), s)),
     );
 
-    // Sample count must stay within the cap.
     assert!(
         built.sample_len() <= built.sample_cap(),
         "sample count ({}) exceeded cap ({}) after from_sorted_entries with n={n}",
@@ -328,7 +348,6 @@ fn from_sorted_entries_compacts_when_exceeding_sample_cap() {
         built.sample_cap()
     );
 
-    // Must match the manual observe path exactly.
     let mut observed = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     for (key, &size) in keys.iter().zip(sizes.iter()) {
         observed.observe(key, size);
@@ -337,7 +356,6 @@ fn from_sorted_entries_compacts_when_exceeding_sample_cap() {
     assert_eq!(built.sample_debug_view(), observed.sample_debug_view());
     assert_eq!(built.estimate_split_key(), observed.estimate_split_key());
 
-    // Split key must be valid.
     let split = built
         .estimate_split_key()
         .expect("should produce a split for n > 2");
@@ -395,18 +413,17 @@ fn batch_range_cap_eliminates_split_drift() {
         .estimate_split_key()
         .expect("capped estimator should produce a split");
 
-    // Confirm that DEFAULT_SAMPLE_CAP actually introduces drift (the
-    // motivating observation from the review).
+    // This confirms the default cap can drift from the exact midpoint on
+    // sufficiently large materialized ranges.
     assert_ne!(
         index_from_key(exact_key),
         index_from_key(capped_key),
-        "expected capped estimator to drift from exact on n={n}, \
-         cap={LARGE_SAMPLE_CAP} — if this starts passing, the batch-cap \
-         fix may no longer be necessary"
+        "expected capped estimator to differ from exact on n={n}, \
+         cap={LARGE_SAMPLE_CAP}"
     );
 
-    // The fix: batch connectors pass range.len() as sample_cap.  With
-    // cap = n no compaction fires, so the result matches the exact path.
+    // Setting `sample_cap = range.len()` disables compaction for materialized
+    // ranges and aligns the result with the exact estimator.
     let batch = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
     assert_eq!(
         batch.estimate_split_key(),
@@ -862,9 +879,7 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
     assert_eq!(samples.first().unwrap().key, original_first_key);
     assert_eq!(samples.last().unwrap().key, original_last_key);
 
-    // Ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
-    // Bytes non-decreasing.
     assert!(
         samples
             .windows(2)
@@ -1490,7 +1505,8 @@ proptest! {
             .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
             .collect();
 
-        // Naive: collect into new vec via the index selector.
+        // Compare the in-place algorithm against the simplest obviously-correct
+        // specification: select indices first, then collect them into a new vec.
         let keep = selected_sample_indices(&samples, cap);
         let expected: Vec<_> = keep
             .iter()
@@ -1525,7 +1541,8 @@ proptest! {
         use super::selected_sample_indices;
 
         let cap = (MIN_SAMPLE_CAP * cap_mult).min(count);
-        // Skip degenerate cases where cap >= count (no compaction needed).
+        // Only test cases where compaction is triggered; cap >= count means no
+        // compaction fires and the invariant is trivially satisfied.
         prop_assume!(count > cap);
 
         let samples: Vec<Sample> = (0..count)

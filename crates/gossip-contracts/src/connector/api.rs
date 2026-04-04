@@ -31,6 +31,9 @@
 //! - `retry_after_ms` is advisory backoff metadata, not a scheduler contract.
 //!   The runtime may enforce stricter global policies regardless of connector
 //!   hints.
+//! - Constructor invariants are enforced by private fields: only the
+//!   rate-limited constructor records `retry_after_ms = Some(_)`, while the
+//!   generic retryable and permanent constructors always store `None`.
 //! - `message` is passthrough connector text. The `Display` impl replaces most
 //!   control characters with U+FFFD (preserving HT/LF/CR) to prevent log
 //!   injection, but raw field access via [`message()`] returns the original
@@ -84,6 +87,11 @@ impl fmt::Display for ErrorClass {
 /// and C1 (U+0080..U+009F). Together with HT/LF/CR (which are preserved),
 /// these ranges form the full set for which [`char::is_control()`] returns
 /// `true`.
+///
+/// This helper streams directly into the formatter and does not allocate an
+/// intermediate sanitized string. Hidden visibility keeps the public API
+/// surface small while still allowing macro-generated `Display` impls to reuse
+/// one canonical sanitization policy.
 #[inline]
 #[doc(hidden)]
 pub fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
@@ -107,6 +115,11 @@ pub fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::
 /// - `class: ErrorClass` — binary retry posture
 /// - `message: String` — connector-originated diagnostic text
 /// - `retry_after_ms: Option<u64>` — optional advisory backoff hint
+///
+/// Invariant preserved by the generated constructors:
+/// - `retryable()` => `class = Retryable`, `retry_after_ms = None`
+/// - `rate_limited()` => `class = Retryable`, `retry_after_ms = Some(_)`
+/// - `permanent()` => `class = Permanent`, `retry_after_ms = None`
 ///
 /// Generated API surface per type:
 /// - Accessors: `class()`, `message()`, `retry_after_ms()`, `is_retryable()`, `into_message()`
@@ -306,6 +319,10 @@ impl ReadError {
 /// Orchestration and planning layers use these to choose enumeration strategy
 /// (key-seek vs token-resume), decide whether range reads are available, and
 /// determine if the connector can emit split hints for dynamic re-sharding.
+/// The flags are orthogonal: a connector may support neither, either, or both
+/// of `seek_by_key` and `token_resume`, and planning code should pick the most
+/// natural strategy for the connector/runtime combination instead of assuming
+/// one excludes the other.
 ///
 /// `Default` produces a conservative "no features" profile (all fields
 /// `false`), which is safe for connectors that have not been updated to
