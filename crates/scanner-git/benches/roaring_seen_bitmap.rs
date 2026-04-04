@@ -65,6 +65,16 @@ fn bench_serialize(c: &mut Criterion) {
     });
 }
 
+fn bench_deserialize(c: &mut Criterion) {
+    let bytes = build_bitmap(BITMAP_SIZE).serialize().expect("serialize");
+
+    c.bench_function("roaring_seen/deserialize_1m", |b| {
+        b.iter(|| {
+            black_box(RoaringSeenBitmap::deserialize(black_box(&bytes)).expect("deserialize"))
+        })
+    });
+}
+
 fn bench_insert_batch(c: &mut Criterion) {
     let bitmap = build_bitmap(BITMAP_SIZE);
     let update = build_update_batch(BITMAP_SIZE, PROBE_BATCH);
@@ -91,6 +101,7 @@ criterion_group!(
     bench_batch_contains,
     bench_batch_contains_sorted,
     bench_serialize,
+    bench_deserialize,
     bench_insert_batch
 );
 criterion_main!(benches);

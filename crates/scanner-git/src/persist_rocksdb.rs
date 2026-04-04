@@ -301,7 +301,7 @@ impl PersistenceStore for RocksDbStore {
                                 "staging bitmap contains unseen entries",
                             ));
                         }
-                        seen_oids.extend_from_slice(staging_bitmap.all_oids());
+                        seen_oids.extend(staging_bitmap.all_oids());
                     }
                     // Delete the staging key in both cases: complete folds
                     // it into live; partial discards it so skipped blobs

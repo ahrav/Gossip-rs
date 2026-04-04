@@ -658,7 +658,7 @@ where
         let resolved_staging = staging_bitmap.or(staging_from_backend);
         let has_staging = resolved_staging.is_some();
         if is_complete && let Some(staging) = &resolved_staging {
-            seen_oids.extend_from_slice(staging.all_oids());
+            seen_oids.extend(staging.all_oids());
         }
 
         let mut staged_bitmap = None;

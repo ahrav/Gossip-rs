@@ -99,6 +99,8 @@ For repositories where candidates fit in a single chunk, no disk I/O occurs.
 |------|----------|-------------|
 | `SeenBlobStore` (trait) | `seen_store.rs` | Batch query interface for seen-blob filtering. Returns one bool per OID; inputs expected sorted. |
 | `SeenBitmapPersister` (trait) | `seen_store.rs` | Incremental write interface for scope-scoped seen-bitmap updates. Inputs must already be sorted and unique. |
+| `SeenBitmapDelta` | `roaring_seen.rs` | Finalize-time `sb\0` payload. Holds canonical OIDs as `Vec<OidBytes>` because batches are short-lived. |
+| `RoaringSeenBitmap` | `roaring_seen.rs` | Durable per-scope seen snapshot. Keeps the sorted OID index flat-packed as `oid_count * oid_len` bytes in memory and overlays a roaring bitmap over positions in that table. |
 | `NullSeenBitmapPersister` | `seen_store.rs` | No-op persister used when a scan has no durable mid-spill checkpoint target. |
 | `NeverSeenStore` | `seen_store.rs` | Marks all blobs unseen (full-scan mode). |
 | `AlwaysSeenStore` | `seen_store.rs` | Marks all blobs seen (testing). |
@@ -171,7 +173,9 @@ with `seen_batch_max_oids` and `seen_batch_max_path_bytes` limits). Unseen
 blobs are emitted to the `UniqueBlobSink`, and the batch's sorted OIDs are
 then forwarded to the seen-bitmap persister so crash recovery can resume from
 the last flushed checkpoint. Temporary run files are deleted after finalize
-(also deleted on drop as a safety net).
+(also deleted on drop as a safety net). Persisted scope snapshots keep those
+OIDs in a flat-packed byte table, so the long-lived seen index does not pay the
+per-entry padding cost of `OidBytes`.
 
 ## Arena Allocation
 
