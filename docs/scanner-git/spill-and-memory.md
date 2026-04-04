@@ -397,6 +397,8 @@ are approximate.
 | No-op seen-bitmap persister | `crates/scanner-git/src/seen_store.rs` |
 | Unique blob sink trait | `crates/scanner-git/src/unique_blob.rs` |
 | Tree diff limits | `crates/scanner-git/src/tree_diff_limits.rs` |
+| Durable seen bitmap (flat-packed OID index + roaring) | `crates/scanner-git/src/roaring_seen.rs` |
+| Finalize-time seen-bitmap delta | `crates/scanner-git/src/roaring_seen.rs` |
 
 ## Related Docs
 

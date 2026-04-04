@@ -406,13 +406,13 @@ impl SeenBitmapDelta {
 
 /// Inserts the position into the bitmap as a u32 index.
 ///
-/// The OID count is validated to fit in u32 at construction (via `u32_len`)
-/// and at merge entry, so the truncation is safe under those invariants.
+/// Callers must ensure `pos` fits in u32. This is guaranteed by the
+/// construction-time `u32_len` check in `from_oids_and_bitmap` and the
+/// pre-mutation `u32_len` guard in both merge paths of `merge_positions`.
 #[inline]
-fn insert_position(bitmap: &mut RoaringBitmap, pos: usize) -> Result<(), SeenBitmapError> {
+fn insert_position(bitmap: &mut RoaringBitmap, pos: usize) {
     debug_assert!(pos <= u32::MAX as usize, "bitmap position exceeds u32::MAX");
     bitmap.insert(pos as u32);
-    Ok(())
 }
 
 /// Probes the bitmap for the given position.
@@ -546,7 +546,8 @@ impl RoaringSeenBitmap {
     ///
     /// # Panics
     ///
-    /// Debug-asserts that `oids` is strictly sorted.
+    /// Debug-asserts that `oids` is sorted in non-decreasing order.
+    /// Duplicate probes are allowed and return the same result.
     #[must_use]
     pub fn batch_contains_sorted(&self, oids: &[OidBytes]) -> Vec<bool> {
         debug_assert!(
@@ -635,14 +636,19 @@ impl RoaringSeenBitmap {
         // Fast path: all incoming OIDs sort strictly after the existing
         // maximum. Extends in-place, avoiding a full-buffer copy.
         if self.oids.len() > 0 && self.oids.oid_at(self.oids.len() - 1) < other_oid_at(0) {
+            // Validate the final length fits in u32 BEFORE mutating self,
+            // so a failed check cannot leave self.oids with more entries
+            // than the Roaring bitmap can index. No dedup occurs on this
+            // path (all incoming OIDs are strictly greater), so the sum is
+            // exact rather than an upper bound.
             let base_len = self.oids.len();
+            let _ = u32_len(base_len + other_len)?;
             for idx in 0..other_len {
                 self.oids.push(other_oid_at(idx));
                 if other_contains(idx) {
-                    insert_position(&mut self.seen, base_len + idx)?;
+                    insert_position(&mut self.seen, base_len + idx);
                 }
             }
-            let _ = u32_len(self.oids.len())?;
             return Ok(());
         }
 
@@ -679,14 +685,14 @@ impl RoaringSeenBitmap {
                 }
             };
             if insert_seen {
-                insert_position(&mut merged_seen, merged_oids.len() - 1)?;
+                insert_position(&mut merged_seen, merged_oids.len() - 1);
             }
         }
 
         while left < self.oids.len() {
             merged_oids.push(self.oids.oid_at(left));
             if bitmap_contains(&self.seen, left) {
-                insert_position(&mut merged_seen, merged_oids.len() - 1)?;
+                insert_position(&mut merged_seen, merged_oids.len() - 1);
             }
             left += 1;
         }
@@ -694,7 +700,7 @@ impl RoaringSeenBitmap {
         while right < other_len {
             merged_oids.push(other_oid_at(right));
             if other_contains(right) {
-                insert_position(&mut merged_seen, merged_oids.len() - 1)?;
+                insert_position(&mut merged_seen, merged_oids.len() - 1);
             }
             right += 1;
         }
