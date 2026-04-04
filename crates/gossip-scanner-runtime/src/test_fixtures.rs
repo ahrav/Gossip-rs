@@ -45,7 +45,7 @@ pub(crate) fn write_context_with_epoch(fence_epoch_raw: u64) -> WriteContext {
 }
 
 /// Run `git` inside `dir` and assert the command succeeds.
-pub(crate) fn run_git_in(dir: &Path, args: &[&str]) {
+pub fn run_git_in(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -63,7 +63,7 @@ pub(crate) fn run_git_in(dir: &Path, args: &[&str]) {
 }
 
 /// Initialize a git repository with the configured author identity.
-pub(crate) fn init_git_repo(dir: &Path, email: &str, name: &str) {
+pub fn init_git_repo(dir: &Path, email: &str, name: &str) {
     run_git_in(dir, &["init", "-q"]);
     run_git_in(dir, &["config", "user.email", email]);
     run_git_in(dir, &["config", "user.name", name]);
