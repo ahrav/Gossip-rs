@@ -28,10 +28,9 @@
 //! ```
 //!
 //! The decoder requires the full `1 + oid_len + 4` byte layout.
-//! Shorter payloads (e.g., OID-only values from a prior code revision)
-//! are rejected as malformed, causing a one-time full rescan for that ref.
-//! Adding new trailing fields requires a new length class or an
-//! explicit version byte.
+//! Shorter or malformed payloads are rejected (returns `None`), which
+//! callers surface as an error. Adding new trailing fields requires a
+//! new length class or an explicit version byte.
 
 use std::num::NonZeroU32;
 

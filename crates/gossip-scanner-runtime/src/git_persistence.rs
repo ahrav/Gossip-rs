@@ -998,7 +998,7 @@ mod tests {
         let start_set_id = [0x88; 32];
         let ref_name = b"refs/heads/main".as_slice();
         let oid = OidBytes::sha1([0x33; 20]);
-        // OID-only payload (no generation trailer) — from a prior code revision.
+        // OID-only payload (no generation trailer).
         let mut oid_only = vec![oid.len()];
         oid_only.extend_from_slice(oid.as_slice());
         backend.set(
