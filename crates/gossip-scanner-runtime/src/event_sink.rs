@@ -648,6 +648,10 @@ mod tests {
             !line.contains("norm_hash"),
             "encoded git event must omit norm_hash, got: {line}"
         );
+        assert!(
+            !line.contains("rule_id"),
+            "encoded git event must omit rule_id, got: {line}"
+        );
     }
 
     #[test]

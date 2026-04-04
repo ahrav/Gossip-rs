@@ -6564,12 +6564,11 @@ mod tests {
         );
     }
 
-    /// The done-ledger record produced by a successful git repo scan must
-    /// derive its findings count from the durable findings receipt, not from
-    /// the captured event stream. When the fixture produces no findings,
-    /// findings_count must be zero and status ScannedClean.
+    /// A successful git repo scan of a clean (zero-findings) fixture must
+    /// produce exactly one done-ledger row with findings_count=0 and status
+    /// ScannedClean.
     #[test]
-    fn git_repo_worker_done_ledger_uses_receipt_count() {
+    fn git_repo_worker_clean_scan_produces_scanned_clean_done_ledger_row() {
         let repo = create_clean_git_repo_fixture();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
