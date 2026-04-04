@@ -8363,8 +8363,7 @@ mod tests {
                     {
                         use std::os::unix::fs::PermissionsExt;
                         let perms = fs::Permissions::from_mode(0o644);
-                        fs::set_permissions(obj_entry.path(), perms)
-                            .expect("set writable");
+                        fs::set_permissions(obj_entry.path(), perms).expect("set writable");
                     }
                     fs::write(obj_entry.path(), b"CORRUPT").expect("corrupt blob");
                     corrupted = true;
