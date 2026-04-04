@@ -2131,7 +2131,6 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[allow(dead_code)]
 pub mod test_fixtures;
 
 #[cfg(test)]

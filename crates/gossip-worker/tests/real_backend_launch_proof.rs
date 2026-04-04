@@ -163,10 +163,14 @@ struct GitRepoFixture {
 
 /// Local Git launch fixture for real-backend worker proofs.
 ///
-/// Each repo contains one committed evidence file with `SAFE_TOKEN` plus an
-/// extra committed file so the Git proof exercises both findings and clean
-/// object handling. The fixture also owns the worker-local mirror root and
-/// rules file required by connector-mode Git launches.
+/// Each repo contains committed files so the Git proof exercises object
+/// handling. Repos created via [`new`](Self::new) include a file that matches
+/// `SAFE_TOKEN` (for submission-only tests). Repos created via
+/// [`clean`](Self::clean) contain only non-matching content so the worker can
+/// complete the shard without hitting the findings-persistence guard.
+///
+/// The fixture also owns the worker-local mirror root and rules file required
+/// by connector-mode Git launches.
 struct GitScanFixture {
     /// RAII guard — dropping this removes the temporary repo workspace.
     _workspace_root: TempDir,
@@ -180,13 +184,28 @@ struct GitScanFixture {
 
 impl GitScanFixture {
     fn new(repo_count: usize) -> Self {
+        Self::build(repo_count, true)
+    }
+
+    /// Create a fixture whose repos contain no content matching `SAFE_TOKEN`.
+    ///
+    /// Use this for tests that run the actual worker binary: durable Git
+    /// finding translation is not yet wired up, so the runtime rejects shards
+    /// that detect findings. Clean repos let the worker complete the shard.
+    fn clean(repo_count: usize) -> Self {
+        Self::build(repo_count, false)
+    }
+
+    fn build(repo_count: usize, include_secret: bool) -> Self {
         assert!(repo_count > 0, "GitScanFixture requires at least one repo");
 
         let workspace_root = tempfile::tempdir().expect("repo workspace tempdir should create");
         let mirror_root = tempfile::tempdir().expect("mirror-root tempdir should create");
         let (rules_root, rules_path) = create_rules_fixture();
         let repos = (0..repo_count)
-            .map(|index| create_committed_git_repo(workspace_root.path(), index))
+            .map(|index| {
+                create_committed_git_repo(workspace_root.path(), index, include_secret)
+            })
             .collect();
 
         Self {
@@ -219,7 +238,11 @@ impl GitScanFixture {
     }
 }
 
-fn create_committed_git_repo(workspace_root: &Path, index: usize) -> GitRepoFixture {
+fn create_committed_git_repo(
+    workspace_root: &Path,
+    index: usize,
+    include_secret: bool,
+) -> GitRepoFixture {
     let repo_path = workspace_root.join(format!("repo-{index}"));
     fs::create_dir_all(&repo_path).expect("git fixture repo directory should create");
     init_git_repo(
@@ -227,12 +250,13 @@ fn create_committed_git_repo(workspace_root: &Path, index: usize) -> GitRepoFixt
         "launch-proof-tests@example.com",
         "Launch Proof Tests",
     );
-    run_git_in(&repo_path, &["branch", "-M", "main"]);
-    fs::write(
-        repo_path.join("evidence.txt"),
-        format!("git evidence fixture {index}: {SAFE_TOKEN}\n"),
-    )
-    .expect("git evidence fixture should write");
+    let evidence_content = if include_secret {
+        format!("git evidence fixture {index}: {SAFE_TOKEN}\n")
+    } else {
+        format!("git clean fixture {index}: no rule-matching content\n")
+    };
+    fs::write(repo_path.join("evidence.txt"), evidence_content)
+        .expect("git evidence fixture should write");
     fs::write(
         repo_path.join("readme.txt"),
         format!("fixture repo {index} adds one clean file\n"),
@@ -243,6 +267,10 @@ fn create_committed_git_repo(workspace_root: &Path, index: usize) -> GitRepoFixt
     run_git_in(&repo_path, &["commit", "-q", "-m", commit_message.as_str()]);
 
     let head_oid = run_git_in_stdout(&repo_path, &["rev-parse", "HEAD"]);
+    assert!(
+        head_oid.len() >= 40 && head_oid.chars().all(|c| c.is_ascii_hexdigit()),
+        "git rev-parse HEAD returned invalid OID for repo-{index}: {head_oid:?}"
+    );
     GitRepoFixture {
         path: repo_path,
         head_oid,
@@ -350,6 +378,12 @@ impl GitSeededLaunchProof {
             OpId::from_raw(21),
         );
 
+        assert_eq!(
+            submission.shard_keys.len(),
+            1,
+            "single-repo Git submission must register exactly one shard"
+        );
+
         Self {
             backends,
             fixture,
@@ -437,16 +471,27 @@ fn submit_git_request(
         GitRunSetupInput::new(&plan),
         op_id,
     )
-    .expect("test Git run setup should succeed");
+    .unwrap_or_else(|e| panic!("Git run setup should succeed (run={:?}): {e}", run_id()));
     assert!(
         outcome.is_executed(),
-        "fresh Git launch proof setup should execute instead of replaying an existing run"
+        "fresh Git launch proof setup should execute instead of replaying (run={:?})",
+        run_id(),
     );
     let setup = outcome.into_inner();
     let persisted_run = coordinator
         .test_load_run_snapshot(tenant_id(), run_id())
-        .expect("run snapshot lookup should succeed after Git submission")
-        .expect("Git submission should register a run record");
+        .unwrap_or_else(|e| {
+            panic!(
+                "run snapshot lookup should succeed after Git submission (run={:?}): {e}",
+                run_id()
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "Git submission should register a run record (run={:?})",
+                run_id()
+            )
+        });
     assert_eq!(persisted_run.status(), RunStatus::Active);
     assert_eq!(
         persisted_run.root_shards(),
@@ -538,18 +583,22 @@ fn assert_registered_git_shard_state(
 ) -> GitShardPayload {
     let shard = coordinator
         .test_load_shard_snapshot(tenant_id(), key)
-        .expect("submitted Git shard snapshot lookup should succeed")
-        .expect("Git submission should register the startup shard");
-    assert_eq!(shard.status, ShardStatus::Active);
+        .unwrap_or_else(|e| panic!("shard {key:?}: snapshot lookup should succeed: {e}"))
+        .unwrap_or_else(|| panic!("shard {key:?}: submission should register the startup shard"));
+    assert_eq!(
+        shard.status,
+        ShardStatus::Active,
+        "shard {key:?}: should be Active after submission"
+    );
     assert_eq!(
         shard.spec.key_range_start(shard.slab()),
         entry.geometry().key_range_start(),
-        "Git submission should persist the planned lower key bound"
+        "shard {key:?}: submission should persist the planned lower key bound"
     );
     assert_eq!(
         shard.spec.key_range_end(shard.slab()),
         entry.geometry().key_range_end(),
-        "Git submission should persist the planned upper key bound"
+        "shard {key:?}: submission should persist the planned upper key bound"
     );
     assert!(
         shard.cursor.last_key(shard.slab()).is_none(),
@@ -560,16 +609,16 @@ fn assert_registered_git_shard_state(
             .test_load_owner_binding(tenant_id(), key)
             .expect("owner-binding lookup should succeed after Git submission")
             .is_none(),
-        "Git submission alone must not claim the shard"
+        "shard {key:?}: submission alone must not claim the shard"
     );
     let connector_extra = decode_connector_extra(shard.spec.as_spec_ref(shard.slab()))
-        .expect("Git shard metadata should decode");
+        .unwrap_or_else(|e| panic!("shard {key:?}: metadata should decode: {e}"));
     let payload = GitShardPayload::decode(connector_extra)
-        .expect("Git shard payload should round-trip from shard metadata");
+        .unwrap_or_else(|e| panic!("shard {key:?}: payload should round-trip: {e}"));
     assert_eq!(
         &payload,
         entry.payload(),
-        "persisted Git shard payload must match the orchestrator plan"
+        "shard {key:?}: persisted payload must match the orchestrator plan"
     );
     payload
 }
@@ -577,8 +626,8 @@ fn assert_registered_git_shard_state(
 /// Assert that a shard completed durably and released its live lease state.
 ///
 /// Validates the persisted etcd snapshot: Done status, a non-trivial progress
-/// cursor, and no live owner binding. Each connector-family wrapper calls this
-/// for the common invariants before optionally adding connector-specific checks.
+/// cursor, and no live owner binding. Connector-family wrappers delegate here
+/// with a diagnostic label for assertion messages.
 fn assert_completed_shard_invariants(coordinator: &EtcdCoordinator, key: ShardKey, label: &str) {
     let shard = coordinator
         .test_load_shard_snapshot(tenant_id(), key)
@@ -615,11 +664,10 @@ fn assert_completed_filesystem_shard_state(coordinator: &EtcdCoordinator, key: S
     assert_completed_shard_invariants(coordinator, key, "filesystem");
 }
 
-/// Assert that a Git shard completed durably and released its live lease state.
+/// Assert that a Git shard completed durably.
 ///
-/// Completion is validated against the persisted etcd snapshot rather than
-/// transient runtime reports so the proof exercises the same post-conditions a
-/// restarted worker would observe.
+/// Validates all common completion invariants (Done status, non-trivial
+/// progress cursor, no owner binding) via [`assert_completed_shard_invariants`].
 fn assert_completed_git_shard_state(coordinator: &EtcdCoordinator, key: ShardKey) {
     assert_completed_shard_invariants(coordinator, key, "git");
 }
