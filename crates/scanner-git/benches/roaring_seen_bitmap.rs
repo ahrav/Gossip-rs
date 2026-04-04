@@ -96,12 +96,36 @@ fn bench_insert_batch(c: &mut Criterion) {
     });
 }
 
+fn bench_merge(c: &mut Criterion) {
+    let base = build_bitmap(BITMAP_SIZE);
+    let update_oids: Vec<OidBytes> = (BITMAP_SIZE..BITMAP_SIZE + PROBE_BATCH)
+        .map(oid_from_u32)
+        .collect();
+    let mut update = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+    update.insert_batch(&update_oids).expect("update bitmap");
+
+    c.bench_function("roaring_seen/merge_10k_into_1m", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut working = base.clone();
+                let start = Instant::now();
+                working.merge(black_box(&update)).expect("merge");
+                total += start.elapsed();
+                black_box(working);
+            }
+            total
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_batch_contains,
     bench_batch_contains_sorted,
     bench_serialize,
     bench_deserialize,
-    bench_insert_batch
+    bench_insert_batch,
+    bench_merge
 );
 criterion_main!(benches);

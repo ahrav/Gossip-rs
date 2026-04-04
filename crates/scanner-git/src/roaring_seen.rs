@@ -79,6 +79,17 @@ fn validate_oid_len(oid_len: u8) -> Result<(), SeenBitmapError> {
     }
 }
 
+/// Panics if `oid_len` is not 20 (SHA-1) or 32 (SHA-256).
+/// Used by `FlatOidIndex` constructors on cold paths where an invalid length
+/// is a programming error, not a runtime input validation concern.
+fn validated_oid_len(oid_len: u8) -> u8 {
+    assert!(
+        oid_len == OidBytes::SHA1_LEN || oid_len == OidBytes::SHA256_LEN,
+        "FlatOidIndex requires SHA-1 (20) or SHA-256 (32) OID length, got {oid_len}",
+    );
+    oid_len
+}
+
 fn u32_len(len: usize) -> Result<u32, SeenBitmapError> {
     u32::try_from(len).map_err(|_| SeenBitmapError::TooManyOids(len))
 }
@@ -146,6 +157,7 @@ struct FlatOidIndex {
 
 impl FlatOidIndex {
     fn new(oid_len: u8) -> Self {
+        let oid_len = validated_oid_len(oid_len);
         Self {
             oid_len,
             data: Vec::new(),
@@ -153,6 +165,7 @@ impl FlatOidIndex {
     }
 
     fn try_with_capacity(oid_len: u8, count: usize) -> Result<Self, SeenBitmapError> {
+        let oid_len = validated_oid_len(oid_len);
         let capacity = count
             .checked_mul(oid_len as usize)
             .ok_or(SeenBitmapError::TooManyOids(count))?;
@@ -163,6 +176,7 @@ impl FlatOidIndex {
     }
 
     fn from_bytes(data: Vec<u8>, oid_len: u8) -> Self {
+        let oid_len = validated_oid_len(oid_len);
         assert_eq!(
             data.len() % oid_len as usize,
             0,
@@ -187,6 +201,10 @@ impl FlatOidIndex {
             oid.len(),
             self.oid_len as usize,
             "packed OID stride mismatch",
+        );
+        debug_assert!(
+            self.data.is_empty() || &self.data[self.data.len() - self.oid_len as usize..] < oid,
+            "FlatOidIndex::push violates sorted order",
         );
         self.data.extend_from_slice(oid);
     }
@@ -614,6 +632,20 @@ impl RoaringSeenBitmap {
             .checked_add(other_len)
             .ok_or(SeenBitmapError::TooManyOids(usize::MAX))?;
 
+        // Fast path: all incoming OIDs sort strictly after the existing
+        // maximum. Extends in-place, avoiding a full-buffer copy.
+        if self.oids.len() > 0 && self.oids.oid_at(self.oids.len() - 1) < other_oid_at(0) {
+            let base_len = self.oids.len();
+            for idx in 0..other_len {
+                self.oids.push(other_oid_at(idx));
+                if other_contains(idx) {
+                    insert_position(&mut self.seen, base_len + idx)?;
+                }
+            }
+            let _ = u32_len(self.oids.len())?;
+            return Ok(());
+        }
+
         let mut merged_oids =
             FlatOidIndex::try_with_capacity(self.oid_len, self.oids.len() + other_len)?;
         let mut merged_seen = RoaringBitmap::new();
@@ -670,6 +702,11 @@ impl RoaringSeenBitmap {
         // Authoritative check: the deduped merged count is the real value
         // that must fit in u32 for the bitmap to index correctly.
         let _ = u32_len(merged_oids.len())?;
+
+        debug_assert!(
+            packed_oids_are_canonical(merged_oids.as_bytes(), self.oid_len as usize),
+            "merge produced non-canonical OID order",
+        );
 
         self.oids = merged_oids;
         self.seen = merged_seen;
@@ -1211,6 +1248,11 @@ mod proptests {
             .prop_map(|items| items.into_iter().map(OidBytes::sha1).collect())
     }
 
+    fn arb_sha256_oids() -> impl Strategy<Value = Vec<OidBytes>> {
+        prop::collection::vec(any::<[u8; 32]>(), 0..128)
+            .prop_map(|items| items.into_iter().map(OidBytes::sha256).collect())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(
             crate::test_utils::proptest_cases(PROPTEST_CASES)
@@ -1331,6 +1373,16 @@ mod proptests {
             let flags = round_tripped.batch_contains(&probe);
             let expected: Vec<bool> = probe.iter().map(|oid| oracle.contains(oid)).collect();
             prop_assert_eq!(flags, expected);
+        }
+
+        #[test]
+        fn bitmap_sha256_round_trip(oids in arb_sha256_oids()) {
+            let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA256_LEN);
+            bitmap.insert_batch(&oids).expect("insert");
+
+            let bytes = bitmap.serialize().expect("serialize");
+            let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+            prop_assert_eq!(decoded, bitmap);
         }
     }
 }
