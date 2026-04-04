@@ -32,7 +32,7 @@ Rule loading order:
 
 1. Explicit `--rules=<path>`
 2. `crates/scanner-engine/default_rules.yaml` next to the scanner binary
-3. Compiled-in fallback (`scanner_engine::rules::BUILTIN_RULES_YAML`, sourced from `crates/scanner-engine/default_rules.yaml` via `include_str!("../../default_rules.yaml")`)
+3. Compiled-in fallback embedded from `crates/scanner-engine/default_rules.yaml` via `include_str!("../../default_rules.yaml")` in `crates/scanner-engine/src/rules/mod.rs`
 
 Startup logs include the resolved rule source and a stable fast non-cryptographic
 `rule_hash` fingerprint of the loaded rule bytes to make cache and rule-source
@@ -55,7 +55,7 @@ Examples:
 2. **Safelist**: a real-looking bearer token in documentation-style context (for example hosts/placeholders) can be filtered by emit-time safelist even when the secret bytes do not match `value_suppressors_any`.
 3. **Non-safelisted context**: the same token in production-like context (for example `api.internal`) remains reportable if other gates pass.
 
-`value_suppressors_any` is the only suppression control encoded directly in rule YAML today; safelist suppression is deliberately outside rule-gate sequencing and runs at finding emission.
+`value_suppressors_any` is the only rule-level post-match substring suppressor encoded directly in rule YAML today; `offline_validation` and `uuid_format_secret` also affect emit-time suppression, while safelist suppression is deliberately outside rule-gate sequencing and runs at finding emission.
 
 ## Rule Families (Representative Only)
 
