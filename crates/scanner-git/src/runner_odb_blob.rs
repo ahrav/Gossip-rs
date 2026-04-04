@@ -51,9 +51,7 @@ use super::pack_candidates::{
     CappedPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateCollector,
 };
 use super::pack_io::PackIo;
-use super::pack_plan::{
-    bucket_pack_candidates, build_pack_plan_for_pack, filter_completed_packs, PackPlanError,
-};
+use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPlanError};
 use super::pack_plan_model::CompletedPacksBitmap;
 use super::runner::{
     GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
@@ -439,7 +437,10 @@ pub(super) fn run_odb_blob(
             pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
             plans.push(plan);
         }
-        filter_completed_packs(&mut plans, &completed_packs);
+        // No plan-level filter needed: the candidate-level retain on line 348
+        // already removed every candidate belonging to a completed pack, so
+        // bucket_pack_candidates never produces those pack_ids and no plan is
+        // built for them.
         perf_set!(
             stage_nanos,
             pack_plan,
@@ -483,14 +484,14 @@ pub(super) fn run_odb_blob(
                 Arc::clone(&commit_meta_seen),
             )?;
             collect_scheduler_outputs(
-                plan_pack_ids,
+                &plan_pack_ids,
                 outputs,
                 &mut completed_packs,
                 &mut pack_exec_reports,
                 &mut skipped_candidates,
                 &mut common_metrics,
                 &mut scanned,
-            );
+            )?;
         }
 
         if !loose.is_empty() {

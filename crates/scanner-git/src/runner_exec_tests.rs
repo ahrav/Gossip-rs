@@ -596,6 +596,101 @@ fn merge_shard_outputs_mixed_error_prevents_completion() {
 }
 
 #[test]
+fn collect_scheduler_outputs_mismatched_lengths_returns_error() {
+    let plan_pack_ids: Vec<u16> = vec![0, 1];
+    let outputs = vec![scheduler_output_with_report(PackExecReport::default())];
+    let mut completed = CompletedPacksBitmap::empty(4);
+    let mut reports = Vec::new();
+    let mut skipped = Vec::new();
+    let mut metrics = GitScanCommonMetrics::default();
+    let mut scanned = ScannedBlobs {
+        blobs: Vec::new(),
+        finding_arena: Vec::new(),
+    };
+
+    let err = collect_scheduler_outputs(
+        &plan_pack_ids,
+        outputs,
+        &mut completed,
+        &mut reports,
+        &mut skipped,
+        &mut metrics,
+        &mut scanned,
+    )
+    .expect_err("mismatched lengths must return an error");
+
+    assert!(
+        matches!(
+            err,
+            crate::pack_exec::PackExecError::SchedulerOutputCountMismatch {
+                expected: 2,
+                got: 1
+            }
+        ),
+        "expected SchedulerOutputCountMismatch, got: {err:?}"
+    );
+}
+
+#[test]
+fn collect_scheduler_outputs_mixed_completion() {
+    let plan_pack_ids: Vec<u16> = vec![0, 1, 2];
+    let clean_report = PackExecReport::default();
+    let error_report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![SkipRecord {
+            offset: 42,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        }],
+    };
+    let not_blob_report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![SkipRecord {
+            offset: 10,
+            reason: crate::pack_exec::SkipReason::NotBlob,
+        }],
+    };
+    let outputs = vec![
+        scheduler_output_with_report(clean_report),
+        scheduler_output_with_report(error_report),
+        scheduler_output_with_report(not_blob_report),
+    ];
+    let mut completed = CompletedPacksBitmap::empty(4);
+    let mut reports = Vec::new();
+    let mut skipped = Vec::new();
+    let mut metrics = GitScanCommonMetrics::default();
+    let mut scanned = ScannedBlobs {
+        blobs: Vec::new(),
+        finding_arena: Vec::new(),
+    };
+
+    collect_scheduler_outputs(
+        &plan_pack_ids,
+        outputs,
+        &mut completed,
+        &mut reports,
+        &mut skipped,
+        &mut metrics,
+        &mut scanned,
+    )
+    .expect("equal lengths should succeed");
+
+    // Pack 0 (clean) and pack 2 (NotBlob only) marked complete.
+    // Pack 1 (error skip) not marked.
+    assert!(completed.is_complete(0), "clean plan should be complete");
+    assert!(
+        !completed.is_complete(1),
+        "error-skip plan should not be complete"
+    );
+    assert!(
+        completed.is_complete(2),
+        "NotBlob-only plan should be complete"
+    );
+    assert_eq!(reports.len(), 3, "all reports should be accumulated");
+}
+
+#[test]
 fn auto_tree_delta_cache_bytes_small_repo() {
     let bytes = auto_tree_delta_cache_bytes(3_000, 128 * 1024 * 1024);
     assert_eq!(bytes, 8 * 1024 * 1024, "small repos clamp to floor");
@@ -926,10 +1021,6 @@ fn estimate_locality_pressure_known_deps() {
         "all deps cross shard boundaries"
     );
 }
-
-// NOTE: The field-ordering assertion for SchedulerPackWorkerRuntime is now a
-// compile-time `const` assertion in runner_exec.rs (next to the struct
-// definition). It catches reordering at build time rather than at test time.
 
 /// Exercises the full lifecycle of `SchedulerPackWorkerRuntime`:
 /// construction (with the same `transmute` pattern used in production),

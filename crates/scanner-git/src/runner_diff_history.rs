@@ -405,14 +405,14 @@ pub(super) fn run_diff_history(
             Arc::clone(&commit_meta_seen),
         )?;
         collect_scheduler_outputs(
-            plan_pack_ids,
+            &plan_pack_ids,
             outputs,
             &mut completed_packs,
             &mut pack_exec_reports,
             &mut skipped_candidates,
             &mut common_metrics,
             &mut scanned,
-        );
+        )?;
     }
     if !sink.loose.is_empty() {
         let mut adapter = EngineAdapter::new_with_event_sink(

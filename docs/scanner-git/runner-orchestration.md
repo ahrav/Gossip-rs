@@ -31,9 +31,12 @@ optionally persists. The mode output also carries a completed-pack bitmap
 indexed by MIDX `pack_id`; the runner thread marks a bit only after the
 scheduler has reassembled that plan's final `PackExecReport`, so sharded
 execution flips the bit only after every shard succeeds without error-class
-skips. When a persistence store is present, spill-stage seen-bitmap deltas are
-written incrementally during mode execution and finalize still ends with a
-two-phase atomic write.
+skips. Seen-bitmap persistence depends on the caller-supplied
+`SeenBitmapPersister`: when no persistence store is provided, `run_git_scan`
+uses a `NullSeenBitmapPersister` that discards deltas, so the seen bitmap is
+persisted only via the atomic finalize batch. When a `PersistenceStore` is
+present, spill-stage seen-bitmap deltas are written incrementally during mode
+execution in addition to the finalize batch.
 
 ## Execution Lifecycle
 

@@ -1376,20 +1376,21 @@ pub(super) fn plan_completed_cleanly(report: &PackExecReport) -> bool {
 /// Each output is paired with its plan's `pack_id` by position. A pack is
 /// marked complete only when its report contains no error-class skips.
 pub(super) fn collect_scheduler_outputs(
-    plan_pack_ids: Vec<u16>,
+    plan_pack_ids: &[u16],
     outputs: Vec<SchedulerPackExecOutput>,
     completed_packs: &mut CompletedPacksBitmap,
     pack_exec_reports: &mut Vec<PackExecReport>,
     skipped_candidates: &mut Vec<SkippedCandidate>,
     common_metrics: &mut GitScanCommonMetrics,
     scanned: &mut ScannedBlobs,
-) {
-    assert_eq!(
-        plan_pack_ids.len(),
-        outputs.len(),
-        "scheduler output count mismatch"
-    );
-    for (pack_id, output) in plan_pack_ids.into_iter().zip(outputs) {
+) -> Result<(), PackExecError> {
+    if plan_pack_ids.len() != outputs.len() {
+        return Err(PackExecError::SchedulerOutputCountMismatch {
+            expected: plan_pack_ids.len(),
+            got: outputs.len(),
+        });
+    }
+    for (pack_id, output) in plan_pack_ids.iter().copied().zip(outputs) {
         if plan_completed_cleanly(&output.report) {
             completed_packs.mark_complete(pack_id);
         }
@@ -1398,6 +1399,7 @@ pub(super) fn collect_scheduler_outputs(
         common_metrics.merge_from(&output.common_metrics);
         append_scanned_blobs(scanned, output.scanned);
     }
+    Ok(())
 }
 
 /// Execute a single scheduler-dispatched pack task (plan or shard).

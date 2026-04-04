@@ -157,7 +157,7 @@ impl PackPlanStats {
     }
 
     /// Number of indegree-0 nodes with dependents (delta tree roots).
-    /// Only populated when `perf-stats` is enabled.
+    /// Only populated when both `perf-stats` feature and `debug_assertions` are active.
     #[inline]
     #[must_use]
     pub const fn delta_tree_roots(&self) -> u32 {
@@ -165,7 +165,7 @@ impl PackPlanStats {
     }
 
     /// Maximum depth of the dependency DAG.
-    /// Only populated when `perf-stats` is enabled.
+    /// Only populated when both `perf-stats` feature and `debug_assertions` are active.
     #[inline]
     #[must_use]
     pub const fn delta_tree_max_depth(&self) -> u32 {
@@ -200,31 +200,55 @@ impl CompletedPacksBitmap {
         }
     }
 
+    /// Number of packs this bitmap was sized for.
+    #[inline]
+    #[must_use]
+    pub fn pack_count(&self) -> usize {
+        self.bits.bit_length()
+    }
+
+    /// Number of packs marked complete. O(words) via popcount.
+    #[inline]
+    #[must_use]
+    pub fn count_completed(&self) -> usize {
+        self.bits.count()
+    }
+
     /// Marks `pack_id` as fully processed for this scan epoch.
     ///
     /// # Panics
     ///
-    /// Debug-asserts `pack_id < pack_count` inside [`DynamicBitSet::set`].
-    /// In release builds the debug-assert is elided, but the underlying
-    /// `Vec` index still panics on out-of-bounds access.
-    /// In practice, pack ids originate from the MIDX which also determines
-    /// the bitmap capacity, so out-of-range values indicate a logic error.
+    /// Panics if `pack_id >= pack_count`. Pack ids originate from the MIDX
+    /// which also determines the bitmap capacity, so out-of-range values
+    /// indicate a logic error.
     #[inline]
     pub fn mark_complete(&mut self, pack_id: u16) {
-        self.bits.set(pack_id as usize);
+        let idx = pack_id as usize;
+        assert!(
+            idx < self.bits.bit_length(),
+            "pack_id {pack_id} out of range for bitmap with capacity {}",
+            self.bits.bit_length()
+        );
+        self.bits.set(idx);
     }
 
     /// Returns whether `pack_id` completed without error-class skips.
     ///
     /// # Panics
     ///
-    /// Debug-asserts `pack_id < pack_count` inside [`DynamicBitSet::is_set`].
-    /// In release builds the debug-assert is elided, but the underlying
-    /// `Vec` index still panics on out-of-bounds access.
+    /// Panics if `pack_id >= pack_count`. Pack ids originate from the MIDX
+    /// which also determines the bitmap capacity, so out-of-range values
+    /// indicate a logic error.
     #[inline]
     #[must_use]
     pub fn is_complete(&self, pack_id: u16) -> bool {
-        self.bits.is_set(pack_id as usize)
+        let idx = pack_id as usize;
+        assert!(
+            idx < self.bits.bit_length(),
+            "pack_id {pack_id} out of range for bitmap with capacity {}",
+            self.bits.bit_length()
+        );
+        self.bits.is_set(idx)
     }
 }
 
