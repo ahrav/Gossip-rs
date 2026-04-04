@@ -22,6 +22,20 @@
 //! [`validate_filled_page`] accepts raw shard bounds as byte slices to mirror
 //! coordination's `ShardSpec` model. Empty bounds mean "unbounded", so callers
 //! can pass `shard.key_range_start()` / `shard.key_range_end()` directly.
+//!
+//! # Algorithms
+//!
+//! Sequence validation processes pages in four sequential rules:
+//! 1. Intra-page shape validation (non-empty, increasing keys, shard bounds).
+//! 2. Inter-page cursor advance (keys must strictly advance).
+//! 3. HasMore state requires a valid last key token.
+//! 4. The HasMore token must align exactly with the last item emitted.
+//!
+//! # Design Trade-offs
+//!
+//! - Pages own a `Vec<T>` instead of yielding iterators, forcing bulk processing.
+//!   This prevents connectors from leaking asynchronous borrow lifetimes across
+//!   the enumeration boundaries.
 
 use std::slice;
 
@@ -72,8 +86,6 @@ impl<T> PageBuf<T> {
         T: KeyedPageItem,
     {
         validate_filled_page(&items, shard_start, shard_end)?;
-        // Delegate to try_new so any future invariants added there are enforced.
-        // validate_filled_page already guarantees non-empty, so try_new succeeds.
         Self::try_new(items, state)
     }
 
@@ -272,8 +284,6 @@ pub fn validate_filled_page<T: KeyedPageItem>(
         });
     }
 
-    // Strictly increasing keys guarantee all subsequent items exceed the first,
-    // which was already verified against shard_start.
     for (offset, item) in rest.iter().enumerate() {
         let index = offset + 1;
         let key = item.item_key().as_bytes();
