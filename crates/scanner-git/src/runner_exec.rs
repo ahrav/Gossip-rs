@@ -1737,6 +1737,9 @@ fn execute_plan_tasks(
         .collect();
     ex.spawn_external_batch(tasks)
         .map_err(|_| scheduler_queue_rejected_error(false))?;
+    // SAFETY: This join is load-bearing for `AbortSignal` soundness — all worker
+    // threads must complete before the caller's `&AtomicBool` borrow can expire.
+    // See the `AbortSignal` definition above.
     ex.join();
 
     // Order matters: check scheduler error first (may have set the abort flag),
@@ -1950,6 +1953,9 @@ fn execute_sharded_tasks(
 
     ex.spawn_external_batch(tasks)
         .map_err(|_| scheduler_queue_rejected_error(true))?;
+    // SAFETY: This join is load-bearing for `AbortSignal` soundness — all worker
+    // threads must complete before the caller's `&AtomicBool` borrow can expire.
+    // See the `AbortSignal` definition above.
     ex.join();
 
     // Order matters: check scheduler error first (may have set the abort flag),
