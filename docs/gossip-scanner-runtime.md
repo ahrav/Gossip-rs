@@ -897,6 +897,8 @@ and coordination-backend observations).
 | Distributed worker-loop foundation types | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Static Git repo discovery source | `crates/gossip-scanner-runtime/src/git_discovery.rs` |
+| Mirror-backed Git executor adapter | `crates/gossip-scanner-runtime/src/git_executor.rs` |
+| Worker-local Git mirror lifecycle | `crates/gossip-scanner-runtime/src/git_mirror.rs` |
 | Git-repo local scan runtime | `crates/gossip-scanner-runtime/src/git_repo.rs` |
 | Git persistence adapters and repo-frontier durability | `crates/gossip-scanner-runtime/src/git_persistence.rs` |
 | Event sinks | `crates/gossip-scanner-runtime/src/event_sink.rs` |
