@@ -8312,4 +8312,177 @@ mod tests {
             "no persistence writes should occur when mirror sync fails"
         );
     }
+
+    /// Creates a git repo fixture with one corrupted loose blob object.
+    ///
+    /// The fixture has two commits (init + secret file), then the blob's
+    /// loose object file is overwritten with invalid zlib data. When
+    /// `OdbBlobFast` scans this repo, the blob candidate is discovered via
+    /// tree diff but its loose object read fails with `LooseDecode`,
+    /// producing a `FinalizeOutcome::Partial`.
+    fn create_git_repo_fixture_with_corrupt_blob() -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        init_git_repo(
+            dir.path(),
+            "distributed-runtime-tests@example.com",
+            "Distributed Runtime Tests",
+        );
+        fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+        run_git_in(dir.path(), &["add", "."]);
+        run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+
+        // Locate and corrupt the blob loose object. Walk .git/objects
+        // fan-out directories looking for loose files, then use `git
+        // cat-file -t` (via the OID reconstructed from the path) to
+        // identify the blob.
+        let objects_dir = dir.path().join(".git/objects");
+        let mut corrupted = false;
+        for fan_entry in fs::read_dir(&objects_dir).expect("read objects dir") {
+            let fan_entry = fan_entry.expect("fan entry");
+            let fan_name = fan_entry.file_name();
+            let fan_str = fan_name.to_string_lossy();
+            // Fan-out directories are two hex characters; skip `info`/`pack`.
+            if fan_str.len() != 2 || !fan_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            for obj_entry in fs::read_dir(fan_entry.path()).expect("read fan dir") {
+                let obj_entry = obj_entry.expect("object entry");
+                let obj_name = obj_entry.file_name();
+                let oid = format!("{}{}", fan_str, obj_name.to_string_lossy());
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(["cat-file", "-t", &oid])
+                    .output()
+                    .expect("git cat-file");
+                let kind = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if kind == "blob" {
+                    // Loose objects are read-only (mode 0o444); set
+                    // owner-writable before overwriting with invalid data.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let perms = fs::Permissions::from_mode(0o644);
+                        fs::set_permissions(obj_entry.path(), perms)
+                            .expect("set writable");
+                    }
+                    fs::write(obj_entry.path(), b"CORRUPT").expect("corrupt blob");
+                    corrupted = true;
+                    break;
+                }
+            }
+            if corrupted {
+                break;
+            }
+        }
+        assert!(
+            corrupted,
+            "test fixture must contain at least one blob to corrupt"
+        );
+        dir
+    }
+
+    /// A `FinalizeOutcome::Partial` from the scanner (caused by skipped
+    /// candidates) must be rejected by the repo-frontier worker because
+    /// outer progress requires a fully durable repo receipt.
+    #[test]
+    fn run_git_repo_worker_rejects_partial_finalize() {
+        let repo = create_git_repo_fixture_with_corrupt_blob();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend.clone(),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("corrupt blob should produce a partial finalize rejection");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("finalized partially"),
+            "error must mention partial finalize: {msg}"
+        );
+
+        // Shard must not be advanced when finalize is partial.
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_ne!(
+            summaries[0].status(),
+            ShardStatus::Done,
+            "shard must not be marked Done after a partial finalize"
+        );
+    }
+
+    /// The `checkpoint_input.is_none()` guard after a `Complete` finalize
+    /// (line that rejects "completed without a durable repo receipt-backed
+    /// checkpoint") is defense-in-depth: `repo_frontier_checkpoint_input`
+    /// always returns `Some` for `Complete` outcomes by construction.
+    ///
+    /// This test verifies the lower-level invariant that makes the
+    /// integration-level guard structurally unreachable, ensuring the
+    /// defense-in-depth path stays dead unless the adapter contract changes.
+    #[test]
+    fn git_persistence_complete_finalize_always_yields_checkpoint_input() {
+        use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
+
+        // A backend that accepts all writes but stores nothing.
+        #[derive(Debug, Clone, Default)]
+        struct NullGitBackend;
+        impl GitPersistenceBackend for NullGitBackend {
+            type Error = std::io::Error;
+            fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(None)
+            }
+            fn apply_batch(
+                &self,
+                _ops: &[crate::git_persistence::GitPersistenceOp],
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let adapter = GitPersistenceAdapter::new(NullGitBackend, 99, [0xAA; 32]);
+        let wc = write_context();
+        // Use a real temp directory so canonicalize() in git_repo_key succeeds.
+        let tmp = tempdir().expect("temp dir for repo key");
+        let key = git_repo_key(tmp.path());
+
+        // Complete outcome must always produce a checkpoint input, regardless
+        // of backend state. This is the invariant the integration-level guard
+        // at `run_git_repo_lease` relies on.
+        let checkpoint = adapter
+            .repo_frontier_checkpoint_input(wc, 0, &key, FinalizeOutcome::Complete)
+            .expect("complete finalize must not error")
+            .expect("complete finalize must yield checkpoint input");
+
+        assert_eq!(
+            checkpoint
+                .receipt()
+                .completed_unit()
+                .checkpoint_cursor()
+                .last_key(),
+            Some(key.as_item_key()),
+            "checkpoint cursor must carry the repo key"
+        );
+
+        // Partial outcome must return None — no outer progress on incomplete scans.
+        let partial = adapter
+            .repo_frontier_checkpoint_input(
+                wc,
+                0,
+                &key,
+                FinalizeOutcome::Partial { skipped_count: 1 },
+            )
+            .expect("partial finalize must not error");
+        assert!(
+            partial.is_none(),
+            "partial finalize must not yield checkpoint input"
+        );
+    }
 }
