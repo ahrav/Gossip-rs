@@ -1,8 +1,23 @@
+//! Regression tests for the connector-facing API contract.
+//!
+//! These tests pin the observable behavior of the connector capability flags and
+//! the public error helpers that adapters use to classify failures.
+//! Specifically, they verify that:
+//!
+//! - constructor helpers preserve the expected [`ErrorClass`] and retry hints,
+//! - display output stays stable and sanitizes disallowed control characters,
+//! - default [`ConnectorCapabilities`] remain conservative until a connector
+//!   opts into a feature, and
+//! - property tests cover arbitrary messages so formatting never panics on
+//!   unusual input.
+//!
+//! The assertions focus on externally visible behavior rather than internal
+//! representation so the implementation can evolve without breaking downstream
+//! connectors or callers that pattern-match on these guarantees.
+
 use rstest::rstest;
 
 use super::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
-
-// -- EnumerateError constructor cases (each runs as an isolated sub-test) --
 
 #[rstest]
 #[case::retryable(
@@ -47,8 +62,6 @@ fn enumerate_error_constructors(
     assert_eq!(error.retry_after_ms(), expected_retry);
 }
 
-// -- ReadError constructor cases (includes `unsupported` convenience ctor) --
-
 #[rstest]
 #[case::retryable(
     ReadError::retryable("temporary read failure"),
@@ -92,8 +105,6 @@ fn read_error_constructors(
     assert_eq!(error.retry_after_ms(), expected_retry);
 }
 
-// -- Display formatting (with / without retry hint) --
-
 #[rstest]
 #[case::without_retry(
     EnumerateError::permanent("enumeration disabled"),
@@ -130,8 +141,6 @@ fn read_error_display(#[case] error: ReadError, #[case] expected: &str) {
     assert_eq!(error.to_string(), expected);
 }
 
-// -- Standalone tests (unique setup, not worth parameterizing) --
-
 #[test]
 fn default_caps_are_conservative() {
     let capabilities = ConnectorCapabilities::default();
@@ -149,8 +158,6 @@ fn error_trait_impls_compile() {
     assert_error_impl::<ReadError>();
 }
 
-// -- Display sanitization --
-
 #[test]
 fn display_sanitizes_control_characters() {
     let msg = "hello\x00world\x1b[31m\x7fred";
@@ -165,8 +172,6 @@ fn display_sanitizes_control_characters() {
     let err2 = ReadError::permanent("line1\tline2\nline3\rline4");
     assert_eq!(err2.to_string(), "permanent: line1\tline2\nline3\rline4");
 }
-
-// -- is_retryable predicate --
 
 #[test]
 fn error_class_is_retryable() {
@@ -188,8 +193,6 @@ fn read_error_is_retryable_delegates_to_class() {
     assert!(!ReadError::permanent("gone").is_retryable());
     assert!(!ReadError::unsupported("range_read").is_retryable());
 }
-
-// -- Proptest: property-based coverage for error types --
 
 mod proptests {
     use proptest::prelude::*;
