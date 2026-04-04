@@ -8511,14 +8511,11 @@ mod tests {
         );
     }
 
-    /// The `checkpoint_input.is_none()` guard after a `Complete` finalize
-    /// (line that rejects "completed without a durable repo receipt-backed
-    /// checkpoint") is defense-in-depth: `repo_frontier_checkpoint_input`
-    /// always returns `Some` for `Complete` outcomes by construction.
-    ///
-    /// This test verifies the lower-level invariant that makes the
-    /// integration-level guard structurally unreachable, ensuring the
-    /// defense-in-depth path stays dead unless the adapter contract changes.
+    /// `repo_frontier_checkpoint_input` always returns `Some` for `Complete`
+    /// finalize outcomes by construction, so the `checkpoint_input.is_none()`
+    /// guard in `run_git_repo_lease` is structurally unreachable. The adapter
+    /// contract guarantees a non-`None` checkpoint whenever finalize completes
+    /// successfully.
     #[test]
     fn git_persistence_complete_finalize_always_yields_checkpoint_input() {
         use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
