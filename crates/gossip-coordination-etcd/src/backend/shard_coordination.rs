@@ -1091,9 +1091,6 @@ macro_rules! impl_sync_coordination_backend {
                 compares.append(&mut child_absent_compares);
                 compares.push(tenant_counter.compare);
 
-                // Atomically: update parent to Split status, delete its owner
-                // and active-index keys, then create all child records and their
-                // active-index entries.
                 this.inject_split_replace_fault_if_armed(tenant, key);
 
                 let mut txn = TxnBuilder::from_compares(compares);
@@ -1852,7 +1849,6 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 tokio::time::sleep(cas_retry_delay(attempt_num)).await;
             }
         }
-        // Exhaustion.
         let persisted = self
             .load_shard_checked("renew.exhaust.load_shard", tenant, key)
             .await
@@ -1949,7 +1945,6 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 tokio::time::sleep(cas_retry_delay(attempt_num)).await;
             }
         }
-        // Exhaustion.
         let persisted = self
             .load_shard_checked("checkpoint.exhaust.load_shard", tenant, key)
             .await
@@ -2255,7 +2250,6 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 tokio::time::sleep(cas_retry_delay(attempt_num)).await;
             }
         }
-        // Exhaustion: re-read and diagnose.
         let persisted = self
             .load_shard_checked("split_replace.exhaust.load_shard", tenant, key)
             .await
@@ -2502,7 +2496,6 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 tokio::time::sleep(cas_retry_delay(attempt_num)).await;
             }
         }
-        // Exhaustion: re-read and diagnose.
         let persisted = self
             .load_shard_checked("split_residual.exhaust.load_shard", tenant, key)
             .await
