@@ -166,6 +166,51 @@ fn test_adapter_with_sink<'a>(engine: &'a Engine, sink: Arc<VecEventSink>) -> En
         },
     )
 }
+
+#[derive(Default)]
+struct CapturingFindingSink {
+    finding_norm_hashes: Mutex<Vec<Option<[u8; 32]>>>,
+}
+
+impl CapturingFindingSink {
+    fn take_finding_norm_hashes(&self) -> Vec<Option<[u8; 32]>> {
+        std::mem::take(
+            &mut *self
+                .finding_norm_hashes
+                .lock()
+                .expect("capturing sink mutex poisoned"),
+        )
+    }
+}
+
+impl EventSink for CapturingFindingSink {
+    fn emit(&self, event: ScanEvent<'_>) {
+        if let ScanEvent::Finding(finding) = event {
+            self.finding_norm_hashes
+                .lock()
+                .expect("capturing sink mutex poisoned")
+                .push(finding.norm_hash);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn test_adapter_with_capturing_sink<'a>(
+    engine: &'a Engine,
+    sink: Arc<CapturingFindingSink>,
+) -> EngineAdapter<'a> {
+    EngineAdapter::new_with_event_sink(
+        engine,
+        EngineAdapterConfig::default(),
+        CommitMetaContext {
+            event_sink: sink,
+            commit_graph_index: Arc::new(CommitGraphIndex::empty()),
+            commit_meta_seen: Arc::new(AtomicBitSet::empty(1)),
+            identity_interner: None,
+        },
+    )
+}
 use crate::{
     demo_tuning, AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode,
     ValidatorKind,
@@ -399,6 +444,27 @@ fn git_finding_events_propagate_confidence_score() {
     assert!(
         output.contains("\"confidence_score\":2"),
         "git findings must carry non-zero confidence score from engine: {output}"
+    );
+}
+
+#[test]
+fn git_finding_events_propagate_norm_hash() {
+    let engine = test_engine_with_tok_rule();
+    let sink = Arc::new(CapturingFindingSink::default());
+    let mut adapter = test_adapter_with_capturing_sink(&engine, Arc::clone(&sink));
+
+    let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+    let blob = b"prefix TOK_ABCDEFGH suffix";
+    adapter
+        .emit_loose(&candidate, b"secret.txt", blob)
+        .expect("scan");
+
+    let captured = sink.take_finding_norm_hashes();
+    assert_eq!(captured.len(), 1, "expected exactly one captured finding");
+    assert_eq!(
+        captured[0],
+        Some(adapter.findings_arena()[0].key.norm_hash),
+        "git finding events must forward the finding norm_hash"
     );
 }
 

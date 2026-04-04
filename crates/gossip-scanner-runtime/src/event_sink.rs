@@ -339,6 +339,7 @@ fn encode_core_event(event: CoreEvent<'_>, line: &mut Vec<u8>) {
             push_key(line, b"confidence_score");
             write_i8(line, finding.confidence_score);
 
+            // norm_hash intentionally omitted — secret-derived digest must not appear in event logs.
             if let Some(commit_id) = finding.commit_id {
                 line.push(b',');
                 push_key(line, b"commit_id");
@@ -593,6 +594,7 @@ mod tests {
             end: 40,
             rule_id: 7,
             rule_name: "aws-access-key",
+            norm_hash: Some([0xAB; 32]),
             commit_id: None,
             change_kind: None,
             confidence_score: 8,
@@ -619,6 +621,7 @@ mod tests {
             end: 32,
             rule_id: 9,
             rule_name: "generic-secret",
+            norm_hash: Some([0xCD; 32]),
             commit_id: Some(3),
             change_kind: Some("add"),
             confidence_score: -4,
@@ -645,6 +648,7 @@ mod tests {
             end: 12,
             rule_id: 1,
             rule_name: "rule",
+            norm_hash: Some([0x11; 32]),
             commit_id: None,
             change_kind: None,
             confidence_score: 0,
@@ -671,6 +675,7 @@ mod tests {
             end: 2,
             rule_id: 1,
             rule_name: "rule",
+            norm_hash: None,
             commit_id: None,
             change_kind: None,
             confidence_score: 3,
@@ -698,6 +703,7 @@ mod tests {
             end: 2,
             rule_id: 1,
             rule_name: "rule",
+            norm_hash: None,
             commit_id: None,
             change_kind: None,
             confidence_score: 3,
@@ -729,6 +735,7 @@ mod tests {
             end: 20,
             rule_id: 2,
             rule_name: "aws-access-key",
+            norm_hash: None,
             commit_id: None,
             change_kind: None,
             confidence_score: 7,
@@ -760,6 +767,7 @@ mod tests {
             end: 20,
             rule_id: 2,
             rule_name: "aws-access-key",
+            norm_hash: None,
             commit_id: None,
             change_kind: None,
             confidence_score: 7,

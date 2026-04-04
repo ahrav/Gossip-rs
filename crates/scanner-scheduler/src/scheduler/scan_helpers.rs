@@ -144,6 +144,9 @@ pub(super) fn emit_findings<E: ScanEngine, F: FindingRecord>(
                 end: rec.root_hint_end(),
                 rule_id: rec.rule_id(),
                 rule_name: engine.rule_name(rec.rule_id()),
+                // Generic scheduler finding records do not carry norm_hash on the
+                // event surface; persistence captures it separately when available.
+                norm_hash: None,
                 commit_id: None,
                 change_kind: None,
                 confidence_score: rec.confidence_score(),
