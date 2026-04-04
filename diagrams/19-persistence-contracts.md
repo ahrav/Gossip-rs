@@ -114,7 +114,7 @@ The trait hierarchy summarized:
 
 | Trait / Type | Role | Associated Types |
 |:---|:---|:---|
-| `CommitReceipt` | Marker: proof of durability | (supertraits: `Clone + Debug + Send + Sync`) |
+| `CommitReceipt` | Marker: proof of durability | (supertraits: `Clone + Debug + Send + Sync + 'static`) |
 | `CommitHandle` | Two-phase durability handle | `Receipt: CommitReceipt`, `Error` |
 | `ReadyCommitHandle<R, E>` | Sync adapter wrapping `Result<R, E>` | (implements `CommitHandle`) |
 | `DoneLedger` | Deduplication store | `Error`, `CommitHandle` (receipt = `DoneLedgerCommitReceipt`) |

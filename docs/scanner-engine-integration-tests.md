@@ -15,6 +15,7 @@ crates/scanner-engine-integration-tests/
     integration/                      # ~162 tests: cross-crate integration
     property/                         # ~100 tests + ~30 proptest cases
     simulation/                       # ~41 tests: deterministic sim replay
+      corpus/                         # Scheduler simulation replay artifacts
     diagnostic/                       # 2 tests: anchor derivation diagnostics
     smoke/                            # Deferred (awaiting CLI binary name)
     corpus/                           # JSON replay artifacts + fixture files
@@ -52,6 +53,11 @@ Each category is a separate test binary gated behind a Cargo feature:
 | `diagnostic-tests`   | Diagnostic test binary                                      |
 | `smoke-tests`        | Smoke test binary (all tests currently deferred)            |
 | `aegis-pure-rust`    | Pure-Rust AEGIS crypto backend (combinable with any above)  |
+| `kgram-gate`         | `scanner-engine` k-gram gate support                        |
+| `bench`              | `scanner-engine` benchmark-guard support                    |
+| `perf-stats`         | `scanner-engine` perf counter instrumentation               |
+| `stdx-proptest`      | `scanner-engine` stdx proptest support                      |
+| `rocksdb`            | `scanner-git` RocksDB-backed coverage                       |
 
 ## Running Tests
 

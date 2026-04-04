@@ -20,14 +20,16 @@ launching. The repo `.gitignore` excludes both `runbook-params.json` and
 `run-runbook.sh`, so these runbook helper files may exist only in your local
 checkout.
 
-Use concrete values in the JSON file instead of shell expressions:
+**NEVER write secrets or tokens into `runbook-params.json`.** The `run-runbook.sh`
+script injects `GITHUB_TOKEN` automatically via `gh auth token` at launch time.
+Do not add a `GITHUB_TOKEN` field to the JSON file — it is unnecessary and
+risks leaking credentials.
 
 ```json
 {
   "repository": "ahrav/gossip-rs",
   "pr_number": "312",
   "base_branch": "main",
-  "GITHUB_TOKEN": "<output of gh auth token>",
   "CARGO_HOME": "/Users/<you>/.cargo",
   "timeout_sec": 3600
 }
@@ -85,3 +87,4 @@ Report these to the user so they can track progress in Jetty.
 | Passing wrong task name | Name must match a file in `runbooks/` without `.md`. The script lists available names on error. |
 | Not reporting trajectory ID | Always show the trajectory and workflow IDs in your response |
 | Not knowing which runbook to run | Use the guarded runbook-listing command above and ask the user to pick one |
+| Writing `GITHUB_TOKEN` into `runbook-params.json` | **Never.** `run-runbook.sh` injects the token via `gh auth token` automatically. Writing tokens into files risks credential leaks. |
