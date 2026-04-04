@@ -35,7 +35,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | Document                                               | Focus                            | Key Concepts                                           |
 | ------------------------------------------------------ | -------------------------------- | ------------------------------------------------------ |
 | [architecture-overview.md](architecture-overview.md)   | C4-style component diagram       | CLI, Engine, Pipeline, Memory, Data Structures         |
-| [architecture.md](architecture.md)                     | Data flow                        | Walker → Reader → Scanner → Output, transform worklist |
+| [architecture.md](architecture.md)                     | Data flow                        | Owner-compute filesystem flow, transform worklist       |
 | [data-types.md](data-types.md)                         | Class diagrams                   | Key type relationships across crates                   |
 | [pipeline-flow.md](pipeline-flow.md)                   | Pipeline execution flow          | Discovery, executor model, backpressure                |
 | [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Executor termination, `scan_local` states, worker tasks |
@@ -143,7 +143,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | Document                                     | Focus                    | Key Concepts                                                  |
 | -------------------------------------------- | ------------------------ | ------------------------------------------------------------- |
 | [memory-management.md](memory-management.md) | Buffer lifecycle & pools | BufferPool, RAII, 8MiB fixed buffers, DecodeSlab, ScanScratch |
-| [kani-verification.md](kani-verification.md) | Bounded model checking   | 80 Kani proofs across 4 crates, Miri, Loom, ASAN              |
+| [kani-verification.md](kani-verification.md) | Bounded model checking   | 100 Kani proofs across 4 crates, Miri, Loom, ASAN             |
 
 ---
 

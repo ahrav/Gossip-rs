@@ -6,7 +6,7 @@ backed by CBMC.
 
 ## Overview
 
-80 proof harnesses across 4 workspace crates verify memory safety,
+100 proof harnesses across 4 workspace crates verify memory safety,
 bounds correctness, and algorithmic invariants for the most
 safety-critical data structures. All proofs are gated behind
 `#[cfg(kani)]` and add zero overhead outside verification.
@@ -15,18 +15,20 @@ safety-critical data structures. All proofs are gated behind
 
 | Crate               | Proofs | Files | Properties Verified                                                                                   |
 | ------------------- | ------ | ----- | ----------------------------------------------------------------------------------------------------- |
-| `gossip-stdx`       | 54     | 6     | Bitset invariants, timing wheel safety, SPSC ring bounds, inline vec bounds, atomic dedup correctness |
+| `gossip-stdx`       | 74     | 8     | Bitset invariants, byte-slab safety, timing wheel safety, ring buffer bounds, SPSC ring bounds, inline vec bounds, atomic dedup correctness |
 | `scanner-engine`    | 15     | 3     | Node pool allocation safety, hit pool lifecycle, scratch memory bounds                                |
 | `scanner-scheduler` | 9      | 4     | Archive format detection, runtime chunk arithmetic, budget stack depth, tar zero-block detection      |
 | `scanner-git`       | 2      | 2     | DAG counter underflow, shard partitioning invariants                                                  |
 
-### gossip-stdx (54 proofs)
+### gossip-stdx (74 proofs)
 
 | File                                               | Proofs | What is verified                                                                                                                            |
 | -------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/gossip-stdx/src/timing_wheel_tests.rs`     | 14     | Never-fires-early, pool coherence, horizon enforcement, slot occupancy, FIFO ordering, monotonicity, reset correctness, Bitset2 consistency |
 | `crates/gossip-stdx/src/bitset_tests.rs`           | 12     | Set/unset roundtrips, padding invariant preservation, count correctness, clear semantics, iterator consistency                              |
+| `crates/gossip-stdx/src/byte_slab.rs`              | 10     | Slab growth, prefix accounting, chunk indexing, drain semantics, and slice bounds                                                          |
 | `crates/gossip-stdx/src/inline_vec.rs`             | 9      | Push/pop/truncate/extend/drain bounds, `get_unchecked` equivalence, `MaybeUninit` array validity                                            |
+| `crates/gossip-stdx/src/ring_buffer.rs`            | 10     | Wraparound indexing, capacity invariants, push/pop semantics, and batch drain bounds                                                         |
 | `crates/gossip-stdx/src/spsc.rs`                   | 8      | Ring capacity, index wrapping, push/pop safety, producer/consumer non-interference, empty/full detection                                    |
 | `crates/gossip-stdx/src/atomic_bitset_tests.rs`    | 6      | `test_and_set` idempotency, bit independence, count bounds, clear correctness                                                               |
 | `crates/gossip-stdx/src/atomic_seen_sets_tests.rs` | 5      | `mark`/`is_seen` roundtrips, cross-set independence, clear-all                                                                              |
@@ -87,7 +89,7 @@ so failures are isolated. See `.github/workflows/ci.yml`, job `kani`.
 
 | Tool     | Scope                                      | CI Job | Schedule |
 | -------- | ------------------------------------------ | ------ | -------- |
-| **Kani** | Bounded model checking (80 proofs)         | `kani` | Nightly  |
+| **Kani** | Bounded model checking (100 proofs)        | `kani` | Nightly  |
 | **Miri** | Undefined behavior detection               | `miri` | Nightly  |
-| **Loom** | Exhaustive concurrency testing (12 models) | `loom` | Nightly  |
+| **Loom** | Exhaustive concurrency testing in `gossip-stdx` and `scanner-scheduler` | `loom` | Nightly  |
 | **ASAN** | Address sanitizer for SIMD/unsafe paths    | `asan` | Nightly  |
