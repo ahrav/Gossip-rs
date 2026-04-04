@@ -18,7 +18,7 @@ use crate::common::test_util::{default_budgets, make_key};
 /// Runs a git command in a fixture repository and asserts that setup succeeded.
 ///
 /// These tests rely on real git metadata, so fixture construction fails fast if
-/// any command writes to stderr or exits unsuccessfully.
+/// any command exits unsuccessfully.
 fn run_git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
