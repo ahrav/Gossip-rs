@@ -17,14 +17,22 @@ uses `#![forbid(unsafe_code)]`.
 | `src/ring_buffer.rs` | `RingBuffer<T, N>`, `Iter`, `IntoIter` | Fixed-capacity circular buffer with power-of-2 bitwise indexing |
 | `src/byte_ring.rs` | `ByteRing` | Byte stream tail ring buffer keyed by absolute stream offsets |
 | `src/atomic_bitset.rs` | `AtomicBitSet` | Lock-free bitset with atomic test-and-set for concurrent dedup |
+| `src/atomic_bitset_tests.rs` | — | Unit/property tests for `AtomicBitSet` |
 | `src/atomic_seen_sets.rs` | `AtomicSeenSets` | Composite concurrent dedup tracker for git object traversal |
+| `src/atomic_seen_sets_tests.rs` | — | Unit/property tests for `AtomicSeenSets` |
 | `src/bitset.rs` | `DynamicBitSet`, `DynamicBitSetIterator`, `words_for_bits` | Runtime-sized bitset backed by `Vec<u64>` |
+| `src/bitset_tests.rs` | — | Unit/property tests for `DynamicBitSet` |
+| `src/byte_slab_tests.rs` | — | Unit/fuzz-adjacent tests for `ByteSlab` / `ByteSlot` |
 | `src/fixed_set.rs` | `FixedSet128` | Epoch-resettable hash set for 128-bit keys |
 | `src/timing_wheel.rs` | `TimingWheel<T, G>`, `Bitset2`, `PushError`, `PushOutcome` | Hashed timing wheel with FIFO per bucket and bitmap occupancy |
+| `src/timing_wheel_tests.rs` | — | Unit/property tests for `TimingWheel` |
 | `src/spsc.rs` | `OwnedSpscProducer`, `OwnedSpscConsumer`, `spsc_channel` | Wait-free SPSC bounded ring buffer |
 | `src/fastrange.rs` | `fast_range` | Division-free range reduction via multiply-high |
 | `src/fnv.rs` | `FNV_OFFSET`, `FNV_PRIME`, `fnv_mix_byte`, `fnv_mix_bytes`, `fnv_mix_opt_bytes`, `fnv_mix_u64` | FNV-1a 64-bit hashing helpers for deterministic fingerprinting |
+| `src/fnv_tests.rs` | — | Unit tests for FNV helpers |
+| `src/inline_vec_tests.rs` | — | Unit/fuzz-adjacent tests for `InlineVec` |
 | `src/perf_stats.rs` | `sat_add_u64`, `sat_add_u32`, `sat_add_usize`, `max_u64`, `max_u32`, `max_u16`, `set_u32`, `set_u64`, `set_usize` | Saturating counter helpers (no-op outside `perf-stats` + `debug_assertions`) |
+| `src/ring_buffer_tests.rs` | — | Unit/fuzz-adjacent tests for `RingBuffer` |
 | `src/test_support.rs` | `proptest_cases`, `proptest_fuzz_multiplier` | Shared proptest configuration (feature-gated: `stdx-proptest`) |
 
 ## Type Decision Tree
