@@ -30,7 +30,7 @@
 //! implementors to verify correctness against the contract surface:
 //!
 //! - `run_conformance` executes done-ledger, findings, and redaction checks.
-//! - `run_done_ledger_conformance` executes only the done-ledger checks (4)
+//! - `run_done_ledger_conformance` executes only the done-ledger checks (5)
 //!   for backends that have not implemented findings persistence yet.
 //! - `run_findings_conformance` executes only the findings-layer checks (4)
 //!   for backends that have findings but not done-ledger persistence.

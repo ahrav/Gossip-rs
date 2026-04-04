@@ -56,7 +56,7 @@ use postgres::{Client, Row};
 use crate::{
     error::{DoneLedgerPgConversionError, DoneLedgerPgError},
     migrations::apply_all_migrations,
-    schema::{BATCH_GET_SQL, UPSERT_SQL},
+    schema::{BATCH_GET_SQL, LIST_DONE_HASHES_SQL, UPSERT_SQL},
     types::{
         decode_fixed_32, pg_bigint_nonnegative_to_u64, pg_bigint_to_u64_bits,
         u64_to_pg_bigint_bits, u64_to_pg_bigint_checked,
@@ -238,6 +238,21 @@ impl DoneLedger for DoneLedgerPg {
             .collect())
     }
 
+    fn list_done_hashes(
+        &self,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+    ) -> Result<Vec<OvidHash>, Self::Error> {
+        let tenant_bytes: &[u8] = tenant_id.as_bytes();
+        let policy_bytes: &[u8] = policy_hash.as_bytes();
+        let terminal_statuses = terminal_status_ranks();
+
+        let mut client = self.lock_client()?;
+        let stmt = client.prepare(LIST_DONE_HASHES_SQL)?;
+        let rows = client.query(&stmt, &[&tenant_bytes, &policy_bytes, &terminal_statuses])?;
+        rows.into_iter().map(|row| decode_ovid_hash(&row)).collect()
+    }
+
     fn batch_upsert(
         &self,
         records: &[DoneLedgerRecord],
@@ -297,6 +312,14 @@ fn build_receipt(records: &[DoneLedgerRecord]) -> DoneLedgerCommitReceipt {
             acc.saturating_add(record.findings_count() as u64)
         }),
     )
+}
+
+fn terminal_status_ranks() -> Vec<i16> {
+    DoneLedgerStatus::ALL
+        .iter()
+        .filter(|s| s.is_terminal())
+        .map(|s| i16::from(s.rank()))
+        .collect()
 }
 
 /// Validate each input record and merge duplicate keys before SQL mutation.
@@ -560,6 +583,13 @@ fn decode_row(row: &Row) -> Result<DoneLedgerRecord, DoneLedgerPgError> {
         })?;
 
     Ok(record)
+}
+
+fn decode_ovid_hash(row: &Row) -> Result<OvidHash, DoneLedgerPgError> {
+    Ok(OvidHash::from_bytes(decode_fixed_32(
+        row.try_get::<_, &[u8]>("ovid_hash")?,
+        "ovid_hash",
+    )?))
 }
 
 #[cfg(test)]

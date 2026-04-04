@@ -135,6 +135,28 @@ fn done_ledger_status_from_rank_rejects_unknown_discriminants() {
     }
 }
 
+#[rstest]
+#[case(FailedRetryable, false)]
+#[case(FailedPermanent, true)]
+#[case(Skipped, true)]
+#[case(ScannedClean, true)]
+#[case(ScannedWithFindings, true)]
+fn done_ledger_status_is_terminal_matches_expected(
+    #[case] status: DoneLedgerStatus,
+    #[case] expected: bool,
+) {
+    assert_eq!(status.is_terminal(), expected);
+}
+
+#[test]
+fn done_ledger_status_terminal_is_a_superset_of_scanned() {
+    for status in DoneLedgerStatus::ALL {
+        if status.is_scanned() {
+            assert!(status.is_terminal(), "{status:?} should also be terminal");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DoneLedgerKey canonical digest
 // ---------------------------------------------------------------------------

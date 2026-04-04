@@ -36,6 +36,7 @@ and validation, and Git connector mode uses the direct path.
 | `src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregator that buffers out-of-order durable receipts, reconstructs contiguous item-level proofs, strips connector tokens from durable checkpoint boundaries, and finalizes progress only after a matching checkpoint receipt |
 | `src/commit_sink.rs` | `CommitSink` trait, `CliNoOpCommitSink` (no-op), and lightweight bridge record types (`ItemMeta`, `FindingRecord`, `FindingsBatch`) for scan-loop lifecycle |
 | `src/coordination_sink.rs` | Owned event records (`StoredGitEvent`, `CommitProgressRecord`) and `CoordinationEventRecorder` trait for distributed scan telemetry |
+| `src/done_ledger_bloom.rs` | Internal done-ledger Bloom filter wrapper: OvidHash-aware membership checks, scope-size gating, and memory-cap enforcement for prefilter construction |
 | `src/distributed.rs` | Distributed worker-loop runtime: filesystem `WorkerIdentity` / `ShardLease`, Git `GitWorkerIdentity` / `GitShardLease`, `DistributedPersistence<F, D>`, config/report/error types, `ReceiptCommitSink` (receipt-driven execution adapter), and the sibling lease loops `run_worker` (filesystem) plus `run_git_repo_worker` (repo-frontier Git). Internal helpers cover receipt-driven checkpoint building, singleton repo-frontier execution, and direct `CoordinationFacade` claim/complete helpers |
 | `src/event_sink.rs` | JSONL, text, JSON, and SARIF event sinks |
 | `src/git_discovery.rs` | Static single-target Git repository discovery source for payload-backed repo-frontier shards |
@@ -892,6 +893,7 @@ and coordination-backend observations).
 | Durable findings -> done-ledger commit stage | `crates/gossip-scanner-runtime/src/result_committer.rs` |
 | Bounded execution -> commit worker and outcome queues | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` |
 | Coordination recorder payloads | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
+| Done-ledger Bloom prefilter helper | `crates/gossip-scanner-runtime/src/done_ledger_bloom.rs` |
 | Distributed worker-loop foundation types | `crates/gossip-scanner-runtime/src/distributed.rs` |
 | Ordered-content local filesystem runtime | `crates/gossip-scanner-runtime/src/ordered_content.rs` |
 | Static Git repo discovery source | `crates/gossip-scanner-runtime/src/git_discovery.rs` |

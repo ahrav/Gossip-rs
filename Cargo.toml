@@ -50,6 +50,7 @@ gossip-orchestrator = { path = "crates/gossip-orchestrator" }
 # External dependencies
 thiserror = "2"
 postgres = "0.19"
+fastbloom = "0.8"
 
 # External dev/test dependencies
 rstest = "0.25"
