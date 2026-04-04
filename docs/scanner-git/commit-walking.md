@@ -140,6 +140,27 @@ entire history was already scanned in a prior run and the ref is skipped.
 The number of ancestry checks is bounded by `max_new_ref_skip_checks`
 (default 1024) to avoid O(refs^2) cost.
 
+### Watermark Generation Validation
+
+Before running the ancestry walk, `resolve_current_watermark`
+(`commit_walk.rs`) performs an O(1) generation comparison when the
+persisted `RefWatermark` carries a generation number:
+
+1. Look up the watermark OID in the commit graph.
+2. If the OID is missing (GC'd or rewritten), discard the watermark.
+3. If the stored `NonZeroU32` generation differs from the graph's
+   generation at that position, the commit was force-pushed away —
+   discard the watermark without an ancestry walk.
+4. If generations match, proceed to the full `is_ancestor` DFS. Matching
+   generations alone do not prove ancestry because unrelated siblings can
+   share a generation number.
+
+When `generation` is `None` (persisted before generation tracking),
+the check is skipped and the ancestry walk always runs.
+
+The same validation runs in the new-ref skip loop: a stale generation
+on another ref's watermark prevents spurious skip decisions.
+
 ### Ancestry Check
 
 `is_ancestor` (`commit_walk.rs`) performs a DFS from `descendant`

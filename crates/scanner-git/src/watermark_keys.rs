@@ -62,7 +62,7 @@ pub struct RefWatermark {
     /// Commit OID captured at the last completed scan frontier.
     pub oid: OidBytes,
     /// Commit generation number captured with the OID, when available.
-    pub generation: Option<u32>,
+    pub generation: Option<NonZeroU32>,
 }
 
 /// A reference to a key within a `KeyArena`.

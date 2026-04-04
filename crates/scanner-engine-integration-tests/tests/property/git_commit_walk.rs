@@ -180,15 +180,26 @@ proptest! {
 
         let ref_count = tips.len();
         let mut refs = Vec::with_capacity(ref_count);
+        let mut generations: Vec<Option<NonZeroU32>> = Vec::with_capacity(ref_count);
         for i in 0..ref_count {
             let tip = Position(tips[i]);
             let wm = Position(watermarks[i]);
+
+            // Deterministic selection: correct generation, mismatched, or None.
+            let gen_choice = (tip.0 as usize + wm.0 as usize) % 3;
+            let generation = match gen_choice {
+                0 => NonZeroU32::new(graph.generation(wm)),
+                1 => NonZeroU32::new(graph.generation(wm).wrapping_add(7)),
+                _ => None,
+            };
+            generations.push(generation);
+
             refs.push(StartSetRef {
                 name: ByteRef::new(0, 0),
                 tip: TestCommitGraph::oid_for_pos(tip.0),
                 watermark: Some(RefWatermark {
                     oid: TestCommitGraph::oid_for_pos(wm.0),
-                    generation: NonZeroU32::new(graph.generation(wm)),
+                    generation,
                 }),
             });
         }

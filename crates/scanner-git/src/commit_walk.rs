@@ -564,8 +564,8 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
             return Ok(WatermarkResolution::OidMissing);
         };
         if let Some(stored_generation) = watermark.generation {
-            if self.cg.generation(wm_pos) != stored_generation {
-                return Ok(None);
+            if self.cg.generation(wm_pos) != stored_generation.get() {
+                return Ok(WatermarkResolution::GenerationMismatch);
             }
         }
         Ok(WatermarkResolution::Valid(wm_pos))
