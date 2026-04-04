@@ -2,7 +2,7 @@
 
 > **Implementation status: Design Target.** The circuit breaker types described below
 > (`CircuitBreakerState`, `CircuitConfig`) do **not** exist in compiled source code. The
-> current retry mechanism uses a `RetryBudget` with `BackendError` classification
+> current retry mechanism uses a `RetryBudget` with `ErrorClass` classification
 > (`RetryableReason` / `PermanentReason`) in `scanner-scheduler/src/scheduler/failure.rs`.
 > This document describes the target design for a future circuit breaker implementation.
 
