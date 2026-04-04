@@ -1,3 +1,11 @@
+//! Criterion benchmarks for the identity-derivation primitives in
+//! `gossip_contracts::identity`.
+//!
+//! Each benchmark uses deterministic synthetic inputs so the measurement focuses on the
+//! hashing or ID-derivation path itself instead of setup noise such as random generation
+//! or fixture loading. The suite includes both leaf operations and a full derivation chain
+//! to show how the primitives compose in a realistic hot path.
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use gossip_contracts::identity::{
@@ -8,6 +16,7 @@ use gossip_contracts::identity::{
     key_secret_hash,
 };
 
+/// Measures the keyed normalization hash used to derive tenant-scoped secrets.
 fn bench_key_secret_hash(c: &mut Criterion) {
     let key = TenantSecretKey::from_bytes([0xBB; 32]);
     let norm = NormHash::from_digest([0xCC; 32]);
@@ -17,6 +26,7 @@ fn bench_key_secret_hash(c: &mut Criterion) {
     });
 }
 
+/// Measures finding ID derivation once the caller has already normalized the secret input.
 fn bench_derive_finding_id(c: &mut Criterion) {
     let tenant_key = TenantSecretKey::from_bytes([0xBB; 32]);
     let norm = NormHash::from_digest([0xCC; 32]);
@@ -34,6 +44,7 @@ fn bench_derive_finding_id(c: &mut Criterion) {
     });
 }
 
+/// Measures occurrence ID derivation for a fixed byte range within a versioned object.
 fn bench_derive_occurrence_id(c: &mut Criterion) {
     let inputs = OccurrenceIdInputs {
         finding: FindingId::from_bytes([0x55; 32]),
@@ -47,6 +58,7 @@ fn bench_derive_occurrence_id(c: &mut Criterion) {
     });
 }
 
+/// Measures observation ID derivation from tenant, policy, and occurrence identifiers.
 fn bench_derive_observation_id(c: &mut Criterion) {
     let inputs = ObservationIdInputs {
         tenant: TenantId::from_bytes([0x77; 32]),
@@ -58,6 +70,7 @@ fn bench_derive_observation_id(c: &mut Criterion) {
     });
 }
 
+/// Measures policy hash computation for a representative keyed hashing configuration.
 fn bench_compute_policy_hash(c: &mut Criterion) {
     let inputs = PolicyHashInputs {
         policy_hash_version: 1,
@@ -71,6 +84,7 @@ fn bench_compute_policy_hash(c: &mut Criterion) {
     });
 }
 
+/// Measures stable item ID derivation from connector metadata and an identity path.
 fn bench_item_key_stable_id(c: &mut Criterion) {
     let key = ItemIdentityKey::new(
         ConnectorTag::from_ascii(b"github"),
@@ -83,6 +97,7 @@ fn bench_item_key_stable_id(c: &mut Criterion) {
     });
 }
 
+/// Measures the end-to-end cost of constructing an item key and deriving downstream IDs.
 fn bench_full_derivation_chain(c: &mut Criterion) {
     let connector = ConnectorTag::from_ascii(b"github");
     let connector_instance =
@@ -96,6 +111,8 @@ fn bench_full_derivation_chain(c: &mut Criterion) {
 
     c.bench_function("full_derivation_chain", |b| {
         b.iter(|| {
+            // Rebuild the owned path each iteration so the benchmark includes the same
+            // allocation and copy work a caller pays when assembling a fresh identity key.
             let key = ItemIdentityKey::new(connector, connector_instance, path.clone());
             let stable_id = key.stable_id();
             let secret = key_secret_hash(&tenant_key, &norm);

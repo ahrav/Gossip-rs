@@ -1,11 +1,16 @@
+//! Smoke tests for connector identity primitives used by connector-facing APIs.
+//!
+//! These checks protect a few cross-cutting invariants that other crates rely on:
+//! fixed-width identifier wrappers retain their size and zero sentinel semantics,
+//! ASCII connector tags are zero-padded deterministically, stable item ids derived
+//! from connector identity material never collapse to zero, and distinct version
+//! bytes hash to distinct non-zero object version ids.
+
 use gossip_contracts::identity::{
     ConnectorInstanceIdHash, ConnectorTag, ItemIdentityKey, ObjectVersionId, StableItemId,
 };
 
-// --- Size + ZERO sentinel checks -------------------------------------------
 gossip_contracts::smoke_test_id_32!(ConnectorInstanceIdHash, StableItemId, ObjectVersionId);
-
-// --- Size-only check (ConnectorTag is 8 bytes, not 32) ----------------------
 gossip_contracts::smoke_test_id_size!(ConnectorTag, 8);
 
 #[test]
@@ -22,6 +27,7 @@ fn connector_tag_from_ascii_works() {
 fn item_identity_key_derives_non_zero_stable_id() {
     let tag = ConnectorTag::from_ascii(b"github");
     let instance = ConnectorInstanceIdHash::from_instance_id_bytes(b"github-installation-1");
+    // The locator keeps connector-local structure by separating path segments with NUL.
     let key = ItemIdentityKey::new(tag, instance, b"org/repo\0src/main.rs");
 
     let id = key.stable_id();

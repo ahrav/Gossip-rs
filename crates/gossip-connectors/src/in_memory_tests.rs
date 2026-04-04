@@ -1,19 +1,28 @@
+//! Regression tests for the in-memory connector's deterministic behavior.
+//!
+//! The connector is used as a reference implementation in higher-level tests, so
+//! this module focuses on invariants that other components rely on rather than on
+//! exhaustive API documentation. In particular, these tests lock down:
+//!
+//! - split-point selection across empty, bounded, unbounded, and cursor-advanced
+//!   ranges;
+//! - rejection paths for malformed references and inverted ranges;
+//! - duplicate-key enforcement, including panic-message redaction guarantees; and
+//! - identity and capability behavior that must remain stable across connectors.
+//!
+//! Several cases intentionally exercise byte-weighted balancing instead of simple
+//! item-count balancing. The degenerate cases also verify that the connector falls
+//! back to a count-based split when a byte-weighted median would otherwise point at
+//! the first eligible item and fail to advance the shard.
+
 use rstest::rstest;
 
 use super::*;
 use crate::common::test_util::{default_budgets, make_key};
 
-// ---------------------------------------------------------------
-// Test helpers
-// ---------------------------------------------------------------
-
 fn make_item(key: &[u8], data: &[u8]) -> MemItem {
     MemItem::new(make_key(key), Vec::from(data))
 }
-
-// ---------------------------------------------------------------
-// Split point None cases (parameterized)
-// ---------------------------------------------------------------
 
 #[rstest]
 #[case::fewer_than_two(vec![make_item(b"only", b"1")], Cursor::initial())]
@@ -30,10 +39,6 @@ fn split_point_returns_none(#[case] items: Vec<MemItem>, #[case] cursor: Cursor)
     assert!(split.is_none());
 }
 
-// ---------------------------------------------------------------
-// Invalid ItemRef (parameterized)
-// ---------------------------------------------------------------
-
 const BAD_INDEX_BYTES: [u8; 8] = 999u64.to_be_bytes();
 
 #[rstest]
@@ -49,10 +54,6 @@ fn invalid_item_ref_returns_error(#[case] ref_bytes: &[u8]) {
             .is_err()
     );
 }
-
-// ---------------------------------------------------------------
-// Duplicate key rejection
-// ---------------------------------------------------------------
 
 #[test]
 #[should_panic(expected = "unique item keys")]
@@ -104,10 +105,6 @@ fn duplicate_keys_panic_redacts_item_key() {
     );
 }
 
-// ---------------------------------------------------------------
-// Inverted range rejection
-// ---------------------------------------------------------------
-
 #[test]
 fn inverted_range_split_returns_error() {
     let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
@@ -118,10 +115,6 @@ fn inverted_range_split_returns_error() {
     let result = c.choose_split_point_range(&start, &end, &Cursor::initial());
     assert!(result.is_err(), "inverted range should return an error");
 }
-
-// ---------------------------------------------------------------
-// Split point: byte-weight balancing
-// ---------------------------------------------------------------
 
 #[test]
 fn split_point_valid_returns_key_between_bounds() {
@@ -167,10 +160,6 @@ fn split_point_byte_weight_favors_heavy_items() {
     assert_eq!(split.as_bytes(), b"c");
 }
 
-// ---------------------------------------------------------------
-// Capabilities
-// ---------------------------------------------------------------
-
 #[test]
 fn caps_reflect_token_setting() {
     let c_with = InMemoryDeterministicConnector::new(vec![]);
@@ -179,10 +168,6 @@ fn caps_reflect_token_setting() {
     let c_without = InMemoryDeterministicConnector::new(vec![]).with_tokens(false);
     assert!(!c_without.caps().token_resume);
 }
-
-// ---------------------------------------------------------------
-// Identity derivation
-// ---------------------------------------------------------------
 
 #[test]
 fn different_tags_produce_different_stable_ids() {
@@ -216,10 +201,6 @@ fn different_instances_produce_different_stable_ids() {
         ItemIdentityKey::new(IN_MEMORY_CONNECTOR_TAG, instance_b, key.as_bytes()).stable_id();
     assert_ne!(id_a, id_b);
 }
-
-// ---------------------------------------------------------------
-// ShardSpec-based split point
-// ---------------------------------------------------------------
 
 #[test]
 fn choose_split_point_via_shard_spec() {
@@ -270,14 +251,11 @@ fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
     );
 }
 
-// ---------------------------------------------------------------
-// Degenerate split point
-// ---------------------------------------------------------------
-
 #[test]
 fn split_point_degenerate_first_item_heavy() {
-    // First item holds >50% weight. Byte-weighted median exits on first
-    // item (split_idx == start_idx), triggering the count-based fallback.
+    // When the byte-weighted median lands on the first eligible item, the
+    // connector must fall back to a count-based midpoint so the split still
+    // advances beyond the shard start.
     let items = vec![
         make_item(b"a", &vec![0u8; 1000]),
         make_item(b"b", b"x"),
@@ -291,13 +269,9 @@ fn split_point_degenerate_first_item_heavy() {
         .choose_split_point_range(&start, &end, &Cursor::initial())
         .unwrap();
     let split = split.expect("should produce a split point");
-    // Count-fallback: 3 items, midpoint at index 1 -> "b".
+    // With three items, the fallback midpoint is the middle element.
     assert_eq!(split.as_bytes(), b"b");
 }
-
-// ---------------------------------------------------------------
-// Property-based tests
-// ---------------------------------------------------------------
 
 mod prop {
     use super::*;
@@ -306,10 +280,11 @@ mod prop {
 
     use gossip_stdx::test_support::proptest_cases;
 
-    /// Strategy: generate 0..max_items unique keys as short byte strings.
+    /// Generates test items while preserving the connector's unique-key invariant.
     fn item_vec_strategy(max_items: usize) -> impl Strategy<Value = Vec<MemItem>> {
         pvec(pvec(1u8..=127u8, 1..8usize), 0..max_items).prop_map(|key_vecs| {
-            // Deduplicate keys to satisfy the unique-key invariant.
+            // The constructor rejects duplicate keys, so the strategy filters them
+            // out before materializing `MemItem` values.
             let mut seen = std::collections::HashSet::new();
             key_vecs
                 .into_iter()

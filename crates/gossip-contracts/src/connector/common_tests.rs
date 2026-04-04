@@ -1,3 +1,17 @@
+//! Common paging-contract tests for connector page buffers and validators.
+//!
+//! These tests treat page validation as a shape contract over connector output:
+//! pages must be non-empty, item keys must be strictly increasing, and every key
+//! must stay inside the connector's half-open shard interval `[start, end)`.
+//! The suite exercises that contract through both `validate_filled_page` and the
+//! `PageBuf` constructors so callers get the same failures whether they validate
+//! eagerly or build a page wrapper directly.
+//!
+//! Property tests focus on sorted, deduplicated inputs because connector pages
+//! are expected to arrive in key order. They then perturb that canonical shape
+//! to prove the validator rejects duplicates, descending pairs, and out-of-range
+//! keys with stable error reporting.
+
 use crate::connector::{ItemRef, TokenBytes, VersionId};
 use crate::identity::{ObjectVersionId, StableItemId};
 use proptest::prelude::*;
@@ -31,6 +45,8 @@ fn arb_key_bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 1..=32)
 }
 
+/// Produces sorted key sets with duplicates removed, while still enforcing the
+/// caller's minimum unique-key count after normalization.
 fn arb_sorted_unique_keys(min: usize, max: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
     proptest::collection::vec(arb_key_bytes(), min..=max)
         .prop_map(|mut keys| {
@@ -306,6 +322,8 @@ proptest! {
         let items = scan_items_from_vecs(&keys);
         let start = keys.first().unwrap().clone();
         let mut end = keys.last().unwrap().clone();
+        // Appending `0` yields the smallest exclusive upper bound still greater
+        // than the final key under Rust's lexicographic byte-slice ordering.
         end.push(0);
 
         prop_assert_eq!(validate_filled_page(&items, &start, &end), Ok(()));
