@@ -1,19 +1,15 @@
 //! etcd-backed coordination backend implementation.
 //!
 //! This module owns [`EtcdCoordinator`], the concrete [`CoordinationBackend`]
-//! that persists run and shard lifecycle state in etcd. It implements:
+//! that persists run and shard lifecycle state in etcd.
 //!
-//! - **Run management** (`create_run`, `register_shards`, `get_run`,
-//!   `get_run_progress`, `list_shards_into`, `collect_claim_candidates_into`,
-//!   `complete_run`, `fail_run`, `cancel_run`)
-//! - **Shard hot path** (`acquire_and_restore_into`, `renew`, `checkpoint`)
-//! - **Shard lifecycle** (`complete`, `park_shard`, `split_replace`,
-//!   `split_residual`, `unpark_shard`)
-//! - **Shard claiming** (via [`default_claim_next_available`])
-//! - **Cold-path maintenance** (`list_active_runs_into`,
-//!   `gc_stale_initializing_runs_into`)
+//! # Purpose
 //!
-//! # Concurrency model
+//! The backend provides a fault-tolerant, concurrent storage layer for
+//! coordinating distributed workers. It maps the abstract coordination
+//! protocol into etcd keys, values, and compare-and-swap (CAS) transactions.
+//!
+//! # Algorithm
 //!
 //! All mutating operations use optimistic compare-and-swap (CAS) transactions
 //! against etcd. Each operation follows the same pattern:
@@ -21,41 +17,23 @@
 //! 1. **Read** — Load the current record (shard or run) and its `mod_revision`.
 //! 2. **Validate** — Check preconditions locally (lease, status, fencing epoch).
 //! 3. **CAS** — Submit an etcd `Txn` conditioned on `mod_revision` equality.
-//! 4. **Retry** — On CAS failure, backoff with jitter and retry from step 1
-//!    (up to `optimistic_txn_retries`).
+//! 4. **Retry** — On CAS failure, backoff with jitter and retry from step 1.
 //!
-//! If retries exhaust without success, the operation re-reads and returns
-//! whatever domain error is appropriate (stale fence, already leased, etc.)
-//! or panics if the contention is unexplainable. This last-resort re-read
-//! ensures the caller never silently loses work.
+//! # Invariants
 //!
-//! # Shard ownership
+//! **Shard ownership**: A shard is owned if and only if both conditions hold:
+//! 1. The `/owner` key exists and matches the worker ID and fence epoch.
+//! 2. The shard record's logical deadline has not passed.
 //!
-//! Each shard has a separate `/owner` key holding a `(WorkerId, FenceEpoch)`
-//! binding, attached to an etcd lease. When the etcd lease expires (e.g.,
-//! worker crash), the `/owner` key is automatically deleted by etcd's TTL
-//! mechanism. The shard record itself persists the logical lease deadline
-//! for coordinators to make availability decisions without watching etcd
-//! lease events.
+//! # Design Trade-offs
 //!
-//! This dual-key design means ownership depends on *two* conditions being
-//! true simultaneously: (a) the `/owner` key exists and matches, and
-//! (b) the shard record's logical deadline has not passed. CAS transactions
-//! guard both.
-//!
-//! # Idempotency
-//!
-//! Op-log-backed mutations (`checkpoint`, `complete`, `park_shard`,
-//! `split_replace`, `split_residual`, `register_shards`, terminal run
-//! transitions, and `unpark_shard`) carry an `OpId` and a payload hash.
-//! If a retry finds the operation already recorded in the shard's or run's
-//! op-log, it returns [`IdempotentOutcome::Replayed`] with the previously
-//! computed result, making these mutations safe to retry across network
-//! partitions.
-//!
-//! `acquire_and_restore_into` and `renew` do **not** use OpId-based
-//! idempotency. They rely on CAS fencing (lease + epoch checks) for
-//! correctness instead.
+//! - **Dual-key ownership:** Trades increased etcd transaction size (updating
+//!   both record and owner keys) for the ability to use etcd's native TTL
+//!   mechanism, removing the need for a background lease-sweeper process.
+//! - **Optimistic Concurrency:** Trades worst-case latency under high contention
+//!   for zero-overhead reads and no distributed lock management under typical workloads.
+//! - **Op-log idempotency:** Trades payload size (storing historical operations)
+//!   for robust distributed idempotency that survives network partitions.
 
 use std::time::Duration;
 
@@ -81,10 +59,6 @@ mod test_support;
 #[cfg(any(test, feature = "test-support"))]
 pub use self::test_support::{EtcdTestFault, EtcdTestShardSnapshot};
 pub use coordinator::{AsyncEtcdCoordinator, EtcdCoordinator};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Minimum slab capacity allocated for decoding a shard record blob.
 ///
@@ -338,10 +312,6 @@ impl Drop for PersistedShard {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Free functions — key parsing, CAS delay, terminal transitions, encoding
-// ---------------------------------------------------------------------------
-
 /// Compute a backoff delay for CAS retry loops.
 ///
 /// Uses exponential backoff (5 ms base, 2× per attempt, capped at 200 ms)
@@ -437,10 +407,6 @@ pub(crate) fn apply_terminal_run_transition(
     ));
     record.assert_invariants();
 }
-
-// ---------------------------------------------------------------------------
-// Shared helpers — used by both sync and async coordinators
-// ---------------------------------------------------------------------------
 
 /// Create a decode slab sized from the blob length, clamped to
 /// `[MIN_DECODE_SLAB_CAPACITY, MAX_DECODE_SLAB_CAPACITY]`.
@@ -578,8 +544,6 @@ fn visible_now(persisted: &PersistedShard, now: LogicalTime) -> LogicalTime {
     }
 }
 
-// -- Error mapping --
-
 /// Map an [`EtcdCoordinatorError`] to the appropriate [`InfraError`]
 /// variant, preserving the corruption vs. transient distinction.
 ///
@@ -622,11 +586,6 @@ pub(crate) fn map_etcd_err(
         },
     }
 }
-
-// -- Shared lease/CAS validation helpers --
-//
-// These are used by both `EtcdCoordinator` and `AsyncEtcdCoordinator`
-// trait impls across `shard_coordination` and `run_management`.
 
 /// Validate a presented lease against a loaded shard's persisted state.
 ///
@@ -683,8 +642,6 @@ fn build_shard_owner_cas(
     compares
 }
 
-// -- CAS guard helpers --
-
 /// CAS guard: shard record key has not been modified since `mod_revision`.
 fn compare_shard_revision(shard_record_key: ShardRecordKey, mod_revision: i64) -> Compare {
     Compare::mod_revision(shard_record_key, CompareOp::Equal, mod_revision)
@@ -734,8 +691,6 @@ fn compare_owner_present(
         Compare::lease(owner_key, CompareOp::Equal, lease_id),
     ]
 }
-
-// -- Codec helpers --
 
 /// Decode an owner-key blob, wrapping codec errors with the given
 /// operation context.
