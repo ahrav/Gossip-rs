@@ -1,0 +1,81 @@
+# CodeRabbit configuration for gossip-rs
+# Docs: https://docs.coderabbit.ai/pr-reviews/pre-merge-checks
+
+reviews:
+  pre_merge_checks:
+    # --- Built-in checks ---
+    docstrings:
+      mode: "warning"
+      threshold: 75
+
+    title:
+      mode: "warning"
+      requirements: >-
+        Start with an imperative verb (Add, Fix, Remove, Refactor, etc.),
+        keep under 72 characters. Do not include tracking IDs, milestone
+        labels, or issue numbers in the title.
+
+    description:
+      mode: "warning"
+
+    issue_assessment:
+      mode: "warning"
+
+    # --- Custom checks (3 of 5 slots used) ---
+    custom_checks:
+      - name: "Design Doc Freshness"
+        mode: "warning"
+        instructions: >-
+          Pass/fail criteria: If this PR modifies .rs files under crates/*/src/
+          (excluding tests, benches, build.rs, lib.rs), check whether
+          corresponding design docs in docs/ were also modified OR the PR
+          description contains "Design docs reviewed" or "No doc updates needed".
+          Key scope mappings:
+          crates/gossip-coordination/src/ -> docs/gossip-coordination/,
+          crates/gossip-contracts/src/identity/ -> docs/gossip-contracts/boundary-1-identity-spine.md,
+          crates/scanner-engine/src/ -> docs/scanner-engine/,
+          crates/scanner-git/src/ -> docs/scanner-git/,
+          crates/gossip-contracts/src/connector/ -> docs/gossip-connectors/,
+          crates/gossip-contracts/src/persistence/ -> docs/gossip-contracts/boundary-5-persistence.md,
+          crates/gossip-frontier/src/ -> docs/gossip-frontier/.
+          Full mappings live in docs/scope-map.toml.
+          PASS if: only test/bench files changed, docs were updated, or PR
+          description acknowledges doc review.
+          FAIL if: scoped source files changed with no doc updates and no
+          acknowledgment.
+
+      - name: "Comment and Doc Hygiene"
+        mode: "warning"
+        instructions: >-
+          Pass/fail criteria: New or modified comments in .rs files and prose
+          in docs/*.md must not contain: tracking IDs (F-011, C3, P0 as labels),
+          milestone labels (B0 scaffold, phase 1), PR references (PR #N, merge
+          request), review-response language (per review, reviewer feedback,
+          addressed finding), temporal narration (previously used, was changed
+          from, newly added, before the fix), conversational tone (good catch,
+          as discussed, note to reviewer), history narration (refactored from,
+          moved from). Exception: stable code-internal cross-references like
+          S1-S7 invariant labels in simulation code are documentation, not
+          tracking. Comments must stand alone -- a reader with no access to PRs,
+          issues, or chat must fully understand the comment from code context
+          alone. PASS if all new/modified comments describe behavior, invariants,
+          or design reasoning. FAIL if any comment references external context
+          or narrates change history.
+
+      - name: "No Versioning or Legacy Code"
+        mode: "warning"
+        instructions: >-
+          Pass/fail criteria: This is pre-release code with zero
+          backwards-compatibility obligations. FAIL if the PR introduces:
+          (1) versioned types with V1/V2/V3 suffixes or _v2/_v3 functions,
+          (2) #[deprecated] attributes,
+          (3) compatibility shims (old_*/new_* parallel implementations),
+          (4) feature flags gating old-vs-new behavior,
+          (5) migration layers or version discriminants in wire formats,
+          (6) code paths preserved "for backwards compatibility".
+          One code path per behavior -- if a refactor replaces an approach,
+          the old approach must be fully deleted.
+          PASS if no versioning, deprecation, or compatibility patterns are
+          introduced.
+
+    override_requested_reviewers_only: true
