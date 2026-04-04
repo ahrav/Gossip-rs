@@ -103,8 +103,9 @@ Key observations from the source code:
 
 A run aggregates multiple shards into a single scan job. Its lifecycle is derived
 from the collective state of its shards. The run progresses from `Initializing`
-(manifest validated, initial shards materialized) through `Active` (workers
-processing shards) to either `Done` (all shards settled with zero parked
+(empty run record created by `create_run`) through `Active` (manifest validated
+and initial shards materialized by `register_shards`, then workers processing
+shards) to either `Done` (all shards settled with zero parked
 shards), `Failed` (timeout, unrecoverable error, or a settled run that still
 contains parked shards), or `Cancelled` (explicitly cancelled before
 completion). Run completion requires recursive terminal checks: if a shard was
@@ -115,9 +116,9 @@ split, all its descendant shards must also be terminal.
 stateDiagram-v2
     direction TB
 
-    [*] --> Initializing : create_run<br/>(validate manifest, materialize shards)
+    [*] --> Initializing : create_run<br/>(empty run record)
 
-    Initializing --> Active : register_shards<br/>(shard registration activates run)
+    Initializing --> Active : register_shards<br/>(validate manifest, materialize shards, activate run)
     Initializing --> Cancelled : cancelled before any work starts
     Active --> Active : shard operations<br/>(checkpoint, split, complete, park)
     Active --> Done : all shards settled<br/>(Done or Split; no Parked shards)
@@ -129,9 +130,9 @@ stateDiagram-v2
     Cancelled --> [*]
 
     note right of Initializing
-        Manifest validated.
-        Initial shards materialized in
-        Active state (unleased).
+        create_run completed.
+        register_shards has not yet run.
+        No shard records exist yet.
         No workers assigned yet.
     end note
 
