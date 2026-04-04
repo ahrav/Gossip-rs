@@ -365,10 +365,11 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
     type Error = std::convert::Infallible;
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        // Recover from lock poisoning: HashMap internals are valid even after a panic in user code.
         Ok(self
             .store
             .lock()
-            .expect("in-memory git persistence lock poisoned in get")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
             .cloned())
     }
@@ -382,7 +383,7 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
         let store = self
             .store
             .lock()
-            .expect("in-memory git persistence lock poisoned in multi_get");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(keys
             .iter()
             .map(|key| store.get(key.as_slice()).cloned())
@@ -393,7 +394,7 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
         let mut store = self
             .store
             .lock()
-            .expect("in-memory git persistence lock poisoned in apply_batch");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for op in ops {
             match op {
                 GitPersistenceOp::Put { key, value } => {

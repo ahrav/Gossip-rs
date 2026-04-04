@@ -2746,6 +2746,18 @@ where
     Ok((report, completion))
 }
 
+/// Bundled metadata for one completed Git repo scan, consumed by the
+/// done-ledger submission helper.
+struct GitRepoPersistenceInput<'a> {
+    write_context: WriteContext,
+    shard_id: &'a str,
+    repo_id: u64,
+    bytes_scanned: u64,
+    detected_count: u64,
+    claim_time: LogicalTime,
+    complete_time: LogicalTime,
+}
+
 /// Submit a done-ledger entry for one completed Git repo scan.
 ///
 /// Constructs the done-ledger record from the scan metadata and submits it
@@ -2758,16 +2770,9 @@ where
 /// If the done-ledger submit fails, the shard checkpoint is not advanced and
 /// the repo stays reclaimable. On re-claim the repo is re-scanned, so
 /// partial done-ledger writes are harmless.
-#[allow(clippy::too_many_arguments)]
 fn submit_git_repo_done_ledger<D>(
     done_ledger: &D,
-    write_context: WriteContext,
-    shard_id: &str,
-    repo_id: u64,
-    bytes_scanned: u64,
-    detected_count: u64,
-    claim_time: LogicalTime,
-    complete_time: LogicalTime,
+    input: &GitRepoPersistenceInput<'_>,
 ) -> Result<(FindingsCommitReceipt, DoneLedgerCommitReceipt), DistributedRuntimeError>
 where
     D: DoneLedger + Clone + Send + Sync + 'static,
@@ -2779,11 +2784,12 @@ where
     // enforces this invariant in release builds as defense-in-depth.
     // Synthesize a zero-count receipt to skip an unnecessary sink
     // round-trip for clean shards.
-    if detected_count > 0 {
+    if input.detected_count > 0 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow::anyhow!(
-                "submit_git_repo_done_ledger called with detected_count={detected_count}; \
-                 durable Git finding translation is not yet implemented"
+                "submit_git_repo_done_ledger called with detected_count={}; \
+                 durable Git finding translation is not yet implemented",
+                input.detected_count,
             ),
         )));
     }
@@ -2794,12 +2800,12 @@ where
     // will need real handling when findings persistence is implemented.
     let findings_count: u32 = 0;
     let record = crate::git_persistence::build_git_repo_done_ledger_record(
-        write_context,
-        repo_id,
-        bytes_scanned,
+        input.write_context,
+        input.repo_id,
+        input.bytes_scanned,
         findings_count,
-        claim_time,
-        complete_time,
+        input.claim_time,
+        input.complete_time,
     )
     .map_err(|error| {
         DistributedRuntimeError::Durability(
@@ -2808,12 +2814,14 @@ where
     })?;
     let handle = done_ledger.batch_upsert(&[record]).map_err(|error| {
         DistributedRuntimeError::Durability(anyhow::Error::new(error).context(format!(
-            "git repo-frontier shard '{shard_id}' done-ledger submit failed",
+            "git repo-frontier shard '{}' done-ledger submit failed",
+            input.shard_id,
         )))
     })?;
     let done_ledger_receipt = handle.wait().map_err(|error| {
         DistributedRuntimeError::Durability(anyhow::Error::new(error).context(format!(
-            "git repo-frontier shard '{shard_id}' done-ledger wait failed",
+            "git repo-frontier shard '{}' done-ledger wait failed",
+            input.shard_id,
         )))
     })?;
 
@@ -3033,16 +3041,17 @@ where
         )));
     }
 
-    let (findings_receipt, done_ledger_receipt) = submit_git_repo_done_ledger(
-        &persistence.done_ledger,
-        execution.write_context,
-        lease.shard_id(),
-        lease.payload().repo_id(),
-        execution.report.bytes_scanned,
+    let input = GitRepoPersistenceInput {
+        write_context: execution.write_context,
+        shard_id: lease.shard_id(),
+        repo_id: lease.payload().repo_id(),
+        bytes_scanned: execution.report.bytes_scanned,
         detected_count,
-        lease.claim_wall_clock(),
+        claim_time: lease.claim_wall_clock(),
         complete_time,
-    )?;
+    };
+    let (findings_receipt, done_ledger_receipt) =
+        submit_git_repo_done_ledger(&persistence.done_ledger, &input)?;
 
     tracing::debug!(
         shard_id = %lease.shard_id(),
