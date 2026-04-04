@@ -27,7 +27,7 @@ The simulation framework is organized in three layers:
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    Test Harness Layer                         │
-│  sim_scanner/runner_tests.rs    integration tests             │
+│  scanner-engine-integration-tests/tests/simulation/*.rs       │
 │  Corpus replay · Random-seed stress · Mutation stress         │
 ├──────────────────────────────────────────────────────────────┤
 │                  Execution Layer                              │
@@ -174,6 +174,7 @@ pub struct ReproArtifact {
     pub schema_version: u32,
     pub scanner_pkg_version: String,
     pub git_commit: Option<String>,
+    pub target: String,
     pub scenario_seed: u64,
     pub schedule_seed: u64,
     pub run_config: RunConfig,
