@@ -31,7 +31,7 @@ errors."*
 | `src/main.rs` | Binary entrypoint: parse, dispatch, exit, error-chain printing |
 | `Cargo.toml` | Manifest: single dependency on `gossip-scanner-runtime` |
 
-There is no `lib.rs`, no additional modules, and no subdirectories.
+There is no `lib.rs` and no additional Rust modules beyond `src/main.rs`.
 
 ---
 
