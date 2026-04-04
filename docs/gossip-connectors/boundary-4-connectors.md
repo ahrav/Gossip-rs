@@ -107,7 +107,7 @@ gossip-contracts::identity + gossip-contracts::coordination
 | Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
 | Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `resolve_bounds`                                     |
 | Streaming split estimation     | `gossip-connectors::split_estimator` | `StreamingSplitEstimator` (bounded-memory byte-weighted median)             |
-| Family runtime entry points    | `gossip-scanner-runtime`         | `scan_local_filesystem()`, `scan_local_repo()`, execution-mode dispatch over source families |
+| Family runtime entry points    | `gossip-scanner-runtime`         | `scan_fs()`, `scan_git()`, execution-mode dispatch over source families |
 
 ### Dependency direction
 
