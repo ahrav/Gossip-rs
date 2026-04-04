@@ -440,10 +440,12 @@ impl GitDistributedSourceSettings {
     /// Bundle distributed Git scan settings with the required mirror root.
     #[must_use]
     pub fn new(git: GitSourceSettings, mirror_root: impl Into<PathBuf>) -> Self {
-        Self {
-            git,
-            mirror_root: mirror_root.into(),
-        }
+        let mirror_root: PathBuf = mirror_root.into();
+        debug_assert!(
+            !mirror_root.as_os_str().is_empty(),
+            "mirror_root must not be empty"
+        );
+        Self { git, mirror_root }
     }
 
     /// Borrow the underlying Git scan settings.

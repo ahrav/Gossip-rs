@@ -2758,12 +2758,17 @@ where
 /// `FindingsSink::upsert_batch` uses upsert (idempotent) semantics: on
 /// re-claim the repo is re-scanned and findings are re-submitted, with
 /// duplicates deduplicated by the sink's primary key.
+///
+/// The idempotency claim is a contract-level guarantee of `FindingsSink`,
+/// not yet validated by integration tests for the git repo path.
+#[allow(clippy::too_many_arguments)]
 fn persist_git_repo_findings_and_done_ledger<F, D>(
     persistence: &DistributedPersistence<F, D>,
     write_context: WriteContext,
     shard_id: &str,
     repo_id: u64,
     bytes_scanned: u64,
+    detected_count: u64,
     claim_time: LogicalTime,
     complete_time: LogicalTime,
 ) -> Result<(FindingsCommitReceipt, DoneLedgerCommitReceipt), DistributedRuntimeError>
@@ -2794,7 +2799,18 @@ where
     })?;
 
     // --- done-ledger submission ---
-    let findings_count = u32::try_from(findings_receipt.finding_count()).unwrap_or(u32::MAX);
+    let findings_count = match u32::try_from(detected_count) {
+        Ok(count) => count,
+        Err(_) => {
+            tracing::warn!(
+                shard_id,
+                actual_count = detected_count,
+                saturated_to = u32::MAX,
+                "findings count exceeds u32::MAX; done-ledger record clamped"
+            );
+            u32::MAX
+        }
+    };
     let record = crate::git_persistence::build_git_repo_done_ledger_record(
         write_context,
         repo_id,
@@ -3015,11 +3031,11 @@ where
         )));
     }
 
-    // Findings must be durable BEFORE shard checkpoint advances. With the
-    // in-memory GitPersistenceBackend, post-execution batch write is safe:
-    // a crash clears in-memory watermarks, causing full re-scan on re-claim.
-    // With a durable GitPersistenceBackend, finalize must be split:
-    // seen-bitmaps → findings persistence → watermark commit.
+    // Findings must be durable BEFORE shard checkpoint advances. The in-memory
+    // GitPersistenceBackend makes post-execution batch write safe: a crash
+    // clears in-memory watermarks, causing full re-scan on re-claim. A durable
+    // GitPersistenceBackend would require splitting finalize into: seen-bitmaps
+    // → findings persistence → watermark commit.
     let detected_count = capture_sink.detected_finding_count();
 
     if detected_count > 0 {
@@ -3045,6 +3061,7 @@ where
         lease.shard_id(),
         lease.payload().repo_id(),
         execution.report.bytes_scanned,
+        detected_count,
         lease.claim_wall_clock(),
         complete_time,
     )?;
@@ -3074,6 +3091,11 @@ where
                 )),
             ))
         })?;
+
+    debug_assert!(
+        checkpoint_input.is_some(),
+        "complete finalize must produce a checkpoint input"
+    );
 
     let checkpoint = checkpoint_input
         .as_ref()
@@ -6675,6 +6697,98 @@ mod tests {
             summaries[0].status(),
             ShardStatus::Done,
             "shard must not advance when done-ledger submission fails"
+        );
+    }
+
+    /// A findings-sink commit failure (handle.wait() returns Err) during git
+    /// repo persistence must surface as `DistributedRuntimeError::Durability`
+    /// and must not advance the shard cursor. The done-ledger must remain empty
+    /// because the commit failure occurs before done-ledger submission.
+    #[test]
+    fn git_repo_worker_propagates_findings_commit_failure() {
+        let repo = create_clean_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let findings_sink = InMemoryFindingsSink::new();
+        findings_sink
+            .fail_next_commits(1)
+            .expect("inject findings-sink commit failure");
+        let done_ledger = InMemoryDoneLedger::new();
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            DistributedPersistence::new(findings_sink, done_ledger.clone()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("findings-sink commit failure should propagate as an error");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Durability(_)),
+            "expected Durability variant, got: {err:?}"
+        );
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_ne!(
+            summaries[0].status(),
+            ShardStatus::Done,
+            "shard must not advance when findings-sink commit fails"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "done-ledger must remain empty when findings-sink commit fails before it"
+        );
+    }
+
+    /// A done-ledger commit failure (handle.wait() returns Err) during git
+    /// repo persistence must surface as `DistributedRuntimeError::Durability`
+    /// and must not advance the shard cursor.
+    #[test]
+    fn git_repo_worker_propagates_done_ledger_commit_failure() {
+        let repo = create_clean_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let findings_sink = InMemoryFindingsSink::new();
+        let done_ledger = InMemoryDoneLedger::new();
+        done_ledger
+            .fail_next_commits(1)
+            .expect("inject done-ledger commit failure");
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            DistributedPersistence::new(findings_sink, done_ledger),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("done-ledger commit failure should propagate as an error");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Durability(_)),
+            "expected Durability variant, got: {err:?}"
+        );
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_ne!(
+            summaries[0].status(),
+            ShardStatus::Done,
+            "shard must not advance when done-ledger commit fails"
         );
     }
 

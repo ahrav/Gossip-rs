@@ -353,8 +353,10 @@ impl ProductionRuntimeBackends {
 /// `Send` bounds or the scan is refactored to cross thread boundaries.
 ///
 /// State does not survive process restarts. This backend is suitable for
-/// single-worker development and early integration until a durable
-/// (e.g. PostgreSQL-backed) Git persistence backend is available.
+/// single-worker development and early integration where persistence
+/// across process restarts is not required.
+// Structurally similar to `TestGitBackend` in the `distributed.rs` test module.
+// This is production (development-mode) code; that is test-only with failure injection.
 #[derive(Debug, Clone, Default)]
 struct InMemoryGitPersistence {
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -367,7 +369,7 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
         Ok(self
             .store
             .lock()
-            .expect("in-memory git persistence lock poisoned")
+            .expect("in-memory git persistence lock poisoned in get")
             .get(key)
             .cloned())
     }
@@ -381,7 +383,7 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
         let store = self
             .store
             .lock()
-            .expect("in-memory git persistence lock poisoned");
+            .expect("in-memory git persistence lock poisoned in multi_get");
         Ok(keys
             .iter()
             .map(|key| store.get(key.as_slice()).cloned())
@@ -392,7 +394,7 @@ impl GitPersistenceBackend for InMemoryGitPersistence {
         let mut store = self
             .store
             .lock()
-            .expect("in-memory git persistence lock poisoned");
+            .expect("in-memory git persistence lock poisoned in apply_batch");
         for op in ops {
             match op {
                 GitPersistenceOp::Put { key, value } => {
@@ -914,7 +916,10 @@ mod tests {
     use gossip_contracts::identity::{PolicyHash, RunId, TenantId, TenantSecretKey, WorkerId};
     use gossip_coordination_etcd::test_support::test_async_coordinator_config;
     use gossip_pg_common::test_support::create_test_db;
-    use gossip_scanner_runtime::{ExecutionMode, FsScanConfig, ScanBudgets, ScanRuntimeError};
+    use gossip_scanner_runtime::distributed::GitWorkerIdentity;
+    use gossip_scanner_runtime::{
+        ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets, ScanRuntimeError,
+    };
     use tempfile::tempdir;
 
     fn fresh_backend_config() -> ProductionBackendConfig {
@@ -1738,6 +1743,131 @@ mod tests {
                 )
             ),
             "expected CorruptedAppliedMigration with 0 bytes, got {error:?}"
+        );
+    }
+
+    // --- InMemoryGitPersistence tests ---
+
+    #[test]
+    fn in_memory_git_persistence_get_absent_key_returns_none() {
+        let store = InMemoryGitPersistence::default();
+        assert_eq!(store.get(b"missing").unwrap(), None);
+    }
+
+    #[test]
+    fn in_memory_git_persistence_put_then_get() {
+        let store = InMemoryGitPersistence::default();
+        store
+            .apply_batch(&[GitPersistenceOp::Put {
+                key: b"key1".to_vec(),
+                value: b"value1".to_vec(),
+            }])
+            .unwrap();
+        assert_eq!(store.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+    }
+
+    #[test]
+    fn in_memory_git_persistence_put_then_delete() {
+        let store = InMemoryGitPersistence::default();
+        store
+            .apply_batch(&[GitPersistenceOp::Put {
+                key: b"key1".to_vec(),
+                value: b"value1".to_vec(),
+            }])
+            .unwrap();
+        store
+            .apply_batch(&[GitPersistenceOp::Delete {
+                key: b"key1".to_vec(),
+            }])
+            .unwrap();
+        assert_eq!(store.get(b"key1").unwrap(), None);
+    }
+
+    #[test]
+    fn in_memory_git_persistence_multi_get_preserves_order() {
+        let store = InMemoryGitPersistence::default();
+        store
+            .apply_batch(&[
+                GitPersistenceOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"val_a".to_vec(),
+                },
+                GitPersistenceOp::Put {
+                    key: b"b".to_vec(),
+                    value: b"val_b".to_vec(),
+                },
+                GitPersistenceOp::Put {
+                    key: b"c".to_vec(),
+                    value: b"val_c".to_vec(),
+                },
+            ])
+            .unwrap();
+
+        let keys = vec![b"c".to_vec(), b"missing".to_vec(), b"a".to_vec()];
+        let results = store.multi_get(&keys).unwrap();
+        assert_eq!(
+            results,
+            vec![Some(b"val_c".to_vec()), None, Some(b"val_a".to_vec()),]
+        );
+    }
+
+    #[test]
+    fn in_memory_git_persistence_clones_share_state() {
+        let original = InMemoryGitPersistence::default();
+        let cloned = original.clone();
+        cloned
+            .apply_batch(&[GitPersistenceOp::Put {
+                key: b"shared_key".to_vec(),
+                value: b"shared_val".to_vec(),
+            }])
+            .unwrap();
+        assert_eq!(
+            original.get(b"shared_key").unwrap(),
+            Some(b"shared_val".to_vec()),
+        );
+    }
+
+    /// Helper to build a `DistributedWorkerLaunch::Git` variant with the given
+    /// mirror root. Uses dummy identity fields since the test exercises the
+    /// mirror manager error path, not the coordinator.
+    fn git_worker_launch(mirror_root: PathBuf) -> DistributedWorkerLaunch {
+        DistributedWorkerLaunch::Git {
+            identity: GitWorkerIdentity::new(
+                TenantId::from_bytes([0x11; 32]),
+                RunId::from_raw(42),
+                WorkerId::from_raw(7),
+                PolicyHash::from_bytes([0x22; 32]),
+                TenantSecretKey::from_bytes([0x33; 32]),
+                GitScanConfig::new("/dummy/repo"),
+                Arc::new(ProductionCoordinationEventRecorder::default()),
+            ),
+            mirror_root,
+        }
+    }
+
+    #[test]
+    fn run_production_worker_git_dispatch_maps_mirror_manager_error() {
+        // Place a regular file where LocalMirrorManager expects a directory.
+        // `LocalMirrorManager::new` tries to create a subdirectory under
+        // `mirror_root`, which fails when `mirror_root` is a plain file.
+        let dir = tempdir().expect("tempdir");
+        let file_as_root = dir.path().join("not-a-directory");
+        fs::write(&file_as_root, "block").expect("write sentinel file");
+
+        let error = run_production_worker(
+            &migrated_backend_config(),
+            ProductionStartupSettings::validate_only(),
+            git_worker_launch(file_as_root),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("mirror manager must fail when mirror_root is a regular file");
+
+        assert!(
+            matches!(
+                error,
+                ProductionWorkerError::Startup(ProductionBootstrapError::GitMirrorManager(_))
+            ),
+            "expected GitMirrorManager bootstrap error, got {error:?}"
         );
     }
 }

@@ -836,12 +836,7 @@ pub(crate) fn build_git_repo_done_ledger_record(
         ));
     }
 
-    // Git repo done-ledger entries use a fixed zero ObjectVersionId because
-    // repo-frontier shards track mutable refs, not immutable content versions.
-    // The 32-byte StableItemId is zero-padded from the u64 repo_id per the
-    // fixed-width contract. Domain separation from filesystem StableItemIds is
-    // guaranteed by repo_id being derived from TenantId + normalized path via
-    // domain_hasher.
+    // See "OvidHash derivation" in the doc comment above.
     let ovid = {
         let mut buf = [0u8; 32];
         buf[..8].copy_from_slice(&repo_id.to_le_bytes());
@@ -1743,6 +1738,77 @@ mod tests {
         assert!(
             source_msg.contains("returned") && source_msg.contains("results for"),
             "expected inner source to mention count mismatch, got: {source_msg}"
+        );
+    }
+
+    // ---- build_git_repo_done_ledger_record tests ----
+
+    #[test]
+    fn build_git_repo_done_ledger_record_scanned_clean() {
+        let wc = write_context();
+        let record = build_git_repo_done_ledger_record(
+            wc,
+            42,
+            1024,
+            0,
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        )
+        .expect("should build a valid record");
+
+        assert_eq!(record.status(), DoneLedgerStatus::ScannedClean);
+        assert_eq!(record.findings_count(), 0);
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_scanned_with_findings() {
+        let wc = write_context();
+        let record = build_git_repo_done_ledger_record(
+            wc,
+            42,
+            2048,
+            5,
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        )
+        .expect("should build a valid record");
+
+        assert_eq!(record.status(), DoneLedgerStatus::ScannedWithFindings);
+        assert_eq!(record.findings_count(), 5);
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_different_repo_ids_produce_different_ovid() {
+        let claim = LogicalTime::from_raw(100);
+        let complete = LogicalTime::from_raw(200);
+
+        let record_a = build_git_repo_done_ledger_record(write_context(), 1, 0, 0, claim, complete)
+            .expect("record a");
+        let record_b = build_git_repo_done_ledger_record(write_context(), 2, 0, 0, claim, complete)
+            .expect("record b");
+
+        assert_ne!(
+            record_a.key(),
+            record_b.key(),
+            "distinct repo_ids must produce distinct done-ledger keys"
+        );
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_is_deterministic() {
+        let claim = LogicalTime::from_raw(300);
+        let complete = LogicalTime::from_raw(400);
+
+        let record_1 =
+            build_git_repo_done_ledger_record(write_context(), 99, 512, 3, claim, complete)
+                .expect("first call");
+        let record_2 =
+            build_git_repo_done_ledger_record(write_context(), 99, 512, 3, claim, complete)
+                .expect("second call");
+
+        assert_eq!(
+            record_1, record_2,
+            "identical inputs must produce identical records"
         );
     }
 }
