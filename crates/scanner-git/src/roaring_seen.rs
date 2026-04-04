@@ -628,25 +628,25 @@ impl RoaringSeenBitmap {
         if other_len == 0 {
             return Ok(());
         }
-        // Pre-flight: catch usize overflow before allocation. The actual
-        // merged count may be smaller due to dedup, so this is a
-        // conservative upper bound rather than the authoritative check.
-        let _ = self
+        // Pre-flight: catch usize overflow and u32 overflow before any
+        // mutation or allocation. The actual merged count may be smaller
+        // due to dedup, so this is a conservative upper bound rather than
+        // the authoritative check. The u32 bound ensures that every
+        // position passed to `insert_position` fits in a Roaring bitmap
+        // index on both the fast path (in-place) and the slow path
+        // (temporaries).
+        let upper_bound = self
             .oids
             .len()
             .checked_add(other_len)
             .ok_or(SeenBitmapError::TooManyOids(usize::MAX))?;
+        let _ = u32_len(upper_bound)?;
 
         // Fast path: all incoming OIDs sort strictly after the existing
         // maximum. Extends in-place, avoiding a full-buffer copy.
+        // The preflight u32_len check above already validated the sum.
         if self.oids.len() > 0 && self.oids.oid_at(self.oids.len() - 1) < other_oid_at(0) {
-            // Validate the final length fits in u32 BEFORE mutating self,
-            // so a failed check cannot leave self.oids with more entries
-            // than the Roaring bitmap can index. No dedup occurs on this
-            // path (all incoming OIDs are strictly greater), so the sum is
-            // exact rather than an upper bound.
             let base_len = self.oids.len();
-            let _ = u32_len(base_len + other_len)?;
             for idx in 0..other_len {
                 self.oids.push(other_oid_at(idx));
                 if other_contains(idx) {
