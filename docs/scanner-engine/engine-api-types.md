@@ -507,7 +507,7 @@ on overflow. Only available when the `b64-stats` feature is enabled.
 Every configuration type implements `encode_policy(&self, out: &mut Vec<u8>)`,
 producing a deterministic, order-invariant byte string. This is hashed to form
 the *policy hash* — a fingerprint of the full scan configuration used by
-`src/git_scan/policy_hash.rs` to detect configuration changes between runs.
+`crates/scanner-git/src/policy_hash.rs` to detect configuration changes between runs.
 
 **Stability contract:** any semantic change to encodings (field additions,
 reorderings, tag value changes) requires a version bump in the policy-hash
