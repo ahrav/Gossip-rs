@@ -275,7 +275,11 @@ impl InMemoryDeterministicConnector {
 }
 
 impl InMemoryDeterministicConnector {
-    /// Advertise connector capabilities used by orchestration planning.
+    /// Advertise the connector features that planners may rely on.
+    ///
+    /// `token_resume` mirrors the current `emit_tokens` setting exactly, so a
+    /// connector configured with [`with_tokens(false)`](Self::with_tokens)
+    /// never claims opaque-token resume support.
     pub fn caps(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             seek_by_key: true,
@@ -285,6 +289,12 @@ impl InMemoryDeterministicConnector {
         }
     }
 
+    /// Choose a shard-local split hint for the given [`ShardSpec`].
+    ///
+    /// The shard's half-open key bounds are resolved first, then the same
+    /// sorted-range estimator used by
+    /// [`Self::choose_split_point_range`] is applied within those bounds.
+    ///
     /// Budgets are accepted but not consumed: split-point selection is a
     /// metadata-only operation with no I/O or time-bounded work.
     pub fn choose_split_point(
@@ -304,6 +314,11 @@ impl InMemoryDeterministicConnector {
     /// returned reader in a bounded adapter), consistent with the advisory
     /// budget contract. This matches [`read_range`](Self::read_range)
     /// semantics, which also does not reject items based on total size.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReadError::permanent` when `item_ref` is malformed, cannot be
+    /// decoded as a big-endian index, or points outside the prepared item set.
     pub fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -313,8 +328,18 @@ impl InMemoryDeterministicConnector {
         Ok(Box::new(io::Cursor::new(bytes)))
     }
 
-    /// Clamps the copy length to `min(dst.len(), max_bytes, available)` so
+    /// Copy a byte range from the referenced item into `dst`.
+    ///
+    /// The copy length is clamped to `min(dst.len(), max_bytes, available)` so
     /// the budget acts as an additional upper bound on bytes returned.
+    ///
+    /// Returns `Ok(0)` when `offset` is at or beyond the end of the item, or
+    /// when the offset cannot fit in `usize` on the current platform.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReadError::permanent` when `item_ref` is malformed or when
+    /// `offset + dst.len()` overflows `u64`.
     pub fn read_range(
         &mut self,
         item_ref: &ItemRef,
