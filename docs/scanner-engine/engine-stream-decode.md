@@ -49,10 +49,11 @@ The streaming decoder processes encoded input through a **callback-based pattern
 
 ```rust
 // From transform.rs
-pub(super) fn stream_decode(tc: &TransformConfig, encoded: &[u8], on_bytes: F)
-    -> Result<(), ()>
-where
-    F: FnMut(&[u8]) -> ControlFlow<()>,
+pub(super) fn stream_decode(
+    tc: &TransformConfig,
+    input: &[u8],
+    on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> Result<(), ()>
 ```
 
 Key characteristics:
@@ -467,7 +468,7 @@ pub struct ScanScratch {
     pub decode_ring: ByteRing,             // Circular buffer of decoded bytes
     pub pending_windows: TimingWheel<...>, // Windows scheduled for processing
     pub stream_hit_counts: Vec<u32>,       // Per-rule-variant window counter
-    pub stream_hit_touched: Vec<u32>,      // Touched indices for reset
+    pub stream_hit_touched: ScratchVec<u32>, // Touched indices for reset
     pub vs_stream_matches: Vec<...>,       // Matches from Vectorscan callback
     pub vs_stream_scratch: Option<...>,    // Vectorscan scratch reuse
     pub pending_spans: Vec<...>,           // Child transform spans
