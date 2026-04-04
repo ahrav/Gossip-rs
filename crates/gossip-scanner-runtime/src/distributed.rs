@@ -9008,7 +9008,7 @@ mod tests {
         let ledger = InMemoryDoneLedger::new();
         let err = submit_git_repo_done_ledger(&ledger, &input)
             .expect_err("nonzero detected_count must be rejected");
-        let msg = format!("{err:?}");
+        let msg = format!("{err}");
         assert!(
             msg.contains("detected_count=5"),
             "error must report the count: {msg}"

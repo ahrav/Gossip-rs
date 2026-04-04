@@ -613,6 +613,10 @@ mod tests {
             !line.contains("norm_hash"),
             "encoded event must omit norm_hash, got: {line}"
         );
+        assert!(
+            !line.contains("rule_id"),
+            "encoded event must omit rule_id, got: {line}"
+        );
     }
 
     #[test]
@@ -640,6 +644,10 @@ mod tests {
             .expect("vec writer");
         let line = String::from_utf8(output).expect("valid utf8 output");
         assert_eq!(line, load_event_golden("finding_git.jsonl"));
+        assert!(
+            !line.contains("norm_hash"),
+            "encoded git event must omit norm_hash, got: {line}"
+        );
     }
 
     #[test]
