@@ -132,8 +132,8 @@ struct Sample {
     key: Box<[u8]>,
 }
 
-#[derive(Clone, Copy)]
 /// Redacts key material from debug output while preserving byte length.
+#[derive(Clone, Copy)]
 struct RedactedKeyLen(usize);
 
 impl fmt::Debug for RedactedKeyLen {
@@ -142,9 +142,9 @@ impl fmt::Debug for RedactedKeyLen {
     }
 }
 
-#[derive(Clone, Copy)]
 /// Redacts optional key material from debug output while preserving presence
 /// and byte length.
+#[derive(Clone, Copy)]
 struct RedactedOptionalKeyLen(Option<usize>);
 
 impl fmt::Debug for RedactedOptionalKeyLen {
