@@ -113,9 +113,13 @@ flowchart TB
 
 ## Budget Limits
 
+`Tuning` is caller-supplied; these values are not engine-global defaults. The
+numbers below match `demo_tuning()` in `crates/scanner-engine/src/demo.rs` and
+illustrate one concrete configuration.
+
 ```mermaid
 graph LR
-    subgraph Limits["DoS Protection Limits"]
+    subgraph Limits["Example DoS Limits (`demo_tuning()`)"]
         MaxDepth["max_transform_depth: 3"]
         MaxOutput["max_total_decode_output_bytes: 512 KiB"]
         MaxItems["max_work_items: 256"]
@@ -173,8 +177,8 @@ contribute based on `dedupe_with_span` alone — there is no additional
 from the key (the goal is to pick the highest-confidence winner among rules
 that matched the same location).
 
-| Limit                           | Default | Purpose                                  |
-|---------------------------------|---------|------------------------------------------|
+| Limit                           | `demo_tuning()` Example | Purpose                                  |
+|---------------------------------|-------------------------|------------------------------------------|
 | `max_transform_depth`           | 3       | Maximum decode chain length              |
 | `max_total_decode_output_bytes` | 512 KiB | Global decode output budget              |
 | `max_work_items`                | 256     | Maximum queued decoded buffers           |
