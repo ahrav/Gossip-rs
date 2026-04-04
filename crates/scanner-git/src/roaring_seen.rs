@@ -182,6 +182,10 @@ impl FlatOidIndex {
             0,
             "packed OID table must use a whole-number stride",
         );
+        debug_assert!(
+            packed_oids_are_canonical(&data, oid_len as usize),
+            "FlatOidIndex::from_bytes received non-canonical data",
+        );
         Self { oid_len, data }
     }
 
@@ -197,7 +201,7 @@ impl FlatOidIndex {
 
     #[inline]
     fn push(&mut self, oid: &[u8]) {
-        assert_eq!(
+        debug_assert_eq!(
             oid.len(),
             self.oid_len as usize,
             "packed OID stride mismatch",
@@ -649,6 +653,10 @@ impl RoaringSeenBitmap {
                     insert_position(&mut self.seen, base_len + idx);
                 }
             }
+            debug_assert!(
+                packed_oids_are_canonical(self.oids.as_bytes(), self.oid_len as usize),
+                "append-only merge produced non-canonical OID order",
+            );
             return Ok(());
         }
 
@@ -1159,6 +1167,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn roaring_bitmap_merge_append_only_fast_path() {
+        let mut base = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        base.insert_batch(&[sha1(0x10), sha1(0x20)]).expect("base");
+
+        let mut tail = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        tail.insert_batch(&[sha1(0x30), sha1(0x40)]).expect("tail");
+
+        // All tail OIDs sort strictly after base max → triggers fast path.
+        base.merge(&tail).expect("merge");
+
+        assert_eq!(base.index_len(), 4);
+        assert_eq!(
+            base.batch_contains(&[sha1(0x10), sha1(0x20), sha1(0x30), sha1(0x40), sha1(0x50)]),
+            vec![true, true, true, true, false]
+        );
+
+        // Round-trip through serialization preserves the merged state.
+        let bytes = base.serialize().expect("serialize");
+        let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+        assert_eq!(decoded, base);
+    }
+
+    #[test]
+    fn roaring_bitmap_merge_fast_path_partial_seen() {
+        let mut base = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        base.insert_batch(&[sha1(0x10)]).expect("base");
+
+        // Build a bitmap where 0x30 is in the index but NOT marked seen.
+        // The public API always marks inserted OIDs as seen, so construct
+        // via deserialize with a roaring bitmap that only includes position 0.
+        let mut seen_bits = RoaringBitmap::new();
+        seen_bits.insert(0); // only position 0 (= sha1(0x20)) is seen
+        let mut seen_bytes = Vec::new();
+        seen_bits
+            .serialize_into(&mut seen_bytes)
+            .expect("serialize roaring");
+
+        let oid_table = raw_oid_bytes(&[sha1(0x20), sha1(0x30)]);
+        let payload = bitmap_bytes(
+            BITMAP_MAGIC,
+            OidBytes::SHA1_LEN,
+            2,
+            &oid_table,
+            seen_bytes.len() as u32,
+            &seen_bytes,
+        );
+        let other = RoaringSeenBitmap::deserialize(&payload).expect("deserialize");
+        assert!(other.contains(&sha1(0x20)));
+        assert!(!other.contains(&sha1(0x30)));
+
+        // All of other's OIDs sort after base max → triggers fast path.
+        base.merge(&other).expect("merge");
+
+        assert_eq!(base.index_len(), 3);
+        assert!(base.contains(&sha1(0x10)));
+        assert!(base.contains(&sha1(0x20)));
+        // 0x30 is in the index but was NOT marked seen in other.
+        assert!(!base.contains(&sha1(0x30)));
+    }
+
+    #[test]
+    fn roaring_bitmap_merge_rejects_mixed_oid_lengths() {
+        let mut sha1_bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        sha1_bitmap.insert_batch(&[sha1(0x10)]).expect("sha1");
+
+        let mut sha256_bitmap = RoaringSeenBitmap::new(OidBytes::SHA256_LEN);
+        sha256_bitmap.insert_batch(&[sha256(0x20)]).expect("sha256");
+
+        let err = sha1_bitmap
+            .merge(&sha256_bitmap)
+            .expect_err("mixed lengths must fail");
+        assert_eq!(err, SeenBitmapError::MixedOidLengths);
+    }
+
+    #[test]
+    fn roaring_bitmap_merge_into_empty() {
+        let mut empty = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+
+        let mut source = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        source
+            .insert_batch(&[sha1(0x10), sha1(0x20), sha1(0x30)])
+            .expect("source");
+
+        empty.merge(&source).expect("merge");
+
+        assert_eq!(empty.index_len(), 3);
+        assert_eq!(
+            empty.batch_contains(&[sha1(0x10), sha1(0x20), sha1(0x30)]),
+            vec![true, true, true]
+        );
+    }
+
     #[rstest]
     #[case::truncated(vec![0; 12], SeenBitmapError::Truncated)]
     #[case::invalid_magic(
@@ -1276,8 +1377,17 @@ mod proptests {
         }
 
         #[test]
-        fn bitmap_serialized_size_matches_actual(oids in arb_sha1_oids()) {
+        fn bitmap_serialized_size_matches_actual_sha1(oids in arb_sha1_oids()) {
             let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            bitmap.insert_batch(&oids).expect("insert");
+
+            let bytes = bitmap.serialize().expect("serialize");
+            prop_assert_eq!(bitmap.serialized_size(), bytes.len());
+        }
+
+        #[test]
+        fn bitmap_serialized_size_matches_actual_sha256(oids in arb_sha256_oids()) {
+            let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA256_LEN);
             bitmap.insert_batch(&oids).expect("insert");
 
             let bytes = bitmap.serialize().expect("serialize");
