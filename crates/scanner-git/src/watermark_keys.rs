@@ -248,6 +248,9 @@ impl KeyArena {
 ///
 /// Value format: `oid_len (u8) + oid bytes (20 or 32) + generation_le (4B)`
 ///
+/// The generation trailer is always present. The decoder rejects payloads
+/// without it (e.g., values from a prior code revision) as malformed.
+///
 /// Returns `(buffer, used_len)` where `buffer[..used_len]` is the encoded value.
 /// Maximum `used_len` is 37.
 pub fn encode_ref_watermark_value(oid: &OidBytes, generation: NonZeroU32) -> ([u8; 37], usize) {

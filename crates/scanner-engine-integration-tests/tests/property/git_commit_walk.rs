@@ -30,7 +30,8 @@ struct TestCommitGraph {
 
 impl TestCommitGraph {
     fn new(parents: Vec<Vec<Position>>) -> Self {
-        let generations = (0..parents.len() as u32).collect();
+        // Generation numbers are 1-indexed per the commit-graph spec.
+        let generations = (1..=parents.len() as u32).collect();
         Self {
             generations,
             parents,

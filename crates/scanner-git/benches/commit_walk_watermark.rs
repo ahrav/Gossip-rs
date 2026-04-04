@@ -1,14 +1,15 @@
 //! Commit-plan watermark validation benchmarks.
 //!
-//! Exercises `CommitPlanIter` startup for the three watermark states that
+//! Exercises `CommitPlanIter` startup for the four watermark states that
 //! matter for ref initialization:
 //! - matching watermark generation (ancestry walk still required),
-//! - stale generation mismatch (force-push fast path),
-//! - missing watermark.
+//! - stale generation mismatch (fast path rejection),
+//! - watermark OID absent from the commit graph (lookup miss),
+//! - no watermark at all.
 //!
 //! Each iteration includes iterator construction (scratch allocation) plus
 //! the first `next()` call (ref initialization + watermark resolution).
-//! The allocation overhead is constant across all three cases, so the delta
+//! The allocation overhead is constant across all cases, so the delta
 //! between cases isolates the watermark validation cost.
 
 use std::collections::HashMap;
@@ -118,7 +119,14 @@ fn benchmark_commit_walk_watermarks(c: &mut Criterion) {
                 generation: NonZeroU32::new(graph.generation(watermark_pos) + 1).unwrap(),
             }),
         ),
-        ("missing_watermark", None),
+        (
+            "oid_missing",
+            Some(RefWatermark {
+                oid: oid_from_u32(u32::MAX),
+                generation: NonZeroU32::new(1).unwrap(),
+            }),
+        ),
+        ("no_watermark", None),
     ];
 
     let mut group = c.benchmark_group("commit_walk_watermark");

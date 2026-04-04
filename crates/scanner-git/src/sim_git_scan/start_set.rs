@@ -35,14 +35,17 @@ struct SimRef {
 impl SimStartSet {
     /// Build a simulated start set from the repo model.
     ///
-    /// This performs OID length validation but does not check for duplicate
-    /// ref names; duplicates will share a watermark entry.
+    /// This performs OID length validation and rejects duplicate commit
+    /// OIDs (which would mask fixture bugs). Duplicate ref names are
+    /// tolerated; duplicates will share a watermark entry.
     pub fn from_repo(repo: &GitRepoModel) -> Result<Self, SimGitError> {
         let object_format = to_object_format(repo.object_format);
         let mut generations = HashMap::with_capacity(repo.commits.len());
         for commit in &repo.commits {
             let oid = to_oid_bytes(&commit.oid, object_format)?;
-            generations.insert(oid, commit.generation);
+            if generations.insert(oid, commit.generation).is_some() {
+                return Err(SimGitError::DuplicateOid { kind: "commit" });
+            }
         }
         let mut refs = Vec::with_capacity(repo.refs.len());
         for r in &repo.refs {
