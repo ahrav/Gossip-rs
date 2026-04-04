@@ -1,3 +1,8 @@
+//! Shared test utilities for gossip-contracts.
+//!
+//! Provides property-test strategies, memory-safe test wrappers, and deterministic
+//! identity generators to ensure consistent and isolated test execution.
+
 /// Returns a [`proptest::test_runner::Config`] tuned for the current environment.
 ///
 /// Under Miri, disables file-based failure persistence (filesystem I/O is
