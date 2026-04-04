@@ -125,7 +125,9 @@ impl BlobKind {
 /// Decoded owner-key payload stored under a shard's `/owner` key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerLeaseValue {
+    /// The worker holding the lease.
     pub worker: WorkerId,
+    /// The fence epoch of the worker's lease.
     pub fence: FenceEpoch,
 }
 
