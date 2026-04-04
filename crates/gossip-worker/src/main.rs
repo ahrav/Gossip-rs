@@ -13,7 +13,8 @@ use gossip_scanner_runtime::{
     ScanReport, ScanRuntimeError, distributed::DistributedRunReport, scan_fs, scan_git,
 };
 use gossip_worker::config::{
-    DistributedWorkerConfig, LocalWorkerConfig, ResolvedWorkerConfig, WorkerSourceSettings,
+    DistributedSourceSettings, DistributedWorkerConfig, LocalWorkerConfig, ResolvedWorkerConfig,
+    WorkerSourceSettings,
     resolve_worker_config_from_env_and_args,
 };
 use gossip_worker::production::{ProductionWorkerError, run_production_worker};
@@ -103,7 +104,7 @@ fn run_distributed_worker(
     run_production_worker(
         cfg.production_backends(),
         cfg.startup(),
-        cfg.worker_identity(),
+        cfg.worker_launch(),
         cfg.runtime_config(),
     )
 }
@@ -146,20 +147,32 @@ fn log_local_report(cfg: &LocalWorkerConfig, report: ScanReport) {
 }
 
 fn log_distributed_report(cfg: &DistributedWorkerConfig, report: DistributedRunReport) {
-    // `DistributedWorkerConfig` is type-constrained to `FsSourceSettings`,
-    // so source is always "fs" and mode is always `Connector`.
-    tracing::info!(
-        backend = "production",
-        source = "fs",
-        mode = ?gossip_scanner_runtime::ExecutionMode::Connector,
-        tenant = %cfg.tenant(),
-        run = %cfg.run(),
-        worker = %cfg.worker(),
-        path = %cfg.source().path().display(),
-        leases_seen = report.leases_seen,
-        shards_scanned = report.shards_scanned,
-        "distributed scan completed",
-    );
+    match cfg.source() {
+        DistributedSourceSettings::Fs(source) => tracing::info!(
+            backend = "production",
+            source = "fs",
+            mode = ?gossip_scanner_runtime::ExecutionMode::Connector,
+            tenant = %cfg.tenant(),
+            run = %cfg.run(),
+            worker = %cfg.worker(),
+            path = %source.path().display(),
+            leases_seen = report.leases_seen,
+            shards_scanned = report.shards_scanned,
+            "distributed scan completed",
+        ),
+        DistributedSourceSettings::Git(source) => tracing::info!(
+            backend = "production",
+            source = "git",
+            mode = ?gossip_scanner_runtime::ExecutionMode::Connector,
+            tenant = %cfg.tenant(),
+            run = %cfg.run(),
+            worker = %cfg.worker(),
+            mirror_root = %source.mirror_root().display(),
+            leases_seen = report.leases_seen,
+            shards_scanned = report.shards_scanned,
+            "distributed scan completed",
+        ),
+    }
 }
 
 fn log_worker_report(resolved: &ResolvedWorkerConfig, report: WorkerRunReport) {

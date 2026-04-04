@@ -20,7 +20,7 @@
 
 use std::fmt;
 
-use crate::config::ProductionBackendConfig;
+use crate::config::{DistributedWorkerLaunch, ProductionBackendConfig};
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
 use gossip_done_ledger_postgres::{
     DoneLedgerPg, DoneLedgerPgMigrationError, EmbeddedMigration,
@@ -33,8 +33,9 @@ use gossip_findings_postgres::{
 };
 use gossip_scanner_runtime::distributed::{
     DistributedPersistence, DistributedRunReport, DistributedRuntimeConfig,
-    DistributedRuntimeError, WorkerIdentity, run_worker,
+    DistributedRuntimeError, GitWorkerIdentity, WorkerIdentity, run_git_repo_worker, run_worker,
 };
+use gossip_scanner_runtime::git_mirror::LocalMirrorManager;
 use postgres::{Client, NoTls};
 
 /// Schema-readiness mode applied during backend bootstrap.
@@ -181,6 +182,9 @@ pub enum ProductionBootstrapError {
     /// A connection thread panicked instead of returning a result.
     #[error("{backend} connection thread panicked unexpectedly")]
     ThreadPanicked { backend: &'static str },
+    /// Git mirror manager initialization failed before any shard work started.
+    #[error("git mirror manager startup failed: {message}")]
+    GitMirrorManager { message: String },
 }
 
 impl fmt::Debug for ProductionBootstrapError {
@@ -210,6 +214,10 @@ impl fmt::Debug for ProductionBootstrapError {
             Self::ThreadPanicked { backend } => f
                 .debug_struct("ThreadPanicked")
                 .field("backend", backend)
+                .finish(),
+            Self::GitMirrorManager { message } => f
+                .debug_struct("GitMirrorManager")
+                .field("message", message)
                 .finish(),
         }
     }
@@ -298,12 +306,33 @@ impl ProductionRuntimeBackends {
     ///
     /// Returns [`DistributedRuntimeError`] when shard claiming, scan
     /// execution, durable commit handling, or lease completion fails.
-    pub fn run(
+    pub fn run_filesystem(
         mut self,
         identity: WorkerIdentity,
         runtime: DistributedRuntimeConfig,
     ) -> Result<DistributedRunReport, DistributedRuntimeError> {
         run_worker(&mut self.coordinator, identity, self.persistence, runtime)
+    }
+
+    /// Run the distributed Git repo-frontier worker loop on the real backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DistributedRuntimeError`] when shard claiming, mirror sync,
+    /// Git execution, durable finalize handling, or lease completion fails.
+    pub fn run_git(
+        mut self,
+        mirrors: &mut LocalMirrorManager,
+        identity: GitWorkerIdentity,
+        runtime: DistributedRuntimeConfig,
+    ) -> Result<DistributedRunReport, DistributedRuntimeError> {
+        run_git_repo_worker(
+            &mut self.coordinator,
+            mirrors,
+            identity,
+            self.persistence,
+            runtime,
+        )
     }
 }
 
@@ -445,13 +474,29 @@ pub fn build_production_backends_from_clients(
 pub fn run_production_worker(
     config: &ProductionBackendConfig,
     startup: ProductionStartupSettings,
-    identity: WorkerIdentity,
+    launch: DistributedWorkerLaunch,
     runtime: DistributedRuntimeConfig,
 ) -> Result<DistributedRunReport, ProductionWorkerError> {
     let backends = build_production_backends(config, startup)?;
-    backends
-        .run(identity, runtime)
-        .map_err(ProductionWorkerError::Runtime)
+    match launch {
+        DistributedWorkerLaunch::Fs(identity) => backends
+            .run_filesystem(identity, runtime)
+            .map_err(ProductionWorkerError::Runtime),
+        DistributedWorkerLaunch::Git {
+            identity,
+            mirror_root,
+        } => {
+            let mut mirrors =
+                LocalMirrorManager::new(mirror_root).map_err(|error| {
+                    ProductionBootstrapError::GitMirrorManager {
+                        message: error.to_string(),
+                    }
+                })?;
+            backends
+                .run_git(&mut mirrors, identity, runtime)
+                .map_err(ProductionWorkerError::Runtime)
+        }
+    }
 }
 
 /// Default TCP-level connect timeout (seconds) injected when the caller DSN
