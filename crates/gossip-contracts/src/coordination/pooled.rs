@@ -97,10 +97,6 @@ use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::shard_spec::ShardSpecRef;
 use crate::identity::ShardId;
 
-// ============================================================================
-// Staged allocation helper
-// ============================================================================
-
 /// Allocate `N` byte slices into the slab with rollback on failure.
 ///
 /// Provides a strong exception guarantee: if the k-th allocation fails,
@@ -140,10 +136,6 @@ fn allocate_with_rollback<const N: usize>(
     }
     Ok(slots)
 }
-
-// ============================================================================
-// PooledShardSpec
-// ============================================================================
 
 /// Arena-pooled mirror of [`crate::coordination::shard_spec::ShardSpec`],
 /// backed by `ByteSlot` handles.
@@ -238,7 +230,6 @@ impl PooledShardSpec {
             key_range_end,
             metadata,
         } = PooledShardSpec::from_spec_ref(new_spec, slab)?;
-        // New allocation succeeded — now safe to release old fields.
         self.release_fields(slab);
         self.key_range_start = key_range_start;
         self.key_range_end = key_range_end;
@@ -271,10 +262,6 @@ impl PooledShardSpec {
         slab.deallocate(meta);
     }
 }
-
-// ============================================================================
-// PooledCursor
-// ============================================================================
 
 /// Arena-pooled mirror of [`CursorUpdate`], backed by `ByteSlot` handles.
 ///
@@ -382,10 +369,6 @@ impl PooledCursor {
         }
     }
 }
-
-// ============================================================================
-// PooledSpawned
-// ============================================================================
 
 /// Byte width of a single `ShardId` in the packed encoding (8 bytes, little-endian `u64`).
 const SHARD_ID_ENCODED_BYTES: usize = core::mem::size_of::<u64>();
@@ -595,10 +578,6 @@ impl Iterator for PooledSpawnedIter<'_> {
 
 impl ExactSizeIterator for PooledSpawnedIter<'_> {}
 
-// ============================================================================
-// Test-only helpers
-// ============================================================================
-
 #[cfg(test)]
 impl PooledShardSpec {
     /// Test whether `key` falls within `[start, end)`.
@@ -611,10 +590,6 @@ impl PooledShardSpec {
         above_start && below_end
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -697,7 +672,6 @@ mod tests {
         pooled.update_from_ref(spec2.as_ref(), &mut slab).unwrap();
         assert_eq!(pooled.key_range_start(&slab), b"n");
         assert_eq!(pooled.key_range_end(&slab), b"z");
-        // Same number of live slots (old deallocated, new allocated).
         assert_eq!(slab.live_count(), live_before);
 
         pooled.release_fields(&mut slab);
@@ -762,7 +736,6 @@ mod tests {
         assert_eq!(pooled.last_key(&slab), Some(b"aaa".as_slice()));
         assert_eq!(pooled.token(&slab), None);
 
-        // Clean up original allocation so ByteSlab debug-drop observes no leaks.
         pooled.release_fields(&mut slab);
         assert_eq!(slab.live_count(), 0);
     }
@@ -776,7 +749,6 @@ mod tests {
         pooled.release_fields(&mut slab);
         assert_eq!(slab.live_count(), 0);
 
-        // Second release is a no-op (EMPTY slots).
         pooled.release_fields(&mut slab);
         assert_eq!(slab.live_count(), 0);
     }

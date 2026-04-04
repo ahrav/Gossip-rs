@@ -53,6 +53,21 @@
 //! A single bag-of-fields context would therefore carry unused data through
 //! most call sites and blur which derivation actually owns which scope. The
 //! explicit input structs below keep each hash boundary local and visible.
+//!
+//! # Invariants
+//!
+//! - **Collision Resistance:** All derived identities rely on cryptographic
+//!   collision resistance. Different inputs SHOULD produce different IDs,
+//!   except with cryptographically negligible probability.
+//! - **Determinism:** Identities are derived deterministically. Same inputs MUST
+//!   always yield the same output ID.
+//!
+//! # Algorithms
+//!
+//! Derivations exclusively use **BLAKE3**. Most functions use BLAKE3's `derive-key`
+//! mode with versioned domain strings (e.g., `gossip/finding/v1`) to prevent domain
+//! overlap. The exception is `key_secret_hash`, which uses BLAKE3's keyed hashing
+//! mode to isolate secrets across tenants.
 
 use blake3::Hasher;
 

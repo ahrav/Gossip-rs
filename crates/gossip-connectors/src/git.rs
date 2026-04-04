@@ -31,7 +31,7 @@
 //! # Security model
 //!
 //! The connector defends against path traversal and symlink escapes in
-//! untrusted repositories using a three-layer approach:
+//! untrusted repositories using a four-layer approach:
 //!
 //! 1. The repo root is canonicalized at index time.
 //! 2. Each tracked path is rejected if it contains `..` components or
@@ -127,13 +127,13 @@ enum IndexState {
 /// - `repo` is validated once during indexing; a missing or non-directory
 ///   path latches a permanent failure.
 /// - `emit_tokens` controls the advertised `token_resume` capability. Cursor
-///   resume is currently still `last_key`-authoritative over the frozen
-///   in-memory snapshot.
+///   resume uses the frozen in-memory snapshot's `last_key` and ignores
+///   connector tokens.
 pub struct GitConnector {
     /// Absolute path to the repository root (working directory).
     repo: PathBuf,
     /// Whether [`caps`](Self::caps) advertises `token_resume`. Defaults to
-    /// `true`; the current implementation still resumes from `Cursor::last_key`
+    /// `true`; cursor resume uses `Cursor::last_key`
     /// in either mode.
     emit_tokens: bool,
     /// Optional upper bound on tracked files. When set, `ensure_indexed`
@@ -173,7 +173,7 @@ impl GitConnector {
     /// Enable or disable advertising opaque token resume support.
     ///
     /// This toggles only the `token_resume` flag returned by
-    /// [`caps`](Self::caps). GitConnector resume remains `last_key`-based over
+    /// [`caps`](Self::caps). GitConnector resume is `last_key`-based over
     /// the indexed snapshot regardless of this setting.
     #[must_use]
     pub fn with_tokens(mut self, enabled: bool) -> Self {
@@ -198,7 +198,8 @@ impl GitConnector {
     ///
     /// # Errors
     ///
-    /// Returns `EnumerateError::permanent` if `start > end`.
+    /// Returns a permanent [`EnumerateError`] if `start > end`. Propagates
+    /// initialization errors if lazy indexing fails.
     pub fn choose_split_point_range(
         &mut self,
         start: &ItemKey,
@@ -232,12 +233,14 @@ impl GitConnector {
     /// 3. **Symlink rejection** — `symlink_metadata` ensures only
     ///    regular files are indexed (symlinks are skipped).
     ///
-    /// The `deadline` is checked both before shelling out and between
-    /// per-file stat calls, so large repositories can be interrupted
-    /// without blocking the caller. A deadline expiry returns a
-    /// *retryable* error (the index state stays `NotIndexed`), while a
-    /// git/I/O failure that is classified as permanent latches
-    /// [`IndexState::Failed`].
+    /// # Errors
+    ///
+    /// Returns a retryable [`EnumerateError`] if `deadline` expires before or during
+    /// the per-file stat walk. The index state remains `NotIndexed`.
+    ///
+    /// Returns a permanent [`EnumerateError`] and latches [`IndexState::Failed`] if
+    /// `git ls-files` fails, if the repository is not a directory, or if an unrecoverable
+    /// I/O error occurs during metadata checks.
     fn ensure_indexed(&mut self, deadline: Option<Instant>) -> Result<(), EnumerateError> {
         match &self.index_state {
             IndexState::Indexed => return Ok(()),
@@ -251,8 +254,8 @@ impl GitConnector {
             return Err(EnumerateError::retryable("indexing deadline expired"));
         }
 
-        // Canonicalize the repo root so all subsequent joins resolve against
-        // the real path. This also fails fast for non-existent paths.
+        // Canonicalizing the repository root guarantees that subsequent path joins
+        // resolve against the physical filesystem layout, preventing symlink bypasses.
         match fs::canonicalize(&self.repo) {
             Ok(canonical) => self.repo = canonical,
             Err(err) => {
@@ -301,7 +304,8 @@ impl GitConnector {
             }
 
             let rel_path = path_buf_from_bytes(&key_bytes);
-            // Reject paths containing ".." to prevent directory traversal.
+            // Explicit rejection of relative parent components defends against
+            // directory traversal exploits in the raw index output.
             if rel_path
                 .components()
                 .any(|c| matches!(c, Component::ParentDir))
@@ -310,7 +314,8 @@ impl GitConnector {
             }
             let abs_path = self.repo.join(&rel_path);
 
-            // Canonicalize to verify the resolved path stays within the repo.
+            // Re-canonicalization of the absolute path ensures that intermediate
+            // symlinks have not redirected the entry outside the physical repository bounds.
             let canonical_abs = match fs::canonicalize(&abs_path) {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -319,9 +324,8 @@ impl GitConnector {
                 continue;
             }
 
-            // symlink_metadata avoids following symlinks — a tracked symlink
-            // must not be indexed since it could escape the repo root in
-            // untrusted repositories.
+            // Using symlink_metadata avoids following symlinks; indexing a tracked
+            // symlink risks escaping the repository root when resolved.
             let metadata = match fs::symlink_metadata(&abs_path) {
                 Ok(m) => m,
                 Err(error) => {
@@ -348,6 +352,11 @@ impl GitConnector {
     /// bounds and the cursor resume position. Returns `None` when fewer than
     /// two keys remain, the estimator produces no candidate, or the candidate
     /// fails validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EnumerateError`] if lazy indexing fails or if the provided
+    /// bounds or cursor resume state are invalid.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -382,6 +391,14 @@ impl GitConnector {
     /// opens it. This catches snapshot drift such as a tracked path being
     /// replaced with an out-of-repo symlink after indexing, but it is still a
     /// best-effort containment check rather than a TOCTOU-proof openat walk.
+    ///
+    /// # Errors
+    ///
+    /// Returns a permanent [`ReadError`] if `item_ref` is not found in the indexed
+    /// snapshot, or if the canonicalized absolute path escapes the repository boundary.
+    ///
+    /// Returns a permanent or retryable [`ReadError`] (via `enumerate_error_to_read`)
+    /// if lazy indexing fails.
     fn open_path_for_ref(&mut self, item_ref: &ItemRef) -> Result<PathBuf, ReadError> {
         self.ensure_indexed(None).map_err(enumerate_error_to_read)?;
 
@@ -428,7 +445,7 @@ impl GitConnector {
     ///
     /// # Errors
     ///
-    /// Returns an error if shard bounds are malformed, indexing fails, or the
+    /// Returns an [`EnumerateError`] if shard bounds are malformed, indexing fails, or the
     /// estimator rejects the provided range.
     pub fn choose_split_point(
         &mut self,
@@ -449,7 +466,7 @@ impl GitConnector {
     ///
     /// # Errors
     ///
-    /// Returns a permanent error when `item_ref` is unknown or resolves
+    /// Returns a permanent [`ReadError`] when `item_ref` is unknown or resolves
     /// outside the repository boundary. Filesystem open and revalidation
     /// failures are classified via the common read-error mapper.
     pub fn open(
@@ -471,7 +488,7 @@ impl GitConnector {
     ///
     /// # Errors
     ///
-    /// Returns a permanent error if `offset + dst.len()` overflows `u64` or if
+    /// Returns a permanent [`ReadError`] if `offset + dst.len()` overflows `u64` or if
     /// `item_ref` is not present in the index. Open, seek, and read failures
     /// are classified through the connector's read-error helpers.
     pub fn read_range(
@@ -507,6 +524,12 @@ impl GitConnector {
 /// share the same byte representation for this connector). The dual
 /// validation catches oversized or malformed paths at index time rather
 /// than during later enumeration or read calls.
+///
+/// # Errors
+///
+/// Returns a permanent [`EnumerateError`] if the byte slice exceeds the size
+/// limits of either [`ItemKey`] or [`ItemRef`], or if it contains invalid
+/// path characters depending on platform restrictions.
 fn build_git_entry(key_bytes: &[u8], size_hint: u64) -> Result<GitEntry, EnumerateError> {
     let key = ItemKey::try_from_slice(key_bytes)
         .map_err(|error| EnumerateError::permanent(format!("invalid git item key: {error}")))?;
@@ -528,6 +551,12 @@ fn build_git_entry(key_bytes: &[u8], size_hint: u64) -> Result<GitEntry, Enumera
 ///
 /// A non-zero exit from `git` is classified as a permanent error because
 /// it typically indicates that the directory is not a git repository.
+///
+/// # Errors
+///
+/// Returns a permanent [`EnumerateError`] if the `git ls-files` process
+/// fails to launch, exits with a non-zero status, or if an I/O error
+/// occurs while reading its output.
 fn list_git_tracked_paths(repo: &Path) -> Result<Vec<Vec<u8>>, EnumerateError> {
     let output = Command::new("git")
         .arg("-C")
