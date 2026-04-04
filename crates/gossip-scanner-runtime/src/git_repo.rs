@@ -169,7 +169,8 @@ impl GitRepoRuntime {
                 );
                 return Ok(GitRepoExecutionOutcome {
                     report: ScanReport::default(),
-                    checkpoint_input: None,
+                    persistence,
+                    write_context,
                     finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
                 });
             }
