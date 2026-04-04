@@ -1176,7 +1176,7 @@ mod tests {
         let mut tail = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
         tail.insert_batch(&[sha1(0x30), sha1(0x40)]).expect("tail");
 
-        // All tail OIDs sort strictly after base max → triggers fast path.
+        // The tail range is entirely after the base range, so the merge is append-only.
         base.merge(&tail).expect("merge");
 
         assert_eq!(base.index_len(), 4);
@@ -1219,7 +1219,7 @@ mod tests {
         assert!(other.contains(&sha1(0x20)));
         assert!(!other.contains(&sha1(0x30)));
 
-        // All of other's OIDs sort after base max → triggers fast path.
+        // Every OID in `other` is after the base range, so the merge is append-only.
         base.merge(&other).expect("merge");
 
         assert_eq!(base.index_len(), 3);
