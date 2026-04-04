@@ -32,7 +32,7 @@ Rule loading order:
 
 1. Explicit `--rules=<path>`
 2. `crates/scanner-engine/default_rules.yaml` next to the scanner binary
-3. Compiled-in fallback (`include_str!("../../default_rules.yaml")`)
+3. Compiled-in fallback (`scanner_engine::rules::BUILTIN_RULES_YAML`, sourced from `crates/scanner-engine/default_rules.yaml` via `include_str!("../../default_rules.yaml")`)
 
 Startup logs include the resolved rule source and a stable fast non-cryptographic
 `rule_hash` fingerprint of the loaded rule bytes to make cache and rule-source
