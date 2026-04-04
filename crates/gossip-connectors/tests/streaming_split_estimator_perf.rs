@@ -8,6 +8,15 @@
 //! Criterion bench uses. The goal is not to pin an absolute runtime; it is to
 //! catch shape regressions where a 1,000,000-item stream starts allocating
 //! linearly instead of following the expected sublinear compaction pattern.
+//!
+//! Two invariants matter:
+//! - the workload should still produce a split at this scale; and
+//! - heap traffic should grow with the estimator's logarithmic compaction
+//!   phases rather than with the full stream length.
+//!
+//! The assertion focuses on allocation-producing events because the allocator's
+//! deallocation churn can vary with compaction timing without indicating a
+//! regression in the hot `observe` path.
 
 use gossip_connectors::benchmark_streaming_split_estimator_observe_fixed_size;
 use scanner_scheduler::{CountingAllocator, alloc_stats};
@@ -27,6 +36,8 @@ fn observe_allocation_upper_bound(sample_cap: usize, count: usize) -> u64 {
 }
 
 #[test]
+/// Verifies that the fixed-size streaming workload keeps allocator traffic
+/// sublinear while still producing a split for one million observations.
 fn observe_one_million_items_allocates_sublinearly() {
     let sample_cap = 128usize;
     let count = 1_000_000usize;
@@ -42,9 +53,8 @@ fn observe_one_million_items_allocates_sublinearly() {
 
     // Count only allocation-producing events. Deallocation churn can vary with
     // compaction timing, but regressions in the hot `observe` path show up as
-    // extra alloc/realloc pressure.
-    // As of 2026-03: actual heap_ops ≈ 1026 at sample_cap=128, count=1M.
-    // Bound is ~3x slack (2944) to absorb implementation changes.
+    // extra alloc/realloc pressure. The helper leaves generous slack so the
+    // test catches shape regressions without pinning a brittle constant factor.
     let heap_ops = delta.allocs + delta.reallocs;
     let upper_bound = observe_allocation_upper_bound(sample_cap, count);
     assert!(
