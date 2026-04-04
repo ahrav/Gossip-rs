@@ -765,6 +765,11 @@ where
             PageState::HasMore {
                 cursor: next_cursor,
             } => {
+                // Cursor stall: `HasMore` must advance strictly past the prior
+                // page boundary. `validate_page_sequence` already guarantees
+                // this cursor carries the page's last emitted key, but a
+                // single-item page that repeats the previous boundary is still
+                // a non-advancing cursor.
                 let next_last = next_cursor
                     .last_key()
                     .expect("validate_page_sequence guarantees HasMore carries last_key");
