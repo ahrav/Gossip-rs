@@ -22,7 +22,7 @@
 //!
 //! # Design Trade-offs
 //! * `TenantSecretKey` deliberately omits `Ord`, `Hash`, and `CanonicalBytes` to prevent accidental misuse in sorted collections, map keys, or content-addressed IDs.
-//! * `TenantSecretKey` implements `Copy` instead of `Zeroize` on drop. This avoids borrow-lifetime entanglement at the cost of stack copies persisting, which is acceptable because the key is not a high-value long-term secret and process-memory threats are out-of-scope for this defense depth.
+//! * `TenantSecretKey` implements `Copy` instead of `Zeroize` on drop. This avoids borrow-lifetime entanglement at the cost of stack copies persisting, which is acceptable because the key is tenant-scoped and re-provisionable rather than a global root secret, and process-memory threats are out-of-scope for this defense depth.
 
 crate::define_id_32! {
     /// Stable tenant identity. Top of the isolation hierarchy.
