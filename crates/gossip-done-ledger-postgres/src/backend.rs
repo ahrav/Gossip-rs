@@ -245,7 +245,7 @@ impl DoneLedger for DoneLedgerPg {
     ) -> Result<Vec<OvidHash>, Self::Error> {
         let tenant_bytes: &[u8] = tenant_id.as_bytes();
         let policy_bytes: &[u8] = policy_hash.as_bytes();
-        let terminal_statuses = terminal_status_ranks().to_vec();
+        let terminal_statuses = terminal_status_ranks();
 
         let mut client = self.lock_client()?;
         let stmt = client.prepare(LIST_DONE_HASHES_SQL)?;
@@ -314,13 +314,12 @@ fn build_receipt(records: &[DoneLedgerRecord]) -> DoneLedgerCommitReceipt {
     )
 }
 
-fn terminal_status_ranks() -> [i16; 4] {
-    [
-        i16::from(DoneLedgerStatus::FailedPermanent.rank()),
-        i16::from(DoneLedgerStatus::Skipped.rank()),
-        i16::from(DoneLedgerStatus::ScannedClean.rank()),
-        i16::from(DoneLedgerStatus::ScannedWithFindings.rank()),
-    ]
+fn terminal_status_ranks() -> Vec<i16> {
+    DoneLedgerStatus::ALL
+        .iter()
+        .filter(|s| s.is_terminal())
+        .map(|s| i16::from(s.rank()))
+        .collect()
 }
 
 /// Validate each input record and merge duplicate keys before SQL mutation.

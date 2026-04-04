@@ -568,10 +568,107 @@ where
         source: Box::new(source),
     })?;
 
+    let failed_permanent_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(21))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-failed-permanent-version",
+        )),
+    });
+    let failed_permanent_code = DoneLedgerErrorCode::try_new("PERM_FAILURE").map_err(|source| {
+        PersistenceConformanceError::FixtureConstruction {
+            case: "done-ledger/list-done-hashes:failed-permanent-error-code",
+            source: Box::new(source),
+        }
+    })?;
+    let failed_permanent_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(
+            fixture.tenant_id,
+            fixture.policy_hash,
+            failed_permanent_hash,
+        ),
+        DoneLedgerStatus::FailedPermanent,
+        1024,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(40),
+            ShardId::from_raw(41),
+            FenceEpoch::from_raw(42),
+            LogicalTime::from_raw(43),
+            LogicalTime::from_raw(44),
+        ),
+        Some(failed_permanent_code),
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:failed-permanent-record",
+        source: Box::new(source),
+    })?;
+
+    let skipped_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(22))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-skipped-version",
+        )),
+    });
+    let skipped_code = DoneLedgerErrorCode::try_new("UNSUPPORTED_FORMAT").map_err(|source| {
+        PersistenceConformanceError::FixtureConstruction {
+            case: "done-ledger/list-done-hashes:skipped-error-code",
+            source: Box::new(source),
+        }
+    })?;
+    let skipped_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, fixture.policy_hash, skipped_hash),
+        DoneLedgerStatus::Skipped,
+        512,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(50),
+            ShardId::from_raw(51),
+            FenceEpoch::from_raw(52),
+            LogicalTime::from_raw(53),
+            LogicalTime::from_raw(54),
+        ),
+        Some(skipped_code),
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:skipped-record",
+        source: Box::new(source),
+    })?;
+
+    let scanned_clean_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(23))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-scanned-clean-version",
+        )),
+    });
+    let scanned_clean_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, fixture.policy_hash, scanned_clean_hash),
+        DoneLedgerStatus::ScannedClean,
+        2048,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(60),
+            ShardId::from_raw(61),
+            FenceEpoch::from_raw(62),
+            LogicalTime::from_raw(63),
+            LogicalTime::from_raw(64),
+        ),
+        None,
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:scanned-clean-record",
+        source: Box::new(source),
+    })?;
+
     let _ = submit_done_ledger(
         done_ledger,
         "done-ledger/list-done-hashes:upsert",
-        &[fixture.scanned_record.clone(), retryable_record],
+        &[
+            fixture.scanned_record.clone(),
+            retryable_record,
+            failed_permanent_record,
+            skipped_record,
+            scanned_clean_record,
+        ],
     )?;
 
     let hashes = done_ledger
@@ -581,13 +678,68 @@ where
             source: Box::new(err),
         })?;
     let actual: HashSet<_> = hashes.into_iter().collect();
-    let expected = HashSet::from([fixture.ovid_hash]);
+    let expected = HashSet::from([
+        fixture.ovid_hash,
+        failed_permanent_hash,
+        skipped_hash,
+        scanned_clean_hash,
+    ]);
     if actual != expected {
         return Err(PersistenceConformanceError::DoneLedgerInvariant {
-            case: "done-ledger/list-done-hashes:list",
+            case: "done-ledger/list-done-hashes:terminal-set",
             message: format!(
                 "expected terminal hash set {:?}, got {:?}",
                 expected, actual
+            ),
+        });
+    }
+
+    // Cross-tenant isolation: a terminal key under a different tenant must not
+    // leak into the original scope's results.
+    let other_tenant = TenantId::from_bytes(fill32(0x33_u8.wrapping_add(30)));
+    let cross_tenant_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(31))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-cross-tenant-version",
+        )),
+    });
+    let cross_tenant_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(other_tenant, fixture.policy_hash, cross_tenant_hash),
+        DoneLedgerStatus::ScannedClean,
+        256,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(70),
+            ShardId::from_raw(71),
+            FenceEpoch::from_raw(72),
+            LogicalTime::from_raw(73),
+            LogicalTime::from_raw(74),
+        ),
+        None,
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:cross-tenant-record",
+        source: Box::new(source),
+    })?;
+    let _ = submit_done_ledger(
+        done_ledger,
+        "done-ledger/list-done-hashes:cross-tenant-upsert",
+        &[cross_tenant_record],
+    )?;
+
+    let hashes_after = done_ledger
+        .list_done_hashes(fixture.tenant_id, fixture.policy_hash)
+        .map_err(|err| PersistenceConformanceError::DoneLedgerGet {
+            case: "done-ledger/list-done-hashes:cross-tenant-requery",
+            source: Box::new(err),
+        })?;
+    let actual_after: HashSet<_> = hashes_after.into_iter().collect();
+    if actual_after != expected {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-tenant-isolation",
+            message: format!(
+                "cross-tenant key leaked into scope: expected {:?}, got {:?}",
+                expected, actual_after
             ),
         });
     }
