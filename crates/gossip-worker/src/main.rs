@@ -295,7 +295,7 @@ mod tests {
     }
 
     fn make_distributed_config(
-        path: &Path,
+        source: DistributedSourceSettings,
         backends: ProductionBackendConfig,
     ) -> DistributedWorkerConfig {
         let defaults = gossip_scanner_runtime::distributed::DistributedRuntimeConfig::default();
@@ -311,7 +311,7 @@ mod tests {
             backends,
             ProductionStartupSettings::validate_only(),
             identity,
-            DistributedSourceSettings::Fs(FsSourceSettings::new(path.to_path_buf())),
+            source,
             DistributedWorkerRuntimeSettings::new(
                 ScanBudgets::default(),
                 defaults.commit_queue_capacity,
@@ -327,39 +327,26 @@ mod tests {
             "postgresql://scanner@localhost/findings",
         )
         .expect("test production backend config should be valid");
-        make_distributed_config(path, backends)
+        make_distributed_config(
+            DistributedSourceSettings::Fs(FsSourceSettings::new(path.to_path_buf())),
+            backends,
+        )
     }
 
     fn test_git_distributed_config(path: &Path, mirror_root: &Path) -> DistributedWorkerConfig {
-        let defaults = gossip_scanner_runtime::distributed::DistributedRuntimeConfig::default();
         let backends = ProductionBackendConfig::new(
             EtcdCoordinatorConfig::localhost(),
             "postgresql://scanner@localhost/done_ledger",
             "postgresql://scanner@localhost/findings",
         )
         .expect("test production backend config should be valid");
-        let identity = WorkerIdentityConfig::new(
-            tenant(),
-            run_id(),
-            worker_id(),
-            policy_hash(),
-            tenant_secret_key(),
-        )
-        .expect("test worker identity config should be valid");
-        DistributedWorkerConfig::new(
-            backends,
-            ProductionStartupSettings::validate_only(),
-            identity,
+        make_distributed_config(
             DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
                 GitSourceSettings::new(path.to_path_buf()),
                 mirror_root.to_path_buf(),
             )),
-            DistributedWorkerRuntimeSettings::new(
-                ScanBudgets::default(),
-                defaults.commit_queue_capacity,
-            ),
+            backends,
         )
-        .expect("distributed git worker config should be valid")
     }
 
     fn unreachable_production_config(path: &Path) -> DistributedWorkerConfig {
@@ -370,7 +357,10 @@ mod tests {
             "postgresql://scanner@127.0.0.1:1/findings?connect_timeout=1",
         )
         .expect("unreachable production backend config should be valid");
-        make_distributed_config(path, backends)
+        make_distributed_config(
+            DistributedSourceSettings::Fs(FsSourceSettings::new(path.to_path_buf())),
+            backends,
+        )
     }
 
     fn setup_coordinator_with_fs_shard(
@@ -518,6 +508,9 @@ mod tests {
         );
     }
 
+    /// Validates that Git-mode configs dispatch through the distributed runner
+    /// and surface the `Git` launch variant with correct identity and mirror
+    /// root. Does not exercise end-to-end scan behavior.
     #[test]
     fn connector_git_dispatches_through_execute_resolved_worker() {
         let repo = tempdir().expect("tempdir");
@@ -542,6 +535,8 @@ mod tests {
             assert_eq!(identity.tenant, cfg.tenant());
             assert_eq!(identity.run, cfg.run());
             assert_eq!(identity.worker, cfg.worker());
+            assert_eq!(identity.policy_hash, cfg.policy_hash());
+            assert_eq!(identity.tenant_secret_key, cfg.tenant_secret_key());
             assert_eq!(launch_mirror_root, mirror_root.path());
             Ok(DistributedRunReport::default())
         })

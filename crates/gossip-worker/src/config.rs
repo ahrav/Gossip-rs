@@ -1661,14 +1661,23 @@ fn validate_path_exists(field: &'static str, path: &Path) -> Result<(), WorkerCo
 /// that will be used as parent directories (e.g., mirror roots where repo
 /// subdirectories are created at runtime).
 fn validate_directory_exists(field: &'static str, path: &Path) -> Result<(), WorkerConfigError> {
-    validate_path_exists(field, path)?;
-    let metadata = std::fs::metadata(path).map_err(|io_err| {
-        WorkerConfigError::invalid_value(
-            field,
-            path.display().to_string(),
-            format!("cannot inspect path kind: {io_err}"),
-        )
-    })?;
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(WorkerConfigError::invalid_value(
+                field,
+                path.display().to_string(),
+                "path does not exist",
+            ));
+        }
+        Err(io_err) => {
+            return Err(WorkerConfigError::invalid_value(
+                field,
+                path.display().to_string(),
+                format!("cannot verify path existence: {io_err}"),
+            ));
+        }
+    };
     if !metadata.is_dir() {
         return Err(WorkerConfigError::invalid_value(
             field,
@@ -2308,6 +2317,30 @@ mod tests {
     }
 
     #[test]
+    fn connector_git_source_rejects_non_directory_mirror_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_as_root = dir.path().join("not-a-directory");
+        std::fs::write(&file_as_root, "block").expect("write sentinel file");
+
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_MIRROR_ROOT, file_as_root.to_str().expect("utf-8 path"));
+
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("file-as-mirror_root must be rejected");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("mirror_root"),
+            "error must name the mirror_root field: {message}"
+        );
+        assert!(
+            message.contains("not a directory"),
+            "error must explain the path is not a directory: {message}"
+        );
+    }
+
+    #[test]
     fn distributed_config_rejects_git_mirror_root_that_is_not_a_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_as_root = dir.path().join("not-a-directory");
@@ -2344,14 +2377,17 @@ mod tests {
         )
         .expect_err("non-directory mirror_root must be rejected");
 
-        assert!(matches!(
-            err,
-            WorkerConfigError::InvalidValue {
-                field: "mirror_root",
-                ref reason,
-                ..
-            } if reason.contains("not a directory")
-        ));
+        assert!(
+            matches!(
+                err,
+                WorkerConfigError::InvalidValue {
+                    field: "mirror_root",
+                    ref reason,
+                    ..
+                } if reason.contains("not a directory")
+            ),
+            "expected InvalidValue for 'mirror_root' with 'not a directory' reason, got: {err:?}"
+        );
     }
 
     #[test]
