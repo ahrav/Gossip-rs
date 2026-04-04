@@ -94,14 +94,14 @@ absolute byte positions within the scanned object.
 │  root_hint_end: u64                  │  ◄── dedup region end (excl.)
 │  span_start: u64                     │  ◄── matched span start
 │  span_end: u64                       │  ◄── matched span end (excl.)
-│  norm_hash: [u8; 32]                 │  ◄── BLAKE3 of normalized secret
+│  norm_hash: NormHash                 │  ◄── BLAKE3 of extracted secret bytes
 │  confidence_score: i8                │  ◄── additive 0–10 from gate signals
 └──────────────────────────────────────┘
 ```
 
-The `norm_hash` is the BLAKE3 digest of the normalized secret value
-(whitespace-collapsed, case-folded). Two findings with the same `norm_hash`
-matched the same logical secret, regardless of surrounding context.
+The `norm_hash` is the BLAKE3 digest of the extracted secret bytes after gate
+validation. Two findings with the same `norm_hash` matched the same logical
+secret bytes, regardless of surrounding context.
 
 ### FsFindingBatch
 
@@ -114,6 +114,7 @@ archive entry).
 ├──────────────────────────────────────┤
 │  object_path: &'a [u8]              │  ◄── FS path or virtual archive path
 │  findings: &'a [FsFindingRecord]    │  ◄── deduplicated findings
+│  discovery_sequence: u32             │  ◄── monotonic discovery counter
 └──────────────────────────────────────┘
 ```
 
