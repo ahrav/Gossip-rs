@@ -650,7 +650,6 @@ impl SimulatedEtcdKV {
     ) -> Result<(), SimEtcdError> {
         let mut keys_to_delete: BTreeSet<Vec<u8>> = BTreeSet::new();
 
-        // Match against pre-transaction store.
         let matched = self.matching_keys(&request.key, &request.range_end)?;
         for (key, _) in matched {
             keys_to_delete.insert(key.clone());
@@ -659,19 +658,16 @@ impl SimulatedEtcdKV {
         // Also match against previously staged puts so that a delete can
         // target a key created by an earlier put in the same transaction.
         if request.range_end.is_empty() {
-            // Point delete.
             if staged.pending_puts.contains(&request.key) {
                 keys_to_delete.insert(request.key.clone());
             }
         } else if request.range_end == [0] {
-            // From-key or all-keys sentinel.
             if request.key.is_empty() {
                 keys_to_delete.extend(staged.pending_puts.iter().cloned());
             } else {
                 keys_to_delete.extend(staged.pending_puts.range(request.key.clone()..).cloned());
             }
         } else {
-            // Explicit half-open range: empty if key >= range_end.
             if request.key < request.range_end {
                 keys_to_delete.extend(
                     staged
@@ -899,6 +895,7 @@ impl SimulatedEtcdKV {
     }
 }
 
+/// Snapshot of a single key-value entry stored in the simulator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KvEntry {
     value: Vec<u8>,
@@ -997,6 +994,7 @@ impl std::ops::AddAssign for SimEtcdFaultStats {
     }
 }
 
+/// Internal state tracking for an active lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeaseState {
     ttl: u64,
@@ -1004,12 +1002,14 @@ struct LeaseState {
     attached_keys: BTreeSet<Vec<u8>>,
 }
 
+/// In-progress state for a sustained CAS contention burst fault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRetryExhaustion {
     txn_fingerprint: u64,
     remaining_failures: usize,
 }
 
+/// A single put operation pending within a transaction's success branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StagedPut {
     key: Vec<u8>,
@@ -2330,7 +2330,7 @@ mod tests {
         }
     }
 
-    // ---- Verification tests for review-identified edge cases ----
+    // ---- Verification tests for edge cases ----
 
     /// TTL-race fault injection is not applied inside `lease_keep_alive_once`
     /// because it would permanently expire the target lease and return
