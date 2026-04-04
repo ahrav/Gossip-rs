@@ -345,7 +345,7 @@ identical async counterpart for I/O-bound backends:
 | `register_shards`  | Populate shards, transition to Active |  Yes (OpId) |      No      |
 | `get_run`          | Return run record (read-only)         |     N/A     |      No      |
 | `get_run_progress` | Aggregate shard status counts         |     N/A     |      No      |
-| `list_shards`      | Return filtered shard summaries       |     N/A     |      No      |
+| `list_shards_into` | Return filtered shard summaries       |     N/A     |      No      |
 | `complete_run`     | Transition Active to Done             |  Yes (OpId) |      No      |
 | `fail_run`         | Transition Active to Failed           |  Yes (OpId) |      No      |
 | `cancel_run`       | Transition non-terminal to Cancelled  |  Yes (OpId) |      No      |
@@ -847,7 +847,7 @@ shards are `Done` or `Split`.
 
 ### ShardFilter (`run.rs`)
 
-Predicate type for `list_shards` queries with named constructors:
+Predicate type for `list_shards_into` queries with named constructors:
 
 | Constructor  | Semantics                                 |
 | ------------ | ----------------------------------------- |
@@ -860,7 +860,7 @@ The `root_only` field controls whether only root (non-child) shards are included
 
 ### ShardSummary (`run.rs`)
 
-Lightweight view of a shard returned by `list_shards`. Contains fields for
+Lightweight view of a shard returned by `list_shards_into`. Contains fields for
 status, spec bounds, cursor position, lease deadline, acquire count, key range
 boundaries, and parent/child relationships.
 
