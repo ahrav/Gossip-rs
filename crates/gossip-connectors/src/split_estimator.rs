@@ -133,6 +133,7 @@ struct Sample {
 }
 
 #[derive(Clone, Copy)]
+/// Redacts key material from debug output while preserving byte length.
 struct RedactedKeyLen(usize);
 
 impl fmt::Debug for RedactedKeyLen {
@@ -142,6 +143,8 @@ impl fmt::Debug for RedactedKeyLen {
 }
 
 #[derive(Clone, Copy)]
+/// Redacts optional key material from debug output while preserving presence
+/// and byte length.
 struct RedactedOptionalKeyLen(Option<usize>);
 
 impl fmt::Debug for RedactedOptionalKeyLen {
@@ -164,6 +167,11 @@ impl fmt::Debug for Sample {
 }
 
 impl Sample {
+    /// Capture one observed key together with its rank and recorded byte
+    /// position at sampling time.
+    ///
+    /// The key bytes are copied into owned storage so retained samples stay
+    /// valid after the caller's input buffer is reused.
     fn new(rank: u64, recorded_byte_position: u64, key: &[u8]) -> Self {
         Self {
             rank,
@@ -617,6 +625,9 @@ impl StreamingSplitEstimator {
     /// streaming callers without requiring the caller to store a persistent
     /// estimator. Entries must be yielded in globally sorted ascending key
     /// order as `(key_bytes, entry_size)` pairs. Duplicate keys are permitted.
+    ///
+    /// When `sample_cap` is at least the entry count, the result is exact
+    /// because compaction never needs to discard a retained key.
     pub(crate) fn from_sorted_entries<'a>(
         sample_cap: usize,
         entries: impl Iterator<Item = (&'a [u8], u64)>,
@@ -798,12 +809,20 @@ impl StreamingSplitEstimator {
     /// Snap the next rank and byte sampling marks to the current stride grid.
     /// Called after compaction and when `observe` needs to recover from
     /// saturation onto the current stride grid.
+    ///
+    /// This may move the next mark forward past multiple skipped positions, but
+    /// it preserves the cadence invariant that every future trigger lands on
+    /// the active stride grid.
     fn realign_sample_marks(&mut self) {
         self.next_rank_sample = align_to_stride(self.count, self.rank_stride);
         self.next_byte_mark = align_to_stride(self.total_bytes, self.byte_stride);
     }
 
     /// Target sample count after compaction: half the cap (rounded up).
+    ///
+    /// Rounding up preserves a little more rank and byte coverage for odd caps
+    /// while still guaranteeing the next sample insertion fits before another
+    /// compaction is required.
     fn downsample_target(&self) -> usize {
         self.sample_cap.div_ceil(2)
     }
