@@ -372,6 +372,7 @@ enum WorkerConfigError {
     InvalidEtcdConfig(..),
     InvalidBackendConfig(..),
     UnsupportedCombination { .. },
+    InvalidEncoding { .. },
 }
 ```
 
