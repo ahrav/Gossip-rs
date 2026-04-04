@@ -12,7 +12,9 @@
 
 use proptest::prelude::*;
 
-use scanner_git::{ByteRef, OidBytes};
+use std::num::NonZeroU32;
+
+use scanner_git::{ByteRef, OidBytes, RefWatermark};
 use scanner_git::{
     CommitGraph, CommitPlanError, CommitPlanIter, CommitWalkLimits, ParentScratch, StartSetRef,
 };
@@ -28,7 +30,8 @@ struct TestCommitGraph {
 
 impl TestCommitGraph {
     fn new(parents: Vec<Vec<Position>>) -> Self {
-        let generations = (0..parents.len() as u32).collect();
+        // Generation numbers are 1-indexed per the commit-graph spec.
+        let generations = (1..=parents.len() as u32).collect();
         Self {
             generations,
             parents,
@@ -178,13 +181,26 @@ proptest! {
 
         let ref_count = tips.len();
         let mut refs = Vec::with_capacity(ref_count);
+        let mut generations: Vec<Option<NonZeroU32>> = Vec::with_capacity(ref_count);
         for i in 0..ref_count {
             let tip = Position(tips[i]);
             let wm = Position(watermarks[i]);
+
+            // Deterministic selection: correct generation or mismatched.
+            let gen_choice = (tip.0 as usize + wm.0 as usize) % 2;
+            let generation = match gen_choice {
+                0 => NonZeroU32::new(graph.generation(wm)).unwrap(),
+                _ => NonZeroU32::new(graph.generation(wm).wrapping_add(7)).unwrap(),
+            };
+            generations.push(Some(generation));
+
             refs.push(StartSetRef {
                 name: ByteRef::new(0, 0),
                 tip: TestCommitGraph::oid_for_pos(tip.0),
-                watermark: Some(TestCommitGraph::oid_for_pos(wm.0)),
+                watermark: Some(RefWatermark {
+                    oid: TestCommitGraph::oid_for_pos(wm.0),
+                    generation,
+                }),
             });
         }
 
@@ -202,9 +218,14 @@ proptest! {
             let tip = Position(tips[i]);
             let wm = Position(watermarks[i]);
 
+            // When stored generation mismatches the graph, the real walker
+            // treats the watermark as invalid and does a full history walk.
+            let wm_is_valid = generations[i]
+                .is_some_and(|g| g.get() == graph.generation(wm));
+
             let reach_tip = reachable_from(&parents, tip);
             let mut in_range = reach_tip.clone();
-            if is_ancestor(&parents, wm, tip) {
+            if wm_is_valid && is_ancestor(&parents, wm, tip) {
                 let reach_wm = reachable_from(&parents, wm);
                 for j in 0..n {
                     if reach_wm[j] {

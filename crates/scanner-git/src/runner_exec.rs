@@ -26,6 +26,7 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroU32;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -37,10 +38,11 @@ use memmap2::Mmap;
 
 use super::byte_arena::ByteArena;
 use super::bytes::BytesView;
+use super::commit_walk::CommitGraph;
 use super::engine_adapter::{
     CommitMetaContext, EngineAdapter, EngineAdapterConfig, GitScanCommonMetrics, ScannedBlobs,
 };
-use super::errors::TreeDiffError;
+use super::errors::{CommitPlanError, TreeDiffError};
 use super::finalize::RefEntry;
 use super::midx::MidxView;
 use super::midx_error::MidxError;
@@ -310,15 +312,32 @@ pub(super) fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanErro
 /// (populated during repo discovery). Each entry's ref name is resolved
 /// through the repo's shared name table so the resulting `RefEntry` vector
 /// carries owned byte names suitable for the finalize stage.
-pub(super) fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
+///
+/// # Errors
+///
+/// Returns `GitScanError::CommitPlan` if a start-set tip is missing from the
+/// commit graph, or if the graph returns a zero generation number (which
+/// violates the commit-graph spec).
+pub(super) fn build_ref_entries<CG: CommitGraph>(
+    repo: &RepoJobState,
+    cg: &CG,
+) -> Result<Vec<RefEntry>, GitScanError> {
     let mut refs = Vec::with_capacity(repo.start_set.len());
     for r in &repo.start_set {
+        let tip_pos = cg.lookup(&r.tip)?.ok_or(CommitPlanError::TipNotFound)?;
+        let raw_gen = cg.generation(tip_pos);
+        let tip_generation =
+            NonZeroU32::new(raw_gen).ok_or(CommitPlanError::InvalidGeneration {
+                pos: tip_pos,
+                generation: raw_gen,
+            })?;
         refs.push(RefEntry {
             ref_name: repo.ref_names.get(r.name).to_vec(),
             tip_oid: r.tip,
+            tip_generation,
         });
     }
-    refs
+    Ok(refs)
 }
 
 /// Memory-map pack files for zero-copy decoding.

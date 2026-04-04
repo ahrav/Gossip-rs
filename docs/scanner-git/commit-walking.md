@@ -35,6 +35,7 @@ flowchart TD
 | `ParentScratch` | struct | Reusable scratch buffer for parent collection. Stores up to 16 parents inline (no allocation); spills to `Vec` for octopus merges. | `commit_walk.rs` |
 | `VisitedCommitBitset` | struct | 1-bit-per-commit bitset for cross-ref emission dedup. `test_and_set` returns whether the bit was newly marked. | `commit_walk.rs` |
 | `CommitPlanIter` | struct | Iterator over `(watermark, tip]` commits for all refs. Uses two generation-ordered heaps and per-ref scratch. Deduplicates across refs via `VisitedCommitBitset`. | `commit_walk.rs` |
+| `RefWatermark` | struct | Persisted watermark state: `oid: OidBytes` + `generation: NonZeroU32`. The generation enables O(1) force-push detection before the ancestry walk. | `watermark_keys.rs` |
 | `CommitWalkLimits` | struct | Hard caps for traversal: max graph size, heap entries, parents per commit, new-ref skip checks. 16 bytes, compile-time validated. | `commit_walk_limits.rs` |
 
 ### Commit Loading (`commit_loader.rs`)
@@ -85,6 +86,7 @@ flowchart TD
 | `TooManyParents` | Commit exceeds `max_parents_per_commit`. | `errors.rs` |
 | `TopoSortCycle` | Kahn's algorithm could not drain all commits. | `errors.rs` |
 | `IdentityLengthMismatch` | Identity-ID vector length does not match commit count. | `errors.rs` |
+| `InvalidGeneration` | Commit-graph returned generation 0, which violates the spec (generation numbers start at 1). | `errors.rs` |
 
 ## Walking Algorithm
 
@@ -137,6 +139,29 @@ an ancestor of another ref's watermark (`commit_walk.rs`). If so, the
 entire history was already scanned in a prior run and the ref is skipped.
 The number of ancestry checks is bounded by `max_new_ref_skip_checks`
 (default 1024) to avoid O(refs^2) cost.
+
+### Watermark Generation Validation
+
+Before running the ancestry walk, `resolve_current_watermark`
+(`commit_walk.rs`) performs an O(1) generation comparison when the
+persisted `RefWatermark` carries a generation number:
+
+1. Look up the watermark OID in the commit graph.
+2. If the OID is missing (GC'd or rewritten), discard the watermark.
+3. If the stored `NonZeroU32` generation differs from the graph's
+   generation at that position, the commit was likely force-pushed
+   away or the graph was rebuilt — discard the watermark without an
+   ancestry walk.
+4. If generations match, proceed to the full `is_ancestor` DFS. Matching
+   generations alone do not prove ancestry because unrelated siblings can
+   share a generation number.
+
+The same validation runs in the new-ref skip loop: a stale generation
+on another ref's watermark prevents spurious skip decisions.
+
+Watermarks persisted without a generation trailer (from a prior code
+revision) are rejected by the decoder and treated as absent, triggering
+a one-time full rescan for that ref.
 
 ### Ancestry Check
 

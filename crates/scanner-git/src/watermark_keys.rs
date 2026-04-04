@@ -19,6 +19,20 @@
 //! Big-endian repo_id ensures lexicographic key ordering groups by repo.
 //! Trailing null byte terminates the variable-length ref_name unambiguously
 //! (Git ref names cannot contain NUL bytes per `git-check-ref-format`).
+//!
+//! # Value Format
+//!
+//! ```text
+//! ref_watermark value:
+//!   oid_len (1B) || oid (20B or 32B) || generation_le (4B)
+//! ```
+//!
+//! The decoder requires the full `1 + oid_len + 4` byte layout.
+//! Shorter or malformed payloads are rejected (returns `None`), which
+//! callers surface as an error. Adding new trailing fields requires a
+//! new length class or an explicit version byte.
+
+use std::num::NonZeroU32;
 
 use super::object_id::OidBytes;
 use super::start_set::StartSetId;
@@ -33,6 +47,19 @@ pub const NS_REF_WATERMARK: [u8; 2] = *b"rw";
 ///
 /// `2 (ns) + 8 (repo_id) + 32 (policy_hash) + 32 (start_set_id) + 1 (null) = 75`
 const RW_KEY_FIXED_OVERHEAD: usize = 2 + 8 + 32 + 32 + 1;
+
+/// Persisted ref watermark state.
+///
+/// Pairs a commit OID with its generation number for O(1) force-push
+/// detection. The struct is `Copy` because both fields are fixed-width
+/// value types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefWatermark {
+    /// Commit OID captured at the last completed scan frontier.
+    pub oid: OidBytes,
+    /// Commit generation number captured with the OID.
+    pub generation: NonZeroU32,
+}
 
 /// A reference to a key within a `KeyArena`.
 ///
@@ -216,24 +243,28 @@ impl KeyArena {
     }
 }
 
-/// Encodes a ref watermark value (OID) into a fixed buffer.
+/// Encodes a ref watermark value into a fixed buffer.
 ///
-/// Value format: `oid_len (u8) + oid bytes (20 or 32)`
+/// Value format: `oid_len (u8) + oid bytes (20 or 32) + generation_le (4B)`
+///
+/// The generation trailer is always present. The decoder rejects payloads
+/// without it (e.g., values from a prior code revision) as malformed.
 ///
 /// Returns `(buffer, used_len)` where `buffer[..used_len]` is the encoded value.
-/// Maximum `used_len` is 33 (1 + 32 for SHA-256).
-pub fn encode_ref_watermark_value(oid: &OidBytes) -> ([u8; 33], usize) {
-    let mut out = [0u8; 33];
+/// Maximum `used_len` is 37.
+pub fn encode_ref_watermark_value(oid: &OidBytes, generation: NonZeroU32) -> ([u8; 37], usize) {
+    let mut out = [0u8; 37];
     let n = oid.len() as usize;
 
     debug_assert!(n == 20 || n == 32, "OID len must be 20 or 32, got {n}");
 
     out[0] = oid.len();
     out[1..1 + n].copy_from_slice(oid.as_slice());
-    (out, 1 + n)
+    out[1 + n..1 + n + 4].copy_from_slice(&generation.get().to_le_bytes());
+    (out, 1 + n + 4)
 }
 
-/// Decodes a ref watermark value back to an `OidBytes`.
+/// Decodes a ref watermark value.
 ///
 /// The input slice must be exactly the encoded value (no trailing bytes).
 /// This matches the semantics of KV store point lookups (MultiGet), where
@@ -242,8 +273,9 @@ pub fn encode_ref_watermark_value(oid: &OidBytes) -> ([u8; 33], usize) {
 /// Returns `None` if the value is malformed:
 /// - Empty input
 /// - OID length is not 20 or 32
-/// - Actual byte count does not match declared length
-pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<OidBytes> {
+/// - Byte count does not equal `1 + oid_len + 4`
+/// - Generation trailer is zero (invalid per the commit-graph spec)
+pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<RefWatermark> {
     if bytes.is_empty() {
         return None;
     }
@@ -251,10 +283,15 @@ pub fn decode_ref_watermark_value(bytes: &[u8]) -> Option<OidBytes> {
     if oid_len != 20 && oid_len != 32 {
         return None;
     }
-    if bytes.len() != 1 + oid_len {
+    let expected_len = 1 + oid_len + 4;
+    if bytes.len() != expected_len {
         return None;
     }
-    OidBytes::try_from_slice(&bytes[1..])
+    let oid = OidBytes::try_from_slice(&bytes[1..1 + oid_len])?;
+    let generation = NonZeroU32::new(u32::from_le_bytes(
+        bytes[1 + oid_len..expected_len].try_into().ok()?,
+    ))?;
+    Some(RefWatermark { oid, generation })
 }
 
 #[cfg(test)]
@@ -370,25 +407,70 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_sha1() {
         let oid = test_oid_sha1(0xab);
-        let (buf, len) = encode_ref_watermark_value(&oid);
+        let generation = NonZeroU32::new(17).unwrap();
+        let (buf, len) = encode_ref_watermark_value(&oid, generation);
 
-        assert_eq!(len, 21);
+        assert_eq!(len, 25);
         assert_eq!(buf[0], 20);
+        assert_eq!(&buf[21..25], &generation.get().to_le_bytes());
 
         let decoded = decode_ref_watermark_value(&buf[..len]).unwrap();
-        assert_eq!(decoded, oid);
+        assert_eq!(decoded, RefWatermark { oid, generation });
     }
 
     #[test]
     fn encode_decode_roundtrip_sha256() {
         let oid = test_oid_sha256(0xcd);
-        let (buf, len) = encode_ref_watermark_value(&oid);
+        let generation = NonZeroU32::new(99).unwrap();
+        let (buf, len) = encode_ref_watermark_value(&oid, generation);
 
-        assert_eq!(len, 33);
+        assert_eq!(len, 37);
         assert_eq!(buf[0], 32);
+        assert_eq!(&buf[33..37], &generation.get().to_le_bytes());
 
         let decoded = decode_ref_watermark_value(&buf[..len]).unwrap();
-        assert_eq!(decoded, oid);
+        assert_eq!(decoded, RefWatermark { oid, generation });
+    }
+
+    #[test]
+    fn decode_rejects_oid_only_sha1() {
+        let oid = test_oid_sha1(0xab);
+        let mut buf = [0u8; 21];
+        buf[0] = oid.len();
+        buf[1..21].copy_from_slice(oid.as_slice());
+
+        assert!(
+            decode_ref_watermark_value(&buf).is_none(),
+            "OID-only payloads (no generation trailer) must be rejected"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_oid_only_sha256() {
+        let oid = test_oid_sha256(0xcd);
+        let mut buf = [0u8; 33];
+        buf[0] = oid.len();
+        buf[1..33].copy_from_slice(oid.as_slice());
+
+        assert!(
+            decode_ref_watermark_value(&buf).is_none(),
+            "OID-only payloads (no generation trailer) must be rejected"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_zero_generation() {
+        let oid = test_oid_sha1(0xab);
+        let generation_zero = 0u32;
+        let mut buf = [0u8; 25];
+        buf[0] = oid.len();
+        buf[1..21].copy_from_slice(oid.as_slice());
+        buf[21..25].copy_from_slice(&generation_zero.to_le_bytes());
+
+        assert!(
+            decode_ref_watermark_value(&buf).is_none(),
+            "generation=0 violates the commit-graph spec and must be rejected"
+        );
     }
 
     #[test]
@@ -412,7 +494,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized() {
-        let mut buf = [0u8; 33];
+        let mut buf = [0u8; 38];
         buf[0] = 20;
         assert!(decode_ref_watermark_value(&buf).is_none());
     }
@@ -420,11 +502,11 @@ mod tests {
     #[test]
     fn decode_rejects_trailing_bytes() {
         let oid = test_oid_sha1(0xab);
-        let (buf, len) = encode_ref_watermark_value(&oid);
+        let (buf, len) = encode_ref_watermark_value(&oid, NonZeroU32::new(5).unwrap());
 
         assert!(decode_ref_watermark_value(&buf[..len]).is_some());
 
-        let mut extended = [0u8; 34];
+        let mut extended = [0u8; 38];
         extended[..len].copy_from_slice(&buf[..len]);
         assert!(decode_ref_watermark_value(&extended[..len + 1]).is_none());
     }

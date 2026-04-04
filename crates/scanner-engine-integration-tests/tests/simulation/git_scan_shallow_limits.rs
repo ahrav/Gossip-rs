@@ -118,7 +118,7 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         Ok(ref_names.iter().map(|_| None).collect())
     }
 }

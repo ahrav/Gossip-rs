@@ -24,4 +24,7 @@ pub enum SimGitError {
     /// MIDX parse failed.
     #[error("midx error: {0}")]
     Midx(String),
+    /// Commit-graph returned an invalid generation number (must be nonzero).
+    #[error("invalid generation {generation} for watermark commit")]
+    InvalidGeneration { generation: u32 },
 }

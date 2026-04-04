@@ -12,6 +12,7 @@
 //! Requires `git` on `PATH`; tests skip gracefully if unavailable.
 
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::Command;
 
@@ -150,7 +151,7 @@ impl StartSetResolver for TestResolver {
 }
 
 struct TestWatermarkStore {
-    watermarks: Vec<(Vec<u8>, Option<OidBytes>)>,
+    watermarks: Vec<(Vec<u8>, Option<scanner_git::RefWatermark>)>,
 }
 
 impl RefWatermarkStore for TestWatermarkStore {
@@ -160,7 +161,7 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         let mut out = Vec::with_capacity(ref_names.len());
         for name in ref_names {
             let mut found = None;
@@ -208,7 +209,15 @@ fn commit_walk_linear_history() {
         refs: vec![(b"refs/heads/main".to_vec(), tip_oid)],
     };
     let watermark_store = TestWatermarkStore {
-        watermarks: vec![(b"refs/heads/main".to_vec(), Some(watermark_oid))],
+        watermarks: vec![(
+            b"refs/heads/main".to_vec(),
+            Some(scanner_git::RefWatermark {
+                oid: watermark_oid,
+                // HEAD~2 in a 4-commit linear chain is the 2nd commit from
+                // root, so generation = 2.
+                generation: NonZeroU32::new(2).unwrap(),
+            }),
+        )],
     };
 
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
@@ -302,7 +311,15 @@ fn commit_walk_watermark_not_ancestor_scans_full_history() {
         refs: vec![(b"refs/heads/main".to_vec(), tip_oid)],
     };
     let watermark_store = TestWatermarkStore {
-        watermarks: vec![(b"refs/heads/main".to_vec(), Some(other_oid))],
+        watermarks: vec![(
+            b"refs/heads/main".to_vec(),
+            Some(scanner_git::RefWatermark {
+                oid: other_oid,
+                // Generation value is irrelevant; this OID is not an ancestor
+                // of the tip, so the watermark will be rejected regardless.
+                generation: NonZeroU32::new(1).unwrap(),
+            }),
+        )],
     };
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
@@ -510,4 +527,135 @@ fn commit_graph_builds_with_packed_parent_and_loose_head() {
 
     assert!(cg.lookup(&loose_head).unwrap().is_some());
     assert!(cg.lookup(&packed_parent).unwrap().is_some());
+}
+
+/// When the watermark carries a generation that matches the commit graph,
+/// the walker performs an incremental scan (watermark-exclusive to tip).
+#[test]
+fn commit_walk_generation_match_incremental_scan() {
+    if !git_available() {
+        eprintln!("git not available; skipping commit walk integration test");
+        return;
+    }
+
+    let tmp = init_repo_with_commits(5);
+
+    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let head_parent = git_output(tmp.path(), &["rev-parse", "HEAD~1"]);
+    let watermark = git_output(tmp.path(), &["rev-parse", "HEAD~2"]);
+
+    let tip_oid = oid_from_hex(&head);
+    let parent_oid = oid_from_hex(&head_parent);
+    let watermark_oid = oid_from_hex(&watermark);
+
+    let resolver = TestResolver {
+        refs: vec![(b"refs/heads/main".to_vec(), tip_oid)],
+    };
+
+    // In a 5-commit linear chain, generation = topological depth (1-indexed
+    // from the root). HEAD~2 is the 3rd commit from the root, so generation 3.
+    let watermark_store = TestWatermarkStore {
+        watermarks: vec![(
+            b"refs/heads/main".to_vec(),
+            Some(scanner_git::RefWatermark {
+                oid: watermark_oid,
+                generation: NonZeroU32::new(3).unwrap(),
+            }),
+        )],
+    };
+
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+
+    let mut state = repo_open(
+        tmp.path(),
+        42,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &watermark_store,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    let cg = build_commit_graph(&mut state);
+
+    let iter = CommitPlanIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
+    let mut out = Vec::new();
+    for item in iter {
+        out.push(item.unwrap().pos.0);
+    }
+
+    let tip_pos = cg.lookup(&tip_oid).unwrap().unwrap().0;
+    let parent_pos = cg.lookup(&parent_oid).unwrap().unwrap().0;
+
+    // Only the two commits between the watermark (exclusive) and tip should
+    // be walked: HEAD and HEAD~1.
+    assert_eq!(out, vec![tip_pos, parent_pos]);
+}
+
+/// When the watermark carries a generation that does NOT match the commit
+/// graph (simulating a force-push that rewrote history), the walker rejects
+/// the watermark and falls back to scanning the full reachable history.
+#[test]
+fn commit_walk_generation_mismatch_scans_full_history() {
+    if !git_available() {
+        eprintln!("git not available; skipping commit walk integration test");
+        return;
+    }
+
+    let tmp = init_repo_with_commits(5);
+
+    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let watermark = git_output(tmp.path(), &["rev-parse", "HEAD~2"]);
+
+    let tip_oid = oid_from_hex(&head);
+    let watermark_oid = oid_from_hex(&watermark);
+
+    let resolver = TestResolver {
+        refs: vec![(b"refs/heads/main".to_vec(), tip_oid)],
+    };
+
+    // Generation 99 will never match any real generation in a 5-commit chain,
+    // triggering the O(1) force-push detection path.
+    let watermark_store = TestWatermarkStore {
+        watermarks: vec![(
+            b"refs/heads/main".to_vec(),
+            Some(scanner_git::RefWatermark {
+                oid: watermark_oid,
+                generation: NonZeroU32::new(99).unwrap(),
+            }),
+        )],
+    };
+
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+
+    let mut state = repo_open(
+        tmp.path(),
+        43,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &watermark_store,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    let cg = build_commit_graph(&mut state);
+
+    let mut actual: Vec<u32> = CommitPlanIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE)
+        .unwrap()
+        .map(|item| item.unwrap().pos.0)
+        .collect();
+    actual.sort_unstable();
+
+    // Full history should be walked, identical to the missing-watermark case.
+    let expected_oids = rev_list(tmp.path(), "HEAD");
+    let mut expected: Vec<u32> = expected_oids
+        .iter()
+        .map(|oid| cg.lookup(oid).unwrap().unwrap().0)
+        .collect();
+    expected.sort_unstable();
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual.len(), 5, "all five commits should be walked");
 }

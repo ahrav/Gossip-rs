@@ -180,6 +180,13 @@ pub enum CommitPlanError {
     /// Identity-ID vector length does not match commit count.
     #[error("identity_ids length ({identity_ids}) does not match commits ({commits})")]
     IdentityLengthMismatch { commits: usize, identity_ids: usize },
+    /// Commit-graph returned a zero generation number, which violates the
+    /// commit-graph specification (generation numbers start at 1).
+    #[error("invalid generation 0 for commit at position {pos:?} (raw={generation})")]
+    InvalidGeneration {
+        pos: gix_commitgraph::Position,
+        generation: u32,
+    },
 }
 
 /// Errors from tree diff and candidate collection.
