@@ -779,12 +779,12 @@ type's `OpIdConflict` variant. Run-level errors do not go through
 |------|----------|:--------:|
 | `CoordError` | error.rs | 12 |
 | `CursorOutOfBoundsDetail` | error.rs | struct (3 fields) |
-| `AcquireError` | error.rs | 4 |
-| `RenewError` | error.rs | 5 |
-| `CheckpointError` | error.rs | 12 |
-| `CompleteError` | error.rs | 12 |
-| `ParkError` | error.rs | 6 |
-| `SplitError` | error.rs | 8 |
+| `AcquireError` | error.rs | 5 |
+| `RenewError` | error.rs | 6 |
+| `CheckpointError` | error.rs | 13 |
+| `CompleteError` | error.rs | 13 |
+| `ParkError` | error.rs | 7 |
+| `SplitError` | error.rs | 9 |
 | `SplitReplaceError` (alias) | error.rs | = `SplitError` |
 | `SplitResidualError` (alias) | error.rs | = `SplitError` |
 
@@ -835,17 +835,17 @@ type's `OpIdConflict` variant. Run-level errors do not go through
 
 | Type | Location | Variants |
 |------|----------|:--------:|
-| `CreateRunError` | run_errors.rs | 5 |
-| `RegisterShardsError` | run_errors.rs | 7 |
-| `GetRunError` | run_errors.rs | 2 |
-| `RunTransitionError` | run_errors.rs | 5 |
-| `UnparkError` | run_errors.rs | 5 |
+| `CreateRunError` | run_errors.rs | 6 |
+| `RegisterShardsError` | run_errors.rs | 8 |
+| `GetRunError` | run_errors.rs | 3 |
+| `RunTransitionError` | run_errors.rs | 6 |
+| `UnparkError` | run_errors.rs | 6 |
 
 ### Facade-level error (facade.rs)
 
 | Type | Location | Variants |
 |------|----------|:--------:|
-| `ClaimError` | facade.rs | 4 |
+| `ClaimError` | facade.rs | 5 |
 
 ### Split execution types (split_execution.rs)
 
