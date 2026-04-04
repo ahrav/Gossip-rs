@@ -118,6 +118,8 @@ impl<T> PageBuf<T> {
     }
 }
 
+/// Borrowed iteration preserves the page state so callers can inspect items
+/// while still deciding whether to resume from the current page.
 impl<'a, T> IntoIterator for &'a PageBuf<T> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
@@ -170,6 +172,10 @@ impl PageState {
 }
 
 /// Optional paging behavior flags exposed by a connector family.
+///
+/// These flags advertise which paging features a family is capable of
+/// producing. They do not override per-call validation requirements; callers
+/// must still validate any emitted page or cursor against the actual payload.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PagingCapabilities {
     /// Whether the family produces strictly ordered page keys.
@@ -334,6 +340,10 @@ pub enum PageSequenceViolation {
 ///    `last_key`.
 /// 4. **Cursor-page alignment** — the `HasMore` cursor's `last_key` must
 ///    match the page's actual last emitted key.
+///
+/// `previous_last_key` is expected to come from the last item emitted in the
+/// current enumeration scope. Passing a key from another shard or scope can
+/// cause valid pages to fail the cursor-advance check.
 ///
 /// # Errors
 ///
