@@ -1,3 +1,9 @@
+//! Fuzzing target for `RunRecord` serialization round-trips.
+//!
+//! Ensures that `decode_run_record` and `encode_run_record` are symmetric.
+//! Any record successfully decoded from arbitrary fuzzer bytes must exactly
+//! round-trip through encoding and re-decoding without data loss or mutation.
+
 #![no_main]
 
 use gossip_coordination_etcd::{decode_run_record, encode_run_record};
