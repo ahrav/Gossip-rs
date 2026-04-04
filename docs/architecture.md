@@ -11,7 +11,7 @@ reusable scratch buffers so large scans do not trigger per-chunk allocations.
 ```
 scanner-rs scan fs
   -> scan_fs (gossip-scanner-runtime)
-  -> path + budget validation
+  -> path validation (budget checks happen inside ordered_content)
   -> ordered_content::scan_local_filesystem (crates/gossip-scanner-runtime/src/ordered_content.rs)
 ```
 
