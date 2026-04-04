@@ -1,5 +1,11 @@
 #![no_main]
 
+//! Fuzz target for decoding shard records.
+//!
+//! This target feeds arbitrary byte slices to the decoder to ensure:
+//! 1. The decoder never panics on malformed input.
+//! 2. The allocation rollback invariant is maintained (on error, no allocations are leaked in the `ByteSlab`).
+
 use gossip_coordination_etcd::decode_shard_record;
 use gossip_stdx::ByteSlab;
 use libfuzzer_sys::fuzz_target;
