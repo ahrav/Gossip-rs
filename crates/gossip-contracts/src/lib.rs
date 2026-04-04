@@ -47,13 +47,8 @@
 #[doc(hidden)]
 pub use blake3;
 
-// ---------------------------------------------------------------------------
-// Boundary modules.
-// ---------------------------------------------------------------------------
-
-// Connector boundary: shared paging vocabulary, connector value types, and
-// family-specific contracts.
-// (Module-level docs with intra-doc links live in `connector/mod.rs`.)
+/// Connector boundary: shared paging vocabulary, connector value types, and
+/// family-specific contracts.
 pub mod connector;
 /// Defines the shard data model: key ranges, cursors, split planning, and pooled wrappers.
 pub mod coordination;
@@ -83,7 +78,6 @@ mod tests {
         use proptest::prelude::*;
 
         proptest!(crate::test_util::miri_proptest_config(), |(x: u64)| {
-            // Verify blake3 produces deterministic output.
             let h1 = blake3::hash(&x.to_le_bytes());
             let h2 = blake3::hash(&x.to_le_bytes());
             prop_assert_eq!(h1, h2);
@@ -93,7 +87,6 @@ mod tests {
     /// Smoke test: test-support feature gate compiles in both configurations.
     #[test]
     fn test_support_feature_gate() {
-        // This test verifies the feature flag plumbing exists.
         #[cfg(feature = "test-support")]
         {}
     }

@@ -1,3 +1,13 @@
+//! Object-version identity hashing (OVID).
+//!
+//! This module provides the [`OvidHash`] type and derivation logic for creating
+//! deterministic, stable hashes of object-version pairs. These hashes serve as
+//! the primary join key in the done-ledger, associating exact bytes with a stable
+//! item identity.
+//!
+//! The hashes ensure that weak and strong claims for the same stable item produce
+//! distinct keys, avoiding cross-contamination of findings records.
+
 use std::sync::LazyLock;
 
 use blake3::Hasher;
