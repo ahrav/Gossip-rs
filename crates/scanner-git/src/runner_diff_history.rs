@@ -66,7 +66,8 @@ use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
 use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::pack_candidates::CappedPackCandidateSink;
 use super::pack_io::PackIo;
-use super::pack_plan::build_pack_plans;
+use super::pack_plan::{build_pack_plans, filter_completed_packs};
+use super::pack_plan_model::CompletedPacksBitmap;
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
 use super::runner::{
@@ -83,8 +84,8 @@ use super::repo_paths::{
 use super::runner_exec::{
     append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views,
     execute_pack_plans_with_scheduler, load_midx, make_spill_dir, mmap_pack_files,
-    per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
-    summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
+    per_worker_cache_bytes, plan_completed_cleanly, scan_loose_candidates,
+    select_pack_exec_strategy, summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
 };
 
 /// Runs the diff-history scan pipeline.
@@ -102,6 +103,11 @@ use super::runner_exec::{
 /// Output order is deterministic for identical inputs regardless of worker
 /// count. Parallel strategies reassemble results by planned sequence index,
 /// and loose candidates are always appended after all packed results.
+///
+/// The returned [`ScanModeOutput`] also carries a completed-pack bitmap sized
+/// to `midx.pack_count()`. The runner thread marks a pack only after its final
+/// post-scheduler report is assembled, so sharded execution sets the bit after
+/// all shards for that pack finish without error-class skips.
 ///
 /// # Lifetime of the returned path arena
 ///
@@ -159,6 +165,7 @@ pub(super) fn run_diff_history(
 
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
     let midx = load_midx(repo)?;
+    let mut completed_packs = CompletedPacksBitmap::empty(midx.pack_count() as usize);
     let object_store_layout = ObjectStoreLayout::from_midx(repo, midx)?;
     // Scale tree delta-cache to repo size to reduce repeated base decode work
     // while staying within the configured max cache budget.
@@ -291,6 +298,8 @@ pub(super) fn run_diff_history(
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
     perf_let!(pack_plan_start = Instant::now());
+    sink.packed
+        .retain(|cand| !completed_packs.is_complete(cand.pack_id));
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
@@ -312,6 +321,7 @@ pub(super) fn run_diff_history(
         // large candidate vec; the sink's packed field is left empty.
         let packed = std::mem::take(&mut sink.packed);
         let mut pack_plans = build_pack_plans(packed, &pack_views, &midx, &config.pack_plan)?;
+        filter_completed_packs(&mut pack_plans, &completed_packs);
         pack_plan_stats.extend(pack_plans.iter().map(|p| p.stats));
         plans.append(&mut pack_plans);
     }
@@ -374,6 +384,7 @@ pub(super) fn run_diff_history(
             .midx
             .clone()
             .ok_or_else(|| GitScanError::Io(io::Error::other("midx bytes missing")))?;
+        let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
         let outputs = execute_pack_plans_with_scheduler(
             Arc::clone(&engine),
             event_sink.clone(),
@@ -394,7 +405,11 @@ pub(super) fn run_diff_history(
             Arc::clone(&commit_graph_index),
             Arc::clone(&commit_meta_seen),
         )?;
-        for output in outputs {
+        debug_assert_eq!(plan_pack_ids.len(), outputs.len());
+        for (pack_id, output) in plan_pack_ids.into_iter().zip(outputs) {
+            if plan_completed_cleanly(&output.report) {
+                completed_packs.mark_complete(pack_id);
+            }
             pack_exec_reports.push(output.report);
             skipped_candidates.extend(output.skipped);
             common_metrics.merge_from(&output.common_metrics);
@@ -448,6 +463,7 @@ pub(super) fn run_diff_history(
             .map_err(|_| GitScanError::Io(io::Error::other("path arena still shared")))?,
         skipped_candidates,
         pack_exec_reports,
+        completed_packs,
         pack_plan_stats,
         pack_plan_config: config.pack_plan,
         pack_plan_delta_deps_total,

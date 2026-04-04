@@ -1362,6 +1362,14 @@ fn count_pack_exec_skip_errors(skips: &[SkipRecord]) -> u64 {
     errors
 }
 
+/// Returns whether a pack plan completed without any error-class skips.
+///
+/// Non-error skips such as `NotBlob` still count as a completed plan because
+/// the pack offsets were decoded successfully and do not need to be revisited.
+pub(super) fn plan_completed_cleanly(report: &PackExecReport) -> bool {
+    !report.skips.iter().any(|skip| skip.reason.is_error())
+}
+
 /// Execute a single scheduler-dispatched pack task (plan or shard).
 ///
 /// Uses reusable per-worker runtime (`PackIo` + `EngineAdapter`) from
@@ -1565,6 +1573,12 @@ fn scheduler_queue_rejected_error(shard_queue: bool) -> GitScanError {
     })
 }
 
+/// Reassembles one scheduler output per plan in deterministic plan order.
+///
+/// Workers store results into sequence-indexed mutex slots as they finish.
+/// This helper drains those slots after join, maps skip offsets back to
+/// candidate-level records, and returns outputs in the original `plans`
+/// order regardless of worker completion order.
 fn collect_plan_outputs(
     plans: &[PackPlan],
     output_slots: &[Mutex<Option<SchedulerPackExecOutput>>],
@@ -1710,6 +1724,13 @@ fn build_shard_slot_bases(shard_meta: &[SchedulerShardMeta]) -> Vec<usize> {
     shard_slot_base
 }
 
+/// Merges shard outputs back into one scheduler output per plan.
+///
+/// Each plan's shards are gathered from `shard_slots`, their execution
+/// reports are merged in shard order, and their scanned blobs are rebased
+/// into one `ScannedBlobs` arena. The returned vector preserves the original
+/// `plans` order, so callers can pair outputs back to plan metadata without
+/// inspecting worker completion order.
 fn merge_shard_outputs(
     plans: &[PackPlan],
     shard_meta: &[SchedulerShardMeta],

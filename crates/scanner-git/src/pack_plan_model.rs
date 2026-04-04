@@ -16,6 +16,7 @@
 
 use super::object_id::OidBytes;
 use super::pack_candidates::PackCandidate;
+use gossip_stdx::bitset::DynamicBitSet;
 
 /// Sentinel for missing `u32` indices.
 pub const NONE_U32: u32 = u32::MAX;
@@ -169,6 +170,47 @@ impl PackPlanStats {
     #[must_use]
     pub const fn delta_tree_max_depth(&self) -> u32 {
         self.delta_tree_max_depth
+    }
+}
+
+/// Bitmap of packs that completed pack execution in the current scan epoch.
+///
+/// A bit is set only after the runner thread has reassembled the final
+/// [`PackExecReport`](crate::pack_exec::PackExecReport) for that pack and
+/// confirmed it contains no error-class skips. This means sharded execution
+/// marks a pack complete only after every shard succeeds. The bitmap is sized
+/// to the repository's MIDX pack count, so `pack_id` can be used directly as
+/// the bit index.
+///
+/// The bitmap is mutated only in the runner's post-scheduler assembly loop and
+/// carried forward in [`ScanModeOutput`](crate::runner::ScanModeOutput), so it
+/// intentionally has no internal synchronization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedPacksBitmap {
+    bits: DynamicBitSet,
+}
+
+impl CompletedPacksBitmap {
+    /// Creates an empty completed-pack bitmap sized to the repository pack count.
+    #[inline]
+    #[must_use]
+    pub fn empty(pack_count: usize) -> Self {
+        Self {
+            bits: DynamicBitSet::empty(pack_count),
+        }
+    }
+
+    /// Marks `pack_id` as fully processed for this scan epoch.
+    #[inline]
+    pub fn mark_complete(&mut self, pack_id: u16) {
+        self.bits.set(pack_id as usize);
+    }
+
+    /// Returns whether `pack_id` completed without error-class skips.
+    #[inline]
+    #[must_use]
+    pub fn is_complete(&self, pack_id: u16) -> bool {
+        self.bits.is_set(pack_id as usize)
     }
 }
 

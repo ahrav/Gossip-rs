@@ -4,7 +4,9 @@ use std::path::Path;
 use crate::delta_test_helpers::zlib_compress;
 use crate::object_id::OidBytes;
 use crate::pack_decode::PackDecodeLimits;
-use crate::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats, NONE_U32};
+use crate::pack_plan_model::{
+    BaseLoc, CompletedPacksBitmap, DeltaDep, DeltaKind, PackPlanStats, NONE_U32,
+};
 use crate::{
     demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId, TransformMode,
     ValidatorKind,
@@ -112,6 +114,18 @@ fn synthetic_locality_plan(
     plan.delta_deps = delta_deps;
     plan.delta_dep_index = delta_dep_index;
     plan
+}
+
+fn scheduler_output_with_report(report: PackExecReport) -> SchedulerPackExecOutput {
+    SchedulerPackExecOutput {
+        report,
+        scanned: ScannedBlobs {
+            blobs: Vec::new(),
+            finding_arena: Vec::new(),
+        },
+        skipped: Vec::new(),
+        common_metrics: GitScanCommonMetrics::default(),
+    }
 }
 
 #[test]
@@ -376,6 +390,73 @@ fn count_pack_exec_skip_errors_deduplicates_by_offset() {
 
     // Two unique broken offsets (100, 200), not 4 skip events.
     assert_eq!(count_pack_exec_skip_errors(&skips), 2);
+}
+
+#[test]
+fn completion_bitmap_marks_successful_plan() {
+    let plans = [synthetic_plan(7, 1, 1, 0, 0)];
+    let report = PackExecReport::default();
+    let mut completed = CompletedPacksBitmap::empty(16);
+
+    assert!(plan_completed_cleanly(&report));
+    if plan_completed_cleanly(&report) {
+        completed.mark_complete(plans[0].pack_id());
+    }
+
+    assert!(completed.is_complete(7));
+}
+
+#[test]
+fn completion_bitmap_skips_fatal_error_plan() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![SkipRecord {
+            offset: 42,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        }],
+    };
+    let mut completed = CompletedPacksBitmap::empty(16);
+
+    assert!(!plan_completed_cleanly(&report));
+    if plan_completed_cleanly(&report) {
+        completed.mark_complete(3);
+    }
+
+    assert!(!completed.is_complete(3));
+}
+
+#[test]
+fn merge_shard_outputs_marks_completion() {
+    let plans = vec![synthetic_plan(5, 2, 2, 0, 0)];
+    let shard_meta = vec![SchedulerShardMeta {
+        exec_plan: SchedulerShardExecPlan::Natural { len: 2 },
+        plan_hot_deps: PackPlanHotDeps::from_plan(&plans[0]),
+        candidate_ranges: Vec::new(),
+        shard_ranges: vec![(0, 1), (1, 2)],
+    }];
+    let shard_slots = vec![
+        std::sync::Mutex::new(Some(
+            scheduler_output_with_report(PackExecReport::default()),
+        )),
+        std::sync::Mutex::new(Some(
+            scheduler_output_with_report(PackExecReport::default()),
+        )),
+    ];
+    let shard_slot_base = vec![0usize];
+
+    let outputs = merge_shard_outputs(&plans, &shard_meta, &shard_slots, &shard_slot_base)
+        .expect("shard merge should succeed");
+    let mut completed = CompletedPacksBitmap::empty(16);
+    let report = &outputs[0].report;
+
+    assert!(plan_completed_cleanly(report));
+    if plan_completed_cleanly(report) {
+        completed.mark_complete(plans[0].pack_id());
+    }
+
+    assert!(completed.is_complete(5));
 }
 
 #[test]
