@@ -1,3 +1,7 @@
+//! Fuzzing target for shard record serialization round-trips.
+//!
+//! Ensures that any valid byte sequence parsed into a shard record
+//! can be reliably re-encoded and re-decoded to the exact same bytes.
 #![no_main]
 
 use gossip_coordination_etcd::{decode_shard_record, encode_shard_record};
