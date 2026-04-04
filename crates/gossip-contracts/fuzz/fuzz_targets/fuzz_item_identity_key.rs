@@ -15,8 +15,10 @@ use gossip_contracts::identity::{
 };
 
 fuzz_target!(|data: &[u8]| {
-    // `from_ascii` validates human-readable tags and may panic on documented
-    // precondition violations, so isolate that contract from genuine crashes.
+    // Empty and too-long tags are filtered out here. Non-graphic bytes are
+    // still intentionally exercised inside `catch_unwind` so the fuzzer can
+    // probe the documented ASCII-validation panic path without reporting it as
+    // a harness crash.
     if !data.is_empty() && data.len() <= 8 {
         let _ = std::panic::catch_unwind(|| ConnectorTag::from_ascii(data));
     }
