@@ -30,7 +30,7 @@ use scanner_git::{
 
 const NS_BLOB_CTX: [u8; 3] = *b"bc\0";
 const NS_FINDING: [u8; 3] = *b"fn\0";
-const NS_SEEN_BLOB: [u8; 3] = *b"sb\0";
+use scanner_git::NS_SEEN_BLOB;
 
 pub(crate) fn perf_stats_enabled() -> bool {
     cfg!(all(feature = "perf-stats", debug_assertions))
@@ -64,6 +64,11 @@ pub(crate) fn git_output(repo: &Path, args: &[&str]) -> String {
 
 /// Decode a hex string into bytes (expects even length and valid hex digits).
 fn decode_hex(hex: &str) -> Vec<u8> {
+    assert!(
+        hex.len().is_multiple_of(2),
+        "decode_hex: odd-length input ({len} bytes): {hex:?}",
+        len = hex.len()
+    );
     let mut out = Vec::with_capacity(hex.len() / 2);
     let bytes = hex.as_bytes();
     let mut i = 0;
@@ -594,7 +599,7 @@ fn odb_blob_parallel_intro_keeps_persistence_contract_without_blob_ctx_determini
 // -ad`), which also packs every blob. There is no reliable way to create a
 // loose-only blob whose commit is still in a pack using normal Git
 // operations. The `LooseMissing` code path is covered by the unit test in
-// `runner.rs` (see `scan_loose_candidates_missing_object_skipped`).
+// `runner_exec_tests.rs` (see `missing_loose_object_is_skipped`).
 
 #[test]
 fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
@@ -793,7 +798,12 @@ fn failed_finalize_retry_still_scans_blob() {
     .expect("retry should succeed");
 
     assert_eq!(second.0.finalize.outcome, FinalizeOutcome::Complete);
-    assert_eq!(second.0.finalize.stats.unique_blobs, 1);
+    if perf_stats_enabled() {
+        assert_eq!(
+            second.0.finalize.stats.unique_blobs, 1,
+            "retry should re-scan the single blob"
+        );
+    }
     if perf_stats_enabled() {
         assert_eq!(second.0.finalize.stats.total_findings, 1);
     } else {
@@ -816,10 +826,12 @@ fn failed_finalize_retry_still_scans_blob() {
     .expect("third run should succeed");
 
     assert_eq!(third.0.finalize.outcome, FinalizeOutcome::Complete);
-    assert_eq!(
-        third.0.finalize.stats.unique_blobs, 0,
-        "blob should be skipped after successful finalize persisted seen state"
-    );
+    if perf_stats_enabled() {
+        assert_eq!(
+            third.0.finalize.stats.unique_blobs, 0,
+            "blob should be skipped after successful finalize persisted seen state"
+        );
+    }
 }
 
 #[test]

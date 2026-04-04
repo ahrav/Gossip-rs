@@ -68,8 +68,7 @@ impl SeenBitmapPersister for RecordingStore {
 }
 
 /// RocksDB-backed test double that delegates all persistence to a real
-/// `RocksDbStore` while counting `persist_seen_delta` calls for
-/// spill-stage verification.
+/// `RocksDbStore` while counting non-empty `persist_seen_delta` calls.
 #[cfg(feature = "rocksdb")]
 #[derive(Debug)]
 struct CountingPersistStore {
@@ -232,9 +231,9 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let mut config = base_config();
-    // DiffHistory mode walks commits through the spill pipeline, which triggers
-    // `persist_seen_delta` when the batch size (`seen_batch_max_oids = 2`) is
-    // exceeded — exercising incremental seen-bitmap persistence.
+    // DiffHistory mode walks commits through the spill pipeline.
+    // With `seen_batch_max_oids = 2`, non-empty seen deltas are persisted
+    // incrementally as batches flush.
     config.scan_mode = scanner_git::GitScanMode::DiffHistory;
     config.spill.seen_batch_max_oids = 2;
     let db_dir = tempfile::tempdir().expect("temp RocksDB dir");
@@ -263,6 +262,14 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
     .expect("first scan should succeed");
 
     assert_eq!(first.0.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(
+        !first.0.finalize.watermark_ops.is_empty(),
+        "complete scan should emit watermark ops"
+    );
+    // When `perf-stats` is disabled, FinalizeStats fields are zeroed regardless of
+    // actual processing. The unconditional assertions below (NS_SEEN_BLOB op
+    // presence, incremental_calls count, batch_check_seen results) provide the
+    // primary dedup evidence in that configuration.
     if perf_stats_enabled() {
         assert_eq!(
             first.0.finalize.stats.unique_blobs,
@@ -285,9 +292,9 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
     );
 
     let first_calls = store.incremental_calls();
-    assert!(
-        first_calls >= 2,
-        "5 blobs with seen_batch_max_oids=2 must produce multiple incremental persist calls"
+    assert_eq!(
+        first_calls, 3,
+        "5 blobs with seen_batch_max_oids=2 flush as 2+2+1, producing exactly 3 persist calls"
     );
     assert_eq!(
         scanner_git::SeenBlobStore::batch_check_seen(&store, &blob_oids).unwrap(),
@@ -312,6 +319,8 @@ fn run_git_scan_with_rocksdb_writes_incremental_seen_bitmap() {
     .expect("second scan should succeed");
 
     assert_eq!(second.0.finalize.outcome, FinalizeOutcome::Complete);
+    // Without `perf-stats`, the absence of NS_SEEN_BLOB data ops and the stable
+    // incremental_calls count are the unconditional dedup signals.
     if perf_stats_enabled() {
         assert_eq!(
             second.0.finalize.stats.unique_blobs, 0,
