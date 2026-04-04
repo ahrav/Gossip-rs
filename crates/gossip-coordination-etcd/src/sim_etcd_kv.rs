@@ -667,15 +667,13 @@ impl SimulatedEtcdKV {
             } else {
                 keys_to_delete.extend(staged.pending_puts.range(request.key.clone()..).cloned());
             }
-        } else {
-            if request.key < request.range_end {
-                keys_to_delete.extend(
-                    staged
-                        .pending_puts
-                        .range(request.key.clone()..request.range_end.clone())
-                        .cloned(),
-                );
-            }
+        } else if request.key < request.range_end {
+            keys_to_delete.extend(
+                staged
+                    .pending_puts
+                    .range(request.key.clone()..request.range_end.clone())
+                    .cloned(),
+            );
         }
 
         let keys: Vec<Vec<u8>> = keys_to_delete.into_iter().collect();

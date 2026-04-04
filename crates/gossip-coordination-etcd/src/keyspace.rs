@@ -253,7 +253,6 @@ impl ShardRecordKey {
     ///
     /// # Complexity
     /// `O(L)` where `L` is the length of the slice.
-
     pub(crate) fn from_encoded_key(key: &[u8]) -> Option<Self> {
         if PersistedShardSubtreeKey::classify(key) != Some(PersistedShardSubtreeKey::Record) {
             return None;
