@@ -7,8 +7,8 @@
 //! `ResultCommitter`), while event recording remains best-effort telemetry.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
 use gossip_contracts::connector::ItemKey;
@@ -161,54 +161,54 @@ impl GitEventOutput for CoordinationEventSink {
     }
 }
 
-/// Wrapper around [`CoordinationEventSink`] that intercepts `Finding` events
-/// and clones them into an internal buffer while forwarding all events to the
-/// inner sink unchanged.
+/// Wrapper around [`CoordinationEventSink`] that counts `Finding` events
+/// while forwarding all events to the inner sink unchanged.
 ///
-/// After the scan completes, callers retrieve the buffered findings via
-/// [`drain_findings`](Self::drain_findings) to write them into the durable
-/// [`FindingsSink`](gossip_contracts::persistence::FindingsSink) before
+/// The count is retrieved via [`detected_finding_count`](Self::detected_finding_count)
+/// after the scan completes to log how many findings were detected before
 /// advancing the shard checkpoint.
+///
+/// The counter uses `Relaxed` ordering because it is only read after the scan
+/// thread joins (establishing a happens-before via `std::thread::scope`), so
+/// the final value is always visible to the reader.
+///
+/// When the durable findings translation layer lands, this struct should be
+/// upgraded to capture `OwnedCoreEvent::Finding` instances into a buffer so
+/// they can be written to `FindingsSink` before checkpoint advance.
 pub(crate) struct FindingsCaptureSink {
     inner: Arc<CoordinationEventSink>,
-    captured: Mutex<Vec<OwnedCoreEvent>>,
+    finding_count: AtomicU64,
 }
 
 impl FindingsCaptureSink {
-    /// Wrap an existing coordination event sink with a findings capture layer.
+    /// Wrap an existing coordination event sink with a findings counter.
     pub(crate) fn new(inner: Arc<CoordinationEventSink>) -> Self {
         Self {
             inner,
-            captured: Mutex::new(Vec::new()),
+            finding_count: AtomicU64::new(0),
         }
     }
 
-    /// Drain all captured `Finding` events, leaving the buffer empty.
+    /// Return the number of `Finding` events observed during the scan.
     ///
-    /// Intended to be called exactly once after the scan completes and before
-    /// the findings are written to the durable persistence layer.
-    pub(crate) fn drain_findings(&self) -> Vec<OwnedCoreEvent> {
-        self.captured
-            .lock()
-            .expect("findings capture lock poisoned")
-            .drain(..)
-            .collect()
+    /// Intended to be called after the scan thread has joined, so the count
+    /// reflects the full scan. The `Relaxed` load is safe because the thread
+    /// join provides the necessary happens-before synchronization.
+    pub(crate) fn detected_finding_count(&self) -> u64 {
+        self.finding_count.load(Ordering::Relaxed)
     }
 }
 
 impl EventOutput for FindingsCaptureSink {
     fn emit_core(&self, event: CoreEvent<'_>) {
-        // Convert to owned first — `CoreEvent` is not `Copy`, so we must
-        // capture before forwarding. All events are replayed into the inner
-        // sink via `emit_into` so telemetry sees the full stream.
-        let owned = OwnedCoreEvent::from_core(event);
-        if matches!(owned, OwnedCoreEvent::Finding { .. }) {
-            self.captured
-                .lock()
-                .expect("findings capture lock poisoned")
-                .push(owned.clone());
+        if matches!(event, CoreEvent::Finding(_)) {
+            self.finding_count.fetch_add(1, Ordering::Relaxed);
         }
-        owned.emit_into(self.inner.as_ref());
+        // Forward the borrowed event directly to the inner sink, which
+        // performs its own `OwnedCoreEvent::from_core` conversion exactly
+        // once. This avoids the double-conversion that would result from
+        // calling `from_core` here and then `emit_into`.
+        self.inner.emit_core(event);
     }
 
     fn flush(&self) {
@@ -219,5 +219,170 @@ impl EventOutput for FindingsCaptureSink {
 impl GitEventOutput for FindingsCaptureSink {
     fn emit_git(&self, event: GitEvent<'_>) {
         self.inner.emit_git(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use scanner_scheduler::events::{DiagnosticEvent, FindingEvent, ProgressEvent};
+    use scanner_scheduler::source_kind::SourceKind;
+
+    /// Test recorder that captures all event kinds for assertion.
+    #[derive(Debug, Default)]
+    struct TestRecorder {
+        core_events: Mutex<Vec<OwnedCoreEvent>>,
+        git_events: Mutex<Vec<StoredGitEvent>>,
+    }
+
+    impl CoordinationEventRecorder for TestRecorder {
+        fn record_core_event(&self, _shard_id: &str, event: OwnedCoreEvent) -> Result<()> {
+            self.core_events.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        fn record_git_event(&self, _shard_id: &str, event: StoredGitEvent) -> Result<()> {
+            self.git_events.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        fn record_commit_progress(
+            &self,
+            _shard_id: &str,
+            _event: CommitProgressRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_sink_and_recorder() -> (FindingsCaptureSink, Arc<TestRecorder>) {
+        let recorder = Arc::new(TestRecorder::default());
+        let inner = Arc::new(CoordinationEventSink::new(
+            Arc::clone(&recorder) as Arc<dyn CoordinationEventRecorder>,
+            Arc::from("test-shard"),
+        ));
+        let sink = FindingsCaptureSink::new(inner);
+        (sink, recorder)
+    }
+
+    fn finding_event() -> CoreEvent<'static> {
+        CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"/tmp/secret.txt",
+            start: 10,
+            end: 42,
+            rule_id: 7,
+            rule_name: "test-rule",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 85,
+        })
+    }
+
+    fn progress_event() -> CoreEvent<'static> {
+        CoreEvent::Progress(ProgressEvent {
+            source: SourceKind::Fs,
+            stage: "scanning",
+            objects_scanned: 100,
+            bytes_scanned: 2048,
+            findings_emitted: 1,
+        })
+    }
+
+    fn diagnostic_event() -> CoreEvent<'static> {
+        CoreEvent::Diagnostic(DiagnosticEvent {
+            level: "warn",
+            message: "something happened",
+        })
+    }
+
+    #[test]
+    fn findings_capture_sink_counts_finding_events() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        sink.emit_core(finding_event());
+
+        assert_eq!(
+            sink.detected_finding_count(),
+            1,
+            "should count exactly one finding"
+        );
+
+        let forwarded = recorder.core_events.lock().unwrap();
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "inner sink should also receive the finding"
+        );
+        assert!(matches!(forwarded[0], OwnedCoreEvent::Finding { .. }));
+    }
+
+    #[test]
+    fn findings_capture_sink_skips_non_finding_events() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        sink.emit_core(progress_event());
+        sink.emit_core(diagnostic_event());
+
+        assert_eq!(
+            sink.detected_finding_count(),
+            0,
+            "non-finding events must not be counted"
+        );
+
+        let forwarded = recorder.core_events.lock().unwrap();
+        assert_eq!(
+            forwarded.len(),
+            2,
+            "inner sink should still receive all events"
+        );
+        assert!(matches!(forwarded[0], OwnedCoreEvent::Progress { .. }));
+        assert!(matches!(forwarded[1], OwnedCoreEvent::Diagnostic { .. }));
+    }
+
+    #[test]
+    fn findings_capture_sink_counts_multiple_findings() {
+        let (sink, _recorder) = make_sink_and_recorder();
+
+        sink.emit_core(finding_event());
+        sink.emit_core(finding_event());
+
+        assert_eq!(
+            sink.detected_finding_count(),
+            2,
+            "should count both findings"
+        );
+    }
+
+    #[test]
+    fn findings_capture_sink_forwards_git_events() {
+        let (sink, recorder) = make_sink_and_recorder();
+
+        let oid = scanner_git::OidBytes::sha1([0xab; 20]);
+        sink.emit_git(GitEvent::CommitMeta(scanner_git::CommitMetaEvent {
+            commit_id: 1,
+            commit_oid: oid,
+            timestamp: 1_700_000_000,
+            identity: None,
+        }));
+
+        let forwarded = recorder.git_events.lock().unwrap();
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "inner sink should receive the git event"
+        );
+        assert!(matches!(forwarded[0], StoredGitEvent::CommitMeta { .. }));
+    }
+
+    #[test]
+    fn findings_capture_sink_flush_delegates() {
+        let (sink, _recorder) = make_sink_and_recorder();
+
+        // CoordinationEventSink::flush is a no-op, so this verifies the
+        // delegation path completes without error or panic.
+        sink.flush();
     }
 }

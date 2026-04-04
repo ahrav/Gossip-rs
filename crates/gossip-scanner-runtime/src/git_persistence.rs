@@ -40,10 +40,13 @@ use std::num::NonZeroU64;
 
 use gossip_contracts::{
     connector::Cursor,
+    connector::VersionId,
     connector::git::RepoKey,
+    identity::{LogicalTime, ObjectVersionId, StableItemId},
     persistence::{
-        CommitScope, DoneLedgerCommitReceipt, FindingsCommitReceipt, PageCommit,
-        PageCommitValidationError, WriteContext,
+        CommitScope, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerProvenance,
+        DoneLedgerRecord, DoneLedgerStatus, FindingsCommitReceipt, OvidHashInputs, PageCommit,
+        PageCommitValidationError, PersistenceInputError, WriteContext, derive_ovid_hash,
     },
 };
 use scanner_git::{
@@ -132,6 +135,9 @@ pub enum GitRepoDurabilityError {
     /// The durable repo receipt did not match the repo-frontier checkpoint input kind.
     #[error("repo-frontier checkpoint input kind mismatch: {0}")]
     KindMismatch(#[source] KindMismatchError),
+    /// The done-ledger record failed construction or validation.
+    #[error("git repo done-ledger record invalid: {0}")]
+    InvalidDoneLedgerRecord(#[source] PersistenceInputError),
 }
 
 /// Runtime adapter that satisfies all four `scanner-git` persistence traits
@@ -777,6 +783,68 @@ where
         }
         Ok(())
     }
+}
+
+/// Build a done-ledger record for one completed Git repo-frontier scan.
+///
+/// Git repos have no object-version concept at the done-ledger level -- the
+/// repo itself is the scanned unit. A fixed zero version produces one
+/// done-ledger entry per (tenant, policy, repo_id) triple.
+///
+/// # OvidHash derivation
+///
+/// Git repo done-ledger entries use a fixed zero `ObjectVersionId` because
+/// repo-frontier shards track mutable refs, not immutable content versions.
+/// The 32-byte `StableItemId` is zero-padded from the u64 `repo_id` per the
+/// fixed-width contract. Domain separation from filesystem `StableItemId`s is
+/// guaranteed by `repo_id` being derived from `TenantId` + normalized path
+/// via `domain_hasher`.
+///
+/// # Provenance timestamps
+///
+/// `claim_time` should be the wall-clock `LogicalTime` captured when the
+/// lease was acquired. `complete_time` should be the wall-clock `LogicalTime`
+/// captured after `execute_repo` returns. Together they bracket the scan
+/// duration for provenance ordering.
+pub(crate) fn build_git_repo_done_ledger_record(
+    write_context: WriteContext,
+    repo_id: u64,
+    bytes_scanned: u64,
+    findings_count: u32,
+    claim_time: LogicalTime,
+    complete_time: LogicalTime,
+) -> Result<DoneLedgerRecord, GitRepoDurabilityError> {
+    // Git repo done-ledger entries use a fixed zero ObjectVersionId because
+    // repo-frontier shards track mutable refs, not immutable content versions.
+    // The 32-byte StableItemId is zero-padded from the u64 repo_id per the
+    // fixed-width contract. Domain separation from filesystem StableItemIds is
+    // guaranteed by repo_id being derived from TenantId + normalized path via
+    // domain_hasher.
+    let ovid = {
+        let mut buf = [0u8; 32];
+        buf[..8].copy_from_slice(&repo_id.to_le_bytes());
+        let stable_item = StableItemId::from_bytes(buf);
+        let version = VersionId::Strong(ObjectVersionId::from_bytes([0u8; 32]));
+        derive_ovid_hash(&OvidHashInputs {
+            stable_item_id: stable_item,
+            version,
+        })
+    };
+    let key = DoneLedgerKey::new(write_context.tenant_id(), write_context.policy_hash(), ovid);
+    let status = if findings_count > 0 {
+        DoneLedgerStatus::ScannedWithFindings
+    } else {
+        DoneLedgerStatus::ScannedClean
+    };
+    let provenance =
+        DoneLedgerProvenance::from_write_context(write_context, claim_time, complete_time);
+    let record =
+        DoneLedgerRecord::try_new(key, status, bytes_scanned, findings_count, provenance, None)
+            .map_err(GitRepoDurabilityError::InvalidDoneLedgerRecord)?;
+    record
+        .validate()
+        .map_err(GitRepoDurabilityError::InvalidDoneLedgerRecord)?;
+    Ok(record)
 }
 
 #[cfg(test)]

@@ -20,9 +20,8 @@
 
 use std::fmt;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::config::{DistributedWorkerLaunch, ProductionBackendConfig};
 use gossip_contracts::connector::git::GitRunError;
@@ -348,27 +347,52 @@ impl ProductionRuntimeBackends {
 
 /// Process-local in-memory Git key-value persistence backend.
 ///
-/// Stores key-value pairs in a shared [`HashMap`] using reference-counted
-/// interior mutability. All clones share the same backing store, so state
-/// written by one `GitPersistenceAdapter` clone is visible to all others.
+/// Stores key-value pairs in a shared [`HashMap`] behind an [`Arc`]+[`Mutex`]
+/// so clones share the same backing store. This is `Send`-safe, unlike
+/// `Rc<RefCell<…>>`, so it remains correct if `GitPersistenceBackend` gains
+/// `Send` bounds or the scan is refactored to cross thread boundaries.
 ///
 /// State does not survive process restarts. This backend is suitable for
 /// single-worker development and early integration until a durable
 /// (e.g. PostgreSQL-backed) Git persistence backend is available.
 #[derive(Debug, Clone, Default)]
 struct InMemoryGitPersistence {
-    store: Rc<RefCell<HashMap<Vec<u8>, Vec<u8>>>>,
+    store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 }
 
 impl GitPersistenceBackend for InMemoryGitPersistence {
     type Error = std::convert::Infallible;
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        Ok(self.store.borrow().get(key).cloned())
+        Ok(self
+            .store
+            .lock()
+            .expect("in-memory git persistence lock poisoned")
+            .get(key)
+            .cloned())
+    }
+
+    /// Batch lookup under a single lock acquisition.
+    ///
+    /// The default trait implementation calls `get()` per key, which would
+    /// acquire and release the Mutex N times. This override holds the lock
+    /// once for the entire batch, avoiding O(keys) lock/unlock cycles.
+    fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let store = self
+            .store
+            .lock()
+            .expect("in-memory git persistence lock poisoned");
+        Ok(keys
+            .iter()
+            .map(|key| store.get(key.as_slice()).cloned())
+            .collect())
     }
 
     fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
-        let mut store = self.store.borrow_mut();
+        let mut store = self
+            .store
+            .lock()
+            .expect("in-memory git persistence lock poisoned");
         for op in ops {
             match op {
                 GitPersistenceOp::Put { key, value } => {
