@@ -195,10 +195,10 @@ impl<B> GitPersistenceAdapter<B> {
     /// Build the repo-frontier durable receipt for one already-committed finalize.
     ///
     /// Synthesizes the `CompletedUnit`, `CommitScope`, and `PageCommit`
-    /// chain that the runtime checkpoint path expects. The receipt records
-    /// zero findings (Git repos emit findings via the event sink, not via
-    /// the commit receipt) and exactly one done-ledger entry (the repo
-    /// itself).
+    /// chain that the runtime checkpoint path expects. The caller provides
+    /// the actual `FindingsCommitReceipt` and `DoneLedgerCommitReceipt`
+    /// from the persistence layer so the receipt accurately reflects
+    /// durable findings and done-ledger state.
     ///
     /// Complete finalizes yield a receipt. Partial finalizes return `None`
     /// because their watermark state is intentionally non-authoritative.
@@ -208,6 +208,8 @@ impl<B> GitPersistenceAdapter<B> {
         sequence_no: u64,
         repo_key: &RepoKey,
         outcome: FinalizeOutcome,
+        findings_receipt: FindingsCommitReceipt,
+        done_ledger_receipt: DoneLedgerCommitReceipt,
     ) -> Result<Option<UnitCommitReceipt>, GitRepoDurabilityError> {
         if !matches!(outcome, FinalizeOutcome::Complete) {
             return Ok(None);
@@ -223,8 +225,8 @@ impl<B> GitPersistenceAdapter<B> {
             completed_unit.checkpoint_boundary().clone(),
         );
         let durable = PageCommit::new(scope)
-            .record_findings(FindingsCommitReceipt::new(0, 0, 0))
-            .record_done_ledger(DoneLedgerCommitReceipt::new(1, 1, 0))
+            .record_findings(findings_receipt)
+            .record_done_ledger(done_ledger_receipt)
             .map_err(GitRepoDurabilityError::InvalidItemReceipt)?
             .into_item_commit_receipt();
 
@@ -246,9 +248,17 @@ impl<B> GitPersistenceAdapter<B> {
         sequence_no: u64,
         repo_key: &RepoKey,
         outcome: FinalizeOutcome,
+        findings_receipt: FindingsCommitReceipt,
+        done_ledger_receipt: DoneLedgerCommitReceipt,
     ) -> Result<Option<CheckpointAggregatorInput>, GitRepoDurabilityError> {
-        let Some(receipt) =
-            self.repo_frontier_receipt(write_context, sequence_no, repo_key, outcome)?
+        let Some(receipt) = self.repo_frontier_receipt(
+            write_context,
+            sequence_no,
+            repo_key,
+            outcome,
+            findings_receipt,
+            done_ledger_receipt,
+        )?
         else {
             return Ok(None);
         };
@@ -1069,6 +1079,8 @@ mod tests {
                     0,
                     &repo_key(),
                     FinalizeOutcome::Partial { skipped_count: 1 },
+                    FindingsCommitReceipt::new(0, 0, 0),
+                    DoneLedgerCommitReceipt::new(1, 1, 0),
                 )
                 .expect("checkpoint input")
                 .is_none(),
@@ -1196,7 +1208,14 @@ mod tests {
         let adapter = GitPersistenceAdapter::new(backend, 11, [0xB0; 32]);
 
         let receipt = adapter
-            .repo_frontier_receipt(write_context(), 7, &repo_key(), FinalizeOutcome::Complete)
+            .repo_frontier_receipt(
+                write_context(),
+                7,
+                &repo_key(),
+                FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
             .expect("receipt")
             .expect("complete finalize yields receipt");
         assert_eq!(receipt.completed_unit().sequence_no(), 7);
@@ -1214,6 +1233,8 @@ mod tests {
                 7,
                 &repo_key(),
                 FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
             )
             .expect("checkpoint input")
             .expect("complete finalize yields checkpoint input");
@@ -1232,10 +1253,24 @@ mod tests {
         let adapter = GitPersistenceAdapter::new(backend, 12, [0xC0; 32]);
 
         let first = adapter
-            .repo_frontier_receipt(write_context(), 3, &repo_key(), FinalizeOutcome::Complete)
+            .repo_frontier_receipt(
+                write_context(),
+                3,
+                &repo_key(),
+                FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
             .expect("first receipt");
         let second = adapter
-            .repo_frontier_receipt(write_context(), 3, &repo_key(), FinalizeOutcome::Complete)
+            .repo_frontier_receipt(
+                write_context(),
+                3,
+                &repo_key(),
+                FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
             .expect("second receipt");
 
         assert_eq!(first, second);

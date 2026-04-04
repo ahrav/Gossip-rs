@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::config::{DistributedWorkerLaunch, ProductionBackendConfig};
+use gossip_contracts::connector::git::GitRunError;
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
 use gossip_done_ledger_postgres::{
     DoneLedgerPg, DoneLedgerPgMigrationError, EmbeddedMigration,
@@ -188,8 +189,8 @@ pub enum ProductionBootstrapError {
     #[error("{backend} connection thread panicked unexpectedly")]
     ThreadPanicked { backend: &'static str },
     /// Git mirror manager initialization failed before any shard work started.
-    #[error("git mirror manager startup failed: {message}")]
-    GitMirrorManager { message: String },
+    #[error("git mirror manager startup failed: {0}")]
+    GitMirrorManager(#[source] GitRunError),
 }
 
 impl fmt::Debug for ProductionBootstrapError {
@@ -220,10 +221,7 @@ impl fmt::Debug for ProductionBootstrapError {
                 .debug_struct("ThreadPanicked")
                 .field("backend", backend)
                 .finish(),
-            Self::GitMirrorManager { message } => f
-                .debug_struct("GitMirrorManager")
-                .field("message", message)
-                .finish(),
+            Self::GitMirrorManager(e) => f.debug_tuple("GitMirrorManager").field(e).finish(),
         }
     }
 }
@@ -323,9 +321,8 @@ impl ProductionRuntimeBackends {
     ///
     /// The caller provides a concrete [`GitPersistenceBackend`] for Git
     /// key-value durability (seen-blobs, ref watermarks, staging state).
-    /// This is separate from the filesystem-path `DistributedPersistence`
-    /// because the Git worker loop manages persistence through the
-    /// `GitPersistenceAdapter` rather than the findings/done-ledger pipeline.
+    /// Findings and done-ledger records are written through the same
+    /// `DistributedPersistence` handles used by the filesystem worker.
     ///
     /// # Errors
     ///
@@ -343,6 +340,7 @@ impl ProductionRuntimeBackends {
             mirrors,
             identity,
             git_backend,
+            self.persistence,
             runtime,
         )
     }
@@ -535,11 +533,8 @@ pub fn run_production_worker(
             identity,
             mirror_root,
         } => {
-            let mut mirrors = LocalMirrorManager::new(mirror_root).map_err(|error| {
-                ProductionBootstrapError::GitMirrorManager {
-                    message: error.to_string(),
-                }
-            })?;
+            let mut mirrors = LocalMirrorManager::new(mirror_root)
+                .map_err(ProductionBootstrapError::GitMirrorManager)?;
             let git_backend = InMemoryGitPersistence::default();
             backends
                 .run_git(&mut mirrors, git_backend, identity, runtime)

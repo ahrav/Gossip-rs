@@ -7,8 +7,8 @@
 //! `ResultCommitter`), while event recording remains best-effort telemetry.
 
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use gossip_contracts::connector::ItemKey;
@@ -158,5 +158,66 @@ impl GitEventOutput for CoordinationEventSink {
                 "recorder failed to persist git event; subsequent failures suppressed",
             );
         }
+    }
+}
+
+/// Wrapper around [`CoordinationEventSink`] that intercepts `Finding` events
+/// and clones them into an internal buffer while forwarding all events to the
+/// inner sink unchanged.
+///
+/// After the scan completes, callers retrieve the buffered findings via
+/// [`drain_findings`](Self::drain_findings) to write them into the durable
+/// [`FindingsSink`](gossip_contracts::persistence::FindingsSink) before
+/// advancing the shard checkpoint.
+pub(crate) struct FindingsCaptureSink {
+    inner: Arc<CoordinationEventSink>,
+    captured: Mutex<Vec<OwnedCoreEvent>>,
+}
+
+impl FindingsCaptureSink {
+    /// Wrap an existing coordination event sink with a findings capture layer.
+    pub(crate) fn new(inner: Arc<CoordinationEventSink>) -> Self {
+        Self {
+            inner,
+            captured: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Drain all captured `Finding` events, leaving the buffer empty.
+    ///
+    /// Intended to be called exactly once after the scan completes and before
+    /// the findings are written to the durable persistence layer.
+    pub(crate) fn drain_findings(&self) -> Vec<OwnedCoreEvent> {
+        self.captured
+            .lock()
+            .expect("findings capture lock poisoned")
+            .drain(..)
+            .collect()
+    }
+}
+
+impl EventOutput for FindingsCaptureSink {
+    fn emit_core(&self, event: CoreEvent<'_>) {
+        // Convert to owned first — `CoreEvent` is not `Copy`, so we must
+        // capture before forwarding. All events are replayed into the inner
+        // sink via `emit_into` so telemetry sees the full stream.
+        let owned = OwnedCoreEvent::from_core(event);
+        if matches!(owned, OwnedCoreEvent::Finding { .. }) {
+            self.captured
+                .lock()
+                .expect("findings capture lock poisoned")
+                .push(owned.clone());
+        }
+        owned.emit_into(self.inner.as_ref());
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
+impl GitEventOutput for FindingsCaptureSink {
+    fn emit_git(&self, event: GitEvent<'_>) {
+        self.inner.emit_git(event);
     }
 }
