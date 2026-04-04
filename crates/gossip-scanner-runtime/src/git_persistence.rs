@@ -955,7 +955,9 @@ pub mod test_support {
             self.state.borrow_mut().fail_on_batch_call = None;
         }
 
-        /// Injects a failure on the Nth `get` call (1-indexed).
+        /// Injects a failure when the internal `get` call counter reaches `call_no`.
+        ///
+        /// Same semantics as [`set_fail_on_batch_call`](Self::set_fail_on_batch_call).
         pub fn set_fail_on_get_call(&self, call_no: usize) {
             self.state.borrow_mut().fail_on_get_call = Some(call_no);
         }
