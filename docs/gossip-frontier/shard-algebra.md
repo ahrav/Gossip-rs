@@ -157,7 +157,7 @@ compile-time assertion rejects `CAP > 1024` to keep stack growth bounded.
 
 | Function | Purpose | Returns `None` when |
 |----------|---------|---------------------|
-| `prefix_successor(prefix, buf)` | Exclusive upper bound for a prefix scan. Finds rightmost non-`0xFF` byte, truncates trailing `0xFF` suffix, increments last remaining byte. Analogous to FoundationDB `strinc`. | Empty prefix, all-`0xFF`, or exceeds `KeyBuf::CAPACITY`. |
+| `prefix_successor(prefix, buf)` | Exclusive upper bound for a prefix scan. Finds rightmost non-`0xFF` byte, truncates trailing `0xFF` suffix, increments last remaining byte. Analogous to FoundationDB `strinc`. | Empty prefix, all-`0xFF`, or exceeds `MAX_KEY_SIZE`. |
 | `key_successor(key, buf)` | Minimal strict successor of an arbitrary key. Appends `0x00` if `key.len() < MAX_KEY_SIZE`; delegates to `prefix_successor` if at `MAX_KEY_SIZE`. | Key exceeds `MAX_KEY_SIZE`, or exactly `MAX_KEY_SIZE` bytes and all `0xFF`. |
 | `byte_midpoint(a, b, out)` | Approximate bisection point between two keys for split planning. Five-phase algorithm: (1) big-endian addition, (2) halving by long division, (3) overflow-normalized candidate check, (4) fixed-width candidate check, (5) `key_successor` fallback. | `a >= b`, either input exceeds `MAX_KEY_SIZE`, or no interior point exists. |
 
