@@ -964,9 +964,7 @@ fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
         original_last_key,
         "last sample must be preserved even in a trailing plateau"
     );
-    // Ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
-    // Byte positions non-decreasing (plateau means equal is expected).
     assert!(
         samples
             .windows(2)
@@ -1033,16 +1031,13 @@ fn compact_samples_typical_half_reduction() {
     assert_eq!(samples.first().unwrap().rank, 0, "first sample preserved");
     assert_eq!(samples.last().unwrap().rank, 511, "last sample preserved");
 
-    // Monotonicity: ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
-    // Byte positions non-decreasing.
     assert!(
         samples
             .windows(2)
             .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
     );
 
-    // Approximate uniform spacing: average rank gap should be close to 2.
     let gaps: Vec<u64> = samples.windows(2).map(|w| w[1].rank - w[0].rank).collect();
     let avg_gap = gaps.iter().sum::<u64>() as f64 / gaps.len() as f64;
     assert!(
@@ -1247,8 +1242,8 @@ fn observe_realigns_marks_after_count_saturates_to_max() {
     // Next observe will push count from MAX-1 to MAX via saturating_add.
     estimator.count = u64::MAX - 1;
     estimator.total_bytes = 5000;
-    // Set marks so neither cadence fires — we only care about the saturation
-    // guard realigning marks, not about emitting a new sample.
+    // Set marks so neither cadence fires. This isolates the saturation guard's
+    // realignment of marks without emitting a new sample.
     estimator.next_rank_sample = u64::MAX;
     estimator.next_byte_mark = 6000;
     estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
@@ -1519,7 +1514,6 @@ proptest! {
             })
             .collect();
 
-        // In-place swap compaction.
         let mut actual_samples = samples;
         compact_samples(&mut actual_samples, cap);
         let actual: Vec<_> = actual_samples
@@ -1683,10 +1677,8 @@ fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
         plateau3_ranks
     );
 
-    // Endpoints preserved.
     assert_eq!(samples.first().unwrap().rank, 0);
     assert_eq!(samples.last().unwrap().rank, 99);
-    // Strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
 }
 
@@ -1829,7 +1821,6 @@ fn plateau_redistribution_spreads_picks_across_leading_plateau() {
 
     assert_eq!(samples.len(), 10);
 
-    // Endpoint preservation.
     assert_eq!(
         samples.first().unwrap().rank,
         0,
@@ -1841,15 +1832,12 @@ fn plateau_redistribution_spreads_picks_across_leading_plateau() {
         "last sample must be preserved"
     );
 
-    // Strictly increasing ranks.
     assert!(
         samples.windows(2).all(|w| w[0].rank < w[1].rank),
         "ranks must remain strictly increasing: {:?}",
         samples.iter().map(|s| s.rank).collect::<Vec<_>>()
     );
 
-    // Plateau samples (rank 0..15) should be spread, not bunched at the
-    // leading edge.
     let plateau_ranks: Vec<u64> = samples
         .iter()
         .filter(|s| s.rank < 15)
@@ -1878,17 +1866,14 @@ fn redistribute_plateau_picks_early_return_for_small_pick_arrays() {
         .map(|i| Sample::new(i as u64, 500, &key_for_index(i)))
         .collect();
 
-    // 0 picks — empty slice must not panic.
     let mut empty: Vec<usize> = vec![];
     redistribute_plateau_picks(&samples, &mut empty, SampleAxis::Bytes);
     assert!(empty.is_empty());
 
-    // 1 pick — single element must be unchanged.
     let mut one = vec![5];
     redistribute_plateau_picks(&samples, &mut one, SampleAxis::Bytes);
     assert_eq!(one, vec![5]);
 
-    // 2 picks — pair must be unchanged (cannot form a non-endpoint plateau).
     let mut two = vec![0, 9];
     redistribute_plateau_picks(&samples, &mut two, SampleAxis::Bytes);
     assert_eq!(two, vec![0, 9]);
@@ -1918,7 +1903,6 @@ fn plateau_redistribution_spreads_picks_across_trailing_plateau() {
 
     assert_eq!(samples.len(), 10);
 
-    // Endpoint preservation.
     assert_eq!(
         samples.first().unwrap().rank,
         0,
@@ -1930,15 +1914,12 @@ fn plateau_redistribution_spreads_picks_across_trailing_plateau() {
         "last sample must be preserved"
     );
 
-    // Strictly increasing ranks.
     assert!(
         samples.windows(2).all(|w| w[0].rank < w[1].rank),
         "ranks must remain strictly increasing: {:?}",
         samples.iter().map(|s| s.rank).collect::<Vec<_>>()
     );
 
-    // Trailing plateau samples (rank 15..30) should be spread, not bunched at
-    // the plateau's leading edge.
     let trailing_ranks: Vec<u64> = samples
         .iter()
         .filter(|s| s.rank >= 15)

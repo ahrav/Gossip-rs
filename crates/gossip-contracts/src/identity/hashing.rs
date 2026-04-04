@@ -49,15 +49,6 @@ use blake3::Hasher;
 
 use super::domain;
 
-// ---------------------------------------------------------------------------
-// Cached derive-key hashers
-//
-// BLAKE3 derive-key mode performs a key-schedule setup from the context
-// string.  Caching the post-setup state in a `LazyLock<Hasher>` lets
-// every derivation start from a `clone()` of the fully-initialized
-// hasher, avoiding redundant key-schedule computation on each call.
-// ---------------------------------------------------------------------------
-
 /// Cached derive-key hasher for [`FindingId`](super::FindingId) derivation.
 pub(crate) static FINDING_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::FINDING_ID_V1));
@@ -201,9 +192,7 @@ mod tests {
         finalize_32(&hasher)
     }
 
-    // ---------------------------------------------------------------
     // Correctness anchor: domain_hasher + finalize_32 == blake3::derive_key
-    // ---------------------------------------------------------------
 
     #[test]
     fn domain_hasher_matches_blake3_derive_key() {
@@ -221,9 +210,7 @@ mod tests {
         assert_eq!(ours, reference);
     }
 
-    // ---------------------------------------------------------------
     // Property-based: determinism across random payloads
-    // ---------------------------------------------------------------
 
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]
@@ -246,9 +233,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // finalize_64: property-based
-    // ---------------------------------------------------------------
 
     fn hash_payload_64(domain: &str, payload: &[u8]) -> u64 {
         let mut hasher = domain_hasher(domain);
