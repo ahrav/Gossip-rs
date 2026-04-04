@@ -78,6 +78,7 @@ classDiagram
 
     class RuleCold {
         -&'static str name
+        -[u8; 32] fingerprint
         -i8 min_confidence
     }
 
@@ -480,6 +481,7 @@ classDiagram
     class FsFindingBatch {
         +&[u8] object_path
         +&[FsFindingRecord] findings
+        +u32 discovery_sequence
     }
 
     class FsRunLoss {
@@ -525,7 +527,7 @@ and `end_run()` derives the final run status and persists it to the database.
 | Type                    | Purpose                                                                                                               |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `FsFindingRecord`       | Post-dedupe, backend-agnostic finding with absolute byte offsets, `norm_hash`, and additive `confidence_score` (0–10) |
-| `FsFindingBatch`        | Borrowed batch of findings for one scanned object (file or archive entry)                                             |
+| `FsFindingBatch`        | Borrowed batch of findings for one scanned object (file or archive entry), plus discovery-order sequencing metadata    |
 | `FsRunLoss`             | Run-level loss accounting (dropped findings, emit failures); `incomplete()` is a computed method, not a stored field  |
 | `StoreProducer`         | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`)                                             |
 | `NullStoreProducer`     | Default no-op for CLI / feature-off paths                                                                             |
