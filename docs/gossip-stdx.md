@@ -26,14 +26,14 @@ uses `#![forbid(unsafe_code)]`.
 | `src/fixed_set.rs` | `FixedSet128` | Epoch-resettable hash set for 128-bit keys |
 | `src/timing_wheel.rs` | `TimingWheel<T, G>`, `Bitset2`, `PushError`, `PushOutcome` | Hashed timing wheel with FIFO per bucket and bitmap occupancy |
 | `src/timing_wheel_tests.rs` | — | Unit/property tests for `TimingWheel` |
-| `src/spsc.rs` | `OwnedSpscProducer`, `OwnedSpscConsumer`, `spsc_channel` | Wait-free SPSC bounded ring buffer |
+| `src/spsc.rs` | `SpscProducer<T, N>`, `SpscConsumer<T, N>`, `OwnedSpscProducer<T, N>`, `OwnedSpscConsumer<T, N>`, `spsc_channel` | Wait-free SPSC bounded ring buffer |
 | `src/fastrange.rs` | `fast_range` | Division-free range reduction via multiply-high |
 | `src/fnv.rs` | `FNV_OFFSET`, `FNV_PRIME`, `fnv_mix_byte`, `fnv_mix_bytes`, `fnv_mix_opt_bytes`, `fnv_mix_u64` | FNV-1a 64-bit hashing helpers for deterministic fingerprinting |
 | `src/fnv_tests.rs` | — | Unit tests for FNV helpers |
 | `src/inline_vec_tests.rs` | — | Unit/fuzz-adjacent tests for `InlineVec` |
 | `src/perf_stats.rs` | `sat_add_u64`, `sat_add_u32`, `sat_add_usize`, `max_u64`, `max_u32`, `max_u16`, `set_u32`, `set_u64`, `set_usize` | Saturating counter helpers (no-op outside `perf-stats` + `debug_assertions`) |
 | `src/ring_buffer_tests.rs` | — | Unit/fuzz-adjacent tests for `RingBuffer` |
-| `src/test_support.rs` | `proptest_cases`, `proptest_fuzz_multiplier` | Shared proptest configuration (feature-gated: `stdx-proptest`) |
+| `src/test_support.rs` | `proptest_cases`, `proptest_fuzz_multiplier`, `miri_proptest_config` | Shared proptest configuration (`stdx-proptest`; `miri_proptest_config` is test-only) |
 
 ## Type Decision Tree
 
@@ -422,26 +422,27 @@ is enabled.
 
 | Type | Miri | Kani | Fuzz | Loom | Proptest |
 |------|------|------|------|------|----------|
-| `ByteSlab` / `ByteSlot` | Yes | — | `fuzz_byte_slab` | — | — |
+| `ByteSlab` / `ByteSlot` | Yes | 10 proofs | `fuzz_byte_slab` | — | — |
 | `InlineVec<T, N>` | Yes | 9 proofs (8 of 9 unsafe blocks) | `fuzz_inline_vec` | — | — |
-| `RingBuffer<T, N>` | Yes | — | `fuzz_ring_buffer` | — | — |
+| `RingBuffer<T, N>` | Yes | 10 proofs | `fuzz_ring_buffer` | — | — |
 | `ByteRing` | Yes | — | — | — | — |
-| `AtomicBitSet` | Yes | 6 proofs | `fuzz_atomic_bitset` | 3 tests (concurrent dedup, no lost updates, three-thread) | Yes (proptest) |
+| `AtomicBitSet` | Yes | 6 proofs | `fuzz_atomic_bitset` | 4 tests (concurrent dedup, no lost updates, three-thread, clear/reuse) | Yes (proptest) |
 | `AtomicSeenSets` | Yes | 5 proofs | — | 3 tests (tree dedup, blob dedup, independence) | Yes (proptest) |
 | `DynamicBitSet` | Yes | 12 proofs | — | — | Yes (proptest: 6 property tests) |
 | `FixedSet128` | Yes | — | — | — | Yes (proptest: 5 property tests) |
 | `TimingWheel<T, G>` | Yes | 14 proofs | `fuzz_timing_wheel` | — | Yes (proptest) |
-| `spsc_channel` | Yes | 8 proofs (bounds, FIFO, full/empty detection, wrapping, batch, drop) | `fuzz_spsc` | 2 tests (FIFO ordering, full retry) | Yes (proptest: FIFO invariant) |
-| `fast_range` | Yes | — | — | — | Yes (proptest: range, power-of-2) |
+| `spsc_channel` | Yes | 8 proofs (bounds, FIFO, full/empty detection, wrapping, batch, drop) | `fuzz_spsc` | 4 tests (FIFO ordering, full retry, batch drain, batch backpressure) | Yes (proptest: FIFO invariant) |
+| `fast_range` | Yes | — | — | — | Yes (proptest: range, p=1, power-of-2) |
 | `fnv_mix_*` | Yes | — | — | — | — |
 
 **Miri**: All tests run under Miri via `cargo +nightly miri test -p gossip-stdx`.
 
-**Kani**: Feature-gated (`cfg(kani)`). 54 total proofs across the crate.
-`InlineVec` has 9 formal proofs covering push bounds, spill preservation,
-`as_slice`, drop, clone, `from_slice`, `From<Vec>`, `uninit_array`, and spill
-element conservation. `spsc_channel` has 8 proofs covering slot index bounds,
-FIFO ordering across wrap, full/empty detection, batch pop, wrapping near
+**Kani**: Feature-gated (`cfg(kani)`). 74 total proofs across the crate.
+`ByteSlab` has 10 proofs. `InlineVec` has 9 formal proofs covering push
+bounds, spill preservation, `as_slice`, drop, clone, `from_slice`,
+`From<Vec>`, `uninit_array`, and spill element conservation. `RingBuffer`
+has 10 proofs. `spsc_channel` has 8 proofs covering slot index bounds, FIFO
+ordering across wrap, full/empty detection, batch pop, wrapping near
 `u32::MAX`, and drop coverage. `TimingWheel` has 14 proofs, `DynamicBitSet`
 has 12, `AtomicBitSet` has 6, and `AtomicSeenSets` has 5.
 
@@ -480,7 +481,7 @@ During scanner-rs consolidation, duplicate container implementations are avoided
 
 - `crossbeam-utils` (runtime) — `CachePadded` for SPSC cache-line separation
 - `criterion` (dev) — benchmarking
-- `loom` (dev) — concurrency testing for atomic types and SPSC
+- `loom` (optional runtime + dev) — concurrency testing for atomic types and SPSC
 - `proptest` (dev) — property-based testing
 
 ## Features
