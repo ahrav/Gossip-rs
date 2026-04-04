@@ -41,7 +41,6 @@ use scanner_git::{
     RefWatermarkStore, RepoOpenError, RepoOpenLimits, SeenBlobStore, StartSetConfig, run_git_scan,
 };
 
-use crate::commit_model::CheckpointAggregatorInput;
 use crate::git_executor::{ScannerGitExecutor, map_merge_strategy, map_scan_mode};
 use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
 use crate::{
@@ -60,19 +59,24 @@ pub struct GitRepoRuntime;
 
 /// Aggregate outcome from executing one mirror-backed Git repository scan.
 ///
-/// Bundles the scan metrics, an optional checkpoint input for the
-/// coordination layer, and the scanner's finalize outcome (complete vs.
+/// Bundles the scan metrics, the persistence adapter (for downstream
+/// checkpoint construction), and the scanner's finalize outcome (complete vs.
 /// partial). Produced by [`GitRepoRuntime::execute_repo`] and consumed by
-/// the distributed Git worker loop to advance the shard.
+/// the distributed Git worker loop. The caller builds the checkpoint input
+/// after obtaining durable findings and done-ledger receipts.
 #[derive(Debug)]
 #[must_use]
-pub(crate) struct GitRepoExecutionOutcome {
+pub(crate) struct GitRepoExecutionOutcome<B> {
     /// Aggregate scan metrics (objects, bytes, findings, errors) translated
     /// into the crate-level report format.
     pub(crate) report: ScanReport,
-    /// Checkpoint input synthesized from the persistence adapter's durable
-    /// state. `None` when the scan produced no persistence-backed progress.
-    pub(crate) checkpoint_input: Option<CheckpointAggregatorInput>,
+    /// The persistence adapter that managed watermarks and seen-bitmaps
+    /// during the scan. Retained so the caller can build the checkpoint
+    /// input with the real findings and done-ledger receipts.
+    pub(crate) persistence: GitPersistenceAdapter<B>,
+    /// The write context used during execution, needed for checkpoint
+    /// construction.
+    pub(crate) write_context: WriteContext,
     /// Whether the scanner fully traversed the configured start-set
     /// (`Complete`) or stopped early due to resource limits or errors.
     pub(crate) finalize_outcome: FinalizeOutcome,
@@ -103,7 +107,7 @@ impl GitRepoRuntime {
 
     /// Execute one already-prepared mirror-backed repository scan.
     ///
-    /// Orchestrates three phases:
+    /// Orchestrates two phases:
     ///
     /// 1. **Selection lowering**: explicit-commit selections inside `mirror`
     ///    are resolved to concrete ref names via `lower_selection_for_local_mirror`.
@@ -111,9 +115,10 @@ impl GitRepoRuntime {
     ///    overlay of the scan template, payload settings, and lowered selection,
     ///    then paired with a [`GitPersistenceAdapter`] so finalize results land
     ///    durably.
-    /// 3. **Checkpoint synthesis**: after the scan completes, the persistence
-    ///    adapter produces a [`CheckpointAggregatorInput`] encoding the repo's
-    ///    frontier state for coordination-layer advancement.
+    ///
+    /// The returned outcome carries the persistence adapter so the caller can
+    /// build the checkpoint input after obtaining durable findings and
+    /// done-ledger receipts from the persistence layer.
     ///
     /// # Errors
     ///
@@ -121,8 +126,6 @@ impl GitRepoRuntime {
     ///   `ScanRuntimeError::Driver`.
     /// - Engine construction or scan execution failures propagate through
     ///   the executor error boundary.
-    /// - Checkpoint synthesis failures indicate a persistence-layer
-    ///   inconsistency.
     pub(crate) fn execute_repo<B>(
         scan_template: &GitScanConfig,
         payload: &GitShardPayload,
@@ -131,7 +134,7 @@ impl GitRepoRuntime {
         abort: &AtomicBool,
         event_sink: Arc<dyn GitEventOutput + Send + Sync>,
         backend: B,
-    ) -> Result<GitRepoExecutionOutcome, ScanRuntimeError>
+    ) -> Result<GitRepoExecutionOutcome<B>, ScanRuntimeError>
     where
         B: GitPersistenceBackend,
     {
@@ -166,7 +169,8 @@ impl GitRepoRuntime {
                 );
                 return Ok(GitRepoExecutionOutcome {
                     report: ScanReport::default(),
-                    checkpoint_input: None,
+                    persistence,
+                    write_context,
                     finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
                 });
             }
@@ -180,26 +184,12 @@ impl GitRepoRuntime {
             }
         };
         let finalize_outcome = execution.result.0.finalize.outcome;
-        // Sequence number is always 0: each repo-frontier shard processes
-        // exactly one singleton repo target per lease, so the checkpoint
-        // aggregator never needs to distinguish multiple completed units.
-        let checkpoint_input = persistence
-            .repo_frontier_checkpoint_input(write_context, 0, payload.repo_key(), finalize_outcome)
-            .map_err(|error| {
-                ScanRuntimeError::Driver(anyhow::Error::new(error).context(format!(
-                    "git repo durability checkpoint synthesis failed for '{}'",
-                    digest_repo_path(mirror.path())
-                )))
-            })?;
         let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
 
-        debug_assert!(
-            !matches!(finalize_outcome, FinalizeOutcome::Complete) || checkpoint_input.is_some(),
-            "complete finalize must produce a checkpoint input"
-        );
         Ok(GitRepoExecutionOutcome {
             report,
-            checkpoint_input,
+            persistence,
+            write_context,
             finalize_outcome,
         })
     }

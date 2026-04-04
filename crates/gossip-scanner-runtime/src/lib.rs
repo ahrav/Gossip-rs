@@ -1718,7 +1718,7 @@ impl OwnedCoreEvent {
     /// Reconstructs the original borrowed `CoreEvent<'_>` from owned fields
     /// and emits it. This is the second half of the channel-based forwarding
     /// pattern: `from_core` on the producer side, `emit_into` on the consumer.
-    fn emit_into(&self, out: &dyn EventOutput) {
+    pub(crate) fn emit_into(&self, out: &dyn EventOutput) {
         match self {
             Self::Finding {
                 source,
