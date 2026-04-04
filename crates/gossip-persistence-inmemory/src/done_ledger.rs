@@ -6,7 +6,7 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use gossip_contracts::{
-    identity::TenantId,
+    identity::{PolicyHash, TenantId},
     persistence::{
         CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerRecord,
         OvidHash, PersistenceInputError,
@@ -327,7 +327,7 @@ impl DoneLedger for InMemoryDoneLedger {
     fn batch_get(
         &self,
         tenant_id: TenantId,
-        policy_hash: gossip_contracts::identity::PolicyHash,
+        policy_hash: PolicyHash,
         ovid_hashes: &[OvidHash],
     ) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error> {
         let guard = self.core.lock_state()?;
@@ -336,6 +336,25 @@ impl DoneLedger for InMemoryDoneLedger {
             .map(|ovid_hash| {
                 let key = DoneLedgerKey::new(tenant_id, policy_hash, *ovid_hash);
                 guard.durable.rows.get(&key).cloned()
+            })
+            .collect())
+    }
+
+    fn list_done_hashes(
+        &self,
+        tenant_id: TenantId,
+        policy_hash: PolicyHash,
+    ) -> Result<Vec<OvidHash>, Self::Error> {
+        let guard = self.core.lock_state()?;
+        Ok(guard
+            .durable
+            .rows
+            .iter()
+            .filter_map(|(key, record)| {
+                (key.tenant_id() == tenant_id
+                    && key.policy_hash() == policy_hash
+                    && record.status().is_terminal())
+                .then_some(key.ovid_hash())
             })
             .collect())
     }

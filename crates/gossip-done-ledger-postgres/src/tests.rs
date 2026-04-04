@@ -10,8 +10,8 @@
 //!   checksum-mismatch detection (synthetic and persisted-history tamper),
 //!   connection smoke checks, and concurrent advisory-lock serialisation.
 //! - **`DoneLedger` backend behavior** — conformance suite, positional
-//!   alignment of `batch_get`, empty-input and absent-key edge handling,
-//!   and duplicate-key merge in `batch_upsert`.
+//!   alignment of `batch_get`, terminal-key enumeration, empty-input and
+//!   absent-key edge handling, and duplicate-key merge in `batch_upsert`.
 //! - **Schema constraint enforcement** — verifies that SQL `CHECK`
 //!   constraints reject invalid status values, negative counters,
 //!   wrong-length `BYTEA` columns, and shape-inconsistent rows.
@@ -202,7 +202,8 @@ mod merge_parity_proptest;
 /// Run the contract-defined conformance suite against the PostgreSQL backend.
 ///
 /// The suite verifies idempotent upsert, fail→scan dominance, scan→fail
-/// dominance, and `batch_get` positional semantics (4 checks total).
+/// dominance, `batch_get` positional semantics, and terminal-key enumeration
+/// (5 checks total).
 #[test]
 
 fn done_ledger_backend_passes_conformance_suite() {
@@ -213,7 +214,7 @@ fn done_ledger_backend_passes_conformance_suite() {
 
     let checks = run_done_ledger_conformance(&backend)
         .unwrap_or_else(|err| panic!("done-ledger conformance failed: {err}"));
-    assert_eq!(checks, 4);
+    assert_eq!(checks, 5);
 }
 
 /// `batch_get` with an empty `ovid_hashes` slice must return an empty vec

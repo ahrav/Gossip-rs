@@ -16,9 +16,9 @@
 //!
 //! The suite is split into three independently runnable sub-suites:
 //!
-//! 1. **Done-ledger** ([`run_done_ledger_conformance`]) — four checks:
+//! 1. **Done-ledger** ([`run_done_ledger_conformance`]) — five checks:
 //!    idempotent upsert, fail-then-scan dominance, scan-then-fail dominance,
-//!    batch-get positional semantics.
+//!    batch-get positional semantics, terminal-key enumeration.
 //! 2. **Findings** ([`run_findings_conformance`]) — four checks: idempotent
 //!    upsert with durable count verification, orphan occurrence rejection,
 //!    orphan observation rejection, observation upsert merge idempotency.
@@ -49,7 +49,7 @@
 //! probe: [`FindingsConformanceProbe`]. Production code does not depend on this
 //! trait; backend test suites implement it in their test harnesses.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
 use super::{
     CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey,
@@ -141,8 +141,8 @@ pub trait FindingsConformanceProbe: Send + Sync {
 /// *all* checks passed.
 ///
 /// Current check counts (for reference):
-/// - Done-ledger: 4 (idempotent upsert, fail→scan dominance, scan→fail dominance,
-///   batch-get positional semantics)
+/// - Done-ledger: 5 (idempotent upsert, fail→scan dominance, scan→fail dominance,
+///   batch-get positional semantics, terminal-key enumeration)
 /// - Findings: 4 (idempotent upsert, orphan occurrence, orphan observation,
 ///   observation upsert merge)
 /// - Redaction: 3 (`NormHash` debug, `SecretHash` debug, `FindingRecord` debug)
@@ -333,7 +333,7 @@ where
 
 /// Run only the done-ledger portion of the conformance suite.
 ///
-/// Verifies four properties of the [`DoneLedger`] implementation:
+/// Verifies five properties of the [`DoneLedger`] implementation:
 ///
 /// 1. **Idempotent upsert** — writing the same `ScannedWithFindings` record
 ///    twice must not alter durable state. The harness writes, replays, reads
@@ -354,7 +354,11 @@ where
 ///    yield `Some`, absent keys yield `None`, and the positional alignment
 ///    must hold regardless of which keys are present.
 ///
-/// Returns the number of checks that passed (currently 4).
+/// 5. **Terminal-key enumeration** — `list_done_hashes` must return exactly
+///    the keys in the requested `(tenant, policy)` scope whose durable status
+///    is terminal. `FailedRetryable` keys must be excluded.
+///
+/// Returns the number of checks that passed (currently 5).
 ///
 /// # Errors
 ///
@@ -367,7 +371,8 @@ where
     check_done_ledger_fail_then_scan(done_ledger)?;
     check_done_ledger_scan_then_fail(done_ledger)?;
     check_done_ledger_batch_get_positional(done_ledger)?;
-    Ok(4)
+    check_done_ledger_list_done_hashes(done_ledger)?;
+    Ok(5)
 }
 
 /// Check 1: writing the same `ScannedWithFindings` record twice must not
@@ -520,6 +525,70 @@ where
         return Err(PersistenceConformanceError::DoneLedgerInvariant {
             case: "done-ledger/batch-get-positional:fetch",
             message: "result[1] should be None for an absent key, got Some".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Check 5: `list_done_hashes` must return only terminal keys for one scope.
+fn check_done_ledger_list_done_hashes<L>(done_ledger: &L) -> Result<(), PersistenceConformanceError>
+where
+    L: DoneLedger,
+{
+    let fixture = sample_fixture(0x33)?;
+    let retryable_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(20))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-retryable-version",
+        )),
+    });
+    let retryable_error_code =
+        DoneLedgerErrorCode::try_new("TEMP_RETRYABLE").map_err(|source| {
+            PersistenceConformanceError::FixtureConstruction {
+                case: "done-ledger/list-done-hashes:retryable-error-code",
+                source: Box::new(source),
+            }
+        })?;
+    let retryable_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, fixture.policy_hash, retryable_hash),
+        DoneLedgerStatus::FailedRetryable,
+        512,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(33),
+            ShardId::from_raw(34),
+            FenceEpoch::from_raw(35),
+            LogicalTime::from_raw(36),
+            LogicalTime::from_raw(37),
+        ),
+        Some(retryable_error_code),
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:retryable-record",
+        source: Box::new(source),
+    })?;
+
+    let _ = submit_done_ledger(
+        done_ledger,
+        "done-ledger/list-done-hashes:upsert",
+        &[fixture.scanned_record.clone(), retryable_record],
+    )?;
+
+    let hashes = done_ledger
+        .list_done_hashes(fixture.tenant_id, fixture.policy_hash)
+        .map_err(|err| PersistenceConformanceError::DoneLedgerGet {
+            case: "done-ledger/list-done-hashes:list",
+            source: Box::new(err),
+        })?;
+    let actual: HashSet<_> = hashes.into_iter().collect();
+    let expected = HashSet::from([fixture.ovid_hash]);
+    if actual != expected {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:list",
+            message: format!(
+                "expected terminal hash set {:?}, got {:?}",
+                expected, actual
+            ),
         });
     }
     Ok(())

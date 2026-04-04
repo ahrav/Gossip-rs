@@ -72,6 +72,23 @@ WHERE tenant_id = $1
   AND ovid_hash = ANY($3::bytea[])
 "#;
 
+/// Terminal-key enumeration query used by [`crate::DoneLedgerPg`].
+///
+/// Returns only `ovid_hash` values for one `(tenant_id, policy_hash)` scope.
+/// The backend supplies the terminal status ranks as a `SMALLINT[]`
+/// parameter so this query stays aligned with
+/// [`DoneLedgerStatus::is_terminal`](gossip_contracts::persistence::DoneLedgerStatus::is_terminal)
+/// without hard-coding enum discriminants in SQL text.
+///
+/// The existing `(tenant_id, policy_hash, finished_at DESC, ovid_hash)` index
+/// covers the leading scope columns used here.
+pub const LIST_DONE_HASHES_SQL: &str = r#"
+SELECT ovid_hash FROM done_ledger_entries
+WHERE tenant_id = $1
+  AND policy_hash = $2
+  AND status = ANY($3::smallint[])
+"#;
+
 /// Bulk monotonic done-ledger UPSERT used by [`crate::DoneLedgerPg`].
 ///
 /// Accepts 12 array parameters (one per column) and uses `unnest()` to
