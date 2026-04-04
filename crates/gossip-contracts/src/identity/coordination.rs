@@ -114,13 +114,19 @@ impl FenceEpoch {
     /// The first valid epoch (value=1); shard records start here after creation.
     pub const INITIAL: Self = Self(1);
 
-    /// Construct from a raw `u64`.
+    /// Constructs the identity type directly from its underlying 64-bit representation.
+    ///
+    /// This bypasses domain-specific generation (e.g. random assignment or splitting)
+    /// and is primarily used when deserializing from network payloads or database records.
     #[inline]
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
-    /// Return the inner `u64`.
+    /// Extracts the raw 64-bit integer representing this identity.
+    ///
+    /// Use this for low-level serialization or when bridging to systems
+    /// that do not share the strong typing of the coordination module.
     #[inline]
     pub const fn as_raw(&self) -> u64 {
         self.0
@@ -188,13 +194,19 @@ impl LogicalTime {
     /// The zero sentinel -- origin of time; operations require `now > ZERO`.
     pub const ZERO: Self = Self(0);
 
-    /// Construct from a raw `u64`.
+    /// Constructs the identity type directly from its underlying 64-bit representation.
+    ///
+    /// This bypasses domain-specific generation (e.g. random assignment or splitting)
+    /// and is primarily used when deserializing from network payloads or database records.
     #[inline]
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
-    /// Return the inner `u64`.
+    /// Extracts the raw 64-bit integer representing this identity.
+    ///
+    /// Use this for low-level serialization or when bridging to systems
+    /// that do not share the strong typing of the coordination module.
     #[inline]
     pub const fn as_raw(&self) -> u64 {
         self.0
