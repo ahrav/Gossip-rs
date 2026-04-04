@@ -2745,19 +2745,16 @@ where
     Ok((report, completion))
 }
 
-/// Submit findings and a done-ledger entry for one completed Git repo scan.
+/// Build a done-ledger entry for one completed Git repo scan.
 ///
-/// Persists captured findings first, then constructs and submits the
-/// done-ledger record. Returns both receipts so the caller can build a
-/// durable checkpoint.
+/// # Precondition
 ///
-/// # Partial write window
+/// `detected_count` must be zero — the caller's fail-fast guard rejects
+/// leases with nonzero findings before this helper is reached. A zero-count
+/// `FindingsCommitReceipt` is synthesized without touching the findings sink.
 ///
-/// If findings upsert succeeds but the done-ledger submit fails, orphaned
-/// findings rows persist in the sink. This is safe because
-/// `FindingsSink::upsert_batch` uses upsert (idempotent) semantics: on
-/// re-claim the repo is re-scanned and findings are re-submitted, with
-/// duplicates deduplicated by the sink's primary key.
+/// Once durable findings translation is implemented, this helper will
+/// persist translated findings before the done-ledger write.
 #[allow(clippy::too_many_arguments)]
 fn persist_git_repo_findings_and_done_ledger<F, D>(
     persistence: &DistributedPersistence<F, D>,
@@ -2789,18 +2786,9 @@ where
     let findings_receipt = FindingsCommitReceipt::new(0, 0, 0);
 
     // --- done-ledger submission ---
-    let findings_count = match u32::try_from(detected_count) {
-        Ok(count) => count,
-        Err(_) => {
-            tracing::warn!(
-                shard_id,
-                actual_count = detected_count,
-                saturated_to = u32::MAX,
-                "findings count exceeds u32::MAX; done-ledger record clamped"
-            );
-            u32::MAX
-        }
-    };
+    // findings_count is derived from the synthesized receipt to keep the
+    // receipt chain explicit. On this zero-findings path the value is always 0.
+    let findings_count = u32::try_from(findings_receipt.finding_count()).unwrap_or(u32::MAX);
     let record = crate::git_persistence::build_git_repo_done_ledger_record(
         write_context,
         repo_id,
@@ -6512,8 +6500,7 @@ mod tests {
     }
 
     /// Git events are emitted during the scan phase, before the findings
-    /// guard evaluates. The result is discarded because this test only
-    /// verifies that telemetry events are recorded.
+    /// guard can reject the lease.
     #[test]
     fn run_git_repo_worker_records_git_events() {
         let repo = create_git_repo_fixture();
