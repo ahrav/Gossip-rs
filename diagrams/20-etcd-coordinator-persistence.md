@@ -465,15 +465,15 @@ provide the same semantics for I/O-bound contexts:
 graph TB
     subgraph sync_traits ["Sync Coordination Traits"]
         direction TB
-        CB_TRAIT["CoordinationBackend<br/>7 shard lifecycle methods:<br/>acquire_and_restore_into, renew, checkpoint,<br/>complete, park, split_replace,<br/>split_residual"]
-        RM_TRAIT["RunManagement<br/>10 run lifecycle methods:<br/>create/complete/fail/cancel run,<br/>register_shards, get_run,<br/>get_run_progress, list_shards,<br/>collect_claim_candidates, unpark"]
+        CB_TRAIT["CoordinationBackend<br/>7 shard lifecycle methods:<br/>acquire_and_restore_into, renew, checkpoint,<br/>complete, park_shard, split_replace,<br/>split_residual"]
+        RM_TRAIT["RunManagement<br/>11 run/admin methods:<br/>create_run, register_shards,<br/>create_run_with_shards, get_run,<br/>get_run_progress, list_shards_into,<br/>collect_claim_candidates_into,<br/>complete_run, fail_run, cancel_run,<br/>unpark_shard"]
         SC_TRAIT["ShardClaiming<br/>1 method:<br/>claim_next_available"]
     end
 
     subgraph async_traits ["Async Coordination Traits"]
         direction TB
         ACB_TRAIT["AsyncCoordinationBackend<br/>7 async fn shard lifecycle methods<br/>(same semantics as sync)"]
-        ARM_TRAIT["AsyncRunManagement<br/>10 async fn run lifecycle methods<br/>(same semantics as sync)"]
+        ARM_TRAIT["AsyncRunManagement<br/>11 async fn run/admin methods<br/>(same semantics as sync)"]
     end
 
     subgraph backends ["Coordination Backends"]

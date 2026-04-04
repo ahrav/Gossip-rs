@@ -62,11 +62,11 @@ main()
   |     |                      |
   |     |                      +--> Ok(_) --> exit 0
   |     |                      |
-  |     |                      +--> Err(e) --> eprintln!("{e}") --> exit 2
+  |     |                      +--> Err(e) --> print_error_chain(&e) --> exit 2
   |     |
   |     +--> Err(HelpRequested(usage)) --> println!("{usage}") --> exit 0
   |     |
-  |     +--> Err(error) --> eprintln!("{error}") --> exit 2
+  |     +--> Err(error) --> print_error_chain(&error) --> exit 2
 ```
 
 ### Exit codes
@@ -90,9 +90,9 @@ scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
 | Flag | Values | Default | Purpose |
 |------|--------|---------|---------|
 | `--execution-mode` | `direct`, `connector` | `direct` | Execution mode |
-| `--max-items` | integer | 256 | Checkpoint frequency |
-| `--max-bytes` | integer | 1000000 | Byte budget |
-| `--workers` | integer >= 1 | CPU count | Worker threads |
+| `--max-items` | integer | 4096 | Checkpoint frequency |
+| `--max-bytes` | integer | 67108864 (64 MiB) | Byte budget |
+| `--workers` | integer >= 1 | runtime-selected | Worker threads |
 | `--decode-depth` | integer | engine default | Max transform decode depth |
 | `--anchors` | `manual`, `derived` | `manual` | Anchor extraction mode |
 | `--rules` | file path | built-in | Custom YAML rules file |
@@ -117,7 +117,7 @@ scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
 |------|---------|
 | `--repo` | Repository path (also accepted positionally) |
 | `--scan-binary` / `--skip-binary` | Toggle binary blob scanning |
-| `--debug` / `--debug=perf` | Debug output to stderr (stats or perf) |
+| `--debug`, `--debug=stats`, `--debug=perf` | Debug output to stderr (stats or perf) |
 | `--enrich-identities` | Emit identity dictionary |
 
 ### Git hidden flags (parsed but excluded from `--help`)
@@ -145,7 +145,7 @@ Builder-pattern configuration parsed from CLI arguments:
 |-------|------|---------|---------|
 | `source` | `CliSource` | required | `Fs { path }` or `Git { repo }` |
 | `execution_mode` | `ExecutionMode` | `Direct` | `Direct` or `Connector` |
-| `budgets` | `ScanBudgets` | `{ 256, 1M }` | Checkpoint frequency and byte budget |
+| `budgets` | `ScanBudgets` | `{ 4096, 64 MiB }` | Checkpoint frequency and byte budget |
 | `null_sink` | `bool` | `false` | Drop all events |
 | `event_format` | `EventFormat` | `Jsonl` | Output format |
 | `verbose` | `bool` | `false` | Verbose text output |

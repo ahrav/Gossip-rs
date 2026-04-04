@@ -123,8 +123,8 @@ logical time advanced via `now(t)`.
 | Op-log eviction    | `op_log_eviction_treats_old_op_as_new`                                                                                                    |
 | Tenant isolation   | `acquire_wrong_tenant_returns_not_found`, `checkpoint_wrong_tenant_returns_not_found`, etc.                                               |
 | Shard count limits | `split_replace_exceeds_per_tenant_limit`, `split_residual_exceeds_global_limit`, `register_shards_exceeds_per_tenant_limit`               |
-| Run lifecycle      | `complete_run_happy_path`, `fail_run_happy_path`, `cancel_run_from_initializing`, `terminal_ops_set_completed_at`                         |
-| Unpark             | `unpark_shard_happy_path`, `unpark_shard_fence_epoch_bumped`, `unpark_shard_cursor_preserved`, `unpark_shard_rejected_when_run_cancelled` |
+| Run lifecycle      | `terminal_op_happy_path`, `cancel_run_from_initializing`, `terminal_op_idempotent_replay`, `complete_run_not_found`                       |
+| Unpark             | `unpark_shard_happy_path`, `unpark_shard_fence_epoch_bumped`, `unpark_shard_cursor_preserved`, `unpark_shard_rejected_when_run_terminal` |
 | List shards        | `list_shards_filter_active`, `list_shards_filter_available`, `list_shards_filter_parked`, `list_shards_filter_root_only`                  |
 | Integration        | `full_lifecycle_acquire_checkpoint_split_residual_complete`, `full_run_lifecycle_create_register_process_complete`                        |
 

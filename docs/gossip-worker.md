@@ -193,8 +193,8 @@ override environment values when both are present.
 | `GOSSIP_WORKER_ID` | u64, must be >= 1 | *(none)* | Yes (production) | Worker identity. Zero is the unassigned sentinel and is rejected. |
 | `GOSSIP_POLICY_HASH` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Policy hash for the scan ruleset. Accepts optional `0x` prefix. |
 | `GOSSIP_TENANT_SECRET_KEY` | 64 hex chars (32 bytes) | *(none)* | Yes (production) | Tenant secret key. Must not be all zeros. Accepts optional `0x` prefix. |
-| `GOSSIP_MAX_ITEMS` | 1..10,000,000 | `256` | No | Maximum items processed between checkpoints. |
-| `GOSSIP_MAX_BYTES` | 1..64 GiB | `1000000` | No | Maximum bytes processed between checkpoints (1 MB default). |
+| `GOSSIP_MAX_ITEMS` | 1..10,000,000 | `4096` | No | Maximum items processed between checkpoints. |
+| `GOSSIP_MAX_BYTES` | 1..64 GiB | `67108864` (64 MiB) | No | Maximum bytes processed between checkpoints. |
 | `GOSSIP_COMMIT_QUEUE_CAPACITY` | 1..65,536 | `64` | No | Bounded commit queue capacity for the distributed runtime. |
 | `GOSSIP_WORKER_RULES_FILE` | filesystem path | *(none)* | No | Path to an optional rules file. |
 | `GOSSIP_WORKER_DECODE_DEPTH` | non-negative integer | *(none)* | No | Maximum decode depth for nested content extraction. |

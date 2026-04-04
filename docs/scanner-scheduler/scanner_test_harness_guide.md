@@ -106,6 +106,7 @@ Configuration for a single simulation run.
 | `scan_utf16_variants`   | bool          | true     | Enable UTF-16 LE/BE scanning                                       |
 | `archive`               | ArchiveConfig | default  | Archive scanning configuration (shared with production)            |
 | `stability_runs`        | u32           | 2        | Runs per scenario with different schedule seeds                    |
+| `archive_deadline_countdown` | Option<u32> | None | Test-only deterministic timeout trigger for archive deadline paths |
 
 **Example:**
 ```rust
@@ -121,6 +122,7 @@ let run_cfg = RunConfig {
     scan_utf16_variants: true,
     archive: ArchiveConfig::default(),
     stability_runs: 3,
+    archive_deadline_countdown: None,
 };
 ```
 
@@ -256,6 +258,7 @@ let run_cfg = RunConfig {
     scan_utf16_variants: true,
     archive: ArchiveConfig::default(),
     stability_runs: 1,
+    archive_deadline_countdown: None,
 };
 ```
 
@@ -316,6 +319,7 @@ let run_cfg = RunConfig {
     scan_utf16_variants: true,
     archive: ArchiveConfig::default(),
     stability_runs: 1,
+    archive_deadline_countdown: None,
 };
 ```
 
