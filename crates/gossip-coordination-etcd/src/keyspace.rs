@@ -50,7 +50,7 @@
 //!   that appends into a caller-owned `&mut String` without clearing it first.
 //!   This trades API simplicity for performance, allowing hot-path callers to
 //!   reuse a single buffer and avoid per-call heap allocation. Exact-key convenience
-//!   methods return typed wrappers such as `RunRecordKey` and `ShardOwnerKey`,
+//!   methods return typed wrappers such as [`RunRecordKey`] and [`ShardOwnerKey`],
 //!   while prefix-scan helpers continue to return `String`.
 
 use std::fmt;
