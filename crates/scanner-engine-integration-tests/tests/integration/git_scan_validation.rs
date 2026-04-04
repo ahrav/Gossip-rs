@@ -37,7 +37,7 @@ fn perf_stats_enabled() -> bool {
 }
 
 /// Returns true when the `git` CLI is available on the host.
-fn git_available() -> bool {
+pub(crate) fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
 
@@ -52,7 +52,7 @@ fn run_git(repo: &Path, args: &[&str]) {
 }
 
 /// Runs a git command and returns UTF-8 stdout, asserting success.
-fn git_output(repo: &Path, args: &[&str]) -> String {
+pub(crate) fn git_output(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -77,13 +77,13 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 }
 
 /// Parse a Git object ID from hex output.
-fn oid_from_hex(hex: &str) -> OidBytes {
+pub(crate) fn oid_from_hex(hex: &str) -> OidBytes {
     let bytes = decode_hex(hex.trim());
     OidBytes::from_slice(&bytes)
 }
 
 /// Initialize a new repo with a deterministic user identity.
-fn init_repo() -> TempDir {
+pub(crate) fn init_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
     run_git(tmp.path(), &["init", "-b", "main"]);
     run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
@@ -92,7 +92,7 @@ fn init_repo() -> TempDir {
 }
 
 /// Write a file and commit it to the repo.
-fn commit_file(repo: &Path, name: &str, contents: &str, msg: &str) {
+pub(crate) fn commit_file(repo: &Path, name: &str, contents: &str, msg: &str) {
     let path = repo.join(name);
     fs::write(&path, contents).unwrap();
     run_git(repo, &["add", name]);
@@ -100,7 +100,7 @@ fn commit_file(repo: &Path, name: &str, contents: &str, msg: &str) {
 }
 
 /// Ensure all objects are packed and indexed.
-fn ensure_artifacts(repo: &Path) {
+pub(crate) fn ensure_artifacts(repo: &Path) {
     run_git(repo, &["gc"]);
 }
 
@@ -110,7 +110,7 @@ fn repack_all(repo: &Path) {
 }
 
 /// Build a tiny engine that detects TOK_ secrets (and Base64 variants).
-fn test_engine() -> Engine {
+pub(crate) fn test_engine() -> Engine {
     let rule = RuleSpec {
         name: "tok",
         anchors: &[b"TOK_"],
@@ -151,8 +151,8 @@ fn test_engine() -> Engine {
 }
 
 /// Start set resolver pinned to the current `main` tip.
-struct TestResolver {
-    tip: OidBytes,
+pub(crate) struct TestResolver {
+    pub(crate) tip: OidBytes,
 }
 
 impl StartSetResolver for TestResolver {
@@ -230,7 +230,7 @@ fn run_scan(repo: &Path, watermark: Option<RefWatermark>) -> GitScanResult {
     run_scan_with_config(repo, watermark, base_config()).unwrap()
 }
 
-fn base_config() -> GitScanConfig {
+pub(crate) fn base_config() -> GitScanConfig {
     GitScanConfig {
         repo_id: 42,
         policy_hash: [0x11; 32],
