@@ -2507,7 +2507,9 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("ultra-secret"));
-        assert!(!debug.contains("3333333333333333333333333333333333333333333333333333333333333333"));
+        assert!(
+            !debug.contains("3333333333333333333333333333333333333333333333333333333333333333")
+        );
         assert!(debug.contains("[redacted]"));
     }
 
