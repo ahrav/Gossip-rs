@@ -378,6 +378,8 @@ watermarks without corresponding data writes.
 | `persist_finalize_output`     | `persist.rs`                         |
 | Worker runtime safety         | `runner_exec.rs`                     |
 | Scheduler task execution      | `runner_exec.rs`                     |
+| `SeenBitmapDelta` (finalize-time delta) | `roaring_seen.rs`              |
+| `RoaringSeenBitmap` (durable scope snapshot) | `roaring_seen.rs`         |
 
 ## Related Docs
 
