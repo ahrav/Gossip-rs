@@ -24,7 +24,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gossip_contracts::connector::git::{GitExecutionLimits, GitMergeStrategy, GitScanMode};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, TenantId, WorkerId};
@@ -34,6 +34,7 @@ use gossip_coordination::{
 };
 use gossip_coordination_etcd::test_support::{
     contention_namespace, test_coordinator_in_namespace, test_coordinator_in_namespace_with_tuning,
+    wait_for_owner_binding_expiry,
 };
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig};
 use gossip_done_ledger_postgres::{
@@ -49,7 +50,7 @@ use gossip_orchestrator::{
     plan_filesystem_initial_shards, plan_git_initial_shards, setup_filesystem_run, setup_git_run,
 };
 use gossip_pg_common::test_support::create_test_db;
-use gossip_scanner_runtime::test_fixtures::{init_git_repo, run_git_in};
+use gossip_scanner_runtime::test_fixtures::{init_git_repo, run_git_in, run_git_in_stdout};
 use gossip_stdx::hex_encode;
 use gossip_worker::config::{
     ENV_COMMIT_QUEUE_CAPACITY, ENV_DONE_LEDGER_POSTGRES_DSN, ENV_ETCD_ENDPOINTS,
@@ -111,8 +112,7 @@ struct SafeScanFixture {
     /// RAII guard — dropping this removes the temporary scan directory.
     scan_root: TempDir,
     /// RAII guard — dropping this removes the temporary rules directory.
-    #[allow(dead_code)]
-    rules_root: TempDir,
+    _rules_root: TempDir,
     rules_path: PathBuf,
 }
 
@@ -134,7 +134,7 @@ impl SafeScanFixture {
 
         Self {
             scan_root,
-            rules_root,
+            _rules_root: rules_root,
             rules_path,
         }
     }
@@ -155,27 +155,6 @@ fn create_rules_fixture() -> (TempDir, PathBuf) {
     (rules_root, rules_path)
 }
 
-fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("git command should run");
-    assert!(
-        output.status.success(),
-        "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
-        dir.display(),
-        args.join(" "),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout)
-        .expect("git stdout should be valid UTF-8")
-        .trim()
-        .to_owned()
-}
-
 #[derive(Clone, Debug)]
 struct GitRepoFixture {
     path: PathBuf,
@@ -190,13 +169,11 @@ struct GitRepoFixture {
 /// rules file required by connector-mode Git launches.
 struct GitScanFixture {
     /// RAII guard — dropping this removes the temporary repo workspace.
-    #[allow(dead_code)]
-    workspace_root: TempDir,
+    _workspace_root: TempDir,
     /// RAII guard — dropping this removes the worker-local mirror cache root.
     mirror_root: TempDir,
     /// RAII guard — dropping this removes the temporary rules directory.
-    #[allow(dead_code)]
-    rules_root: TempDir,
+    _rules_root: TempDir,
     rules_path: PathBuf,
     repos: Vec<GitRepoFixture>,
 }
@@ -213,9 +190,9 @@ impl GitScanFixture {
             .collect();
 
         Self {
-            workspace_root,
+            _workspace_root: workspace_root,
             mirror_root,
-            rules_root,
+            _rules_root: rules_root,
             rules_path,
             repos,
         }
@@ -265,55 +242,35 @@ fn create_committed_git_repo(workspace_root: &Path, index: usize) -> GitRepoFixt
     let commit_message = format!("fixture-{index}");
     run_git_in(&repo_path, &["commit", "-q", "-m", commit_message.as_str()]);
 
+    let head_oid = run_git_in_stdout(&repo_path, &["rev-parse", "HEAD"]);
     GitRepoFixture {
-        path: repo_path.clone(),
-        head_oid: git_stdout(&repo_path, &["rev-parse", "HEAD"]),
+        path: repo_path,
+        head_oid,
     }
 }
 
-/// Live-backend filesystem proof seeded through real etcd and PostgreSQL.
-struct SeededLaunchProof {
+/// Shared etcd + PostgreSQL test backends used by all launch proof types.
+///
+/// Creates an isolated etcd namespace, a done-ledger database, and a findings
+/// database — all migrated and ready for shard submission.
+struct SeededBackends {
     coordinator: EtcdCoordinator,
     done_ledger_dsn: String,
     findings_dsn: String,
-    fixture: SafeScanFixture,
-    shard_key: ShardKey,
 }
 
-impl SeededLaunchProof {
+impl SeededBackends {
     fn new() -> Self {
         let namespace = contention_namespace();
-        let mut coordinator = test_coordinator_in_namespace(&namespace);
+        let coordinator = test_coordinator_in_namespace(&namespace);
         let done_ledger_dsn = create_test_db();
         let findings_dsn = create_test_db();
         migrate_database_pair(&done_ledger_dsn, &findings_dsn);
-
-        let fixture = SafeScanFixture::new();
-        let shard_key = submit_filesystem_request(
-            &mut coordinator,
-            fixture.scan_path(),
-            DEFAULT_LEASE_DURATION_MS,
-        );
-
         Self {
             coordinator,
             done_ledger_dsn,
             findings_dsn,
-            fixture,
-            shard_key,
         }
-    }
-
-    fn run_worker_binary(&self) -> Output {
-        run_worker_process(
-            self.coordinator.config(),
-            &self.done_ledger_dsn,
-            &self.findings_dsn,
-            WorkerLaunchTarget::Fs {
-                path: self.fixture.scan_path(),
-            },
-            self.fixture.rules_path(),
-        )
     }
 
     fn done_ledger_row_count(&self) -> i64 {
@@ -328,30 +285,60 @@ impl SeededLaunchProof {
     }
 }
 
+/// Live-backend filesystem proof seeded through real etcd and PostgreSQL.
+struct SeededLaunchProof {
+    backends: SeededBackends,
+    fixture: SafeScanFixture,
+    shard_key: ShardKey,
+}
+
+impl SeededLaunchProof {
+    fn new() -> Self {
+        let mut backends = SeededBackends::new();
+        let fixture = SafeScanFixture::new();
+        let shard_key = submit_filesystem_request(
+            &mut backends.coordinator,
+            fixture.scan_path(),
+            DEFAULT_LEASE_DURATION_MS,
+        );
+
+        Self {
+            backends,
+            fixture,
+            shard_key,
+        }
+    }
+
+    fn run_worker_binary(&self) -> Output {
+        run_worker_process(
+            self.backends.coordinator.config(),
+            &self.backends.done_ledger_dsn,
+            &self.backends.findings_dsn,
+            WorkerLaunchTarget::Fs {
+                path: self.fixture.scan_path(),
+            },
+            self.fixture.rules_path(),
+        )
+    }
+}
+
 /// Live-backend Git proof seeded through real etcd, PostgreSQL, and a local repo fixture.
 ///
 /// The fixture must contain at least one committed repo so the worker can
 /// lower request-side selection into a real repository scan and persist durable
 /// completion state against the production-shaped backends.
 struct GitSeededLaunchProof {
-    coordinator: EtcdCoordinator,
-    done_ledger_dsn: String,
-    findings_dsn: String,
+    backends: SeededBackends,
     fixture: GitScanFixture,
     shard_key: ShardKey,
 }
 
 impl GitSeededLaunchProof {
     fn new() -> Self {
-        let namespace = contention_namespace();
-        let mut coordinator = test_coordinator_in_namespace(&namespace);
-        let done_ledger_dsn = create_test_db();
-        let findings_dsn = create_test_db();
-        migrate_database_pair(&done_ledger_dsn, &findings_dsn);
-
+        let mut backends = SeededBackends::new();
         let fixture = GitScanFixture::new(1);
         let submission = submit_git_request(
-            &mut coordinator,
+            &mut backends.coordinator,
             GitRequest::single_repo(
                 tenant_id(),
                 fixture.primary_repo().path.as_path(),
@@ -364,9 +351,7 @@ impl GitSeededLaunchProof {
         );
 
         Self {
-            coordinator,
-            done_ledger_dsn,
-            findings_dsn,
+            backends,
             fixture,
             shard_key: submission.shard_keys[0],
         }
@@ -374,26 +359,15 @@ impl GitSeededLaunchProof {
 
     fn run_worker_binary(&self) -> Output {
         run_worker_process(
-            self.coordinator.config(),
-            &self.done_ledger_dsn,
-            &self.findings_dsn,
+            self.backends.coordinator.config(),
+            &self.backends.done_ledger_dsn,
+            &self.backends.findings_dsn,
             WorkerLaunchTarget::Git {
                 path: self.fixture.primary_repo().path.as_path(),
                 mirror_root: self.fixture.mirror_root(),
             },
             self.fixture.rules_path(),
         )
-    }
-
-    fn done_ledger_row_count(&self) -> i64 {
-        table_row_count(
-            &self.done_ledger_dsn,
-            done_ledger_schema::DONE_LEDGER_ENTRIES_TABLE,
-        )
-    }
-
-    fn observation_row_count(&self) -> i64 {
-        table_row_count(&self.findings_dsn, findings_schema::OBSERVATIONS_TABLE)
     }
 }
 
@@ -433,6 +407,7 @@ fn default_git_execution_limits() -> GitExecutionLimits {
 struct SubmittedGitRun {
     plan: GitInitialShardPlan,
     shard_keys: Vec<ShardKey>,
+    payloads: Vec<GitShardPayload>,
 }
 
 /// Register one Git request through the real orchestrator setup path.
@@ -484,18 +459,22 @@ fn submit_git_request(
         "Git submission should register one root shard per planned target"
     );
 
-    let shard_keys = setup
+    let (shard_keys, payloads) = setup
         .root_shards()
         .iter()
         .zip(plan.entries())
         .map(|(&shard_id, entry)| {
             let key = ShardKey::new(run_id(), shard_id);
-            assert_registered_git_shard_state(coordinator, key, entry);
-            key
+            let payload = assert_registered_git_shard_state(coordinator, key, entry);
+            (key, payload)
         })
-        .collect();
+        .unzip();
 
-    SubmittedGitRun { plan, shard_keys }
+    SubmittedGitRun {
+        plan,
+        shard_keys,
+        payloads,
+    }
 }
 
 fn submit_filesystem_request(
@@ -595,28 +574,45 @@ fn assert_registered_git_shard_state(
     payload
 }
 
-fn assert_completed_filesystem_shard_state(coordinator: &EtcdCoordinator, key: ShardKey) {
+/// Assert that a shard completed durably and released its live lease state.
+///
+/// Validates the persisted etcd snapshot: Done status, a non-trivial progress
+/// cursor, and no live owner binding. Each connector-family wrapper calls this
+/// for the common invariants before optionally adding connector-specific checks.
+fn assert_completed_shard_invariants(coordinator: &EtcdCoordinator, key: ShardKey, label: &str) {
     let shard = coordinator
         .test_load_shard_snapshot(tenant_id(), key)
-        .expect("shard snapshot lookup should succeed")
-        .expect("submitted shard must still exist after worker completion");
-    assert_eq!(shard.status, ShardStatus::Done);
+        .unwrap_or_else(|e| panic!("{label}: shard snapshot lookup should succeed: {e}"))
+        .unwrap_or_else(|| panic!("{label}: shard must still exist after worker completion"));
+    assert_eq!(
+        shard.status,
+        ShardStatus::Done,
+        "{label}: shard should be Done"
+    );
     assert!(
         shard.cursor.last_key(shard.slab()).is_some(),
-        "receipt-driven completion must persist a progress cursor"
+        "{label}: completion must persist a progress cursor"
     );
     assert_ne!(
         shard.cursor.last_key(shard.slab()),
         Some(b"\x00".as_slice()),
-        "non-empty proof fixture must checkpoint a real filesystem progress key"
+        "{label}: completion must checkpoint a real progress key, not a sentinel"
     );
     assert!(
         coordinator
             .test_load_owner_binding(tenant_id(), key)
-            .expect("owner-binding lookup should succeed after completion")
+            .unwrap_or_else(|e| panic!("{label}: owner-binding lookup should succeed: {e}"))
             .is_none(),
-        "completed shard must not retain a live owner binding"
+        "{label}: completed shard must not retain a live owner binding"
     );
+}
+
+/// Assert that a filesystem shard completed durably.
+///
+/// Validates all common completion invariants (Done status, non-trivial
+/// progress cursor, no owner binding) via [`assert_completed_shard_invariants`].
+fn assert_completed_filesystem_shard_state(coordinator: &EtcdCoordinator, key: ShardKey) {
+    assert_completed_shard_invariants(coordinator, key, "filesystem");
 }
 
 /// Assert that a Git shard completed durably and released its live lease state.
@@ -625,22 +621,7 @@ fn assert_completed_filesystem_shard_state(coordinator: &EtcdCoordinator, key: S
 /// transient runtime reports so the proof exercises the same post-conditions a
 /// restarted worker would observe.
 fn assert_completed_git_shard_state(coordinator: &EtcdCoordinator, key: ShardKey) {
-    let shard = coordinator
-        .test_load_shard_snapshot(tenant_id(), key)
-        .expect("Git shard snapshot lookup should succeed")
-        .expect("submitted Git shard must still exist after worker completion");
-    assert_eq!(shard.status, ShardStatus::Done);
-    assert!(
-        shard.cursor.last_key(shard.slab()).is_some(),
-        "Git completion must persist a progress cursor"
-    );
-    assert!(
-        coordinator
-            .test_load_owner_binding(tenant_id(), key)
-            .expect("owner-binding lookup should succeed after Git completion")
-            .is_none(),
-        "completed Git shard must not retain a live owner binding"
-    );
+    assert_completed_shard_invariants(coordinator, key, "git");
 }
 
 fn worker_binary_path() -> PathBuf {
@@ -816,6 +797,12 @@ fn assert_worker_success(output: &Output, context: &str) {
     );
 }
 
+/// Count rows in `table` from the database at `dsn`.
+///
+/// The table name is validated to be a plain SQL identifier (alphanumeric +
+/// underscore) before interpolation. This is safe because all call sites pass
+/// compile-time schema constants, and the assert guards against accidental
+/// misuse if the function is ever called with dynamic input.
 fn table_row_count(dsn: &str, table: &str) -> i64 {
     assert!(
         !table.is_empty() && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
@@ -826,30 +813,6 @@ fn table_row_count(dsn: &str, table: &str) -> i64 {
         .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
         .expect("row-count query should succeed")
         .get::<_, i64>(0)
-}
-
-/// Poll until the owner binding for `key` disappears, or panic if
-/// `ttl_secs + 10s` elapses without cleanup.  The generous fixed margin
-/// absorbs CI-host scheduling jitter, matching the canonical pattern in
-/// `gossip-coordination-etcd::tests::wait_for_owner_binding_expiry`.
-fn wait_for_owner_binding_expiry(coordinator: &EtcdCoordinator, key: ShardKey, ttl_secs: i64) {
-    let deadline = Instant::now()
-        + Duration::from_secs(u64::try_from(ttl_secs).expect("TTL must be non-negative") + 10);
-    let interval = Duration::from_millis(250);
-    loop {
-        if coordinator
-            .test_load_owner_binding(tenant_id(), key)
-            .expect("owner-binding lookup should succeed")
-            .is_none()
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "owner binding did not expire within {ttl_secs}s + 10s margin"
-        );
-        std::thread::sleep(interval);
-    }
 }
 
 #[test]
@@ -863,8 +826,8 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
         "worker should produce diagnostic output on stderr"
     );
 
-    let done_ledger_rows = proof.done_ledger_row_count();
-    let observation_rows = proof.observation_row_count();
+    let done_ledger_rows = proof.backends.done_ledger_row_count();
+    let observation_rows = proof.backends.observation_row_count();
     // The scan fixture contains exactly 2 files (evidence.txt, readme.txt),
     // producing one done-ledger entry per scanned object-version.
     assert_eq!(
@@ -877,7 +840,7 @@ fn worker_binary_happy_path_commits_to_real_backends_and_completes_the_shard() {
         "expected exactly 1 observation for rule '{}', got {observation_rows}",
         SAFE_RULE_NAME,
     );
-    assert_completed_filesystem_shard_state(&proof.coordinator, proof.shard_key);
+    assert_completed_filesystem_shard_state(&proof.backends.coordinator, proof.shard_key);
 }
 
 #[test]
@@ -886,8 +849,8 @@ fn worker_binary_restart_is_idempotent_after_completed_shard() {
 
     let first = proof.run_worker_binary();
     assert_worker_success(&first, "first real-backend worker launch");
-    let done_rows_after_first = proof.done_ledger_row_count();
-    let observation_rows_after_first = proof.observation_row_count();
+    let done_rows_after_first = proof.backends.done_ledger_row_count();
+    let observation_rows_after_first = proof.backends.observation_row_count();
     assert_eq!(
         done_rows_after_first, 2,
         "first launch must write exactly 2 done-ledger rows (one per scanned file), \
@@ -903,17 +866,17 @@ fn worker_binary_restart_is_idempotent_after_completed_shard() {
     assert_worker_success(&second, "worker restart after completed shard");
 
     assert_eq!(
-        proof.done_ledger_row_count(),
+        proof.backends.done_ledger_row_count(),
         done_rows_after_first,
         "restarting after shard completion must not duplicate done-ledger rows"
     );
     assert_eq!(
-        proof.observation_row_count(),
+        proof.backends.observation_row_count(),
         observation_rows_after_first,
         "restarting after shard completion must not duplicate findings observations"
     );
 
-    assert_completed_filesystem_shard_state(&proof.coordinator, proof.shard_key);
+    assert_completed_filesystem_shard_state(&proof.backends.coordinator, proof.shard_key);
 }
 
 /// Verifies that default-branch Git submission registers one active, claimable shard.
@@ -937,13 +900,8 @@ fn git_submit_default_selection_registers_claimable_shard_in_etcd() {
     );
 
     assert_eq!(submission.shard_keys.len(), 1);
-    let payload = assert_registered_git_shard_state(
-        &coordinator,
-        submission.shard_keys[0],
-        &submission.plan.entries()[0],
-    );
     assert!(matches!(
-        payload.selection(),
+        submission.payloads[0].selection(),
         NormalizedGitSelection::DefaultBranchOnly
     ));
 }
@@ -969,12 +927,7 @@ fn git_submit_explicit_refs_registers_shard_with_ref_selection_payload() {
         OpId::from_raw(32),
     );
 
-    let payload = assert_registered_git_shard_state(
-        &coordinator,
-        submission.shard_keys[0],
-        &submission.plan.entries()[0],
-    );
-    match payload.selection() {
+    match submission.payloads[0].selection() {
         NormalizedGitSelection::ExplicitRefs { refs } => {
             assert_eq!(refs, &[MAIN_REF.as_bytes().to_vec()]);
         }
@@ -1004,12 +957,7 @@ fn git_submit_explicit_commit_registers_shard_with_oid_payload() {
         OpId::from_raw(33),
     );
 
-    let payload = assert_registered_git_shard_state(
-        &coordinator,
-        submission.shard_keys[0],
-        &submission.plan.entries()[0],
-    );
-    match payload.selection() {
+    match submission.payloads[0].selection() {
         NormalizedGitSelection::ExplicitCommit { commit } => {
             assert_eq!(commit.to_string(), expected_head);
         }
@@ -1116,17 +1064,21 @@ fn git_worker_binary_happy_path_completes_shard_and_commits() {
         "Git worker should produce diagnostic output on stderr"
     );
 
-    let done_ledger_rows = proof.done_ledger_row_count();
-    let observation_rows = proof.observation_row_count();
-    assert!(
-        done_ledger_rows > 0,
-        "Git worker should write at least one done-ledger row, got {done_ledger_rows}"
+    let done_ledger_rows = proof.backends.done_ledger_row_count();
+    let observation_rows = proof.backends.observation_row_count();
+    // Git scanning produces one done-ledger entry per repository (the repo
+    // is the scanned unit) and one observation per matching rule hit.  The
+    // fixture has one repo with one SAFE_TOKEN match.
+    assert_eq!(
+        done_ledger_rows, 1,
+        "expected exactly 1 done-ledger row (one per repo in Git mode), got {done_ledger_rows}"
     );
-    assert!(
-        observation_rows > 0,
-        "Git worker should persist at least one finding for the SAFE_TOKEN fixture, got {observation_rows}"
+    assert_eq!(
+        observation_rows, 1,
+        "expected exactly 1 observation for rule '{}', got {observation_rows}",
+        SAFE_RULE_NAME,
     );
-    assert_completed_git_shard_state(&proof.coordinator, proof.shard_key);
+    assert_completed_git_shard_state(&proof.backends.coordinator, proof.shard_key);
 }
 
 /// Verifies that rerunning the worker after Git shard completion is replay-safe and does not duplicate durable rows.
@@ -1136,32 +1088,33 @@ fn git_worker_restart_is_idempotent_after_completed_shard() {
 
     let first = proof.run_worker_binary();
     assert_worker_success(&first, "first real-backend Git worker launch");
-    let done_rows_after_first = proof.done_ledger_row_count();
-    let observation_rows_after_first = proof.observation_row_count();
-    assert!(
-        done_rows_after_first > 0,
-        "first Git launch should write at least one done-ledger row, got {done_rows_after_first}"
+    let done_rows_after_first = proof.backends.done_ledger_row_count();
+    let observation_rows_after_first = proof.backends.observation_row_count();
+    assert_eq!(
+        done_rows_after_first, 1,
+        "expected exactly 1 done-ledger row (one per repo in Git mode), got {done_rows_after_first}"
     );
-    assert!(
-        observation_rows_after_first > 0,
-        "first Git launch should write at least one findings row, got {observation_rows_after_first}"
+    assert_eq!(
+        observation_rows_after_first, 1,
+        "expected exactly 1 observation for rule '{}', got {observation_rows_after_first}",
+        SAFE_RULE_NAME,
     );
 
     let second = proof.run_worker_binary();
     assert_worker_success(&second, "worker restart after completed Git shard");
 
     assert_eq!(
-        proof.done_ledger_row_count(),
+        proof.backends.done_ledger_row_count(),
         done_rows_after_first,
         "restarting after Git shard completion must not duplicate done-ledger rows"
     );
     assert_eq!(
-        proof.observation_row_count(),
+        proof.backends.observation_row_count(),
         observation_rows_after_first,
         "restarting after Git shard completion must not duplicate findings observations"
     );
 
-    assert_completed_git_shard_state(&proof.coordinator, proof.shard_key);
+    assert_completed_git_shard_state(&proof.backends.coordinator, proof.shard_key);
 }
 
 #[test]
@@ -1194,7 +1147,7 @@ fn stale_fence_smoke_rejects_progress_after_owner_lease_loss() {
         )
         .expect("worker A checkpoint should succeed before owner-lease expiry");
 
-    wait_for_owner_binding_expiry(&backend_a, key, ttl_secs);
+    wait_for_owner_binding_expiry(&backend_a, tenant_id(), key, ttl_secs);
 
     // Zombie-worker assertions: the owner binding is gone (etcd lease
     // expired) but no replacement worker has reacquired. Worker A's

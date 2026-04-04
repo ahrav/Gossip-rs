@@ -44,8 +44,9 @@ pub(crate) fn write_context_with_epoch(fence_epoch_raw: u64) -> WriteContext {
     )
 }
 
-/// Run `git` inside `dir` and assert the command succeeds.
-pub fn run_git_in(dir: &Path, args: &[&str]) {
+/// Run `git` inside `dir`, assert the command succeeds, and return the raw
+/// process output. Both [`run_git_in`] and [`run_git_in_stdout`] delegate here.
+fn assert_git_output(dir: &Path, args: &[&str]) -> std::process::Output {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -60,6 +61,21 @@ pub fn run_git_in(dir: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    output
+}
+
+/// Run `git` inside `dir` and assert the command succeeds.
+pub fn run_git_in(dir: &Path, args: &[&str]) {
+    assert_git_output(dir, args);
+}
+
+/// Run `git` inside `dir`, assert success, and return trimmed stdout.
+pub fn run_git_in_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = assert_git_output(dir, args);
+    String::from_utf8(output.stdout)
+        .expect("git stdout should be valid UTF-8")
+        .trim()
+        .to_owned()
 }
 
 /// Initialize a git repository with the configured author identity.
