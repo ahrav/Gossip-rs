@@ -272,6 +272,7 @@ mod tests {
             end: 42,
             rule_id: 7,
             rule_name: "test-rule",
+            norm_hash: Some([0xAA; 32]),
             commit_id: None,
             change_kind: None,
             confidence_score: 85,
@@ -313,7 +314,12 @@ mod tests {
             1,
             "inner sink should also receive the finding"
         );
-        assert!(matches!(forwarded[0], OwnedCoreEvent::Finding { .. }));
+        match &forwarded[0] {
+            OwnedCoreEvent::Finding { norm_hash, .. } => {
+                assert_eq!(*norm_hash, Some([0xAA; 32]));
+            }
+            other => panic!("expected finding event, got: {other:?}"),
+        }
     }
 
     #[test]

@@ -1433,6 +1433,7 @@ fn emit_ordered_item_findings(
             end: finding.root_hint_end,
             rule_id: finding.rule_id,
             rule_name: engine.rule_name(finding.rule_id),
+            norm_hash: Some(finding.norm_hash),
             commit_id: None,
             change_kind: None,
             confidence_score: finding.confidence_score,

@@ -55,6 +55,7 @@
 //! Owned event types (`OwnedCoreEvent`, `OwnedGitEvent`) carry the
 //! channel payloads without borrowing into the scan's lifetime.
 
+use std::fmt;
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -1637,7 +1638,7 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> anyhow::Result<Vec
 /// Mirrors the borrowed `CoreEvent<'_>` variants but owns all heap data
 /// (paths, rule names, messages). Created by `from_core` and replayed by
 /// `emit_into`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum OwnedCoreEvent {
     Finding {
         source: SourceKind,
@@ -1650,6 +1651,9 @@ pub enum OwnedCoreEvent {
         /// engine's `rule_name()` return type would require a cross-crate
         /// signature change across `scanner_engine` and `scanner_scheduler`.
         rule_name: String,
+        /// BLAKE3 digest of the normalized secret content when the source path
+        /// carries it on the event surface.
+        norm_hash: Option<[u8; 32]>,
         commit_id: Option<u32>,
         change_kind: Option<String>,
         confidence_score: i8,
@@ -1676,7 +1680,90 @@ pub enum OwnedCoreEvent {
     },
 }
 
+impl fmt::Debug for OwnedCoreEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct RedactedNormHash(bool);
+
+        impl fmt::Debug for RedactedNormHash {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                if self.0 {
+                    f.write_str("[redacted]")
+                } else {
+                    f.write_str("None")
+                }
+            }
+        }
+
+        match self {
+            Self::Finding {
+                source,
+                object_path,
+                start,
+                end,
+                rule_id,
+                rule_name,
+                norm_hash,
+                commit_id,
+                change_kind,
+                confidence_score,
+            } => f
+                .debug_struct("Finding")
+                .field("source", source)
+                .field("object_path", object_path)
+                .field("start", start)
+                .field("end", end)
+                .field("rule_id", rule_id)
+                .field("rule_name", rule_name)
+                // Secret-derived digests are redacted to keep debug output safe.
+                .field("norm_hash", &RedactedNormHash(norm_hash.is_some()))
+                .field("commit_id", commit_id)
+                .field("change_kind", change_kind)
+                .field("confidence_score", confidence_score)
+                .finish(),
+            Self::Progress {
+                source,
+                stage,
+                objects_scanned,
+                bytes_scanned,
+                findings_emitted,
+            } => f
+                .debug_struct("Progress")
+                .field("source", source)
+                .field("stage", stage)
+                .field("objects_scanned", objects_scanned)
+                .field("bytes_scanned", bytes_scanned)
+                .field("findings_emitted", findings_emitted)
+                .finish(),
+            Self::Summary {
+                source,
+                status,
+                elapsed_ms,
+                bytes_scanned,
+                findings_emitted,
+                errors,
+                throughput_mib_s,
+            } => f
+                .debug_struct("Summary")
+                .field("source", source)
+                .field("status", status)
+                .field("elapsed_ms", elapsed_ms)
+                .field("bytes_scanned", bytes_scanned)
+                .field("findings_emitted", findings_emitted)
+                .field("errors", errors)
+                .field("throughput_mib_s", throughput_mib_s)
+                .finish(),
+            Self::Diagnostic { level, message } => f
+                .debug_struct("Diagnostic")
+                .field("level", level)
+                .field("message", message)
+                .finish(),
+        }
+    }
+}
+
 impl OwnedCoreEvent {
+    /// Convert a borrowed scheduler event into an owned event suitable for
+    /// cross-thread forwarding and coordination sinks.
     pub(crate) fn from_core(event: CoreEvent<'_>) -> Self {
         match event {
             CoreEvent::Finding(finding) => Self::Finding {
@@ -1686,6 +1773,7 @@ impl OwnedCoreEvent {
                 end: finding.end,
                 rule_id: finding.rule_id,
                 rule_name: finding.rule_name.to_owned(),
+                norm_hash: finding.norm_hash,
                 commit_id: finding.commit_id,
                 change_kind: finding.change_kind.map(ToOwned::to_owned),
                 confidence_score: finding.confidence_score,
@@ -1727,6 +1815,7 @@ impl OwnedCoreEvent {
                 end,
                 rule_id,
                 rule_name,
+                norm_hash,
                 commit_id,
                 change_kind,
                 confidence_score,
@@ -1737,6 +1826,7 @@ impl OwnedCoreEvent {
                 end: *end,
                 rule_id: *rule_id,
                 rule_name,
+                norm_hash: *norm_hash,
                 commit_id: *commit_id,
                 change_kind: change_kind.as_deref(),
                 confidence_score: *confidence_score,
@@ -1789,6 +1879,7 @@ impl PartialEq for OwnedCoreEvent {
                     end: e1,
                     rule_id: r1,
                     rule_name: rn1,
+                    norm_hash: nh1,
                     commit_id: c1,
                     change_kind: ck1,
                     confidence_score: cs1,
@@ -1800,6 +1891,7 @@ impl PartialEq for OwnedCoreEvent {
                     end: e2,
                     rule_id: r2,
                     rule_name: rn2,
+                    norm_hash: nh2,
                     commit_id: c2,
                     change_kind: ck2,
                     confidence_score: cs2,
@@ -1811,6 +1903,7 @@ impl PartialEq for OwnedCoreEvent {
                     && e1 == e2
                     && r1 == r2
                     && rn1 == rn2
+                    && nh1 == nh2
                     && c1 == c2
                     && ck1 == ck2
                     && cs1 == cs2

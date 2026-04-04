@@ -152,6 +152,7 @@ impl EventOutput for VecEventSink {
                 line.extend_from_slice(b",\"confidence_score\":");
                 write_i8(&mut line, f.confidence_score);
 
+                // norm_hash intentionally omitted — secret-derived digest must not appear in event logs.
                 if let Some(commit_id) = f.commit_id {
                     line.extend_from_slice(b",\"commit_id\":");
                     write_u64(&mut line, u64::from(commit_id));
@@ -288,5 +289,34 @@ fn write_identity_field(line: &mut Vec<u8>, name: &[u8], id: u32) {
         line.extend_from_slice(name);
         line.extend_from_slice(b"\":");
         write_u64(line, u64::from(id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scanner_scheduler::source_kind::SourceKind;
+
+    #[test]
+    fn vec_event_sink_omits_norm_hash_in_json() {
+        let sink = VecEventSink::new();
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Git,
+            object_path: b"secret.txt",
+            start: 10,
+            end: 20,
+            rule_id: 7,
+            rule_name: "rule",
+            norm_hash: Some([0xAB; 32]),
+            commit_id: Some(3),
+            change_kind: Some("modify"),
+            confidence_score: 2,
+        }));
+
+        let output = String::from_utf8(sink.take()).expect("valid utf-8 output");
+        assert!(
+            !output.contains("norm_hash"),
+            "event JSON must omit norm_hash, got: {output}"
+        );
     }
 }
