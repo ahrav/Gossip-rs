@@ -17,7 +17,7 @@ crates/scanner-engine-integration-tests/
     simulation/                       # ~41 tests: deterministic sim replay
       corpus/                         # Scheduler simulation replay artifacts
     diagnostic/                       # 2 tests: anchor derivation diagnostics
-    smoke/                            # Deferred (awaiting CLI binary name)
+    smoke/                            # Deferred (tests present but commented out)
     corpus/                           # JSON replay artifacts + fixture files
       scanner/                        # Scanner case files
       scanner_mutation/               # Mutation testing corpus
