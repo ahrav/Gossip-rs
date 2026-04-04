@@ -26,9 +26,11 @@ use scanner_git::{
     GitScanError, GitScanMode as ScannerGitScanMode, MergeDiffMode, RepoOpenError, TreeDiffError,
 };
 
+use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
 use crate::git_repo::{
-    GitRunExecution, apply_scan_limit_overrides, digest_repo_path, format_git_debug_output,
-    resolve_scan_ns, run_runtime_git_scan, start_set_from_ref_selection,
+    GitRunExecution, GitRuntimeStores, apply_scan_limit_overrides, digest_repo_path,
+    format_git_debug_output, resolve_scan_ns, run_runtime_git_scan,
+    run_runtime_git_scan_with_stores, start_set_from_ref_selection,
 };
 use crate::{
     ChannelEventOutput, EVENT_CHANNEL_CAP, GitScanConfig as RuntimeGitScanConfig, ScanRuntimeError,
@@ -46,6 +48,13 @@ pub struct ScannerGitExecutor {
     event_sink: Arc<dyn GitEventOutput + Send + Sync>,
 }
 
+/// Resolved scanner-level Git configuration bundled with the requested
+/// debug verbosity.
+///
+/// Built by [`build_git_scan_config`] from contract-level selection and
+/// execution limits. The `git_cfg` field is passed directly to the
+/// `scanner-git` runner, while `debug_level` controls post-scan diagnostic
+/// output independently of the scanner's own logging.
 #[derive(Debug)]
 struct ExecutorGitScanConfig {
     git_cfg: ScannerGitScanConfig,
@@ -85,13 +94,31 @@ impl ScannerGitExecutor {
         Ok(Self::new(config.repo_id, engine, event_sink))
     }
 
-    fn run_repo_with<R>(
+    /// Core dual-thread execution path shared by all Git scan entry points.
+    ///
+    /// Spawns a scoped event-forwarder thread alongside the caller-provided
+    /// `run_scan` closure:
+    ///
+    /// 1. A bounded `sync_channel` carries events from the scan thread to the
+    ///    forwarder, which replays them into the executor's [`GitEventOutput`]
+    ///    sink.
+    /// 2. After `run_scan` returns (success or failure), the sender handle is
+    ///    explicitly dropped so the forwarder observes EOF.
+    /// 3. The forwarder is joined before inspecting the scan result — this
+    ///    prevents a forwarder panic from masking the classified scan error.
+    /// 4. When both the scan and forwarder fail, the scan error is preferred
+    ///    because it is the root cause.
+    ///
+    /// The `policy_hash` flows into the scanner config for persistence
+    /// identity derivation; callers that do not persist pass `[0; 32]`.
+    fn execute_repo_with<R>(
         &self,
         mirror: &LocalMirror,
         selection: &GitSelection,
         limits: GitExecutionLimits,
+        policy_hash: [u8; 32],
         run_scan: R,
-    ) -> Result<GitRunOutcome, GitRunError>
+    ) -> Result<GitRunExecution, GitRunError>
     where
         R: FnOnce(
             &Path,
@@ -107,7 +134,7 @@ impl ScannerGitExecutor {
         let ExecutorGitScanConfig {
             git_cfg,
             debug_level,
-        } = build_git_scan_config(self.repo_id, selection, limits)?;
+        } = build_git_scan_config(self.repo_id, policy_hash, selection, limits)?;
 
         std::thread::scope(|scope| {
             let (event_tx, event_rx) = sync_channel(EVENT_CHANNEL_CAP);
@@ -153,8 +180,73 @@ impl ScannerGitExecutor {
             };
 
             maybe_log_debug_output(mirror.path(), debug_level, &execution.result.0);
-            Ok(git_run_outcome(execution))
+            Ok(execution)
         })
+    }
+
+    /// Convenience wrapper that executes a scan without persistence and maps
+    /// the raw [`GitRunExecution`] into the contract-level [`GitRunOutcome`].
+    ///
+    /// Used by the [`GitRepoExecutor`] trait implementation for the
+    /// non-persistent local scan path. Passes a zeroed policy hash because
+    /// no persistence identity is derived.
+    fn run_repo_with<R>(
+        &self,
+        mirror: &LocalMirror,
+        selection: &GitSelection,
+        limits: GitExecutionLimits,
+        run_scan: R,
+    ) -> Result<GitRunOutcome, GitRunError>
+    where
+        R: FnOnce(
+            &Path,
+            Arc<Engine>,
+            &ScannerGitScanConfig,
+            Arc<dyn scanner_git::EventSink>,
+        ) -> Result<GitRunExecution, GitScanError>,
+    {
+        self.execute_repo_with(mirror, selection, limits, [0; 32], run_scan)
+            .map(git_run_outcome)
+    }
+
+    /// Execute a mirror-backed Git scan with an injected persistence adapter.
+    ///
+    /// The [`GitPersistenceAdapter`] is wired as the scanner's seen-blob
+    /// store, ref-watermark store, and persistence store, so finalize results
+    /// are durable by the time the scan completes. The distributed Git
+    /// worker path uses this method instead of [`run_repo_with`](Self::run_repo_with)
+    /// because it needs the raw [`GitRunExecution`] to extract the
+    /// finalize outcome and synthesize a checkpoint.
+    pub(crate) fn run_repo_with_persistence<B>(
+        &self,
+        mirror: &LocalMirror,
+        selection: &GitSelection,
+        limits: GitExecutionLimits,
+        policy_hash: [u8; 32],
+        persistence: &GitPersistenceAdapter<B>,
+    ) -> Result<GitRunExecution, GitRunError>
+    where
+        B: GitPersistenceBackend,
+    {
+        self.execute_repo_with(
+            mirror,
+            selection,
+            limits,
+            policy_hash,
+            |repo, engine, git_cfg, git_sink| {
+                run_runtime_git_scan_with_stores(
+                    repo,
+                    engine,
+                    git_cfg,
+                    git_sink,
+                    GitRuntimeStores {
+                        seen_store: persistence,
+                        watermark_store: persistence,
+                        persist_store: Some(persistence),
+                    },
+                )
+            },
+        )
     }
 }
 
@@ -178,7 +270,7 @@ impl GitRepoExecutor for ScannerGitExecutor {
 }
 
 /// Map the contract scan mode onto the scanner-git scan mode.
-fn map_scan_mode(mode: ContractGitScanMode) -> ScannerGitScanMode {
+pub(crate) fn map_scan_mode(mode: ContractGitScanMode) -> ScannerGitScanMode {
     match mode {
         ContractGitScanMode::DiffHistory => ScannerGitScanMode::DiffHistory,
         ContractGitScanMode::OdbBlobFast => ScannerGitScanMode::OdbBlobFast,
@@ -186,20 +278,38 @@ fn map_scan_mode(mode: ContractGitScanMode) -> ScannerGitScanMode {
 }
 
 /// Map the contract merge strategy onto the scanner-git merge mode.
-fn map_merge_strategy(strategy: GitMergeStrategy) -> MergeDiffMode {
+pub(crate) fn map_merge_strategy(strategy: GitMergeStrategy) -> MergeDiffMode {
     match strategy {
         GitMergeStrategy::AllParents => MergeDiffMode::AllParents,
         GitMergeStrategy::FirstParentOnly => MergeDiffMode::FirstParentOnly,
     }
 }
 
+/// Assemble a scanner-level Git config from contract-level selection and limits.
+///
+/// Translates contract enums (scan mode, merge strategy, ref selection) into
+/// their `scanner-git` equivalents and applies execution-limit overrides
+/// (worker count, binary scanning, tree-delta cache size, engine chunk size).
+///
+/// Non-obvious defaults:
+/// - `pack_exec_workers` defaults to [`available_workers`] when the limits do
+///   not specify a worker count, clamped to at least 1.
+/// - `debug_level` is extracted from execution limits and returned alongside
+///   the scanner config rather than embedded in it.
+///
+/// # Errors
+///
+/// Returns a permanent [`GitRunError`] when MiB-to-byte conversion overflows
+/// for `tree_delta_cache_mb` or `engine_chunk_mb`.
 fn build_git_scan_config(
     repo_id: u64,
+    policy_hash: [u8; 32],
     selection: &GitSelection,
     limits: GitExecutionLimits,
 ) -> Result<ExecutorGitScanConfig, GitRunError> {
     let mut git_cfg = ScannerGitScanConfig {
         repo_id,
+        policy_hash,
         scan_mode: map_scan_mode(selection.scan_mode()),
         merge_diff_mode: map_merge_strategy(selection.merge_strategy()),
         pack_exec_workers: limits
@@ -225,6 +335,12 @@ fn build_git_scan_config(
     })
 }
 
+/// Log scanner diagnostics at `info` level when the requested debug level
+/// is non-`Off`.
+///
+/// Uses `info` rather than `debug` so explicitly-requested diagnostics are
+/// visible under the default production log filter without needing a config
+/// change.
 fn maybe_log_debug_output(
     mirror_path: &Path,
     debug_level: GitDebugLevel,
@@ -451,7 +567,7 @@ mod tests {
             GitMergeStrategy::AllParents,
         );
 
-        let built = build_git_scan_config(9, &selection, GitExecutionLimits::default())
+        let built = build_git_scan_config(9, [0; 32], &selection, GitExecutionLimits::default())
             .expect("executor git scan config");
         assert_eq!(built.git_cfg.start_set, expected);
     }
@@ -493,7 +609,8 @@ mod tests {
             GitMergeStrategy::FirstParentOnly,
         );
 
-        let built = build_git_scan_config(42, &selection, limits).expect("executor config");
+        let built =
+            build_git_scan_config(42, [0; 32], &selection, limits).expect("executor config");
         assert_eq!(built.git_cfg.repo_id, 42);
         assert_eq!(built.git_cfg.scan_mode, ScannerGitScanMode::DiffHistory);
         assert_eq!(
@@ -516,7 +633,7 @@ mod tests {
         let limits = GitExecutionLimits::default()
             .with_tree_delta_cache_mb(NonZeroU32::new(u32::MAX).expect("non-zero"));
 
-        let err = build_git_scan_config(1, &GitSelection::default(), limits)
+        let err = build_git_scan_config(1, [0; 32], &GitSelection::default(), limits)
             .expect_err("overflow should fail");
         assert_eq!(err.class(), ErrorClass::Permanent);
     }
@@ -526,7 +643,7 @@ mod tests {
         let limits = GitExecutionLimits::default()
             .with_engine_chunk_mb(NonZeroU32::new(u32::MAX).expect("non-zero"));
 
-        let err = build_git_scan_config(1, &GitSelection::default(), limits)
+        let err = build_git_scan_config(1, [0; 32], &GitSelection::default(), limits)
             .expect_err("overflow should fail");
         assert_eq!(err.class(), ErrorClass::Permanent);
     }
@@ -841,5 +958,19 @@ mod tests {
             .expect("from_runtime_config should succeed");
 
         assert_eq!(executor.repo_id, config.repo_id);
+    }
+
+    #[test]
+    fn build_git_scan_config_preserves_policy_hash() {
+        let policy_hash = [0xAB; 32];
+        let config = build_git_scan_config(
+            17,
+            policy_hash,
+            &GitSelection::default(),
+            GitExecutionLimits::default(),
+        )
+        .expect("config should build");
+
+        assert_eq!(config.git_cfg.policy_hash, policy_hash);
     }
 }
