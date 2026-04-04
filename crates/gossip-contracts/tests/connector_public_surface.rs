@@ -1,3 +1,9 @@
+//! Integration tests verifying the public API surface of the connector module.
+//!
+//! This module ensures that shared paging types and family contracts are accessible
+//! from their expected public paths and namespaced modules, preventing accidental
+//! breakage of the public API boundaries.
+
 use gossip_contracts::connector::{
     self, KeyedPageItem, PageBuf, PageShapeError, PageState, PagingCapabilities, ReadError,
     ScanItem,
@@ -13,6 +19,7 @@ use gossip_contracts::coordination::ShardSpec;
 
 use std::io;
 
+/// Verifies that common paging types can be resolved from both the flat root and the `common` submodule.
 #[test]
 fn shared_paging_types_are_available_from_flat_and_common_paths() {
     let _: Option<PageBuf<ScanItem>> = None;
@@ -32,6 +39,7 @@ fn shared_paging_types_are_available_from_flat_and_common_paths() {
     let _common = connector::common::validate_filled_page::<ScanItem>;
 }
 
+/// Verifies that domain-specific contracts (such as OrderedContentSource) are exposed in their respective modules.
 #[test]
 fn family_contracts_are_available_from_namespaced_modules() {
     let _: Option<&dyn OrderedContentSource> = None;
@@ -45,6 +53,8 @@ fn family_contracts_are_available_from_namespaced_modules() {
     let _run = run_ordered_content_conformance::<fn() -> UnusedSource, UnusedSource>;
 }
 
+/// A dummy implementation of `OrderedContentSource` used solely to verify
+/// that trait methods and associated types are publicly accessible.
 struct UnusedSource;
 
 impl OrderedContentSource for UnusedSource {
