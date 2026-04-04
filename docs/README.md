@@ -99,8 +99,8 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [engine-api-types.md](scanner-engine/engine-api-types.md)                               | `crates/scanner-engine/src/api.rs`                        | Public API types: RuleSpec, FindingRec, Tuning, gates, transforms  |
 | [engine-offline-validation.md](scanner-engine/engine-offline-validation.md)             | `crates/scanner-engine/src/engine/offline_validate.rs`    | Offline structural validators: CRC32, AWS, GitHub PAT, JWT, Slack  |
 | [regex-to-anchor-extraction.md](scanner-engine/regex-to-anchor-extraction.md)           | `crates/scanner-engine/src/regex2anchor.rs`               | Regex AST → literal anchor extraction for Vectorscan prefiltering  |
-| [engine-internals.md](scanner-engine/engine-internals.md)                               | `crates/scanner-engine/src/engine/{scratch,hit_pool,...}` | ScanScratch layout, HitAccPool, VsDbCache, compiled rule repr      |
-| [content-policy-and-caching.md](scanner-engine/content-policy-and-caching.md)           | `crates/scanner-engine/src/{content_policy,b64_yara,...}` | Content type detection, YARA base64 gate, set-associative cache    |
+| [engine-internals.md](scanner-engine/engine-internals.md)                               | `crates/scanner-engine/src/engine/{scratch.rs,hit_pool.rs,vs_cache.rs,rule_repr.rs}` | ScanScratch layout, HitAccPool, VsDbCache, compiled rule repr      |
+| [content-policy-and-caching.md](scanner-engine/content-policy-and-caching.md)           | `crates/scanner-engine/src/{content_policy/,b64_yara_gate.rs,lsm/set_associative_cache.rs}` | Content type detection, YARA base64 gate, set-associative cache    |
 
 ---
 
