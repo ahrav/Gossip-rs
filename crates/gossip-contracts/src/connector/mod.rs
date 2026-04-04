@@ -3,7 +3,8 @@
 //!
 //! This module exports validated wrapper types for connector-originated bytes
 //! (`ItemKey`, `ItemRef`, `TokenBytes`), cursor and metadata types used by
-//! enumeration/read flows, and a log-safe digest type ([`ToxicDigest`]) for
+//! enumeration/read flows, and a log-safe digest type
+//! ([`ToxicDigest`](crate::connector::ToxicDigest)) for
 //! redacting untrusted connector data in diagnostics.
 //!
 //! ## Surface split
@@ -12,39 +13,56 @@
 //!
 //! - `types.rs` defines validated value wrappers, item metadata/value
 //!   invariants (including toxic-byte redaction and size bounds), and
-//!   [`ToxicDigest`].
+//!   [`ToxicDigest`](crate::connector::ToxicDigest).
 //! - `api.rs` defines operation-outcome classification and optional capability
-//!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
-//!   `ConnectorCapabilities`).
+//!   negotiation ([`ErrorClass`](crate::connector::ErrorClass),
+//!   [`EnumerateError`](crate::connector::EnumerateError),
+//!   [`ReadError`](crate::connector::ReadError),
+//!   [`ConnectorCapabilities`](crate::connector::ConnectorCapabilities)).
 //! - `common.rs` defines shared paging vocabulary reused across connector
-//!   families and exposed at [`common`] ([`PageBuf`], [`PageState`],
-//!   [`PagingCapabilities`], [`KeyedPageItem`], [`validate_filled_page`]).
+//!   families and exposed at [`common`](crate::connector::common)
+//!   ([`PageBuf`](crate::connector::PageBuf),
+//!   [`PageState`](crate::connector::PageState),
+//!   [`PagingCapabilities`](crate::connector::PagingCapabilities),
+//!   [`KeyedPageItem`](crate::connector::KeyedPageItem),
+//!   [`validate_filled_page`](crate::connector::validate_filled_page)).
 //! - `conformance.rs` provides the reusable ordered-content conformance
-//!   harness ([`conformance::run_ordered_content_conformance`],
-//!   [`conformance::drain_ordered_source`]).
+//!   harness
+//!   ([`conformance::run_ordered_content_conformance`](crate::connector::conformance::run_ordered_content_conformance),
+//!   [`conformance::drain_ordered_source`](crate::connector::conformance::drain_ordered_source)).
 //! - `ordered.rs` defines the ordered-content family contract
-//!   ([`ordered::OrderedContentCapabilities`],
-//!   [`ordered::OrderedContentSource`]).
+//!   ([`ordered::OrderedContentCapabilities`](crate::connector::ordered::OrderedContentCapabilities),
+//!   [`ordered::OrderedContentSource`](crate::connector::ordered::OrderedContentSource)).
 //! - `git.rs` defines the Git family contract
-//!   ([`git::RepoKey`], [`git::RepoLocator`], [`git::GitRepoTarget`],
-//!   [`git::GitSelection`], [`git::LocalMirror`],
-//!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
-//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
-//!   [`git::GitRepoDiscoverySource`],
-//!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]).
+//!   ([`git::RepoKey`](crate::connector::git::RepoKey),
+//!   [`git::RepoLocator`](crate::connector::git::RepoLocator),
+//!   [`git::GitRepoTarget`](crate::connector::git::GitRepoTarget),
+//!   [`git::GitSelection`](crate::connector::git::GitSelection),
+//!   [`git::LocalMirror`](crate::connector::git::LocalMirror),
+//!   [`git::GitExecutionLimits`](crate::connector::git::GitExecutionLimits),
+//!   [`git::GitRunOutcome`](crate::connector::git::GitRunOutcome),
+//!   [`git::GitRunError`](crate::connector::git::GitRunError),
+//!   [`git::GitDiscoveryCapabilities`](crate::connector::git::GitDiscoveryCapabilities),
+//!   [`git::GitRepoDiscoverySource`](crate::connector::git::GitRepoDiscoverySource),
+//!   [`git::GitMirrorManager`](crate::connector::git::GitMirrorManager),
+//!   [`git::GitRepoExecutor`](crate::connector::git::GitRepoExecutor)).
 //!
 //! `api.rs` and `types.rs` remain internal organization units; their public
 //! items are re-exported here so runtime crates keep a single import boundary
-//! for shared nouns and error taxonomy. [`common`] is public because the paging
-//! vocabulary is reused across families, while the family contracts stay
-//! namespaced under [`ordered`] and [`git`]. Conformance harnesses stay
-//! namespaced under [`conformance`] as cross-cutting test utilities consumed
-//! by multiple downstream crates.
+//! for shared nouns and error taxonomy. [`common`](crate::connector::common) is
+//! public because the paging vocabulary is reused across families, while the
+//! family contracts stay namespaced under
+//! [`ordered`](crate::connector::ordered) and
+//! [`git`](crate::connector::git). Conformance harnesses stay namespaced under
+//! [`conformance`](crate::connector::conformance) as cross-cutting test
+//! utilities consumed by multiple downstream crates.
 //!
 //! Family modules compose from the shared layers instead of inheriting a
-//! single universal connector model: [`ordered`] and [`git`] depend on
-//! [`common`], `types.rs`, and `api.rs` for paging, value wrappers, and error
-//! classification.
+//! single universal connector model:
+//! [`ordered`](crate::connector::ordered) and
+//! [`git`](crate::connector::git) depend on
+//! [`common`](crate::connector::common), `types.rs`, and `api.rs` for paging,
+//! value wrappers, and error classification.
 //!
 //! ## Invariants
 //!
@@ -61,38 +79,60 @@
 //!
 //! ## Public surface
 //!
-//! - Byte wrappers: [`ItemKey`], [`ItemRef`], [`TokenBytes`]
-//! - Pooled slab owner for page-scoped toxic-byte wrappers: [`PooledByteSlab`]
-//! - Shared paging vocabulary: [`PageBuf`], [`PageState`], [`PagingCapabilities`],
-//!   [`KeyedPageItem`], [`PageShapeError`], [`PageSequenceViolation`]
-//! - Paging bridge: [`Cursor`]
-//! - Version semantics: [`VersionId`]
-//! - Optional metadata: [`ContentHints`], [`Location`]
-//! - Enumeration composites: [`ScanItem`]
-//! - Scan budgets: [`Budgets`]
-//! - Validation errors: [`ConnectorInputError`]
-//! - Log-safe digest: [`ToxicDigest`]
-//! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
-//! - Connector feature flags: [`ConnectorCapabilities`]
-//! - Ordered-content family contract: [`ordered::OrderedContentCapabilities`],
-//!   [`ordered::OrderedContentSource`]
-//! - Ordered-content conformance harness (under [`conformance`]):
-//!   [`conformance::run_ordered_content_conformance`],
-//!   [`conformance::drain_ordered_source`],
-//!   [`conformance::drain_ordered_source_from`],
-//!   [`conformance::assert_repeatable_drain`],
-//!   [`conformance::assert_resume_after_corrupt_token`],
-//!   [`conformance::assert_no_forbidden_fragments`]
-//! - Conformance snapshot types (under [`conformance`]):
-//!   [`conformance::ObservedScanItem`],
-//!   [`conformance::OrderedContentDrain`],
-//!   [`conformance::OrderedContentConformanceError`]
-//! - Git family types and contracts: [`git::RepoKey`], [`git::RepoLocator`],
-//!   [`git::GitRepoTarget`], [`git::GitSelection`], [`git::LocalMirror`],
-//!   [`git::GitExecutionLimits`], [`git::GitRunOutcome`],
-//!   [`git::GitRunError`], [`git::GitDiscoveryCapabilities`],
-//!   [`git::GitRepoDiscoverySource`],
-//!   [`git::GitMirrorManager`], [`git::GitRepoExecutor`]
+//! - Byte wrappers: [`ItemKey`](crate::connector::ItemKey),
+//!   [`ItemRef`](crate::connector::ItemRef),
+//!   [`TokenBytes`](crate::connector::TokenBytes)
+//! - Pooled slab owner for page-scoped toxic-byte wrappers:
+//!   [`PooledByteSlab`](crate::connector::PooledByteSlab)
+//! - Shared paging vocabulary: [`PageBuf`](crate::connector::PageBuf),
+//!   [`PageState`](crate::connector::PageState),
+//!   [`PagingCapabilities`](crate::connector::PagingCapabilities),
+//!   [`KeyedPageItem`](crate::connector::KeyedPageItem),
+//!   [`PageShapeError`](crate::connector::PageShapeError),
+//!   [`PageSequenceViolation`](crate::connector::PageSequenceViolation)
+//! - Paging bridge: [`Cursor`](crate::connector::Cursor)
+//! - Version semantics: [`VersionId`](crate::connector::VersionId)
+//! - Optional metadata: [`ContentHints`](crate::connector::ContentHints),
+//!   [`Location`](crate::connector::Location)
+//! - Enumeration composites: [`ScanItem`](crate::connector::ScanItem)
+//! - Scan budgets: [`Budgets`](crate::connector::Budgets)
+//! - Validation errors:
+//!   [`ConnectorInputError`](crate::connector::ConnectorInputError)
+//! - Log-safe digest: [`ToxicDigest`](crate::connector::ToxicDigest)
+//! - Connector API errors: [`ErrorClass`](crate::connector::ErrorClass),
+//!   [`EnumerateError`](crate::connector::EnumerateError),
+//!   [`ReadError`](crate::connector::ReadError)
+//! - Connector feature flags:
+//!   [`ConnectorCapabilities`](crate::connector::ConnectorCapabilities)
+//! - Ordered-content family contract:
+//!   [`ordered::OrderedContentCapabilities`](crate::connector::ordered::OrderedContentCapabilities),
+//!   [`ordered::OrderedContentSource`](crate::connector::ordered::OrderedContentSource)
+//! - Ordered-content conformance harness (under
+//!   [`conformance`](crate::connector::conformance)):
+//!   [`conformance::run_ordered_content_conformance`](crate::connector::conformance::run_ordered_content_conformance),
+//!   [`conformance::drain_ordered_source`](crate::connector::conformance::drain_ordered_source),
+//!   [`conformance::drain_ordered_source_from`](crate::connector::conformance::drain_ordered_source_from),
+//!   [`conformance::assert_repeatable_drain`](crate::connector::conformance::assert_repeatable_drain),
+//!   [`conformance::assert_resume_after_corrupt_token`](crate::connector::conformance::assert_resume_after_corrupt_token),
+//!   [`conformance::assert_no_forbidden_fragments`](crate::connector::conformance::assert_no_forbidden_fragments)
+//! - Conformance snapshot types (under
+//!   [`conformance`](crate::connector::conformance)):
+//!   [`conformance::ObservedScanItem`](crate::connector::conformance::ObservedScanItem),
+//!   [`conformance::OrderedContentDrain`](crate::connector::conformance::OrderedContentDrain),
+//!   [`conformance::OrderedContentConformanceError`](crate::connector::conformance::OrderedContentConformanceError)
+//! - Git family types and contracts:
+//!   [`git::RepoKey`](crate::connector::git::RepoKey),
+//!   [`git::RepoLocator`](crate::connector::git::RepoLocator),
+//!   [`git::GitRepoTarget`](crate::connector::git::GitRepoTarget),
+//!   [`git::GitSelection`](crate::connector::git::GitSelection),
+//!   [`git::LocalMirror`](crate::connector::git::LocalMirror),
+//!   [`git::GitExecutionLimits`](crate::connector::git::GitExecutionLimits),
+//!   [`git::GitRunOutcome`](crate::connector::git::GitRunOutcome),
+//!   [`git::GitRunError`](crate::connector::git::GitRunError),
+//!   [`git::GitDiscoveryCapabilities`](crate::connector::git::GitDiscoveryCapabilities),
+//!   [`git::GitRepoDiscoverySource`](crate::connector::git::GitRepoDiscoverySource),
+//!   [`git::GitMirrorManager`](crate::connector::git::GitMirrorManager),
+//!   [`git::GitRepoExecutor`](crate::connector::git::GitRepoExecutor)
 //!
 //! These types are intentionally composable: a connector validates once at the
 //! boundary, then hands strongly-typed values across crate boundaries without
