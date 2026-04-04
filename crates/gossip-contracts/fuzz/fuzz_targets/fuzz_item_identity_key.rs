@@ -1,4 +1,3 @@
-#![no_main]
 //! Fuzzes the identity-key constructors that normalize connector, instance, and
 //! object-version bytes into stable identifiers.
 //!
@@ -7,6 +6,7 @@
 //! slice matches the field widths expected by `ItemIdentityKey::new`, and the
 //! ASCII-tag path is wrapped in `catch_unwind` because invalid human-readable
 //! tags are part of the input space being explored.
+#![no_main]
 
 use libfuzzer_sys::fuzz_target;
 
