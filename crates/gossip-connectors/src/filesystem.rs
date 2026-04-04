@@ -21,7 +21,7 @@
 //!
 //! # Design Trade-offs
 //! - **Memory vs. Resumption Cost**: Lazily expanding directories keeps memory bounded to `O(depth * max_dir_entries)` but requires re-traversing ancestor nodes on resumption.
-//! - **Confinement Overhead**: Component-by-component `openat` traversal adds system call overhead for every read but guarantees robust confinement without race conditions.
+//! - **Confinement Overhead**: Component-by-component `openat` traversal adds system call overhead on cache misses and first reads, but adjacent `read_range` calls can reuse the cached descriptor while preserving confinement guarantees.
 //! - **Weak Versioning**: Versions derive from metadata (`mtime`, `size`, `ino`, `dev`) and paths. This enables fast change detection but does not guarantee immutable content identity.
 //!
 //! # Budget behavior
