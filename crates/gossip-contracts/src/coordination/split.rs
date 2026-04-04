@@ -24,7 +24,8 @@
 //!
 //! - **This module** owns shape validation (fan-out bounds), cursor-to-
 //!   split-point derivation, and orchestrates coverage validation by
-//!   calling [`validate_split_coverage_bounds`] / [`validate_residual_split`]
+//!   calling [`crate::coordination::shard_spec::validate_split_coverage_bounds`] /
+//!   [`validate_residual_split`]
 //!   (defined in `shard_spec.rs`).
 //! - **`gossip-coordination::split_execution`** owns execution-time
 //!   concerns: derived shard IDs, payload hashing for op-log idempotency,
@@ -212,7 +213,7 @@ pub enum SplitReplacePlanningError {
 /// Derives a split-replace plan, validating comprehensive coverage of the parent shard.
 ///
 /// This helper enforces both child-count bounds and full coverage
-/// correctness via [`validate_split_coverage_bounds`].
+/// correctness via [`crate::coordination::shard_spec::validate_split_coverage_bounds`].
 ///
 /// Coverage validation treats children as an unordered set (sorted internally
 /// by `key_range_start`), but the returned plan keeps original child order.
