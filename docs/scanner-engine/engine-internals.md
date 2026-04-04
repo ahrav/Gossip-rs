@@ -517,7 +517,7 @@ Compile-time size guards enforce that hot-path structures remain compact:
 | `PackedPatterns` | `== 32` bytes | 2 × `Box<[T]>` |
 | `EntropyCompiled` | `<= 32` bytes | Copied by value in `ResolvedGates` |
 | `RuleCompiled` | `<= 88` bytes | Fits in ~1.4 cache lines |
-| `RuleCold` | `<= 24` bytes | Minimal cold metadata |
+| `RuleCold` | `<= 56` bytes | Minimal cold metadata |
 
 ## Lifecycle
 
@@ -701,10 +701,10 @@ pipeline instrumentation. When disabled, all recording functions compile to
 no-ops and `snapshot()` returns a zeroed struct — zero runtime cost.
 
 **Key types**:
-- `GitPerfStats`: 43-field `pub` snapshot struct (`Clone, Copy, Debug, Default`).
+- `GitPerfStats`: 47-field `pub` snapshot struct (`Clone, Copy, Debug, Default`).
   Stable shape regardless of feature flag.
 
-**Recording functions** (34 total, all `pub fn`):
+**Recording functions** (30 total, all `pub fn`):
 - **Pack decode**: `record_pack_inflate`, `record_delta_apply`
 - **Blob scanning**: `record_scan`, `record_scan_vs_prefilter`,
   `record_scan_validate`, `record_scan_transform`, `record_scan_sort_dedup`,
