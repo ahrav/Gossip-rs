@@ -1542,6 +1542,8 @@ proptest! {
         use super::selected_sample_indices;
 
         let cap = (MIN_SAMPLE_CAP * cap_mult).min(count);
+        // Only test cases where compaction is triggered; cap >= count means no
+        // compaction fires and the invariant is trivially satisfied.
         prop_assume!(count > cap);
 
         let samples: Vec<Sample> = (0..count)
