@@ -940,7 +940,12 @@ pub mod test_support {
             self.state.borrow().kv.get(key).cloned()
         }
 
-        /// Injects a failure on the Nth `apply_batch` call (1-indexed).
+        /// Injects a failure when `batch_call_count` reaches `call_no`.
+        ///
+        /// The check fires when the internal monotonic counter equals `call_no`.
+        /// Use [`batch_call_count`](Self::batch_call_count) to read the current
+        /// value and compute a relative offset (e.g., `backend.batch_call_count() + 3`
+        /// to fail 3 calls from now).
         pub fn set_fail_on_batch_call(&self, call_no: usize) {
             self.state.borrow_mut().fail_on_batch_call = Some(call_no);
         }
@@ -953,6 +958,11 @@ pub mod test_support {
         /// Injects a failure on the Nth `get` call (1-indexed).
         pub fn set_fail_on_get_call(&self, call_no: usize) {
             self.state.borrow_mut().fail_on_get_call = Some(call_no);
+        }
+
+        /// Clears any previously injected get failure.
+        pub fn clear_fail_on_get_call(&self) {
+            self.state.borrow_mut().fail_on_get_call = None;
         }
 
         /// Configures `multi_get` to return one fewer result than requested.
@@ -985,6 +995,9 @@ pub mod test_support {
             Ok(state.kv.get(key).cloned())
         }
 
+        /// Injected failures are all-or-nothing: a failing call returns `Err`
+        /// without applying any ops. Partial batch application (where some ops
+        /// land before the failure) is not modeled.
         fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
             let mut state = self.state.borrow_mut();
             state.batch_call_count += 1;

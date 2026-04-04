@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the non-atomic `commit_finalize` path in
 //! [`GitPersistenceAdapter`], verifying that the three-phase write sequence
-//! (scope Put, staging Delete, watermark write) maintains crash-safety
+//! (data + seen-scope Put, staging Delete, watermark write) maintains crash-safety
 //! invariants when individual phases fail.
 
 use gossip_scanner_runtime::git_persistence::test_support::TestBackend;
@@ -251,6 +251,15 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
         })
         .unwrap_err();
     assert!(format!("{err}").contains("injected batch failure"));
+
+    // Confirm the failure hit the expected batch call (staging-delete phase).
+    assert_eq!(
+        backend.batch_call_count(),
+        batch_calls_before + 2,
+        "commit_finalize non-atomic path should fail on the staging-delete batch; \
+         if this fails, the internal batch sequence changed and the failure \
+         injection offset must be updated"
+    );
 
     // -- Phase 3: verify post-crash state --------------------------------------
     //
