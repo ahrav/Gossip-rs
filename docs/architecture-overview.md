@@ -6,7 +6,7 @@ High-level C4-style component diagram showing the gossip-rs secret scanning engi
 graph TB
     subgraph CLI["CLI Layer"]
         Main["main.rs<br/>Entry Point"]
-        Orch["scheduler/parallel_scan.rs<br/>Source Dispatcher"]
+        Orch["gossip-scanner-runtime::scan_fs / scan_git<br/>Source Dispatcher"]
     end
 
     subgraph Core["Core Engine"]
@@ -96,7 +96,7 @@ graph TB
 | Component                      | Location                                                                                 | Purpose                                                                                                         |
 | ------------------------------ | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | **CLI Layer**                  | `crates/scanner-rs-cli/src/main.rs`                                                      | Entry point that delegates to scan routing                                                                      |
-| **Scan Dispatcher**            | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`                                | Dispatches sources and wires structured event sinks                                                             |
+| **Scan Dispatcher**            | `crates/gossip-scanner-runtime/src/lib.rs`                                               | Public `scan_fs()` / `scan_git()` entrypoints that validate requests and dispatch into the runtime family modules |
 | **Events**                     | `crates/scanner-scheduler/src/events.rs`                                                 | Structured `CoreEvent` model and JSONL sink                                                                     |
 | **parallel_scan_dir**          | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`                                | High-level FS scan entrypoint (walker + scheduler wiring)                                                       |
 | **FS Owner-Compute Scheduler** | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs`                               | Round-robin file dispatch with per-worker owned I/O+scan state                                                  |
