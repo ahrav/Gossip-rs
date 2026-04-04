@@ -129,6 +129,7 @@ struct Sample {
     /// mark that the file straddles; otherwise it is the recorded byte position
     /// at the start of the file (a rank-triggered fallback position).
     recorded_byte_position: u64,
+    /// The actual bytes of the sampled key, retained to ensure key fidelity.
     key: Box<[u8]>,
 }
 
@@ -545,6 +546,7 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 /// - **Memory**: O(sample_cap) samples, each carrying a heap-allocated key.
 #[derive(Clone)]
 pub(crate) struct StreamingSplitEstimator {
+    /// Maximum number of retained samples before compaction is triggered.
     sample_cap: usize,
     /// Sparse checkpoints retained from the stream. Each sample carries both
     /// ordinal rank and the byte-space search position associated with the
