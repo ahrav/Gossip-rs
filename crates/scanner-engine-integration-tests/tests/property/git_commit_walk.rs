@@ -185,14 +185,13 @@ proptest! {
             let tip = Position(tips[i]);
             let wm = Position(watermarks[i]);
 
-            // Deterministic selection: correct generation, mismatched, or None.
-            let gen_choice = (tip.0 as usize + wm.0 as usize) % 3;
+            // Deterministic selection: correct generation or mismatched.
+            let gen_choice = (tip.0 as usize + wm.0 as usize) % 2;
             let generation = match gen_choice {
-                0 => NonZeroU32::new(graph.generation(wm)),
-                1 => NonZeroU32::new(graph.generation(wm).wrapping_add(7)),
-                _ => None,
+                0 => NonZeroU32::new(graph.generation(wm)).unwrap(),
+                _ => NonZeroU32::new(graph.generation(wm).wrapping_add(7)).unwrap(),
             };
-            generations.push(generation);
+            generations.push(Some(generation));
 
             refs.push(StartSetRef {
                 name: ByteRef::new(0, 0),
@@ -220,11 +219,8 @@ proptest! {
 
             // When stored generation mismatches the graph, the real walker
             // treats the watermark as invalid and does a full history walk.
-            // None means legacy/unknown — skip the generation gate.
-            let wm_is_valid = match generations[i] {
-                Some(g) => g.get() == graph.generation(wm),
-                None => true,
-            };
+            let wm_is_valid = generations[i]
+                .is_some_and(|g| g.get() == graph.generation(wm));
 
             let reach_tip = reachable_from(&parents, tip);
             let mut in_range = reach_tip.clone();

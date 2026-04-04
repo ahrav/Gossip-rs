@@ -980,41 +980,38 @@ mod tests {
             vec![
                 Some(RefWatermark {
                     oid: OidBytes::sha1([0x22; 20]),
-                    generation: NonZeroU32::new(22),
+                    generation: NonZeroU32::new(22).unwrap(),
                 }),
                 None,
                 Some(RefWatermark {
                     oid: OidBytes::sha1([0x11; 20]),
-                    generation: NonZeroU32::new(11),
+                    generation: NonZeroU32::new(11).unwrap(),
                 }),
             ]
         );
     }
 
     #[test]
-    fn load_watermarks_decodes_legacy_values_without_generation() {
+    fn load_watermarks_rejects_oid_only_values() {
         let backend = TestBackend::atomic();
         let adapter = GitPersistenceAdapter::new(backend.clone(), 7, [0x77; 32]);
         let start_set_id = [0x88; 32];
         let ref_name = b"refs/heads/main".as_slice();
         let oid = OidBytes::sha1([0x33; 20]);
-        let mut legacy = vec![oid.len()];
-        legacy.extend_from_slice(oid.as_slice());
+        // OID-only payload (no generation trailer) — from a prior code revision.
+        let mut oid_only = vec![oid.len()];
+        oid_only.extend_from_slice(oid.as_slice());
         backend.set(
             build_ref_wm_key(7, &[0x77; 32], &start_set_id, ref_name),
-            legacy,
+            oid_only,
         );
 
-        let loaded = adapter
-            .load_watermarks(7, [0x77; 32], start_set_id, &[ref_name])
-            .expect("load legacy watermark");
-
-        assert_eq!(
-            loaded,
-            vec![Some(RefWatermark {
-                oid,
-                generation: None,
-            })]
+        // The decoder rejects OID-only payloads as malformed, which the
+        // adapter surfaces as an error (invalid watermark encoding).
+        let result = adapter.load_watermarks(7, [0x77; 32], start_set_id, &[ref_name]);
+        assert!(
+            result.is_err(),
+            "OID-only watermark values must be rejected as malformed"
         );
     }
 

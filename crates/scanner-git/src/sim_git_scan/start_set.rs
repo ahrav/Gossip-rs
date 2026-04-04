@@ -90,9 +90,11 @@ fn convert_ref(
                         .ok_or(SimGitError::MissingObject {
                             kind: "watermark commit",
                         })?;
+                let gen = NonZeroU32::new(generation)
+                    .ok_or(SimGitError::InvalidGeneration { generation })?;
                 Some(RefWatermark {
                     oid,
-                    generation: NonZeroU32::new(generation),
+                    generation: gen,
                 })
             }
             None => None,

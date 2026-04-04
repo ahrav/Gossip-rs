@@ -213,7 +213,9 @@ fn commit_walk_linear_history() {
             b"refs/heads/main".to_vec(),
             Some(scanner_git::RefWatermark {
                 oid: watermark_oid,
-                generation: None,
+                // HEAD~2 in a 4-commit linear chain is the 2nd commit from
+                // root, so generation = 2.
+                generation: NonZeroU32::new(2).unwrap(),
             }),
         )],
     };
@@ -313,7 +315,9 @@ fn commit_walk_watermark_not_ancestor_scans_full_history() {
             b"refs/heads/main".to_vec(),
             Some(scanner_git::RefWatermark {
                 oid: other_oid,
-                generation: None,
+                // Generation value is irrelevant; this OID is not an ancestor
+                // of the tip, so the watermark will be rejected regardless.
+                generation: NonZeroU32::new(1).unwrap(),
             }),
         )],
     };
@@ -555,7 +559,7 @@ fn commit_walk_generation_match_incremental_scan() {
             b"refs/heads/main".to_vec(),
             Some(scanner_git::RefWatermark {
                 oid: watermark_oid,
-                generation: NonZeroU32::new(3),
+                generation: NonZeroU32::new(3).unwrap(),
             }),
         )],
     };
@@ -618,7 +622,7 @@ fn commit_walk_generation_mismatch_scans_full_history() {
             b"refs/heads/main".to_vec(),
             Some(scanner_git::RefWatermark {
                 oid: watermark_oid,
-                generation: NonZeroU32::new(99),
+                generation: NonZeroU32::new(99).unwrap(),
             }),
         )],
     };

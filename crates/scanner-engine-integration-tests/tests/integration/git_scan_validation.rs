@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::Command;
 
@@ -224,16 +225,8 @@ impl PersistenceStore for RetryStore {
 ///
 /// The config pins `repo_id`, `policy_hash`, and `start_set` to keep the
 /// test inputs deterministic. Persistence is routed to an in-memory store.
-fn run_scan(repo: &Path, watermark: Option<OidBytes>) -> GitScanResult {
-    run_scan_with_config(
-        repo,
-        watermark.map(|oid| RefWatermark {
-            oid,
-            generation: None,
-        }),
-        base_config(),
-    )
-    .unwrap()
+fn run_scan(repo: &Path, watermark: Option<RefWatermark>) -> GitScanResult {
+    run_scan_with_config(repo, watermark, base_config()).unwrap()
 }
 
 fn base_config() -> GitScanConfig {
@@ -362,7 +355,14 @@ fn loose_only_candidate_scans_complete() {
     repack_all(tmp.path());
 
     let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
-    let result = run_scan(tmp.path(), Some(watermark));
+    // Root commit in a 2-commit chain has generation 1.
+    let result = run_scan(
+        tmp.path(),
+        Some(RefWatermark {
+            oid: watermark,
+            generation: NonZeroU32::new(1).unwrap(),
+        }),
+    );
 
     let GitScanResult(report) = result;
     assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
@@ -695,18 +695,13 @@ fn shallow_clone_fails_fast_when_shallow_root_limit_is_exceeded() {
 /// Run a scan using a `VecEventSink` and return the JSONL output as lines.
 fn run_scan_with_events(
     repo: &Path,
-    watermark: Option<OidBytes>,
+    watermark: Option<RefWatermark>,
     config: GitScanConfig,
 ) -> (GitScanResult, Vec<String>) {
     let engine = test_engine();
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
-    let watermark_store = TestWatermarkStore {
-        watermark: watermark.map(|oid| RefWatermark {
-            oid,
-            generation: None,
-        }),
-    };
+    let watermark_store = TestWatermarkStore { watermark };
     #[cfg(feature = "rocksdb")]
     let persist_store =
         InMemoryPersistenceStore::with_seen_scope(config.repo_id, config.policy_hash);

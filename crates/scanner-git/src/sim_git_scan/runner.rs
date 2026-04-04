@@ -444,9 +444,12 @@ fn stage_repo_open(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
                     .lookup(&oid)
                     .map_err(|err| failure_inv(6, err))?
                     .ok_or_else(|| failure_inv(6, "watermark commit missing from commit graph"))?;
+                let raw_gen = commit_graph.generation(pos);
+                let gen = NonZeroU32::new(raw_gen)
+                    .ok_or_else(|| failure_inv(6, "watermark generation must be nonzero"))?;
                 Some(RefWatermark {
                     oid,
-                    generation: NonZeroU32::new(commit_graph.generation(pos)),
+                    generation: gen,
                 })
             }
             None => None,

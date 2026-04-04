@@ -108,14 +108,14 @@ fn benchmark_commit_walk_watermarks(c: &mut Criterion) {
             "ancestor_match",
             Some(RefWatermark {
                 oid: graph.oid(watermark_pos),
-                generation: NonZeroU32::new(graph.generation(watermark_pos)),
+                generation: NonZeroU32::new(graph.generation(watermark_pos)).unwrap(),
             }),
         ),
         (
             "generation_mismatch",
             Some(RefWatermark {
                 oid: graph.oid(watermark_pos),
-                generation: NonZeroU32::new(graph.generation(watermark_pos) + 1),
+                generation: NonZeroU32::new(graph.generation(watermark_pos) + 1).unwrap(),
             }),
         ),
         ("missing_watermark", None),

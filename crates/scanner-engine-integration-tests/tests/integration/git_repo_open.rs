@@ -91,7 +91,9 @@ impl RefWatermarkStore for TestWatermarkStore {
                 if *name == b"refs/heads/a" {
                     Some(scanner_git::RefWatermark {
                         oid: OidBytes::sha1([0x0a; 20]),
-                        generation: None,
+                        // Synthetic OID for repo-open test; generation value
+                        // is arbitrary since it won't match any real commit.
+                        generation: std::num::NonZeroU32::new(1).unwrap(),
                     })
                 } else {
                     None

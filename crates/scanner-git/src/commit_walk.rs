@@ -31,6 +31,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::num::NonZeroU32;
 
 use gix_commitgraph::Position;
 
@@ -503,7 +504,7 @@ enum WatermarkResolution {
     /// Watermark OID not found in the commit graph (GC'd or rebuilt).
     OidMissing,
     /// Stored generation does not match the graph — likely a force push.
-    GenerationMismatch,
+    GenerationMismatch { stored: NonZeroU32, actual: u32 },
 }
 
 impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
@@ -554,8 +555,8 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
         })
     }
 
-    /// Resolves a persisted watermark OID and rejects stale generation data
-    /// before any ancestry walk.
+    /// Resolves a persisted watermark OID and checks its generation against
+    /// the current commit graph before any ancestry walk.
     fn resolve_current_watermark(
         &self,
         watermark: RefWatermark,
@@ -563,10 +564,12 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
         let Some(wm_pos) = self.cg.lookup(&watermark.oid)? else {
             return Ok(WatermarkResolution::OidMissing);
         };
-        if let Some(stored_generation) = watermark.generation {
-            if self.cg.generation(wm_pos) != stored_generation.get() {
-                return Ok(WatermarkResolution::GenerationMismatch);
-            }
+        let actual_gen = self.cg.generation(wm_pos);
+        if actual_gen != watermark.generation.get() {
+            return Ok(WatermarkResolution::GenerationMismatch {
+                stored: watermark.generation,
+                actual: actual_gen,
+            });
         }
         Ok(WatermarkResolution::Valid(wm_pos))
     }
@@ -594,8 +597,9 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
         // was already scanned in the prior run. Skip to avoid rescanning
         // old history. The check count is bounded to avoid O(refs^2).
         //
-        // Each iteration calls `resolve_current_watermark`, which performs an
-        // O(log n) fanout lookup in the commit graph. The loop is bounded by
+        // Each iteration calls `resolve_current_watermark`, which performs a
+        // commit-graph lookup (cost depends on the `CommitGraph` impl). The
+        // loop is bounded by
         // `max_new_ref_skip_checks` (default 1024), making the total lookup
         // cost negligible compared to the ancestry DFS that follows.
         if r.watermark.is_none() {
@@ -631,10 +635,10 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
             }
         }
 
-        // Resolve and validate watermark. Non-ancestor watermarks are ignored,
-        // which falls back to a full-history walk for that ref. A generation
-        // mismatch is an O(1) force-push detector, but matching generations
-        // still require an ancestry walk because siblings can share a generation.
+        // Resolve and validate watermark. Missing OIDs, generation mismatches,
+        // and non-ancestor watermarks all discard the watermark and fall back
+        // to a full-history walk for that ref. Matching generations still
+        // require an ancestry walk because siblings can share a generation.
         let mut wm_pos_opt: Option<Position> = None;
         if let Some(watermark) = r.watermark {
             if let WatermarkResolution::Valid(wm_pos) = self.resolve_current_watermark(watermark)? {
@@ -1244,7 +1248,7 @@ mod tests {
             graph.oid(Position(2)),
             Some(RefWatermark {
                 oid: graph.oid(watermark_pos),
-                generation: NonZeroU32::new(graph.generation(watermark_pos) + 10),
+                generation: NonZeroU32::new(graph.generation(watermark_pos) + 10).unwrap(),
             }),
         )];
         let mut iter = CommitPlanIter::new_from_refs(&refs, &graph, CommitWalkLimits::DEFAULT)
@@ -1263,7 +1267,7 @@ mod tests {
             graph.oid(Position(2)),
             Some(RefWatermark {
                 oid: graph.oid(watermark_pos),
-                generation: NonZeroU32::new(graph.generation(watermark_pos)),
+                generation: NonZeroU32::new(graph.generation(watermark_pos)).unwrap(),
             }),
         )];
         let mut iter = CommitPlanIter::new_from_refs(&refs, &graph, CommitWalkLimits::DEFAULT)
@@ -1282,7 +1286,7 @@ mod tests {
         let graph = MockGraph::linear(3);
         let stale_watermark = RefWatermark {
             oid: graph.oid(Position(2)),
-            generation: NonZeroU32::new(graph.generation(Position(2)) + 1),
+            generation: NonZeroU32::new(graph.generation(Position(2)) + 1).unwrap(),
         };
         let refs = vec![
             test_ref(graph.oid(Position(1)), None),
@@ -1299,25 +1303,5 @@ mod tests {
             0,
             "stale generations must not trigger the new-ref skip ancestry walk"
         );
-    }
-
-    #[test]
-    fn legacy_watermark_skips_generation_check() {
-        let graph = MockGraph::linear(3);
-        let watermark_pos = Position(1);
-        let refs = vec![test_ref(
-            graph.oid(Position(2)),
-            Some(RefWatermark {
-                oid: graph.oid(watermark_pos),
-                generation: None,
-            }),
-        )];
-        let mut iter = CommitPlanIter::new_from_refs(&refs, &graph, CommitWalkLimits::DEFAULT)
-            .expect("iterator");
-
-        assert!(iter.init_next_ref().expect("init"));
-        // No generation to compare, so the ancestry walk runs and confirms
-        // the watermark is an ancestor of the tip — watermark accepted.
-        assert_eq!(iter.cur_wm, Some(watermark_pos));
     }
 }

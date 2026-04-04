@@ -227,7 +227,7 @@ mod tests {
         let tip = OidBytes::from_slice(&oid(3));
         let watermark = Some(RefWatermark {
             oid: OidBytes::from_slice(&oid(9)),
-            generation: NonZeroU32::new(1),
+            generation: NonZeroU32::new(1).unwrap(),
         });
         let refs = vec![StartSetRef {
             name,
