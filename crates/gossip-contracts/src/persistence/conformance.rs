@@ -356,7 +356,9 @@ where
 ///
 /// 5. **Terminal-key enumeration** — `list_done_hashes` must return exactly
 ///    the keys in the requested `(tenant, policy)` scope whose durable status
-///    is terminal. `FailedRetryable` keys must be excluded.
+///    is terminal. `FailedRetryable` keys must be excluded. Cross-tenant and
+///    cross-policy isolation must hold: terminal keys outside the queried scope
+///    must not appear in results.
 ///
 /// Returns the number of checks that passed (currently 5).
 ///
@@ -530,14 +532,15 @@ where
     Ok(())
 }
 
-/// Check 5: `list_done_hashes` must return only terminal keys for one scope.
+/// Check 5: `list_done_hashes` must return only terminal keys for one scope,
+/// with cross-tenant and cross-policy isolation.
 fn check_done_ledger_list_done_hashes<L>(done_ledger: &L) -> Result<(), PersistenceConformanceError>
 where
     L: DoneLedger,
 {
-    let fixture = sample_fixture(0x33)?;
+    let fixture = sample_fixture(0xBB)?;
     let retryable_hash = derive_ovid_hash(&OvidHashInputs {
-        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(20))),
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(20))),
         version: VersionId::Strong(ObjectVersionId::from_version_bytes(
             b"conformance-retryable-version",
         )),
@@ -569,7 +572,7 @@ where
     })?;
 
     let failed_permanent_hash = derive_ovid_hash(&OvidHashInputs {
-        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(21))),
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(21))),
         version: VersionId::Strong(ObjectVersionId::from_version_bytes(
             b"conformance-failed-permanent-version",
         )),
@@ -604,7 +607,7 @@ where
     })?;
 
     let skipped_hash = derive_ovid_hash(&OvidHashInputs {
-        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(22))),
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(22))),
         version: VersionId::Strong(ObjectVersionId::from_version_bytes(
             b"conformance-skipped-version",
         )),
@@ -635,7 +638,7 @@ where
     })?;
 
     let scanned_clean_hash = derive_ovid_hash(&OvidHashInputs {
-        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(23))),
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(23))),
         version: VersionId::Strong(ObjectVersionId::from_version_bytes(
             b"conformance-scanned-clean-version",
         )),
@@ -677,6 +680,19 @@ where
             case: "done-ledger/list-done-hashes:list",
             source: Box::new(err),
         })?;
+    // Assert raw Vec length before converting to HashSet so duplicate rows
+    // from a buggy backend cannot be masked by set deduplication.
+    let expected_terminal_count = 4;
+    if hashes.len() != expected_terminal_count {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:terminal-count",
+            message: format!(
+                "expected {} terminal hashes, got {}",
+                expected_terminal_count,
+                hashes.len()
+            ),
+        });
+    }
     let actual: HashSet<_> = hashes.into_iter().collect();
     let expected = HashSet::from([
         fixture.ovid_hash,
@@ -696,9 +712,9 @@ where
 
     // Cross-tenant isolation: a terminal key under a different tenant must not
     // leak into the original scope's results.
-    let other_tenant = TenantId::from_bytes(fill32(0x33_u8.wrapping_add(30)));
+    let other_tenant = TenantId::from_bytes(fill32(0xBB_u8.wrapping_add(30)));
     let cross_tenant_hash = derive_ovid_hash(&OvidHashInputs {
-        stable_item_id: StableItemId::from_bytes(fill32(0x33_u8.wrapping_add(31))),
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(31))),
         version: VersionId::Strong(ObjectVersionId::from_version_bytes(
             b"conformance-cross-tenant-version",
         )),
@@ -733,6 +749,16 @@ where
             case: "done-ledger/list-done-hashes:cross-tenant-requery",
             source: Box::new(err),
         })?;
+    if hashes_after.len() != expected_terminal_count {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-tenant-count",
+            message: format!(
+                "cross-tenant requery: expected {} hashes, got {}",
+                expected_terminal_count,
+                hashes_after.len()
+            ),
+        });
+    }
     let actual_after: HashSet<_> = hashes_after.into_iter().collect();
     if actual_after != expected {
         return Err(PersistenceConformanceError::DoneLedgerInvariant {
@@ -743,6 +769,67 @@ where
             ),
         });
     }
+
+    // Cross-policy isolation: a terminal key under the same tenant but a
+    // different policy must not leak into the original scope's results.
+    let other_policy = PolicyHash::from_bytes(fill32(0xBB_u8.wrapping_add(32)));
+    let cross_policy_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(33))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-cross-policy-version",
+        )),
+    });
+    let cross_policy_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, other_policy, cross_policy_hash),
+        DoneLedgerStatus::ScannedClean,
+        256,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(80),
+            ShardId::from_raw(81),
+            FenceEpoch::from_raw(82),
+            LogicalTime::from_raw(83),
+            LogicalTime::from_raw(84),
+        ),
+        None,
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:cross-policy-record",
+        source: Box::new(source),
+    })?;
+    let _ = submit_done_ledger(
+        done_ledger,
+        "done-ledger/list-done-hashes:cross-policy-upsert",
+        &[cross_policy_record],
+    )?;
+
+    let hashes_cross_policy = done_ledger
+        .list_done_hashes(fixture.tenant_id, fixture.policy_hash)
+        .map_err(|err| PersistenceConformanceError::DoneLedgerGet {
+            case: "done-ledger/list-done-hashes:cross-policy-requery",
+            source: Box::new(err),
+        })?;
+    if hashes_cross_policy.len() != expected_terminal_count {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-policy-count",
+            message: format!(
+                "cross-policy requery: expected {} hashes, got {}",
+                expected_terminal_count,
+                hashes_cross_policy.len()
+            ),
+        });
+    }
+    let actual_cross_policy: HashSet<_> = hashes_cross_policy.into_iter().collect();
+    if actual_cross_policy != expected {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-policy-isolation",
+            message: format!(
+                "cross-policy key leaked into scope: expected {:?}, got {:?}",
+                expected, actual_cross_policy
+            ),
+        });
+    }
+
     Ok(())
 }
 

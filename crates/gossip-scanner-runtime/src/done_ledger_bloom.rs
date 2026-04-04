@@ -5,8 +5,9 @@
 //!
 //! - scopes below [`DoneLedgerBloomFilter::MIN_THRESHOLD`] skip the filter
 //!   because the fixed setup cost outweighs the benefit;
-//! - scopes above [`DoneLedgerBloomFilter::MAX_BYTES`] skip the filter so the
-//!   bitset stays within the configured memory budget.
+//! - scopes whose estimated Bloom memory would exceed
+//!   [`DoneLedgerBloomFilter::MAX_BYTES`] skip the filter to stay within the
+//!   configured memory budget.
 //!
 //! The done-ledger is monotonic, so a missing filter only causes extra
 //! persistence lookups. It never causes an already-processed item to be
@@ -40,12 +41,18 @@ pub(crate) struct DoneLedgerBloomFilter {
 impl DoneLedgerBloomFilter {
     /// Skip Bloom construction for tiny scopes.
     pub(crate) const MIN_THRESHOLD: usize = 10_000;
-    /// Cap Bloom memory at 32 MiB so the filter remains cache-friendly.
+    /// Cap Bloom memory at 32 MiB to bound per-scope prefilter overhead.
     pub(crate) const MAX_BYTES: usize = 32 * 1024 * 1024;
     /// Target false-positive rate used for sizing.
     pub(crate) const TARGET_FPR: f64 = 0.01;
 
     /// Construct an empty Bloom filter sized for `expected_items`.
+    ///
+    /// Callers must pass the **full lifetime population** (preloaded keys +
+    /// expected growth during the run) so the false-positive rate stays near
+    /// [`TARGET_FPR`](Self::TARGET_FPR). Passing only the initial
+    /// `list_done_hashes()` count and then inserting many more keys will
+    /// degrade the filter.
     ///
     /// Returns `None` when the scope is too small to justify the filter or
     /// when the requested capacity would exceed the memory cap.
@@ -62,6 +69,9 @@ impl DoneLedgerBloomFilter {
         let inner = BloomFilter::with_false_pos(Self::TARGET_FPR)
             .hasher(RawU64BuildHasher::default())
             .expected_items(expected_items);
+        // Safety net: the library may round the bitset up to the next block
+        // boundary, so the actual allocation can slightly exceed the estimate.
+        // This check is cheap and should rarely fire in practice.
         let memory_bytes = inner.as_slice().len().checked_mul(size_of::<u64>())?;
         if memory_bytes > Self::MAX_BYTES {
             return None;
@@ -76,8 +86,8 @@ impl DoneLedgerBloomFilter {
 
     /// Return `true` when the filter may contain `hash`.
     ///
-    /// False positives are possible, but false negatives are not for keys that
-    /// were previously inserted into this filter instance.
+    /// False positives are possible, but false negatives are not for keys
+    /// inserted into this filter instance.
     #[inline]
     pub(crate) fn maybe_contains(&self, hash: &OvidHash) -> bool {
         self.inner.contains(&RawBloomWord(ovid_to_u64(hash)))
@@ -90,7 +100,10 @@ impl DoneLedgerBloomFilter {
         self.len = self.len.saturating_add(1);
     }
 
-    /// Number of inserted keys recorded by this wrapper instance.
+    /// Number of insertions performed on this filter instance.
+    ///
+    /// Counts each `insert` call, including duplicates. This is a diagnostic
+    /// counter and does not affect Bloom filter membership semantics.
     #[inline]
     pub(crate) const fn len(&self) -> usize {
         self.len
@@ -135,14 +148,11 @@ fn ovid_to_u64(hash: &OvidHash) -> u64 {
 struct RawU64Hasher(u64);
 
 impl Hasher for RawU64Hasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut state = 0xcbf29ce484222325u64;
-        for &byte in bytes {
-            state ^= u64::from(byte);
-            state = state.wrapping_mul(0x100000001b3);
-        }
-        self.0 = state;
+    fn write(&mut self, _bytes: &[u8]) {
+        unimplemented!(
+            "RawU64Hasher is a pass-through hasher for pre-hashed u64 values; \
+             only write_u64 is supported"
+        );
     }
 
     #[inline]
@@ -218,7 +228,7 @@ mod tests {
         policy_hash: PolicyHash,
         ovid_hash: OvidHash,
     ) -> DoneLedgerRecord {
-        DoneLedgerRecord::try_new(
+        let record = DoneLedgerRecord::try_new(
             DoneLedgerKey::new(tenant_id, policy_hash, ovid_hash),
             DoneLedgerStatus::ScannedClean,
             128,
@@ -226,7 +236,9 @@ mod tests {
             provenance(10),
             None,
         )
-        .expect("scanned record should be valid")
+        .expect("scanned record should be valid");
+        record.validate().expect("scanned record invariants");
+        record
     }
 
     fn retryable_record(
@@ -234,7 +246,7 @@ mod tests {
         policy_hash: PolicyHash,
         ovid_hash: OvidHash,
     ) -> DoneLedgerRecord {
-        DoneLedgerRecord::try_new(
+        let record = DoneLedgerRecord::try_new(
             DoneLedgerKey::new(tenant_id, policy_hash, ovid_hash),
             DoneLedgerStatus::FailedRetryable,
             64,
@@ -242,7 +254,9 @@ mod tests {
             provenance(20),
             Some(DoneLedgerErrorCode::try_new("RETRYABLE").expect("error code should be valid")),
         )
-        .expect("retryable record should be valid")
+        .expect("retryable record should be valid");
+        record.validate().expect("retryable record invariants");
+        record
     }
 
     #[test]
@@ -292,6 +306,14 @@ mod tests {
         assert!(filter.maybe_contains(&hash));
         assert_eq!(filter.len(), 1);
         assert!(!filter.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "pass-through hasher")]
+    fn raw_u64_hasher_write_panics() {
+        use std::hash::Hasher as _;
+        let mut h = RawU64Hasher::default();
+        h.write(b"must panic");
     }
 
     #[test]

@@ -81,7 +81,9 @@ WHERE tenant_id = $1
 /// without hard-coding enum discriminants in SQL text.
 ///
 /// The existing `(tenant_id, policy_hash, finished_at DESC, ovid_hash)` index
-/// covers the leading scope columns used here.
+/// narrows the scan to the target tenant+policy scope. The `status` filter
+/// requires a heap lookup per candidate row, acceptable for a COLD-tier
+/// bulk-load operation.
 pub const LIST_DONE_HASHES_SQL: &str = r#"
 SELECT ovid_hash FROM done_ledger_entries
 WHERE tenant_id = $1
@@ -312,7 +314,7 @@ mod tests {
         assert_eq!(ascii, "GSDLPGM1");
     }
 
-    /// Both SQL query constants must embed the canonical table name.
+    /// All SQL query constants must embed the canonical table name.
     /// This guards against silent drift if the table constant is renamed
     /// but the SQL literals are not updated in lockstep.
     #[test]
@@ -324,6 +326,10 @@ mod tests {
         assert!(
             UPSERT_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
             "UPSERT_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
+        );
+        assert!(
+            LIST_DONE_HASHES_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
+            "LIST_DONE_HASHES_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
         );
     }
 }
