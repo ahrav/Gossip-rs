@@ -411,8 +411,8 @@ impl SeenBitmapDelta {
 /// Inserts the position into the bitmap as a u32 index.
 ///
 /// Callers must ensure `pos` fits in u32. This is guaranteed by the
-/// construction-time `u32_len` check in `from_oids_and_bitmap` and the
-/// pre-mutation `u32_len` guard in both merge paths of `merge_positions`.
+/// pre-flight `u32_len` upper-bound check at the top of `merge_positions`
+/// (the only caller) and by `deserialize` reading OID counts as u32.
 #[inline]
 fn insert_position(bitmap: &mut RoaringBitmap, pos: usize) {
     debug_assert!(pos <= u32::MAX as usize, "bitmap position exceeds u32::MAX");
@@ -421,7 +421,7 @@ fn insert_position(bitmap: &mut RoaringBitmap, pos: usize) {
 
 /// Probes the bitmap for the given position.
 ///
-/// Positions are guaranteed to fit in u32 by the same construction-time
+/// Positions are guaranteed to fit in u32 by the same pre-flight
 /// `u32_len` check that guards `insert_position`.
 #[inline]
 fn bitmap_contains(bitmap: &RoaringBitmap, pos: usize) -> bool {
