@@ -8318,8 +8318,9 @@ mod tests {
         assert!(signal.current().is_none(), "expiry was silently lost");
     }
 
-    /// Proves the fix: checking the deadline and noting before `close()`
-    /// preserves the expiry through the `Recorded` state.
+    /// `note()` before `close()` transitions the signal to `Recorded`, which
+    /// `close()` cannot overwrite. The expiry reason survives the seal and
+    /// is visible to `current()`.
     #[test]
     fn lease_uncertainty_note_before_close_preserves_expiry() {
         let signal = LeaseUncertaintySignal::default();
