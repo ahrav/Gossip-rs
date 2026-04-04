@@ -1,3 +1,10 @@
+//! Tests for shard specifications, cursors, and shard arenas.
+//!
+//! This module verifies the correctness of `ShardSpec` and `ShardArena` operations,
+//! including bounds validation, canonical hashing stability, split coverage contiguity,
+//! and memory-safe arena allocations. It enforces invariants such as proper key
+//! ordering, size constraints on keys and metadata, and correct error generation.
+
 use rstest::rstest;
 
 use super::*;
@@ -6,10 +13,6 @@ use crate::test_util::{
     arb_valid_n_way_split, canonical_digest,
 };
 use proptest::prelude::*;
-
-// -------------------------------------------------------------------
-// CursorSemantics
-// -------------------------------------------------------------------
 
 #[test]
 fn from_u8_roundtrip() {
@@ -36,10 +39,6 @@ fn canonical_bytes_discriminant_distinct() {
     let d_dispatched = canonical_digest(&CursorSemantics::Dispatched);
     assert_ne!(d_completed, d_dispatched);
 }
-
-// -------------------------------------------------------------------
-// ShardSpec construction
-// -------------------------------------------------------------------
 
 #[rstest]
 #[case::unbounded(ShardSpec::unbounded(), b"" as &[u8], b"" as &[u8], true, true, true)]
@@ -120,10 +119,6 @@ fn with_range_and_metadata_panics_on_oversized_metadata() {
     let _ = ShardSpec::with_range_and_metadata(b"a", b"z", vec![0xAA; MAX_METADATA_SIZE + 1]);
 }
 
-// -------------------------------------------------------------------
-// Fallible constructors
-// -------------------------------------------------------------------
-
 #[test]
 fn try_with_range_inverted() {
     let err = ShardSpec::try_with_range(b"z", b"a").unwrap_err();
@@ -198,10 +193,6 @@ fn shard_spec_input_error_display(
     }
 }
 
-// -------------------------------------------------------------------
-// Size-limit validation
-// -------------------------------------------------------------------
-
 #[test]
 fn try_with_range_start_key_at_max() {
     let start = vec![0x01; MAX_KEY_SIZE];
@@ -251,10 +242,6 @@ fn try_with_range_and_metadata_over_max() {
         }
     );
 }
-
-// -------------------------------------------------------------------
-// Split validation
-// -------------------------------------------------------------------
 
 #[test]
 fn split_valid_two_way() {
@@ -394,10 +381,6 @@ fn split_inverted_child_reports_original_index() {
     }
 }
 
-// -------------------------------------------------------------------
-// Residual split
-// -------------------------------------------------------------------
-
 #[test]
 fn residual_split_valid() {
     let old_parent = ShardSpec::with_range(b"a", b"z");
@@ -418,7 +401,6 @@ fn residual_split_gap() {
 #[test]
 fn residual_split_swapped_roles_rejected() {
     let old_parent = ShardSpec::with_range(b"a", b"z");
-    // Swap: new_parent gets upper range, residual gets lower.
     let new_parent = ShardSpec::with_range(b"m", b"z");
     let residual = ShardSpec::with_range(b"a", b"m");
     let result = validate_residual_split(&old_parent, &new_parent, &residual);
@@ -443,16 +425,11 @@ fn split_two_unbounded_children_rejected() {
 #[test]
 fn split_non_last_child_unbounded_end_rejected() {
     let parent = ShardSpec::unbounded();
-    // First child covers everything, second is also unbounded.
     let c1 = ShardSpec::with_range(vec![], vec![]);
     let c2 = ShardSpec::with_range(vec![], vec![]);
     let result = validate_split_coverage(&parent, &[&c1, &c2]);
     assert!(result.is_err());
 }
-
-// -------------------------------------------------------------------
-// SplitValidationError Display
-// -------------------------------------------------------------------
 
 #[test]
 fn split_validation_error_display() {
@@ -468,33 +445,20 @@ fn split_validation_error_display() {
     assert!(msg.contains("child 1"));
 }
 
-// -------------------------------------------------------------------
-// Metadata participates in canonical hashing
-// -------------------------------------------------------------------
-
 #[test]
 fn with_range_and_metadata_stores_and_hashes_metadata() {
     let spec_no_meta = ShardSpec::with_range_and_metadata(b"a", b"z", vec![]);
     let spec_with_meta = ShardSpec::with_range_and_metadata(b"a", b"z", b"repo:org/foo");
-
-    // Metadata is stored.
     assert_eq!(spec_with_meta.metadata(), b"repo:org/foo");
-
-    // Same range, different metadata → different canonical digest.
     assert_ne!(
         canonical_digest(&spec_no_meta),
         canonical_digest(&spec_with_meta),
     );
 }
 
-// -------------------------------------------------------------------
-// Property-based tests
-// -------------------------------------------------------------------
-
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
-    // -- Stability: same input → same digest ----------------------------
 
     #[test]
     fn shard_spec_canonical_bytes_stable(
@@ -507,7 +471,6 @@ proptest! {
         prop_assert_eq!(canonical_digest(&spec), canonical_digest(&spec));
     }
 
-    // -- Collision-freedom: distinct specs → distinct digests -----------
 
     #[test]
     fn shard_spec_canonical_bytes_collision_free(
@@ -518,7 +481,6 @@ proptest! {
         prop_assert_ne!(canonical_digest(&a), canonical_digest(&b));
     }
 
-    // -- contains_key equivalence with manual check ---------------------
 
     #[test]
     fn contains_key_matches_manual_check(
@@ -533,7 +495,6 @@ proptest! {
         prop_assert_eq!(spec.contains_key(&key), expected);
     }
 
-    // -- split coverage: key in parent iff in exactly one child ----------
 
     #[test]
     fn split_coverage_roundtrip(
@@ -553,7 +514,6 @@ proptest! {
         }
     }
 
-    // -- residual split: old_parent == new_parent ∪ residual -------------
 
     #[test]
     fn residual_split_roundtrip(
@@ -580,7 +540,6 @@ proptest! {
         prop_assert!(!(in_new && in_res), "key in both new_parent and residual");
     }
 
-    // -- Constructor equivalence: try_with_range ≡ with_range ------------
 
     #[test]
     fn try_with_range_equivalent_to_with_range(
@@ -593,7 +552,6 @@ proptest! {
         prop_assert_eq!(result, Ok(expected));
     }
 
-    // -- Constructor equivalence: try_with_range_and_metadata -------------
 
     #[test]
     fn try_with_range_and_metadata_equivalent(
@@ -610,9 +568,6 @@ proptest! {
         prop_assert_eq!(try_result, Ok(direct));
     }
 
-    // -- Canonical hash consistency: ShardSpec and ShardSpecRef produce
-    //    the same digest for the same logical value.
-
     #[test]
     fn shard_spec_and_ref_canonical_hash_consistent(
         spec in arb_shard_spec(),
@@ -625,7 +580,6 @@ proptest! {
         );
     }
 
-    // -- Round-trip: try_from_ref(spec.as_ref()) recovers the original.
 
     #[test]
     fn try_from_ref_round_trip(
@@ -638,7 +592,6 @@ proptest! {
         );
     }
 
-    // -- Metadata distinction: different metadata → different digest -----
 
     #[test]
     fn metadata_changes_canonical_digest(
@@ -648,7 +601,6 @@ proptest! {
             spec.key_range_start(),
             spec.key_range_end(),
         );
-        // If the spec has non-empty metadata, digests must differ.
         if !spec.metadata().is_empty() {
             prop_assert_ne!(
                 canonical_digest(&spec),
@@ -659,15 +611,9 @@ proptest! {
     }
 }
 
-// -------------------------------------------------------------------
-// Split coverage rejects oversized child specs
-// -------------------------------------------------------------------
-
-// -------------------------------------------------------------------
-// ShardArena
-// -------------------------------------------------------------------
-
-/// Helper: create a small arena suitable for unit tests.
+/// Creates a constrained `ShardArena` for testing allocation limits.
+///
+/// Ensures tests can predictably trigger slab capacity exhaustion and handle lifecycle events.
 fn test_arena(slots: usize, bytes: usize) -> ShardArena {
     ShardArena::with_capacity(slots, bytes)
 }
@@ -705,7 +651,6 @@ fn arena_slot_exhaustion_returns_slab_full() {
 
 #[test]
 fn arena_byte_capacity_exhaustion_returns_slab_full() {
-    // Very small byte capacity: not enough for even one spec.
     let mut arena = test_arena(4, 1);
     let spec = ShardSpecRef::new(b"a", b"z", b"metadata_payload");
     assert!(arena.alloc_spec(spec).is_err());
@@ -728,7 +673,6 @@ fn arena_stale_handle_free_spec_is_silent() {
     let spec = ShardSpecRef::new(b"a", b"z", &[]);
     let handle = arena.alloc_spec(spec).unwrap();
     arena.free_spec(handle);
-    // Double-free with stale handle should be silently ignored.
     arena.free_spec(handle);
 }
 
@@ -738,8 +682,6 @@ fn arena_slot_reuse_after_free() {
     let spec1 = ShardSpecRef::new(b"a", b"m", &[]);
     let h1 = arena.alloc_spec(spec1).unwrap();
     arena.free_spec(h1);
-
-    // The single slot is free again — a new alloc should succeed.
     let spec2 = ShardSpecRef::new(b"m", b"z", b"different");
     let h2 = arena.alloc_spec(spec2).unwrap();
     let view = arena.view_spec(&h2);
@@ -763,27 +705,17 @@ fn arena_invalid_slot_index_panics() {
 
 #[test]
 fn arena_rollback_on_slab_byte_exhaustion() {
-    // 2 slots, but only enough bytes for one spec.
     let mut arena = test_arena(2, 64);
     let small = ShardSpecRef::new(b"a", b"b", &[]);
     let h1 = arena.alloc_spec(small).unwrap();
-
-    // Second alloc exceeds byte capacity — should fail and
-    // return the slot to the free list.
     let large = ShardSpecRef::new(b"a", b"z", &[0xAA; 200]);
     assert!(arena.alloc_spec(large).is_err());
-
-    // The slot should have been returned, so a small alloc succeeds.
     let h2 = arena.alloc_spec(small).unwrap();
 
     // Free all specs before drop to satisfy ByteSlab leak detector.
     arena.free_spec(h1);
     arena.free_spec(h2);
 }
-
-// -------------------------------------------------------------------
-// try_view_spec
-// -------------------------------------------------------------------
 
 #[test]
 fn try_view_spec_returns_some_for_live_handle() {
@@ -828,10 +760,6 @@ fn try_view_spec_returns_none_for_invalid_slot() {
     assert!(arena.try_view_spec(&bogus).is_none());
 }
 
-// -------------------------------------------------------------------
-// validate_ref error paths
-// -------------------------------------------------------------------
-
 #[rstest]
 #[case::oversized_start_key(
     vec![0x01; MAX_KEY_SIZE + 1], b"z".to_vec(), vec![],
@@ -865,10 +793,6 @@ fn validate_ref_accepts_valid_spec() {
     let spec = ShardSpecRef::new(b"a", b"z", b"meta");
     assert!(ShardSpec::validate_ref(spec).is_ok());
 }
-
-// -------------------------------------------------------------------
-// Split coverage rejects oversized child specs
-// -------------------------------------------------------------------
 
 #[test]
 fn split_coverage_rejects_child_with_oversized_metadata() {
