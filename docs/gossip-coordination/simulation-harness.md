@@ -272,15 +272,19 @@ submodules that are part of the crate's public API.
 
 | Type                    | Purpose                                                    |
 | ----------------------- | ---------------------------------------------------------- |
-| `InvariantChecker`      | Runs all safety/liveness invariants in a single pass over coordinator state |
-| `InvariantViolation`    | Enum of all detectable violations (S1-S9 safety, L1 liveness, D1 diagnostics) |
+| `InvariantChecker`      | Runs the coordination safety invariants in a single pass over coordinator state |
+| `InvariantViolation`    | Enum of S1-S9 safety violations detected by the checker |
 | `SplitCoverageDetail`   | Detail record for S7 (split coverage) violations, containing parent/child spec information |
 
 ### Overload Scenarios (`sim/overload.rs`)
 
 | Type                    | Purpose                                                    |
 | ----------------------- | ---------------------------------------------------------- |
+| `OverloadKind`          | Scripted overload workload selector (`BurstClaim`, `CapacityDrop`, `BurstShards`) |
+| `OverloadScenario`      | Scenario descriptor configuring the overload phase |
 | `GoodputTracker`        | Tracks completion ratio during overload rounds for goodput reporting |
+| `D1Observation`         | Snapshot comparing reported availability to full-scan ground truth |
+| `OverloadReport`        | Extended run report with overload goodput, D1 samples, and the L1 recovery sentinel |
 
 ### Composition Extensions (`sim/composition.rs`, `sim/composition_invariants.rs`, `sim/scan_driver_sim.rs`)
 
