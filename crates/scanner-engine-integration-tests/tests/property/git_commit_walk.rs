@@ -218,9 +218,17 @@ proptest! {
             let tip = Position(tips[i]);
             let wm = Position(watermarks[i]);
 
+            // When stored generation mismatches the graph, the real walker
+            // treats the watermark as invalid and does a full history walk.
+            // None means legacy/unknown — skip the generation gate.
+            let wm_is_valid = match generations[i] {
+                Some(g) => g.get() == graph.generation(wm),
+                None => true,
+            };
+
             let reach_tip = reachable_from(&parents, tip);
             let mut in_range = reach_tip.clone();
-            if is_ancestor(&parents, wm, tip) {
+            if wm_is_valid && is_ancestor(&parents, wm, tip) {
                 let reach_wm = reachable_from(&parents, wm);
                 for j in 0..n {
                     if reach_wm[j] {
