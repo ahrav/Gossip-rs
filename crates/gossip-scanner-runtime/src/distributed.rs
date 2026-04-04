@@ -2758,9 +2758,6 @@ where
 /// `FindingsSink::upsert_batch` uses upsert (idempotent) semantics: on
 /// re-claim the repo is re-scanned and findings are re-submitted, with
 /// duplicates deduplicated by the sink's primary key.
-///
-/// The idempotency claim is a contract-level guarantee of `FindingsSink`,
-/// not yet validated by integration tests for the git repo path.
 #[allow(clippy::too_many_arguments)]
 fn persist_git_repo_findings_and_done_ledger<F, D>(
     persistence: &DistributedPersistence<F, D>,
@@ -3637,9 +3634,7 @@ mod tests {
         dir
     }
 
-    /// Git repo fixture containing only benign content that does not trigger
-    /// any detection rules. Use this for tests that need the scan to complete
-    /// successfully without any findings.
+    /// Git repo fixture with benign content that produces zero findings.
     fn create_clean_git_repo_fixture() -> tempfile::TempDir {
         let dir = tempdir().expect("tempdir");
         init_git_repo(
