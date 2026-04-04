@@ -32,10 +32,10 @@ The harness lives in `tools/eval-harness/` as a standalone crate with its own `C
 | `matching.rs`       | Position-based finding-to-truth matching (greedy, confidence-sorted)                                   |
 | `metrics.rs`        | Precision, recall, F1, F2, AP, P@R, R@P, bootstrap CI, per-rule breakdown                              |
 | `provenance.rs`     | BLAKE3 corpus/binary/ruleset hashing for reproducibility                                               |
-| `regression.rs`     | Baseline comparison with CI overlap gating and two-tier verdicts                                       |
+| `regression.rs`     | Baseline comparison with CI overlap gating and three-tier verdicts                                     |
 | `report.rs`         | Report assembly, JSON/table rendering, error book generation                                           |
 | `pipeline.rs`       | `DedupMode`, `EvalPipelineConfig` — cross-rule dedup configuration for evaluation runs                 |
-| `lib.rs`            | Module re-exports                                                                                      |
+| `lib.rs`            | Crate module declarations and rustdoc lint allowances                                                  |
 
 ### Data Flow
 
@@ -202,9 +202,9 @@ eval-harness creddata \
 
 # Synthetic — position-based evaluation with live scan
 eval-harness synthetic \
-  --manifest tests/synthetic/manifest.json \
-  --corpus-root tests/synthetic/corpus \
-  --scan-corpus tests/synthetic/corpus
+  --manifest tools/eval-harness/testdata/synthetic/cross_rule_overlap/truth.json \
+  --corpus-root tools/eval-harness/testdata/synthetic/cross_rule_overlap/corpus \
+  --scan-corpus tools/eval-harness/testdata/synthetic/cross_rule_overlap/corpus
 
 # LeakyRepo — count-based evaluation with pre-computed findings
 eval-harness leaky-repo \
@@ -376,22 +376,22 @@ Validation is fail-fast: the first invalid entry halts loading with an error tha
 ```bash
 # Live scan — harness scans the corpus directory
 eval-harness synthetic \
-  --manifest tests/synthetic/manifest.json \
-  --corpus-root tests/synthetic/corpus \
-  --scan-corpus tests/synthetic/corpus \
+  --manifest tools/eval-harness/testdata/synthetic/cross_rule_overlap/truth.json \
+  --corpus-root tools/eval-harness/testdata/synthetic/cross_rule_overlap/corpus \
+  --scan-corpus tools/eval-harness/testdata/synthetic/cross_rule_overlap/corpus \
   --cross-rule-dedup
 
 # Pre-computed findings
 eval-harness synthetic \
-  --manifest tests/synthetic/manifest.json \
-  --corpus-root tests/synthetic/corpus \
+  --manifest tools/eval-harness/testdata/synthetic/cross_rule_overlap/truth.json \
+  --corpus-root tools/eval-harness/testdata/synthetic/cross_rule_overlap/corpus \
   --findings findings.jsonl
 
 # With baseline regression check
 eval-harness synthetic \
-  --manifest tests/synthetic/manifest.json \
-  --corpus-root tests/synthetic/corpus \
-  --scan-corpus tests/synthetic/corpus \
+  --manifest tools/eval-harness/testdata/synthetic/cross_rule_overlap/truth.json \
+  --corpus-root tools/eval-harness/testdata/synthetic/cross_rule_overlap/corpus \
+  --scan-corpus tools/eval-harness/testdata/synthetic/cross_rule_overlap/corpus \
   --cross-rule-dedup \
   --baseline baseline.json
 ```
