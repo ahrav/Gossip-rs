@@ -2834,7 +2834,7 @@ where
     }
 
     // The lease-deadline watchdog flips this token when the lease expires.
-    // Scanner-git now borrows the underlying flag, so mid-scan cancellation
+    // Scanner-git borrows the underlying flag, so mid-scan cancellation
     // can stop tree walks, blob introduction, and pack-exec scheduling before
     // finalize persistence begins. The pre-/post-mirror expiry checks still
     // guard the mirror-sync window around the scan itself.

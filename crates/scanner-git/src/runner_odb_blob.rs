@@ -30,7 +30,7 @@
 //! across runs or worker counts.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -55,7 +55,7 @@ use super::pack_io::PackIo;
 use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPlanError};
 use super::pack_plan_model::CompletedPacksBitmap;
 use super::runner::{
-    GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
+    check_abort, GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
 };
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::{SpillStats, Spiller};
@@ -354,9 +354,7 @@ pub(super) fn run_odb_blob(
                 Err(err) => return Err(err.into()),
             }
         };
-    if abort.load(Ordering::Relaxed) {
-        return Err(super::errors::TreeDiffError::Aborted.into());
-    }
+    check_abort(abort)?;
 
     // ── Stage 2 + 3: pack planning + execution ──────────────────────
     let pack_plan_start = Instant::now();
@@ -465,9 +463,7 @@ pub(super) fn run_odb_blob(
         );
 
         if !plans.is_empty() {
-            if abort.load(Ordering::Relaxed) {
-                return Err(super::errors::TreeDiffError::Aborted.into());
-            }
+            check_abort(abort)?;
             #[cfg(feature = "git-perf")]
             start_pack_exec();
             let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
@@ -516,9 +512,7 @@ pub(super) fn run_odb_blob(
         }
 
         if !loose.is_empty() {
-            if abort.load(Ordering::Relaxed) {
-                return Err(super::errors::TreeDiffError::Aborted.into());
-            }
+            check_abort(abort)?;
             #[cfg(feature = "git-perf")]
             start_pack_exec();
             let mut adapter = EngineAdapter::new_with_event_sink(
@@ -564,9 +558,7 @@ pub(super) fn run_odb_blob(
             pack_plan_start.elapsed().as_nanos() as u64
         );
         if !loose.is_empty() {
-            if abort.load(Ordering::Relaxed) {
-                return Err(super::errors::TreeDiffError::Aborted.into());
-            }
+            check_abort(abort)?;
             #[cfg(feature = "git-perf")]
             start_pack_exec();
             let mut adapter = EngineAdapter::new_with_event_sink(

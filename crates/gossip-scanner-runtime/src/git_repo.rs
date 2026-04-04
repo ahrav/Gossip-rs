@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 
@@ -146,21 +146,33 @@ impl GitRepoRuntime {
             payload.repo_id(),
             *write_context.policy_hash().as_bytes(),
         );
-        let execution = executor
-            .run_repo_with_persistence(
-                mirror,
-                &selection,
-                payload.execution_limits(),
-                *write_context.policy_hash().as_bytes(),
-                abort,
-                &persistence,
-            )
-            .map_err(|error| {
-                ScanRuntimeError::Driver(anyhow::Error::new(error).context(format!(
-                    "git repo execution failed for '{}'",
-                    digest_repo_path(mirror.path())
-                )))
-            })?;
+        let execution = match executor.run_repo_with_persistence(
+            mirror,
+            &selection,
+            payload.execution_limits(),
+            *write_context.policy_hash().as_bytes(),
+            abort,
+            &persistence,
+        ) {
+            Ok(exec) => exec,
+            Err(_) if abort.load(Ordering::Relaxed) => {
+                // Abort was signalled — treat as clean cancellation rather
+                // than surfacing an opaque driver error.
+                return Ok(GitRepoExecutionOutcome {
+                    report: ScanReport::default(),
+                    checkpoint_input: None,
+                    finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
+                });
+            }
+            Err(error) => {
+                return Err(ScanRuntimeError::Driver(anyhow::Error::new(error).context(
+                    format!(
+                        "git repo execution failed for '{}'",
+                        digest_repo_path(mirror.path())
+                    ),
+                )));
+            }
+        };
         let finalize_outcome = execution.result.0.finalize.outcome;
         // Sequence number is always 0: each repo-frontier shard processes
         // exactly one singleton repo target per lease, so the checkpoint
@@ -371,6 +383,15 @@ pub(crate) fn scan_local_repo(
                 digest_repo_path(&canonical_repo)
             ))
         });
+
+        // If cancellation was signalled mid-scan, convert the opaque driver
+        // error into a clean early return so callers can distinguish abort
+        // from real failures.
+        if execution.is_err() && cancel.is_cancelled() {
+            drop(event_tx);
+            let _ = join_scoped(event_forwarder, "git event forwarder thread");
+            return Ok((ScanReport::default(), None));
+        }
 
         // Close the sender before joining so the forwarder thread sees EOF.
         drop(event_tx);

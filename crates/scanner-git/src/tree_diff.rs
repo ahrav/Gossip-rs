@@ -349,6 +349,7 @@ impl TreeDiffWalker {
     /// - `TreeBytesBudgetExceeded` if total tree bytes exceed budget
     /// - `PathTooLong` if a path exceeds MAX_PATH_LEN
     /// - Tree loading errors from the source
+    /// - [`TreeDiffError::Aborted`] if the cooperative abort flag is set
     ///
     /// # Notes
     ///
@@ -1438,6 +1439,96 @@ mod tests {
             .unwrap();
 
         assert_eq!(candidates.len(), 1);
+    }
+
+    /// Sink that sets an abort flag on the first `emit` call, then delegates
+    /// to a `CandidateBuffer`. This lets the abort flag be `false` when the
+    /// pre-walk check runs but `true` before the periodic mid-walk check fires.
+    struct AbortOnFirstEmit<'a> {
+        inner: CandidateBuffer,
+        abort: &'a AtomicBool,
+        armed: bool,
+    }
+
+    impl CandidateSink for AbortOnFirstEmit<'_> {
+        fn emit(
+            &mut self,
+            oid: OidBytes,
+            path: &[u8],
+            commit_id: u32,
+            parent_idx: u8,
+            change_kind: ChangeKind,
+            ctx_flags: u16,
+            cand_flags: u16,
+        ) -> Result<(), TreeDiffError> {
+            if self.armed {
+                self.abort.store(true, AtomicOrdering::Relaxed);
+                self.armed = false;
+            }
+            self.inner.emit(
+                oid,
+                path,
+                commit_id,
+                parent_idx,
+                change_kind,
+                ctx_flags,
+                cand_flags,
+            )
+        }
+    }
+
+    #[test]
+    fn abort_fires_at_4096_entry_boundary_during_walk() {
+        // Build a flat tree with 4097 blob entries so the periodic abort check
+        // (`entry_count & 0xFFF == 0`) fires after processing the 4096th entry.
+        const ENTRY_COUNT: usize = 4097;
+
+        let mut tree_data = Vec::new();
+        for i in 0..ENTRY_COUNT {
+            // Zero-padded names guarantee lexicographic sort order.
+            let name = format!("e{i:05}");
+            tree_data.extend_from_slice(b"100644 ");
+            tree_data.extend_from_slice(name.as_bytes());
+            tree_data.push(0);
+            tree_data.extend_from_slice(&[0xab; 20]);
+        }
+
+        let mut source = MockTreeSource::new();
+        let tree_oid = test_oid(1);
+        source.add_tree(tree_oid, tree_data.clone());
+
+        let limits = TreeDiffLimits {
+            max_candidates: 8192,
+            max_tree_depth: 64,
+            max_tree_bytes_in_flight: (tree_data.len() as u64) * 2,
+            ..TreeDiffLimits::RESTRICTIVE
+        };
+        let mut walker = TreeDiffWalker::new(&limits, 20);
+
+        // The abort flag starts `false` so the pre-walk check at function entry
+        // passes. The sink sets it to `true` on the first emitted candidate,
+        // well before the periodic check fires at the 4096th entry.
+        let abort = AtomicBool::new(false);
+        let mut sink = AbortOnFirstEmit {
+            inner: CandidateBuffer::new(&limits, 20),
+            abort: &abort,
+            armed: true,
+        };
+
+        let result = walker.diff_trees(&mut source, &mut sink, Some(&tree_oid), None, 1, 0, &abort);
+
+        assert!(
+            matches!(result, Err(TreeDiffError::Aborted)),
+            "expected mid-walk Aborted, got {result:?}"
+        );
+        assert!(
+            walker.stack.is_empty(),
+            "stack must be drained after mid-walk abort"
+        );
+        assert_eq!(
+            walker.tree_bytes_in_flight, 0,
+            "all tree bytes must be released after mid-walk abort"
+        );
     }
 
     #[test]

@@ -1115,16 +1115,28 @@ struct SchedulerPackShared {
 /// Thin, copyable handle to a caller-owned cooperative abort flag.
 ///
 /// Scheduler worker closures must be `'static`, so they cannot borrow the
-/// caller's `&AtomicBool` directly. `execute_pack_plans_with_scheduler`
-/// guarantees all worker threads join before the original borrow can end, so
-/// this wrapper can safely carry the pointer through the executor.
+/// caller's `&AtomicBool` directly. This wrapper erases the borrow lifetime
+/// into a raw `NonNull` pointer so it can cross the `'static` boundary.
+///
+/// # Safety
+///
+/// All threads that hold an `AbortSignal` must be joined before the
+/// referenced `AtomicBool` is dropped. The type is `Copy`, so the compiler
+/// cannot enforce this — callers of [`AbortSignal::new`] accept responsibility
+/// for the join-before-drop invariant.
 #[derive(Clone, Copy)]
 struct AbortSignal {
     ptr: NonNull<AtomicBool>,
 }
 
 impl AbortSignal {
-    fn new(flag: &AtomicBool) -> Self {
+    /// Create an `AbortSignal` from a borrowed `AtomicBool`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that every thread which receives a copy of this
+    /// signal is joined before the borrow `flag` can expire.
+    unsafe fn new(flag: &AtomicBool) -> Self {
         Self {
             ptr: NonNull::from(flag),
         }
@@ -1727,6 +1739,9 @@ fn execute_plan_tasks(
         .map_err(|_| scheduler_queue_rejected_error(false))?;
     ex.join();
 
+    // Order matters: check scheduler error first (may have set the abort flag),
+    // then check external abort before collecting outputs, because aborted
+    // workers may leave output slots empty.
     if let Some(err) = take_scheduler_error(first_error.as_ref()) {
         return Err(err);
     }
@@ -1937,6 +1952,9 @@ fn execute_sharded_tasks(
         .map_err(|_| scheduler_queue_rejected_error(true))?;
     ex.join();
 
+    // Order matters: check scheduler error first (may have set the abort flag),
+    // then check external abort before collecting outputs, because aborted
+    // workers may leave output slots empty.
     if let Some(err) = take_scheduler_error(first_error.as_ref()) {
         return Err(err);
     }
@@ -2112,7 +2130,9 @@ pub(super) static EXECUTE_PACK_PLANS_WITH_SCHEDULER: ExecutePackPlansWithSchedul
             pack_cache_bytes,
             workers,
             pin_threads,
-            external_abort: AbortSignal::new(external_abort),
+            // SAFETY: `Executor::join()` is called before this borrow expires
+            // in both `execute_plan_tasks` and `execute_sharded_tasks`.
+            external_abort: unsafe { AbortSignal::new(external_abort) },
             commit_graph,
             commit_meta_seen,
         })

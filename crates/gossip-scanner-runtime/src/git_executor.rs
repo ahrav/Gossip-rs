@@ -218,6 +218,8 @@ impl ScannerGitExecutor {
             Arc<dyn scanner_git::EventSink>,
         ) -> Result<GitRunExecution, GitScanError>,
     {
+        // Local non-distributed scans use a permanently-unset abort flag.
+        // These scans are short-lived and do not support external cancellation.
         let abort = AtomicBool::new(false);
         self.execute_repo_with(mirror, selection, limits, [0; 32], &abort, run_scan)
             .map(git_run_outcome)
@@ -695,7 +697,7 @@ mod tests {
                 &mirror,
                 &GitSelection::default(),
                 GitExecutionLimits::default(),
-                move |path, _engine, _cfg, _sink, _abort| {
+                move |path, _engine, _cfg, _abort, _sink| {
                     *captured_path.lock().expect("capture mutex") = Some(path.to_path_buf());
                     Err(GitScanError::ConcurrentMaintenance)
                 },

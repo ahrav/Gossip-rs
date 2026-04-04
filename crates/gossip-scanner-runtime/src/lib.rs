@@ -255,6 +255,12 @@ impl CancellationToken {
     /// cancellation signal itself, so scanner-git uses `Relaxed` loads at read
     /// sites while this token continues to publish cancellation with
     /// `Release`/`Acquire` semantics for runtime-owned state.
+    ///
+    /// Note: because scanner-git reads with `Relaxed` ordering, there is no
+    /// happens-before edge from `cancel()` to the read. On weakly-ordered
+    /// architectures, the signal may not be visible for a brief window after
+    /// `cancel()` returns. The amortized check interval dominates this delay
+    /// in practice.
     #[must_use]
     pub fn as_atomic(&self) -> &AtomicBool {
         self.cancelled.as_ref()

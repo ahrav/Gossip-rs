@@ -595,6 +595,12 @@ impl BlobIntroducer {
     /// handling the failure. Seen sets are preserved; call `reset_seen` if
     /// needed. The abort flag is checked before each commit and every 4096
     /// processed tree entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreeDiffError`] on tree parse failures, capacity exhaustion,
+    /// sink errors, or object-store faults. Returns
+    /// [`TreeDiffError::Aborted`] if the cooperative abort flag is set.
     pub fn introduce<S: CandidateSink>(
         &mut self,
         source: &mut impl TreeSource,
@@ -912,6 +918,9 @@ impl<'a> BlobIntroWorker<'a> {
 
     #[inline]
     fn is_aborted(&self) -> bool {
+        // Relaxed: external abort is a monotonic flag; see CancellationToken::as_atomic().
+        // Acquire: error_abort must synchronize-with the store in the faulting worker so
+        // that any side-effects (e.g. logged diagnostics) are visible before we act on it.
         self.external_abort.load(Ordering::Relaxed) || self.error_abort.load(Ordering::Acquire)
     }
 
@@ -1326,11 +1335,17 @@ pub(super) fn introduce_parallel<'a>(
             Ok(wr) => {
                 worker_results.push(wr);
             }
-            Err(err) => {
-                if first_error.is_none() {
+            Err(err) => match first_error {
+                None => first_error = Some(err),
+                // Prefer non-Aborted errors: a real error (e.g. CorruptTree)
+                // is more informative than an Aborted triggered by sibling
+                // worker fan-out. Workers joined in spawn order may report
+                // Aborted before the root-cause error arrives.
+                Some(TreeDiffError::Aborted) if !matches!(err, TreeDiffError::Aborted) => {
                     first_error = Some(err);
                 }
-            }
+                _ => {}
+            },
         }
     }
 

@@ -82,6 +82,18 @@ use super::tree_diff_limits::TreeDiffLimits;
 use super::runner_exec::build_ref_entries;
 use crate::{perf_let, perf_set};
 
+/// Checks the cooperative cancellation flag and returns an abort error if set.
+///
+/// Used at stage boundaries across the scan pipeline to bail out early when
+/// the caller requests cancellation.
+#[inline]
+pub(super) fn check_abort(abort: &AtomicBool) -> Result<(), GitScanError> {
+    if abort.load(Ordering::Relaxed) {
+        return Err(TreeDiffError::Aborted.into());
+    }
+    Ok(())
+}
+
 /// Limits for pack file mmapping during scan execution.
 #[derive(Clone, Copy, Debug)]
 pub struct PackMmapLimits {
@@ -946,10 +958,8 @@ pub fn run_git_scan(
     abort: &AtomicBool,
     event_sink: std::sync::Arc<dyn crate::events::EventSink>,
 ) -> Result<GitScanResult, GitScanError> {
+    check_abort(abort)?;
     scanner_engine::perf_counters::reset();
-    if abort.load(Ordering::Relaxed) {
-        return Err(TreeDiffError::Aborted.into());
-    }
 
     let start_set_id = config.start_set.id();
     let mut repo = repo_open(
@@ -1001,9 +1011,7 @@ pub fn run_git_scan(
     if let Some(ref interner) = identity_interner {
         emit_identity_dictionary(&*event_sink, interner);
     }
-    if abort.load(Ordering::Relaxed) {
-        return Err(TreeDiffError::Aborted.into());
-    }
+    check_abort(abort)?;
 
     // Dispatch to mode-specific pipeline.
     let mk_commit_meta = || CommitMetaContext {
@@ -1048,9 +1056,7 @@ pub fn run_git_scan(
     if !repo.artifacts_unchanged()? {
         return Err(GitScanError::ConcurrentMaintenance);
     }
-    if abort.load(Ordering::Relaxed) {
-        return Err(TreeDiffError::Aborted.into());
-    }
+    check_abort(abort)?;
 
     // Finalize + persist.
     let refs = build_ref_entries(&repo);

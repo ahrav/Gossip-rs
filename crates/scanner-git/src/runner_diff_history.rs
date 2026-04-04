@@ -49,7 +49,7 @@
 //! results in planned sequence, regardless of worker completion order.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[cfg(feature = "git-perf")]
@@ -72,7 +72,7 @@ use super::pack_plan_model::CompletedPacksBitmap;
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
 use super::runner::{
-    GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
+    check_abort, GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
 };
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::Spiller;
@@ -201,9 +201,7 @@ pub(super) fn run_diff_history(
         perf_let!(diff_start = Instant::now());
         let mut sink = SpillCandidateSink::new(&mut spiller);
         for PlannedCommit { pos, snapshot_root } in plan {
-            if abort.load(Ordering::Relaxed) {
-                return Err(super::errors::TreeDiffError::Aborted.into());
-            }
+            check_abort(abort)?;
             let commit_id = pos.0;
             let new_tree = cg.root_tree_oid(*pos)?;
 
@@ -345,9 +343,7 @@ pub(super) fn run_diff_history(
         pack_plan,
         pack_plan_start.elapsed().as_nanos() as u64
     );
-    if abort.load(Ordering::Relaxed) {
-        return Err(super::errors::TreeDiffError::Aborted.into());
-    }
+    check_abort(abort)?;
 
     // Gate between planning and execution: if pack files or indices were
     // rewritten by a concurrent `git gc` / `git repack`, the offsets in our
@@ -390,9 +386,7 @@ pub(super) fn run_diff_history(
     #[cfg(feature = "git-perf")]
     let pack_exec_alloc_before: AllocStats = alloc_stats();
     if !plans.is_empty() {
-        if abort.load(Ordering::Relaxed) {
-            return Err(super::errors::TreeDiffError::Aborted.into());
-        }
+        check_abort(abort)?;
         let scheduler_workers = match pack_exec_strategy {
             PackExecStrategy::Serial => 1,
             PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
@@ -437,9 +431,7 @@ pub(super) fn run_diff_history(
         )?;
     }
     if !sink.loose.is_empty() {
-        if abort.load(Ordering::Relaxed) {
-            return Err(super::errors::TreeDiffError::Aborted.into());
-        }
+        check_abort(abort)?;
         let mut adapter = EngineAdapter::new_with_event_sink(
             engine.as_ref(),
             config.engine_adapter,
