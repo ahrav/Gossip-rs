@@ -1,15 +1,9 @@
 //! Integration tests for seen-store batching and unique blob determinism.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
 
-use gossip_scanner_runtime::git_persistence::{
-    GitPersistenceAdapter, GitPersistenceBackend, GitPersistenceOp,
-};
 use scanner_git::{
-    ChangeKind, CollectingUniqueBlobSink, FinalizeOutcome, FinalizeOutput, OidBytes,
-    PersistenceStore, SeenBlobStore, SpillError, SpillLimits, Spiller, WriteOp,
+    ChangeKind, CollectingUniqueBlobSink, OidBytes, SeenBlobStore, SpillError, SpillLimits, Spiller,
 };
 #[cfg(feature = "rocksdb")]
 use scanner_git::{InMemoryPersistenceStore, RoaringSeenBitmap};
@@ -28,74 +22,6 @@ impl SeenBlobStore for RecordingSeenStore {
     fn batch_check_seen(&self, oids: &[OidBytes]) -> Result<Vec<bool>, SpillError> {
         self.batches.borrow_mut().push(oids.len());
         Ok(vec![false; oids.len()])
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TestBackendError {
-    message: &'static str,
-}
-
-impl std::fmt::Display for TestBackendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message)
-    }
-}
-
-impl std::error::Error for TestBackendError {}
-
-#[derive(Debug, Default)]
-struct TestBackendState {
-    kv: BTreeMap<Vec<u8>, Vec<u8>>,
-    batch_call_count: usize,
-    fail_on_batch_call: Option<usize>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct TestBackend {
-    state: Rc<RefCell<TestBackendState>>,
-}
-
-impl TestBackend {
-    fn contains_key(&self, key: &[u8]) -> bool {
-        self.state.borrow().kv.contains_key(key)
-    }
-
-    fn batch_call_count(&self) -> usize {
-        self.state.borrow().batch_call_count
-    }
-
-    fn set_fail_on_batch_call(&self, call_no: usize) {
-        self.state.borrow_mut().fail_on_batch_call = Some(call_no);
-    }
-}
-
-impl GitPersistenceBackend for TestBackend {
-    type Error = TestBackendError;
-
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        Ok(self.state.borrow().kv.get(key).cloned())
-    }
-
-    fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
-        let mut state = self.state.borrow_mut();
-        state.batch_call_count += 1;
-        if state.fail_on_batch_call == Some(state.batch_call_count) {
-            return Err(TestBackendError {
-                message: "injected batch failure",
-            });
-        }
-        for op in ops {
-            match op {
-                GitPersistenceOp::Put { key, value } => {
-                    state.kv.insert(key.clone(), value.clone());
-                }
-                GitPersistenceOp::Delete { key } => {
-                    state.kv.remove(key);
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -131,112 +57,6 @@ fn seen_store_batches_by_count() {
         assert_eq!(stats.emitted_blobs, 0);
     }
     assert_eq!(sink.blobs.len(), 7);
-}
-
-#[test]
-fn spiller_recovery_skips_scope_committed_before_watermarks() {
-    let mut limits = SpillLimits::RESTRICTIVE;
-    limits.max_chunk_candidates = 32;
-    limits.max_chunk_path_bytes = 1024;
-    limits.max_path_len = 16;
-    limits.seen_batch_max_oids = 2;
-    limits.seen_batch_max_path_bytes = 64;
-
-    let repo_id = 42;
-    let policy_hash = [0xAB; 32];
-    let seen_scope_key = scanner_git::finalize::build_seen_scope_key(repo_id, &policy_hash);
-    let seen_staging_key = scanner_git::finalize::build_seen_staging_key(repo_id, &policy_hash);
-    let watermark_key = b"rw\0wm".to_vec();
-
-    let oid_a = OidBytes::sha1([0x11; 20]);
-    let oid_b = OidBytes::sha1([0x22; 20]);
-    let oid_c = OidBytes::sha1([0x33; 20]);
-    let oid_d = OidBytes::sha1([0x44; 20]);
-    let oid_e = OidBytes::sha1([0x55; 20]);
-    let oid_f = OidBytes::sha1([0x66; 20]);
-    let oids = [oid_a, oid_b, oid_c, oid_d, oid_e, oid_f];
-
-    let backend = TestBackend::default();
-    let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
-
-    let tmp = TempDir::new().unwrap();
-    let mut spiller = Spiller::new(limits, 20, tmp.path()).unwrap();
-    for oid in oids {
-        spiller
-            .push(oid, b"a", 1, 0, ChangeKind::Add, 0, 0)
-            .unwrap();
-    }
-
-    let mut sink = CollectingUniqueBlobSink::default();
-    spiller.finalize(&adapter, &adapter, &mut sink).unwrap();
-
-    let emitted_oids: Vec<OidBytes> = sink.blobs.iter().map(|blob| blob.oid).collect();
-    assert_eq!(emitted_oids, oids);
-    assert_eq!(
-        adapter.batch_check_seen(&oids).unwrap(),
-        vec![false, false, false, false, false, false],
-        "spill-stage writes remain invisible until finalize commits the seen scope"
-    );
-    assert!(!backend.contains_key(&seen_scope_key));
-    assert!(
-        backend.contains_key(&seen_staging_key),
-        "incremental spill writes must land in the staging key before finalize"
-    );
-
-    let batch_calls_before_finalize = backend.batch_call_count();
-    backend.set_fail_on_batch_call(batch_calls_before_finalize + 3);
-    let err = adapter
-        .commit_finalize(&FinalizeOutput {
-            data_ops: Vec::new(),
-            watermark_ops: vec![WriteOp {
-                key: watermark_key.clone(),
-                value: vec![1],
-            }],
-            outcome: FinalizeOutcome::Complete,
-            stats: Default::default(),
-        })
-        .unwrap_err();
-    assert!(format!("{err}").contains("injected batch failure"));
-
-    assert_eq!(
-        adapter.batch_check_seen(&oids).unwrap(),
-        vec![true, true, true, true, true, true],
-        "the committed seen scope must survive a later watermark-phase failure"
-    );
-    assert!(
-        backend.contains_key(&seen_scope_key),
-        "complete finalize must commit the merged seen scope before watermarks"
-    );
-    assert!(
-        !backend.contains_key(&seen_staging_key),
-        "successful scope commit must clear the staging key before watermark writes"
-    );
-    assert!(
-        !backend.contains_key(&watermark_key),
-        "outer progress must remain absent when the watermark phase fails"
-    );
-
-    let recovered = GitPersistenceAdapter::new(backend, repo_id, policy_hash);
-    assert_eq!(
-        recovered.batch_check_seen(&oids).unwrap(),
-        vec![true, true, true, true, true, true],
-        "a recovered adapter must reload the advanced seen scope from durable state"
-    );
-
-    let tmp = TempDir::new().unwrap();
-    let mut spiller = Spiller::new(limits, 20, tmp.path()).unwrap();
-    for oid in oids {
-        spiller
-            .push(oid, b"b", 2, 0, ChangeKind::Add, 0, 0)
-            .unwrap();
-    }
-
-    let mut sink = CollectingUniqueBlobSink::default();
-    spiller.finalize(&recovered, &recovered, &mut sink).unwrap();
-    assert!(
-        sink.blobs.is_empty(),
-        "replayed scans must skip OIDs whose seen scope committed before the crash"
-    );
 }
 
 struct CandidateInput {

@@ -3255,6 +3255,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "zip 2.4.2",
 ]
 
