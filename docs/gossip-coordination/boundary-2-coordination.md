@@ -74,7 +74,7 @@ The module provides seven core capabilities:
 
 ### Core source files
 
-#### `gossip-coordination` crate (`crates/gossip-coordination/src/`, excluding `*_tests.rs`; `src/sim/` is covered in [simulation-harness.md](simulation-harness.md))
+#### `gossip-coordination` crate (`crates/gossip-coordination/src/`, excluding `*_tests.rs` except the intentionally documented `scenario_tests.rs` and `test_fixtures.rs`; `src/sim/` is covered in [simulation-harness.md](simulation-harness.md))
 
 | File                 | Role                                                                                             |
 | -------------------- | ------------------------------------------------------------------------------------------------ |
