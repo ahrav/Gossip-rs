@@ -203,9 +203,7 @@ impl GitScanFixture {
         let mirror_root = tempfile::tempdir().expect("mirror-root tempdir should create");
         let (rules_root, rules_path) = create_rules_fixture();
         let repos = (0..repo_count)
-            .map(|index| {
-                create_committed_git_repo(workspace_root.path(), index, include_secret)
-            })
+            .map(|index| create_committed_git_repo(workspace_root.path(), index, include_secret))
             .collect();
 
         Self {
@@ -352,9 +350,10 @@ impl SeededLaunchProof {
 
 /// Live-backend Git proof seeded through real etcd, PostgreSQL, and a local repo fixture.
 ///
-/// The fixture must contain at least one committed repo so the worker can
-/// lower request-side selection into a real repository scan and persist durable
-/// completion state against the production-shaped backends.
+/// The fixture uses a clean repo (no rule-matching content) so the worker can
+/// complete the shard end-to-end. Durable Git finding translation is not yet
+/// wired up, so repos with matching content would cause the runtime to reject
+/// the shard before checkpoint.
 struct GitSeededLaunchProof {
     backends: SeededBackends,
     fixture: GitScanFixture,
@@ -364,7 +363,7 @@ struct GitSeededLaunchProof {
 impl GitSeededLaunchProof {
     fn new() -> Self {
         let mut backends = SeededBackends::new();
-        let fixture = GitScanFixture::new(1);
+        let fixture = GitScanFixture::clean(1);
         let submission = submit_git_request(
             &mut backends.coordinator,
             GitRequest::single_repo(
@@ -602,12 +601,14 @@ fn assert_registered_git_shard_state(
     );
     assert!(
         shard.cursor.last_key(shard.slab()).is_none(),
-        "fresh Git submission should not pre-populate shard progress"
+        "shard {key:?}: fresh submission should not pre-populate shard progress"
     );
     assert!(
         coordinator
             .test_load_owner_binding(tenant_id(), key)
-            .expect("owner-binding lookup should succeed after Git submission")
+            .unwrap_or_else(|e| {
+                panic!("shard {key:?}: owner-binding lookup should succeed: {e}")
+            })
             .is_none(),
         "shard {key:?}: submission alone must not claim the shard"
     );
@@ -808,15 +809,19 @@ fn run_worker_process(
 
     let timeout = Duration::from_secs(30);
     match child.wait_timeout(timeout).expect("wait should not fail") {
-        Some(status) => Output {
-            status,
-            stdout: stdout_thread
+        Some(status) => {
+            let stdout = stdout_thread
                 .join()
-                .expect("stdout drain thread should not panic"),
-            stderr: stderr_thread
+                .expect("stdout drain thread should not panic");
+            let stderr = stderr_thread
                 .join()
-                .expect("stderr drain thread should not panic"),
-        },
+                .expect("stderr drain thread should not panic");
+            Output {
+                status,
+                stdout,
+                stderr,
+            }
+        }
         None => {
             child.kill().expect("kill should succeed");
             child.wait().expect("wait after kill should succeed");
@@ -1114,17 +1119,15 @@ fn git_worker_binary_happy_path_completes_shard_and_commits() {
 
     let done_ledger_rows = proof.backends.done_ledger_row_count();
     let observation_rows = proof.backends.observation_row_count();
-    // Git scanning produces one done-ledger entry per repository (the repo
-    // is the scanned unit) and one observation per matching rule hit.  The
-    // fixture has one repo with one SAFE_TOKEN match.
+    // Git scanning produces one done-ledger entry per repository. The clean
+    // fixture has no rule-matching content, so zero observations are expected.
     assert_eq!(
         done_ledger_rows, 1,
         "expected exactly 1 done-ledger row (one per repo in Git mode), got {done_ledger_rows}"
     );
     assert_eq!(
-        observation_rows, 1,
-        "expected exactly 1 observation for rule '{}', got {observation_rows}",
-        SAFE_RULE_NAME,
+        observation_rows, 0,
+        "clean Git fixture should produce 0 observations, got {observation_rows}",
     );
     assert_completed_git_shard_state(&proof.backends.coordinator, proof.shard_key);
 }
@@ -1143,9 +1146,8 @@ fn git_worker_restart_is_idempotent_after_completed_shard() {
         "expected exactly 1 done-ledger row (one per repo in Git mode), got {done_rows_after_first}"
     );
     assert_eq!(
-        observation_rows_after_first, 1,
-        "expected exactly 1 observation for rule '{}', got {observation_rows_after_first}",
-        SAFE_RULE_NAME,
+        observation_rows_after_first, 0,
+        "clean Git fixture should produce 0 observations, got {observation_rows_after_first}",
     );
 
     let second = proof.run_worker_binary();

@@ -10,8 +10,8 @@ use std::process::Command;
 use gossip_contracts::{
     connector::{Cursor, ItemKey, ItemRef, Location, ScanItem, VersionId},
     identity::{
-        derive_rule_fingerprint, FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash,
-        RuleFingerprint, RunId, ShardId, StableItemId, TenantId, TenantSecretKey,
+        FenceEpoch, LogicalTime, ObjectVersionId, PolicyHash, RuleFingerprint, RunId, ShardId,
+        StableItemId, TenantId, TenantSecretKey, derive_rule_fingerprint,
     },
     persistence::WriteContext,
 };
@@ -21,7 +21,7 @@ use scanner_scheduler::store::FsFindingRecord;
 #[cfg(test)]
 use crate::{
     commit_model::CompletedUnit,
-    result_translation::{translate_item_result, ItemResult, PersistenceTranslation, ScanTiming},
+    result_translation::{ItemResult, PersistenceTranslation, ScanTiming, translate_item_result},
 };
 
 #[cfg(test)]
