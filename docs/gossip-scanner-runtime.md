@@ -710,13 +710,16 @@ pub struct ShardLease {
 
 ```rust
 pub struct GitShardLease {
-    /// String shard label used for routing recorder events.
+    /// String shard label used for telemetry routing and log correlation.
     shard_id: Arc<str>,
-    /// Authoritative coordination-layer lease used for terminal completion.
+    /// Authoritative coordination-layer lease used for terminal completion
+    /// and shard advancement.
     lease: Lease,
-    /// Authoritative shard bounds, resume cursor, and cursor semantics.
+    /// Shard bounds, resume cursor, and cursor semantics restored from
+    /// the acquire/restore coordination payload.
     state: RestoredShardState,
-    /// Decoded repo-frontier shard payload for the singleton repo target.
+    /// Decoded Git shard payload carrying the repo target, selection policy,
+    /// and execution limits for this shard.
     payload: GitShardPayload,
     /// Shared routing and fencing metadata for all writes emitted under the lease.
     write_context: WriteContext,

@@ -64,6 +64,7 @@ pub struct GitRepoRuntime;
 /// partial). Produced by [`GitRepoRuntime::execute_repo`] and consumed by
 /// the distributed Git worker loop to advance the shard.
 #[derive(Debug)]
+#[must_use]
 pub(crate) struct GitRepoExecutionOutcome {
     /// Aggregate scan metrics (objects, bytes, findings, errors) translated
     /// into the crate-level report format.
@@ -152,10 +153,10 @@ impl GitRepoRuntime {
                 &persistence,
             )
             .map_err(|error| {
-                ScanRuntimeError::Driver(anyhow!(
-                    "git repo execution failed for '{}': {error}",
+                ScanRuntimeError::Driver(anyhow::Error::new(error).context(format!(
+                    "git repo execution failed for '{}'",
                     digest_repo_path(mirror.path())
-                ))
+                )))
             })?;
         let finalize_outcome = execution.result.0.finalize.outcome;
         // Sequence number is always 0: each repo-frontier shard processes
@@ -164,13 +165,17 @@ impl GitRepoRuntime {
         let checkpoint_input = persistence
             .repo_frontier_checkpoint_input(write_context, 0, payload.repo_key(), finalize_outcome)
             .map_err(|error| {
-                ScanRuntimeError::Driver(anyhow!(
-                    "git repo durability checkpoint synthesis failed for '{}': {error}",
+                ScanRuntimeError::Driver(anyhow::Error::new(error).context(format!(
+                    "git repo durability checkpoint synthesis failed for '{}'",
                     digest_repo_path(mirror.path())
-                ))
+                )))
             })?;
         let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
 
+        debug_assert!(
+            !matches!(finalize_outcome, FinalizeOutcome::Complete) || checkpoint_input.is_some(),
+            "complete finalize must produce a checkpoint input"
+        );
         Ok(GitRepoExecutionOutcome {
             report,
             checkpoint_input,
@@ -843,6 +848,17 @@ mod tests {
     #[test]
     fn single_repo_target_none_returns_ok_none() {
         assert!(single_repo_target(None).expect("None input").is_none());
+    }
+
+    #[test]
+    fn single_repo_target_returns_target_for_single_item_complete_page() {
+        let target = make_test_target(b"git:test:repo-a");
+        let page = PageBuf::try_new(vec![target.clone()], PageState::Complete).expect("page");
+
+        let result = single_repo_target(Some(page))
+            .expect("valid page")
+            .expect("should return Some target");
+        assert_eq!(result.repo_key(), target.repo_key());
     }
 
     #[test]

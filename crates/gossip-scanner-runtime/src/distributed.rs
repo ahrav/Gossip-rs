@@ -604,7 +604,7 @@ impl GitShardLease {
 /// Common read-only view over both filesystem and Git shard leases.
 ///
 /// Abstracts the shared subset of [`ShardLease`] and [`GitShardLease`] so
-/// generic helpers (e.g., `advance_shard`, `log_claim`) can operate on either
+/// generic helpers (e.g., `advance_shard`) can operate on either
 /// lease family without monomorphizing the entire worker loop.
 trait LeaseView {
     /// String shard label for telemetry and log correlation.
@@ -942,12 +942,12 @@ struct InFlightItem {
     findings: Vec<FsFindingRecord>,
 }
 
-/// Compatibility adapter that bridges runtime item execution into the
+/// Adapter that bridges runtime item execution into the
 /// receipt-driven commit pipeline.
 ///
 /// Supports two submission surfaces:
 ///
-/// - The legacy scan-loop `CommitSink` lifecycle (`begin_item` /
+/// - The callback-based `CommitSink` lifecycle (`begin_item` /
 ///   `upsert_findings` / `finish_item`), and
 /// - direct ordered-content item outcomes submitted through
 ///   [`submit_ordered_item`](Self::submit_ordered_item).
@@ -2731,7 +2731,14 @@ where
     M: GitMirrorManager,
     B: GitPersistenceBackend + Clone,
 {
-    config.budgets.validate()?;
+    config.budgets.validate().map_err(|e| {
+        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow::Error::from(e).context(
+            format!(
+                "budget validation failed for git repo-frontier shard '{}'",
+                lease.shard_id()
+            ),
+        )))
+    })?;
     if lease.cursor_semantics() != CursorSemantics::Completed {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
@@ -2765,6 +2772,21 @@ where
     )
     .map_err(DistributedRuntimeError::Runtime)?;
     let Some(target) = single_repo_target(page).map_err(DistributedRuntimeError::Runtime)? else {
+        // Discovery returned no target. Distinguish between a legitimate
+        // already-complete cursor (ExhaustedEmpty) and a malformed shard
+        // whose payload target falls outside its own key range.
+        if !lease
+            .shard_spec()
+            .contains_key(lease.payload().repo_key().as_bytes())
+        {
+            return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                anyhow!(
+                    "git repo-frontier shard '{}' payload repo key {:?} is outside shard bounds",
+                    lease.shard_id(),
+                    lease.payload().repo_key()
+                ),
+            )));
+        }
         return Ok((
             ScanReport::default(),
             ShardCompletionOutcome::ExhaustedEmpty,
@@ -2813,11 +2835,13 @@ where
             }
 
             let mirror = mirrors.sync_mirror(target.locator()).map_err(|error| {
-                DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
-                    "git mirror sync failed for shard '{}' and repo key {:?}: {error}",
-                    lease.shard_id(),
-                    target.repo_key()
-                )))
+                DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                    anyhow::Error::from(error).context(format!(
+                        "git mirror sync failed for shard '{}' and repo key {:?}",
+                        lease.shard_id(),
+                        target.repo_key()
+                    )),
+                ))
             })?;
 
             if let Some(reason) = armed_lease_deadline.expiry_reason() {
@@ -2840,6 +2864,12 @@ where
         // persistence state. Mirrors the filesystem drain-then-close
         // pattern in `drain_commit_stage`.
         if execution.is_ok() {
+            // Final deadline check before sealing — narrows the race window
+            // where the watchdog parks between the scan completing and waking
+            // to observe an elapsed deadline.
+            if let Some(reason) = armed_lease_deadline.expiry_reason() {
+                lease_uncertainty.note(reason);
+            }
             lease_uncertainty.close();
         }
 
@@ -2878,6 +2908,16 @@ where
         .checkpoint_cursor()
         .clone();
 
+    // Post-scan discovery: verify the checkpoint covers the singleton target.
+    //
+    // Under the current invariant (partial finalize rejected above, so
+    // only `FinalizeOutcome::Complete` reaches here), `repo_frontier_receipt`
+    // builds `Cursor::with_last_key(repo_key)`, and `cursor_covers_target`
+    // evaluates `last_key >= repo_key` — always true. The `Checkpoint`
+    // branch is therefore structurally unreachable today but is retained as
+    // a defensive guard: if future work introduces partial repo-frontier
+    // progress (e.g. incremental within a single repo), the post-discovery
+    // check will correctly distinguish Complete from Checkpoint.
     let mut post_discovery =
         StaticGitRepoDiscoverySource::new(lease.payload().repo_target().clone());
     let remaining = GitRepoRuntime::execute_discovery(
@@ -2891,6 +2931,11 @@ where
         .map_err(DistributedRuntimeError::Runtime)?
         .is_some()
     {
+        tracing::warn!(
+            shard_id = %lease.shard_id(),
+            "git repo-frontier singleton shard checkpoint did not cover the target; \
+             shard will be re-claimed"
+        );
         ShardCompletionOutcome::Checkpoint {
             checkpoint: checkpoint.clone(),
         }
@@ -3116,8 +3161,8 @@ mod tests {
         connector::{
             Cursor, EnumerateError, ItemKey, ItemRef, PageBuf, ReadError,
             git::{
-                GitExecutionLimits, GitMergeStrategy, GitRepoTarget, GitScanMode, RepoKey,
-                RepoLocator,
+                GitExecutionLimits, GitMergeStrategy, GitRepoTarget, GitRunError, GitScanMode,
+                LocalMirror, RepoKey, RepoLocator,
             },
             ordered::OrderedContentCapabilities,
         },
@@ -6140,6 +6185,21 @@ mod tests {
             matches!(err, DistributedRuntimeError::Runtime(_)),
             "expected Runtime error variant, got: {err:?}"
         );
+
+        // The error chain must preserve the original cause rather than
+        // stringifying it. Walking source() from the anyhow context layer
+        // should reach the underlying GitRunError (which itself wraps a
+        // persistence-originated message).
+        let runtime_source = std::error::Error::source(&err)
+            .expect("DistributedRuntimeError must expose a source chain");
+        let anyhow_ctx = std::error::Error::source(runtime_source)
+            .expect("ScanRuntimeError::Driver must expose the anyhow context");
+        let original_cause = std::error::Error::source(anyhow_ctx);
+        assert!(
+            original_cause.is_some(),
+            "anyhow context must preserve the original error as source, not stringify it"
+        );
+
         assert_eq!(
             backend.batch_call_count(),
             0,
@@ -8098,6 +8158,158 @@ mod tests {
         assert_eq!(
             done_count_after_recovery, done_count_after_seed,
             "recovery pass should not add new done-ledger entries"
+        );
+    }
+
+    /// Mirror manager that unconditionally fails `sync_mirror` with a
+    /// permanent error, used to exercise error-chain preservation in the
+    /// mirror sync path.
+    struct FailingMirrorManager;
+
+    impl GitMirrorManager for FailingMirrorManager {
+        fn sync_mirror(&mut self, _locator: &RepoLocator) -> Result<LocalMirror, GitRunError> {
+            Err(GitRunError::permanent("injected mirror sync failure"))
+        }
+    }
+
+    /// The error returned when mirror sync fails must preserve the original
+    /// `GitRunError` as a source in the anyhow chain so operators can
+    /// programmatically distinguish permission denials from network timeouts.
+    #[test]
+    fn run_git_repo_worker_preserves_mirror_sync_error_chain() {
+        let repo = create_git_repo_fixture();
+        let backend = TestGitBackend::default();
+        let mut mirrors = FailingMirrorManager;
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("failing mirror manager should propagate an error");
+
+        let anyhow_err = match err {
+            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(e)) => e,
+            other => panic!("expected Runtime(Driver(_)), got: {other:?}"),
+        };
+
+        assert!(
+            anyhow_err.source().is_some(),
+            "error chain must preserve the original GitRunError as a source, \
+             but source() returned None — the error was stringified"
+        );
+        let display = format!("{anyhow_err}");
+        assert!(
+            display.contains("git mirror sync failed"),
+            "top-level context should mention mirror sync failure: {display}"
+        );
+    }
+
+    /// Proves the race: if `close()` is called before the watchdog's `note()`,
+    /// a deadline expiry during the watchdog's park interval is silently lost.
+    #[test]
+    fn lease_uncertainty_close_before_note_loses_expiry() {
+        let signal = LeaseUncertaintySignal::default();
+        signal.close();
+        let recorded = signal.note(LeaseUncertainty::DeadlineElapsed {
+            deadline: LogicalTime::from_raw(100),
+            observed: LogicalTime::from_raw(200),
+        });
+        assert!(!recorded, "note after close should return false");
+        assert!(signal.current().is_none(), "expiry was silently lost");
+    }
+
+    /// Proves the fix: checking the deadline and noting before `close()`
+    /// preserves the expiry through the `Recorded` state.
+    #[test]
+    fn lease_uncertainty_note_before_close_preserves_expiry() {
+        let signal = LeaseUncertaintySignal::default();
+        signal.note(LeaseUncertainty::DeadlineElapsed {
+            deadline: LogicalTime::from_raw(100),
+            observed: LogicalTime::from_raw(200),
+        });
+        signal.close();
+        assert_eq!(
+            signal.current(),
+            Some(LeaseUncertainty::DeadlineElapsed {
+                deadline: LogicalTime::from_raw(100),
+                observed: LogicalTime::from_raw(200),
+            }),
+            "prior Recorded reason must survive close()"
+        );
+    }
+
+    /// Budget validation errors must include the shard ID so operators can
+    /// correlate the failure with a specific shard assignment.
+    #[test]
+    fn run_git_repo_worker_budget_validation_includes_shard_context() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+        let config = DistributedRuntimeConfig {
+            budgets: ScanBudgets {
+                max_items: 0,
+                ..ScanBudgets::default()
+            },
+            ..DistributedRuntimeConfig::default()
+        };
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            config,
+        )
+        .expect_err("zero budget should fail validation");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ShardId(1)"),
+            "budget validation error should include shard context: {msg}"
+        );
+    }
+
+    /// Mirror sync failure must be fail-fast: the shard must not be advanced
+    /// in the coordinator and no persistence writes should occur.
+    #[test]
+    fn run_git_repo_worker_mirror_failure_does_not_advance_shard_or_persist() {
+        let repo = create_git_repo_fixture();
+        let backend = TestGitBackend::default();
+        let mut mirrors = FailingMirrorManager;
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let _err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend.clone(),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("failing mirror manager should propagate an error");
+
+        // Shard must not have been advanced: it should still be in Assigned
+        // (claimed but not completed) rather than Done.
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_ne!(
+            summaries[0].status(),
+            ShardStatus::Done,
+            "shard should not be advanced after mirror sync failure"
+        );
+
+        // No persistence writes should have occurred.
+        assert!(
+            backend.stored_keys().is_empty(),
+            "no persistence writes should occur when mirror sync fails"
         );
     }
 }
