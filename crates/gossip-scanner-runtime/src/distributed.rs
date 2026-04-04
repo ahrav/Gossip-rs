@@ -1,44 +1,70 @@
 //! Distributed worker runtime for receipt-driven shard execution.
 //!
-//! This module is the entry point for distributed scanning. It implements a
-//! claim-execute-advance loop: the worker claims shards from a
-//! [`CoordinationFacade`], executes each shard's filesystem scan, commits
-//! findings and done-ledger rows through a bounded commit pipeline, and then
-//! advances the shard lease with either a non-terminal checkpoint cursor or a
-//! terminal completion cursor derived from the committed prefix.
+//! This module is the entry point for distributed scanning. Two worker loops
+//! share the claim-execute-advance structure but target different source
+//! families:
+//!
+//! - **Filesystem** ([`run_worker`]): ordered-content shards scanned via
+//!   `parallel_scan_dir` and committed through a bounded receipt pipeline.
+//! - **Git repo-frontier** ([`run_git_repo_worker`]): singleton repo-frontier
+//!   shards scanned via `GitRepoRuntime::execute_repo` with durable finalize
+//!   receipts producing the shard-advance checkpoint.
+//!
+//! Both loops claim leases from a [`CoordinationFacade`], execute the
+//! appropriate scan path, and advance (or fail-fast) based on the committed
+//! result.
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌──────────────┐    claim        ┌────────────────────┐
-//! │ Coordinator  │ ─────────────>  │  run_worker loop   │
+//! │ Coordinator  │ ─────────────>  │  run_worker loop   │ (filesystem)
 //! │ (CoordFacade)│ <───────────── │ (claim/scan/advance)│
-//! └──────────────┘ checkpoint/complete └──────┬────────┘
-//!                                        │
-//!                              ┌─────────▼──────────┐
-//!                              │ run_filesystem_lease│
-//!                              │  (per shard)        │
-//!                              └─────────┬──────────┘
-//!                     ┌──────────────────┼──────────────────┐
-//!                     ▼                  ▼                  ▼
-//!          ┌────────────────┐  ┌──────────────────┐ ┌─────────────┐
-//!          │ scan engine    │  │ ReceiptCommitSink │ │ commit      │
-//!          │ (scheduler)    │──│ (CommitSink impl) │─│ pipeline    │
-//!          └────────────────┘  └──────────────────┘ │ + drainer   │
-//!                                                   └──────┬──────┘
-//!                                                          ▼
-//!                                                 ┌────────────────┐
-//!                                                 │ Checkpoint     │
-//!                                                 │ Aggregator     │
-//!                                                 └────────────────┘
+//! └──────┬───────┘ checkpoint/complete └──────┬────────┘
+//!        │                               │
+//!        │                     ┌─────────▼──────────┐
+//!        │                     │ run_filesystem_lease│
+//!        │                     │  (per shard)        │
+//!        │                     └─────────┬──────────┘
+//!        │            ┌──────────────────┼──────────────────┐
+//!        │            ▼                  ▼                  ▼
+//!        │ ┌────────────────┐  ┌──────────────────┐ ┌─────────────┐
+//!        │ │ scan engine    │  │ ReceiptCommitSink │ │ commit      │
+//!        │ │ (scheduler)    │──│ (CommitSink impl) │─│ pipeline    │
+//!        │ └────────────────┘  └──────────────────┘ │ + drainer   │
+//!        │                                          └──────┬──────┘
+//!        │                                                 ▼
+//!        │                                        ┌────────────────┐
+//!        │                                        │ Checkpoint     │
+//!        │                                        │ Aggregator     │
+//!        │                                        └────────────────┘
+//!        │
+//!        │   claim     ┌──────────────────────────┐
+//!        └────────────>│ run_git_repo_worker loop  │ (repo-frontier)
+//!         <────────────│ (claim/mirror/scan/advance)│
+//!     complete/fail    └──────────┬───────────────┘
+//!                                 │
+//!                       ┌─────────▼──────────┐
+//!                       │ run_git_repo_lease  │
+//!                       │  (per shard)        │
+//!                       └─────────┬──────────┘
+//!                    ┌────────────┼────────────┐
+//!                    ▼            ▼            ▼
+//!          ┌──────────────┐ ┌──────────┐ ┌──────────────┐
+//!          │ mirror sync  │ │ execute  │ │ persistence  │
+//!          │ (locator)    │ │ _repo    │ │ (finalize    │
+//!          └──────────────┘ │ (scan)   │ │  receipt)    │
+//!                           └──────────┘ └──────────────┘
 //! ```
 //!
 //! # Key types
 //!
 //! | Type                        | Role                                             |
 //! |-----------------------------|--------------------------------------------------|
-//! | [`WorkerIdentity`]          | Immutable identity threaded through all calls     |
+//! | [`WorkerIdentity`]          | Immutable filesystem worker identity bundle       |
+//! | [`GitWorkerIdentity`]       | Immutable Git repo-frontier worker identity bundle|
 //! | [`ShardLease`]              | Per-shard lease payload with scan config + fencing|
+//! | [`GitShardLease`]           | Per-shard lease payload for repo-frontier shards  |
 //! | [`DistributedPersistence`]  | Cloneable persistence backend handles             |
 //! | [`DistributedRuntimeConfig`]| Budget and queue-sizing knobs                     |
 //! | [`DistributedRunReport`]    | Summary counters from one worker invocation       |

@@ -829,6 +829,11 @@ with a deterministic `OpId`.
 6. re-runs singleton discovery against that checkpoint cursor to decide whether
    the shard is terminally complete or should checkpoint for later replay.
 
+A "not discovered" result maps to exhausted-empty only when the payload repo key
+is within shard bounds. If the payload repo key is outside the shard spec's key
+range, the lease fails with a runtime driver error rather than silently
+completing the shard.
+
 ---
 
 ## Tests
