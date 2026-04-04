@@ -6,6 +6,7 @@
 
 use crate::json_write::{write_f64, write_i8, write_json_bytes, write_json_str, write_u64};
 use crate::source_kind::SourceKind;
+use std::fmt;
 use std::sync::Mutex;
 
 /// Scheduler event emitted during a scan run.
@@ -25,15 +26,64 @@ pub enum CoreEvent<'a> {
 
 /// Structured finding payload written by scheduler event sinks.
 pub struct FindingEvent<'a> {
+    /// Source family that emitted this finding.
     pub source: SourceKind,
+    /// Source-relative object path for the scanned payload.
     pub object_path: &'a [u8],
+    /// Inclusive byte offset where the match starts.
     pub start: u64,
+    /// Exclusive byte offset where the match ends.
     pub end: u64,
+    /// Numeric identifier of the matching detection rule.
     pub rule_id: u32,
+    /// Human-readable rule name resolved from `rule_id`.
     pub rule_name: &'a str,
+    /// Normalized content hash for deduplication. `None` for filesystem findings
+    /// where the scanner does not produce a content-derived digest.
+    ///
+    /// The `Option<[u8; 32]>` representation adds 33 bytes per event. This is
+    /// acceptable because `FindingEvent` is constructed on WARM paths (per-finding,
+    /// not per-chunk), and moving the hash out-of-band would complicate the event
+    /// flow without measurable benefit.
+    pub norm_hash: Option<[u8; 32]>,
+    /// Commit-graph position for Git findings.
     pub commit_id: Option<u32>,
+    /// Git diff classification associated with the finding.
     pub change_kind: Option<&'a str>,
+    /// Additive confidence score from gate signals.
     pub confidence_score: i8,
+}
+
+/// Debug-format wrapper that prints `[redacted]` when a secret-derived digest
+/// is present and `None` otherwise. Prevents accidental hash leakage in logs.
+pub struct RedactedNormHash(pub bool);
+
+impl fmt::Debug for RedactedNormHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 {
+            f.write_str("[redacted]")
+        } else {
+            f.write_str("None")
+        }
+    }
+}
+
+impl fmt::Debug for FindingEvent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FindingEvent")
+            .field("source", &self.source)
+            .field("object_path", &self.object_path)
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("rule_id", &self.rule_id)
+            .field("rule_name", &self.rule_name)
+            // Secret-derived digests are redacted to keep debug output safe.
+            .field("norm_hash", &RedactedNormHash(self.norm_hash.is_some()))
+            .field("commit_id", &self.commit_id)
+            .field("change_kind", &self.change_kind)
+            .field("confidence_score", &self.confidence_score)
+            .finish()
+    }
 }
 
 /// Scheduler progress counters.
@@ -174,6 +224,7 @@ impl EventOutput for VecEventOutput {
                 line.extend_from_slice(b",\"confidence_score\":");
                 write_i8(&mut line, f.confidence_score);
 
+                // norm_hash intentionally omitted — secret-derived digest must not appear in event logs.
                 if let Some(commit_id) = f.commit_id {
                     line.extend_from_slice(b",\"commit_id\":");
                     write_u64(&mut line, u64::from(commit_id));
@@ -342,6 +393,7 @@ mod tests {
             end: 20,
             rule_id: 7,
             rule_name: "rule",
+            norm_hash: Some([0xAB; 32]),
             commit_id: Some(3),
             change_kind: Some("modify"),
             confidence_score: 85,
@@ -351,6 +403,32 @@ mod tests {
         assert_eq!(
             output,
             "{\"type\":\"finding\",\"source\":\"fs\",\"path\":\"dir/file.txt\",\"start\":10,\"end\":20,\"rule_id\":7,\"rule\":\"rule\",\"confidence_score\":85,\"commit_id\":3,\"change_kind\":\"modify\"}\n"
+        );
+    }
+
+    #[test]
+    fn finding_event_debug_redacts_norm_hash() {
+        let finding = FindingEvent {
+            source: SourceKind::Git,
+            object_path: b"dir/file.txt",
+            start: 10,
+            end: 20,
+            rule_id: 7,
+            rule_name: "rule",
+            norm_hash: Some([0xDE; 32]),
+            commit_id: Some(3),
+            change_kind: Some("modify"),
+            confidence_score: 85,
+        };
+
+        let debug = format!("{finding:?}");
+        assert!(
+            debug.contains("norm_hash: [redacted]"),
+            "Debug output must redact norm_hash, got: {debug}"
+        );
+        assert!(
+            !debug.contains("222, 222, 222"),
+            "Debug output must not leak norm_hash bytes, got: {debug}"
         );
     }
 

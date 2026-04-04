@@ -1076,7 +1076,7 @@ fn scan_git_with_runtime_returns_empty_report_when_pre_cancelled() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn owned_core_event_finding_round_trips() {
+fn owned_core_event_finding_with_norm_hash_round_trips() {
     let original = CoreEvent::Finding(FindingEvent {
         source: SourceKind::Fs,
         object_path: b"/tmp/secret.txt",
@@ -1084,12 +1084,23 @@ fn owned_core_event_finding_round_trips() {
         end: 42,
         rule_id: 7,
         rule_name: "test-rule",
+        norm_hash: Some([0xAB; 32]),
         commit_id: Some(3),
         change_kind: Some("modify"),
         confidence_score: 85,
     });
 
     let owned = OwnedCoreEvent::from_core(original);
+    match &owned {
+        OwnedCoreEvent::Finding { norm_hash, .. } => {
+            assert_eq!(
+                *norm_hash,
+                Some([0xAB; 32]),
+                "from_core must preserve norm_hash in memory"
+            );
+        }
+        other => panic!("expected Finding, got {other:?}"),
+    }
     let out = scanner_scheduler::events::VecEventOutput::new();
     owned.emit_into(&out);
 
@@ -1104,6 +1115,111 @@ fn owned_core_event_finding_round_trips() {
     assert_eq!(event["confidence_score"], 85);
     assert_eq!(event["commit_id"], 3);
     assert_eq!(event["change_kind"], "modify");
+    assert!(
+        event.get("norm_hash").is_none(),
+        "serialized finding output must omit norm_hash"
+    );
+}
+
+#[test]
+fn owned_core_event_finding_without_norm_hash_round_trips() {
+    let original = CoreEvent::Finding(FindingEvent {
+        source: SourceKind::Fs,
+        object_path: b"/tmp/secret.txt",
+        start: 10,
+        end: 42,
+        rule_id: 7,
+        rule_name: "test-rule",
+        norm_hash: None,
+        commit_id: Some(3),
+        change_kind: Some("modify"),
+        confidence_score: 85,
+    });
+
+    let owned = OwnedCoreEvent::from_core(original);
+    match &owned {
+        OwnedCoreEvent::Finding { norm_hash, .. } => {
+            assert_eq!(
+                *norm_hash, None,
+                "from_core must preserve None norm_hash in memory"
+            );
+        }
+        other => panic!("expected Finding, got {other:?}"),
+    }
+    let out = scanner_scheduler::events::VecEventOutput::new();
+    owned.emit_into(&out);
+
+    let events = parse_jsonl(out.take());
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["type"], "finding");
+    assert_eq!(event["source"], "fs");
+    assert_eq!(event["rule"], "test-rule");
+    assert_eq!(event["start"], 10);
+    assert_eq!(event["end"], 42);
+    assert_eq!(event["confidence_score"], 85);
+    assert_eq!(event["commit_id"], 3);
+    assert_eq!(event["change_kind"], "modify");
+    assert!(
+        event.get("norm_hash").is_none(),
+        "serialized finding output must omit norm_hash"
+    );
+}
+
+#[test]
+fn owned_core_event_finding_partial_eq_includes_norm_hash() {
+    let left = OwnedCoreEvent::Finding {
+        source: SourceKind::Git,
+        object_path: b"/tmp/secret.txt".to_vec(),
+        start: 10,
+        end: 42,
+        rule_id: 7,
+        rule_name: "test-rule".to_owned(),
+        norm_hash: Some([0xAA; 32]),
+        commit_id: Some(3),
+        change_kind: Some("modify".to_owned()),
+        confidence_score: 85,
+    };
+    let right = OwnedCoreEvent::Finding {
+        source: SourceKind::Git,
+        object_path: b"/tmp/secret.txt".to_vec(),
+        start: 10,
+        end: 42,
+        rule_id: 7,
+        rule_name: "test-rule".to_owned(),
+        norm_hash: Some([0xBB; 32]),
+        commit_id: Some(3),
+        change_kind: Some("modify".to_owned()),
+        confidence_score: 85,
+    };
+
+    assert_ne!(left, right, "norm_hash must participate in equality");
+}
+
+#[test]
+fn owned_core_event_debug_redacts_norm_hash() {
+    let finding = OwnedCoreEvent::Finding {
+        source: SourceKind::Git,
+        object_path: b"/tmp/secret.txt".to_vec(),
+        start: 10,
+        end: 42,
+        rule_id: 7,
+        rule_name: "test-rule".to_owned(),
+        norm_hash: Some([0xDE; 32]),
+        commit_id: Some(3),
+        change_kind: Some("modify".to_owned()),
+        confidence_score: 85,
+    };
+
+    let debug = format!("{finding:?}");
+    assert!(
+        debug.contains("norm_hash: [redacted]"),
+        "Debug output must redact norm_hash, got: {debug}"
+    );
+    assert!(
+        !debug.contains("222, 222, 222"),
+        "Debug output must not leak norm_hash bytes, got: {debug}"
+    );
 }
 
 #[test]

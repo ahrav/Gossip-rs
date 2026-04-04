@@ -517,7 +517,7 @@ Compile-time size guards enforce that hot-path structures remain compact:
 | `PackedPatterns` | `== 32` bytes | 2 × `Box<[T]>` |
 | `EntropyCompiled` | `<= 32` bytes | Copied by value in `ResolvedGates` |
 | `RuleCompiled` | `<= 88` bytes | Fits in ~1.4 cache lines |
-| `RuleCold` | `<= 24` bytes | Minimal cold metadata |
+| `RuleCold` | `<= 56` bytes | Minimal cold metadata |
 
 ## Lifecycle
 
@@ -701,25 +701,15 @@ pipeline instrumentation. When disabled, all recording functions compile to
 no-ops and `snapshot()` returns a zeroed struct — zero runtime cost.
 
 **Key types**:
-- `GitPerfStats`: 43-field `pub` snapshot struct (`Clone, Copy, Debug, Default`).
-  Stable shape regardless of feature flag.
+- `GitPerfStats`: `pub` snapshot struct (`Clone, Copy, Debug, Default`).
+  Stable shape regardless of feature flag; see
+  `crates/scanner-engine/src/perf_counters.rs` for the authoritative field list.
 
-**Recording functions** (34 total, all `pub fn`):
-- **Pack decode**: `record_pack_inflate`, `record_delta_apply`
-- **Blob scanning**: `record_scan`, `record_scan_vs_prefilter`,
-  `record_scan_validate`, `record_scan_transform`, `record_scan_sort_dedup`,
-  `record_scan_reset`, `record_scan_blob`, `record_scan_chunk`,
-  `record_scan_zero_hit_chunk`, `record_scan_finding`,
-  `record_scan_chunker_bypass`, `record_scan_binary_skip`,
-  `record_scan_binary_extract`, `record_scan_prefilter_bypass`
-- **Mapping bridge**: `record_mapping`
-- **Cache**: `record_cache_hit`, `record_cache_miss`
-- **Tree loading**: `record_tree_load`, `record_tree_cache_hit`,
-  `record_tree_delta_cache_hit`, `record_tree_delta_cache_miss`,
-  `record_tree_spill_hit`, `record_tree_object`, `record_tree_inflate`,
-  `record_tree_delta_apply`
-- **Delta chain histogram**: `record_tree_delta_chain` buckets lengths into
-  5 bins (0, 1, 2-3, 4-7, 8+)
+**Recording functions**:
+- Public `record_*` helpers cover pack decode, blob scanning, mapping, cache,
+  tree loading, and delta-chain histogram updates.
+- See `crates/scanner-engine/src/perf_counters.rs` for the authoritative API
+  list and bucket definitions.
 
 **Control**:
 - `reset()`: zeroes all counters
