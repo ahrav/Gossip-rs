@@ -288,7 +288,18 @@ enum RootMode {
     },
 }
 
-/// Deterministic filesystem connector rooted at a local directory or file.
+/// Deterministic ordered-content connector backed by a canonical local
+/// directory or a single regular file.
+///
+/// The connector lazily canonicalizes `root`, derives a connector-instance
+/// scope from that canonical path, and caches the root mode needed for secure
+/// fd-relative reads. Directory roots enumerate every regular file beneath the
+/// tree. Single-file roots expose exactly one item whose key matches the file
+/// name recorded at initialization.
+///
+/// Connector-level key-range bounds are sticky configuration: every
+/// enumeration or split-point request intersects its shard bounds with the
+/// range configured via [`FilesystemConnector::with_key_range`].
 pub struct FilesystemConnector {
     root: PathBuf,
     walk_key_range_start: Option<Box<[u8]>>,
@@ -310,7 +321,13 @@ impl FilesystemConnector {
 
     /// Create a connector rooted at `root`.
     ///
-    /// Root canonicalization is lazy; it happens on first use.
+    /// Root canonicalization and root-mode discovery are deferred until the
+    /// first operation that needs filesystem access.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `root` is an empty path, because the connector cannot derive
+    /// a stable identity or valid `openat` base from it.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         assert!(
@@ -333,7 +350,8 @@ impl FilesystemConnector {
     /// Restrict enumeration and split-point selection to keys inside the
     /// half-open range `[start, end)`.
     ///
-    /// The range is intersected with per-request shard bounds. `None` means
+    /// The configured bounds become part of the connector state and are
+    /// intersected with per-request shard bounds on every call. `None` means
     /// unbounded on that side.
     pub fn with_key_range(mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
         self.walk_key_range_start = start.map(|bound| bound.to_vec().into_boxed_slice());
@@ -770,6 +788,9 @@ impl FilesystemConnector {
 
 impl FilesystemConnector {
     /// Advertise connector capabilities used by orchestration planning.
+    ///
+    /// The connector supports seek-by-key pagination and byte-range reads, but
+    /// not token-based resume or emitted split hints.
     pub fn caps(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             seek_by_key: true,
@@ -780,6 +801,21 @@ impl FilesystemConnector {
     }
 
     /// Fill one bounded page of ordered filesystem items.
+    ///
+    /// The returned page respects the intersection of shard bounds and any
+    /// connector-level key-range bounds. Cursor resume is key-based only: the
+    /// walk restarts from the root view and skips keys at or below
+    /// `cursor.last_key()`.
+    ///
+    /// The page enforces both `max_items` and `max_bytes`, except that the
+    /// first in-scope item is still emitted when its `size_hint` alone exceeds
+    /// the byte budget so pagination can make forward progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable error when the budget deadline has already expired
+    /// or expires during traversal. Returns a permanent error if the root no
+    /// longer resolves to a supported regular-file or directory view.
     pub fn fill_page(
         &mut self,
         shard: &ShardSpec,
@@ -823,7 +859,18 @@ impl FilesystemConnector {
         }
     }
 
-    /// Split-point hint for dynamic shard subdivision.
+    /// Return a best-effort split-point hint for dynamic shard subdivision.
+    ///
+    /// The hint comes from the integrated `StreamingSplitEstimator` after
+    /// intersecting shard bounds with connector-level key-range bounds. The
+    /// connector may still return `Ok(None)` when insufficient samples have
+    /// been observed or when the estimated key would violate the current
+    /// cursor or upper-bound guards.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable error when the budget deadline has expired and a
+    /// permanent error when shard bounds are invalid.
     pub fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
@@ -837,6 +884,20 @@ impl FilesystemConnector {
 
     /// Open the full content for an item, enforcing the read byte budget on
     /// the returned reader.
+    ///
+    /// Resolution happens beneath the pinned root fd with `O_NOFOLLOW` on each
+    /// path component. For single-file roots, `item_ref` must exactly match the
+    /// configured file name and the reopened file must retain its recorded
+    /// `(dev, ino)` identity.
+    ///
+    /// The returned reader yields `Ok(0)` once `budgets.max_bytes()` has been
+    /// consumed, even if the underlying file still has remaining bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable error when the deadline has expired. Returns a
+    /// permanent error for invalid item references, non-regular files, symlink
+    /// escapes, or single-file identity drift.
     pub fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -853,6 +914,20 @@ impl FilesystemConnector {
     }
 
     /// Range-read a file, clamping the returned bytes to `budgets.max_bytes()`.
+    ///
+    /// The connector keeps a single cached file descriptor keyed by
+    /// `item_ref`, which avoids repeated path resolution for adjacent reads on
+    /// the same file while keeping descriptor retention bounded.
+    ///
+    /// At most `min(dst.len(), budgets.max_bytes())` bytes are read. An empty
+    /// effective budget returns `Ok(0)` without touching the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable error when the deadline has expired. Returns a
+    /// permanent error when `offset + dst.len()` overflows or when the target
+    /// path fails the same confinement and identity checks enforced by
+    /// [`FilesystemConnector::open`].
     pub fn read_range(
         &mut self,
         item_ref: &ItemRef,
@@ -925,6 +1000,11 @@ impl OrderedContentSource for FilesystemConnector {
 // Filesystem identity and ordering helpers
 // ---------------------------------------------------------------------------
 
+/// Build the externally visible item identity for one filesystem entry.
+///
+/// Relative path bytes are reused as both the stable ordering key and the
+/// reopenable item reference so pagination and read operations talk about the
+/// same namespace.
 fn build_scan_item(
     rel_path: &[u8],
     metadata: &fs::Metadata,
@@ -947,6 +1027,11 @@ fn build_scan_item(
     Ok(ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(metadata.len()))
 }
 
+/// Derive the connector's weak version fingerprint for a filesystem entry.
+///
+/// The fingerprint combines the relative path with metadata fields that tend
+/// to change across replacement or mutation. It is suitable for change
+/// detection but intentionally does not claim immutable content identity.
 fn derive_filesystem_version(rel_path: &[u8], metadata: &fs::Metadata) -> ObjectVersionId {
     let mut version_bytes = Vec::with_capacity(rel_path.len() + 48);
     version_bytes.extend_from_slice(rel_path);
@@ -1002,6 +1087,8 @@ fn read_sorted_dir_entries(
     Ok(entries)
 }
 
+/// Order siblings so depth-first traversal matches lexicographic relative-path
+/// ordering across the entire tree.
 fn cmp_buffered_dir_entries(left: &BufferedDirEntry, right: &BufferedDirEntry) -> Ordering {
     cmp_component_with_dir_suffix(
         left.name.as_os_str().as_bytes(),
@@ -1038,6 +1125,8 @@ fn cmp_component_with_dir_suffix(
     }
 }
 
+/// Return the byte used for comparison at `index`, treating directories as if
+/// they had a synthetic trailing `/`.
 fn synthetic_component_byte(bytes: &[u8], is_dir: bool, index: usize) -> Option<u8> {
     if index < bytes.len() {
         Some(bytes[index])
@@ -1048,6 +1137,8 @@ fn synthetic_component_byte(bytes: &[u8], is_dir: bool, index: usize) -> Option<
     }
 }
 
+/// Join two validated path components with `/` only when the prefix is
+/// non-empty.
 fn join_relative_path(prefix: &[u8], component: &[u8]) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(prefix.len() + component.len() + usize::from(!prefix.is_empty()));
@@ -1202,10 +1293,12 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// Convert a filesystem path into a C-compatible string for libc calls.
 fn path_to_cstring(path: &Path) -> Result<CString, std::ffi::NulError> {
     CString::new(path.as_os_str().as_bytes())
 }
 
+/// Read the `(dev, ino)` identity pair for an already-open file descriptor.
 fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `fstat` writes a fully initialized `stat` struct on success.
@@ -1218,6 +1311,8 @@ fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
+/// Reject connector reuse when the opened root no longer matches the device
+/// and inode observed during initialization.
 fn verify_root_identity(root_fd: &OwnedFd, expected_id: (u64, u64)) -> Result<(), io::Error> {
     let (fd_dev, fd_ino) = fd_dev_ino(root_fd)?;
     if fd_dev != expected_id.0 || fd_ino != expected_id.1 {
