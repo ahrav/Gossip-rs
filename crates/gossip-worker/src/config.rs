@@ -3744,4 +3744,11 @@ mod tests {
             "error must name the path field: {message}"
         );
     }
+
+    #[test]
+    #[should_panic(expected = "mirror_root must not be empty")]
+    fn git_distributed_source_settings_rejects_empty_mirror_root() {
+        let _settings =
+            GitDistributedSourceSettings::new(GitSourceSettings::new("/tmp/repo"), PathBuf::new());
+    }
 }

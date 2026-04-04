@@ -609,6 +609,10 @@ mod tests {
             .expect("vec writer");
         let line = String::from_utf8(output).expect("valid utf8 output");
         assert_eq!(line, load_event_golden("finding_fs.jsonl"));
+        assert!(
+            !line.contains("norm_hash"),
+            "encoded event must omit norm_hash, got: {line}"
+        );
     }
 
     #[test]

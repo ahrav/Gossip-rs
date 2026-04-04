@@ -8993,4 +8993,25 @@ mod tests {
             "partial finalize must not yield checkpoint input"
         );
     }
+
+    #[test]
+    fn submit_git_repo_done_ledger_rejects_nonzero_detected_count() {
+        let input = GitRepoPersistenceInput {
+            write_context: write_context(),
+            shard_id: "test-shard",
+            repo_id: 42,
+            bytes_scanned: 1024,
+            detected_count: 5,
+            claim_time: LogicalTime::from_raw(100),
+            complete_time: LogicalTime::from_raw(200),
+        };
+        let ledger = InMemoryDoneLedger::new();
+        let err = submit_git_repo_done_ledger(&ledger, &input)
+            .expect_err("nonzero detected_count must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("detected_count=5"),
+            "error must report the count: {msg}"
+        );
+    }
 }
