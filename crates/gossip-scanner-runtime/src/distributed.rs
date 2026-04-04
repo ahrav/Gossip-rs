@@ -2770,6 +2770,10 @@ where
             ShardCompletionOutcome::ExhaustedEmpty,
         ));
     };
+    // Defense-in-depth: unreachable with StaticGitRepoDiscoverySource because
+    // discovery is built from the payload's repo target, so the discovered key
+    // always matches. Guards against future discovery implementations that may
+    // resolve a different target than the payload carries.
     if target.repo_key() != lease.payload().repo_key() {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
@@ -3166,6 +3170,7 @@ mod tests {
     struct TestGitBackendState {
         kv: BTreeMap<Vec<u8>, Vec<u8>>,
         batch_call_count: usize,
+        fail_after_n_batches: Option<usize>,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -3179,6 +3184,23 @@ mod tests {
                 .lock()
                 .expect("git backend state lock")
                 .batch_call_count
+        }
+
+        fn fail_after_n_batches(&self, n: usize) {
+            self.state
+                .lock()
+                .expect("git backend state lock")
+                .fail_after_n_batches = Some(n);
+        }
+
+        fn stored_keys(&self) -> Vec<Vec<u8>> {
+            self.state
+                .lock()
+                .expect("git backend state lock")
+                .kv
+                .keys()
+                .cloned()
+                .collect()
         }
     }
 
@@ -3197,6 +3219,13 @@ mod tests {
 
         fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
             let mut state = self.state.lock().expect("git backend state lock");
+            if let Some(threshold) = state.fail_after_n_batches
+                && state.batch_call_count >= threshold
+            {
+                return Err(TestGitBackendError {
+                    message: "injected persistence failure",
+                });
+            }
             state.batch_call_count += 1;
             for op in ops {
                 match op {
@@ -3316,6 +3345,13 @@ mod tests {
     }
 
     fn git_worker_identity(path: &Path) -> GitWorkerIdentity {
+        git_worker_identity_with_recorder(path, recorder())
+    }
+
+    fn git_worker_identity_with_recorder(
+        path: &Path,
+        recorder: Arc<dyn CoordinationEventRecorder>,
+    ) -> GitWorkerIdentity {
         GitWorkerIdentity::new(
             tenant(),
             run(),
@@ -3323,7 +3359,7 @@ mod tests {
             policy_hash(),
             tenant_secret_key(),
             base_git_scan_config(path),
-            recorder(),
+            recorder,
         )
     }
 
@@ -3486,10 +3522,22 @@ mod tests {
         cursor: CoordCursorUpdate<'_>,
         lease_duration_ms: u64,
     ) -> CoordinationInMemoryCoordinator {
-        let mut coordinator = CoordinationInMemoryCoordinator::new(lease_duration_ms);
+        setup_coordinator_with_git_shard_and_config(
+            path,
+            cursor,
+            test_run_config(lease_duration_ms),
+        )
+    }
+
+    fn setup_coordinator_with_git_shard_and_config(
+        path: &Path,
+        cursor: CoordCursorUpdate<'_>,
+        run_config: RunConfig,
+    ) -> CoordinationInMemoryCoordinator {
+        let mut coordinator = CoordinationInMemoryCoordinator::new(run_config.lease_duration());
         let now = wall_clock_now();
         coordinator
-            .create_run(now, tenant(), run(), test_run_config(lease_duration_ms))
+            .create_run(now, tenant(), run(), run_config)
             .expect("create run");
 
         let repo_key = git_repo_key(path);
@@ -5961,6 +6009,21 @@ mod tests {
             backend.batch_call_count() > 0,
             "git repo worker must durably persist repo state before advancing the shard"
         );
+        assert!(
+            !backend.stored_keys().is_empty(),
+            "persistence backend should contain durable state after a complete scan"
+        );
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        let expected_key = git_repo_key(repo.path());
+        assert_eq!(
+            summaries[0]
+                .last_key()
+                .expect("completed shard should have a last_key"),
+            expected_key.as_bytes(),
+            "shard cursor last_key should match the singleton repo key"
+        );
     }
 
     #[test]
@@ -5992,6 +6055,127 @@ mod tests {
             backend.batch_call_count(),
             0,
             "no Git persistence writes should occur when discovery is already covered by the cursor"
+        );
+    }
+
+    /// Git repo-frontier shards require `CursorSemantics::Completed` so the
+    /// checkpoint cursor represents fully-processed and durable progress.
+    /// `Dispatched` semantics are rejected before any scan work begins.
+    #[test]
+    fn run_git_repo_worker_rejects_dispatched_cursor_semantics() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let dispatched_config =
+            RunConfig::try_new(CursorSemantics::Dispatched, 30_000, None).expect("run config");
+        let mut coordinator = setup_coordinator_with_git_shard_and_config(
+            repo.path(),
+            CoordCursorUpdate::initial(),
+            dispatched_config,
+        );
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("dispatched cursor semantics should be rejected");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CursorSemantics::Completed"),
+            "error should reference the required semantics: {msg}"
+        );
+    }
+
+    /// The repo-key guard at the discovery boundary passes for a correctly
+    /// configured singleton shard where the discovered target matches the
+    /// payload's repo key.
+    #[test]
+    fn run_git_repo_worker_passes_repo_key_guard_for_matching_target() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let report = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("matching repo key should pass the guard");
+
+        assert_eq!(report.shards_scanned, 1);
+    }
+
+    /// When the persistence backend fails on the first write, the worker
+    /// propagates the error without advancing the shard.
+    #[test]
+    fn run_git_repo_worker_fails_cleanly_on_persistence_error() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        backend.fail_after_n_batches(0);
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend.clone(),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("persistence failure should propagate");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Runtime(_)),
+            "expected Runtime error variant, got: {err:?}"
+        );
+        assert_eq!(
+            backend.batch_call_count(),
+            0,
+            "no batch should have succeeded before the injected failure"
+        );
+    }
+
+    /// A successful Git repo-frontier scan emits at least one event through
+    /// the `CoordinationEventRecorder` telemetry path.
+    #[test]
+    fn run_git_repo_worker_records_git_events() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let test_recorder = Arc::new(Recorder::default());
+        let identity = git_worker_identity_with_recorder(
+            repo.path(),
+            Arc::clone(&test_recorder) as Arc<dyn CoordinationEventRecorder>,
+        );
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            identity,
+            backend,
+            DistributedRuntimeConfig::default(),
+        )
+        .expect("git repo worker should succeed");
+
+        let events = test_recorder.git_events.lock().expect("git events lock");
+        assert!(
+            !events.is_empty(),
+            "git worker should emit at least one git event during a successful scan"
         );
     }
 

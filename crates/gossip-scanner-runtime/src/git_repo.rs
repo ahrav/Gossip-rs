@@ -731,7 +731,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 mod tests {
     use super::*;
     use crate::GitScanConfig;
-    use gossip_contracts::connector::git::GitRefSelection;
+    use gossip_contracts::connector::git::{GitRefSelection, GitRepoTarget, RepoKey, RepoLocator};
 
     /// Zero-valued `tree_delta_cache_mb` produces a `ZeroBudget` error.
     #[test]
@@ -831,5 +831,44 @@ mod tests {
                 remote: None,
             }
         );
+    }
+
+    fn make_test_target(key_bytes: &[u8]) -> GitRepoTarget {
+        GitRepoTarget::new(
+            RepoKey::try_from_slice(key_bytes).expect("repo key"),
+            RepoLocator::local_path("/tmp/test"),
+        )
+    }
+
+    #[test]
+    fn single_repo_target_none_returns_ok_none() {
+        assert!(single_repo_target(None).expect("None input").is_none());
+    }
+
+    #[test]
+    fn single_repo_target_rejects_non_terminal_page() {
+        let target = make_test_target(b"git:test:repo-a");
+        let page = PageBuf::try_new(
+            vec![target],
+            PageState::HasMore {
+                cursor: Cursor::initial(),
+            },
+        )
+        .expect("page");
+
+        let err = single_repo_target(Some(page)).expect_err("non-terminal page");
+        let msg = format!("{err}");
+        assert!(msg.contains("non-terminal page"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn single_repo_target_rejects_multi_item_page() {
+        let target_a = make_test_target(b"git:test:repo-a");
+        let target_b = make_test_target(b"git:test:repo-b");
+        let page = PageBuf::try_new(vec![target_a, target_b], PageState::Complete).expect("page");
+
+        let err = single_repo_target(Some(page)).expect_err("multi-item page");
+        let msg = format!("{err}");
+        assert!(msg.contains("2 targets"), "unexpected error: {msg}");
     }
 }
