@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::Command;
 
@@ -21,8 +22,8 @@ use scanner_git::events::{NullEventSink, VecEventSink};
 use scanner_git::{
     ArtifactAcquireError, CommitLoadError, FinalizeOutcome, GitScanConfig, GitScanError,
     GitScanMode, GitScanReport, GitScanResult, InMemoryPersistenceStore, MappingCandidateKind,
-    NeverSeenStore, OidBytes, PersistError, PersistenceStore, RefWatermarkStore, RepoOpenError,
-    SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig,
+    NeverSeenStore, OidBytes, PersistError, PersistenceStore, RefWatermark, RefWatermarkStore,
+    RepoOpenError, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore, SpillError, StartSetConfig,
     StartSetResolver, WriteOp, run_git_scan,
 };
 
@@ -164,7 +165,7 @@ impl StartSetResolver for TestResolver {
 
 /// Watermark store that returns a fixed optional watermark for all refs.
 struct TestWatermarkStore {
-    watermark: Option<OidBytes>,
+    watermark: Option<scanner_git::RefWatermark>,
 }
 
 impl RefWatermarkStore for TestWatermarkStore {
@@ -174,7 +175,7 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         Ok(ref_names.iter().map(|_| self.watermark).collect())
     }
 }
@@ -224,7 +225,7 @@ impl PersistenceStore for RetryStore {
 ///
 /// The config pins `repo_id`, `policy_hash`, and `start_set` to keep the
 /// test inputs deterministic. Persistence is routed to an in-memory store.
-fn run_scan(repo: &Path, watermark: Option<OidBytes>) -> GitScanResult {
+fn run_scan(repo: &Path, watermark: Option<RefWatermark>) -> GitScanResult {
     run_scan_with_config(repo, watermark, base_config()).unwrap()
 }
 
@@ -239,7 +240,7 @@ fn base_config() -> GitScanConfig {
 
 fn run_scan_with_config(
     repo: &Path,
-    watermark: Option<OidBytes>,
+    watermark: Option<RefWatermark>,
     config: GitScanConfig,
 ) -> Result<GitScanResult, GitScanError> {
     let engine = test_engine();
@@ -354,7 +355,14 @@ fn loose_only_candidate_scans_complete() {
     repack_all(tmp.path());
 
     let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
-    let result = run_scan(tmp.path(), Some(watermark));
+    // Root commit in a 2-commit chain has generation 1.
+    let result = run_scan(
+        tmp.path(),
+        Some(RefWatermark {
+            oid: watermark,
+            generation: NonZeroU32::new(1).unwrap(),
+        }),
+    );
 
     let GitScanResult(report) = result;
     assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
@@ -687,7 +695,7 @@ fn shallow_clone_fails_fast_when_shallow_root_limit_is_exceeded() {
 /// Run a scan using a `VecEventSink` and return the JSONL output as lines.
 fn run_scan_with_events(
     repo: &Path,
-    watermark: Option<OidBytes>,
+    watermark: Option<RefWatermark>,
     config: GitScanConfig,
 ) -> (GitScanResult, Vec<String>) {
     let engine = test_engine();

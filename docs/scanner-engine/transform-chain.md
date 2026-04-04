@@ -307,11 +307,11 @@ See `docs/scanner-engine/detection-engine.md` for TimingWheel data structure det
 
 ```mermaid
 graph TB
-    Root["StepId::ROOT<br/>(original buffer)"]
+    Root["STEP_ROOT<br/>(original buffer)"]
 
-    Step1["StepId(0)<br/>Transform { idx: 0, span: 100..200 }"]
-    Step2["StepId(1)<br/>Transform { idx: 1, span: 50..150 }"]
-    Step3["StepId(2)<br/>Utf16Window { Le, span: 0..64 }"]
+    Step1["StepId(0)<br/>Transform { transform_idx: 0, parent_span: 100..200 }"]
+    Step2["StepId(1)<br/>Transform { transform_idx: 1, parent_span: 50..150 }"]
+    Step3["StepId(2)<br/>Utf16Window { endianness: Le, parent_span: 0..64 }"]
 
     Root --> Step1
     Step1 --> Step2

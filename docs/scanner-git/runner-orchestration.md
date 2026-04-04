@@ -160,6 +160,11 @@ flowchart TD
 | `PersistenceStore` (trait) | Atomic finalize commit interface; extends `SeenBitmapPersister` for incremental scope updates |
 | `InMemoryPersistenceStore` | Test-only in-memory store for inspection and scoped seen-bitmap tests |
 
+Finalize-time `sb\0` ops remain `SeenBitmapDelta` payloads. When a store folds
+those deltas into the durable scope snapshot, `RoaringSeenBitmap` keeps the
+sorted OID index flat-packed in memory and applies a roaring bitmap over
+positions in that table. The write ordering and delta encoding stay unchanged.
+
 ## Engine Adapter
 
 The `EngineAdapter` (`engine_adapter.rs`) bridges decoded git blob bytes
@@ -373,6 +378,8 @@ watermarks without corresponding data writes.
 | `persist_finalize_output`     | `persist.rs`                         |
 | Worker runtime safety         | `runner_exec.rs`                     |
 | Scheduler task execution      | `runner_exec.rs`                     |
+| `SeenBitmapDelta` (finalize-time delta) | `roaring_seen.rs`              |
+| `RoaringSeenBitmap` (durable scope snapshot) | `roaring_seen.rs`         |
 
 ## Related Docs
 

@@ -16,9 +16,9 @@
 //!
 //! The suite is split into three independently runnable sub-suites:
 //!
-//! 1. **Done-ledger** ([`run_done_ledger_conformance`]) — four checks:
+//! 1. **Done-ledger** ([`run_done_ledger_conformance`]) — five checks:
 //!    idempotent upsert, fail-then-scan dominance, scan-then-fail dominance,
-//!    batch-get positional semantics.
+//!    batch-get positional semantics, terminal-key enumeration.
 //! 2. **Findings** ([`run_findings_conformance`]) — four checks: idempotent
 //!    upsert with durable count verification, orphan occurrence rejection,
 //!    orphan observation rejection, observation upsert merge idempotency.
@@ -49,7 +49,7 @@
 //! probe: [`FindingsConformanceProbe`]. Production code does not depend on this
 //! trait; backend test suites implement it in their test harnesses.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
 use super::{
     CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerErrorCode, DoneLedgerKey,
@@ -141,8 +141,8 @@ pub trait FindingsConformanceProbe: Send + Sync {
 /// *all* checks passed.
 ///
 /// Current check counts (for reference):
-/// - Done-ledger: 4 (idempotent upsert, fail→scan dominance, scan→fail dominance,
-///   batch-get positional semantics)
+/// - Done-ledger: 5 (idempotent upsert, fail→scan dominance, scan→fail dominance,
+///   batch-get positional semantics, terminal-key enumeration)
 /// - Findings: 4 (idempotent upsert, orphan occurrence, orphan observation,
 ///   observation upsert merge)
 /// - Redaction: 3 (`NormHash` debug, `SecretHash` debug, `FindingRecord` debug)
@@ -333,7 +333,7 @@ where
 
 /// Run only the done-ledger portion of the conformance suite.
 ///
-/// Verifies four properties of the [`DoneLedger`] implementation:
+/// Verifies five properties of the [`DoneLedger`] implementation:
 ///
 /// 1. **Idempotent upsert** — writing the same `ScannedWithFindings` record
 ///    twice must not alter durable state. The harness writes, replays, reads
@@ -354,7 +354,13 @@ where
 ///    yield `Some`, absent keys yield `None`, and the positional alignment
 ///    must hold regardless of which keys are present.
 ///
-/// Returns the number of checks that passed (currently 4).
+/// 5. **Terminal-key enumeration** — `list_done_hashes` must return exactly
+///    the keys in the requested `(tenant, policy)` scope whose durable status
+///    is terminal. `FailedRetryable` keys must be excluded. Cross-tenant and
+///    cross-policy isolation must hold: terminal keys outside the queried scope
+///    must not appear in results.
+///
+/// Returns the number of checks that passed (currently 5).
 ///
 /// # Errors
 ///
@@ -367,7 +373,8 @@ where
     check_done_ledger_fail_then_scan(done_ledger)?;
     check_done_ledger_scan_then_fail(done_ledger)?;
     check_done_ledger_batch_get_positional(done_ledger)?;
-    Ok(4)
+    check_done_ledger_list_done_hashes(done_ledger)?;
+    Ok(5)
 }
 
 /// Check 1: writing the same `ScannedWithFindings` record twice must not
@@ -522,6 +529,307 @@ where
             message: "result[1] should be None for an absent key, got Some".to_owned(),
         });
     }
+    Ok(())
+}
+
+/// Check 5: `list_done_hashes` must return only terminal keys for one scope,
+/// with cross-tenant and cross-policy isolation.
+fn check_done_ledger_list_done_hashes<L>(done_ledger: &L) -> Result<(), PersistenceConformanceError>
+where
+    L: DoneLedger,
+{
+    let fixture = sample_fixture(0xBB)?;
+    let retryable_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(20))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-retryable-version",
+        )),
+    });
+    let retryable_error_code =
+        DoneLedgerErrorCode::try_new("TEMP_RETRYABLE").map_err(|source| {
+            PersistenceConformanceError::FixtureConstruction {
+                case: "done-ledger/list-done-hashes:retryable-error-code",
+                source: Box::new(source),
+            }
+        })?;
+    let retryable_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, fixture.policy_hash, retryable_hash),
+        DoneLedgerStatus::FailedRetryable,
+        512,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(33),
+            ShardId::from_raw(34),
+            FenceEpoch::from_raw(35),
+            LogicalTime::from_raw(36),
+            LogicalTime::from_raw(37),
+        ),
+        Some(retryable_error_code),
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:retryable-record",
+        source: Box::new(source),
+    })?;
+
+    let failed_permanent_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(21))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-failed-permanent-version",
+        )),
+    });
+    let failed_permanent_code = DoneLedgerErrorCode::try_new("PERM_FAILURE").map_err(|source| {
+        PersistenceConformanceError::FixtureConstruction {
+            case: "done-ledger/list-done-hashes:failed-permanent-error-code",
+            source: Box::new(source),
+        }
+    })?;
+    let failed_permanent_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(
+            fixture.tenant_id,
+            fixture.policy_hash,
+            failed_permanent_hash,
+        ),
+        DoneLedgerStatus::FailedPermanent,
+        1024,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(40),
+            ShardId::from_raw(41),
+            FenceEpoch::from_raw(42),
+            LogicalTime::from_raw(43),
+            LogicalTime::from_raw(44),
+        ),
+        Some(failed_permanent_code),
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:failed-permanent-record",
+        source: Box::new(source),
+    })?;
+
+    let skipped_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(22))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-skipped-version",
+        )),
+    });
+    let skipped_code = DoneLedgerErrorCode::try_new("UNSUPPORTED_FORMAT").map_err(|source| {
+        PersistenceConformanceError::FixtureConstruction {
+            case: "done-ledger/list-done-hashes:skipped-error-code",
+            source: Box::new(source),
+        }
+    })?;
+    let skipped_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, fixture.policy_hash, skipped_hash),
+        DoneLedgerStatus::Skipped,
+        512,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(50),
+            ShardId::from_raw(51),
+            FenceEpoch::from_raw(52),
+            LogicalTime::from_raw(53),
+            LogicalTime::from_raw(54),
+        ),
+        Some(skipped_code),
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:skipped-record",
+        source: Box::new(source),
+    })?;
+
+    let scanned_clean_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(23))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-scanned-clean-version",
+        )),
+    });
+    let scanned_clean_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, fixture.policy_hash, scanned_clean_hash),
+        DoneLedgerStatus::ScannedClean,
+        2048,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(60),
+            ShardId::from_raw(61),
+            FenceEpoch::from_raw(62),
+            LogicalTime::from_raw(63),
+            LogicalTime::from_raw(64),
+        ),
+        None,
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:scanned-clean-record",
+        source: Box::new(source),
+    })?;
+
+    let _ = submit_done_ledger(
+        done_ledger,
+        "done-ledger/list-done-hashes:upsert",
+        &[
+            fixture.scanned_record.clone(),
+            retryable_record,
+            failed_permanent_record,
+            skipped_record,
+            scanned_clean_record,
+        ],
+    )?;
+
+    let hashes = done_ledger
+        .list_done_hashes(fixture.tenant_id, fixture.policy_hash)
+        .map_err(|err| PersistenceConformanceError::DoneLedgerGet {
+            case: "done-ledger/list-done-hashes:list",
+            source: Box::new(err),
+        })?;
+    // Assert raw Vec length before converting to HashSet so duplicate rows
+    // from a buggy backend cannot be masked by set deduplication.
+    let expected_terminal_count = 4;
+    if hashes.len() != expected_terminal_count {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:terminal-count",
+            message: format!(
+                "expected {} terminal hashes, got {}",
+                expected_terminal_count,
+                hashes.len()
+            ),
+        });
+    }
+    let actual: HashSet<_> = hashes.into_iter().collect();
+    let expected = HashSet::from([
+        fixture.ovid_hash,
+        failed_permanent_hash,
+        skipped_hash,
+        scanned_clean_hash,
+    ]);
+    if actual != expected {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:terminal-set",
+            message: format!(
+                "expected terminal hash set {:?}, got {:?}",
+                expected, actual
+            ),
+        });
+    }
+
+    // Cross-tenant isolation: a terminal key under a different tenant must not
+    // leak into the original scope's results.
+    let other_tenant = TenantId::from_bytes(fill32(0xBB_u8.wrapping_add(30)));
+    let cross_tenant_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(31))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-cross-tenant-version",
+        )),
+    });
+    let cross_tenant_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(other_tenant, fixture.policy_hash, cross_tenant_hash),
+        DoneLedgerStatus::ScannedClean,
+        256,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(70),
+            ShardId::from_raw(71),
+            FenceEpoch::from_raw(72),
+            LogicalTime::from_raw(73),
+            LogicalTime::from_raw(74),
+        ),
+        None,
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:cross-tenant-record",
+        source: Box::new(source),
+    })?;
+    let _ = submit_done_ledger(
+        done_ledger,
+        "done-ledger/list-done-hashes:cross-tenant-upsert",
+        &[cross_tenant_record],
+    )?;
+
+    let hashes_after = done_ledger
+        .list_done_hashes(fixture.tenant_id, fixture.policy_hash)
+        .map_err(|err| PersistenceConformanceError::DoneLedgerGet {
+            case: "done-ledger/list-done-hashes:cross-tenant-requery",
+            source: Box::new(err),
+        })?;
+    if hashes_after.len() != expected_terminal_count {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-tenant-count",
+            message: format!(
+                "cross-tenant requery: expected {} hashes, got {}",
+                expected_terminal_count,
+                hashes_after.len()
+            ),
+        });
+    }
+    let actual_after: HashSet<_> = hashes_after.into_iter().collect();
+    if actual_after != expected {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-tenant-isolation",
+            message: format!(
+                "cross-tenant key leaked into scope: expected {:?}, got {:?}",
+                expected, actual_after
+            ),
+        });
+    }
+
+    // Cross-policy isolation: a terminal key under the same tenant but a
+    // different policy must not leak into the original scope's results.
+    let other_policy = PolicyHash::from_bytes(fill32(0xBB_u8.wrapping_add(32)));
+    let cross_policy_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xBB_u8.wrapping_add(33))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-cross-policy-version",
+        )),
+    });
+    let cross_policy_record = DoneLedgerRecord::try_new(
+        DoneLedgerKey::new(fixture.tenant_id, other_policy, cross_policy_hash),
+        DoneLedgerStatus::ScannedClean,
+        256,
+        0,
+        DoneLedgerProvenance::new(
+            RunId::from_raw(80),
+            ShardId::from_raw(81),
+            FenceEpoch::from_raw(82),
+            LogicalTime::from_raw(83),
+            LogicalTime::from_raw(84),
+        ),
+        None,
+    )
+    .map_err(|source| PersistenceConformanceError::FixtureConstruction {
+        case: "done-ledger/list-done-hashes:cross-policy-record",
+        source: Box::new(source),
+    })?;
+    let _ = submit_done_ledger(
+        done_ledger,
+        "done-ledger/list-done-hashes:cross-policy-upsert",
+        &[cross_policy_record],
+    )?;
+
+    let hashes_cross_policy = done_ledger
+        .list_done_hashes(fixture.tenant_id, fixture.policy_hash)
+        .map_err(|err| PersistenceConformanceError::DoneLedgerGet {
+            case: "done-ledger/list-done-hashes:cross-policy-requery",
+            source: Box::new(err),
+        })?;
+    if hashes_cross_policy.len() != expected_terminal_count {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-policy-count",
+            message: format!(
+                "cross-policy requery: expected {} hashes, got {}",
+                expected_terminal_count,
+                hashes_cross_policy.len()
+            ),
+        });
+    }
+    let actual_cross_policy: HashSet<_> = hashes_cross_policy.into_iter().collect();
+    if actual_cross_policy != expected {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/list-done-hashes:cross-policy-isolation",
+            message: format!(
+                "cross-policy key leaked into scope: expected {:?}, got {:?}",
+                expected, actual_cross_policy
+            ),
+        });
+    }
+
     Ok(())
 }
 

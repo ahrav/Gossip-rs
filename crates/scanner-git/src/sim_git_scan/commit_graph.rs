@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use gix_commitgraph::Position;
 
+use crate::watermark_keys::RefWatermark;
 use crate::{CommitGraph, CommitPlanError, OidBytes, ParentScratch};
 
 use super::convert::{to_object_format, to_oid_bytes};
@@ -177,6 +178,7 @@ mod tests {
     use super::*;
     use crate::{ByteArena, OidBytes};
     use crate::{CommitPlanIter, CommitWalkLimits, StartSetRef};
+    use std::num::NonZeroU32;
 
     fn oid(val: u8) -> Vec<u8> {
         vec![val; 20]
@@ -223,7 +225,10 @@ mod tests {
         let mut arena = ByteArena::with_capacity(128);
         let name = arena.intern(b"refs/heads/main").expect("ref name");
         let tip = OidBytes::from_slice(&oid(3));
-        let watermark = Some(OidBytes::from_slice(&oid(9)));
+        let watermark = Some(RefWatermark {
+            oid: OidBytes::from_slice(&oid(9)),
+            generation: NonZeroU32::new(1).unwrap(),
+        });
         let refs = vec![StartSetRef {
             name,
             tip,

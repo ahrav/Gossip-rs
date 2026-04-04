@@ -34,6 +34,7 @@ use super::limits::RepoOpenLimits;
 use super::object_id::{ObjectFormat, OidBytes};
 use super::repo::GitRepoPaths;
 use super::start_set::StartSetId;
+use super::watermark_keys::RefWatermark;
 
 /// Paths to artifact files used for lock-file detection.
 #[derive(Clone, Debug)]
@@ -74,8 +75,9 @@ pub struct StartSetRef {
     pub name: ByteRef,
     /// Resolved commit OID at tip.
     pub tip: OidBytes,
-    /// Last scanned tip OID for this ref (if previously scanned).
-    pub watermark: Option<OidBytes>,
+    /// Last completed watermark for this ref, including the persisted
+    /// generation when it was recorded.
+    pub watermark: Option<RefWatermark>,
 }
 
 /// Complete state for a repository job after repo open.
@@ -260,7 +262,7 @@ pub trait RefWatermarkStore {
     ///
     /// # Returns
     ///
-    /// A vector of `Option<OidBytes>` aligned with `ref_names`.
+    /// A vector of `Option<RefWatermark>` aligned with `ref_names`.
     /// Length must equal `ref_names.len()`.
     fn load_watermarks(
         &self,
@@ -268,7 +270,7 @@ pub trait RefWatermarkStore {
         policy_hash: [u8; 32],
         start_set_id: StartSetId,
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError>;
+    ) -> Result<Vec<Option<RefWatermark>>, RepoOpenError>;
 }
 
 /// Executes repo discovery and open.

@@ -11,6 +11,7 @@
 //! `RunState` and validated at the end of the run before a `RunReport` is
 //! emitted.
 //!
+use std::num::NonZeroU32;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use blake3::Hasher;
@@ -18,10 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, StepResult};
 use crate::{
-    build_pack_plans, ByteArena, BytesView, CandidateBuffer, CommitPlanIter, CommitWalkLimits,
-    FinalizeOutcome, OidBytes, PackCache, PackDecodeLimits, PackExecError, PackExecReport,
-    PackPlanConfig, PackReadError, PackReader, PlannedCommit, StartSetRef, TreeDiffLimits,
-    TreeDiffWalker,
+    build_pack_plans, ByteArena, BytesView, CandidateBuffer, CommitGraph, CommitPlanIter,
+    CommitWalkLimits, FinalizeOutcome, OidBytes, PackCache, PackDecodeLimits, PackExecError,
+    PackExecReport, PackPlanConfig, PackReadError, PackReader, PlannedCommit, RefWatermark,
+    StartSetRef, TreeDiffLimits, TreeDiffWalker,
 };
 
 use super::commit_graph::SimCommitGraph;
@@ -437,7 +438,20 @@ fn stage_repo_open(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
             .ok_or_else(|| failure_inv(4, "ref name too long"))?;
         let tip = to_oid_bytes(&r.tip, object_format).map_err(|err| failure_inv(5, err))?;
         let watermark = match &r.watermark {
-            Some(oid) => Some(to_oid_bytes(oid, object_format).map_err(|err| failure_inv(6, err))?),
+            Some(oid) => {
+                let oid = to_oid_bytes(oid, object_format).map_err(|err| failure_inv(6, err))?;
+                let pos = commit_graph
+                    .lookup(&oid)
+                    .map_err(|err| failure_inv(6, err))?
+                    .ok_or_else(|| failure_inv(6, "watermark commit missing from commit graph"))?;
+                let raw_gen = commit_graph.generation(pos);
+                let gen = NonZeroU32::new(raw_gen)
+                    .ok_or_else(|| failure_inv(6, "watermark generation must be nonzero"))?;
+                Some(RefWatermark {
+                    oid,
+                    generation: gen,
+                })
+            }
             None => None,
         };
         start_set_refs.push(StartSetRef {

@@ -8,7 +8,7 @@ across 11 source files. No other boundary module may be referenced from here --
 all four sibling boundaries depend on `identity`, but `identity` depends on none
 of them.
 
-The module provides three core capabilities:
+The module provides four core capabilities:
 
 - **Content-addressed identity types** -- a hierarchy of strongly-typed 32-byte
   identifiers (plus a few variable-width types) that represent items, secrets,
@@ -16,7 +16,7 @@ The module provides three core capabilities:
 - **Canonical encoding** -- the `CanonicalBytes` trait and its primitive
   implementations, providing deterministic, collision-free binary serialization
   for hash-input construction.
-- **Domain-separated hashing** -- a registry of 17 domain constants and two
+- **Domain-separated hashing** -- a registry of 18 domain constants and two
   hashing modes (keyed and derive-key) that prevent cross-derivation and
   cross-tenant collisions.
 - **Rule fingerprint derivation** -- `derive_rule_fingerprint` computes a
@@ -43,8 +43,8 @@ macros.
 | `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId`, `ObservationId` + derivation fns (`derive_rule_fingerprint`, `derive_finding_id`, `derive_occurrence_id`, `derive_observation_id`) |
 | `policy.rs`       | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                                                       |
 | `macros.rs`       | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                                                                |
-| `coordination.rs` | `RunId`, `ShardId`, `WorkerId`, `OpId`, `JobId`, `FenceEpoch`, `LogicalTime`, `ShardKey` — 64-bit coordination identity types |
-| `golden.rs`       | Golden vector tests (7 derivations)                                                                                           |
+| `coordination.rs` | `RunId`, `ShardId`, `WorkerId`, `OpId`, `JobId`, `FenceEpoch`, `LogicalTime` (64-bit types) plus `ShardKey` (16-byte compound key) |
+| `golden.rs`       | Golden vector tests (9 derivations)                                                                                           |
 
 ---
 
@@ -221,7 +221,7 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 
 ## 5. Domain Separation Registry
 
-All 17 domain constants live in `domain.rs` and follow the naming convention
+All 18 domain constants live in `domain.rs` and follow the naming convention
 `"gossip/<subsystem>/v<N>[/<operation>]"`.
 
 ### Constants
@@ -245,11 +245,12 @@ All 17 domain constants live in `domain.rs` and follow the naming convention
 | `TRIAGE_GROUP_KEY_V1` | `gossip/persistence/v1/triage-group` | Persistence  | derive-key | `TriageGroupKey` derivation                         |
 | `COORDINATION_TELEMETRY_V1` | `gossip/worker/v1/coordination-telemetry` | Worker | derive-key | Coordination telemetry redaction digest             |
 | `GIT_REPO_ID_V1`     | `gossip/git/v1/repo-id`              | Git        | derive-key | Stable 64-bit repo-namespace derivation for repo-native Git scans |
+| `GIT_MIRROR_PATH_V1` | `gossip/git/v1/mirror-path`          | Git        | derive-key | Stable 256-bit mirror-cache path derivation for repo-native Git scans |
 
 ### Uniqueness enforcement
 
 1. **Compile-time array length** -- The `ALL` array is declared as
-   `[&str; 17]`. Adding a constant without updating `ALL` is a compile error.
+   `[&str; 18]`. Adding a constant without updating `ALL` is a compile error.
 2. **`no_duplicate_values` test** -- Iterates `ALL` through a `HashSet` and
    panics on collision.
 3. **`no_duplicate_names` test** -- Checks the `(name, value)` fixture for
@@ -547,6 +548,8 @@ pub enum IdentityInputError {
     TagTooLong(usize),
     /// Connector tag contains a non-ASCII-graphic byte at the given index.
     NonGraphicByte { index: usize, byte: u8 },
+    /// Connector instance ID bytes are empty.
+    EmptyConnectorInstanceId,
     /// Item locator is empty.
     EmptyLocator,
     /// Version bytes are empty.
@@ -563,7 +566,8 @@ implements `Display`, `Debug`, `Clone`, `PartialEq`, `Eq`, and
 | Type              | Method                      | Returns                                     |
 | ----------------- | --------------------------- | ------------------------------------------- |
 | `ConnectorTag`    | `try_from_ascii(&[u8])`     | `Result<Self, IdentityInputError>`          |
-| `ItemIdentityKey` | `try_new(tag, &[u8])`       | `Result<Self, IdentityInputError>`          |
+| `ConnectorInstanceIdHash` | `try_from_instance_id_bytes(&[u8])` | `Result<Self, IdentityInputError>` |
+| `ItemIdentityKey` | `try_new(connector, connector_instance, locator)` | `Result<Self, IdentityInputError>` |
 | `ObjectVersionId` | `try_from_version_bytes(&[u8])` | `Result<Self, IdentityInputError>`      |
 
 The panicking equivalents (`from_ascii`, `new`, `from_version_bytes`) remain

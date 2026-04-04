@@ -84,12 +84,17 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         Ok(ref_names
             .iter()
             .map(|name| {
                 if *name == b"refs/heads/a" {
-                    Some(OidBytes::sha1([0x0a; 20]))
+                    Some(scanner_git::RefWatermark {
+                        oid: OidBytes::sha1([0x0a; 20]),
+                        // OID will not resolve in a real commit graph;
+                        // generation satisfies the non-zero invariant.
+                        generation: std::num::NonZeroU32::new(1).unwrap(),
+                    })
                 } else {
                     None
                 }

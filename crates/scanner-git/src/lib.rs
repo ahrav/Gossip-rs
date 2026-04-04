@@ -367,7 +367,8 @@ pub use roaring_seen::{RoaringSeenBitmap, RoaringSeenStore};
 pub use roaring_seen::{SeenBitmapDelta, SeenBitmapError};
 pub use snapshot_plan::snapshot_plan;
 pub use watermark_keys::{
-    decode_ref_watermark_value, encode_ref_watermark_value, KeyArena, KeyRef, NS_REF_WATERMARK,
+    decode_ref_watermark_value, encode_ref_watermark_value, KeyArena, KeyRef, RefWatermark,
+    NS_REF_WATERMARK,
 };
 
 // ── Cross-cutting: errors, config, runner, I/O ──────────────────────────

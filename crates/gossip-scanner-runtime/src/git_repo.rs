@@ -36,7 +36,7 @@ use gossip_contracts::persistence::WriteContext;
 use gossip_orchestrator::{GitSelectionLoweringError, GitShardPayload};
 use scanner_git::{
     FinalizeOutcome, GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError,
-    GitScanResult, NativeRefResolver, NeverSeenStore, OidBytes, PersistenceStore,
+    GitScanResult, NativeRefResolver, NeverSeenStore, PersistenceStore, RefWatermark,
     RefWatermarkStore, RepoOpenError, RepoOpenLimits, SeenBlobStore, StartSetConfig, run_git_scan,
 };
 
@@ -716,7 +716,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<RefWatermark>>, RepoOpenError> {
         Ok(vec![None; ref_names.len()])
     }
 }

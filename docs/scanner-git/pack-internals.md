@@ -8,7 +8,7 @@ the high-level execution pipeline and strategy selection.
 ## Overview
 
 The path from a pack file on disk to a materialized object in memory
-involves six cooperating layers:
+involves seven cooperating layers:
 
 ```mermaid
 flowchart TD

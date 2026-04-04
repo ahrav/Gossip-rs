@@ -51,8 +51,8 @@ use gossip_contracts::{
 };
 use scanner_git::{
     FinalizeOutcome, FinalizeOutput, NS_SEEN_BLOB, OidBytes, PersistError, PersistenceStore,
-    RefWatermarkStore, RepoOpenError, SeenBitmapDelta, SeenBitmapPersister, SeenBlobStore,
-    SpillError, StartSetId, WriteOp, decode_ref_watermark_value,
+    RefWatermark, RefWatermarkStore, RepoOpenError, SeenBitmapDelta, SeenBitmapPersister,
+    SeenBlobStore, SpillError, StartSetId, WriteOp, decode_ref_watermark_value,
     finalize::{build_ref_wm_key, build_seen_scope_key, build_seen_staging_key},
     roaring_seen::{RoaringSeenBitmap, RoaringSeenStore},
 };
@@ -485,7 +485,7 @@ where
 /// the adapter's identity before issuing backend reads, because a mismatch
 /// would silently cross-pollinate watermarks between different scan scopes.
 ///
-/// Returns one `Option<OidBytes>` per input ref name, preserving input order.
+/// Returns one `Option<RefWatermark>` per input ref name, preserving input order.
 /// `None` means no watermark exists for that ref (first scan or ref was pruned).
 impl<B> RefWatermarkStore for GitPersistenceAdapter<B>
 where
@@ -497,7 +497,7 @@ where
         policy_hash: [u8; 32],
         start_set_id: StartSetId,
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<RefWatermark>>, RepoOpenError> {
         // Watermark keys and seen-bitmap keys must be scoped to the same
         // (repo_id, policy_hash) identity. A mismatch would silently return
         // watermarks for a different scope than the seen-bitmap uses.
@@ -674,7 +674,16 @@ where
         let resolved_staging = staging_bitmap.or(staging_from_backend);
         let has_staging = resolved_staging.is_some();
         if is_complete && let Some(staging) = &resolved_staging {
-            seen_oids.extend_from_slice(staging.all_oids());
+            // All OIDs in the staging bitmap must be marked seen. A mismatch
+            // indicates a corrupt serialized payload (e.g., from a crash during
+            // the non-atomic write path). Folding unseen OIDs into the live set
+            // would permanently suppress future detection of those blobs.
+            if staging.len() != staging.index_len() {
+                return Err(PersistError::backend(
+                    "staging bitmap contains unseen entries",
+                ));
+            }
+            seen_oids.extend(staging.all_oids());
         }
 
         let mut staged_bitmap = None;
@@ -850,6 +859,7 @@ pub(crate) fn build_git_repo_done_ledger_record(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::num::NonZeroU32;
 
     use gossip_contracts::{
         connector::git::RepoKey,
@@ -1017,8 +1027,14 @@ mod tests {
         let ref_a = b"refs/heads/main".as_slice();
         let ref_b = b"refs/tags/v1".as_slice();
 
-        let value_a = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x11; 20]));
-        let value_b = scanner_git::encode_ref_watermark_value(&OidBytes::sha1([0x22; 20]));
+        let value_a = scanner_git::encode_ref_watermark_value(
+            &OidBytes::sha1([0x11; 20]),
+            NonZeroU32::new(11).unwrap(),
+        );
+        let value_b = scanner_git::encode_ref_watermark_value(
+            &OidBytes::sha1([0x22; 20]),
+            NonZeroU32::new(22).unwrap(),
+        );
         backend.set(
             build_ref_wm_key(7, &[0x55; 32], &start_set_id, ref_a),
             value_a.0[..value_a.1].to_vec(),
@@ -1040,10 +1056,40 @@ mod tests {
         assert_eq!(
             loaded,
             vec![
-                Some(OidBytes::sha1([0x22; 20])),
+                Some(RefWatermark {
+                    oid: OidBytes::sha1([0x22; 20]),
+                    generation: NonZeroU32::new(22).unwrap(),
+                }),
                 None,
-                Some(OidBytes::sha1([0x11; 20])),
+                Some(RefWatermark {
+                    oid: OidBytes::sha1([0x11; 20]),
+                    generation: NonZeroU32::new(11).unwrap(),
+                }),
             ]
+        );
+    }
+
+    #[test]
+    fn load_watermarks_rejects_oid_only_values() {
+        let backend = TestBackend::atomic();
+        let adapter = GitPersistenceAdapter::new(backend.clone(), 7, [0x77; 32]);
+        let start_set_id = [0x88; 32];
+        let ref_name = b"refs/heads/main".as_slice();
+        let oid = OidBytes::sha1([0x33; 20]);
+        // OID-only payload (no generation trailer).
+        let mut oid_only = vec![oid.len()];
+        oid_only.extend_from_slice(oid.as_slice());
+        backend.set(
+            build_ref_wm_key(7, &[0x77; 32], &start_set_id, ref_name),
+            oid_only,
+        );
+
+        // The decoder rejects OID-only payloads as malformed, which the
+        // adapter surfaces as an error (invalid watermark encoding).
+        let result = adapter.load_watermarks(7, [0x77; 32], start_set_id, &[ref_name]);
+        assert!(
+            result.is_err(),
+            "OID-only watermark values must be rejected as malformed"
         );
     }
 

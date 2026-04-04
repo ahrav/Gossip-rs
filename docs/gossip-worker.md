@@ -7,7 +7,8 @@
 - a binary entrypoint that resolves environment variables plus CLI overrides
   into an explicit local or distributed launch path
 - a library surface that exposes the worker config module and the production
-  composition root for real etcd and PostgreSQL backends
+  composition root for real etcd and PostgreSQL backends, plus the
+  coordination telemetry recorder module
 
 The package owns only:
 

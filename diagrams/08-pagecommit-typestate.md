@@ -103,7 +103,7 @@ The four states correspond to four phases of a page commit:
 | :--------------------- | :------------------------------- | :----------------------------------------------------------------------- | :------------------------------------------------------------ |
 | **AwaitingFindings**   | `PageCommit<AwaitingFindings>`   | `record_findings()`, `wait_findings()`                                   | Entry point — no durable receipts yet                         |
 | **FindingsDurable**    | `PageCommit<FindingsDurable>`    | `record_done_ledger()`, `wait_done_ledger()`, `findings_receipt()`       | Findings are durable; done-ledger is the next required step   |
-| **ItemDurable**        | `PageCommit<ItemDurable>`        | `record_checkpoint()`, `wait_checkpoint()`, `item_commit_receipt()`      | Findings + done-ledger durable; checkpoint is the next step   |
+| **ItemDurable**        | `PageCommit<ItemDurable>`        | `record_checkpoint()`, `wait_checkpoint()`, `item_commit_receipt()`, `into_item_commit_receipt()` | Findings + done-ledger durable; checkpoint is the next step   |
 | **CheckpointDurable**  | `PageCommit<CheckpointDurable>`  | `page_commit_receipt()`, `into_page_commit_receipt()`                    | Terminal — all three stages durable, receipt extractable       |
 
 ### `CommitScope`
@@ -114,10 +114,11 @@ the durable commit boundary:
 | Field               | Type         | Purpose                                                 |
 | :------------------ | :----------- | :------------------------------------------------------ |
 | `tenant_id`         | `TenantId`   | Tenant isolation boundary                               |
+| `policy_hash`       | `PolicyHash` | Policy version that produced the page                   |
 | `run_id`            | `RunId`      | Run that produced the page                              |
 | `shard_id`          | `ShardId`    | Shard that emitted the page                             |
 | `fence_epoch`       | `FenceEpoch` | Fence epoch under which the page was processed          |
-| `committed_units`   | `u64`        | Number of durable units represented by the page         |
+| `committed_units`   | `NonZeroU64` | Number of durable units represented by the page         |
 | `checkpoint_boundary` | `CheckpointBoundary` | Tagged frontier boundary the checkpoint must durably acknowledge |
 
 Receipt validation at the done-ledger and checkpoint stages compares against

@@ -33,6 +33,7 @@ use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::start_set::StartSetId;
 #[cfg(feature = "rocksdb")]
 use super::watermark_keys::decode_ref_watermark_value;
+use super::watermark_keys::RefWatermark;
 
 #[cfg(feature = "rocksdb")]
 use rocksdb::{Options, WriteBatch, DB};
@@ -301,7 +302,7 @@ impl PersistenceStore for RocksDbStore {
                                 "staging bitmap contains unseen entries",
                             ));
                         }
-                        seen_oids.extend_from_slice(staging_bitmap.all_oids());
+                        seen_oids.extend(staging_bitmap.all_oids());
                     }
                     // Delete the staging key in both cases: complete folds
                     // it into live; partial discards it so skipped blobs
@@ -420,7 +421,7 @@ impl RefWatermarkStore for RocksDbStore {
         policy_hash: [u8; 32],
         start_set_id: StartSetId,
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<RefWatermark>>, RepoOpenError> {
         #[cfg(feature = "rocksdb")]
         {
             // `ref_names` are expected to be sorted to preserve key ordering.
@@ -439,6 +440,9 @@ impl RefWatermarkStore for RocksDbStore {
             for res in results {
                 match res {
                     Ok(Some(val)) => {
+                        // Payloads must include the 4-byte LE generation
+                        // trailer. Malformed or undersized payloads are
+                        // rejected, surfacing as a RepoOpenError.
                         let decoded =
                             decode_ref_watermark_value(val.as_ref()).ok_or_else(|| {
                                 RepoOpenError::io(io::Error::other(

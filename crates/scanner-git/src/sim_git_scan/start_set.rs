@@ -4,7 +4,9 @@
 //! and `RefWatermarkStore` traits used by `repo_open`.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
+use crate::watermark_keys::RefWatermark;
 use crate::StartSetId;
 use crate::{ObjectFormat, OidBytes};
 use crate::{RefWatermarkStore, RepoOpenError, StartSetResolver};
@@ -27,19 +29,27 @@ pub struct SimStartSet {
 struct SimRef {
     name: Vec<u8>,
     tip: OidBytes,
-    watermark: Option<OidBytes>,
+    watermark: Option<RefWatermark>,
 }
 
 impl SimStartSet {
     /// Build a simulated start set from the repo model.
     ///
-    /// This performs OID length validation but does not check for duplicate
-    /// ref names; duplicates will share a watermark entry.
+    /// This performs OID length validation and rejects duplicate commit
+    /// OIDs (which would mask fixture bugs). Duplicate ref names are
+    /// tolerated; duplicates will share a watermark entry.
     pub fn from_repo(repo: &GitRepoModel) -> Result<Self, SimGitError> {
         let object_format = to_object_format(repo.object_format);
+        let mut generations = HashMap::with_capacity(repo.commits.len());
+        for commit in &repo.commits {
+            let oid = to_oid_bytes(&commit.oid, object_format)?;
+            if generations.insert(oid, commit.generation).is_some() {
+                return Err(SimGitError::DuplicateOid { kind: "commit" });
+            }
+        }
         let mut refs = Vec::with_capacity(repo.refs.len());
         for r in &repo.refs {
-            refs.push(convert_ref(r, object_format)?);
+            refs.push(convert_ref(r, object_format, &generations)?);
         }
         Ok(Self {
             object_format,
@@ -56,7 +66,7 @@ impl SimStartSet {
     /// Build a ref-name-to-watermark map for fast lookup.
     ///
     /// If duplicate ref names exist, the last one wins.
-    fn watermark_map(&self) -> HashMap<Vec<u8>, Option<OidBytes>> {
+    fn watermark_map(&self) -> HashMap<Vec<u8>, Option<RefWatermark>> {
         let mut map = HashMap::with_capacity(self.refs.len());
         for r in &self.refs {
             map.insert(r.name.clone(), r.watermark);
@@ -65,12 +75,31 @@ impl SimStartSet {
     }
 }
 
-fn convert_ref(r: &GitRefSpec, format: ObjectFormat) -> Result<SimRef, SimGitError> {
+fn convert_ref(
+    r: &GitRefSpec,
+    format: ObjectFormat,
+    generations: &HashMap<OidBytes, u32>,
+) -> Result<SimRef, SimGitError> {
     Ok(SimRef {
         name: r.name.clone(),
         tip: to_oid_bytes(&r.tip, format)?,
         watermark: match &r.watermark {
-            Some(oid) => Some(to_oid_bytes(oid, format)?),
+            Some(oid) => {
+                let oid = to_oid_bytes(oid, format)?;
+                let generation =
+                    generations
+                        .get(&oid)
+                        .copied()
+                        .ok_or(SimGitError::MissingObject {
+                            kind: "watermark commit",
+                        })?;
+                let gen = NonZeroU32::new(generation)
+                    .ok_or(SimGitError::InvalidGeneration { generation })?;
+                Some(RefWatermark {
+                    oid,
+                    generation: gen,
+                })
+            }
             None => None,
         },
     })
@@ -92,7 +121,7 @@ impl RefWatermarkStore for SimStartSet {
         _policy_hash: [u8; 32],
         _start_set_id: StartSetId,
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<RefWatermark>>, RepoOpenError> {
         let map = self.watermark_map();
         let mut out = Vec::with_capacity(ref_names.len());
         for name in ref_names {
@@ -119,7 +148,12 @@ mod tests {
                 tip: super::super::scenario::GitOid { bytes: oid(1) },
                 watermark: Some(super::super::scenario::GitOid { bytes: oid(2) }),
             }],
-            commits: Vec::new(),
+            commits: vec![super::super::scenario::GitCommitSpec {
+                oid: super::super::scenario::GitOid { bytes: oid(2) },
+                parents: Vec::new(),
+                tree: super::super::scenario::GitOid { bytes: oid(99) },
+                generation: 1,
+            }],
             trees: Vec::new(),
             blobs: Vec::new(),
         };

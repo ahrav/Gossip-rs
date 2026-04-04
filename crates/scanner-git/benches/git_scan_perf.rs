@@ -19,7 +19,6 @@ use scanner_engine::{demo_rules, demo_transforms};
 use scanner_git::policy_hash;
 use scanner_git::NativeRefResolver;
 use scanner_git::NullEventSink;
-use scanner_git::OidBytes;
 use scanner_git::{demo_tuning, AnchorMode, AnchorPolicy, Engine};
 use scanner_git::{
     run_git_scan, GitScanConfig, GitScanError, GitScanResult, MergeDiffMode, NeverSeenStore,
@@ -47,7 +46,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
+    ) -> Result<Vec<Option<scanner_git::RefWatermark>>, RepoOpenError> {
         Ok(vec![None; ref_names.len()])
     }
 }

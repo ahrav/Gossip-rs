@@ -19,14 +19,14 @@ Must **not** reference `gossip-coordination`, `connector`, or `persistence`.
 
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | Module root, public re-exports from `key_encoding` and `hint` |
+| `src/lib.rs` | Module root, public `builder` / `hint` / `key_encoding` modules, and public re-exports from `key_encoding` and `hint` |
 | `src/key_encoding.rs` | `KeyEncoding` trait, `KeyBuf`, `PathKey`, `ManifestRowKey`, key arithmetic (`prefix_successor`, `key_successor`, `byte_midpoint`), `ShardSpec` constructors from typed keys, `PrefixShardError` |
 | `src/hint.rs` | `ShardHint` / `ShardMetadata` wire framing, `MetadataBuf`, `ShardSpecScratch`, typed shard-spec convenience constructors (`range_shard_ref`, `prefix_shard_ref`, `manifest_shard_ref` and `*_into` variants), split hint propagation, decode helpers |
 | `src/builder.rs` | `PreallocShardBuilder` — startup-preallocated shard builder with two-phase stage/build workflow |
 | `src/key_encoding_tests.rs` | Tests for key encoding and arithmetic |
 | `src/hint_tests.rs` | Tests for hint encode/decode and shard-spec constructors |
 | `src/builder_tests.rs` | Tests for the preallocated builder |
-| `Cargo.toml` | Depends on `gossip-contracts` and `gossip-stdx`; dev-depends on `proptest` and `rstest` |
+| `Cargo.toml` | Depends on `gossip-contracts`, `gossip-stdx`, and `thiserror`; dev-depends on `proptest` and `rstest` |
 
 ---
 

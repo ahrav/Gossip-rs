@@ -72,6 +72,25 @@ WHERE tenant_id = $1
   AND ovid_hash = ANY($3::bytea[])
 "#;
 
+/// Terminal-key enumeration query used by [`crate::DoneLedgerPg`].
+///
+/// Returns only `ovid_hash` values for one `(tenant_id, policy_hash)` scope.
+/// The backend supplies the terminal status ranks as a `SMALLINT[]`
+/// parameter so this query stays aligned with
+/// [`DoneLedgerStatus::is_terminal`](gossip_contracts::persistence::DoneLedgerStatus::is_terminal)
+/// without hard-coding enum discriminants in SQL text.
+///
+/// The existing `(tenant_id, policy_hash, finished_at DESC, ovid_hash)` index
+/// narrows the scan to the target tenant+policy scope. The `status` filter
+/// requires a heap lookup per candidate row, acceptable for a COLD-tier
+/// bulk-load operation.
+pub const LIST_DONE_HASHES_SQL: &str = r#"
+SELECT ovid_hash FROM done_ledger_entries
+WHERE tenant_id = $1
+  AND policy_hash = $2
+  AND status = ANY($3::smallint[])
+"#;
+
 /// Bulk monotonic done-ledger UPSERT used by [`crate::DoneLedgerPg`].
 ///
 /// Accepts 12 array parameters (one per column) and uses `unnest()` to
@@ -295,7 +314,7 @@ mod tests {
         assert_eq!(ascii, "GSDLPGM1");
     }
 
-    /// Both SQL query constants must embed the canonical table name.
+    /// All SQL query constants must embed the canonical table name.
     /// This guards against silent drift if the table constant is renamed
     /// but the SQL literals are not updated in lockstep.
     #[test]
@@ -307,6 +326,10 @@ mod tests {
         assert!(
             UPSERT_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
             "UPSERT_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
+        );
+        assert!(
+            LIST_DONE_HASHES_SQL.contains(DONE_LEDGER_ENTRIES_TABLE),
+            "LIST_DONE_HASHES_SQL must reference the DONE_LEDGER_ENTRIES_TABLE constant value"
         );
     }
 }
