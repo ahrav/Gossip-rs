@@ -1,6 +1,6 @@
 use super::*;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::delta_test_helpers::zlib_compress;
 use crate::object_id::OidBytes;

@@ -947,17 +947,16 @@ fn extract_commit_id(line: &str) -> Option<u64> {
     rest[..end].parse::<u64>().ok()
 }
 
-/// Verify that a delayed abort signal propagates through the parallel blob
-/// introduction path and prevents finalize persistence.
+/// A delayed abort signal propagates through the parallel blob introduction
+/// path and prevents finalize persistence.
 ///
-/// Unlike `aborted_scan_skips_finalize_persistence` which pre-sets the flag
-/// before calling `run_git_scan`, this test starts with `abort = false` and
-/// flips it from a background thread after a short delay. This exercises the
-/// cooperative cancellation check inside `introduce_parallel`'s worker loop.
+/// Starts with `abort = false` and flips it from a background thread after a
+/// short delay, exercising the cooperative cancellation check inside
+/// `introduce_parallel`'s worker loop.
 ///
-/// The test is inherently timing-dependent: on very fast machines the scan
-/// may complete before the abort fires. Both outcomes are accepted — the key
-/// property is that when abort *is* observed, no finalize data is persisted.
+/// Timing-dependent: on fast machines the scan may complete before the abort
+/// fires. Both outcomes are accepted — the key property is that when abort
+/// *is* observed, no finalize data is persisted.
 #[test]
 fn parallel_blob_intro_aborts_on_delayed_flag() {
     if !git_available() {
@@ -984,6 +983,7 @@ fn parallel_blob_intro_aborts_on_delayed_flag() {
     let persist_store = InMemoryPersistenceStore::default();
 
     let mut config = base_config();
+    config.scan_mode = GitScanMode::OdbBlobFast;
     config.blob_intro_workers = 4;
 
     let abort = std::sync::Arc::new(AtomicBool::new(false));
@@ -1007,8 +1007,13 @@ fn parallel_blob_intro_aborts_on_delayed_flag() {
 
     match result {
         Err(ref err) => {
-            // The scan observed the abort — verify no finalize data leaked.
-            eprintln!("scan aborted as expected: {err}");
+            assert!(
+                matches!(
+                    err,
+                    GitScanError::TreeDiff(scanner_git::TreeDiffError::Aborted)
+                ),
+                "expected Aborted, got {err:?}"
+            );
             assert!(
                 persist_store.data_ops.borrow().is_empty(),
                 "aborted scan must not persist data ops"
@@ -1030,13 +1035,12 @@ fn parallel_blob_intro_aborts_on_delayed_flag() {
     }
 }
 
-/// Verify that flipping the abort flag mid-scan causes a clean abort and
-/// prevents finalize persistence.
+/// Flipping the abort flag mid-scan causes a clean abort and prevents
+/// finalize persistence.
 ///
-/// Unlike `aborted_scan_skips_finalize_persistence` which pre-sets the flag,
-/// this test starts with `abort = false` and flips it from a scoped thread
-/// after a short delay. This exercises the cooperative `check_abort` calls
-/// at stage boundaries inside the scan pipeline.
+/// Starts with `abort = false` and flips it from a scoped thread after a
+/// short delay, exercising the cooperative `check_abort` calls at stage
+/// boundaries inside the scan pipeline.
 ///
 /// Timing-dependent: on fast machines the scan may complete before the abort
 /// fires. Both outcomes are accepted.
@@ -1110,10 +1114,9 @@ fn mid_scan_abort_stops_execution_and_skips_finalize() {
     }
 }
 
-/// Verify that the abort flag is checked at stage boundaries in the
-/// DiffHistory scan mode.
+/// The abort flag is checked at stage boundaries in DiffHistory scan mode.
 ///
-/// This exercises the `check_abort` call added after `bridge.finish()` in
+/// Exercises the `check_abort` call after `bridge.finish()` in
 /// `runner_diff_history.rs`. Timing-dependent: both abort and completion
 /// are accepted.
 #[test]

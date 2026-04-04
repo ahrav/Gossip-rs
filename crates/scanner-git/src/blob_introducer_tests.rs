@@ -255,12 +255,10 @@ fn merge_loose_dedup_is_input_order_invariant() {
 }
 
 // ---------------------------------------------------------------------------
-// Abort-path test infrastructure
+// Stub infrastructure for abort-path coverage
 // ---------------------------------------------------------------------------
 
-/// Minimal commit graph for abort-path tests.
-///
-/// Each entry provides a commit OID and a root tree OID at the same position.
+/// Minimal commit graph: each entry maps a commit OID to its root tree OID.
 struct StubCommitGraph {
     commit_oids: Vec<OidBytes>,
     root_trees: Vec<OidBytes>,
@@ -307,8 +305,8 @@ impl CommitGraph for StubCommitGraph {
 
 /// Tree source that always returns `TreeNotFound`.
 ///
-/// Sufficient for abort tests because the abort check fires before any
-/// tree load.
+/// No valid tree data is needed when the abort check fires before any
+/// tree load attempt.
 struct NeverLoadTreeSource;
 
 impl TreeSource for NeverLoadTreeSource {
@@ -389,8 +387,8 @@ fn introduce_aborts_immediately_when_flag_is_preset() {
     );
 }
 
-/// Verifies that `is_aborted()` returns `true` when either or both abort
-/// flags are set, and `false` only when neither is set.
+/// `is_aborted()` returns `true` when either or both abort flags are set,
+/// and `false` only when neither is set.
 #[test]
 fn blob_intro_worker_is_aborted_checks_both_flags() {
     let external_abort = AtomicBool::new(false);

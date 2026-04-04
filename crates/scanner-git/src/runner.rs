@@ -1078,6 +1078,10 @@ pub fn run_git_scan(
         path_arena: &output.path_arena,
     });
 
+    // Re-check after building FinalizeInput: for large repos the
+    // collect + build can take non-trivial time.
+    check_abort(abort)?;
+
     if let Some(store) = persist_store {
         persist_finalize_output(store, &finalize)?;
     }

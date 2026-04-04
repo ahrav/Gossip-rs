@@ -709,6 +709,10 @@ fn run_serial_spill_retry(
         first_elapsed.saturating_add(retry_elapsed)
     );
 
+    // Bail out before persisting seen-state if the scan was cancelled
+    // during the retry introduction.
+    check_abort(abort)?;
+
     let spill_start = Instant::now();
     let mut bridge = MappingBridge::new(
         midx,
