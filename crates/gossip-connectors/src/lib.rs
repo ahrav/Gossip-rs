@@ -7,7 +7,9 @@
 //!
 //! Shared connector value types (`ScanItem`, `ItemRef`, etc.) live in the
 //! `gossip_contracts::connector` module. This crate supplies concrete adapters
-//! for the currently supported source families.
+//! for the currently supported source families, while the crate root stays
+//! intentionally small and mostly curates the public exports that downstream
+//! code uses to select a connector implementation.
 //!
 //! **Dependency direction:** This crate depends on `gossip-contracts` for value
 //! types and traits. It must not depend on persistence backends or
@@ -30,8 +32,22 @@ pub use gossip_contracts::connector::{
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 
 #[doc(hidden)]
-/// Benchmark hook: drives the streaming split estimator's `observe` loop on a
-/// deterministic fixed-size workload for Criterion benches and allocation guards.
+/// Drives the streaming split estimator with a deterministic fixed-size
+/// workload for benchmarks.
+///
+/// The helper feeds `count` monotonically increasing `u64` keys, encoded as
+/// big-endian bytes, into the estimator. Using a fixed key sequence and a
+/// uniform `file_size` lets Criterion benches and allocation guards measure
+/// estimator behavior without depending on filesystem scans or repository
+/// traversal.
+///
+/// Returns the estimated split key decoded back into a `u64`, or `None` when
+/// the estimator cannot derive a split point for the observed sample set, such
+/// as when no items were observed.
+///
+/// `sample_cap` is forwarded directly to
+/// `split_estimator::StreamingSplitEstimator::new`, so benchmark callers can
+/// exercise the estimator under different sampling budgets.
 pub fn benchmark_streaming_split_estimator_observe_fixed_size(
     sample_cap: usize,
     count: usize,

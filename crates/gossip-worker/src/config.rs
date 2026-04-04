@@ -7,7 +7,8 @@
 //! - real distributed scans (`ExecutionMode::Connector`)
 //!
 //! Connector mode defaults to the real production backends and never silently
-//! falls back to a local or fake backend.
+//! falls back to a local or fake backend. Distributed launches support both
+//! filesystem shards and Git repo-frontier shards.
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -18,7 +19,9 @@ use std::sync::Arc;
 use gossip_contracts::identity::{PolicyHash, RunId, TenantId, TenantSecretKey, WorkerId};
 use gossip_coordination_etcd::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 use gossip_scanner_runtime::coordination_sink::CoordinationEventRecorder;
-use gossip_scanner_runtime::distributed::{DistributedRuntimeConfig, WorkerIdentity};
+use gossip_scanner_runtime::distributed::{
+    DistributedRuntimeConfig, GitWorkerIdentity, WorkerIdentity,
+};
 use gossip_scanner_runtime::{AnchorMode, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets};
 
 use crate::production::{ProductionStartupSettings, StartupSchemaMode};
@@ -32,6 +35,8 @@ pub const ENV_WORKER_BACKEND: &str = "GOSSIP_WORKER_BACKEND";
 pub const ENV_WORKER_SOURCE: &str = "GOSSIP_WORKER_SOURCE";
 /// Environment variable supplying the filesystem path or git repository path.
 pub const ENV_WORKER_PATH: &str = "GOSSIP_WORKER_PATH";
+/// Environment variable supplying the Git mirror-root directory for connector mode.
+pub const ENV_MIRROR_ROOT: &str = "GOSSIP_MIRROR_ROOT";
 /// Environment variable supplying the etcd endpoint CSV.
 pub const ENV_ETCD_ENDPOINTS: &str = "GOSSIP_ETCD_ENDPOINTS";
 /// Environment variable supplying the etcd namespace prefix.
@@ -419,6 +424,70 @@ pub enum WorkerSourceSettings {
     Git(GitSourceSettings),
 }
 
+/// Git source configuration for distributed worker mode.
+///
+/// The wrapped [`GitSourceSettings`] carries the scan template used to derive
+/// shard-local Git scan configs. `mirror_root` names the worker-local
+/// directory where connector-mode Git launches keep deterministic mirrors
+/// between lease cycles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDistributedSourceSettings {
+    git: GitSourceSettings,
+    mirror_root: PathBuf,
+}
+
+impl GitDistributedSourceSettings {
+    /// Bundle distributed Git scan settings with the required mirror root.
+    #[must_use]
+    pub fn new(git: GitSourceSettings, mirror_root: impl Into<PathBuf>) -> Self {
+        let mirror_root: PathBuf = mirror_root.into();
+        debug_assert!(
+            !mirror_root.as_os_str().is_empty(),
+            "mirror_root must not be empty"
+        );
+        Self { git, mirror_root }
+    }
+
+    /// Borrow the underlying Git scan settings.
+    #[inline]
+    #[must_use]
+    pub fn git(&self) -> &GitSourceSettings {
+        &self.git
+    }
+
+    /// Borrow the worker-local mirror root.
+    #[inline]
+    #[must_use]
+    pub fn mirror_root(&self) -> &Path {
+        &self.mirror_root
+    }
+
+    /// Convert the wrapped Git settings into a runtime scan template.
+    #[inline]
+    #[must_use]
+    pub fn to_scan_config(
+        &self,
+        execution_mode: ExecutionMode,
+        budgets: ScanBudgets,
+    ) -> GitScanConfig {
+        self.git.to_scan_config(execution_mode, budgets)
+    }
+}
+
+/// Typed source settings for distributed worker launches.
+///
+/// Filesystem and Git connector paths share the same real backend bundle but
+/// differ in their runtime requirements. Git launches require an explicit
+/// mirror-root so the worker can initialize local mirror management before it
+/// starts claiming repo-frontier shards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DistributedSourceSettings {
+    /// Filesystem connector mode.
+    Fs(FsSourceSettings),
+    /// Git repo-frontier connector mode.
+    Git(GitDistributedSourceSettings),
+}
+
 /// Typed local direct worker launch configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalWorkerConfig {
@@ -715,12 +784,17 @@ impl fmt::Debug for WorkerIdentityConfig {
 }
 
 /// Typed real-backend distributed worker launch configuration.
+///
+/// Filesystem and Git connector launches share the same backend bundle and
+/// runtime tuning, but Git carries one extra invariant: `mirror_root` must
+/// point to an existing local directory where worker-local mirrors can be
+/// managed safely.
 #[derive(Clone, Debug)]
 pub struct DistributedWorkerConfig {
     backends: ProductionBackendConfig,
     startup: ProductionStartupSettings,
     identity: WorkerIdentityConfig,
-    source: FsSourceSettings,
+    source: DistributedSourceSettings,
     runtime: DistributedWorkerRuntimeSettings,
 }
 
@@ -730,11 +804,17 @@ impl DistributedWorkerConfig {
     /// Enforces non-zero budget invariants and resource-exhaustion ceilings as
     /// defense-in-depth. The secret-key and zero-ID invariants are enforced by
     /// [`WorkerIdentityConfig::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerConfigError`] when the configured scan budgets or
+    /// commit queue capacity are invalid, or when a Git distributed source
+    /// points at a mirror root that is missing from the local host.
     pub fn new(
         backends: ProductionBackendConfig,
         startup: ProductionStartupSettings,
         identity: WorkerIdentityConfig,
-        source: FsSourceSettings,
+        source: DistributedSourceSettings,
         runtime: DistributedWorkerRuntimeSettings,
     ) -> Result<Self, WorkerConfigError> {
         validate_budgets(&runtime.budgets)?;
@@ -744,6 +824,9 @@ impl DistributedWorkerConfig {
                 runtime.commit_queue_capacity().get().to_string(),
                 format!("exceeds maximum of {MAX_COMMIT_QUEUE_CEILING}"),
             ));
+        }
+        if let DistributedSourceSettings::Git(source) = &source {
+            validate_path_exists("mirror_root", source.mirror_root())?;
         }
         Ok(Self {
             backends,
@@ -811,7 +894,7 @@ impl DistributedWorkerConfig {
 
     #[inline]
     #[must_use]
-    pub fn source(&self) -> &FsSourceSettings {
+    pub fn source(&self) -> &DistributedSourceSettings {
         &self.source
     }
 
@@ -821,29 +904,43 @@ impl DistributedWorkerConfig {
         self.runtime
     }
 
-    /// Build the runtime `WorkerIdentity` with the production telemetry
-    /// recorder.
+    /// Build the runtime launch bundle with the production telemetry recorder.
     #[must_use]
-    pub fn worker_identity(&self) -> WorkerIdentity {
-        self.worker_identity_with_recorder(Arc::new(ProductionCoordinationEventRecorder::default()))
+    pub fn worker_launch(&self) -> DistributedWorkerLaunch {
+        self.worker_launch_with_recorder(Arc::new(ProductionCoordinationEventRecorder::default()))
     }
 
-    /// Build the runtime `WorkerIdentity` using a caller-supplied recorder.
+    /// Build the runtime launch bundle using a caller-supplied recorder.
     #[must_use]
-    pub fn worker_identity_with_recorder(
+    pub fn worker_launch_with_recorder(
         &self,
         recorder: Arc<dyn CoordinationEventRecorder>,
-    ) -> WorkerIdentity {
-        WorkerIdentity::new(
-            self.identity.tenant(),
-            self.identity.run(),
-            self.identity.worker(),
-            self.identity.policy_hash(),
-            self.identity.tenant_secret_key(),
-            self.source
-                .to_scan_config(ExecutionMode::Connector, self.runtime.budgets()),
-            recorder,
-        )
+    ) -> DistributedWorkerLaunch {
+        match &self.source {
+            DistributedSourceSettings::Fs(source) => {
+                DistributedWorkerLaunch::Fs(WorkerIdentity::new(
+                    self.identity.tenant(),
+                    self.identity.run(),
+                    self.identity.worker(),
+                    self.identity.policy_hash(),
+                    self.identity.tenant_secret_key(),
+                    source.to_scan_config(ExecutionMode::Connector, self.runtime.budgets()),
+                    recorder,
+                ))
+            }
+            DistributedSourceSettings::Git(source) => DistributedWorkerLaunch::Git {
+                identity: GitWorkerIdentity::new(
+                    self.identity.tenant(),
+                    self.identity.run(),
+                    self.identity.worker(),
+                    self.identity.policy_hash(),
+                    self.identity.tenant_secret_key(),
+                    source.to_scan_config(ExecutionMode::Connector, self.runtime.budgets()),
+                    recorder,
+                ),
+                mirror_root: source.mirror_root().to_path_buf(),
+            },
+        }
     }
 
     /// Convert the parsed runtime settings into the runtime struct expected by the worker loop.
@@ -851,6 +948,41 @@ impl DistributedWorkerConfig {
     #[must_use]
     pub fn runtime_config(&self) -> DistributedRuntimeConfig {
         self.runtime.to_runtime_config()
+    }
+}
+
+/// Source-specific runtime launch bundle derived from [`DistributedWorkerConfig`].
+#[derive(Clone)]
+pub enum DistributedWorkerLaunch {
+    /// Filesystem distributed worker identity.
+    Fs(WorkerIdentity),
+    /// Git distributed worker identity plus the required mirror root.
+    Git {
+        identity: GitWorkerIdentity,
+        mirror_root: PathBuf,
+    },
+}
+
+impl fmt::Debug for DistributedWorkerLaunch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fs(identity) => f
+                .debug_struct("Fs")
+                .field("tenant", &identity.tenant)
+                .field("run", &identity.run)
+                .field("worker", &identity.worker)
+                .finish_non_exhaustive(),
+            Self::Git {
+                identity,
+                mirror_root,
+            } => f
+                .debug_struct("Git")
+                .field("tenant", &identity.tenant)
+                .field("run", &identity.run)
+                .field("worker", &identity.worker)
+                .field("mirror_root", &mirror_root)
+                .finish_non_exhaustive(),
+        }
     }
 }
 
@@ -964,6 +1096,7 @@ struct RawWorkerConfig {
     backend: Option<String>,
     source: Option<String>,
     path: Option<String>,
+    mirror_root: Option<String>,
     rules_file: Option<String>,
     decode_depth: Option<String>,
     scan_binary: Option<String>,
@@ -999,6 +1132,7 @@ impl fmt::Debug for RawWorkerConfig {
             .field("backend", &self.backend)
             .field("source", &self.source)
             .field("path", &self.path)
+            .field("mirror_root", &self.mirror_root)
             .field("rules_file", &self.rules_file)
             .field("decode_depth", &self.decode_depth)
             .field("scan_binary", &self.scan_binary)
@@ -1032,6 +1166,7 @@ impl RawWorkerConfig {
             backend: env.get(ENV_WORKER_BACKEND)?,
             source: env.get(ENV_WORKER_SOURCE)?,
             path: env.get(ENV_WORKER_PATH)?,
+            mirror_root: env.get(ENV_MIRROR_ROOT)?,
             rules_file: env.get(ENV_WORKER_RULES_FILE)?,
             decode_depth: env.get(ENV_WORKER_DECODE_DEPTH)?,
             scan_binary: env.get(ENV_WORKER_SCAN_BINARY)?,
@@ -1146,6 +1281,7 @@ impl RawWorkerConfig {
             "backend" => self.backend = Some(value.to_owned()),
             "source" => self.source = Some(value.to_owned()),
             "path" => self.path = Some(value.to_owned()),
+            "mirror-root" => self.mirror_root = Some(value.to_owned()),
             "rules-file" => self.rules_file = Some(value.to_owned()),
             "decode-depth" => self.decode_depth = Some(value.to_owned()),
             "scan-binary" => self.scan_binary = Some(value.to_owned()),
@@ -1273,7 +1409,7 @@ impl RawWorkerConfig {
 
         // Helper: build a direct local config.
         let make_local = || {
-            validate_path_exists(&path)?;
+            validate_path_exists("path", &path)?;
             LocalWorkerConfig::new(
                 build_local_source_settings(
                     source,
@@ -1309,13 +1445,6 @@ impl RawWorkerConfig {
                         message: "connector mode runs the distributed worker loop against the real production backends; switch to --mode=direct for local scans".to_owned(),
                     }),
                     BackendSelection::Production => {
-                        if source != WorkerSource::Fs {
-                            return Err(WorkerConfigError::UnsupportedCombination {
-                                message: "connector mode currently supports only source=fs; git connector mode is not supported (use --mode=direct for local git scans)"
-                                    .to_owned(),
-                            });
-                        }
-
                         let etcd_endpoints = parse_required(
                             self.etcd_endpoints_csv.as_deref(),
                             parse_nonempty_string_redacted,
@@ -1395,13 +1524,38 @@ impl RawWorkerConfig {
                             done_ledger_postgres_dsn,
                             findings_postgres_dsn,
                         )?;
-                        validate_path_exists(&path)?;
-                        let source = FsSourceSettings::new(path)
-                            .with_rules_file(rules_file)
-                            .with_decode_depth(decode_depth)
-                            .with_scan_binary(scan_binary)
-                            .with_skip_archives(skip_archives)
-                            .with_anchor_mode(anchor_mode);
+                        let source = match source {
+                            WorkerSource::Fs => {
+                                validate_path_exists("path", &path)?;
+                                DistributedSourceSettings::Fs(
+                                    FsSourceSettings::new(path)
+                                        .with_rules_file(rules_file)
+                                        .with_decode_depth(decode_depth)
+                                        .with_scan_binary(scan_binary)
+                                        .with_skip_archives(skip_archives)
+                                        .with_anchor_mode(anchor_mode),
+                                )
+                            }
+                            WorkerSource::Git => {
+                                let mirror_root = parse_required(
+                                    self.mirror_root.as_deref(),
+                                    parse_nonempty_string,
+                                    "mirror_root",
+                                    "--mirror-root",
+                                    ENV_MIRROR_ROOT,
+                                )?;
+                                let mirror_root = PathBuf::from(mirror_root);
+                                validate_directory_exists("mirror_root", &mirror_root)?;
+                                DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
+                                    GitSourceSettings::new(path)
+                                        .with_rules_file(rules_file)
+                                        .with_decode_depth(decode_depth)
+                                        .with_scan_binary(scan_binary)
+                                        .with_anchor_mode(anchor_mode),
+                                    mirror_root,
+                                ))
+                            }
+                        };
                         let commit_queue_capacity = parse_optional(
                             self.commit_queue_capacity.as_deref(),
                             "commit_queue_capacity",
@@ -1466,6 +1620,7 @@ fn usage() -> &'static str {
      [--tenant-id=HEX32] [--run-id=U64] [--worker-id=U64] [--policy-hash=HEX32] \\
      [--tenant-secret-key=HEX32] [--etcd-endpoints=CSV] [--etcd-namespace=PREFIX] \\
      [--done-ledger-postgres-dsn=DSN] [--findings-postgres-dsn=DSN] \\
+     [--mirror-root=PATH] \\
      [--startup-schema-mode=validate|dev-auto-migrate] \\
      [--rules-file=PATH] [--decode-depth=N] [--scan-binary=true|false] \\
      [--skip-archives=true|false] [--anchor-mode=manual|derived] \\
@@ -1485,20 +1640,42 @@ fn default_backend_for_mode(execution_mode: ExecutionMode) -> Option<BackendSele
 /// Fail-fast check that a scan path exists on the local host. Called during
 /// config resolution so the worker surfaces a clear error at startup rather
 /// than deep inside the scan loop.
-fn validate_path_exists(path: &Path) -> Result<(), WorkerConfigError> {
+fn validate_path_exists(field: &'static str, path: &Path) -> Result<(), WorkerConfigError> {
     match path.try_exists() {
         Ok(false) => Err(WorkerConfigError::invalid_value(
-            "path",
+            field,
             path.display().to_string(),
             "path does not exist",
         )),
         Err(io_err) => Err(WorkerConfigError::invalid_value(
-            "path",
+            field,
             path.display().to_string(),
             format!("cannot verify path existence: {io_err}"),
         )),
         Ok(true) => Ok(()),
     }
+}
+
+/// Fail-fast check that a path exists **and** is a directory. Used for paths
+/// that will be used as parent directories (e.g., mirror roots where repo
+/// subdirectories are created at runtime).
+fn validate_directory_exists(field: &'static str, path: &Path) -> Result<(), WorkerConfigError> {
+    validate_path_exists(field, path)?;
+    let metadata = std::fs::metadata(path).map_err(|io_err| {
+        WorkerConfigError::invalid_value(
+            field,
+            path.display().to_string(),
+            format!("cannot inspect path kind: {io_err}"),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(WorkerConfigError::invalid_value(
+            field,
+            path.display().to_string(),
+            "path exists but is not a directory",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_budgets(budgets: &ScanBudgets) -> Result<(), WorkerConfigError> {
@@ -1892,9 +2069,12 @@ mod tests {
                 assert_eq!(cfg.runtime().budgets().max_items, 1024);
                 assert_eq!(cfg.runtime().budgets().max_bytes, 2_097_152);
                 assert_eq!(cfg.runtime().commit_queue_capacity().get(), 128);
-                assert_eq!(cfg.source().path(), Path::new("/tmp"));
-                assert!(cfg.source().scan_binary());
-                assert_eq!(cfg.source().anchor_mode(), AnchorMode::Derived);
+                let DistributedSourceSettings::Fs(source) = cfg.source() else {
+                    panic!("expected Fs source");
+                };
+                assert_eq!(source.path(), Path::new("/tmp"));
+                assert!(source.scan_binary());
+                assert_eq!(source.anchor_mode(), AnchorMode::Derived);
                 assert_eq!(
                     cfg.production_backends().etcd().namespace_prefix(),
                     "/gossip/v1"
@@ -1928,7 +2108,10 @@ mod tests {
         match resolved {
             ResolvedWorkerConfig::Distributed(cfg) => {
                 assert_eq!(cfg.run(), RunId::from_raw(99));
-                assert_eq!(cfg.source().path(), Path::new("/tmp"));
+                let DistributedSourceSettings::Fs(source) = cfg.source() else {
+                    panic!("expected Fs source");
+                };
+                assert_eq!(source.path(), Path::new("/tmp"));
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
@@ -2043,17 +2226,84 @@ mod tests {
     }
 
     #[test]
-    fn connector_mode_rejects_git_source_for_local_git_scans() {
+    fn connector_git_source_requires_mirror_root() {
         let env = production_env().with(ENV_WORKER_SOURCE, "git");
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("connector mode must reject git");
+            .expect_err("git connector mode without mirror_root must fail");
 
-        assert!(matches!(
-            err,
-            WorkerConfigError::UnsupportedCombination { ref message }
-                if message.contains("source=fs")
-                    && message.contains("--mode=direct")
-        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("mirror_root"),
+            "error must mention the missing mirror_root field: {message}"
+        );
+    }
+
+    #[test]
+    fn connector_git_source_resolves_with_mirror_root() {
+        let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
+        let env = production_env().with(ENV_WORKER_SOURCE, "git").with(
+            ENV_MIRROR_ROOT,
+            mirror_dir.path().to_str().expect("utf-8 path"),
+        );
+
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("git connector mode with mirror_root should resolve");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        let DistributedSourceSettings::Git(git) = cfg.source() else {
+            panic!("expected Git source");
+        };
+        assert_eq!(git.mirror_root(), mirror_dir.path());
+    }
+
+    #[test]
+    fn connector_git_source_worker_launch_produces_git_variant() {
+        let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
+        let env = production_env().with(ENV_WORKER_SOURCE, "git").with(
+            ENV_MIRROR_ROOT,
+            mirror_dir.path().to_str().expect("utf-8 path"),
+        );
+
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("git connector should resolve");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        let launch = cfg.worker_launch();
+        let DistributedWorkerLaunch::Git {
+            identity,
+            mirror_root,
+        } = launch
+        else {
+            panic!("expected Git launch, got {launch:?}");
+        };
+        assert_eq!(identity.tenant, cfg.tenant());
+        assert_eq!(identity.run, cfg.run());
+        assert_eq!(identity.worker, cfg.worker());
+        assert_eq!(mirror_root, mirror_dir.path());
+    }
+
+    #[test]
+    fn connector_git_source_rejects_nonexistent_mirror_root() {
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_MIRROR_ROOT, "/no/such/mirror/root/directory");
+
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("nonexistent mirror_root must be rejected");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("mirror_root"),
+            "error must name the mirror_root field: {message}"
+        );
+        assert!(
+            message.contains("does not exist"),
+            "error must explain the path does not exist: {message}"
+        );
     }
 
     #[test]
@@ -2125,7 +2375,9 @@ mod tests {
         let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
             panic!("expected distributed config");
         };
-        let identity = cfg.worker_identity();
+        let DistributedWorkerLaunch::Fs(identity) = cfg.worker_launch() else {
+            panic!("expected Fs launch");
+        };
         assert_eq!(identity.tenant, cfg.tenant());
         assert_eq!(identity.run, cfg.run());
         assert_eq!(identity.worker, cfg.worker());
@@ -2147,11 +2399,13 @@ mod tests {
         let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
             panic!("expected distributed config");
         };
-        let identity = cfg.worker_identity();
+        let DistributedWorkerLaunch::Fs(identity) = cfg.worker_launch() else {
+            panic!("expected Fs launch");
+        };
         let debug = format!("{:?}", identity.recorder);
         assert!(
             debug.contains("ProductionCoordinationEventRecorder"),
-            "default worker_identity() must wire the production recorder: {debug}"
+            "default worker_launch() must wire the production recorder: {debug}"
         );
     }
 
@@ -3142,19 +3396,19 @@ mod tests {
         );
     }
 
-    // --- Git source rejection via CLI positional arg ---
+    // --- Git source via CLI positional requires mirror_root ---
 
     #[test]
-    fn connector_mode_rejects_git_source_via_cli_positional() {
+    fn connector_git_source_via_cli_requires_mirror_root() {
         let env = production_env();
         let err = resolve_worker_config_from(["git", "/tmp"], &env)
-            .expect_err("connector mode must reject git via positional arg");
-        assert!(matches!(
-            err,
-            WorkerConfigError::UnsupportedCombination { ref message }
-                if message.contains("source=fs")
-                    && message.contains("--mode=direct")
-        ));
+            .expect_err("git connector via CLI positional without mirror_root must fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("mirror_root"),
+            "error must mention the missing mirror_root field: {message}"
+        );
     }
 
     // --- Direct WorkerIdentityConfig construction validation ---
@@ -3211,7 +3465,7 @@ mod tests {
             backends,
             ProductionStartupSettings::validate_only(),
             identity,
-            FsSourceSettings::new("/tmp"),
+            DistributedSourceSettings::Fs(FsSourceSettings::new("/tmp")),
             runtime,
         );
         assert!(

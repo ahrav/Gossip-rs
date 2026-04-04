@@ -126,14 +126,15 @@ enum IndexState {
 ///   `key` in byte-lexicographic order, and never mutated again.
 /// - `repo` is validated once during indexing; a missing or non-directory
 ///   path latches a permanent failure.
-/// - When `emit_tokens` is true, cursors carry an 8-byte big-endian
-///   absolute index that enables O(1) resume. Token validity is always
-///   cross-checked against the last emitted key.
+/// - `emit_tokens` controls the advertised `token_resume` capability. Cursor
+///   resume is currently still `last_key`-authoritative over the frozen
+///   in-memory snapshot.
 pub struct GitConnector {
     /// Absolute path to the repository root (working directory).
     repo: PathBuf,
-    /// Whether pagination cursors include positional tokens for O(1)
-    /// resume. Defaults to `true`; set to `false` for key-only cursors.
+    /// Whether [`caps`](Self::caps) advertises `token_resume`. Defaults to
+    /// `true`; the current implementation still resumes from `Cursor::last_key`
+    /// in either mode.
     emit_tokens: bool,
     /// Optional upper bound on tracked files. When set, `ensure_indexed`
     /// rejects repositories that exceed this limit with a permanent error.
@@ -146,6 +147,14 @@ pub struct GitConnector {
 
 impl GitConnector {
     /// Create a connector rooted at `repo`.
+    ///
+    /// The connector does not touch the filesystem until the first
+    /// enumeration or read operation, so construction is cheap and does not
+    /// validate that `repo` exists yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `repo` resolves to an empty path.
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         let repo = repo.into();
         assert!(
@@ -161,7 +170,11 @@ impl GitConnector {
         }
     }
 
-    /// Enable or disable pagination token emission/consumption.
+    /// Enable or disable advertising opaque token resume support.
+    ///
+    /// This toggles only the `token_resume` flag returned by
+    /// [`caps`](Self::caps). GitConnector resume remains `last_key`-based over
+    /// the indexed snapshot regardless of this setting.
     #[must_use]
     pub fn with_tokens(mut self, enabled: bool) -> Self {
         self.emit_tokens = enabled;
@@ -169,7 +182,11 @@ impl GitConnector {
     }
 
     /// Set an upper bound on tracked files. Repositories exceeding this
-    /// limit will fail indexing with a permanent error.
+    /// limit fail indexing with a permanent error.
+    ///
+    /// The limit is enforced during the first lazy indexing pass, before any
+    /// per-file metadata walk. This is primarily a guardrail for callers that
+    /// need predictable memory use from the in-memory snapshot.
     #[must_use]
     pub fn with_max_tracked_files(mut self, limit: usize) -> Self {
         self.max_tracked_files = Some(limit);
@@ -387,6 +404,9 @@ impl GitConnector {
 
 impl GitConnector {
     /// Advertise connector capabilities used by orchestration planning.
+    ///
+    /// The returned capabilities are static for the connector instance except
+    /// for `token_resume`, which reflects the `with_tokens` configuration.
     pub fn caps(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             seek_by_key: true,
@@ -397,6 +417,19 @@ impl GitConnector {
     }
 
     /// Split-point hint for dynamic shard subdivision.
+    ///
+    /// This resolves the shard's optional key bounds, ensures the repository
+    /// snapshot has been indexed, and then chooses a byte-weighted midpoint
+    /// from the remaining suffix after applying the cursor.
+    ///
+    /// Returns `Ok(None)` when the bounded range contains fewer than two
+    /// remaining keys or when the estimator cannot produce a valid interior
+    /// split point.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shard bounds are malformed, indexing fails, or the
+    /// estimator rejects the provided range.
     pub fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
@@ -409,6 +442,16 @@ impl GitConnector {
     }
 
     /// Open an item for sequential read access.
+    ///
+    /// The item ref must correspond to an entry in the frozen index snapshot.
+    /// The path is revalidated against the canonical repository root before the
+    /// file is opened so that post-index symlink swaps fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a permanent error when `item_ref` is unknown or resolves
+    /// outside the repository boundary. Filesystem open and revalidation
+    /// failures are classified via the common read-error mapper.
     pub fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -420,7 +463,17 @@ impl GitConnector {
         Ok(Box::new(file))
     }
 
-    /// Range-read fast path.
+    /// Read up to `dst.len()` bytes starting at `offset`.
+    ///
+    /// The actual read length is additionally capped by
+    /// `budgets.max_bytes()`. Short reads are possible at EOF and are reported
+    /// with the returned byte count.
+    ///
+    /// # Errors
+    ///
+    /// Returns a permanent error if `offset + dst.len()` overflows `u64` or if
+    /// `item_ref` is not present in the index. Open, seek, and read failures
+    /// are classified through the connector's read-error helpers.
     pub fn read_range(
         &mut self,
         item_ref: &ItemRef,

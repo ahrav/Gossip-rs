@@ -40,10 +40,13 @@ use std::num::NonZeroU64;
 
 use gossip_contracts::{
     connector::Cursor,
+    connector::VersionId,
     connector::git::RepoKey,
+    identity::{LogicalTime, ObjectVersionId, StableItemId},
     persistence::{
-        CommitScope, DoneLedgerCommitReceipt, FindingsCommitReceipt, PageCommit,
-        PageCommitValidationError, WriteContext,
+        CommitScope, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerProvenance,
+        DoneLedgerRecord, DoneLedgerStatus, FindingsCommitReceipt, OvidHashInputs, PageCommit,
+        PageCommitValidationError, PersistenceInputError, WriteContext, derive_ovid_hash,
     },
 };
 use scanner_git::{
@@ -132,6 +135,9 @@ pub enum GitRepoDurabilityError {
     /// The durable repo receipt did not match the repo-frontier checkpoint input kind.
     #[error("repo-frontier checkpoint input kind mismatch: {0}")]
     KindMismatch(#[source] KindMismatchError),
+    /// The done-ledger record failed construction or validation.
+    #[error("git repo done-ledger record invalid: {0}")]
+    InvalidDoneLedgerRecord(#[source] PersistenceInputError),
 }
 
 /// Runtime adapter that satisfies all four `scanner-git` persistence traits
@@ -195,10 +201,10 @@ impl<B> GitPersistenceAdapter<B> {
     /// Build the repo-frontier durable receipt for one already-committed finalize.
     ///
     /// Synthesizes the `CompletedUnit`, `CommitScope`, and `PageCommit`
-    /// chain that the runtime checkpoint path expects. The receipt records
-    /// zero findings (Git repos emit findings via the event sink, not via
-    /// the commit receipt) and exactly one done-ledger entry (the repo
-    /// itself).
+    /// chain that the runtime checkpoint path expects. The caller provides
+    /// the actual `FindingsCommitReceipt` and `DoneLedgerCommitReceipt`
+    /// from the persistence layer so the receipt accurately reflects
+    /// durable findings and done-ledger state.
     ///
     /// Complete finalizes yield a receipt. Partial finalizes return `None`
     /// because their watermark state is intentionally non-authoritative.
@@ -208,6 +214,8 @@ impl<B> GitPersistenceAdapter<B> {
         sequence_no: u64,
         repo_key: &RepoKey,
         outcome: FinalizeOutcome,
+        findings_receipt: FindingsCommitReceipt,
+        done_ledger_receipt: DoneLedgerCommitReceipt,
     ) -> Result<Option<UnitCommitReceipt>, GitRepoDurabilityError> {
         if !matches!(outcome, FinalizeOutcome::Complete) {
             return Ok(None);
@@ -223,8 +231,8 @@ impl<B> GitPersistenceAdapter<B> {
             completed_unit.checkpoint_boundary().clone(),
         );
         let durable = PageCommit::new(scope)
-            .record_findings(FindingsCommitReceipt::new(0, 0, 0))
-            .record_done_ledger(DoneLedgerCommitReceipt::new(1, 1, 0))
+            .record_findings(findings_receipt)
+            .record_done_ledger(done_ledger_receipt)
             .map_err(GitRepoDurabilityError::InvalidItemReceipt)?
             .into_item_commit_receipt();
 
@@ -246,9 +254,17 @@ impl<B> GitPersistenceAdapter<B> {
         sequence_no: u64,
         repo_key: &RepoKey,
         outcome: FinalizeOutcome,
+        findings_receipt: FindingsCommitReceipt,
+        done_ledger_receipt: DoneLedgerCommitReceipt,
     ) -> Result<Option<CheckpointAggregatorInput>, GitRepoDurabilityError> {
-        let Some(receipt) =
-            self.repo_frontier_receipt(write_context, sequence_no, repo_key, outcome)?
+        let Some(receipt) = self.repo_frontier_receipt(
+            write_context,
+            sequence_no,
+            repo_key,
+            outcome,
+            findings_receipt,
+            done_ledger_receipt,
+        )?
         else {
             return Ok(None);
         };
@@ -778,6 +794,76 @@ where
     }
 }
 
+/// Build a done-ledger record for one completed Git repo-frontier scan.
+///
+/// Git repos have no object-version concept at the done-ledger level -- the
+/// repo itself is the scanned unit. A fixed zero version produces one
+/// done-ledger entry per (tenant, policy, repo_id) triple.
+///
+/// # OvidHash derivation
+///
+/// Git repo done-ledger entries use a fixed zero `ObjectVersionId` because
+/// repo-frontier shards track mutable refs, not immutable content versions.
+/// The 32-byte `StableItemId` is zero-padded from the u64 `repo_id` per the
+/// fixed-width contract. Domain separation from filesystem `StableItemId`s is
+/// guaranteed by `repo_id` being derived from `TenantId` + normalized path
+/// via `domain_hasher`.
+///
+/// # Provenance timestamps
+///
+/// `claim_time` should be the wall-clock `LogicalTime` captured when the
+/// lease was acquired. `complete_time` should be the wall-clock `LogicalTime`
+/// captured after `execute_repo` returns. Together they bracket the scan
+/// duration for provenance ordering.
+pub(crate) fn build_git_repo_done_ledger_record(
+    write_context: WriteContext,
+    repo_id: u64,
+    bytes_scanned: u64,
+    findings_count: u32,
+    claim_time: LogicalTime,
+    complete_time: LogicalTime,
+) -> Result<DoneLedgerRecord, GitRepoDurabilityError> {
+    // Reject reversed provenance timestamps early. DoneLedgerProvenance::new
+    // only debug_asserts this, and DoneLedgerBackend::apply validates it at
+    // persistence time. Catching it here surfaces the error before any
+    // done-ledger write is attempted.
+    if claim_time.as_raw() > complete_time.as_raw() {
+        return Err(GitRepoDurabilityError::InvalidDoneLedgerRecord(
+            PersistenceInputError::ProvenanceOrdering {
+                started_at: claim_time.as_raw(),
+                finished_at: complete_time.as_raw(),
+            },
+        ));
+    }
+
+    // See "OvidHash derivation" in the doc comment above.
+    let ovid = {
+        let mut buf = [0u8; 32];
+        buf[..8].copy_from_slice(&repo_id.to_le_bytes());
+        let stable_item = StableItemId::from_bytes(buf);
+        let version = VersionId::Strong(ObjectVersionId::from_bytes([0u8; 32]));
+        derive_ovid_hash(&OvidHashInputs {
+            stable_item_id: stable_item,
+            version,
+        })
+    };
+    let key = DoneLedgerKey::new(write_context.tenant_id(), write_context.policy_hash(), ovid);
+    let status = if findings_count > 0 {
+        DoneLedgerStatus::ScannedWithFindings
+    } else {
+        DoneLedgerStatus::ScannedClean
+    };
+    let provenance =
+        DoneLedgerProvenance::from_write_context(write_context, claim_time, complete_time);
+    let record =
+        DoneLedgerRecord::try_new(key, status, bytes_scanned, findings_count, provenance, None)
+            .map_err(GitRepoDurabilityError::InvalidDoneLedgerRecord)?;
+    record
+        .validate()
+        .map_err(GitRepoDurabilityError::InvalidDoneLedgerRecord)?;
+    Ok(record)
+}
+
 /// In-memory [`GitPersistenceBackend`] for integration and unit tests.
 ///
 /// Provides a `BTreeMap`-backed KV store with fault injection hooks
@@ -1156,6 +1242,8 @@ mod tests {
                     0,
                     &repo_key(),
                     FinalizeOutcome::Partial { skipped_count: 1 },
+                    FindingsCommitReceipt::new(0, 0, 0),
+                    DoneLedgerCommitReceipt::new(1, 1, 0),
                 )
                 .expect("checkpoint input")
                 .is_none(),
@@ -1283,7 +1371,14 @@ mod tests {
         let adapter = GitPersistenceAdapter::new(backend, 11, [0xB0; 32]);
 
         let receipt = adapter
-            .repo_frontier_receipt(write_context(), 7, &repo_key(), FinalizeOutcome::Complete)
+            .repo_frontier_receipt(
+                write_context(),
+                7,
+                &repo_key(),
+                FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
             .expect("receipt")
             .expect("complete finalize yields receipt");
         assert_eq!(receipt.completed_unit().sequence_no(), 7);
@@ -1301,6 +1396,8 @@ mod tests {
                 7,
                 &repo_key(),
                 FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
             )
             .expect("checkpoint input")
             .expect("complete finalize yields checkpoint input");
@@ -1319,10 +1416,24 @@ mod tests {
         let adapter = GitPersistenceAdapter::new(backend, 12, [0xC0; 32]);
 
         let first = adapter
-            .repo_frontier_receipt(write_context(), 3, &repo_key(), FinalizeOutcome::Complete)
+            .repo_frontier_receipt(
+                write_context(),
+                3,
+                &repo_key(),
+                FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
             .expect("first receipt");
         let second = adapter
-            .repo_frontier_receipt(write_context(), 3, &repo_key(), FinalizeOutcome::Complete)
+            .repo_frontier_receipt(
+                write_context(),
+                3,
+                &repo_key(),
+                FinalizeOutcome::Complete,
+                FindingsCommitReceipt::new(0, 0, 0),
+                DoneLedgerCommitReceipt::new(1, 1, 0),
+            )
             .expect("second receipt");
 
         assert_eq!(first, second);
@@ -1668,6 +1779,77 @@ mod tests {
         assert!(
             source_msg.contains("returned") && source_msg.contains("results for"),
             "expected inner source to mention count mismatch, got: {source_msg}"
+        );
+    }
+
+    // ---- build_git_repo_done_ledger_record tests ----
+
+    #[test]
+    fn build_git_repo_done_ledger_record_scanned_clean() {
+        let wc = write_context();
+        let record = build_git_repo_done_ledger_record(
+            wc,
+            42,
+            1024,
+            0,
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        )
+        .expect("should build a valid record");
+
+        assert_eq!(record.status(), DoneLedgerStatus::ScannedClean);
+        assert_eq!(record.findings_count(), 0);
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_scanned_with_findings() {
+        let wc = write_context();
+        let record = build_git_repo_done_ledger_record(
+            wc,
+            42,
+            2048,
+            5,
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        )
+        .expect("should build a valid record");
+
+        assert_eq!(record.status(), DoneLedgerStatus::ScannedWithFindings);
+        assert_eq!(record.findings_count(), 5);
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_different_repo_ids_produce_different_ovid() {
+        let claim = LogicalTime::from_raw(100);
+        let complete = LogicalTime::from_raw(200);
+
+        let record_a = build_git_repo_done_ledger_record(write_context(), 1, 0, 0, claim, complete)
+            .expect("record a");
+        let record_b = build_git_repo_done_ledger_record(write_context(), 2, 0, 0, claim, complete)
+            .expect("record b");
+
+        assert_ne!(
+            record_a.key(),
+            record_b.key(),
+            "distinct repo_ids must produce distinct done-ledger keys"
+        );
+    }
+
+    #[test]
+    fn build_git_repo_done_ledger_record_is_deterministic() {
+        let claim = LogicalTime::from_raw(300);
+        let complete = LogicalTime::from_raw(400);
+
+        let record_1 =
+            build_git_repo_done_ledger_record(write_context(), 99, 512, 3, claim, complete)
+                .expect("first call");
+        let record_2 =
+            build_git_repo_done_ledger_record(write_context(), 99, 512, 3, claim, complete)
+                .expect("second call");
+
+        assert_eq!(
+            record_1, record_2,
+            "identical inputs must produce identical records"
         );
     }
 }

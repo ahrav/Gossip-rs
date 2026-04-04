@@ -1,4 +1,16 @@
-//! Filesystem connector behavior and regression tests.
+//! Regression coverage for the filesystem connector's ordered-content contract.
+//!
+//! The tests in this module exercise the same invariants production callers rely on:
+//! enumeration must remain lexicographically ordered, resume must honor `last_key`
+//! even when persisted tokens are stale, stable IDs must be rooted in the canonical
+//! connector instance, and path handling must not allow callers to escape the
+//! configured root. The fixtures intentionally mix directory roots and single-file
+//! roots because the connector supports both modes with different identity checks.
+//!
+//! The helpers below keep the individual tests focused on behavior instead of setup,
+//! but they also encode the contract being asserted. In particular, `fill_page` is
+//! always driven with explicit budgets so pagination, byte limits, and deadline
+//! handling stay visible in the test inputs.
 
 use std::{
     io::{self, Read as _},
@@ -37,10 +49,15 @@ fn create_test_dir(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     dir
 }
 
+/// Returns a shard that does not further restrict the connector's key space.
 fn unbounded_shard() -> ShardSpec {
     ShardSpec::unbounded()
 }
 
+/// Runs `fill_page` with explicit item and byte limits and unwraps the resulting page.
+///
+/// The helper keeps tests centered on ordering and pagination semantics while still
+/// making the chosen budgets part of the assertion setup.
 fn fill_page_with_limits(
     connector: &mut FilesystemConnector,
     shard: &ShardSpec,
@@ -58,6 +75,10 @@ fn fill_page_with_limits(
         .expect("page should be present")
 }
 
+/// Recomputes the stable ID a filesystem item should advertise for a given root.
+///
+/// The expected connector instance hash is derived from the canonicalized root path
+/// so equivalent roots resolve to the same identity bytes.
 fn expected_stable_item_id(
     root: &Path,
     rel_path: &[u8],
@@ -68,6 +89,7 @@ fn expected_stable_item_id(
     ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, connector_instance, rel_path).stable_id()
 }
 
+/// Extracts the ordered item keys from a conformance run for direct assertions.
 fn drain_keys(run: &gossip_contracts::connector::conformance::OrderedContentDrain) -> Vec<Vec<u8>> {
     run.items()
         .iter()

@@ -20,7 +20,7 @@ The package owns only:
 
 Neither the binary nor the library implements a scan loop. Local scans
 delegate to `gossip-scanner-runtime::{scan_fs, scan_git}`, and distributed
-execution delegates to `gossip-scanner-runtime::distributed::run_worker`
+execution delegates to `gossip-scanner-runtime::distributed::{run_worker, run_git_repo_worker}`
 through the production composition root.
 
 ---
@@ -108,9 +108,9 @@ in one call:
 caller
   -> ProductionBackendConfig::new(...)
   -> ProductionStartupSettings::{validate_only, dev_auto_migrate}()
-  -> DistributedWorkerConfig::worker_identity() | worker_identity_with_recorder()
+  -> DistributedWorkerConfig::worker_launch() | worker_launch_with_recorder()
   -> DistributedWorkerConfig::runtime_config()
-  -> run_production_worker(config, startup, identity, runtime)
+  -> run_production_worker(config, startup, launch, runtime)
      -> build_production_backends(config, startup)
         -> connect_postgres_client(...) [done-ledger]
         -> connect_postgres_client(...) [findings]
@@ -118,7 +118,9 @@ caller
            -> EtcdCoordinator::connect(...) [includes cluster health check]
            -> prepare_done_ledger_backend(...)
            -> prepare_findings_backend(...)
-     -> distributed::run_worker(...)
+     -> match launch:
+        Fs  -> distributed::run_worker(...)
+        Git -> LocalMirrorManager::new(...) + distributed::run_git_repo_worker(...)
   -> DistributedRunReport
 ```
 
@@ -181,8 +183,9 @@ override environment values when both are present.
 |----------|--------|---------|----------|-------------|
 | `GOSSIP_WORKER_MODE` | `direct` or `connector` | `connector` | No | Selects the execution mode family. |
 | `GOSSIP_WORKER_BACKEND` | `local` or `production` | `production` in connector mode | No | Optional backend override. Connector mode defaults to `production`; `local` is only valid with `--mode=direct`. |
-| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Connector mode supports only `fs`; use direct mode for local git scans. |
+| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Both `fs` and `git` are supported in connector mode. |
 | `GOSSIP_WORKER_PATH` | filesystem path | `.` | No | Filesystem or git repository path to scan. |
+| `GOSSIP_MIRROR_ROOT` | filesystem path | *(none)* | Yes (git connector) | Worker-local directory for deterministic Git mirrors between lease cycles. Required when `source=git` in connector mode. |
 | `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs | *(none)* | Yes (production) | etcd endpoint CSV for the coordination backend. |
 | `GOSSIP_ETCD_NAMESPACE` | string | *(none)* | Yes (production) | etcd namespace prefix for key isolation. |
 | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the done-ledger database. |
@@ -215,6 +218,7 @@ All flags use `--name=value` syntax (equals-sign required; space-separated
 | `--backend` | `GOSSIP_WORKER_BACKEND` | `local`, `production` |
 | `--source` | `GOSSIP_WORKER_SOURCE` | `fs`, `git` |
 | `--path` | `GOSSIP_WORKER_PATH` | filesystem path |
+| `--mirror-root` | `GOSSIP_MIRROR_ROOT` | filesystem path |
 | `--etcd-endpoints` | `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs |
 | `--etcd-namespace` | `GOSSIP_ETCD_NAMESPACE` | string |
 | `--done-ledger-postgres-dsn` | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN |
@@ -310,7 +314,7 @@ struct DistributedWorkerConfig {
     backends: ProductionBackendConfig,
     startup: ProductionStartupSettings,
     identity: WorkerIdentityConfig,
-    source: FsSourceSettings,
+    source: DistributedSourceSettings,
     runtime: DistributedWorkerRuntimeSettings,
 }
 ```
@@ -320,7 +324,55 @@ worker, policy hash, secret key) are grouped in `WorkerIdentityConfig` and
 accessible through the `identity()` accessor or individual delegation methods
 (`tenant()`, `run()`, etc.). The `startup()` accessor exposes the schema
 readiness policy for the production bootstrap path. Backend is always
-`Production` by construction.
+`Production` by construction. The `worker_launch()` method builds the
+source-specific runtime launch bundle (`DistributedWorkerLaunch`).
+
+### DistributedSourceSettings
+
+```rust
+enum DistributedSourceSettings {
+    Fs(FsSourceSettings),
+    Git(GitDistributedSourceSettings),
+}
+```
+
+Source-family settings for distributed connector-mode launches. Filesystem
+and Git connector paths share the same real backend bundle but differ in
+their runtime requirements. Git launches require an explicit mirror-root
+so the worker can initialize local mirror management before claiming
+repo-frontier shards.
+
+### GitDistributedSourceSettings
+
+```rust
+struct GitDistributedSourceSettings {
+    git: GitSourceSettings,
+    mirror_root: PathBuf,
+}
+```
+
+Bundles distributed Git scan settings with the required worker-local mirror
+root directory. The wrapped `GitSourceSettings` carries the scan template
+used to derive shard-local Git scan configs. `mirror_root` names the
+directory where connector-mode Git launches keep deterministic mirrors
+between lease cycles.
+
+### DistributedWorkerLaunch
+
+```rust
+enum DistributedWorkerLaunch {
+    Fs(WorkerIdentity),
+    Git {
+        identity: GitWorkerIdentity,
+        mirror_root: PathBuf,
+    },
+}
+```
+
+Source-specific runtime launch bundle derived from `DistributedWorkerConfig`.
+The `Fs` variant carries a standard `WorkerIdentity`; the `Git` variant
+carries a `GitWorkerIdentity` plus the mirror root needed by the local
+mirror manager.
 
 ### StartupSchemaMode
 
@@ -488,7 +540,10 @@ The config module checks:
 - rejection of `--backend=local` in connector mode
 - direct-mode fallback to local execution without backend selection
 - missing required production identity fields
-- rejection of `source=git` for real distributed launches
+- resolution of `source=git` in connector mode with a valid `mirror_root`
+- rejection of missing `mirror_root` for git connector launches
+- rejection of a nonexistent `mirror_root` path
+- git connector `worker_launch()` produces the `Git` variant
 - secret-key redaction in error and debug output
 - hex parsing, prefix handling, length checks, and non-hex rejection
 - construction of a valid runtime `WorkerIdentity`

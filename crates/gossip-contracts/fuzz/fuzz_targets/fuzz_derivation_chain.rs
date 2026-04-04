@@ -1,3 +1,12 @@
+//! Fuzzes the identity derivation pipeline end to end.
+//!
+//! This harness feeds a single fuzz input through the tenant secret, item
+//! identity, finding identity, and occurrence identity derivation steps so
+//! libFuzzer can mutate the full chain as one corpus entry.
+//!
+//! The primary invariant is determinism: re-deriving a finding or occurrence
+//! identifier from identical inputs must always yield the same value.
+
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
@@ -8,19 +17,19 @@ use gossip_contracts::identity::{
 };
 
 fuzz_target!(|data: &[u8]| {
-    // Need at least 160 bytes to fill the full derivation chain inputs.
+    // The fixed-width portions of the derivation chain require 160 bytes.
     if data.len() < 160 {
         return;
     }
 
-    // Slice the input into fields.
     let tenant_key_bytes: [u8; 32] = data[0..32].try_into().unwrap();
     let norm_bytes: [u8; 32] = data[32..64].try_into().unwrap();
     let tenant_bytes: [u8; 32] = data[64..96].try_into().unwrap();
     let rule_bytes: [u8; 32] = data[96..128].try_into().unwrap();
     let instance_id_bytes = &data[128..160];
 
-    // Use remaining bytes as item path (or a fallback).
+    // Keep the path variable-width so one input can perturb both the fixed
+    // hashes and the item identity payload that feeds later derivation steps.
     let path = if data.len() > 160 {
         data[160..].to_vec()
     } else {
@@ -46,7 +55,7 @@ fuzz_target!(|data: &[u8]| {
         secret,
     };
 
-    // Derive twice and assert determinism.
+    // Re-run the same derivation to prove the identifier remains stable.
     let finding_1 = derive_finding_id(&finding_inputs);
     let finding_2 = derive_finding_id(&finding_inputs);
     assert_eq!(
