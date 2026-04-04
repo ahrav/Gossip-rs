@@ -2860,15 +2860,17 @@ where
                 return Err(DistributedRuntimeError::LeaseUncertain(reason));
             }
 
-            let mirror = mirrors.sync_mirror(target.locator()).map_err(|error| {
-                DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
-                    anyhow::Error::from(error).context(format!(
-                        "git mirror sync failed for shard '{}' and repo key {:?}",
-                        lease.shard_id(),
-                        target.repo_key()
-                    )),
-                ))
-            })?;
+            let mirror = mirrors
+                .sync_mirror(lease.payload().repo_target().locator())
+                .map_err(|error| {
+                    DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                        anyhow::Error::from(error).context(format!(
+                            "git mirror sync failed for shard '{}' and repo key {:?}",
+                            lease.shard_id(),
+                            lease.payload().repo_key()
+                        )),
+                    ))
+                })?;
 
             if let Some(reason) = armed_lease_deadline.expiry_reason() {
                 return Err(DistributedRuntimeError::LeaseUncertain(reason));
@@ -8253,8 +8255,9 @@ mod tests {
     }
 
     /// Mirror manager that unconditionally fails `sync_mirror` with a
-    /// permanent error, used to exercise error-chain preservation in the
-    /// mirror sync path.
+    /// permanent `GitRunError`. Callers propagate this as
+    /// `DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(_))`,
+    /// preserving the original error in the anyhow chain.
     struct FailingMirrorManager;
 
     impl GitMirrorManager for FailingMirrorManager {
@@ -8300,8 +8303,9 @@ mod tests {
         );
     }
 
-    /// Proves the race: if `close()` is called before the watchdog's `note()`,
-    /// a deadline expiry during the watchdog's park interval is silently lost.
+    /// `close()` before `note()` transitions the signal to `Closed`, which
+    /// rejects subsequent expiry notifications. A deadline that fires after
+    /// sealing is silently discarded.
     #[test]
     fn lease_uncertainty_close_before_note_loses_expiry() {
         let signal = LeaseUncertaintySignal::default();
