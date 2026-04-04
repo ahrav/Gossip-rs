@@ -235,8 +235,9 @@ mod tests {
         },
     };
     use gossip_worker::config::{
-        DistributedWorkerLaunch, DistributedWorkerRuntimeSettings, FsSourceSettings,
-        GitSourceSettings, ProductionBackendConfig, WorkerIdentityConfig,
+        DistributedSourceSettings, DistributedWorkerLaunch, DistributedWorkerRuntimeSettings,
+        FsSourceSettings, GitDistributedSourceSettings, GitSourceSettings, ProductionBackendConfig,
+        WorkerIdentityConfig,
     };
     use gossip_worker::production::ProductionStartupSettings;
     use tempfile::tempdir;
@@ -327,6 +328,38 @@ mod tests {
         )
         .expect("test production backend config should be valid");
         make_distributed_config(path, backends)
+    }
+
+    fn test_git_distributed_config(path: &Path, mirror_root: &Path) -> DistributedWorkerConfig {
+        let defaults = gossip_scanner_runtime::distributed::DistributedRuntimeConfig::default();
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "postgresql://scanner@localhost/done_ledger",
+            "postgresql://scanner@localhost/findings",
+        )
+        .expect("test production backend config should be valid");
+        let identity = WorkerIdentityConfig::new(
+            tenant(),
+            run_id(),
+            worker_id(),
+            policy_hash(),
+            tenant_secret_key(),
+        )
+        .expect("test worker identity config should be valid");
+        DistributedWorkerConfig::new(
+            backends,
+            ProductionStartupSettings::validate_only(),
+            identity,
+            DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
+                GitSourceSettings::new(path.to_path_buf()),
+                mirror_root.to_path_buf(),
+            )),
+            DistributedWorkerRuntimeSettings::new(
+                ScanBudgets::default(),
+                defaults.commit_queue_capacity,
+            ),
+        )
+        .expect("distributed git worker config should be valid")
     }
 
     fn unreachable_production_config(path: &Path) -> DistributedWorkerConfig {
@@ -483,6 +516,45 @@ mod tests {
                 .is_empty(),
             "distributed connector run should durably commit findings"
         );
+    }
+
+    #[test]
+    fn connector_git_dispatches_through_execute_resolved_worker() {
+        let repo = tempdir().expect("tempdir");
+        create_git_repo(repo.path());
+        let mirror_root = tempdir().expect("tempdir");
+
+        let resolved = ResolvedWorkerConfig::Distributed(Box::new(test_git_distributed_config(
+            repo.path(),
+            mirror_root.path(),
+        )));
+        let mut distributed_runner_called = false;
+
+        let report = execute_resolved_worker_with(&resolved, |cfg| {
+            distributed_runner_called = true;
+            let DistributedWorkerLaunch::Git {
+                identity,
+                mirror_root: launch_mirror_root,
+            } = cfg.worker_launch()
+            else {
+                panic!("expected Git launch variant");
+            };
+            assert_eq!(identity.tenant, cfg.tenant());
+            assert_eq!(identity.run, cfg.run());
+            assert_eq!(identity.worker, cfg.worker());
+            assert_eq!(launch_mirror_root, mirror_root.path());
+            Ok(DistributedRunReport::default())
+        })
+        .expect("connector git mode should invoke the distributed runner");
+
+        assert!(
+            distributed_runner_called,
+            "distributed worker configs must invoke the injected distributed runner"
+        );
+        let WorkerRunReport::Distributed(report) = report else {
+            panic!("expected distributed worker report");
+        };
+        assert_eq!(report, DistributedRunReport::default());
     }
 
     #[test]

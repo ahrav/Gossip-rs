@@ -809,7 +809,8 @@ impl DistributedWorkerConfig {
     ///
     /// Returns [`WorkerConfigError`] when the configured scan budgets or
     /// commit queue capacity are invalid, or when a Git distributed source
-    /// points at a mirror root that is missing from the local host.
+    /// points at a mirror root that is missing from the local host or is not
+    /// a directory.
     pub fn new(
         backends: ProductionBackendConfig,
         startup: ProductionStartupSettings,
@@ -826,7 +827,7 @@ impl DistributedWorkerConfig {
             ));
         }
         if let DistributedSourceSettings::Git(source) = &source {
-            validate_path_exists("mirror_root", source.mirror_root())?;
+            validate_directory_exists("mirror_root", source.mirror_root())?;
         }
         Ok(Self {
             backends,
@@ -2304,6 +2305,53 @@ mod tests {
             message.contains("does not exist"),
             "error must explain the path does not exist: {message}"
         );
+    }
+
+    #[test]
+    fn distributed_config_rejects_git_mirror_root_that_is_not_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_as_root = dir.path().join("not-a-directory");
+        std::fs::write(&file_as_root, "block").expect("write sentinel file");
+
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "host=127.0.0.1 dbname=done",
+            "host=127.0.0.1 dbname=findings",
+        )
+        .expect("backend config should be valid");
+        let identity = WorkerIdentityConfig::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(1),
+            WorkerId::from_raw(1),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+        )
+        .expect("identity should be valid");
+        let runtime = DistributedWorkerRuntimeSettings::new(
+            ScanBudgets::default(),
+            DistributedRuntimeConfig::default().commit_queue_capacity,
+        );
+
+        let err = DistributedWorkerConfig::new(
+            backends,
+            ProductionStartupSettings::validate_only(),
+            identity,
+            DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
+                GitSourceSettings::new("/tmp"),
+                &file_as_root,
+            )),
+            runtime,
+        )
+        .expect_err("non-directory mirror_root must be rejected");
+
+        assert!(matches!(
+            err,
+            WorkerConfigError::InvalidValue {
+                field: "mirror_root",
+                ref reason,
+                ..
+            } if reason.contains("not a directory")
+        ));
     }
 
     #[test]
