@@ -44,7 +44,7 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
     let oid_f = OidBytes::sha1([0x66; 20]);
     let oids = [oid_a, oid_b, oid_c, oid_d, oid_e, oid_f];
 
-    let backend = TestBackend::default();
+    let backend = TestBackend::non_atomic();
     assert!(
         !backend.supports_atomic_batches(),
         "this test exercises the non-atomic commit path; \
@@ -52,7 +52,7 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
     );
     let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
 
-    // -- Phase 1: spill 6 OIDs through the adapter --------------------------
+    // -- Spill 6 OIDs through the adapter ------------------------------------
     let tmp = TempDir::new().unwrap();
     let mut spiller = Spiller::new(limits, 20, tmp.path()).unwrap();
     for oid in oids {
@@ -64,7 +64,7 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
     let mut sink = CollectingUniqueBlobSink::default();
     spiller.finalize(&adapter, &adapter, &mut sink).unwrap();
 
-    // -- Phase 2: verify staging isolation -----------------------------------
+    // -- Staging isolation: OIDs invisible until finalize commits scope ------
     let emitted_oids: Vec<OidBytes> = sink.blobs.iter().map(|blob| blob.oid).collect();
     assert_eq!(emitted_oids, oids);
     assert_eq!(
@@ -78,7 +78,7 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
         "incremental spill writes must land in the staging key before finalize"
     );
 
-    // -- Phase 3: inject watermark failure during commit_finalize ------------
+    // -- Inject watermark failure during commit_finalize ----------------------
     //
     // The non-atomic commit_finalize path issues 3 sequential apply_batch
     // calls: (1) data+seen scope Put, (2) staging Delete, (3) watermark
@@ -108,7 +108,7 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
          injection offset must be updated"
     );
 
-    // -- Phase 4: verify crash-recovery state --------------------------------
+    // -- Crash-recovery state: scope durable, watermarks absent ---------------
     assert_eq!(
         adapter.batch_check_seen(&oids).unwrap(),
         vec![true, true, true, true, true, true],
@@ -127,7 +127,7 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
         "outer progress must remain absent when the watermark phase fails"
     );
 
-    // -- Phase 5: recovered adapter skips previously-committed OIDs ----------
+    // -- Recovered adapter skips committed OIDs --------------------------------
     backend.clear_fail_on_batch_call();
     let recovered = GitPersistenceAdapter::new(backend, repo_id, policy_hash);
     assert_eq!(
@@ -151,11 +151,10 @@ fn spiller_recovery_skips_scope_committed_before_watermarks() {
         "replayed scans must skip OIDs whose seen scope committed before the crash"
     );
 
-    // -- Phase 6: verify full recovery finalize cycle completes ----------------
+    // -- Recovered finalize cycle completes ------------------------------------
     //
-    // In production, the recovered scan would complete and then finalize.
-    // The second finalize encounters the (now-absent) staging key and must
-    // handle it gracefully.
+    // The recovered scan completes and then finalizes. The second finalize
+    // encounters the (now-absent) staging key and handles it gracefully.
     recovered
         .commit_finalize(&FinalizeOutput {
             data_ops: Vec::new(),
@@ -208,14 +207,14 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
         OidBytes::sha1([0x66; 20]),
     ];
 
-    let backend = TestBackend::default();
+    let backend = TestBackend::non_atomic();
     assert!(
         !backend.supports_atomic_batches(),
         "this test exercises the non-atomic commit path"
     );
     let adapter = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
 
-    // -- Phase 1: spill 6 OIDs through the adapter ----------------------------
+    // -- Spill 6 OIDs through the adapter ------------------------------------
     let tmp = TempDir::new().unwrap();
     let mut spiller = Spiller::new(limits, 20, tmp.path()).unwrap();
     for oid in oids {
@@ -226,7 +225,7 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
     let mut sink = CollectingUniqueBlobSink::default();
     spiller.finalize(&adapter, &adapter, &mut sink).unwrap();
 
-    // -- Phase 2: inject staging-delete failure --------------------------------
+    // -- Inject staging-delete failure -----------------------------------------
     //
     // The non-atomic commit_finalize path issues 3 sequential apply_batch
     // calls: (1) data+seen scope Put, (2) staging Delete, (3) watermark
@@ -261,7 +260,7 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
          injection offset must be updated"
     );
 
-    // -- Phase 3: verify post-crash state --------------------------------------
+    // -- Post-crash state: scope durable, staging survives ---------------------
     //
     // Scope key: PRESENT (first-phase batch succeeded).
     // Staging key: STILL PRESENT (delete failed).
@@ -279,7 +278,7 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
         "watermarks must remain absent when an earlier phase fails"
     );
 
-    // -- Phase 4: recovered adapter sees committed OIDs ------------------------
+    // -- Recovered adapter sees committed OIDs ---------------------------------
     backend.clear_fail_on_batch_call();
     let recovered = GitPersistenceAdapter::new(backend.clone(), repo_id, policy_hash);
     assert_eq!(
@@ -288,7 +287,7 @@ fn staging_delete_crash_leaves_scope_durable_and_recovery_refolds_idempotently()
         "recovered adapter must see all OIDs from the committed scope key"
     );
 
-    // -- Phase 5: recovered finalize re-folds staging idempotently -------------
+    // -- Recovered finalize re-folds staging idempotently ----------------------
     //
     // The critical invariant: commit_finalize re-reads the stale staging
     // key (cold cache falls through to backend read), re-folds those OIDs
