@@ -1,11 +1,15 @@
-//! Fuzzes the identity derivation pipeline end to end.
+//! End-to-end fuzzing harness for the identity derivation pipeline.
 //!
-//! This harness feeds a single fuzz input through the tenant secret, item
-//! identity, finding identity, and occurrence identity derivation steps so
-//! libFuzzer can mutate the full chain as one corpus entry.
+//! Validates the deterministic nature of the identity derivation chain,
+//! encompassing tenant secret generation, item identity, finding identity,
+//! and occurrence identity. By processing these steps sequentially from a
+//! single fuzz input, the entire pipeline is evaluated collectively.
 //!
-//! The primary invariant is determinism: re-deriving a finding or occurrence
-//! identifier from identical inputs must always yield the same value.
+//! # Invariants
+//!
+//! - **Determinism:** Identical inputs to the derivation functions
+//!   (`derive_finding_id`, `derive_occurrence_id`) produce identical output
+//!   identifiers.
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
@@ -17,7 +21,7 @@ use gossip_contracts::identity::{
 };
 
 fuzz_target!(|data: &[u8]| {
-    // The fixed-width portions of the derivation chain require 160 bytes.
+    // Requires 160 bytes for the fixed-width portions of the derivation chain.
     if data.len() < 160 {
         return;
     }
@@ -28,8 +32,8 @@ fuzz_target!(|data: &[u8]| {
     let rule_bytes: [u8; 32] = data[96..128].try_into().unwrap();
     let instance_id_bytes = &data[128..160];
 
-    // Keep the path variable-width so one input can perturb both the fixed
-    // hashes and the item identity payload that feeds later derivation steps.
+    // Variable-width path permits a single input to perturb both the fixed hashes
+    // and the item identity payload feeding subsequent derivation steps.
     let path = if data.len() > 160 {
         data[160..].to_vec()
     } else {
@@ -55,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
         secret,
     };
 
-    // Re-run the same derivation to prove the identifier remains stable.
+    // Validates identifier stability across multiple derivation invocations.
     let finding_1 = derive_finding_id(&finding_inputs);
     let finding_2 = derive_finding_id(&finding_inputs);
     assert_eq!(
