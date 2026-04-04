@@ -27,16 +27,22 @@ use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use gossip_contracts::connector::ToxicDigest;
 use gossip_contracts::connector::git::{
-    GitMirrorManager, GitRefSelection, GitRepoDiscoverySource, GitRepoExecutor,
+    GitRefSelection, GitRepoDiscoverySource, GitRepoTarget, GitSelection, LocalMirror,
 };
+use gossip_contracts::connector::{Budgets, Cursor, PageBuf, PageState, ToxicDigest};
+use gossip_contracts::coordination::ShardSpec;
+use gossip_contracts::persistence::WriteContext;
+use gossip_orchestrator::{GitSelectionLoweringError, GitShardPayload};
 use scanner_git::{
-    GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError, GitScanResult,
-    NativeRefResolver, NeverSeenStore, OidBytes, PersistenceStore, RefWatermarkStore,
-    RepoOpenError, SeenBlobStore, StartSetConfig, run_git_scan,
+    FinalizeOutcome, GitEventOutput, GitScanConfig as RuntimeGitScanConfig, GitScanError,
+    GitScanResult, NativeRefResolver, NeverSeenStore, OidBytes, PersistenceStore,
+    RefWatermarkStore, RepoOpenError, RepoOpenLimits, SeenBlobStore, StartSetConfig, run_git_scan,
 };
 
+use crate::commit_model::CheckpointAggregatorInput;
+use crate::git_executor::{ScannerGitExecutor, map_merge_strategy, map_scan_mode};
+use crate::git_persistence::{GitPersistenceAdapter, GitPersistenceBackend};
 use crate::{
     AssignmentOutcome, CancellationToken, ChannelEventOutput, EVENT_CHANNEL_CAP, GitDebugLevel,
     GitScanConfig, ScanReport, ScanRuntimeError, build_runtime_engine, forward_git_events,
@@ -45,48 +51,230 @@ use crate::{
 
 /// Marker type for the Git-repository source family.
 ///
-/// Provides the trait-dispatched entry points for discovery and mirrored-repo
-/// execution. These paths are placeholders; the primary scan path for local
-/// repositories is the crate-internal `scan_local_repo` function.
+/// Provides the trait-dispatched entry points for one-target repo discovery
+/// and prepared-mirror execution. The local direct-scan path remains the
+/// crate-internal `scan_local_repo` function.
 #[derive(Debug, Default)]
 pub struct GitRepoRuntime;
 
+/// Aggregate outcome from executing one mirror-backed Git repository scan.
+///
+/// Bundles the scan metrics, an optional checkpoint input for the
+/// coordination layer, and the scanner's finalize outcome (complete vs.
+/// partial). Produced by [`GitRepoRuntime::execute_repo`] and consumed by
+/// the distributed Git worker loop to advance the shard.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct GitRepoExecutionOutcome {
+    /// Aggregate scan metrics (objects, bytes, findings, errors) translated
+    /// into the crate-level report format.
+    pub(crate) report: ScanReport,
+    /// Checkpoint input synthesized from the persistence adapter's durable
+    /// state. `None` when the scan produced no persistence-backed progress.
+    pub(crate) checkpoint_input: Option<CheckpointAggregatorInput>,
+    /// Whether the scanner fully traversed the configured start-set
+    /// (`Complete`) or stopped early due to resource limits or errors.
+    pub(crate) finalize_outcome: FinalizeOutcome,
+}
+
 impl GitRepoRuntime {
-    /// Execute one discovery source (not yet implemented).
+    /// Execute one Git discovery step for the current shard suffix.
     ///
-    /// Discovery sources enumerate repositories from a remote API. This path
-    /// always returns an error until connector-level repository enumeration is
-    /// wired in.
-    pub fn execute_discovery<D: GitRepoDiscoverySource>(
-        _discovery: &mut D,
-    ) -> Result<ScanReport, ScanRuntimeError> {
-        Err(ScanRuntimeError::Driver(anyhow!(
-            "git-repo discovery runtime path for source '{}' is not implemented yet",
-            std::any::type_name::<D>()
-        )))
+    /// Delegates to the discovery source's `discover_page` method and wraps
+    /// any discovery error into a [`ScanRuntimeError::Driver`] with the
+    /// concrete source type name for diagnostics. Returns `None` when no
+    /// page is available (the discovery source has no more targets).
+    pub(crate) fn execute_discovery<D: GitRepoDiscoverySource>(
+        discovery: &mut D,
+        shard: &ShardSpec,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<Option<PageBuf<GitRepoTarget>>, ScanRuntimeError> {
+        discovery
+            .discover_page(shard, cursor, budgets)
+            .map_err(|error| {
+                ScanRuntimeError::Driver(anyhow!(
+                    "git-repo discovery failed for source '{}': {error}",
+                    std::any::type_name::<D>()
+                ))
+            })
     }
 
-    /// Execute one mirrored repository.
+    /// Execute one already-prepared mirror-backed repository scan.
     ///
-    /// [`crate::git_mirror::LocalMirrorManager`] provides the concrete mirror
-    /// lifecycle implementation, and [`crate::git_executor::ScannerGitExecutor`]
-    /// provides the per-repository execution adapter. Returns an error because
-    /// mirror acquisition, selection, and execution orchestration are not wired
-    /// into this entrypoint.
-    pub fn execute_repo<M: GitMirrorManager, E: GitRepoExecutor>(
-        _mirrors: &mut M,
-        _executor: &mut E,
-    ) -> Result<ScanReport, ScanRuntimeError> {
-        Err(ScanRuntimeError::Driver(anyhow!(
-            "git-repo execution runtime path for executor '{}' requires mirror and selection context",
-            std::any::type_name::<E>()
-        )))
+    /// Orchestrates three phases:
+    ///
+    /// 1. **Selection lowering**: explicit-commit selections inside `mirror`
+    ///    are resolved to concrete ref names via `lower_selection_for_local_mirror`.
+    /// 2. **Executor construction**: a [`ScannerGitExecutor`] is built from the
+    ///    overlay of the scan template, payload settings, and lowered selection,
+    ///    then paired with a [`GitPersistenceAdapter`] so finalize results land
+    ///    durably.
+    /// 3. **Checkpoint synthesis**: after the scan completes, the persistence
+    ///    adapter produces a [`CheckpointAggregatorInput`] encoding the repo's
+    ///    frontier state for coordination-layer advancement.
+    ///
+    /// # Errors
+    ///
+    /// - Selection lowering failures (e.g., ref resolution) surface as
+    ///   `ScanRuntimeError::Driver`.
+    /// - Engine construction or scan execution failures propagate through
+    ///   the executor error boundary.
+    /// - Checkpoint synthesis failures indicate a persistence-layer
+    ///   inconsistency.
+    pub(crate) fn execute_repo<B>(
+        scan_template: &GitScanConfig,
+        payload: &GitShardPayload,
+        mirror: &LocalMirror,
+        write_context: WriteContext,
+        event_sink: Arc<dyn GitEventOutput + Send + Sync>,
+        backend: B,
+    ) -> Result<GitRepoExecutionOutcome, ScanRuntimeError>
+    where
+        B: GitPersistenceBackend,
+    {
+        let selection = payload
+            .lower_selection_for_local_mirror(mirror, RepoOpenLimits::default())
+            .map_err(|error| lower_selection_error(mirror, error))?;
+        let runtime_config =
+            distributed_git_scan_config(scan_template, mirror, payload, &selection);
+        let executor = ScannerGitExecutor::from_runtime_config(&runtime_config, event_sink)?;
+        let persistence = GitPersistenceAdapter::new(
+            backend,
+            payload.repo_id(),
+            *write_context.policy_hash().as_bytes(),
+        );
+        let execution = executor
+            .run_repo_with_persistence(
+                mirror,
+                &selection,
+                payload.execution_limits(),
+                *write_context.policy_hash().as_bytes(),
+                &persistence,
+            )
+            .map_err(|error| {
+                ScanRuntimeError::Driver(anyhow::Error::new(error).context(format!(
+                    "git repo execution failed for '{}'",
+                    digest_repo_path(mirror.path())
+                )))
+            })?;
+        let finalize_outcome = execution.result.0.finalize.outcome;
+        // Sequence number is always 0: each repo-frontier shard processes
+        // exactly one singleton repo target per lease, so the checkpoint
+        // aggregator never needs to distinguish multiple completed units.
+        let checkpoint_input = persistence
+            .repo_frontier_checkpoint_input(write_context, 0, payload.repo_key(), finalize_outcome)
+            .map_err(|error| {
+                ScanRuntimeError::Driver(anyhow::Error::new(error).context(format!(
+                    "git repo durability checkpoint synthesis failed for '{}'",
+                    digest_repo_path(mirror.path())
+                )))
+            })?;
+        let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
+
+        debug_assert!(
+            !matches!(finalize_outcome, FinalizeOutcome::Complete) || checkpoint_input.is_some(),
+            "complete finalize must produce a checkpoint input"
+        );
+        Ok(GitRepoExecutionOutcome {
+            report,
+            checkpoint_input,
+            finalize_outcome,
+        })
     }
 }
 
-/// Shared low-level `scanner-git` execution output.
+/// Wrap a [`GitSelectionLoweringError`] into a [`ScanRuntimeError::Driver`]
+/// with the mirror's digested path for log-safe diagnostics.
+fn lower_selection_error(
+    mirror: &LocalMirror,
+    error: GitSelectionLoweringError,
+) -> ScanRuntimeError {
+    ScanRuntimeError::Driver(anyhow!(
+        "git selection lowering failed for '{}': {error}",
+        digest_repo_path(mirror.path())
+    ))
+}
+
+/// Build a shard-specific Git scan config by overlaying payload and selection
+/// settings onto the worker's scan template.
+///
+/// The overlay semantics are:
+/// - **Template** provides the base rule file, transform filter, decode depth,
+///   and anchor mode inherited from the worker identity.
+/// - **Mirror path** replaces the template's `repo` field with the prepared
+///   mirror location.
+/// - **Payload** contributes `repo_id` and execution limits (worker count,
+///   binary scanning, identity enrichment, cache/chunk sizes, debug level).
+/// - **Selection** supplies scan mode, merge strategy, and ref selection
+///   (already lowered from explicit-commit form).
+///
+/// Fields not overridden by the payload retain the template's default values.
+fn distributed_git_scan_config(
+    template: &GitScanConfig,
+    mirror: &LocalMirror,
+    payload: &GitShardPayload,
+    selection: &GitSelection,
+) -> GitScanConfig {
+    let limits = payload.execution_limits();
+    let mut config = template.clone();
+    config.repo = mirror.path().to_path_buf();
+    config.repo_id = payload.repo_id();
+    config.scan_mode = map_scan_mode(selection.scan_mode());
+    config.merge_mode = map_merge_strategy(selection.merge_strategy());
+    config.ref_selection = selection.refs().clone();
+    if let Some(workers) = limits.pack_exec_workers() {
+        config.workers = workers;
+    }
+    config.scan_binary = limits.scan_binary();
+    config.debug_level = limits.debug_level();
+    config.enrich_identities = limits.enrich_identities();
+    config.tree_delta_cache_mb = limits.tree_delta_cache_mb();
+    config.engine_chunk_mb = limits.engine_chunk_mb();
+    config
+}
+
+/// Extract the single repo target from a discovery page, enforcing singleton
+/// shard invariants.
+///
+/// Returns `Ok(None)` when `page` is `None` (no discovery result).
+/// Returns `Ok(Some(target))` when the page is `Complete` with exactly one
+/// item. Returns an error if the page is non-terminal or contains zero or
+/// more than one target — both are protocol violations for a singleton shard.
+pub(crate) fn single_repo_target(
+    page: Option<PageBuf<GitRepoTarget>>,
+) -> Result<Option<GitRepoTarget>, ScanRuntimeError> {
+    let Some(page) = page else {
+        return Ok(None);
+    };
+
+    if !matches!(page.state(), PageState::Complete) {
+        return Err(ScanRuntimeError::Driver(anyhow!(
+            "git repo discovery returned a non-terminal page for a singleton shard"
+        )));
+    }
+    if page.len() != 1 {
+        return Err(ScanRuntimeError::Driver(anyhow!(
+            "git repo discovery returned {} targets for a singleton shard",
+            page.len()
+        )));
+    }
+
+    Ok(page.items().first().cloned())
+}
+
+/// Shared low-level `scanner-git` execution output pairing the scan result
+/// with its wall-clock elapsed time.
+///
+/// Used by both the local and distributed scan paths. The `scan_elapsed`
+/// field provides a fallback duration when the scanner's stage-level nanos
+/// are unavailable (see [`resolve_scan_ns`]).
 pub(crate) struct GitRunExecution {
+    /// Raw scan result containing the report, finalize output, and per-stage
+    /// timing data.
     pub(crate) result: GitScanResult,
+    /// Wall-clock elapsed time measured from scan start to completion, used
+    /// as a fallback when stage-level nanos are zero.
     pub(crate) scan_elapsed: Duration,
 }
 
@@ -101,9 +289,22 @@ impl GitRunExecution {
 }
 
 /// Runtime-owned store bundle passed into the shared Git runner helper.
+///
+/// Callers control incremental behavior by choosing store implementations:
+/// - **Local scans** use no-op stores ([`EmptyWatermarkStore`] +
+///   [`NeverSeenStore`]) and `persist_store = None` for full scans.
+/// - **Distributed scans** inject a [`GitPersistenceAdapter`] that implements
+///   all three traits, enabling watermark-driven incremental scanning and
+///   durable finalize output.
 pub(crate) struct GitRuntimeStores<'a> {
+    /// Determines which blobs are considered "already seen" and can be
+    /// skipped during the object scan.
     pub(crate) seen_store: &'a dyn SeenBlobStore,
+    /// Provides per-ref watermark OIDs so the scanner can skip commits
+    /// already covered by a prior scan.
     pub(crate) watermark_store: &'a dyn RefWatermarkStore,
+    /// Optional persistence sink for durable finalize output (data ops,
+    /// watermark ops). `None` for local scans that do not persist state.
     pub(crate) persist_store: Option<&'a dyn PersistenceStore>,
 }
 
@@ -389,8 +590,10 @@ pub(crate) fn resolve_scan_ns(
 ///
 /// Scan duration is resolved by [`resolve_scan_ns`].
 ///
-/// Git scans have no persistence layer, so `dropped_findings`,
-/// `persist_emit_failures`, `persist_incomplete`, and `persist_ns` are zeroed.
+/// The `scanner_git` report does not track persistence-layer metrics (those
+/// flow through a separate `GitPersistenceAdapter` in the distributed path),
+/// so `dropped_findings`, `persist_emit_failures`, `persist_incomplete`, and
+/// `persist_ns` are zeroed at this translation boundary.
 fn git_report_to_scan_report(
     result: GitScanResult,
     scan_elapsed: std::time::Duration,
@@ -533,7 +736,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 mod tests {
     use super::*;
     use crate::GitScanConfig;
-    use gossip_contracts::connector::git::GitRefSelection;
+    use gossip_contracts::connector::git::{GitRefSelection, GitRepoTarget, RepoKey, RepoLocator};
 
     /// Zero-valued `tree_delta_cache_mb` produces a `ZeroBudget` error.
     #[test]
@@ -633,5 +836,55 @@ mod tests {
                 remote: None,
             }
         );
+    }
+
+    fn make_test_target(key_bytes: &[u8]) -> GitRepoTarget {
+        GitRepoTarget::new(
+            RepoKey::try_from_slice(key_bytes).expect("repo key"),
+            RepoLocator::local_path("/tmp/test"),
+        )
+    }
+
+    #[test]
+    fn single_repo_target_none_returns_ok_none() {
+        assert!(single_repo_target(None).expect("None input").is_none());
+    }
+
+    #[test]
+    fn single_repo_target_returns_target_for_single_item_complete_page() {
+        let target = make_test_target(b"git:test:repo-a");
+        let page = PageBuf::try_new(vec![target.clone()], PageState::Complete).expect("page");
+
+        let result = single_repo_target(Some(page))
+            .expect("valid page")
+            .expect("should return Some target");
+        assert_eq!(result.repo_key(), target.repo_key());
+    }
+
+    #[test]
+    fn single_repo_target_rejects_non_terminal_page() {
+        let target = make_test_target(b"git:test:repo-a");
+        let page = PageBuf::try_new(
+            vec![target],
+            PageState::HasMore {
+                cursor: Cursor::initial(),
+            },
+        )
+        .expect("page");
+
+        let err = single_repo_target(Some(page)).expect_err("non-terminal page");
+        let msg = format!("{err}");
+        assert!(msg.contains("non-terminal page"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn single_repo_target_rejects_multi_item_page() {
+        let target_a = make_test_target(b"git:test:repo-a");
+        let target_b = make_test_target(b"git:test:repo-b");
+        let page = PageBuf::try_new(vec![target_a, target_b], PageState::Complete).expect("page");
+
+        let err = single_repo_target(Some(page)).expect_err("multi-item page");
+        let msg = format!("{err}");
+        assert!(msg.contains("2 targets"), "unexpected error: {msg}");
     }
 }
