@@ -809,7 +809,8 @@ impl DistributedWorkerConfig {
     ///
     /// Returns [`WorkerConfigError`] when the configured scan budgets or
     /// commit queue capacity are invalid, or when a Git distributed source
-    /// points at a mirror root that is missing from the local host.
+    /// points at a mirror root that is missing from the local host, is a
+    /// dangling symlink, or is not a directory.
     pub fn new(
         backends: ProductionBackendConfig,
         startup: ProductionStartupSettings,
@@ -1537,6 +1538,7 @@ impl RawWorkerConfig {
                                 )
                             }
                             WorkerSource::Git => {
+                                validate_path_exists("path", &path)?;
                                 let mirror_root = parse_required(
                                     self.mirror_root.as_deref(),
                                     parse_nonempty_string,
@@ -1545,7 +1547,6 @@ impl RawWorkerConfig {
                                     ENV_MIRROR_ROOT,
                                 )?;
                                 let mirror_root = PathBuf::from(mirror_root);
-                                validate_directory_exists("mirror_root", &mirror_root)?;
                                 DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
                                     GitSourceSettings::new(path)
                                         .with_rules_file(rules_file)
@@ -1660,14 +1661,34 @@ fn validate_path_exists(field: &'static str, path: &Path) -> Result<(), WorkerCo
 /// that will be used as parent directories (e.g., mirror roots where repo
 /// subdirectories are created at runtime).
 fn validate_directory_exists(field: &'static str, path: &Path) -> Result<(), WorkerConfigError> {
-    validate_path_exists(field, path)?;
-    let metadata = std::fs::metadata(path).map_err(|io_err| {
-        WorkerConfigError::invalid_value(
-            field,
-            path.display().to_string(),
-            format!("cannot inspect path kind: {io_err}"),
-        )
-    })?;
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            // metadata() follows symlinks, so a broken symlink also yields
+            // NotFound. Probe with symlink_metadata to distinguish a genuinely
+            // absent path from a dangling symlink and produce a more actionable
+            // error for operators.
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err(WorkerConfigError::invalid_value(
+                    field,
+                    path.display().to_string(),
+                    "path is a symlink whose target does not exist",
+                ));
+            }
+            return Err(WorkerConfigError::invalid_value(
+                field,
+                path.display().to_string(),
+                "path does not exist",
+            ));
+        }
+        Err(io_err) => {
+            return Err(WorkerConfigError::invalid_value(
+                field,
+                path.display().to_string(),
+                format!("cannot verify path existence: {io_err}"),
+            ));
+        }
+    };
     if !metadata.is_dir() {
         return Err(WorkerConfigError::invalid_value(
             field,
@@ -2307,21 +2328,128 @@ mod tests {
     }
 
     #[test]
-    fn connector_git_source_rejects_file_as_mirror_root() {
+    fn connector_git_source_rejects_non_directory_mirror_root() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("not-a-directory");
-        std::fs::write(&file_path, "block").expect("create file");
+        let file_as_root = dir.path().join("not-a-directory");
+        std::fs::write(&file_as_root, "block").expect("write sentinel file");
+
         let env = production_env()
             .with(ENV_WORKER_SOURCE, "git")
-            .with(ENV_MIRROR_ROOT, file_path.to_str().expect("utf-8 path"));
+            .with(ENV_MIRROR_ROOT, file_as_root.to_str().expect("utf-8 path"));
 
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("file-as-mirror-root must be rejected");
+            .expect_err("file-as-mirror_root must be rejected");
 
         let message = err.to_string();
         assert!(
+            message.contains("mirror_root"),
+            "error must name the mirror_root field: {message}"
+        );
+        assert!(
             message.contains("not a directory"),
             "error must explain the path is not a directory: {message}"
+        );
+    }
+
+    #[test]
+    fn distributed_config_rejects_git_mirror_root_that_is_not_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_as_root = dir.path().join("not-a-directory");
+        std::fs::write(&file_as_root, "block").expect("write sentinel file");
+
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "host=127.0.0.1 dbname=done",
+            "host=127.0.0.1 dbname=findings",
+        )
+        .expect("backend config should be valid");
+        let identity = WorkerIdentityConfig::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(1),
+            WorkerId::from_raw(1),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+        )
+        .expect("identity should be valid");
+        let runtime = DistributedWorkerRuntimeSettings::new(
+            ScanBudgets::default(),
+            DistributedRuntimeConfig::default().commit_queue_capacity,
+        );
+
+        let err = DistributedWorkerConfig::new(
+            backends,
+            ProductionStartupSettings::validate_only(),
+            identity,
+            DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
+                GitSourceSettings::new("/tmp"),
+                &file_as_root,
+            )),
+            runtime,
+        )
+        .expect_err("non-directory mirror_root must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                WorkerConfigError::InvalidValue {
+                    field: "mirror_root",
+                    ref reason,
+                    ..
+                } if reason.contains("not a directory")
+            ),
+            "expected InvalidValue for 'mirror_root' with 'not a directory' reason, got: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distributed_config_rejects_dangling_symlink_mirror_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("nonexistent-target");
+        let link = dir.path().join("dangling-link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let backends = ProductionBackendConfig::new(
+            EtcdCoordinatorConfig::localhost(),
+            "host=127.0.0.1 dbname=done",
+            "host=127.0.0.1 dbname=findings",
+        )
+        .expect("backend config should be valid");
+        let identity = WorkerIdentityConfig::new(
+            TenantId::from_bytes([0x11; 32]),
+            RunId::from_raw(1),
+            WorkerId::from_raw(1),
+            PolicyHash::from_bytes([0x22; 32]),
+            TenantSecretKey::from_bytes([0x33; 32]),
+        )
+        .expect("identity should be valid");
+        let runtime = DistributedWorkerRuntimeSettings::new(
+            ScanBudgets::default(),
+            DistributedRuntimeConfig::default().commit_queue_capacity,
+        );
+
+        let err = DistributedWorkerConfig::new(
+            backends,
+            ProductionStartupSettings::validate_only(),
+            identity,
+            DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
+                GitSourceSettings::new("/tmp"),
+                &link,
+            )),
+            runtime,
+        )
+        .expect_err("dangling symlink mirror_root must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                WorkerConfigError::InvalidValue {
+                    field: "mirror_root",
+                    ref reason,
+                    ..
+                } if reason.contains("symlink") && reason.contains("target does not exist")
+            ),
+            "expected InvalidValue for 'mirror_root' mentioning symlink, got: {err:?}"
         );
     }
 
@@ -3592,6 +3720,28 @@ mod tests {
         assert!(
             logs.contains("process-table exposure"),
             "must warn when etcd endpoints supplied via CLI flag, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn connector_git_source_rejects_nonexistent_repo_path() {
+        let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_WORKER_PATH, "/no/such/repo/path")
+            .with(
+                ENV_MIRROR_ROOT,
+                mirror_dir.path().to_str().expect("utf-8 path"),
+            );
+
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env).expect_err(
+            "nonexistent repo path in git connector mode must be rejected at config resolution",
+        );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("path"),
+            "error must name the path field: {message}"
         );
     }
 }

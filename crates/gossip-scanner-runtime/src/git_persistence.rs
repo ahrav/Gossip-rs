@@ -866,83 +866,122 @@ pub(crate) fn build_git_repo_done_ledger_record(
     Ok(record)
 }
 
-#[cfg(test)]
-mod tests {
+/// In-memory [`GitPersistenceBackend`] for integration and unit tests.
+///
+/// Provides a `BTreeMap`-backed KV store with fault injection hooks
+/// (`fail_on_batch_call`, `fail_on_get_call`) and batch recording.
+/// Gated behind `cfg(test)` (unit tests in this crate) and the
+/// `test-support` feature (integration tests in downstream crates).
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
-    use std::num::NonZeroU32;
+    use std::rc::Rc;
 
-    use gossip_contracts::{
-        connector::git::RepoKey,
-        identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId},
-        persistence::CheckpointBoundaryKind,
-    };
+    use super::{GitPersistenceBackend, GitPersistenceOp};
 
-    use super::*;
-
+    /// Error type returned by [`TestBackend`] when fault injection fires.
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
     #[error("{message}")]
-    struct TestBackendError {
-        message: &'static str,
+    pub struct TestBackendError {
+        /// Static message describing the injected failure.
+        pub message: &'static str,
     }
 
+    /// Mutable interior state shared across clones of a [`TestBackend`].
     #[derive(Debug, Default)]
-    struct TestBackendState {
-        kv: BTreeMap<Vec<u8>, Vec<u8>>,
-        batches: Vec<Vec<GitPersistenceOp>>,
-        batch_call_count: usize,
-        fail_on_batch_call: Option<usize>,
-        get_call_count: usize,
-        fail_on_get_call: Option<usize>,
-        multi_get_truncate: bool,
+    pub struct TestBackendState {
+        pub(super) kv: BTreeMap<Vec<u8>, Vec<u8>>,
+        pub(super) batches: Vec<Vec<GitPersistenceOp>>,
+        pub(super) batch_call_count: usize,
+        pub(super) fail_on_batch_call: Option<usize>,
+        pub(super) get_call_count: usize,
+        pub(super) fail_on_get_call: Option<usize>,
+        pub(super) multi_get_truncate: bool,
     }
 
+    /// In-memory backend with fault injection and batch recording.
+    ///
+    /// All clones share the same underlying state via `Rc<RefCell<_>>`.
+    /// Not `Send` — intended for single-threaded test contexts only.
     #[derive(Debug, Clone, Default)]
-    struct TestBackend {
-        state: std::rc::Rc<RefCell<TestBackendState>>,
+    pub struct TestBackend {
+        state: Rc<RefCell<TestBackendState>>,
         atomic: bool,
     }
 
     impl TestBackend {
-        fn atomic() -> Self {
+        /// Creates a backend that reports atomic batch support.
+        pub fn atomic() -> Self {
             Self {
-                state: std::rc::Rc::new(RefCell::new(TestBackendState::default())),
+                state: Rc::new(RefCell::new(TestBackendState::default())),
                 atomic: true,
             }
         }
 
-        fn non_atomic() -> Self {
+        /// Creates a backend that reports non-atomic batch support.
+        pub fn non_atomic() -> Self {
             Self {
-                state: std::rc::Rc::new(RefCell::new(TestBackendState::default())),
+                state: Rc::new(RefCell::new(TestBackendState::default())),
                 atomic: false,
             }
         }
 
-        fn set(&self, key: Vec<u8>, value: Vec<u8>) {
+        /// Directly inserts a key-value pair (bypassing `apply_batch`).
+        pub fn set(&self, key: Vec<u8>, value: Vec<u8>) {
             self.state.borrow_mut().kv.insert(key, value);
         }
 
-        fn contains_key(&self, key: &[u8]) -> bool {
+        /// Returns true if the store contains `key`.
+        pub fn contains_key(&self, key: &[u8]) -> bool {
             self.state.borrow().kv.contains_key(key)
         }
 
-        fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+        /// Returns a clone of the value for `key`, if present.
+        pub fn get_value(&self, key: &[u8]) -> Option<Vec<u8>> {
             self.state.borrow().kv.get(key).cloned()
         }
 
-        fn set_fail_on_batch_call(&self, call_no: usize) {
+        /// Injects a failure when `batch_call_count` reaches `call_no`.
+        ///
+        /// The check fires when the internal monotonic counter equals `call_no`.
+        /// Use [`batch_call_count`](Self::batch_call_count) to read the current
+        /// value and compute a relative offset (e.g., `backend.batch_call_count() + 3`
+        /// to fail 3 calls from now).
+        pub fn set_fail_on_batch_call(&self, call_no: usize) {
             self.state.borrow_mut().fail_on_batch_call = Some(call_no);
         }
 
-        fn set_fail_on_get_call(&self, call_no: usize) {
+        /// Clears any previously injected batch failure.
+        pub fn clear_fail_on_batch_call(&self) {
+            self.state.borrow_mut().fail_on_batch_call = None;
+        }
+
+        /// Injects a failure when the internal `get` call counter reaches `call_no`.
+        ///
+        /// Same semantics as [`set_fail_on_batch_call`](Self::set_fail_on_batch_call).
+        pub fn set_fail_on_get_call(&self, call_no: usize) {
             self.state.borrow_mut().fail_on_get_call = Some(call_no);
         }
 
-        fn set_multi_get_truncate(&self, truncate: bool) {
+        /// Clears any previously injected get failure.
+        pub fn clear_fail_on_get_call(&self) {
+            self.state.borrow_mut().fail_on_get_call = None;
+        }
+
+        /// Configures `multi_get` to return one fewer result than requested.
+        pub fn set_multi_get_truncate(&self, truncate: bool) {
             self.state.borrow_mut().multi_get_truncate = truncate;
         }
 
-        fn batches(&self) -> Vec<Vec<GitPersistenceOp>> {
+        /// Returns recorded batches from all `apply_batch` calls.
+        pub fn batches(&self) -> Vec<Vec<GitPersistenceOp>> {
             self.state.borrow().batches.clone()
+        }
+
+        /// Returns the total number of `apply_batch` calls so far.
+        pub fn batch_call_count(&self) -> usize {
+            self.state.borrow().batch_call_count
         }
     }
 
@@ -960,6 +999,9 @@ mod tests {
             Ok(state.kv.get(key).cloned())
         }
 
+        /// Injected failures are all-or-nothing: a failing call returns `Err`
+        /// without applying any ops. Partial batch application (where some ops
+        /// land before the failure) is not modeled.
         fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
             let mut state = self.state.borrow_mut();
             state.batch_call_count += 1;
@@ -999,6 +1041,20 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use gossip_contracts::{
+        connector::git::RepoKey,
+        identity::{FenceEpoch, PolicyHash, RunId, ShardId, TenantId},
+        persistence::CheckpointBoundaryKind,
+    };
+
+    use super::test_support::*;
+    use super::*;
 
     fn write_context() -> WriteContext {
         WriteContext::new(
