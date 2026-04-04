@@ -55,6 +55,7 @@ Resources:
 - `Midx`
 - `Pack { pack_id }`
 - `Persist`
+- `SeenPersist`
 - `Other(String)` for non-core resources
 
 Faults:
