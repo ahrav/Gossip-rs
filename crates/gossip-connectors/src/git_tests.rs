@@ -1,3 +1,12 @@
+//! Integration-style tests for [`GitConnector`] that exercise real git repositories.
+//!
+//! These tests build temporary repositories on disk instead of mocking git state so
+//! split-point selection, item lookup, and capability reporting are validated
+//! against the same tree layout and command behavior used in production. The
+//! fixtures commit tracked files unless the caller explicitly provides an empty
+//! repository, which keeps the tests focused on connector semantics rather than
+//! setup details.
+
 use std::path::Path;
 use std::process::Command;
 
@@ -6,7 +15,10 @@ use rstest::rstest;
 use super::*;
 use crate::common::test_util::{default_budgets, make_key};
 
-/// Run a git command and assert success for test setup.
+/// Runs a git command in a fixture repository and asserts that setup succeeded.
+///
+/// These tests rely on real git metadata, so fixture construction fails fast if
+/// any command writes to stderr or exits unsuccessfully.
 fn run_git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -24,7 +36,11 @@ fn run_git(repo: &Path, args: &[&str]) {
     );
 }
 
-/// Create a temporary git repository with tracked files.
+/// Creates a temporary git repository populated with the provided tracked files.
+///
+/// The helper configures a local author identity so commit creation is stable in
+/// CI environments. When `files` is empty, it intentionally leaves the
+/// repository without a commit so tests can opt into an empty fixture.
 fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
     run_git(dir.path(), &["init", "-q"]);
@@ -51,7 +67,10 @@ fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
 }
 
 /// Asserts the split point over the full key range (`\x00`..`\xff`).
-/// For tests that require different bounds, call `choose_split_point_range` directly.
+///
+/// The helper expects the fixture to produce a split candidate for a multi-item
+/// range. Tests that need different bounds or need to assert `None` should call
+/// `choose_split_point_range` directly.
 fn assert_split_point(files: &[(&str, &[u8])], expected: &[u8]) {
     let dir = create_test_repo(files);
     let mut connector = GitConnector::new(dir.path());
@@ -68,7 +87,8 @@ fn assert_split_point(files: &[(&str, &[u8])], expected: &[u8]) {
     assert_eq!(split.as_bytes(), expected);
 }
 
-// Verifies split-point selection behavior across weighted fixture layouts.
+/// Verifies that byte-weighted midpoint selection falls back to the rank midpoint
+/// when the weighted candidate would leave the right shard empty.
 #[test]
 fn choose_split_point_selects_byte_weighted_midpoint() {
     assert_split_point(
@@ -93,10 +113,8 @@ fn choose_split_point_avoids_first_file_when_weight_is_front_loaded() {
     );
 }
 
-// ---------------------------------------------------------------
-// Read tests
-// ---------------------------------------------------------------
-
+/// Invalid item references should fail immediately and remain non-retryable for
+/// both open and range-read operations.
 #[test]
 fn invalid_item_ref_returns_error() {
     let dir = create_test_repo(&[("a.txt", b"a")]);
@@ -115,10 +133,8 @@ fn invalid_item_ref_returns_error() {
     assert!(!read_err.is_retryable());
 }
 
-// ---------------------------------------------------------------
-// Capabilities tests
-// ---------------------------------------------------------------
-
+/// Capability reporting should only change for token resume support when token
+/// emission is toggled.
 #[rstest]
 #[case::with_token(true)]
 #[case::without_token(false)]
