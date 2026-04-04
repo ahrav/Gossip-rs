@@ -592,19 +592,31 @@ impl BlobIntroducer {
     /// Walks the commit plan and emits unique blob candidates.
     ///
     /// On error, clears traversal state so the introducer can be reused after
-    /// handling the failure. Seen sets are preserved; call `reset_seen` if needed.
+    /// handling the failure. Seen sets are preserved; call `reset_seen` if
+    /// needed. The abort flag is checked before each commit and every 4096
+    /// processed tree entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreeDiffError`] on tree parse failures, capacity exhaustion,
+    /// sink errors, or object-store faults. Returns
+    /// [`TreeDiffError::Aborted`] if the cooperative abort flag is set.
     pub fn introduce<S: CandidateSink>(
         &mut self,
         source: &mut impl TreeSource,
         cg: &CommitGraphIndex,
         plan: &[PlannedCommit],
         oid_index: &OidIndex,
+        abort: &AtomicBool,
         sink: &mut S,
     ) -> Result<BlobIntroStats, TreeDiffError> {
         self.reset_stats();
 
         let result = (|| {
             for PlannedCommit { pos, .. } in plan {
+                if abort.load(Ordering::Relaxed) {
+                    return Err(TreeDiffError::Aborted);
+                }
                 perf_stats::sat_add_u64(&mut self.stats.commits_visited, 1);
                 let commit_id = pos.0;
                 let root_oid = cg.root_tree_oid(*pos);
@@ -617,7 +629,7 @@ impl BlobIntroducer {
                 }
 
                 self.push_tree(source, &root_oid)?;
-                self.walk_stack(source, oid_index, sink, commit_id)?;
+                self.walk_stack(source, oid_index, abort, sink, commit_id)?;
             }
 
             Ok(self.stats)
@@ -690,13 +702,17 @@ impl BlobIntroducer {
     /// Uses the instance `SeenSets` for tree/blob dedup. On encountering a
     /// subtree, pushes a new frame; on exhausting a tree, pops it. Blob
     /// entries are checked against the path exclusion policy before emission.
+    /// Checks the abort flag every 4096 tree entries for responsiveness on
+    /// large trees.
     fn walk_stack<S: CandidateSink>(
         &mut self,
         source: &mut impl TreeSource,
         oid_index: &OidIndex,
+        abort: &AtomicBool,
         sink: &mut S,
         commit_id: u32,
     ) -> Result<(), TreeDiffError> {
+        let mut entry_count: u32 = 0;
         while let Some(frame) = self.stack.last_mut() {
             let entry = match frame.cursor.peek_entry()? {
                 Some(entry) => entry,
@@ -713,6 +729,11 @@ impl BlobIntroducer {
             let oid = entry.oid()?;
 
             frame.cursor.advance()?;
+            entry_count = entry_count.wrapping_add(1);
+            if entry_count & 0xFFF == 0 && abort.load(Ordering::Relaxed) {
+                self.reset_run_state();
+                return Err(TreeDiffError::Aborted);
+            }
 
             match kind {
                 EntryKind::Tree => {
@@ -861,7 +882,8 @@ struct BlobIntroWorker<'a> {
     seen: &'a AtomicSeenSets,
     loose_seen: LooseOidSet,
     loose_excluded: LooseOidSet,
-    abort: &'a AtomicBool,
+    external_abort: &'a AtomicBool,
+    error_abort: &'a AtomicBool,
     scan_binary: bool,
 }
 
@@ -871,7 +893,8 @@ impl<'a> BlobIntroWorker<'a> {
         oid_len: u8,
         max_loose_oids: u32,
         seen: &'a AtomicSeenSets,
-        abort: &'a AtomicBool,
+        external_abort: &'a AtomicBool,
+        error_abort: &'a AtomicBool,
         scan_binary: bool,
     ) -> Self {
         Self {
@@ -887,9 +910,18 @@ impl<'a> BlobIntroWorker<'a> {
             seen,
             loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
-            abort,
+            external_abort,
+            error_abort,
             scan_binary,
         }
+    }
+
+    #[inline]
+    fn is_aborted(&self) -> bool {
+        // Relaxed: external abort is a monotonic flag; see CancellationToken::as_atomic().
+        // Acquire: error_abort must synchronize-with the store in the faulting worker so
+        // that any side-effects (e.g. logged diagnostics) are visible before we act on it.
+        self.external_abort.load(Ordering::Relaxed) || self.error_abort.load(Ordering::Acquire)
     }
 
     /// Processes a slice of planned commits, emitting candidates into `sink`.
@@ -902,8 +934,8 @@ impl<'a> BlobIntroWorker<'a> {
         sink: &mut S,
     ) -> Result<(), TreeDiffError> {
         for PlannedCommit { pos, .. } in chunk {
-            if self.abort.load(Ordering::Relaxed) {
-                break;
+            if self.is_aborted() {
+                return Err(TreeDiffError::Aborted);
             }
 
             perf_stats::sat_add_u64(&mut self.stats.commits_visited, 1);
@@ -920,7 +952,7 @@ impl<'a> BlobIntroWorker<'a> {
             self.push_tree(source, &root_oid)?;
             match self.walk_stack(source, oid_index, sink, commit_id) {
                 Ok(()) => {}
-                Err(TreeDiffError::Aborted) => break,
+                Err(TreeDiffError::Aborted) => return Err(TreeDiffError::Aborted),
                 Err(err) => return Err(err),
             }
         }
@@ -1008,7 +1040,7 @@ impl<'a> BlobIntroWorker<'a> {
 
             // Check abort every 4096 tree entries for large-tree responsiveness.
             entry_count = entry_count.wrapping_add(1);
-            if entry_count & 0xFFF == 0 && self.abort.load(Ordering::Relaxed) {
+            if entry_count & 0xFFF == 0 && self.is_aborted() {
                 self.reset_run_state();
                 return Err(TreeDiffError::Aborted);
             }
@@ -1109,7 +1141,9 @@ pub(super) struct ParallelIntroResult {
 /// chunks via an atomic counter (dynamic work-partitioning). Each worker has
 /// its own mutable `ObjectStore` caches and `PackCandidateCollector`; shared
 /// immutable repo/pack layout is reused via [`ObjectStoreLayout`]. Dedup is
-/// shared through `AtomicSeenSets`.
+/// shared through `AtomicSeenSets`. `abort` is observed cooperatively while a
+/// separate local error flag stops sibling workers after the first hard error
+/// without mutating the caller-owned cancellation flag.
 ///
 /// Cache budgets (`max_tree_cache_bytes`, `max_tree_delta_cache_bytes`,
 /// `max_tree_spill_bytes`) are divided by `worker_count` with a floor
@@ -1136,6 +1170,7 @@ pub(super) fn introduce_parallel<'a>(
     mapping_cfg_path_arena_capacity: u32,
     mapping_cfg_max_packed: u32,
     mapping_cfg_max_loose: u32,
+    abort: &AtomicBool,
 ) -> Result<ParallelIntroResult, TreeDiffError> {
     let worker_count = worker_count.max(1).min(plan.len().max(1));
 
@@ -1153,7 +1188,7 @@ pub(super) fn introduce_parallel<'a>(
     let chunk_size = plan.len().div_ceil(chunk_count);
     let chunks: Vec<&[PlannedCommit]> = plan.chunks(chunk_size).collect();
     let next_chunk = AtomicUsize::new(0);
-    let abort = AtomicBool::new(false);
+    let error_abort = AtomicBool::new(false);
 
     let object_count = midx.object_count();
     let seen_len = (object_count as usize).max(1);
@@ -1212,7 +1247,8 @@ pub(super) fn introduce_parallel<'a>(
             .map(|_| {
                 let chunks = &chunks;
                 let next_chunk = &next_chunk;
-                let abort = &abort;
+                let external_abort = abort;
+                let error_abort = &error_abort;
                 let seen = &seen;
                 let per_worker_limits = &per_worker_limits;
                 let core_assigner = &core_assigner;
@@ -1246,7 +1282,8 @@ pub(super) fn introduce_parallel<'a>(
                         repo.object_format.oid_len(),
                         per_worker_loose,
                         seen,
-                        abort,
+                        external_abort,
+                        error_abort,
                         config.engine_adapter.scan_binary,
                     );
 
@@ -1263,7 +1300,9 @@ pub(super) fn introduce_parallel<'a>(
                             oid_index,
                             &mut collector,
                         ) {
-                            abort.store(true, Ordering::Relaxed);
+                            if !matches!(err, TreeDiffError::Aborted) {
+                                error_abort.store(true, Ordering::Release);
+                            }
                             return Err(err);
                         }
                     }
@@ -1296,11 +1335,17 @@ pub(super) fn introduce_parallel<'a>(
             Ok(wr) => {
                 worker_results.push(wr);
             }
-            Err(err) => {
-                if first_error.is_none() {
+            Err(err) => match first_error {
+                None => first_error = Some(err),
+                // Prefer non-Aborted errors: a real error (e.g. CorruptTree)
+                // is more informative than an Aborted triggered by sibling
+                // worker fan-out. Workers joined in spawn order may report
+                // Aborted before the root-cause error arrives.
+                Some(TreeDiffError::Aborted) if !matches!(err, TreeDiffError::Aborted) => {
                     first_error = Some(err);
                 }
-            }
+                _ => {}
+            },
         }
     }
 

@@ -370,6 +370,15 @@ fn cancellation_token_transitions_to_cancelled() {
 }
 
 #[test]
+fn cancellation_visible_through_as_atomic_bridge() {
+    let token = CancellationToken::new();
+    let flag = token.as_atomic();
+    assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    token.cancel();
+    assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
 fn scan_budgets_reject_zero_items() {
     let error = ScanBudgets {
         max_items: 0,

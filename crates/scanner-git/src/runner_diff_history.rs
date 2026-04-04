@@ -49,6 +49,7 @@
 //! results in planned sequence, regardless of worker completion order.
 
 use std::io;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[cfg(feature = "git-perf")]
@@ -71,7 +72,7 @@ use super::pack_plan_model::CompletedPacksBitmap;
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
 use super::runner::{
-    GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
+    check_abort, GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
 };
 use super::seen_store::{SeenBitmapPersister, SeenBlobStore};
 use super::spiller::Spiller;
@@ -127,6 +128,12 @@ use super::runner_exec::{
 /// is intentionally non-deterministic under parallel workers; findings may
 /// precede matching commit metadata.
 ///
+/// # Cancellation
+///
+/// `abort` is checked before each commit diff, at pack-exec and loose-scan
+/// stage boundaries, inside the tree-diff walker, and by the scheduler task
+/// launcher.
+///
 /// # Errors
 ///
 /// - MIDX load, completeness, or OID resolution failures.
@@ -144,6 +151,7 @@ pub(super) fn run_diff_history(
     cg: &dyn CommitGraph,
     plan: &[PlannedCommit],
     config: &GitScanConfig,
+    abort: &AtomicBool,
     commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
     let CommitMetaContext {
@@ -193,6 +201,7 @@ pub(super) fn run_diff_history(
         perf_let!(diff_start = Instant::now());
         let mut sink = SpillCandidateSink::new(&mut spiller);
         for PlannedCommit { pos, snapshot_root } in plan {
+            check_abort(abort)?;
             let commit_id = pos.0;
             let new_tree = cg.root_tree_oid(*pos)?;
 
@@ -207,6 +216,7 @@ pub(super) fn run_diff_history(
                     None,
                     commit_id,
                     0,
+                    abort,
                 )?;
                 continue;
             }
@@ -229,6 +239,7 @@ pub(super) fn run_diff_history(
                     None,
                     commit_id,
                     0,
+                    abort,
                 )?;
                 continue;
             }
@@ -244,6 +255,7 @@ pub(super) fn run_diff_history(
                             Some(&old_tree),
                             commit_id,
                             idx as u8,
+                            abort,
                         )?;
                     }
                 }
@@ -256,6 +268,7 @@ pub(super) fn run_diff_history(
                         Some(&old_tree),
                         commit_id,
                         0,
+                        abort,
                     )?;
                 }
             }
@@ -291,10 +304,12 @@ pub(super) fn run_diff_history(
         ),
         mapping_cfg,
     );
+    check_abort(abort)?;
     let spill_stats = spiller.finalize(seen_store, seen_persister, &mut bridge)?;
     perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
     let mapping_arena = Arc::new(mapping_arena);
+    check_abort(abort)?;
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
     perf_let!(pack_plan_start = Instant::now());
@@ -330,6 +345,7 @@ pub(super) fn run_diff_history(
         pack_plan,
         pack_plan_start.elapsed().as_nanos() as u64
     );
+    check_abort(abort)?;
 
     // Gate between planning and execution: if pack files or indices were
     // rewritten by a concurrent `git gc` / `git repack`, the offsets in our
@@ -372,6 +388,7 @@ pub(super) fn run_diff_history(
     #[cfg(feature = "git-perf")]
     let pack_exec_alloc_before: AllocStats = alloc_stats();
     if !plans.is_empty() {
+        check_abort(abort)?;
         let scheduler_workers = match pack_exec_strategy {
             PackExecStrategy::Serial => 1,
             PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
@@ -401,6 +418,7 @@ pub(super) fn run_diff_history(
             pack_cache_bytes,
             scheduler_workers,
             config.pin_threads,
+            abort,
             Arc::clone(&commit_graph_index),
             Arc::clone(&commit_meta_seen),
         )?;
@@ -415,6 +433,7 @@ pub(super) fn run_diff_history(
         )?;
     }
     if !sink.loose.is_empty() {
+        check_abort(abort)?;
         let mut adapter = EngineAdapter::new_with_event_sink(
             engine.as_ref(),
             config.engine_adapter,
@@ -438,6 +457,7 @@ pub(super) fn run_diff_history(
             mapping_arena.as_ref(),
             &mut adapter,
             &mut external,
+            abort,
             &mut skipped_candidates,
         )?;
         let loose_metrics = adapter.take_metrics();

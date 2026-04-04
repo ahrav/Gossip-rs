@@ -31,7 +31,7 @@ graph TD
     end
 
     subgraph PageAcq["B4: Page Acquisition"]
-        FILL["<b>2. fill_page</b><br/>OrderedContentSource::fill_page<br/>returns PageBuf&lt;ScanItem&gt;"]
+        FILL["<b>2. fill_page</b><br/>OrderedContentSource::fill_page<br/>returns Option&lt;PageBuf&lt;ScanItem&gt;&gt;"]
         VAL["<b>3. Validate page</b><br/>validate_page_contract<br/>shape, monotonicity,<br/>cursor agreement"]
     end
 

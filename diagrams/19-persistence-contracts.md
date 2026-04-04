@@ -65,7 +65,7 @@ graph TB
         FS["FindingsSink<br/>type Error<br/>type CommitHandle<br/>fn upsert_batch(FindingsUpsertBatch) → CommitHandle"]
         FCP["FindingsConformanceProbe (conformance-only)<br/>type Error<br/>fn durable_counts() → Result&lt;DurableFindingsCounts, Error&gt;"]
 
-        CONF["run_conformance()<br/>Done-ledger checks (4)<br/>Findings checks (4)<br/>Redaction checks (3)"]
+        CONF["run_conformance()<br/>Done-ledger checks (5)<br/>Findings checks (4)<br/>Redaction checks (3)"]
 
         CH -->|"Receipt: CommitReceipt"| CR
         RCH -.->|"implements"| CH
@@ -127,7 +127,7 @@ The trait hierarchy summarized:
 
 | Suite | Checks | Validates |
 |:---|:---|:---|
-| Done-ledger (4) | Idempotent upsert, fail-then-scan dominance, scan-then-fail dominance, batch-get positional alignment | Lattice merge correctness |
+| Done-ledger (5) | Idempotent upsert, fail-then-scan dominance, scan-then-fail dominance, batch-get positional alignment, terminal-key enumeration | Lattice merge correctness |
 | Findings (4) | Idempotent upsert, orphan occurrence rejection, orphan observation rejection, observation upsert merge | Referential integrity and idempotency |
 | Redaction (3) | `NormHash`, `SecretHash`, and `FindingRecord` `Debug` output must not leak raw secret bytes | No secret leakage through debug formatting |
 

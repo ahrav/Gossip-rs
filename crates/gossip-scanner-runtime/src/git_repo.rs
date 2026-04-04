@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 
@@ -130,6 +131,7 @@ impl GitRepoRuntime {
         payload: &GitShardPayload,
         mirror: &LocalMirror,
         write_context: WriteContext,
+        abort: &AtomicBool,
         event_sink: Arc<dyn GitEventOutput + Send + Sync>,
         backend: B,
     ) -> Result<GitRepoExecutionOutcome<B>, ScanRuntimeError>
@@ -147,20 +149,39 @@ impl GitRepoRuntime {
             payload.repo_id(),
             *write_context.policy_hash().as_bytes(),
         );
-        let execution = executor
-            .run_repo_with_persistence(
-                mirror,
-                &selection,
-                payload.execution_limits(),
-                *write_context.policy_hash().as_bytes(),
-                &persistence,
-            )
-            .map_err(|error| {
-                ScanRuntimeError::Driver(anyhow::Error::new(error).context(format!(
-                    "git repo execution failed for '{}'",
-                    digest_repo_path(mirror.path())
-                )))
-            })?;
+        let execution = match executor.run_repo_with_persistence(
+            mirror,
+            &selection,
+            payload.execution_limits(),
+            *write_context.policy_hash().as_bytes(),
+            abort,
+            &persistence,
+        ) {
+            Ok(exec) => exec,
+            Err(error) if abort.load(Ordering::Relaxed) => {
+                // Abort was signalled — treat as clean cancellation rather
+                // than surfacing an opaque driver error. Log the original
+                // error so coincidental non-abort failures remain observable.
+                tracing::debug!(
+                    repo = %digest_repo_path(mirror.path()),
+                    %error,
+                    "scan error with abort signalled; treating as cancellation",
+                );
+                return Ok(GitRepoExecutionOutcome {
+                    report: ScanReport::default(),
+                    checkpoint_input: None,
+                    finalize_outcome: FinalizeOutcome::Partial { skipped_count: 0 },
+                });
+            }
+            Err(error) => {
+                return Err(ScanRuntimeError::Driver(anyhow::Error::new(error).context(
+                    format!(
+                        "git repo execution failed for '{}'",
+                        digest_repo_path(mirror.path())
+                    ),
+                )));
+            }
+        };
         let finalize_outcome = execution.result.0.finalize.outcome;
         let report = git_report_to_scan_report(execution.result, execution.scan_elapsed);
 
@@ -307,7 +328,10 @@ pub(crate) struct GitRuntimeStores<'a> {
 ///
 /// A scoped thread drains events from the scan into `out`. The event channel
 /// is explicitly dropped after `run_git_scan` returns so the forwarder observes
-/// a clean EOF rather than blocking indefinitely.
+/// a clean EOF rather than blocking indefinitely. Mid-scan cancellation is
+/// forwarded into `scanner-git` via `cancel.as_atomic()`, so the scan can stop
+/// at cooperative abort checkpoints inside tree walks, blob introduction, and
+/// pack-exec scheduling.
 ///
 /// # Errors
 ///
@@ -341,13 +365,36 @@ pub(crate) fn scan_local_repo(
         let git_sink: Arc<dyn scanner_git::EventSink> =
             Arc::new(ChannelEventOutput::new(event_tx.clone()));
         let git_cfg = build_git_scan_config(config)?;
-        let execution =
-            run_runtime_git_scan(&canonical_repo, engine, &git_cfg, git_sink).map_err(|error| {
-                ScanRuntimeError::Driver(anyhow!(
-                    "git scan failed for '{}': {error}",
-                    digest_repo_path(&canonical_repo)
-                ))
-            });
+        let execution = run_runtime_git_scan(
+            &canonical_repo,
+            engine,
+            &git_cfg,
+            cancel.as_atomic(),
+            git_sink,
+        )
+        .map_err(|error| {
+            ScanRuntimeError::Driver(anyhow!(
+                "git scan failed for '{}': {error}",
+                digest_repo_path(&canonical_repo)
+            ))
+        });
+
+        // If cancellation was signalled mid-scan, convert the opaque driver
+        // error into a clean early return so callers can distinguish abort
+        // from real failures. Log the original error so coincidental
+        // non-abort failures remain observable.
+        if let Err(ref err) = execution
+            && cancel.is_cancelled()
+        {
+            tracing::debug!(
+                repo = %digest_repo_path(&canonical_repo),
+                error = %err,
+                "scan error with cancellation signalled; treating as cancellation",
+            );
+            drop(event_tx);
+            let _ = join_scoped(event_forwarder, "git event forwarder thread");
+            return Ok((ScanReport::default(), None));
+        }
 
         // Close the sender before joining so the forwarder thread sees EOF.
         drop(event_tx);
@@ -483,10 +530,16 @@ fn build_git_scan_config(config: &GitScanConfig) -> Result<RuntimeGitScanConfig,
 }
 
 /// Execute the shared `scanner-git` runner setup against `canonical_repo`.
+///
+/// This is the local-runtime convenience wrapper around
+/// [`run_runtime_git_scan_with_stores`]. It forwards the caller-owned abort
+/// flag unchanged while wiring the non-persistent default stores used by the
+/// single-node path.
 pub(crate) fn run_runtime_git_scan(
     canonical_repo: &Path,
     engine: Arc<scanner_engine::Engine>,
     git_cfg: &RuntimeGitScanConfig,
+    abort: &AtomicBool,
     git_sink: Arc<dyn scanner_git::EventSink>,
 ) -> Result<GitRunExecution, GitScanError> {
     let watermarks = EmptyWatermarkStore;
@@ -496,6 +549,7 @@ pub(crate) fn run_runtime_git_scan(
         canonical_repo,
         engine,
         git_cfg,
+        abort,
         git_sink,
         GitRuntimeStores {
             seen_store: &seen,
@@ -507,10 +561,24 @@ pub(crate) fn run_runtime_git_scan(
 
 /// Execute the shared `scanner-git` runner setup against `canonical_repo`
 /// with caller-provided persistence adapters.
+///
+/// This helper is the common bridge for both the local runtime path and the
+/// distributed mirror-backed executor. It:
+///
+/// 1. Builds a [`NativeRefResolver`] from the lowered start-set configuration.
+/// 2. Forwards the caller-owned cooperative abort flag into `scanner-git`.
+/// 3. Wires the selected seen/watermark/persistence stores into the scan.
+/// 4. Measures wall-clock elapsed time so higher layers can fall back when the
+///    scanner's stage-level timing is unavailable.
+///
+/// The `abort` flag is borrowed for the duration of the scan and is checked by
+/// scanner-git's cooperative cancellation sites. When it is set, the scanner
+/// returns `TreeDiffError::Aborted` and skips finalize persistence.
 pub(crate) fn run_runtime_git_scan_with_stores(
     canonical_repo: &Path,
     engine: Arc<scanner_engine::Engine>,
     git_cfg: &RuntimeGitScanConfig,
+    abort: &AtomicBool,
     git_sink: Arc<dyn scanner_git::EventSink>,
     stores: GitRuntimeStores<'_>,
 ) -> Result<GitRunExecution, GitScanError> {
@@ -524,6 +592,7 @@ pub(crate) fn run_runtime_git_scan_with_stores(
         stores.watermark_store,
         stores.persist_store,
         git_cfg,
+        abort,
         git_sink,
     )?;
 

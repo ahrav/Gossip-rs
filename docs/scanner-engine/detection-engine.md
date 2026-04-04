@@ -405,8 +405,13 @@ These gates are designed to be **local and bounded**:
 
 ## Tuning Parameters
 
-| Parameter                            | Default | Purpose                                                    |
-|--------------------------------------|---------|------------------------------------------------------------|
+`Tuning` does not define a crate-wide `Default` implementation; callers supply
+their own values. The values below match `demo_tuning()` in
+`crates/scanner-engine/src/demo.rs` and are illustrative rather than universal
+runtime defaults.
+
+| Parameter                            | `demo_tuning()` Example | Purpose                                                    |
+|--------------------------------------|-------------------------|------------------------------------------------------------|
 | `merge_gap`                          | 64      | Merge adjacent windows within this byte gap                |
 | `max_windows_per_rule_variant`       | 16      | Max windows per (rule, variant) before pressure coalescing |
 | `pressure_gap_start`                 | 128     | Starting gap for pressure coalescing                       |
