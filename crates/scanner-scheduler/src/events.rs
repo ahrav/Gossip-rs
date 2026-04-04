@@ -40,8 +40,8 @@ pub struct FindingEvent<'a> {
     pub rule_name: &'a str,
     /// Normalized content hash for deduplication. `None` when the finding source
     /// does not carry a content-derived digest on the event surface; the generic
-    /// scheduler path sets this to `None` while Git-specific paths populate it
-    /// from the per-blob `FindingKey`.
+    /// scheduler path sets this to `None` while both the distributed filesystem
+    /// runtime and Git-specific paths populate it from their per-finding digest.
     ///
     /// The `Option<[u8; 32]>` representation adds 33 bytes per event. This is
     /// acceptable because `FindingEvent` is constructed on WARM paths (per-finding,
