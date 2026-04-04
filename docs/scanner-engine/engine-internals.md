@@ -648,7 +648,7 @@ Readers must never observe partial writes. Write-to-tmp + rename is atomic on PO
 - `decode_state.rs`: `DecodeSlab` and `StepArena` — owned by `ScanScratch`.
 - `work_items.rs`: `WorkItem`, `PendingDecodeSpan`, `PendingWindow` — carried in scratch queues.
 - `vectorscan_prefilter.rs`: `VsScratch`, `VsStreamWindow` — Vectorscan scratch bindings.
-- `helpers.rs`: `hash128`, `pow2_at_least`, `contains_any_memmem`, `contains_all_memmem`.
+- `helpers/`: `hash128`, `pow2_at_least`, `contains_any_memmem`, `contains_all_memmem`.
 - `transform.rs`: `STREAM_DECODE_CHUNK_BYTES`, `is_url_trigger`, `map_decoded_offset`.
 - `window_validate.rs`: Consumes `RuleCompiled` gate indices to validate candidate windows.
 - `safelist.rs`: Emit-time false-positive suppression (see below).
