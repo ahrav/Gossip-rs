@@ -154,6 +154,7 @@ and `types.rs`.
 | `crates/gossip-contracts/src/connector/common.rs` | Shared paging vocabulary |
 | `crates/gossip-contracts/src/connector/types.rs` | Toxic-byte wrappers, cursor, budgets |
 | `crates/gossip-contracts/src/connector/api.rs` | Error taxonomy, capabilities |
+| `crates/gossip-contracts/src/connector/conformance.rs` | Ordered-content conformance harness shared by concrete connector implementations |
 | `crates/gossip-contracts/src/connector/mod.rs` | Re-export hub, canonical connector tags |
 | `crates/gossip-connectors/src/lib.rs` | Crate root re-exports for concrete filesystem, Git, and in-memory connector implementations |
 | `crates/gossip-connectors/src/filesystem.rs` | Filesystem ordered-content connector |
@@ -172,14 +173,18 @@ and `types.rs`.
 | `crates/gossip-orchestrator/src/setup.rs` | Coordination-backed filesystem run setup and shard registration |
 | `crates/gossip-orchestrator/src/test_support.rs` | Shared test fixtures for orchestrator unit tests |
 | `crates/gossip-scanner-runtime/src/lib.rs` | Runtime crate root: public family entrypoints, execution-mode selection, validation, and shared scan report/config types |
+| `crates/gossip-scanner-runtime/src/cli.rs` | CLI/runtime flag mapping and entrypoint wiring for filesystem and Git scans |
 | `crates/gossip-scanner-runtime/src/ordered_content.rs` | Runtime integration for ordered content |
 | `crates/gossip-scanner-runtime/src/git_discovery.rs` | Static single-target Git repository discovery source |
+| `crates/gossip-scanner-runtime/src/git_executor.rs` | Contract-level adapter that runs scanner-git against a local mirror |
 | `crates/gossip-scanner-runtime/src/git_persistence.rs` | Runtime-backed Git persistence adapters and repo-frontier receipt helpers |
 | `crates/gossip-scanner-runtime/src/git_mirror.rs` | Worker-local Git mirror lifecycle and deterministic mirror-cache naming |
 | `crates/gossip-scanner-runtime/src/git_repo.rs` | Runtime integration for Git repo-native |
 | `crates/gossip-scanner-runtime/src/commit_pipeline.rs` | Family-neutral bounded execution -> durable-commit bridge shared after result translation |
 | `crates/gossip-scanner-runtime/src/commit_sink.rs` | Commit-sink trait and bridge record types for scan-loop lifecycle |
 | `crates/gossip-scanner-runtime/src/commit_model.rs` | Frozen runtime commit vocabulary: `CompletedUnit`, `CommitRequest`, `UnitCommitReceipt` |
+| `crates/gossip-scanner-runtime/src/event_sink.rs` | Owned event sinks and forwarders for CLI/runtime output surfaces |
+| `crates/gossip-scanner-runtime/src/parity.rs` | Cross-scanner parity helpers shared by runtime tests and tooling |
 | `crates/gossip-scanner-runtime/src/result_translation.rs` | Deterministic scan-result -> persistence-row translation |
 | `crates/gossip-scanner-runtime/src/result_committer.rs` | Authoritative findings -> done-ledger durable commit stage |
 | `crates/gossip-scanner-runtime/src/checkpoint_aggregator.rs` | Receipt-driven prefix checkpoint aggregation |

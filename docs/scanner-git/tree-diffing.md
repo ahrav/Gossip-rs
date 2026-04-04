@@ -10,7 +10,7 @@ commit and its parent) to find blob entries that were added or modified. It
 operates on raw decompressed tree payloads and performs OID-only comparison --
 no blob contents are read during the diff phase.
 
-The subsystem is composed of seven modules:
+The subsystem is composed of eight modules:
 
 ```mermaid
 flowchart TD

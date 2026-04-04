@@ -244,7 +244,7 @@ graph TD
     end
 
     subgraph Classify["Classification (gossip-connectors::common)"]
-        IPIE["<b>is_permanent_io_error()</b><br/>NotFound<br/>PermissionDenied<br/>InvalidInput<br/>InvalidFilename<br/>NotADirectory<br/>IsADirectory<br/>ELOOP (Unix raw_os_error<br/>via is_symlink_loop())"]
+        IPIE["<b>is_permanent_io_error()</b><br/>NotFound<br/>PermissionDenied<br/>InvalidInput<br/>InvalidFilename<br/>NotADirectory<br/>IsADirectory<br/>ReadOnlyFilesystem<br/>ELOOP (Unix raw_os_error<br/>via is_symlink_loop())"]
         CIE2["<b>classify_io_enumerate_error()</b><br/>op, path, &io::Error<br/>→ EnumerateError"]
         CIR["<b>classify_io_read_error()</b><br/>op, Option&lt;path&gt;, &io::Error<br/>→ ReadError"]
     end
@@ -298,6 +298,7 @@ graph TD
 | `InvalidFilename` | Permanent | OS-rejected filename |
 | `NotADirectory` | Permanent | Type mismatch |
 | `IsADirectory` | Permanent | Type mismatch |
+| `ReadOnlyFilesystem` | Permanent | Read-only mount / filesystem state |
 | `ELOOP` (Unix) | Permanent | Symlink cycle (detected via `raw_os_error`, not `ErrorKind`) |
 | Everything else | Retryable | Interrupted, would-block, timeout, or capacity failure |
 
