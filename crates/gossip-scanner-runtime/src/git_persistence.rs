@@ -823,6 +823,19 @@ pub(crate) fn build_git_repo_done_ledger_record(
     claim_time: LogicalTime,
     complete_time: LogicalTime,
 ) -> Result<DoneLedgerRecord, GitRepoDurabilityError> {
+    // Reject reversed provenance timestamps early. DoneLedgerProvenance::new
+    // only debug_asserts this, and DoneLedgerBackend::apply validates it at
+    // persistence time. Catching it here surfaces the error before any
+    // done-ledger write is attempted.
+    if claim_time.as_raw() > complete_time.as_raw() {
+        return Err(GitRepoDurabilityError::InvalidDoneLedgerRecord(
+            PersistenceInputError::ProvenanceOrdering {
+                started_at: claim_time.as_raw(),
+                finished_at: complete_time.as_raw(),
+            },
+        ));
+    }
+
     // Git repo done-ledger entries use a fixed zero ObjectVersionId because
     // repo-frontier shards track mutable refs, not immutable content versions.
     // The 32-byte StableItemId is zero-padded from the u64 repo_id per the

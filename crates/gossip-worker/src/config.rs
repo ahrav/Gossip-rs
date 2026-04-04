@@ -1543,7 +1543,7 @@ impl RawWorkerConfig {
                                     ENV_MIRROR_ROOT,
                                 )?;
                                 let mirror_root = PathBuf::from(mirror_root);
-                                validate_path_exists("mirror_root", &mirror_root)?;
+                                validate_directory_exists("mirror_root", &mirror_root)?;
                                 DistributedSourceSettings::Git(GitDistributedSourceSettings::new(
                                     GitSourceSettings::new(path)
                                         .with_rules_file(rules_file)
@@ -1652,6 +1652,28 @@ fn validate_path_exists(field: &'static str, path: &Path) -> Result<(), WorkerCo
         )),
         Ok(true) => Ok(()),
     }
+}
+
+/// Fail-fast check that a path exists **and** is a directory. Used for paths
+/// that will be used as parent directories (e.g., mirror roots where repo
+/// subdirectories are created at runtime).
+fn validate_directory_exists(field: &'static str, path: &Path) -> Result<(), WorkerConfigError> {
+    validate_path_exists(field, path)?;
+    let metadata = std::fs::metadata(path).map_err(|io_err| {
+        WorkerConfigError::invalid_value(
+            field,
+            path.display().to_string(),
+            format!("cannot inspect path kind: {io_err}"),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(WorkerConfigError::invalid_value(
+            field,
+            path.display().to_string(),
+            "path exists but is not a directory",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_budgets(budgets: &ScanBudgets) -> Result<(), WorkerConfigError> {

@@ -2745,12 +2745,6 @@ where
     Ok((report, completion))
 }
 
-/// Submit captured Git findings to the durable findings sink.
-///
-/// The batch is currently always empty because the translation from
-/// `OwnedCoreEvent::Finding` to `FindingRecord`/`OccurrenceRecord`/
-/// `ObservationRecord` is not yet implemented. The caller must log a warning
-/// when `detected_count > 0` so the gap is operationally visible.
 /// Submit findings and a done-ledger entry for one completed Git repo scan.
 ///
 /// Persists captured findings first, then constructs and submits the
@@ -2782,7 +2776,8 @@ where
     // --- findings submission ---
     // TODO: Translate captured OwnedCoreEvent::Finding entries into
     // FindingRecord/OccurrenceRecord/ObservationRecord for real persistence.
-    // Until then, an empty batch is submitted to obtain a valid receipt.
+    // The caller rejects leases with detected_count > 0, so this empty batch
+    // is only reached when the scan produced zero findings.
     let batch = FindingsUpsertBatch::new(&[], &[], &[]);
     let handle = persistence
         .findings_sink
@@ -3020,20 +3015,27 @@ where
         )));
     }
 
-    // Findings must be durable BEFORE shard checkpoint advances. With the current
-    // in-memory GitPersistenceBackend, post-execution batch write is safe: a crash
-    // clears in-memory watermarks, causing full re-scan on re-claim. When a durable
-    // GitPersistenceBackend lands, finalize must be split: seen-bitmaps →
-    // findings persistence → watermark commit.
+    // Findings must be durable BEFORE shard checkpoint advances. With the
+    // in-memory GitPersistenceBackend, post-execution batch write is safe:
+    // a crash clears in-memory watermarks, causing full re-scan on re-claim.
+    // With a durable GitPersistenceBackend, finalize must be split:
+    // seen-bitmaps → findings persistence → watermark commit.
     let detected_count = capture_sink.detected_finding_count();
 
     if detected_count > 0 {
-        tracing::warn!(
-            shard_id = %lease.shard_id(),
-            detected_count,
-            "git repo scan detected findings but translation to durable persistence \
-             records is not yet implemented; findings are captured in telemetry only"
-        );
+        // Durable findings translation is not yet available. Persisting an
+        // empty batch while advancing the shard checkpoint would mark the
+        // repo as ScannedClean, silently dropping detected findings from
+        // durable storage. Fail the lease so the repo stays reclaimable
+        // and will be rescanned once findings persistence is implemented.
+        return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+            anyhow::anyhow!(
+                "git repo-frontier shard '{}' detected {detected_count} finding(s), \
+                 but durable Git finding translation is unavailable; \
+                 refusing to checkpoint as clean",
+                lease.shard_id(),
+            ),
+        )));
     }
 
     let complete_time = wall_clock_now();
@@ -3609,6 +3611,22 @@ mod tests {
             "Distributed Runtime Tests",
         );
         fs::write(dir.path().join("secret.txt"), secret_fixture()).expect("write fixture");
+        run_git_in(dir.path(), &["add", "."]);
+        run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
+        dir
+    }
+
+    /// Git repo fixture containing only benign content that does not trigger
+    /// any detection rules. Use this for tests that need the scan to complete
+    /// successfully without any findings.
+    fn create_clean_git_repo_fixture() -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        init_git_repo(
+            dir.path(),
+            "distributed-runtime-tests@example.com",
+            "Distributed Runtime Tests",
+        );
+        fs::write(dir.path().join("readme.txt"), "hello world\n").expect("write fixture");
         run_git_in(dir.path(), &["add", "."]);
         run_git_in(dir.path(), &["commit", "-q", "-m", "fixture"]);
         dir
@@ -6213,7 +6231,7 @@ mod tests {
 
     #[test]
     fn run_git_repo_worker_completes_singleton_repo_frontier_shard() {
-        let repo = create_git_repo_fixture();
+        let repo = create_clean_git_repo_fixture();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6269,12 +6287,12 @@ mod tests {
         assert_eq!(
             rows[0].status(),
             DoneLedgerStatus::ScannedClean,
-            "test fixture has no detection rules; status must be ScannedClean"
+            "benign fixture produces no findings; status must be ScannedClean"
         );
         assert_eq!(
             rows[0].findings_count(),
             0,
-            "test fixture has no detection rules; findings count must be zero"
+            "benign fixture produces no findings; findings count must be zero"
         );
     }
 
@@ -6416,7 +6434,7 @@ mod tests {
     /// payload's repo key.
     #[test]
     fn run_git_repo_worker_passes_repo_key_guard_for_matching_target() {
-        let repo = create_git_repo_fixture();
+        let repo = create_clean_git_repo_fixture();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6488,6 +6506,10 @@ mod tests {
     /// the `CoordinationEventRecorder` telemetry path.
     #[test]
     fn run_git_repo_worker_records_git_events() {
+        // Uses the secret fixture because it produces blob candidates that
+        // trigger scanner processing and emit git events. The fail-fast guard
+        // rejects the lease (findings detected without durable translation),
+        // but git events are emitted during the scan before the guard fires.
         let repo = create_git_repo_fixture();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
@@ -6500,30 +6522,31 @@ mod tests {
         let mut coordinator =
             setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
 
-        run_git_repo_worker(
+        // The scan runs to completion but the fail-fast guard rejects the
+        // lease because findings were detected. Git events are still recorded.
+        let _result = run_git_repo_worker(
             &mut coordinator,
             &mut mirrors,
             identity,
             backend,
             DistributedPersistence::new(InMemoryFindingsSink::new(), InMemoryDoneLedger::new()),
             DistributedRuntimeConfig::default(),
-        )
-        .expect("git repo worker should succeed");
+        );
 
         let events = test_recorder.git_events.lock().expect("git events lock");
         assert!(
             !events.is_empty(),
-            "git worker should emit at least one git event during a successful scan"
+            "git worker should emit at least one git event during the scan"
         );
     }
 
     /// The done-ledger record produced by a successful git repo scan must
     /// derive its findings count from the durable findings receipt, not from
-    /// the captured event stream. When the test fixture has no matching
-    /// detection rules, findings_count must be zero and status ScannedClean.
+    /// the captured event stream. When the fixture produces no findings,
+    /// findings_count must be zero and status ScannedClean.
     #[test]
     fn git_repo_worker_done_ledger_uses_receipt_count() {
-        let repo = create_git_repo_fixture();
+        let repo = create_clean_git_repo_fixture();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6553,7 +6576,7 @@ mod tests {
         assert_eq!(
             rows[0].findings_count(),
             0,
-            "test fixture has no detection rules; findings_count must be zero"
+            "benign fixture produces no findings; findings_count must be zero"
         );
         assert_eq!(
             rows[0].status(),
@@ -6564,10 +6587,11 @@ mod tests {
 
     /// A findings-sink submission failure during git repo persistence must
     /// surface as `DistributedRuntimeError::Durability` and must not advance
-    /// the shard cursor.
+    /// the shard cursor. Uses a clean fixture (no findings) so the persistence
+    /// path is reached.
     #[test]
     fn git_repo_worker_propagates_findings_sink_failure() {
-        let repo = create_git_repo_fixture();
+        let repo = create_clean_git_repo_fixture();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6613,10 +6637,11 @@ mod tests {
 
     /// A done-ledger submission failure during git repo persistence must
     /// surface as `DistributedRuntimeError::Durability` and must not advance
-    /// the shard cursor.
+    /// the shard cursor. Uses a clean fixture (no findings) so the persistence
+    /// path is reached.
     #[test]
     fn git_repo_worker_propagates_done_ledger_failure() {
-        let repo = create_git_repo_fixture();
+        let repo = create_clean_git_repo_fixture();
         let mirror_root = tempdir().expect("mirror root");
         let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
         let backend = TestGitBackend::default();
@@ -6650,6 +6675,51 @@ mod tests {
             summaries[0].status(),
             ShardStatus::Done,
             "shard must not advance when done-ledger submission fails"
+        );
+    }
+
+    /// When a Git scan detects findings but durable findings translation is
+    /// unavailable, the worker must reject the lease rather than checkpointing
+    /// the repo as clean. This prevents false-clean done-ledger entries from
+    /// suppressing future rescans of repos with active secrets.
+    #[test]
+    fn git_repo_worker_rejects_lease_when_findings_detected_without_durable_translation() {
+        let repo = create_git_repo_fixture();
+        let mirror_root = tempdir().expect("mirror root");
+        let mut mirrors = LocalMirrorManager::new(mirror_root.path()).expect("mirror manager");
+        let backend = TestGitBackend::default();
+        let mut coordinator =
+            setup_coordinator_with_git_shard(repo.path(), CoordCursorUpdate::initial(), 30_000);
+
+        let done_ledger = InMemoryDoneLedger::new();
+        let err = run_git_repo_worker(
+            &mut coordinator,
+            &mut mirrors,
+            git_worker_identity(repo.path()),
+            backend,
+            DistributedPersistence::new(InMemoryFindingsSink::new(), done_ledger.clone()),
+            DistributedRuntimeConfig::default(),
+        )
+        .expect_err("scan with detected findings must fail when translation is unavailable");
+
+        assert!(
+            matches!(err, DistributedRuntimeError::Runtime(_)),
+            "expected Runtime variant for findings-without-translation guard, got: {err:?}"
+        );
+
+        let summaries = shard_summaries(&coordinator);
+        assert_eq!(summaries.len(), 1);
+        assert_ne!(
+            summaries[0].status(),
+            ShardStatus::Done,
+            "shard must not advance when findings cannot be durably persisted"
+        );
+        assert!(
+            done_ledger
+                .snapshot()
+                .expect("done-ledger snapshot")
+                .is_empty(),
+            "done-ledger must remain empty when the findings guard rejects the lease"
         );
     }
 

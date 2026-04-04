@@ -165,16 +165,13 @@ impl GitEventOutput for CoordinationEventSink {
 /// while forwarding all events to the inner sink unchanged.
 ///
 /// The count is retrieved via [`detected_finding_count`](Self::detected_finding_count)
-/// after the scan completes to log how many findings were detected before
-/// advancing the shard checkpoint.
+/// after the scan completes. The caller uses this count to decide whether
+/// the shard checkpoint can safely advance (zero findings) or must be
+/// rejected (nonzero findings without durable persistence).
 ///
 /// The counter uses `Relaxed` ordering because it is only read after the scan
 /// thread joins (establishing a happens-before via `std::thread::scope`), so
 /// the final value is always visible to the reader.
-///
-/// When the durable findings translation layer lands, this struct should be
-/// upgraded to capture `OwnedCoreEvent::Finding` instances into a buffer so
-/// they can be written to `FindingsSink` before checkpoint advance.
 pub(crate) struct FindingsCaptureSink {
     inner: Arc<CoordinationEventSink>,
     finding_count: AtomicU64,
