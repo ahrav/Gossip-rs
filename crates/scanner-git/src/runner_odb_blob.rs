@@ -437,7 +437,7 @@ pub(super) fn run_odb_blob(
             pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
             plans.push(plan);
         }
-        // No plan-level filter needed: the candidate-level retain on line 348
+        // No plan-level filter needed: the candidate-level retain above
         // already removed every candidate belonging to a completed pack, so
         // bucket_pack_candidates never produces those pack_ids and no plan is
         // built for them.

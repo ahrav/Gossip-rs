@@ -8,7 +8,7 @@ integration, and finalization.
 
 The runner subsystem is the top-level orchestrator for git scans. It owns the
 end-to-end pipeline from repository open through finalize and optional
-persistence. The subsystem is split across six source files:
+persistence. The subsystem is split across seven source files:
 
 | Module                   | Location                                              | Responsibility                                          |
 | ------------------------ | ----------------------------------------------------- | ------------------------------------------------------- |
@@ -18,6 +18,7 @@ persistence. The subsystem is split across six source files:
 | `runner_exec`            | `crates/scanner-git/src/runner_exec.rs`               | Shared pack execution helpers and scheduler dispatch    |
 | `engine_adapter`         | `crates/scanner-git/src/engine_adapter.rs`            | Bridge from decoded blobs to the core `Engine`          |
 | `finalize`               | `crates/scanner-git/src/finalize.rs`                  | Deterministic write-op builder for persistence          |
+| `persist`                | `crates/scanner-git/src/persist.rs`                   | Atomic finalize commit and incremental seen-bitmap ops  |
 
 The runner dispatches to one of two mode-specific pipelines after shared setup:
 
