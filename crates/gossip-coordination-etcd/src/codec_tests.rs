@@ -1,3 +1,10 @@
+//! Tests for etcd coordination record encoding and decoding.
+//!
+//! Contains round-trip property tests and structural unit tests for the binary
+//! codec used to persist `RunRecord` and `ShardRecord` structures to etcd.
+//! Ensures that field validation, length constraints, and invariant checks
+//! are correctly applied during deserialization.
+
 use super::*;
 
 use gossip_contracts::coordination::{CursorSemantics, CursorUpdate, PooledSpawned, ShardSpecRef};

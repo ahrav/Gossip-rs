@@ -492,7 +492,6 @@ mod tests {
     use blake3::Hasher;
     use proptest::prelude::*;
 
-    // Invoke the macros to create test-only types.
     define_id_32! {
         /// Public test ID for macro verification.
         PubTestId
