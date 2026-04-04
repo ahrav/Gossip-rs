@@ -1,18 +1,18 @@
 //! Ordered-content connector family contract.
 //!
-//! This module defines the first concrete source family built on top of the
-//! shared paging vocabulary ([`PageBuf`], [`super::PageState`]). It models
-//! sources whose worker loop is naturally:
+//! Defines a source family built on the shared paging vocabulary ([`PageBuf`],
+//! [`super::PageState`]). It models sources where the worker loop executes the
+//! following sequence:
 //!
-//! 1. fill a bounded ordered page of [`ScanItem`] values,
-//! 2. scan or skip committed items,
-//! 3. open or range-read item bytes,
-//! 4. checkpoint durable progress using the page's terminal state.
+//! 1. Fill a bounded ordered page of [`ScanItem`] values.
+//! 2. Scan or skip committed items.
+//! 3. Open or range-read item bytes.
+//! 4. Checkpoint durable progress using the page's terminal state.
 //!
-//! This family is intentionally narrower than a fake one-trait-fits-all
-//! connector model. Git repo-native execution is not an ordered-content source;
-//! it belongs in its own family because it operates on whole repositories
-//! rather than item-by-item byte reads.
+//! ## Design Trade-offs
+//! This model is intentionally narrower than a universal connector trait. Sources
+//! operating on aggregate states (e.g., full Git repositories) rather than
+//! item-by-item byte reads belong in separate, specialized families.
 
 use std::io;
 
@@ -38,25 +38,25 @@ pub struct OrderedContentCapabilities {
 /// Ordered content source contract.
 ///
 /// Implementations enumerate [`ScanItem`] values in canonical source order and
-/// expose the corresponding bytes through [`open`](Self::open) and optionally
+/// expose corresponding bytes through [`open`](Self::open) and optionally
 /// [`read_range`](Self::read_range).
 ///
 /// ## Mutability
-///
-/// Methods take `&mut self` because implementations typically maintain mutable
-/// internal state: connection handles, cached pagination position, directory
-/// iterators, or index structures built lazily on first call. For concurrent
-/// multi-shard enumeration, clone the source instance or wrap in
-/// `Arc<Mutex<dyn OrderedContentSource>>`.
+/// Methods take `&mut self` because implementations maintain mutable internal
+/// state (e.g., connection handles, cached pagination position, directory
+/// iterators, or lazy index structures). For concurrent multi-shard enumeration,
+/// clone the source instance or wrap in `Arc<Mutex<dyn OrderedContentSource>>`.
 pub trait OrderedContentSource: Send {
-    /// Returns the ordered-content features this source supports.
     fn capabilities(&self) -> OrderedContentCapabilities;
 
-    /// Fill one bounded page of ordered content items within `shard`.
+    /// Fills one bounded page of ordered content items within `shard`.
     ///
+    /// ## Guarantees
     /// Returns `Ok(Some(page))` with a non-empty page of items, or `Ok(None)`
-    /// to signal terminal completion when no in-scope items remain (the empty
-    /// terminal call in the two-call shard completion pattern).
+    /// to signal terminal completion when no in-scope items remain.
+    ///
+    /// ## Errors
+    /// Returns `EnumerateError` if enumeration fails or budgets are exhausted.
     fn fill_page(
         &mut self,
         shard: &ShardSpec,
@@ -64,10 +64,14 @@ pub trait OrderedContentSource: Send {
         budgets: Budgets,
     ) -> Result<Option<PageBuf<ScanItem>>, EnumerateError>;
 
-    /// Suggest a split point strictly inside the remaining shard suffix.
+    /// Suggests a split point strictly inside the remaining shard suffix.
     ///
-    /// Returns `Ok(None)` when the source does not support split hints
-    /// (the default) or has no suggestion for the current position.
+    /// ## Guarantees
+    /// Returns `Ok(None)` if the source does not support split hints or has
+    /// no suggestion for the current position.
+    ///
+    /// ## Errors
+    /// Returns `EnumerateError` if hint generation fails.
     fn choose_split_point(
         &mut self,
         _shard: &ShardSpec,
@@ -77,23 +81,25 @@ pub trait OrderedContentSource: Send {
         Ok(None)
     }
 
-    /// Open the full content for an item.
+    /// Opens the full content stream for an item.
+    ///
+    /// ## Errors
+    /// Returns `ReadError` if the item stream cannot be opened.
     fn open(
         &mut self,
         item_ref: &ItemRef,
         budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError>;
 
-    /// Read a byte range from item content.
+    /// Reads a byte range from item content.
     ///
-    /// Returns the number of bytes written into `dst`, which may be less than
-    /// `dst.len()`. Returns `Ok(0)` when `offset` is at or past the end of
-    /// item content. Implementations must return an error if `offset + dst.len()`
-    /// would overflow `u64`.
+    /// ## Guarantees
+    /// Returns the number of bytes written into `dst` (may be less than `dst.len()`).
+    /// Returns `Ok(0)` when `offset` is at or past the end of item content.
     ///
-    /// Sources that do not advertise
-    /// [`range_read`](OrderedContentCapabilities::range_read) return
-    /// [`ReadError::unsupported`] (the default).
+    /// ## Errors
+    /// - Returns `ReadError::unsupported` if the source does not advertise `range_read`.
+    /// - Returns `ReadError` if `offset + dst.len()` would overflow `u64`.
     fn read_range(
         &mut self,
         _item_ref: &ItemRef,
