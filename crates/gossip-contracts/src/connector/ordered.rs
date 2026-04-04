@@ -53,10 +53,15 @@ pub trait OrderedContentSource: Send {
     ///
     /// ## Guarantees
     /// Returns `Ok(Some(page))` with a non-empty page of items, or `Ok(None)`
-    /// to signal terminal completion when no in-scope items remain.
+    /// to signal terminal completion when no in-scope items remain. Returned
+    /// pages respect the caller's item and byte budgets, except that an
+    /// implementation may still emit the first in-scope item when admitting it
+    /// is required to preserve forward progress.
     ///
     /// ## Errors
-    /// Returns `EnumerateError` if enumeration fails or budgets are exhausted.
+    /// Returns `EnumerateError` if enumeration fails. Implementations may also
+    /// surface budget exhaustion as an error, but budgets can also terminate a
+    /// successful partial page.
     fn fill_page(
         &mut self,
         shard: &ShardSpec,
