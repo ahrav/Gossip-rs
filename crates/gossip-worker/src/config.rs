@@ -961,6 +961,29 @@ pub enum DistributedWorkerLaunch {
     },
 }
 
+impl fmt::Debug for DistributedWorkerLaunch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fs(identity) => f
+                .debug_struct("Fs")
+                .field("tenant", &identity.tenant)
+                .field("run", &identity.run)
+                .field("worker", &identity.worker)
+                .finish_non_exhaustive(),
+            Self::Git {
+                identity,
+                mirror_root,
+            } => f
+                .debug_struct("Git")
+                .field("tenant", &identity.tenant)
+                .field("run", &identity.run)
+                .field("worker", &identity.worker)
+                .field("mirror_root", &mirror_root)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// Fully resolved worker launch configuration.
 #[derive(Clone, Debug)]
 pub enum ResolvedWorkerConfig {
@@ -1499,16 +1522,18 @@ impl RawWorkerConfig {
                             done_ledger_postgres_dsn,
                             findings_postgres_dsn,
                         )?;
-                        validate_path_exists("path", &path)?;
                         let source = match source {
-                            WorkerSource::Fs => DistributedSourceSettings::Fs(
-                                FsSourceSettings::new(path)
-                                    .with_rules_file(rules_file)
-                                    .with_decode_depth(decode_depth)
-                                    .with_scan_binary(scan_binary)
-                                    .with_skip_archives(skip_archives)
-                                    .with_anchor_mode(anchor_mode),
-                            ),
+                            WorkerSource::Fs => {
+                                validate_path_exists("path", &path)?;
+                                DistributedSourceSettings::Fs(
+                                    FsSourceSettings::new(path)
+                                        .with_rules_file(rules_file)
+                                        .with_decode_depth(decode_depth)
+                                        .with_scan_binary(scan_binary)
+                                        .with_skip_archives(skip_archives)
+                                        .with_anchor_mode(anchor_mode),
+                                )
+                            }
                             WorkerSource::Git => {
                                 let mirror_root = parse_required(
                                     self.mirror_root.as_deref(),
@@ -2020,9 +2045,12 @@ mod tests {
                 assert_eq!(cfg.runtime().budgets().max_items, 1024);
                 assert_eq!(cfg.runtime().budgets().max_bytes, 2_097_152);
                 assert_eq!(cfg.runtime().commit_queue_capacity().get(), 128);
-                assert_eq!(cfg.source().path(), Path::new("/tmp"));
-                assert!(cfg.source().scan_binary());
-                assert_eq!(cfg.source().anchor_mode(), AnchorMode::Derived);
+                let DistributedSourceSettings::Fs(source) = cfg.source() else {
+                    panic!("expected Fs source");
+                };
+                assert_eq!(source.path(), Path::new("/tmp"));
+                assert!(source.scan_binary());
+                assert_eq!(source.anchor_mode(), AnchorMode::Derived);
                 assert_eq!(
                     cfg.production_backends().etcd().namespace_prefix(),
                     "/gossip/v1"
@@ -2056,7 +2084,10 @@ mod tests {
         match resolved {
             ResolvedWorkerConfig::Distributed(cfg) => {
                 assert_eq!(cfg.run(), RunId::from_raw(99));
-                assert_eq!(cfg.source().path(), Path::new("/tmp"));
+                let DistributedSourceSettings::Fs(source) = cfg.source() else {
+                    panic!("expected Fs source");
+                };
+                assert_eq!(source.path(), Path::new("/tmp"));
             }
             other => panic!("expected distributed config, got {other:?}"),
         }
@@ -2171,17 +2202,84 @@ mod tests {
     }
 
     #[test]
-    fn connector_mode_rejects_git_source_for_local_git_scans() {
+    fn connector_git_source_requires_mirror_root() {
         let env = production_env().with(ENV_WORKER_SOURCE, "git");
         let err = resolve_worker_config_from(Vec::<String>::new(), &env)
-            .expect_err("connector mode must reject git");
+            .expect_err("git connector mode without mirror_root must fail");
 
-        assert!(matches!(
-            err,
-            WorkerConfigError::UnsupportedCombination { ref message }
-                if message.contains("source=fs")
-                    && message.contains("--mode=direct")
-        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("mirror_root"),
+            "error must mention the missing mirror_root field: {message}"
+        );
+    }
+
+    #[test]
+    fn connector_git_source_resolves_with_mirror_root() {
+        let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
+        let env = production_env().with(ENV_WORKER_SOURCE, "git").with(
+            ENV_MIRROR_ROOT,
+            mirror_dir.path().to_str().expect("utf-8 path"),
+        );
+
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("git connector mode with mirror_root should resolve");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        let DistributedSourceSettings::Git(git) = cfg.source() else {
+            panic!("expected Git source");
+        };
+        assert_eq!(git.mirror_root(), mirror_dir.path());
+    }
+
+    #[test]
+    fn connector_git_source_worker_launch_produces_git_variant() {
+        let mirror_dir = tempfile::tempdir().expect("tempdir for mirror root");
+        let env = production_env().with(ENV_WORKER_SOURCE, "git").with(
+            ENV_MIRROR_ROOT,
+            mirror_dir.path().to_str().expect("utf-8 path"),
+        );
+
+        let resolved = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect("git connector should resolve");
+
+        let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
+            panic!("expected distributed config");
+        };
+        let launch = cfg.worker_launch();
+        let DistributedWorkerLaunch::Git {
+            identity,
+            mirror_root,
+        } = launch
+        else {
+            panic!("expected Git launch, got {launch:?}");
+        };
+        assert_eq!(identity.tenant, cfg.tenant());
+        assert_eq!(identity.run, cfg.run());
+        assert_eq!(identity.worker, cfg.worker());
+        assert_eq!(mirror_root, mirror_dir.path());
+    }
+
+    #[test]
+    fn connector_git_source_rejects_nonexistent_mirror_root() {
+        let env = production_env()
+            .with(ENV_WORKER_SOURCE, "git")
+            .with(ENV_MIRROR_ROOT, "/no/such/mirror/root/directory");
+
+        let err = resolve_worker_config_from(Vec::<String>::new(), &env)
+            .expect_err("nonexistent mirror_root must be rejected");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("mirror_root"),
+            "error must name the mirror_root field: {message}"
+        );
+        assert!(
+            message.contains("does not exist"),
+            "error must explain the path does not exist: {message}"
+        );
     }
 
     #[test]
@@ -2253,7 +2351,9 @@ mod tests {
         let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
             panic!("expected distributed config");
         };
-        let identity = cfg.worker_identity();
+        let DistributedWorkerLaunch::Fs(identity) = cfg.worker_launch() else {
+            panic!("expected Fs launch");
+        };
         assert_eq!(identity.tenant, cfg.tenant());
         assert_eq!(identity.run, cfg.run());
         assert_eq!(identity.worker, cfg.worker());
@@ -2275,11 +2375,13 @@ mod tests {
         let ResolvedWorkerConfig::Distributed(cfg) = resolved else {
             panic!("expected distributed config");
         };
-        let identity = cfg.worker_identity();
+        let DistributedWorkerLaunch::Fs(identity) = cfg.worker_launch() else {
+            panic!("expected Fs launch");
+        };
         let debug = format!("{:?}", identity.recorder);
         assert!(
             debug.contains("ProductionCoordinationEventRecorder"),
-            "default worker_identity() must wire the production recorder: {debug}"
+            "default worker_launch() must wire the production recorder: {debug}"
         );
     }
 
@@ -3270,19 +3372,19 @@ mod tests {
         );
     }
 
-    // --- Git source rejection via CLI positional arg ---
+    // --- Git source via CLI positional requires mirror_root ---
 
     #[test]
-    fn connector_mode_rejects_git_source_via_cli_positional() {
+    fn connector_git_source_via_cli_requires_mirror_root() {
         let env = production_env();
         let err = resolve_worker_config_from(["git", "/tmp"], &env)
-            .expect_err("connector mode must reject git via positional arg");
-        assert!(matches!(
-            err,
-            WorkerConfigError::UnsupportedCombination { ref message }
-                if message.contains("source=fs")
-                    && message.contains("--mode=direct")
-        ));
+            .expect_err("git connector via CLI positional without mirror_root must fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("mirror_root"),
+            "error must mention the missing mirror_root field: {message}"
+        );
     }
 
     // --- Direct WorkerIdentityConfig construction validation ---
@@ -3339,7 +3441,7 @@ mod tests {
             backends,
             ProductionStartupSettings::validate_only(),
             identity,
-            FsSourceSettings::new("/tmp"),
+            DistributedSourceSettings::Fs(FsSourceSettings::new("/tmp")),
             runtime,
         );
         assert!(

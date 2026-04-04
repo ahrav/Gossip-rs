@@ -6,16 +6,15 @@
 //! - runs a local direct filesystem or git scan, or
 //! - launches the real distributed worker path against etcd and PostgreSQL.
 //!
-//! Connector-mode filesystem scans route through the distributed worker loop.
-//! They do not silently downgrade to the local scan path.
+//! Connector-mode scans (filesystem and Git) route through the distributed
+//! worker loop. They do not silently downgrade to the local scan path.
 
 use gossip_scanner_runtime::{
     ScanReport, ScanRuntimeError, distributed::DistributedRunReport, scan_fs, scan_git,
 };
 use gossip_worker::config::{
     DistributedSourceSettings, DistributedWorkerConfig, LocalWorkerConfig, ResolvedWorkerConfig,
-    WorkerSourceSettings,
-    resolve_worker_config_from_env_and_args,
+    WorkerSourceSettings, resolve_worker_config_from_env_and_args,
 };
 use gossip_worker::production::{ProductionWorkerError, run_production_worker};
 use tracing_subscriber::EnvFilter;
@@ -236,8 +235,8 @@ mod tests {
         },
     };
     use gossip_worker::config::{
-        DistributedWorkerRuntimeSettings, FsSourceSettings, GitSourceSettings,
-        ProductionBackendConfig, WorkerIdentityConfig,
+        DistributedWorkerLaunch, DistributedWorkerRuntimeSettings, FsSourceSettings,
+        GitSourceSettings, ProductionBackendConfig, WorkerIdentityConfig,
     };
     use gossip_worker::production::ProductionStartupSettings;
     use tempfile::tempdir;
@@ -311,7 +310,7 @@ mod tests {
             backends,
             ProductionStartupSettings::validate_only(),
             identity,
-            FsSourceSettings::new(path.to_path_buf()),
+            DistributedSourceSettings::Fs(FsSourceSettings::new(path.to_path_buf())),
             DistributedWorkerRuntimeSettings::new(
                 ScanBudgets::default(),
                 defaults.commit_queue_capacity,
@@ -448,9 +447,12 @@ mod tests {
 
         let report = execute_resolved_worker_with(&resolved, |cfg| {
             distributed_runner_called = true;
+            let DistributedWorkerLaunch::Fs(identity) = cfg.worker_launch() else {
+                panic!("expected Fs launch variant");
+            };
             run_worker(
                 &mut coordinator,
-                cfg.worker_identity(),
+                identity,
                 DistributedPersistence::new(findings.clone(), done_ledger.clone()),
                 cfg.runtime_config(),
             )
@@ -497,9 +499,12 @@ mod tests {
 
         let error = execute_resolved_worker_with(&resolved, |cfg| {
             distributed_runner_called = true;
+            let DistributedWorkerLaunch::Fs(identity) = cfg.worker_launch() else {
+                panic!("expected Fs launch variant");
+            };
             run_worker(
                 &mut coordinator,
-                cfg.worker_identity(),
+                identity,
                 DistributedPersistence::new(findings.clone(), done_ledger.clone()),
                 cfg.runtime_config(),
             )

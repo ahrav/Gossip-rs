@@ -107,9 +107,9 @@ in one call:
 caller
   -> ProductionBackendConfig::new(...)
   -> ProductionStartupSettings::{validate_only, dev_auto_migrate}()
-  -> DistributedWorkerConfig::worker_identity() | worker_identity_with_recorder()
+  -> DistributedWorkerConfig::worker_launch() | worker_launch_with_recorder()
   -> DistributedWorkerConfig::runtime_config()
-  -> run_production_worker(config, startup, identity, runtime)
+  -> run_production_worker(config, startup, launch, runtime)
      -> build_production_backends(config, startup)
         -> connect_postgres_client(...) [done-ledger]
         -> connect_postgres_client(...) [findings]
@@ -117,7 +117,9 @@ caller
            -> EtcdCoordinator::connect(...) [includes cluster health check]
            -> prepare_done_ledger_backend(...)
            -> prepare_findings_backend(...)
-     -> distributed::run_worker(...)
+     -> match launch:
+        Fs  -> distributed::run_worker(...)
+        Git -> LocalMirrorManager::new(...) + distributed::run_git_repo_worker(...)
   -> DistributedRunReport
 ```
 
@@ -180,8 +182,9 @@ override environment values when both are present.
 |----------|--------|---------|----------|-------------|
 | `GOSSIP_WORKER_MODE` | `direct` or `connector` | `connector` | No | Selects the execution mode family. |
 | `GOSSIP_WORKER_BACKEND` | `local` or `production` | `production` in connector mode | No | Optional backend override. Connector mode defaults to `production`; `local` is only valid with `--mode=direct`. |
-| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Connector mode supports only `fs`; use direct mode for local git scans. |
+| `GOSSIP_WORKER_SOURCE` | `fs` or `git` | `fs` | No | Selects the source family. Both `fs` and `git` are supported in connector mode. |
 | `GOSSIP_WORKER_PATH` | filesystem path | `.` | No | Filesystem or git repository path to scan. |
+| `GOSSIP_MIRROR_ROOT` | filesystem path | *(none)* | Yes (git connector) | Worker-local directory for deterministic Git mirrors between lease cycles. Required when `source=git` in connector mode. |
 | `GOSSIP_ETCD_ENDPOINTS` | comma-separated URLs | *(none)* | Yes (production) | etcd endpoint CSV for the coordination backend. |
 | `GOSSIP_ETCD_NAMESPACE` | string | *(none)* | Yes (production) | etcd namespace prefix for key isolation. |
 | `GOSSIP_DONE_LEDGER_POSTGRES_DSN` | PostgreSQL DSN | *(none)* | Yes (production) | Connection string for the done-ledger database. |

@@ -20,6 +20,10 @@
 
 use std::fmt;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use crate::config::{DistributedWorkerLaunch, ProductionBackendConfig};
 use gossip_coordination_etcd::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorError};
 use gossip_done_ledger_postgres::{
@@ -36,6 +40,7 @@ use gossip_scanner_runtime::distributed::{
     DistributedRuntimeError, GitWorkerIdentity, WorkerIdentity, run_git_repo_worker, run_worker,
 };
 use gossip_scanner_runtime::git_mirror::LocalMirrorManager;
+use gossip_scanner_runtime::git_persistence::{GitPersistenceBackend, GitPersistenceOp};
 use postgres::{Client, NoTls};
 
 /// Schema-readiness mode applied during backend bootstrap.
@@ -316,13 +321,20 @@ impl ProductionRuntimeBackends {
 
     /// Run the distributed Git repo-frontier worker loop on the real backends.
     ///
+    /// The caller provides a concrete [`GitPersistenceBackend`] for Git
+    /// key-value durability (seen-blobs, ref watermarks, staging state).
+    /// This is separate from the filesystem-path `DistributedPersistence`
+    /// because the Git worker loop manages persistence through the
+    /// `GitPersistenceAdapter` rather than the findings/done-ledger pipeline.
+    ///
     /// # Errors
     ///
     /// Returns [`DistributedRuntimeError`] when shard claiming, mirror sync,
     /// Git execution, durable finalize handling, or lease completion fails.
-    pub fn run_git(
+    pub fn run_git<B: GitPersistenceBackend + Clone>(
         mut self,
         mirrors: &mut LocalMirrorManager,
+        git_backend: B,
         identity: GitWorkerIdentity,
         runtime: DistributedRuntimeConfig,
     ) -> Result<DistributedRunReport, DistributedRuntimeError> {
@@ -330,9 +342,46 @@ impl ProductionRuntimeBackends {
             &mut self.coordinator,
             mirrors,
             identity,
-            self.persistence,
+            git_backend,
             runtime,
         )
+    }
+}
+
+/// Process-local in-memory Git key-value persistence backend.
+///
+/// Stores key-value pairs in a shared [`HashMap`] using reference-counted
+/// interior mutability. All clones share the same backing store, so state
+/// written by one `GitPersistenceAdapter` clone is visible to all others.
+///
+/// State does not survive process restarts. This backend is suitable for
+/// single-worker development and early integration until a durable
+/// (e.g. PostgreSQL-backed) Git persistence backend is available.
+#[derive(Debug, Clone, Default)]
+struct InMemoryGitPersistence {
+    store: Rc<RefCell<HashMap<Vec<u8>, Vec<u8>>>>,
+}
+
+impl GitPersistenceBackend for InMemoryGitPersistence {
+    type Error = std::convert::Infallible;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn apply_batch(&self, ops: &[GitPersistenceOp]) -> Result<(), Self::Error> {
+        let mut store = self.store.borrow_mut();
+        for op in ops {
+            match op {
+                GitPersistenceOp::Put { key, value } => {
+                    store.insert(key.clone(), value.clone());
+                }
+                GitPersistenceOp::Delete { key } => {
+                    store.remove(key.as_slice());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -486,14 +535,14 @@ pub fn run_production_worker(
             identity,
             mirror_root,
         } => {
-            let mut mirrors =
-                LocalMirrorManager::new(mirror_root).map_err(|error| {
-                    ProductionBootstrapError::GitMirrorManager {
-                        message: error.to_string(),
-                    }
-                })?;
+            let mut mirrors = LocalMirrorManager::new(mirror_root).map_err(|error| {
+                ProductionBootstrapError::GitMirrorManager {
+                    message: error.to_string(),
+                }
+            })?;
+            let git_backend = InMemoryGitPersistence::default();
             backends
-                .run_git(&mut mirrors, identity, runtime)
+                .run_git(&mut mirrors, git_backend, identity, runtime)
                 .map_err(ProductionWorkerError::Runtime)
         }
     }
@@ -840,7 +889,8 @@ mod tests {
     };
 
     use crate::{
-        config::ProductionBackendConfigError, recorder::ProductionCoordinationEventRecorder,
+        config::{DistributedWorkerLaunch, ProductionBackendConfigError},
+        recorder::ProductionCoordinationEventRecorder,
     };
     use gossip_contracts::identity::{PolicyHash, RunId, TenantId, TenantSecretKey, WorkerId};
     use gossip_coordination_etcd::test_support::test_async_coordinator_config;
@@ -896,8 +946,8 @@ mod tests {
         .expect("test backend config should be valid")
     }
 
-    fn production_worker_identity(path: &Path) -> WorkerIdentity {
-        WorkerIdentity::new(
+    fn production_worker_launch(path: &Path) -> DistributedWorkerLaunch {
+        DistributedWorkerLaunch::Fs(WorkerIdentity::new(
             TenantId::from_bytes([0x11; 32]),
             RunId::from_raw(42),
             WorkerId::from_raw(7),
@@ -907,7 +957,7 @@ mod tests {
                 .with_execution_mode(ExecutionMode::Connector)
                 .with_budgets(ScanBudgets::default()),
             Arc::new(ProductionCoordinationEventRecorder::default()),
-        )
+        ))
     }
 
     #[test]
@@ -1382,7 +1432,7 @@ mod tests {
         let error = run_production_worker(
             &migrated_backend_config(),
             ProductionStartupSettings::validate_only(),
-            production_worker_identity(dir.path()),
+            production_worker_launch(dir.path()),
             DistributedRuntimeConfig::default(),
         )
         .expect_err("missing run should fail after real backend bootstrap");
@@ -1408,7 +1458,7 @@ mod tests {
         let error = run_production_worker(
             &fresh_backend_config(),
             ProductionStartupSettings::validate_only(),
-            production_worker_identity(dir.path()),
+            production_worker_launch(dir.path()),
             DistributedRuntimeConfig::default(),
         )
         .expect_err("startup readiness must fail before the runtime claims any shard");
