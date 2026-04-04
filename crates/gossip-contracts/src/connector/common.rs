@@ -86,6 +86,9 @@ impl<T> PageBuf<T> {
         T: KeyedPageItem,
     {
         validate_filled_page(&items, shard_start, shard_end)?;
+        // Reuse `try_new` so future page-construction invariants stay
+        // centralized there. `validate_filled_page` already proved the page is
+        // non-empty, so the constructor cannot fail here.
         Self::try_new(items, state)
     }
 
