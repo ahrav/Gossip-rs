@@ -100,6 +100,7 @@ scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
 | `--event-format` | `jsonl`, `text`, `json`, `sarif` | `jsonl` | Output format |
 | `--null-sink` | flag | off | Drop all events (benchmarking) |
 | `--verbose` | flag | off | Verbose text output |
+| `--debug` | flag | off | Include extended debug/timing fields in the stderr summary |
 
 ### FS-specific flags
 
@@ -148,6 +149,7 @@ Builder-pattern configuration parsed from CLI arguments:
 | `null_sink` | `bool` | `false` | Drop all events |
 | `event_format` | `EventFormat` | `Jsonl` | Output format |
 | `verbose` | `bool` | `false` | Verbose text output |
+| `summary_debug` | `bool` | `false` | Append extended debug/timing fields to the stderr summary |
 | `rules_file` | `Option<PathBuf>` | `None` | Custom YAML rules override |
 | `transform_filter` | `TransformFilter` | `All` | Transform decoder filter |
 | `workers` | `Option<usize>` | `None` | Worker thread count |

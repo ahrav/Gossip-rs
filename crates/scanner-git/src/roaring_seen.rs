@@ -4,6 +4,18 @@
 //! that were scanned during the current finalize call. The persisted on-disk
 //! format is `RoaringSeenBitmap`, which stores the scope's sorted OID index and
 //! a Roaring bitmap over that index.
+//!
+//! # Storage
+//! `SeenBitmapDelta` keeps canonical `Vec<OidBytes>` payloads because finalize
+//! batches are short-lived. `RoaringSeenBitmap` flat-packs the long-lived OID
+//! index as `oid_count * oid_len` bytes so SHA-1 scopes do not carry the
+//! 13-byte unused tail that each `OidBytes` entry reserves for SHA-256.
+//!
+//! # Complexity
+//! - `contains`: O(log n)
+//! - `batch_contains_sorted`: O(n + m)
+//! - `merge` / `merge_delta`: O(n + m)
+//! - `serialize` / `deserialize`: O(n + bitmap_bytes)
 
 use super::errors::SpillError;
 use super::object_id::OidBytes;
@@ -67,6 +79,17 @@ fn validate_oid_len(oid_len: u8) -> Result<(), SeenBitmapError> {
     }
 }
 
+/// Panics if `oid_len` is not 20 (SHA-1) or 32 (SHA-256).
+/// Used by `FlatOidIndex` constructors on cold paths where an invalid length
+/// is a programming error, not a runtime input validation concern.
+fn validated_oid_len(oid_len: u8) -> u8 {
+    assert!(
+        oid_len == OidBytes::SHA1_LEN || oid_len == OidBytes::SHA256_LEN,
+        "FlatOidIndex requires SHA-1 (20) or SHA-256 (32) OID length, got {oid_len}",
+    );
+    oid_len
+}
+
 fn u32_len(len: usize) -> Result<u32, SeenBitmapError> {
     u32::try_from(len).map_err(|_| SeenBitmapError::TooManyOids(len))
 }
@@ -97,6 +120,161 @@ fn canonicalize_oids(oids: &[OidBytes]) -> Result<(u8, Vec<OidBytes>), SeenBitma
 fn oids_are_canonical(oids: &[OidBytes]) -> bool {
     oids.windows(2).all(|pair| pair[0] < pair[1])
 }
+
+fn packed_oids_are_canonical(data: &[u8], oid_len: usize) -> bool {
+    debug_assert_eq!(
+        data.len() % oid_len,
+        0,
+        "packed OID table must use a whole-number stride",
+    );
+    let mut chunks = data.chunks_exact(oid_len);
+    let Some(mut previous) = chunks.next() else {
+        return true;
+    };
+    for current in chunks {
+        if previous >= current {
+            return false;
+        }
+        previous = current;
+    }
+    true
+}
+
+/// Flat-packed sorted OID table for long-lived seen bitmaps.
+///
+/// Each entry occupies exactly `oid_len` bytes, so SHA-1 snapshots avoid the
+/// per-entry tail padding that `OidBytes` keeps to support both object formats.
+///
+/// # Invariants
+/// - `data.len()` is always a multiple of `oid_len`
+/// - `oid_len` is always 20 or 32
+/// - Entries are stored in strictly sorted, duplicate-free order
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FlatOidIndex {
+    oid_len: u8,
+    data: Vec<u8>,
+}
+
+impl FlatOidIndex {
+    fn new(oid_len: u8) -> Self {
+        let oid_len = validated_oid_len(oid_len);
+        Self {
+            oid_len,
+            data: Vec::new(),
+        }
+    }
+
+    fn try_with_capacity(oid_len: u8, count: usize) -> Result<Self, SeenBitmapError> {
+        let oid_len = validated_oid_len(oid_len);
+        let capacity = count
+            .checked_mul(oid_len as usize)
+            .ok_or(SeenBitmapError::TooManyOids(count))?;
+        Ok(Self {
+            oid_len,
+            data: Vec::with_capacity(capacity),
+        })
+    }
+
+    fn from_bytes(data: Vec<u8>, oid_len: u8) -> Self {
+        let oid_len = validated_oid_len(oid_len);
+        assert_eq!(
+            data.len() % oid_len as usize,
+            0,
+            "packed OID table must use a whole-number stride",
+        );
+        debug_assert!(
+            packed_oids_are_canonical(&data, oid_len as usize),
+            "FlatOidIndex::from_bytes received non-canonical data",
+        );
+        Self { oid_len, data }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len() / self.oid_len as usize
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    #[inline]
+    fn push(&mut self, oid: &[u8]) {
+        debug_assert_eq!(
+            oid.len(),
+            self.oid_len as usize,
+            "packed OID stride mismatch",
+        );
+        debug_assert!(
+            self.data.is_empty() || &self.data[self.data.len() - self.oid_len as usize..] < oid,
+            "FlatOidIndex::push violates sorted order",
+        );
+        self.data.extend_from_slice(oid);
+    }
+
+    #[inline]
+    fn oid_at(&self, idx: usize) -> &[u8] {
+        let stride = self.oid_len as usize;
+        let start = idx * stride;
+        &self.data[start..start + stride]
+    }
+
+    /// Binary search over the flat-packed OID table.
+    ///
+    /// Hoists the stride computation and data slice outside the loop so the
+    /// compiler can keep both in registers across iterations. Each step
+    /// computes the entry offset with a single multiply and indexes into
+    /// the pre-borrowed slice.
+    #[inline]
+    fn binary_search(&self, target: &[u8]) -> Result<usize, usize> {
+        debug_assert_eq!(
+            target.len(),
+            self.oid_len as usize,
+            "packed OID search length mismatch",
+        );
+        let stride = self.oid_len as usize;
+        let data = self.data.as_slice();
+        let mut left = 0usize;
+        let mut right = data.len() / stride;
+        while left < right {
+            let mid = left + ((right - left) >> 1);
+            let start = mid * stride;
+            let entry = &data[start..start + stride];
+            match entry.cmp(target) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(left)
+    }
+
+    fn iter(&self) -> FlatOidIter<'_> {
+        FlatOidIter {
+            chunks: self.data.chunks_exact(self.oid_len as usize),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FlatOidIter<'a> {
+    chunks: std::slice::ChunksExact<'a, u8>,
+}
+
+impl Iterator for FlatOidIter<'_> {
+    type Item = OidBytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.chunks.next().map(OidBytes::from_slice)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.chunks.size_hint()
+    }
+}
+
+impl ExactSizeIterator for FlatOidIter<'_> {}
 
 /// Finalize-time delta payload for the `sb\0` namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,20 +408,56 @@ impl SeenBitmapDelta {
     }
 }
 
-fn insert_position(bitmap: &mut RoaringBitmap, pos: usize) -> Result<(), SeenBitmapError> {
-    bitmap.insert(u32::try_from(pos).map_err(|_| SeenBitmapError::TooManyOids(pos + 1))?);
-    Ok(())
+/// Inserts the position into the bitmap as a u32 index.
+///
+/// Callers must ensure `pos` fits in u32. This is guaranteed by the
+/// pre-flight `u32_len` upper-bound check at the top of `merge_positions`
+/// (the only caller) and by `deserialize` reading OID counts as u32.
+#[inline]
+fn insert_position(bitmap: &mut RoaringBitmap, pos: usize) {
+    debug_assert!(pos <= u32::MAX as usize, "bitmap position exceeds u32::MAX");
+    bitmap.insert(pos as u32);
 }
 
+/// Probes the bitmap for the given position.
+///
+/// Positions are guaranteed to fit in u32 by the same pre-flight
+/// `u32_len` check that guards `insert_position`.
+#[inline]
 fn bitmap_contains(bitmap: &RoaringBitmap, pos: usize) -> bool {
-    bitmap.contains(u32::try_from(pos).expect("bitmap position exceeds u32::MAX"))
+    debug_assert!(pos <= u32::MAX as usize, "bitmap position exceeds u32::MAX");
+    bitmap.contains(pos as u32)
 }
 
 /// Persisted seen bitmap for one `(repo_id, policy_hash)` scope.
+///
+/// # Layout
+/// ```text
+/// +----------------+
+/// | Magic (4B)     |  "RSBM"
+/// | OID len (1B)   |  20 or 32
+/// | OID count (4B) |  Big-endian u32
+/// +----------------+
+/// | OID Table      |  count * oid_len bytes (sorted, unique)
+/// +----------------+
+/// | Bitmap len (4B)|  Big-endian u32
+/// | Roaring bitmap |  serialized positions into the OID table
+/// +----------------+
+/// ```
+///
+/// # Invariants
+/// - `oids` stores strictly sorted, duplicate-free OIDs using `oid_len` stride.
+/// - Every set bit in `seen` refers to an existing OID position.
+/// - `oid_len` is always 20 or 32.
+///
+/// # Complexity
+/// - `contains`: O(log n)
+/// - `batch_contains_sorted`: O(n + m)
+/// - `merge` / `merge_delta`: O(n + m)
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoaringSeenBitmap {
     oid_len: u8,
-    oids: Vec<OidBytes>,
+    oids: FlatOidIndex,
     seen: RoaringBitmap,
 }
 
@@ -254,7 +468,7 @@ impl RoaringSeenBitmap {
         validate_oid_len(oid_len).expect("RoaringSeenBitmap requires SHA-1 or SHA-256 OIDs");
         Self {
             oid_len,
-            oids: Vec::new(),
+            oids: FlatOidIndex::new(oid_len),
             seen: RoaringBitmap::new(),
         }
     }
@@ -291,16 +505,16 @@ impl RoaringSeenBitmap {
         self.seen.is_empty()
     }
 
-    /// Returns a slice of all OIDs in the sorted index.
+    /// Returns all OIDs in the sorted index.
     #[must_use]
-    pub fn all_oids(&self) -> &[OidBytes] {
-        &self.oids
+    pub fn all_oids(&self) -> impl ExactSizeIterator<Item = OidBytes> + '_ {
+        self.oids.iter()
     }
 
     /// Returns the serialized byte length for the persisted bitmap payload.
     #[must_use]
     pub fn serialized_size(&self) -> usize {
-        4 + 1 + 4 + self.oids.len() * self.oid_len as usize + 4 + self.seen.serialized_size()
+        4 + 1 + 4 + self.oids.as_bytes().len() + 4 + self.seen.serialized_size()
     }
 
     /// Returns true when the OID has already been seen in this scope.
@@ -309,7 +523,7 @@ impl RoaringSeenBitmap {
         if oid.len() != self.oid_len {
             return false;
         }
-        match self.oids.binary_search(oid) {
+        match self.oids.binary_search(oid.as_slice()) {
             Ok(idx) => bitmap_contains(&self.seen, idx),
             Err(_) => false,
         }
@@ -331,9 +545,13 @@ impl RoaringSeenBitmap {
     /// The `SeenBlobStore` contract guarantees sorted inputs, so this is
     /// the preferred hot-path implementation.
     ///
+    /// Uses a single `cmp` per index entry to avoid redundant slice
+    /// lookups and stride arithmetic.
+    ///
     /// # Panics
     ///
-    /// Debug-asserts that `oids` is strictly sorted.
+    /// Debug-asserts that `oids` is sorted in non-decreasing order.
+    /// Duplicate probes are allowed and return the same result.
     #[must_use]
     pub fn batch_contains_sorted(&self, oids: &[OidBytes]) -> Vec<bool> {
         debug_assert!(
@@ -348,12 +566,21 @@ impl RoaringSeenBitmap {
             if oid.len() != self.oid_len {
                 continue;
             }
-            // Advance the index pointer past OIDs smaller than the probe.
-            while idx < index_len && index[idx] < *oid {
-                idx += 1;
-            }
-            if idx < index_len && index[idx] == *oid {
-                result[i] = bitmap_contains(&self.seen, idx);
+            let probe = oid.as_slice();
+            // Advance the index pointer, comparing each entry exactly once.
+            while idx < index_len {
+                let entry = index.oid_at(idx);
+                match entry.cmp(probe) {
+                    std::cmp::Ordering::Less => {
+                        idx += 1;
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        result[i] = bitmap_contains(&self.seen, idx);
+                        break;
+                    }
+                    std::cmp::Ordering::Greater => break,
+                }
             }
         }
         result
@@ -373,59 +600,93 @@ impl RoaringSeenBitmap {
         if self.oid_len != other.oid_len {
             return Err(SeenBitmapError::MixedOidLengths);
         }
-        self.merge_positions(&other.oids, |idx| bitmap_contains(&other.seen, idx))
+        self.merge_positions(
+            other.oids.len(),
+            |idx| other.oids.oid_at(idx),
+            |idx| bitmap_contains(&other.seen, idx),
+        )
     }
 
+    /// Merges a finalize-time delta into this persisted bitmap.
     pub fn merge_delta(&mut self, delta: &SeenBitmapDelta) -> Result<(), SeenBitmapError> {
         if self.oid_len != delta.oid_len {
             return Err(SeenBitmapError::MixedOidLengths);
         }
-        self.merge_positions(delta.oids(), |_| true)
+        self.merge_positions(delta.len(), |idx| delta.oids()[idx].as_slice(), |_| true)
     }
 
-    fn merge_positions<F>(
+    fn merge_positions<'a, F, G>(
         &mut self,
-        other_oids: &[OidBytes],
+        other_len: usize,
+        mut other_oid_at: G,
         other_contains: F,
     ) -> Result<(), SeenBitmapError>
     where
         F: Fn(usize) -> bool,
+        G: FnMut(usize) -> &'a [u8],
     {
-        if other_oids.is_empty() {
+        if other_len == 0 {
             return Ok(());
         }
-        // Pre-flight: catch usize overflow before allocation. The actual
-        // merged count may be smaller due to dedup, so this is a
-        // conservative upper bound rather than the authoritative check.
-        let _ = self
+        // Pre-flight: catch usize overflow and u32 overflow before any
+        // mutation or allocation. The actual merged count may be smaller
+        // due to dedup, so this is a conservative upper bound rather than
+        // the authoritative check. The u32 bound ensures that every
+        // position passed to `insert_position` fits in a Roaring bitmap
+        // index on both the fast path (in-place) and the slow path
+        // (temporaries).
+        let upper_bound = self
             .oids
             .len()
-            .checked_add(other_oids.len())
+            .checked_add(other_len)
             .ok_or(SeenBitmapError::TooManyOids(usize::MAX))?;
+        let _ = u32_len(upper_bound)?;
 
-        let mut merged_oids = Vec::with_capacity(self.oids.len() + other_oids.len());
+        // Fast path: all incoming OIDs sort strictly after the existing
+        // maximum, or the base is empty. Extends in-place, avoiding a
+        // full-buffer copy. The preflight u32_len check above already
+        // validated the sum.
+        if self.oids.len() == 0 || self.oids.oid_at(self.oids.len() - 1) < other_oid_at(0) {
+            let base_len = self.oids.len();
+            for idx in 0..other_len {
+                self.oids.push(other_oid_at(idx));
+                if other_contains(idx) {
+                    insert_position(&mut self.seen, base_len + idx);
+                }
+            }
+            debug_assert!(
+                packed_oids_are_canonical(self.oids.as_bytes(), self.oid_len as usize),
+                "append-only merge produced non-canonical OID order",
+            );
+            return Ok(());
+        }
+
+        let mut merged_oids =
+            FlatOidIndex::try_with_capacity(self.oid_len, self.oids.len() + other_len)?;
         let mut merged_seen = RoaringBitmap::new();
         let mut left = 0usize;
         let mut right = 0usize;
 
-        while left < self.oids.len() && right < other_oids.len() {
+        while left < self.oids.len() && right < other_len {
             use std::cmp::Ordering::{Equal, Greater, Less};
 
-            let insert_seen = match self.oids[left].cmp(&other_oids[right]) {
+            let left_oid = self.oids.oid_at(left);
+            let right_oid = other_oid_at(right);
+            let insert_seen = match left_oid.cmp(right_oid) {
                 Less => {
-                    merged_oids.push(self.oids[left]);
+                    merged_oids.push(left_oid);
                     let seen = bitmap_contains(&self.seen, left);
                     left += 1;
                     seen
                 }
                 Greater => {
-                    merged_oids.push(other_oids[right]);
+                    merged_oids.push(right_oid);
                     let seen = other_contains(right);
                     right += 1;
                     seen
                 }
                 Equal => {
-                    merged_oids.push(self.oids[left]);
+                    merged_oids.push(left_oid);
                     let seen = bitmap_contains(&self.seen, left) || other_contains(right);
                     left += 1;
                     right += 1;
@@ -433,22 +694,22 @@ impl RoaringSeenBitmap {
                 }
             };
             if insert_seen {
-                insert_position(&mut merged_seen, merged_oids.len() - 1)?;
+                insert_position(&mut merged_seen, merged_oids.len() - 1);
             }
         }
 
         while left < self.oids.len() {
-            merged_oids.push(self.oids[left]);
+            merged_oids.push(self.oids.oid_at(left));
             if bitmap_contains(&self.seen, left) {
-                insert_position(&mut merged_seen, merged_oids.len() - 1)?;
+                insert_position(&mut merged_seen, merged_oids.len() - 1);
             }
             left += 1;
         }
 
-        while right < other_oids.len() {
-            merged_oids.push(other_oids[right]);
+        while right < other_len {
+            merged_oids.push(other_oid_at(right));
             if other_contains(right) {
-                insert_position(&mut merged_seen, merged_oids.len() - 1)?;
+                insert_position(&mut merged_seen, merged_oids.len() - 1);
             }
             right += 1;
         }
@@ -456,6 +717,11 @@ impl RoaringSeenBitmap {
         // Authoritative check: the deduped merged count is the real value
         // that must fit in u32 for the bitmap to index correctly.
         let _ = u32_len(merged_oids.len())?;
+
+        debug_assert!(
+            packed_oids_are_canonical(merged_oids.as_bytes(), self.oid_len as usize),
+            "merge produced non-canonical OID order",
+        );
 
         self.oids = merged_oids;
         self.seen = merged_seen;
@@ -482,10 +748,7 @@ impl RoaringSeenBitmap {
             .try_into()
             .expect("bitmap OID count validated at construction via u32_len");
         out.extend_from_slice(&oid_count.to_be_bytes());
-        for oid in &self.oids {
-            debug_assert_eq!(oid.len(), self.oid_len, "bitmap OID length mismatch");
-            out.extend_from_slice(oid.as_slice());
-        }
+        out.extend_from_slice(self.oids.as_bytes());
         let bitmap_len_u32: u32 = bitmap_len.try_into().map_err(|_| {
             SeenBitmapError::SerializationFailed(format!(
                 "roaring bitmap serialized size {bitmap_len} exceeds u32::MAX"
@@ -541,18 +804,11 @@ impl RoaringSeenBitmap {
             return Err(SeenBitmapError::LengthMismatch);
         }
 
-        let mut oids = Vec::with_capacity(oid_count);
-        let mut offset = 9;
-        for _ in 0..oid_count {
-            let next = offset + oid_len as usize;
-            let oid = OidBytes::try_from_slice(&bytes[offset..next])
-                .ok_or(SeenBitmapError::InvalidOidLength(oid_len))?;
-            oids.push(oid);
-            offset = next;
-        }
-        if !oids.is_empty() && !oids_are_canonical(&oids) {
+        let oid_table = &bytes[9..bitmap_len_offset];
+        if !oid_table.is_empty() && !packed_oids_are_canonical(oid_table, oid_len as usize) {
             return Err(SeenBitmapError::NonCanonicalOids);
         }
+        let oids = FlatOidIndex::from_bytes(oid_table.to_vec(), oid_len);
 
         let bitmap = RoaringBitmap::deserialize_from(Cursor::new(
             &bytes[bitmap_len_offset + 4..expected_len],
@@ -623,6 +879,10 @@ mod tests {
 
     fn sha1(byte: u8) -> OidBytes {
         OidBytes::sha1([byte; 20])
+    }
+
+    fn sha256(byte: u8) -> OidBytes {
+        OidBytes::sha256([byte; 32])
     }
 
     fn raw_oid_bytes(oids: &[OidBytes]) -> Vec<u8> {
@@ -729,6 +989,122 @@ mod tests {
     }
 
     #[test]
+    fn roaring_bitmap_empty_round_trips() {
+        let bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+
+        let bytes = bitmap.serialize().expect("serialize");
+        let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+        assert_eq!(decoded, bitmap);
+    }
+
+    #[test]
+    fn roaring_bitmap_single_oid_round_trips() {
+        let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        bitmap.insert_batch(&[sha1(0x42)]).expect("insert");
+
+        let bytes = bitmap.serialize().expect("serialize");
+        let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+        assert_eq!(decoded, bitmap);
+    }
+
+    #[rstest]
+    #[case::first(0, sha1(0x10))]
+    #[case::middle(1, sha1(0x20))]
+    #[case::last(2, sha1(0x30))]
+    fn flat_index_get_oid_by_position(#[case] idx: usize, #[case] expected: OidBytes) {
+        let mut index = FlatOidIndex::try_with_capacity(OidBytes::SHA1_LEN, 3).expect("capacity");
+        for oid in [sha1(0x10), sha1(0x20), sha1(0x30)] {
+            index.push(oid.as_slice());
+        }
+
+        assert_eq!(OidBytes::from_slice(index.oid_at(idx)), expected);
+    }
+
+    #[rstest]
+    #[case::found_first(sha1(0x10), Ok(0))]
+    #[case::found_middle(sha1(0x20), Ok(1))]
+    #[case::found_last(sha1(0x30), Ok(2))]
+    #[case::not_found_before_all(sha1(0x05), Err(0))]
+    #[case::not_found_between(sha1(0x15), Err(1))]
+    #[case::not_found_after_all(sha1(0x40), Err(3))]
+    fn flat_index_binary_search(#[case] target: OidBytes, #[case] expected: Result<usize, usize>) {
+        let mut index = FlatOidIndex::try_with_capacity(OidBytes::SHA1_LEN, 3).expect("capacity");
+        for oid in [sha1(0x10), sha1(0x20), sha1(0x30)] {
+            index.push(oid.as_slice());
+        }
+        assert_eq!(index.binary_search(target.as_slice()), expected);
+    }
+
+    #[test]
+    fn flat_index_binary_search_empty() {
+        let index = FlatOidIndex::new(OidBytes::SHA1_LEN);
+        assert_eq!(index.binary_search(sha1(0x10).as_slice()), Err(0));
+    }
+
+    #[rstest]
+    #[case::empty(&[], true)]
+    #[case::single(&[sha1(0x10)], true)]
+    #[case::sorted(&[sha1(0x10), sha1(0x20), sha1(0x30)], true)]
+    #[case::reversed(&[sha1(0x20), sha1(0x10)], false)]
+    #[case::duplicates(&[sha1(0x10), sha1(0x10)], false)]
+    fn packed_oids_canonical_check(#[case] oids: &[OidBytes], #[case] expected: bool) {
+        let stride = OidBytes::SHA1_LEN as usize;
+        let packed: Vec<u8> = oids
+            .iter()
+            .flat_map(|o| &o.as_slice()[..stride])
+            .copied()
+            .collect();
+        assert_eq!(packed_oids_are_canonical(&packed, stride), expected);
+    }
+
+    #[test]
+    fn flat_index_iter_count_and_values() {
+        let mut index = FlatOidIndex::try_with_capacity(OidBytes::SHA1_LEN, 3).expect("capacity");
+        let expected = [sha1(0x10), sha1(0x20), sha1(0x30)];
+        for oid in &expected {
+            index.push(oid.as_slice());
+        }
+
+        let iter = index.iter();
+        assert_eq!(iter.len(), 3);
+        let collected: Vec<OidBytes> = iter.collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn flat_index_iter_empty() {
+        let index = FlatOidIndex::new(OidBytes::SHA1_LEN);
+        let iter = index.iter();
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.collect::<Vec<OidBytes>>(), Vec::<OidBytes>::new());
+    }
+
+    #[test]
+    fn roaring_bitmap_sha256_round_trips() {
+        let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA256_LEN);
+        bitmap
+            .insert_batch(&[sha256(0x10), sha256(0x20), sha256(0x30)])
+            .expect("insert");
+
+        let bytes = bitmap.serialize().expect("serialize");
+        let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+        assert_eq!(decoded, bitmap);
+    }
+
+    #[rstest]
+    #[case::first(0, sha256(0xAA))]
+    #[case::middle(1, sha256(0xBB))]
+    #[case::last(2, sha256(0xCC))]
+    fn flat_index_sha256_get_oid_by_position(#[case] idx: usize, #[case] expected: OidBytes) {
+        let mut index = FlatOidIndex::try_with_capacity(OidBytes::SHA256_LEN, 3).expect("capacity");
+        for oid in [sha256(0xAA), sha256(0xBB), sha256(0xCC)] {
+            index.push(oid.as_slice());
+        }
+
+        assert_eq!(OidBytes::from_slice(index.oid_at(idx)), expected);
+    }
+
+    #[test]
     fn roaring_bitmap_serialization_golden_value() {
         let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
         bitmap
@@ -789,6 +1165,99 @@ mod tests {
         assert_eq!(
             left.batch_contains(&[sha1(0x10), sha1(0x20), sha1(0x30), sha1(0x40)]),
             vec![true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn roaring_bitmap_merge_append_only_fast_path() {
+        let mut base = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        base.insert_batch(&[sha1(0x10), sha1(0x20)]).expect("base");
+
+        let mut tail = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        tail.insert_batch(&[sha1(0x30), sha1(0x40)]).expect("tail");
+
+        // The tail range is entirely after the base range, so the merge is append-only.
+        base.merge(&tail).expect("merge");
+
+        assert_eq!(base.index_len(), 4);
+        assert_eq!(
+            base.batch_contains(&[sha1(0x10), sha1(0x20), sha1(0x30), sha1(0x40), sha1(0x50)]),
+            vec![true, true, true, true, false]
+        );
+
+        // Round-trip through serialization preserves the merged state.
+        let bytes = base.serialize().expect("serialize");
+        let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+        assert_eq!(decoded, base);
+    }
+
+    #[test]
+    fn roaring_bitmap_merge_fast_path_partial_seen() {
+        let mut base = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        base.insert_batch(&[sha1(0x10)]).expect("base");
+
+        // Build a bitmap where 0x30 is in the index but NOT marked seen.
+        // The public API always marks inserted OIDs as seen, so construct
+        // via deserialize with a roaring bitmap that only includes position 0.
+        let mut seen_bits = RoaringBitmap::new();
+        seen_bits.insert(0); // only position 0 (= sha1(0x20)) is seen
+        let mut seen_bytes = Vec::new();
+        seen_bits
+            .serialize_into(&mut seen_bytes)
+            .expect("serialize roaring");
+
+        let oid_table = raw_oid_bytes(&[sha1(0x20), sha1(0x30)]);
+        let payload = bitmap_bytes(
+            BITMAP_MAGIC,
+            OidBytes::SHA1_LEN,
+            2,
+            &oid_table,
+            seen_bytes.len() as u32,
+            &seen_bytes,
+        );
+        let other = RoaringSeenBitmap::deserialize(&payload).expect("deserialize");
+        assert!(other.contains(&sha1(0x20)));
+        assert!(!other.contains(&sha1(0x30)));
+
+        // Every OID in `other` is after the base range, so the merge is append-only.
+        base.merge(&other).expect("merge");
+
+        assert_eq!(base.index_len(), 3);
+        assert!(base.contains(&sha1(0x10)));
+        assert!(base.contains(&sha1(0x20)));
+        // 0x30 is in the index but was NOT marked seen in other.
+        assert!(!base.contains(&sha1(0x30)));
+    }
+
+    #[test]
+    fn roaring_bitmap_merge_rejects_mixed_oid_lengths() {
+        let mut sha1_bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        sha1_bitmap.insert_batch(&[sha1(0x10)]).expect("sha1");
+
+        let mut sha256_bitmap = RoaringSeenBitmap::new(OidBytes::SHA256_LEN);
+        sha256_bitmap.insert_batch(&[sha256(0x20)]).expect("sha256");
+
+        let err = sha1_bitmap
+            .merge(&sha256_bitmap)
+            .expect_err("mixed lengths must fail");
+        assert_eq!(err, SeenBitmapError::MixedOidLengths);
+    }
+
+    #[test]
+    fn roaring_bitmap_merge_into_empty() {
+        let mut empty = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+
+        let mut source = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+        source
+            .insert_batch(&[sha1(0x10), sha1(0x20), sha1(0x30)])
+            .expect("source");
+
+        empty.merge(&source).expect("merge");
+
+        assert_eq!(empty.index_len(), 3);
+        assert_eq!(
+            empty.batch_contains(&[sha1(0x10), sha1(0x20), sha1(0x30)]),
+            vec![true, true, true]
         );
     }
 
@@ -887,6 +1356,11 @@ mod proptests {
             .prop_map(|items| items.into_iter().map(OidBytes::sha1).collect())
     }
 
+    fn arb_sha256_oids() -> impl Strategy<Value = Vec<OidBytes>> {
+        prop::collection::vec(any::<[u8; 32]>(), 0..128)
+            .prop_map(|items| items.into_iter().map(OidBytes::sha256).collect())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(
             crate::test_utils::proptest_cases(PROPTEST_CASES)
@@ -901,6 +1375,24 @@ mod proptests {
             let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
 
             prop_assert_eq!(decoded, bitmap);
+        }
+
+        #[test]
+        fn bitmap_serialized_size_matches_actual_sha1(oids in arb_sha1_oids()) {
+            let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            bitmap.insert_batch(&oids).expect("insert");
+
+            let bytes = bitmap.serialize().expect("serialize");
+            prop_assert_eq!(bitmap.serialized_size(), bytes.len());
+        }
+
+        #[test]
+        fn bitmap_serialized_size_matches_actual_sha256(oids in arb_sha256_oids()) {
+            let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA256_LEN);
+            bitmap.insert_batch(&oids).expect("insert");
+
+            let bytes = bitmap.serialize().expect("serialize");
+            prop_assert_eq!(bitmap.serialized_size(), bytes.len());
         }
 
         #[test]
@@ -977,6 +1469,37 @@ mod proptests {
             let ab_flags = ab.batch_contains(&probe);
             let ba_flags = ba.batch_contains(&probe);
             prop_assert_eq!(ab_flags, ba_flags);
+        }
+
+        #[test]
+        fn bitmap_merge_round_tripped_with_fresh_matches_oracle(
+            a in arb_sha1_oids(),
+            b in arb_sha1_oids(),
+            probe in arb_sha1_oids()
+        ) {
+            let mut round_tripped = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            round_tripped.insert_batch(&a).expect("a");
+            let bytes = round_tripped.serialize().expect("serialize");
+            let mut round_tripped = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+
+            let mut fresh = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+            fresh.insert_batch(&b).expect("b");
+            round_tripped.merge(&fresh).expect("merge");
+
+            let oracle: HashSet<OidBytes> = a.iter().chain(&b).copied().collect();
+            let flags = round_tripped.batch_contains(&probe);
+            let expected: Vec<bool> = probe.iter().map(|oid| oracle.contains(oid)).collect();
+            prop_assert_eq!(flags, expected);
+        }
+
+        #[test]
+        fn bitmap_sha256_round_trip(oids in arb_sha256_oids()) {
+            let mut bitmap = RoaringSeenBitmap::new(OidBytes::SHA256_LEN);
+            bitmap.insert_batch(&oids).expect("insert");
+
+            let bytes = bitmap.serialize().expect("serialize");
+            let decoded = RoaringSeenBitmap::deserialize(&bytes).expect("decode");
+            prop_assert_eq!(decoded, bitmap);
         }
     }
 }

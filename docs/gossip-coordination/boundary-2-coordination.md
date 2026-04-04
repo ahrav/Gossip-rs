@@ -28,9 +28,9 @@ Shard owner bindings live in separate etcd lease-backed keys so storage-layer
 liveness and logical lease deadlines are checked together before accepting
 progress updates. `split_replace` also enforces a backend-local
 `max_children_per_op` cap so one atomic child publication stays bounded.
-Each `split_replace` transaction uses `3 + 2N` writes and `4 + N` compares
-(total `7 + 3N` txn-ops, where N = children). The default cap of 8 yields
-31 total ops; operators raising the cap must verify the total stays within
+Each `split_replace` transaction uses `4 + 2N` writes and `5 + N` compares
+(total `9 + 3N` txn-ops, where N = children). The default cap of 8 yields
+33 total ops; operators raising the cap must verify the total stays within
 the cluster's `--max-txn-ops` budget (etcd default 128).
 The etcd config also carries the same per-tenant and global shard ceilings
 used by the in-memory backend. The persisted backend enforces those limits
@@ -74,7 +74,7 @@ The module provides seven core capabilities:
 
 ### Core source files
 
-#### `gossip-coordination` crate (`crates/gossip-coordination/src/`, excluding `*_tests.rs`; `src/sim/` is covered in [simulation-harness.md](simulation-harness.md))
+#### `gossip-coordination` crate (`crates/gossip-coordination/src/`, excluding `*_tests.rs` except the intentionally documented `scenario_tests.rs` and `test_fixtures.rs`; `src/sim/` is covered in [simulation-harness.md](simulation-harness.md))
 
 | File                 | Role                                                                                             |
 | -------------------- | ------------------------------------------------------------------------------------------------ |
@@ -92,6 +92,8 @@ The module provides seven core capabilities:
 | `facade.rs`          | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                                              |
 | `session.rs`         | `WorkerSession` ergonomic wrapper with move/borrow lifecycle                                     |
 | `conformance.rs`     | Feature-gated backend-agnostic coordination conformance harness for `SimulationBackend` impls    |
+| `scenario_tests.rs`  | Multi-step coordination workflow tests covering realistic lease/run stories                       |
+| `test_fixtures.rs`   | Shared seeded coordinators, canonical plans, and helper constructors used by coordination tests  |
 | `lib.rs`             | Module root and public re-exports                                                                |
 
 #### `gossip-contracts` crate (`crates/gossip-contracts/src/coordination/`, excluding `*_tests.rs`)

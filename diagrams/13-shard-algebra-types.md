@@ -335,7 +335,7 @@ sequenceDiagram
 
     Note over Caller,Builder: Phase 1: Stage
 
-    Caller->>Builder: new(arena, entry_limit, shard_ids)
+    Caller->>Builder: new(arena, entry_limit)
     Note over Builder: Enforce capacity hierarchy:<br/>entry_limit ≤ CAP ≤ 1024<br/>entry_limit ≤ MAX_INITIAL_SHARDS
 
     loop add_range / add_prefix / add_manifest

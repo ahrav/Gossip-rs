@@ -12,7 +12,7 @@ no blob contents are read during the diff phase. The walker also accepts a
 cooperative abort flag so large diffs can stop without waiting for the entire
 tree walk to finish.
 
-The subsystem is composed of seven modules:
+The subsystem is composed of eight modules:
 
 ```mermaid
 flowchart TD

@@ -1477,7 +1477,7 @@ pub enum AnchorPolicy {
 // deterministic, order-invariant byte string that is hashed to form the
 // *policy hash* -- a fingerprint of the full scan configuration.
 //
-// The policy hash is used by `src/git_scan/policy_hash.rs` to detect
+// The policy hash is used by `crates/scanner-git/src/policy_hash.rs` to detect
 // configuration changes between runs. A different hash means cached results
 // are invalid and a full re-scan is required.
 //
@@ -1492,7 +1492,7 @@ impl RuleSpec {
     /// The encoding is deterministic and order-invariant for anchor/keyword lists
     /// (lists are sorted and deduplicated before serialization). Callers should
     /// treat this as an internal serialization format; any change to the encoding
-    /// requires a policy-hash version bump in `src/git_scan/policy_hash.rs`.
+    /// requires a policy-hash version bump in `crates/scanner-git/src/policy_hash.rs`.
     pub fn encode_policy(&self, out: &mut Vec<u8>) {
         push_bytes_u32(out, self.name.as_bytes());
         encode_bytes_list(out, self.anchors);

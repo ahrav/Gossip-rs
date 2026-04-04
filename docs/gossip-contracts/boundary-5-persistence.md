@@ -77,7 +77,7 @@ Non-negotiables (project-wide):
 
 ### Data types
 
-**Done-ledger records** (`done_ledger.rs`):
+**Done-ledger records** (`done_ledger.rs`, `ovid.rs`):
 
 | Type | Purpose |
 |------|---------|
@@ -130,8 +130,8 @@ Non-negotiables (project-wide):
 | Type | Implements | Notes |
 |------|-----------|-------|
 | `ReadyCommitHandle<R, E>` | `CommitHandle` | Pre-resolved handle wrapping an already-computed `Result<R, E>`. `wait()` returns immediately. Used by synchronous backends and test doubles. Provides `ok()`, `err()`, and `from_result()` constructors. |
-| `InMemoryDoneLedger` | `DoneLedger` | `HashMap`-backed reference implementation with configurable commit timing, injected failures, and lattice-merge semantics. Thread-safe via internal `Mutex`. Lives in `gossip-persistence-inmemory` crate. Passes `run_conformance`. |
-| `InMemoryFindingsSink` | `FindingsSink` | `HashMap`-backed reference implementation with three-layer upsert, referential integrity checks, and configurable commit timing. Thread-safe via internal `Mutex`. Lives in `gossip-persistence-inmemory` crate. Passes `run_conformance`. |
+| `InMemoryDoneLedger` | `DoneLedger` | `HashMap`-backed reference implementation with configurable commit timing, injected failures, and lattice-merge semantics. Thread-safe via internal `Mutex`. Lives in `gossip-persistence-inmemory` crate. Passes `run_done_ledger_conformance`. |
+| `InMemoryFindingsSink` | `FindingsSink` | `HashMap`-backed reference implementation with three-layer upsert, referential integrity checks, and configurable commit timing. Thread-safe via internal `Mutex`. Lives in `gossip-persistence-inmemory` crate. Passes `run_findings_conformance`. |
 | `FindingsConformanceProbe` | (conformance-only trait) | Read-side probe for observing durable findings state; `pub` but not referenced by production code paths. The production `FindingsSink` API is write-only; this trait adds a narrow read surface so the conformance harness can snapshot row counts and prove replay does not duplicate rows. Backend crates implement this unconditionally (no `#[cfg(test)]` gate) so integration tests can exercise the real backend. |
 | `run_conformance` | (harness entry point) | Backend-agnostic conformance harness exposed at `gossip_contracts::persistence::run_conformance` (also available via `persistence::conformance`). Verifies done-ledger idempotency and lattice merge, findings idempotency and referential integrity, and sensitive-type `Debug` redaction. Returns a `PersistenceConformanceReport` on success. |
 | `run_done_ledger_conformance` | (harness entry point) | Done-ledger-only conformance harness exposed at `gossip_contracts::persistence::run_done_ledger_conformance` (also available via `persistence::conformance`). Runs four checks and returns `Result<u32, PersistenceConformanceError>` with `Ok(4)` when all done-ledger checks pass. |

@@ -65,6 +65,16 @@ fn bench_serialize(c: &mut Criterion) {
     });
 }
 
+fn bench_deserialize(c: &mut Criterion) {
+    let bytes = build_bitmap(BITMAP_SIZE).serialize().expect("serialize");
+
+    c.bench_function("roaring_seen/deserialize_1m", |b| {
+        b.iter(|| {
+            black_box(RoaringSeenBitmap::deserialize(black_box(&bytes)).expect("deserialize"))
+        })
+    });
+}
+
 fn bench_insert_batch(c: &mut Criterion) {
     let bitmap = build_bitmap(BITMAP_SIZE);
     let update = build_update_batch(BITMAP_SIZE, PROBE_BATCH);
@@ -86,11 +96,36 @@ fn bench_insert_batch(c: &mut Criterion) {
     });
 }
 
+fn bench_merge(c: &mut Criterion) {
+    let base = build_bitmap(BITMAP_SIZE);
+    let update_oids: Vec<OidBytes> = (BITMAP_SIZE..BITMAP_SIZE + PROBE_BATCH)
+        .map(oid_from_u32)
+        .collect();
+    let mut update = RoaringSeenBitmap::new(OidBytes::SHA1_LEN);
+    update.insert_batch(&update_oids).expect("update bitmap");
+
+    c.bench_function("roaring_seen/merge_10k_into_1m", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut working = base.clone();
+                let start = Instant::now();
+                working.merge(black_box(&update)).expect("merge");
+                total += start.elapsed();
+                black_box(working);
+            }
+            total
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_batch_contains,
     bench_batch_contains_sorted,
     bench_serialize,
-    bench_insert_batch
+    bench_deserialize,
+    bench_insert_batch,
+    bench_merge
 );
 criterion_main!(benches);

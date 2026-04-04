@@ -222,7 +222,7 @@ The `key_secret_hash()` function creates a BLAKE3 keyed-mode hasher initialized 
 
 This prevents cross-tenant correlation: an attacker who compromises tenant A's `SecretHash` values learns nothing about whether tenant B has the same secret. The `NormHash` itself (the engine's raw output) never leaves the derivation boundary.
 
-Both `NormHash` and `SecretHash` use `define_id_32_restricted!`, which makes the constructor `pub(crate)` and provides a redacted `Debug` impl (`SecretHash([redacted])`) to prevent accidental logging of security-sensitive material.
+Both `NormHash` and `SecretHash` use `define_id_32_restricted!`, which provides redacted `Debug` output for security-sensitive material. `SecretHash` retains the macro's `pub(crate)` constructor, while `NormHash` also exposes a public `from_digest` constructor so the engine crate can build it from a precomputed digest.
 
 ---
 

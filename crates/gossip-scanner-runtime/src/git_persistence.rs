@@ -658,7 +658,16 @@ where
         let resolved_staging = staging_bitmap.or(staging_from_backend);
         let has_staging = resolved_staging.is_some();
         if is_complete && let Some(staging) = &resolved_staging {
-            seen_oids.extend_from_slice(staging.all_oids());
+            // All OIDs in the staging bitmap must be marked seen. A mismatch
+            // indicates a corrupt serialized payload (e.g., from a crash during
+            // the non-atomic write path). Folding unseen OIDs into the live set
+            // would permanently suppress future detection of those blobs.
+            if staging.len() != staging.index_len() {
+                return Err(PersistError::backend(
+                    "staging bitmap contains unseen entries",
+                ));
+            }
+            seen_oids.extend(staging.all_oids());
         }
 
         let mut staged_bitmap = None;
