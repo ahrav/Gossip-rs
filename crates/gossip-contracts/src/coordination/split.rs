@@ -71,20 +71,20 @@ pub struct SplitReplaceChild<'a> {
 }
 
 impl<'a> SplitReplaceChild<'a> {
-    /// Construct a new child entry from a key sub-range and initial cursor.
+    /// Initializes a child configuration for a split-replace operation.
     #[must_use]
     pub fn new(spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
         Self { spec, cursor }
     }
 
-    /// The child's shard specification (key sub-range).
+    /// Returns the assigned key sub-range for this child.
     #[inline]
     #[must_use]
     pub fn spec(&self) -> ShardSpecRef<'a> {
         self.spec
     }
 
-    /// The child's initial cursor position.
+    /// Returns the scanning origin point for this child.
     #[inline]
     #[must_use]
     pub fn cursor(&self) -> CursorUpdate<'a> {
@@ -123,8 +123,7 @@ pub struct SplitReplacePlan<'a> {
     children: InlineVec<SplitReplaceChild<'a>, MAX_SPLIT_CHILDREN>,
 }
 
-/// Error returned when a [`SplitReplacePlan`] is constructed with an
-/// invalid number of children.
+/// Indicates an invalid child count during split-replace planning.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SplitReplacePlanError {
     /// Fewer than 2 children — not a split.
@@ -139,7 +138,7 @@ pub enum SplitReplacePlanError {
 }
 
 impl<'a> SplitReplacePlan<'a> {
-    /// Construct a validated split-replace plan.
+    /// Validates structural fan-out bounds for a split-replace plan.
     ///
     /// This constructor enforces only shape invariants (fan-out bounds). It
     /// does not validate parent-range coverage; use [`plan_split_replace`] for
@@ -171,7 +170,7 @@ impl<'a> SplitReplacePlan<'a> {
         })
     }
 
-    /// The children in this plan, in caller-provided order.
+    /// Returns the ordered sequence of child configurations.
     #[inline]
     #[must_use]
     pub fn children(&self) -> &[SplitReplaceChild<'a>] {
@@ -196,7 +195,7 @@ impl CanonicalBytes for SplitReplacePlan<'_> {
     }
 }
 
-/// Error returned by split-replace planning free functions.
+/// Failures occurring during split-replace derivation.
 ///
 /// Distinguishes shape errors (invalid child count) from semantic errors
 /// (children do not form a valid partition of the parent range).
@@ -210,7 +209,7 @@ pub enum SplitReplacePlanningError {
     InvalidCoverage(#[source] SplitValidationError),
 }
 
-/// Build and validate a split-replace plan against a parent shard.
+/// Derives a split-replace plan, validating comprehensive coverage of the parent shard.
 ///
 /// This helper enforces both child-count bounds and full coverage
 /// correctness via [`validate_split_coverage_bounds`].
@@ -243,7 +242,7 @@ pub fn plan_split_replace<'a>(
     Ok(plan)
 }
 
-/// Build a split-replace plan from explicit split points.
+/// Derives a split-replace plan from discrete internal boundary markers.
 ///
 /// Split points define child boundaries over the parent range:
 /// `[start, p0), [p0, p1), ..., [pn, end)`.
@@ -297,8 +296,7 @@ pub fn plan_split_replace_at_points<'a>(
     plan_split_replace(parent, children.as_slice().iter().copied())
 }
 
-/// Build a split-replace plan from explicit split points using
-/// [`CursorUpdate::initial`] for all children.
+/// Derives a split-replace plan, initializing all child cursors to their starting positions.
 ///
 /// # Errors
 ///
@@ -311,9 +309,7 @@ pub fn plan_split_replace_at_points_initial_cursor<'a>(
     plan_split_replace_at_points(parent, split_points, |_, _| CursorUpdate::initial())
 }
 
-// ============================================================================
 // Split-residual planning
-// ============================================================================
 
 /// Validated plan for a split-residual operation.
 ///
@@ -358,8 +354,7 @@ pub struct SplitResidualPlan<'a> {
     residual_spec: ShardSpecRef<'a>,
 }
 
-/// Error returned when a [`SplitResidualPlan`] is constructed with
-/// identical specs.
+/// Indicates identical parent and residual specifications during residual planning.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SplitResidualPlanError {
     /// `parent_new_spec` and `residual_spec` are identical — a residual
@@ -369,7 +364,7 @@ pub enum SplitResidualPlanError {
 }
 
 impl<'a> SplitResidualPlan<'a> {
-    /// Construct a residual plan with a minimal structural guard.
+    /// Validates structural distinction between parent and residual specifications.
     ///
     /// The only check performed here is that the two specs differ
     /// (identical specs would mean no actual split occurred). The full
@@ -394,14 +389,14 @@ impl<'a> SplitResidualPlan<'a> {
         })
     }
 
-    /// The parent's new (shrunk) specification — the range it keeps.
+    /// Returns the retained subset of the parent's key range.
     #[inline]
     #[must_use]
     pub fn parent_new_spec(&self) -> ShardSpecRef<'a> {
         self.parent_new_spec
     }
 
-    /// The residual shard's specification — the range split off.
+    /// Returns the offloaded tail section of the key range.
     #[inline]
     #[must_use]
     pub fn residual_spec(&self) -> ShardSpecRef<'a> {
@@ -421,7 +416,7 @@ impl CanonicalBytes for SplitResidualPlan<'_> {
     }
 }
 
-/// Error returned by split-residual planning helpers.
+/// Failures occurring during split-residual derivation.
 ///
 /// Variants are ordered from most specific (cursor-derived) to most
 /// general (downstream coverage validation). The first three variants
@@ -451,7 +446,7 @@ pub enum SplitResidualPlanningError {
     InvalidCoverage(#[source] SplitValidationError),
 }
 
-/// Build and validate a split-residual plan against a parent shard.
+/// Derives a split-residual plan, enforcing strict partition coverage against the parent shard.
 ///
 /// # Errors
 ///
@@ -471,7 +466,7 @@ pub fn plan_split_residual<'a>(
     Ok(plan)
 }
 
-/// Build a split-residual plan from an explicit split point.
+/// Derives a split-residual plan, bisecting the parent range at the specified boundary.
 ///
 /// The split point defines:
 /// - parent new range: `[parent.start, split_point)`
@@ -490,7 +485,7 @@ pub fn plan_split_residual_at_point<'a>(
     plan_split_residual(parent, parent_new_spec, residual_spec)
 }
 
-/// Build a split-residual plan from a cursor, using successor semantics.
+/// Derives a split-residual plan by offloading keys subsequent to the active cursor.
 ///
 /// Derives the split point as `key_successor(cursor.last_key)` -- the
 /// smallest byte string strictly greater than the last processed key --
@@ -559,8 +554,6 @@ mod tests {
     use proptest::prelude::*;
     use rstest::rstest;
 
-    // -- Consolidation 1: SplitReplacePlan::try_new boundary validation ------
-
     #[rstest]
     #[case::zero(0, Err(SplitReplacePlanError::TooFewChildren { count: 0 }))]
     #[case::one(1, Err(SplitReplacePlanError::TooFewChildren { count: 1 }))]
@@ -591,8 +584,6 @@ mod tests {
             Err(ref e) => assert_eq!(&result.unwrap_err(), e, "count={count}"),
         }
     }
-
-    // -- Consolidation 2: plan_split_replace boundary validation -------------
 
     #[rstest]
     #[case::zero(
@@ -666,8 +657,6 @@ mod tests {
         );
         assert_eq!(cursor_calls, 0, "children should not be materialized");
     }
-
-    // -- Consolidation 3: proptest replacing two happy-path hand-picked tests
 
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]
@@ -905,8 +894,6 @@ mod tests {
         assert_eq!(plan.residual_spec().metadata(), b"meta");
     }
 
-    // -- Consolidation 4: cursor error rejection tests -----------------------
-
     #[rstest]
     #[case::missing_cursor(
         b"a".as_slice(),
@@ -990,8 +977,6 @@ mod tests {
         // Residual inherits the unbounded end.
         assert!(plan.residual_spec().key_range_end().is_empty());
     }
-
-    // -- prefix_successor_into stripping logic at MAX_KEY_SIZE ----------------
 
     #[test]
     fn cursor_split_strips_trailing_0xff_at_max_key_size() {
