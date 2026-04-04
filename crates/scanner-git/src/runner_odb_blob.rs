@@ -51,7 +51,9 @@ use super::pack_candidates::{
     CappedPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateCollector,
 };
 use super::pack_io::PackIo;
-use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPlanError};
+use super::pack_plan::{
+    bucket_pack_candidates, build_pack_plan_for_pack, filter_completed_packs, PackPlanError,
+};
 use super::pack_plan_model::CompletedPacksBitmap;
 use super::runner::{
     GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
@@ -65,10 +67,10 @@ use super::repo_paths::{
     collect_loose_dirs, collect_pack_dirs, list_pack_files, resolve_pack_paths,
 };
 use super::runner_exec::{
-    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views,
+    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_scheduler_outputs,
     estimate_path_arena_capacity, execute_pack_plans_with_scheduler, load_midx, make_spill_dir,
-    mmap_pack_files, per_worker_cache_bytes, plan_completed_cleanly, scan_loose_candidates,
-    select_pack_exec_strategy, PackExecStrategy, SpillCandidateSink,
+    mmap_pack_files, per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
+    PackExecStrategy, SpillCandidateSink,
 };
 
 use super::repo_open::RepoJobState;
@@ -437,6 +439,7 @@ pub(super) fn run_odb_blob(
             pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
             plans.push(plan);
         }
+        filter_completed_packs(&mut plans, &completed_packs);
         perf_set!(
             stage_nanos,
             pack_plan,
@@ -479,16 +482,15 @@ pub(super) fn run_odb_blob(
                 Arc::clone(&commit_graph_index),
                 Arc::clone(&commit_meta_seen),
             )?;
-            debug_assert_eq!(plan_pack_ids.len(), outputs.len());
-            for (pack_id, output) in plan_pack_ids.into_iter().zip(outputs) {
-                if plan_completed_cleanly(&output.report) {
-                    completed_packs.mark_complete(pack_id);
-                }
-                pack_exec_reports.push(output.report);
-                skipped_candidates.extend(output.skipped);
-                common_metrics.merge_from(&output.common_metrics);
-                append_scanned_blobs(&mut scanned, output.scanned);
-            }
+            collect_scheduler_outputs(
+                plan_pack_ids,
+                outputs,
+                &mut completed_packs,
+                &mut pack_exec_reports,
+                &mut skipped_candidates,
+                &mut common_metrics,
+                &mut scanned,
+            );
         }
 
         if !loose.is_empty() {

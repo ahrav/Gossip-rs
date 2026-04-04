@@ -428,6 +428,96 @@ fn completion_bitmap_skips_fatal_error_plan() {
 }
 
 #[test]
+fn completion_bitmap_treats_non_error_skips_as_clean() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+        ],
+    };
+    let mut completed = CompletedPacksBitmap::empty(16);
+
+    assert!(
+        plan_completed_cleanly(&report),
+        "NotBlob skips are non-error; plan should be considered clean"
+    );
+    if plan_completed_cleanly(&report) {
+        completed.mark_complete(4);
+    }
+
+    assert!(completed.is_complete(4));
+}
+
+#[test]
+fn completion_bitmap_rejects_mixed_error_and_non_error_skips() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::PackParse(
+                    crate::pack_inflate::PackParseError::Truncated,
+                ),
+            },
+        ],
+    };
+
+    assert!(
+        !plan_completed_cleanly(&report),
+        "any error-class skip makes the plan incomplete"
+    );
+}
+
+#[test]
+fn plan_completed_cleanly_with_only_non_error_skips() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+        ],
+    };
+    assert!(plan_completed_cleanly(&report));
+}
+
+#[test]
+fn plan_completed_cleanly_mixed_error_and_non_error_skips() {
+    let report = PackExecReport {
+        stats: Default::default(),
+        skips: vec![
+            SkipRecord {
+                offset: 10,
+                reason: crate::pack_exec::SkipReason::NotBlob,
+            },
+            SkipRecord {
+                offset: 20,
+                reason: crate::pack_exec::SkipReason::PackParse(
+                    crate::pack_inflate::PackParseError::Truncated,
+                ),
+            },
+        ],
+    };
+    assert!(!plan_completed_cleanly(&report));
+}
+
+#[test]
 fn merge_shard_outputs_marks_completion() {
     let plans = vec![synthetic_plan(5, 2, 2, 0, 0)];
     let shard_meta = vec![SchedulerShardMeta {
@@ -457,6 +547,52 @@ fn merge_shard_outputs_marks_completion() {
     }
 
     assert!(completed.is_complete(5));
+}
+
+#[test]
+fn merge_shard_outputs_mixed_error_prevents_completion() {
+    let plans = vec![synthetic_plan(5, 2, 2, 0, 0)];
+    let shard_meta = vec![SchedulerShardMeta {
+        exec_plan: SchedulerShardExecPlan::Natural { len: 2 },
+        plan_hot_deps: PackPlanHotDeps::from_plan(&plans[0]),
+        candidate_ranges: Vec::new(),
+        shard_ranges: vec![(0, 1), (1, 2)],
+    }];
+    // Shard 0 succeeds; shard 1 has a fatal parse error. The merged report
+    // must surface the error, preventing the pack from being marked complete.
+    let shard_slots = vec![
+        std::sync::Mutex::new(Some(
+            scheduler_output_with_report(PackExecReport::default()),
+        )),
+        std::sync::Mutex::new(Some(scheduler_output_with_report(PackExecReport {
+            stats: Default::default(),
+            skips: vec![SkipRecord {
+                offset: 99,
+                reason: crate::pack_exec::SkipReason::PackParse(
+                    crate::pack_inflate::PackParseError::Truncated,
+                ),
+            }],
+        }))),
+    ];
+    let shard_slot_base = vec![0usize];
+
+    let outputs = merge_shard_outputs(&plans, &shard_meta, &shard_slots, &shard_slot_base)
+        .expect("shard merge should succeed");
+    let mut completed = CompletedPacksBitmap::empty(16);
+    let report = &outputs[0].report;
+
+    assert!(
+        !plan_completed_cleanly(report),
+        "merged report with one failing shard must not be clean"
+    );
+    if plan_completed_cleanly(report) {
+        completed.mark_complete(plans[0].pack_id());
+    }
+
+    assert!(
+        !completed.is_complete(5),
+        "pack with a failing shard must not be marked complete"
+    );
 }
 
 #[test]

@@ -66,7 +66,7 @@ use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
 use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::pack_candidates::CappedPackCandidateSink;
 use super::pack_io::PackIo;
-use super::pack_plan::{build_pack_plans, filter_completed_packs};
+use super::pack_plan::build_pack_plans;
 use super::pack_plan_model::CompletedPacksBitmap;
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
@@ -82,10 +82,10 @@ use super::repo_paths::{
     collect_loose_dirs, collect_pack_dirs, list_pack_files, resolve_pack_paths,
 };
 use super::runner_exec::{
-    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views,
+    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_scheduler_outputs,
     execute_pack_plans_with_scheduler, load_midx, make_spill_dir, mmap_pack_files,
-    per_worker_cache_bytes, plan_completed_cleanly, scan_loose_candidates,
-    select_pack_exec_strategy, summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
+    per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
+    summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
 };
 
 /// Runs the diff-history scan pipeline.
@@ -321,7 +321,6 @@ pub(super) fn run_diff_history(
         // large candidate vec; the sink's packed field is left empty.
         let packed = std::mem::take(&mut sink.packed);
         let mut pack_plans = build_pack_plans(packed, &pack_views, &midx, &config.pack_plan)?;
-        filter_completed_packs(&mut pack_plans, &completed_packs);
         pack_plan_stats.extend(pack_plans.iter().map(|p| p.stats));
         plans.append(&mut pack_plans);
     }
@@ -405,16 +404,15 @@ pub(super) fn run_diff_history(
             Arc::clone(&commit_graph_index),
             Arc::clone(&commit_meta_seen),
         )?;
-        debug_assert_eq!(plan_pack_ids.len(), outputs.len());
-        for (pack_id, output) in plan_pack_ids.into_iter().zip(outputs) {
-            if plan_completed_cleanly(&output.report) {
-                completed_packs.mark_complete(pack_id);
-            }
-            pack_exec_reports.push(output.report);
-            skipped_candidates.extend(output.skipped);
-            common_metrics.merge_from(&output.common_metrics);
-            append_scanned_blobs(&mut scanned, output.scanned);
-        }
+        collect_scheduler_outputs(
+            plan_pack_ids,
+            outputs,
+            &mut completed_packs,
+            &mut pack_exec_reports,
+            &mut skipped_candidates,
+            &mut common_metrics,
+            &mut scanned,
+        );
     }
     if !sink.loose.is_empty() {
         let mut adapter = EngineAdapter::new_with_event_sink(

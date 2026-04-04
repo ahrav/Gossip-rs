@@ -57,7 +57,7 @@ use super::pack_exec::{
 use super::pack_inflate::ObjectKind;
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
 use super::pack_plan::{PackPlanError, PackView};
-use super::pack_plan_model::{BaseLoc, PackPlan, NONE_U32};
+use super::pack_plan_model::{BaseLoc, CompletedPacksBitmap, PackPlan, NONE_U32};
 use super::repo_open::RepoJobState;
 use super::runner::{CandidateSkipReason, GitScanError, PackMmapLimits, SkippedCandidate};
 use super::spiller::Spiller;
@@ -1368,6 +1368,36 @@ fn count_pack_exec_skip_errors(skips: &[SkipRecord]) -> u64 {
 /// the pack offsets were decoded successfully and do not need to be revisited.
 pub(super) fn plan_completed_cleanly(report: &PackExecReport) -> bool {
     !report.skips.iter().any(|skip| skip.reason.is_error())
+}
+
+/// Collects scheduler outputs into the pipeline's accumulator buffers and
+/// marks completed packs in the bitmap.
+///
+/// Each output is paired with its plan's `pack_id` by position. A pack is
+/// marked complete only when its report contains no error-class skips.
+pub(super) fn collect_scheduler_outputs(
+    plan_pack_ids: Vec<u16>,
+    outputs: Vec<SchedulerPackExecOutput>,
+    completed_packs: &mut CompletedPacksBitmap,
+    pack_exec_reports: &mut Vec<PackExecReport>,
+    skipped_candidates: &mut Vec<SkippedCandidate>,
+    common_metrics: &mut GitScanCommonMetrics,
+    scanned: &mut ScannedBlobs,
+) {
+    assert_eq!(
+        plan_pack_ids.len(),
+        outputs.len(),
+        "scheduler output count mismatch"
+    );
+    for (pack_id, output) in plan_pack_ids.into_iter().zip(outputs) {
+        if plan_completed_cleanly(&output.report) {
+            completed_packs.mark_complete(pack_id);
+        }
+        pack_exec_reports.push(output.report);
+        skipped_candidates.extend(output.skipped);
+        common_metrics.merge_from(&output.common_metrics);
+        append_scanned_blobs(scanned, output.scanned);
+    }
 }
 
 /// Execute a single scheduler-dispatched pack task (plan or shard).
