@@ -7,6 +7,9 @@ contract, and ODB-blob attribution semantics.
 
 ```mermaid
 flowchart LR
+    Cancel["Abort Flag"] -.-> Mode
+    Cancel -.-> PackExec
+    Cancel -.-> Finalize
     Preflight["Optional Preflight (metadata only)"] -.-> RepoOpen["Repo Open + Watermarks"]
     RepoOpen --> ArtifactAcquire["Artifact Acquire"]
     ArtifactAcquire --> CommitWalk["Commit Walk"]
@@ -67,6 +70,31 @@ flowchart LR
 - Any decode skips or missing/corrupt loose objects result in `FinalizeOutcome::Partial`.
 - Skipped candidates are reported with explicit reasons; pack exec reports contain detailed decode errors.
 - Pack decoding can be driven via a read-at reader for deterministic fault injection.
+- Cancellation is cooperative: the caller-owned abort flag is checked at
+  runner phase boundaries, commit loops, tree-walk hot loops, scheduler task
+  launch sites, and loose-object decode boundaries.
+- An aborted scan returns `GitScanError::TreeDiff(TreeDiffError::Aborted)` and
+  skips finalize persistence instead of emitting partial durable state.
+
+## Cooperative Cancellation
+
+`run_git_scan` accepts a borrowed `AtomicBool` rather than owning its own
+runtime token type. The runtime layer bridges its `CancellationToken` into this
+interface with `CancellationToken::as_atomic()`, so local scans and the
+distributed lease watchdog both drive the same cooperative stop signal.
+
+Cancellation checks are intentionally tiered:
+
+- Runner boundaries stop work before entering expensive phases such as pack
+  execution, loose-object decoding, and finalize persistence.
+- Commit-level checks in `run_odb_blob`, `run_diff_history`, and serial blob
+  introduction prevent new commit work from starting once cancellation is set.
+- Tree-walk hot loops (`BlobIntroducer::walk_stack` and
+  `TreeDiffWalker::diff_trees`) sample the flag every 4096 processed entries to
+  bound latency on deep or wide trees without adding a per-entry atomic load.
+- Scheduler task launch combines the external abort signal with the scheduler's
+  internal error latch so lease expiry and worker failure both stop additional
+  pack work.
 
 ## Concurrency and Backpressure
 
@@ -84,7 +112,10 @@ mode) and pack execution introduce parallelism:
   are divided per worker with floor/cap clamping. After all workers finish,
   results are merged and global caps are re-validated. The worker that first
   claims a blob determines that blob's emitted context (`commit_id`, path,
-  flags), so attribution is not deterministic across worker counts.
+  flags), so attribution is not deterministic across worker counts. The shared
+  external abort flag is OR'd with a local worker-error latch so lease expiry
+  stops new chunk work without letting one worker mutate the caller-owned
+  cancellation state.
 
 - **Pack planning** is built on the runner thread before execution
   (`build_pack_plans` in diff-history, per-pack planning in ODB-blob mode).

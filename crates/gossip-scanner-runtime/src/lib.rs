@@ -248,6 +248,18 @@ impl CancellationToken {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Returns the underlying cancellation flag used by scanner-git.
+    ///
+    /// Scanner-git accepts `&AtomicBool` so it can stay independent from the
+    /// runtime crate. Callers that bridge into that pipeline only observe the
+    /// cancellation signal itself, so scanner-git uses `Relaxed` loads at read
+    /// sites while this token continues to publish cancellation with
+    /// `Release`/`Acquire` semantics for runtime-owned state.
+    #[must_use]
+    pub fn as_atomic(&self) -> &AtomicBool {
+        self.cancelled.as_ref()
+    }
+
     /// Returns true when cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {

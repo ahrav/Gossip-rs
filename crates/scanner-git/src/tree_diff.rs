@@ -58,6 +58,7 @@
 //! tracker is reset and the diff stack must be empty.
 
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use crate::perf_stats;
 
@@ -339,6 +340,7 @@ impl TreeDiffWalker {
     /// * `old_tree` - OID of the old (parent) tree, or None for empty tree
     /// * `commit_id` - Commit identifier for attribution
     /// * `parent_idx` - Which parent this diff is against (for merge commits)
+    /// * `abort` - Cooperative cancellation flag checked during the walk
     ///
     /// # Errors
     ///
@@ -358,6 +360,8 @@ impl TreeDiffWalker {
     /// - Stats are cumulative across calls; `reset_stats()` clears counters.
     /// - All retained tree-byte charges are released before return, including
     ///   early-error exits, so retries start from a clean budget state.
+    /// - The abort flag is checked every 4096 processed tree entries to bound
+    ///   cancellation latency on large commits.
     pub fn diff_trees<S: TreeSource, C: CandidateSink>(
         &mut self,
         source: &mut S,
@@ -366,9 +370,13 @@ impl TreeDiffWalker {
         old_tree: Option<&OidBytes>,
         commit_id: u32,
         parent_idx: u8,
+        abort: &AtomicBool,
     ) -> Result<(), TreeDiffError> {
         if new_tree == old_tree {
             return Ok(());
+        }
+        if abort.load(AtomicOrdering::Relaxed) {
+            return Err(TreeDiffError::Aborted);
         }
 
         self.cleanup_after_diff_call();
@@ -389,6 +397,7 @@ impl TreeDiffWalker {
                 prefix_len: 0,
             });
 
+            let mut entry_count: u32 = 0;
             while !self.stack.is_empty() {
                 let depth = self.stack.len() as u16;
                 perf_stats::max_u16(&mut self.stats.max_depth_reached, depth);
@@ -411,6 +420,12 @@ impl TreeDiffWalker {
                     }
                     action
                 };
+                if !matches!(action, Action::Pop) {
+                    entry_count = entry_count.wrapping_add(1);
+                    if entry_count & 0xFFF == 0 && abort.load(AtomicOrdering::Relaxed) {
+                        return Err(TreeDiffError::Aborted);
+                    }
+                }
 
                 match action {
                     Action::Pop => {
@@ -823,6 +838,9 @@ mod tests {
     use crate::CandidateBuffer;
 
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+
+    static NEVER_ABORT: AtomicBool = AtomicBool::new(false);
 
     struct MockTreeSource {
         trees: HashMap<OidBytes, Vec<u8>>,
@@ -885,7 +903,15 @@ mod tests {
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
         walker
-            .diff_trees(&mut source, &mut candidates, Some(&oid), Some(&oid), 1, 0)
+            .diff_trees(
+                &mut source,
+                &mut candidates,
+                Some(&oid),
+                Some(&oid),
+                1,
+                0,
+                &NEVER_ABORT,
+            )
             .unwrap();
 
         assert!(candidates.is_empty());
@@ -922,6 +948,7 @@ mod tests {
                 Some(&old_root),
                 1,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 
@@ -954,7 +981,15 @@ mod tests {
         let mut walker = TreeDiffWalker::new(&limits, 20);
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
-        let result = walker.diff_trees(&mut source, &mut candidates, Some(&root), None, 1, 0);
+        let result = walker.diff_trees(
+            &mut source,
+            &mut candidates,
+            Some(&root),
+            None,
+            1,
+            0,
+            &NEVER_ABORT,
+        );
 
         assert!(matches!(
             result,
@@ -988,6 +1023,7 @@ mod tests {
             Some(&old_oid),
             1,
             0,
+            &NEVER_ABORT,
         );
         assert!(matches!(
             first,
@@ -1004,6 +1040,7 @@ mod tests {
                 None,
                 2,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 
@@ -1049,6 +1086,7 @@ mod tests {
             None,
             1,
             0,
+            &NEVER_ABORT,
         );
         assert!(matches!(
             first,
@@ -1066,6 +1104,7 @@ mod tests {
                 None,
                 2,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 
@@ -1088,7 +1127,15 @@ mod tests {
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
         walker
-            .diff_trees(&mut source, &mut candidates, Some(&new_oid), None, 1, 0)
+            .diff_trees(
+                &mut source,
+                &mut candidates,
+                Some(&new_oid),
+                None,
+                1,
+                0,
+                &NEVER_ABORT,
+            )
             .unwrap();
 
         assert!(candidates.is_empty());
@@ -1117,6 +1164,7 @@ mod tests {
                 Some(&old_oid),
                 1,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 
@@ -1148,6 +1196,7 @@ mod tests {
                 Some(&old_oid),
                 1,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 
@@ -1179,6 +1228,7 @@ mod tests {
                 Some(&old_oid),
                 1,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 
@@ -1214,6 +1264,7 @@ mod tests {
                 Some(&old_oid),
                 1,
                 0,
+                &NEVER_ABORT,
             )
             .unwrap();
 
@@ -1246,7 +1297,15 @@ mod tests {
         let mut walker = TreeDiffWalker::new(&limits, 20);
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
-        let result = walker.diff_trees(&mut source, &mut candidates, Some(&root), None, 1, 0);
+        let result = walker.diff_trees(
+            &mut source,
+            &mut candidates,
+            Some(&root),
+            None,
+            1,
+            0,
+            &NEVER_ABORT,
+        );
 
         assert!(matches!(result, Err(TreeDiffError::PathTooLong { .. })));
     }
@@ -1264,7 +1323,15 @@ mod tests {
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
         walker
-            .diff_trees(&mut source, &mut candidates, Some(&new_oid), None, 1, 0)
+            .diff_trees(
+                &mut source,
+                &mut candidates,
+                Some(&new_oid),
+                None,
+                1,
+                0,
+                &NEVER_ABORT,
+            )
             .unwrap();
 
         let stats = walker.stats();
@@ -1288,7 +1355,15 @@ mod tests {
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
         walker
-            .diff_trees(&mut source, &mut candidates, Some(&oid), None, 1, 0)
+            .diff_trees(
+                &mut source,
+                &mut candidates,
+                Some(&oid),
+                None,
+                1,
+                0,
+                &NEVER_ABORT,
+            )
             .unwrap();
         crate::test_utils::assert_perf_u64(walker.stats().candidates_emitted, 1);
 
@@ -1312,10 +1387,26 @@ mod tests {
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
         walker
-            .diff_trees(&mut source, &mut candidates, Some(&oid1), None, 1, 0)
+            .diff_trees(
+                &mut source,
+                &mut candidates,
+                Some(&oid1),
+                None,
+                1,
+                0,
+                &NEVER_ABORT,
+            )
             .unwrap();
         walker
-            .diff_trees(&mut source, &mut candidates, Some(&oid2), None, 2, 0)
+            .diff_trees(
+                &mut source,
+                &mut candidates,
+                Some(&oid2),
+                None,
+                2,
+                0,
+                &NEVER_ABORT,
+            )
             .unwrap();
 
         assert_eq!(candidates.len(), 2);
@@ -1335,9 +1426,45 @@ mod tests {
         let mut candidates = CandidateBuffer::new(&limits, 20);
 
         walker
-            .diff_trees(&mut source, &mut candidates, Some(&new_oid), None, 1, 0)
+            .diff_trees(
+                &mut source,
+                &mut candidates,
+                Some(&new_oid),
+                None,
+                1,
+                0,
+                &NEVER_ABORT,
+            )
             .unwrap();
 
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn abort_returns_cleanly_before_tree_walk() {
+        let mut source = MockTreeSource::new();
+
+        let new_oid = test_oid(1);
+        source.add_tree(new_oid, make_entry(b"100644", b"file.txt", &[0xab; 20]));
+
+        let limits = test_limits();
+        let mut walker = TreeDiffWalker::new(&limits, 20);
+        let mut candidates = CandidateBuffer::new(&limits, 20);
+        let abort = AtomicBool::new(true);
+
+        let result = walker.diff_trees(
+            &mut source,
+            &mut candidates,
+            Some(&new_oid),
+            None,
+            1,
+            0,
+            &abort,
+        );
+
+        assert!(matches!(result, Err(TreeDiffError::Aborted)));
+        assert!(walker.stack.is_empty());
+        assert_eq!(walker.tree_bytes_in_flight, 0);
+        assert!(candidates.is_empty());
     }
 }

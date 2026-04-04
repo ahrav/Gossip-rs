@@ -12,6 +12,7 @@
 //! emitted.
 //!
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::AtomicBool;
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
@@ -496,6 +497,7 @@ fn stage_tree_diff(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let oid_len = to_object_format(state.scenario.repo.object_format).oid_len();
     let mut walker = TreeDiffWalker::new(&limits, oid_len);
     let mut candidates = CandidateBuffer::new(&limits, oid_len);
+    let abort = AtomicBool::new(false);
 
     for planned in &state.plan {
         let new_tree = commit_graph
@@ -512,6 +514,7 @@ fn stage_tree_diff(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
                     None,
                     planned.pos.0,
                     0,
+                    &abort,
                 )
                 .map_err(|err| failure_inv(23, err))?;
         } else {
@@ -528,6 +531,7 @@ fn stage_tree_diff(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
                         Some(&old_tree),
                         planned.pos.0,
                         parent_idx,
+                        &abort,
                     )
                     .map_err(|err| failure_inv(26, err))?;
             }

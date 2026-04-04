@@ -8,7 +8,9 @@ tree objects are compared to identify changed blobs for scanning.
 The tree subsystem compares two Git tree objects (typically the trees of a child
 commit and its parent) to find blob entries that were added or modified. It
 operates on raw decompressed tree payloads and performs OID-only comparison --
-no blob contents are read during the diff phase.
+no blob contents are read during the diff phase. The walker also accepts a
+cooperative abort flag so large diffs can stop without waiting for the entire
+tree walk to finish.
 
 The subsystem is composed of seven modules:
 
@@ -103,7 +105,9 @@ flowchart TD
 `TreeDiffWalker::diff_trees` (`tree_diff.rs`) performs an iterative
 merge-walk of two trees using an explicit stack of `DiffFrame`s -- no
 recursion. Each frame holds a pair of cursors (new tree, old tree) and a path
-prefix length for truncation on pop.
+prefix length for truncation on pop. The caller also supplies an abort flag;
+the walker samples it every 4096 processed entries so cancellation latency
+stays bounded on large commits without paying a per-entry atomic cost.
 
 The walk peeks the next entry from each cursor and dispatches on ordering:
 
@@ -128,6 +132,20 @@ flowchart TD
 The `compute_action` function (`tree_diff.rs`) computes the `Action` enum
 variant from the peeked entries. The walker then executes the action, which may
 emit a candidate, push a subtree frame, or simply advance a cursor.
+
+### Cooperative Cancellation
+
+`TreeDiffWalker::diff_trees` checks the abort flag in two places:
+
+- Once before any tree bytes are loaded, which lets a pre-cancelled scan fail
+  without mutating walker state.
+- Every 4096 processed entries inside the main merge-walk loop, which bounds
+  cancellation latency for deep or wide trees while keeping the hot path
+  amortized.
+
+When the flag is set, the walker returns `TreeDiffError::Aborted`. Callers such
+as `run_diff_history` treat that as a retryable scan abort and skip finalize
+work upstream.
 
 ### Entry Comparison Rules
 

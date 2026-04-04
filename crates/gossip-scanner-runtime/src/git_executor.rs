@@ -13,6 +13,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::sync_channel;
 
 use gossip_connectors::is_permanent_io_error;
@@ -110,13 +111,17 @@ impl ScannerGitExecutor {
     ///    because it is the root cause.
     ///
     /// The `policy_hash` flows into the scanner config for persistence
-    /// identity derivation; callers that do not persist pass `[0; 32]`.
+    /// identity derivation; callers that do not persist pass `[0; 32]`. The
+    /// borrowed `abort` flag is forwarded unchanged into `run_scan` so the
+    /// caller controls cooperative cancellation for the entire scanner-git
+    /// pipeline.
     fn execute_repo_with<R>(
         &self,
         mirror: &LocalMirror,
         selection: &GitSelection,
         limits: GitExecutionLimits,
         policy_hash: [u8; 32],
+        abort: &AtomicBool,
         run_scan: R,
     ) -> Result<GitRunExecution, GitRunError>
     where
@@ -124,6 +129,7 @@ impl ScannerGitExecutor {
             &Path,
             Arc<Engine>,
             &ScannerGitScanConfig,
+            &AtomicBool,
             Arc<dyn scanner_git::EventSink>,
         ) -> Result<GitRunExecution, GitScanError>,
     {
@@ -143,7 +149,13 @@ impl ScannerGitExecutor {
 
             let git_sink: Arc<dyn scanner_git::EventSink> =
                 Arc::new(ChannelEventOutput::new(event_tx.clone()));
-            let execution = run_scan(mirror.path(), Arc::clone(&self.engine), &git_cfg, git_sink);
+            let execution = run_scan(
+                mirror.path(),
+                Arc::clone(&self.engine),
+                &git_cfg,
+                abort,
+                git_sink,
+            );
 
             // Close our sender handle so the forwarder sees EOF regardless
             // of whether run_scan retained an Arc clone of the event sink.
@@ -202,10 +214,12 @@ impl ScannerGitExecutor {
             &Path,
             Arc<Engine>,
             &ScannerGitScanConfig,
+            &AtomicBool,
             Arc<dyn scanner_git::EventSink>,
         ) -> Result<GitRunExecution, GitScanError>,
     {
-        self.execute_repo_with(mirror, selection, limits, [0; 32], run_scan)
+        let abort = AtomicBool::new(false);
+        self.execute_repo_with(mirror, selection, limits, [0; 32], &abort, run_scan)
             .map(git_run_outcome)
     }
 
@@ -216,13 +230,16 @@ impl ScannerGitExecutor {
     /// are durable by the time the scan completes. The distributed Git
     /// worker path uses this method instead of [`run_repo_with`](Self::run_repo_with)
     /// because it needs the raw [`GitRunExecution`] to extract the
-    /// finalize outcome and synthesize a checkpoint.
+    /// finalize outcome and synthesize a checkpoint. The caller-owned `abort`
+    /// flag is forwarded into the runtime bridge so lease expiry can stop the
+    /// scan before finalize persistence begins.
     pub(crate) fn run_repo_with_persistence<B>(
         &self,
         mirror: &LocalMirror,
         selection: &GitSelection,
         limits: GitExecutionLimits,
         policy_hash: [u8; 32],
+        abort: &AtomicBool,
         persistence: &GitPersistenceAdapter<B>,
     ) -> Result<GitRunExecution, GitRunError>
     where
@@ -233,11 +250,13 @@ impl ScannerGitExecutor {
             selection,
             limits,
             policy_hash,
-            |repo, engine, git_cfg, git_sink| {
+            abort,
+            |repo, engine, git_cfg, abort, git_sink| {
                 run_runtime_git_scan_with_stores(
                     repo,
                     engine,
                     git_cfg,
+                    abort,
                     git_sink,
                     GitRuntimeStores {
                         seen_store: persistence,
@@ -676,7 +695,7 @@ mod tests {
                 &mirror,
                 &GitSelection::default(),
                 GitExecutionLimits::default(),
-                move |path, _engine, _cfg, _sink| {
+                move |path, _engine, _cfg, _sink, _abort| {
                     *captured_path.lock().expect("capture mutex") = Some(path.to_path_buf());
                     Err(GitScanError::ConcurrentMaintenance)
                 },

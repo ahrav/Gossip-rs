@@ -20,7 +20,9 @@ persistence. The subsystem is split across seven source files:
 | `finalize`               | `crates/scanner-git/src/finalize.rs`                  | Deterministic write-op builder for persistence          |
 | `persist`                | `crates/scanner-git/src/persist.rs`                   | Atomic finalize commit and incremental seen-bitmap ops  |
 
-The runner dispatches to one of two mode-specific pipelines after shared setup:
+The runner dispatches to one of two mode-specific pipelines after shared setup.
+Both the shared runner and the mode-specific pipelines also receive a
+caller-owned cooperative abort flag that can stop the scan before finalize:
 
 - **ODB-blob fast path** (`runner_odb_blob`) -- walks the unique blob set from
   the commit graph, then scans in pack order with streaming plan generation.
@@ -43,7 +45,8 @@ execution in addition to the finalize batch.
 
 ```mermaid
 flowchart TD
-    A["run_git_scan()"] --> B["repo_open"]
+    Cancel["abort flag"] --> A["run_git_scan()"]
+    A --> B["repo_open"]
     B --> C["acquire_midx"]
     C --> D{"artifacts_unchanged?"}
     D -- No --> ERR["ConcurrentMaintenance"]
@@ -53,8 +56,10 @@ flowchart TD
     G --> H{"scan_mode"}
     H -- OdbBlobFast --> I["run_odb_blob"]
     H -- DiffHistory --> J["run_diff_history"]
-    I --> K{"artifacts_unchanged?"}
-    J --> K
+    I --> X{"abort?"}
+    J --> X
+    X -- Yes --> ABORT["TreeDiffError::Aborted"]
+    X -- No --> K{"artifacts_unchanged?"}
     K -- No --> ERR
     K -- Yes --> L["build_finalize_ops"]
     L --> M{"persist_store?"}
@@ -81,16 +86,35 @@ flowchart TD
    `AtomicBitSet` gates exactly-once `CommitMeta` emission across workers.
 6. **Mode dispatch** (`runner.rs`) -- delegates to
    `run_odb_blob` or `run_diff_history`. Both receive the shared engine,
-   seen store, optional seen-bitmap persister, commit plan, and
-   `CommitMetaContext`.
+   seen store, optional seen-bitmap persister, commit plan,
+   caller-provided abort flag, and `CommitMetaContext`.
 7. **Post-execution stability check** (`runner.rs`) -- verifies pack
    artifacts have not changed during execution (detects concurrent `git gc`).
-8. **Finalize** (`runner.rs`) -- `build_finalize_ops` transforms
+8. **Cancellation gate** (`runner.rs`) -- a final abort check runs after the
+   post-execution artifact validation. Aborted scans stop here and do not
+   build finalize ops or persist partial progress.
+9. **Finalize** (`runner.rs`) -- `build_finalize_ops` transforms
    scan results into deterministic write operations.
-9. **Persist** (`runner.rs`) -- optional two-phase atomic write
-   via `persist_finalize_output`.
-10. **Report assembly** (`runner.rs`) -- perf counters are
+10. **Persist** (`runner.rs`) -- optional two-phase atomic write
+    via `persist_finalize_output`.
+11. **Report assembly** (`runner.rs`) -- perf counters are
     snapshot, and the final `GitScanReport` is returned.
+
+## Cooperative Cancellation
+
+The runner treats cancellation as a first-class control flow path rather than a
+best-effort hint:
+
+- `run_git_scan` checks the abort flag before repo open work continues, after
+  identity-dictionary emission, and after the post-mode artifact stability
+  check.
+- `run_odb_blob` and `run_diff_history` check the same flag at commit
+  boundaries, before pack execution, before loose-object scanning, and inside
+  their hottest tree-walk helpers.
+- The scheduler bridge in `runner_exec.rs` observes the external abort flag in
+  addition to its internal error latch before launching each pack-exec task.
+- Aborted scans return `GitScanError::TreeDiff(TreeDiffError::Aborted)` and
+  skip finalize persistence entirely.
 
 ## Key Types
 

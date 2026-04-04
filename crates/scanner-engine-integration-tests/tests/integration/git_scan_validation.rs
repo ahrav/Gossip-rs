@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use regex::bytes::Regex;
 use tempfile::TempDir;
@@ -251,6 +252,7 @@ fn run_scan_with_config(
         InMemoryPersistenceStore::with_seen_scope(config.repo_id, config.policy_hash);
     #[cfg(not(feature = "rocksdb"))]
     let persist_store = InMemoryPersistenceStore::default();
+    let abort = AtomicBool::new(false);
 
     run_git_scan(
         repo,
@@ -260,6 +262,7 @@ fn run_scan_with_config(
         &watermark_store,
         Some(&persist_store),
         &config,
+        &abort,
         std::sync::Arc::new(NullEventSink),
     )
 }
@@ -700,6 +703,7 @@ fn run_scan_with_events(
     #[cfg(not(feature = "rocksdb"))]
     let persist_store = InMemoryPersistenceStore::default();
     let sink = std::sync::Arc::new(VecEventSink::new());
+    let abort = AtomicBool::new(false);
 
     let result = run_git_scan(
         repo,
@@ -709,6 +713,7 @@ fn run_scan_with_events(
         &watermark_store,
         Some(&persist_store),
         &config,
+        &abort,
         sink.clone(),
     )
     .expect("scan should succeed");
@@ -748,6 +753,7 @@ fn failed_finalize_retry_still_scans_blob() {
         fail_commit_once: Cell::new(true),
     };
     let config = base_config();
+    let abort = AtomicBool::new(false);
 
     let first = run_git_scan(
         repo,
@@ -757,6 +763,7 @@ fn failed_finalize_retry_still_scans_blob() {
         &watermark_store,
         Some(&store),
         &config,
+        &abort,
         std::sync::Arc::new(NullEventSink),
     );
     assert!(
@@ -772,6 +779,7 @@ fn failed_finalize_retry_still_scans_blob() {
         &watermark_store,
         Some(&store),
         &config,
+        &abort,
         std::sync::Arc::new(NullEventSink),
     )
     .expect("retry should succeed");
@@ -794,6 +802,7 @@ fn failed_finalize_retry_still_scans_blob() {
         &watermark_store,
         Some(&store),
         &config,
+        &abort,
         std::sync::Arc::new(NullEventSink),
     )
     .expect("third run should succeed");
@@ -803,6 +812,51 @@ fn failed_finalize_retry_still_scans_blob() {
         third.0.finalize.stats.unique_blobs, 0,
         "blob should be skipped after successful finalize persisted seen state"
     );
+}
+
+#[test]
+fn aborted_scan_skips_finalize_persistence() {
+    if !git_available() {
+        eprintln!("git not available, skipping");
+        return;
+    }
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+    commit_file(
+        repo,
+        "secret.txt",
+        "prefix TOK_ABCDEFGH suffix",
+        "add secret",
+    );
+    ensure_artifacts(repo);
+
+    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let resolver = TestResolver { tip };
+    let watermark_store = TestWatermarkStore { watermark: None };
+    let persist_store = InMemoryPersistenceStore::default();
+    let config = base_config();
+    let abort = AtomicBool::new(true);
+
+    let err = run_git_scan(
+        repo,
+        std::sync::Arc::new(test_engine()),
+        &resolver,
+        &NeverSeenStore,
+        &watermark_store,
+        Some(&persist_store),
+        &config,
+        &abort,
+        std::sync::Arc::new(NullEventSink),
+    )
+    .expect_err("pre-cancelled scan should abort");
+
+    assert!(matches!(
+        err,
+        GitScanError::TreeDiff(scanner_git::TreeDiffError::Aborted)
+    ));
+    assert!(persist_store.data_ops.borrow().is_empty());
+    assert!(persist_store.watermark_ops.borrow().is_empty());
 }
 
 /// Verify that every finding's `commit_id` has a matching `commit_meta` event

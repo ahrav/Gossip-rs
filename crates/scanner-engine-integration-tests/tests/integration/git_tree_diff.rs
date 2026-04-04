@@ -15,6 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use scanner_git::{
     ArtifactBuildLimits, BlobIntroducer, CandidateBuffer, CandidateSink, ChangeKind,
@@ -26,6 +27,8 @@ use scanner_git::{
 };
 use scanner_git::{OidBytes, PlannedCommit, RepoJobState};
 use tempfile::TempDir;
+
+static NEVER_ABORT: AtomicBool = AtomicBool::new(false);
 
 /// Returns true when the `git` CLI is available on the host.
 fn git_available() -> bool {
@@ -313,6 +316,7 @@ fn diff_paths(
             Some(old_tree),
             0,
             parent_idx,
+            &NEVER_ABORT,
         )
         .unwrap();
 
@@ -357,6 +361,7 @@ fn tree_diff_matches_git_diff_tree() {
             Some(&old_tree),
             0,
             0,
+            &NEVER_ABORT,
         )
         .unwrap();
 
@@ -440,6 +445,7 @@ fn blob_introducer_matches_diff_history_unique_oids() {
                     None,
                     commit_id,
                     0,
+                    &NEVER_ABORT,
                 )
                 .unwrap();
         } else {
@@ -453,6 +459,7 @@ fn blob_introducer_matches_diff_history_unique_oids() {
                         Some(&old_tree),
                         commit_id,
                         idx as u8,
+                        &NEVER_ABORT,
                     )
                     .unwrap();
             }
@@ -483,6 +490,7 @@ fn blob_introducer_matches_diff_history_unique_oids() {
             &cg_index,
             &plan,
             &oid_index,
+            &NEVER_ABORT,
             &mut intro_candidates,
         )
         .unwrap();
@@ -531,6 +539,7 @@ fn blob_introducer_prefers_first_non_excluded_path() {
             &cg_index,
             &plan,
             &oid_index,
+            &NEVER_ABORT,
             &mut intro_candidates,
         )
         .unwrap();
@@ -582,6 +591,7 @@ fn blob_introducer_dedupes_duplicate_oids() {
             &cg_index,
             &plan,
             &oid_index,
+            &NEVER_ABORT,
             &mut intro_candidates,
         )
         .unwrap();
@@ -641,6 +651,7 @@ fn tree_diff_spill_path_uses_spill_arena() {
             Some(&old_tree),
             0,
             0,
+            &NEVER_ABORT,
         )
         .unwrap();
 
@@ -716,7 +727,15 @@ fn corrupt_tree_is_reported() {
     let corrupt_oid = OidBytes::sha1([0x11; 20]);
     write_corrupt_tree(state.paths.objects_dir(), &corrupt_oid);
 
-    let result = walker.diff_trees(&mut store, &mut candidates, Some(&corrupt_oid), None, 0, 0);
+    let result = walker.diff_trees(
+        &mut store,
+        &mut candidates,
+        Some(&corrupt_oid),
+        None,
+        0,
+        0,
+        &NEVER_ABORT,
+    );
 
     assert!(matches!(result, Err(TreeDiffError::CorruptTree { .. })));
 }
@@ -835,7 +854,15 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
 
             if *snapshot_root {
                 walker
-                    .diff_trees(&mut store, &mut sink, Some(&new_tree), None, commit_id, 0)
+                    .diff_trees(
+                        &mut store,
+                        &mut sink,
+                        Some(&new_tree),
+                        None,
+                        commit_id,
+                        0,
+                        &NEVER_ABORT,
+                    )
                     .unwrap();
                 continue;
             }
@@ -851,7 +878,15 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
 
             if parents.is_empty() {
                 walker
-                    .diff_trees(&mut store, &mut sink, Some(&new_tree), None, commit_id, 0)
+                    .diff_trees(
+                        &mut store,
+                        &mut sink,
+                        Some(&new_tree),
+                        None,
+                        commit_id,
+                        0,
+                        &NEVER_ABORT,
+                    )
                     .unwrap();
                 continue;
             }
@@ -869,6 +904,7 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
                                 Some(&old_tree),
                                 commit_id,
                                 idx as u8,
+                                &NEVER_ABORT,
                             )
                             .unwrap();
                     }
@@ -883,6 +919,7 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
                             Some(&old_tree),
                             commit_id,
                             0,
+                            &NEVER_ABORT,
                         )
                         .unwrap();
                 }
@@ -923,7 +960,15 @@ fn collect_unique_blobs_buffered(
 
         if *snapshot_root {
             walker
-                .diff_trees(&mut store, &mut buffer, Some(&new_tree), None, commit_id, 0)
+                .diff_trees(
+                    &mut store,
+                    &mut buffer,
+                    Some(&new_tree),
+                    None,
+                    commit_id,
+                    0,
+                    &NEVER_ABORT,
+                )
                 .unwrap();
             continue;
         }
@@ -939,7 +984,15 @@ fn collect_unique_blobs_buffered(
 
         if parents.is_empty() {
             walker
-                .diff_trees(&mut store, &mut buffer, Some(&new_tree), None, commit_id, 0)
+                .diff_trees(
+                    &mut store,
+                    &mut buffer,
+                    Some(&new_tree),
+                    None,
+                    commit_id,
+                    0,
+                    &NEVER_ABORT,
+                )
                 .unwrap();
             continue;
         }
@@ -954,6 +1007,7 @@ fn collect_unique_blobs_buffered(
                     Some(&old_tree),
                     commit_id,
                     idx as u8,
+                    &NEVER_ABORT,
                 )
                 .unwrap();
         }

@@ -115,6 +115,7 @@ fn encode_entry(
 mod tests {
     use super::*;
     use crate::{CandidateBuffer, ChangeKind, TreeDiffLimits, TreeDiffWalker};
+    use std::sync::atomic::AtomicBool;
 
     fn oid(val: u8) -> Vec<u8> {
         vec![val; 20]
@@ -153,10 +154,11 @@ mod tests {
         let limits = TreeDiffLimits::default();
         let mut walker = TreeDiffWalker::new(&limits, 20);
         let mut out = CandidateBuffer::new(&limits, 20);
+        let abort = AtomicBool::new(false);
 
         let tree_oid = OidBytes::from_slice(&oid(1));
         walker
-            .diff_trees(&mut source, &mut out, Some(&tree_oid), None, 1, 0)
+            .diff_trees(&mut source, &mut out, Some(&tree_oid), None, 1, 0, &abort)
             .expect("diff");
 
         let candidates: Vec<_> = out.iter_resolved().collect();

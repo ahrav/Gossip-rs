@@ -30,6 +30,7 @@
 //! across runs or worker counts.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -112,6 +113,13 @@ use crate::perf_set;
 /// non-deterministic under parallel workers; findings may appear before
 /// matching commit metadata.
 ///
+/// # Cancellation
+///
+/// `abort` is checked at stage boundaries, inside blob introduction, before
+/// loose-object scanning, and by the scheduler task launcher used for pack
+/// execution. When it is set, this function returns
+/// `GitScanError::TreeDiff(TreeDiffError::Aborted)`.
+///
 /// # Parameters
 /// - `repo`: opened repository job state (paths, object format, artifacts).
 /// - `engine`: detection engine instance for scanning blob contents.
@@ -120,6 +128,7 @@ use crate::perf_set;
 /// - `cg_index`: commit graph index built from the commit graph.
 /// - `plan`: commit plan (planned commits from `introduced_by_plan`).
 /// - `config`: scan configuration (limits, worker counts, etc.).
+/// - `abort`: cooperative cancellation flag shared with the caller.
 /// - `commit_meta`: event sink + commit-graph index + emit-once bitset.
 ///
 /// # Errors
@@ -135,6 +144,7 @@ pub(super) fn run_odb_blob(
     cg_index: &CommitGraphIndex,
     plan: &[PlannedCommit],
     config: &GitScanConfig,
+    abort: &AtomicBool,
     commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
     let CommitMetaContext {
@@ -219,6 +229,7 @@ pub(super) fn run_odb_blob(
                 mapping_cfg.path_arena_capacity,
                 mapping_cfg.max_packed_candidates,
                 mapping_cfg.max_loose_candidates,
+                abort,
             ) {
                 Ok(result) => {
                     perf_set!(
@@ -258,6 +269,7 @@ pub(super) fn run_odb_blob(
                         seen_store,
                         seen_persister,
                         &mut object_store,
+                        abort,
                         &mut stage_nanos,
                         intro_start,
                     )?
@@ -288,6 +300,7 @@ pub(super) fn run_odb_blob(
                 cg_index,
                 plan,
                 &oid_index,
+                abort,
                 &mut collector,
             ) {
                 Ok(stats) => {
@@ -333,6 +346,7 @@ pub(super) fn run_odb_blob(
                         seen_store,
                         seen_persister,
                         &mut object_store,
+                        abort,
                         &mut stage_nanos,
                         intro_start,
                     )?
@@ -340,6 +354,9 @@ pub(super) fn run_odb_blob(
                 Err(err) => return Err(err.into()),
             }
         };
+    if abort.load(Ordering::Relaxed) {
+        return Err(super::errors::TreeDiffError::Aborted.into());
+    }
 
     // ── Stage 2 + 3: pack planning + execution ──────────────────────
     let pack_plan_start = Instant::now();
@@ -448,6 +465,9 @@ pub(super) fn run_odb_blob(
         );
 
         if !plans.is_empty() {
+            if abort.load(Ordering::Relaxed) {
+                return Err(super::errors::TreeDiffError::Aborted.into());
+            }
             #[cfg(feature = "git-perf")]
             start_pack_exec();
             let plan_pack_ids: Vec<u16> = plans.iter().map(|plan| plan.pack_id()).collect();
@@ -480,6 +500,7 @@ pub(super) fn run_odb_blob(
                 pack_cache_bytes,
                 scheduler_workers,
                 config.pin_threads,
+                abort,
                 Arc::clone(&commit_graph_index),
                 Arc::clone(&commit_meta_seen),
             )?;
@@ -495,6 +516,9 @@ pub(super) fn run_odb_blob(
         }
 
         if !loose.is_empty() {
+            if abort.load(Ordering::Relaxed) {
+                return Err(super::errors::TreeDiffError::Aborted.into());
+            }
             #[cfg(feature = "git-perf")]
             start_pack_exec();
             let mut adapter = EngineAdapter::new_with_event_sink(
@@ -521,6 +545,7 @@ pub(super) fn run_odb_blob(
                 path_arena.as_ref(),
                 &mut adapter,
                 &mut external,
+                abort,
                 &mut skipped_candidates,
             )?;
             perf_set!(
@@ -539,6 +564,9 @@ pub(super) fn run_odb_blob(
             pack_plan_start.elapsed().as_nanos() as u64
         );
         if !loose.is_empty() {
+            if abort.load(Ordering::Relaxed) {
+                return Err(super::errors::TreeDiffError::Aborted.into());
+            }
             #[cfg(feature = "git-perf")]
             start_pack_exec();
             let mut adapter = EngineAdapter::new_with_event_sink(
@@ -565,6 +593,7 @@ pub(super) fn run_odb_blob(
                 path_arena.as_ref(),
                 &mut adapter,
                 &mut external,
+                abort,
                 &mut skipped_candidates,
             )?;
             perf_set!(
@@ -661,6 +690,7 @@ fn run_serial_spill_retry(
     seen_store: &dyn SeenBlobStore,
     seen_persister: &dyn SeenBitmapPersister,
     object_store: &mut ObjectStore<'_>,
+    abort: &AtomicBool,
     stage_nanos: &mut GitScanStageNanos,
     intro_start: Instant,
 ) -> Result<IntroResult, GitScanError> {
@@ -678,7 +708,7 @@ fn run_serial_spill_retry(
     let retry_start = Instant::now();
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), spill_dir)?;
     let mut sink = SpillCandidateSink::new(&mut spiller);
-    let stats = introducer.introduce(object_store, cg_index, plan, oid_index, &mut sink)?;
+    let stats = introducer.introduce(object_store, cg_index, plan, oid_index, abort, &mut sink)?;
     let retry_elapsed = retry_start.elapsed().as_nanos() as u64;
     perf_set!(
         stage_nanos,

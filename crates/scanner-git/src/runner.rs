@@ -38,6 +38,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "git-perf")]
 use std::time::Instant;
 
@@ -923,6 +924,13 @@ pub enum GitScanError {
 /// workers: `commit_meta` and `finding` events may interleave across commits,
 /// and a finding may appear before its matching commit metadata.
 ///
+/// # Cancellation
+///
+/// `abort` is checked at runner phase boundaries and inside the mode-specific
+/// hot loops. When it is set, the scan returns
+/// `GitScanError::TreeDiff(TreeDiffError::Aborted)` and skips finalize
+/// persistence.
+///
 /// # Caveats
 /// - Loose object decode failures are recorded as skipped candidates and may
 ///   yield a `FinalizeOutcome::Partial`, suppressing watermark writes.
@@ -935,9 +943,13 @@ pub fn run_git_scan(
     watermark_store: &dyn RefWatermarkStore,
     persist_store: Option<&dyn PersistenceStore>,
     config: &GitScanConfig,
+    abort: &AtomicBool,
     event_sink: std::sync::Arc<dyn crate::events::EventSink>,
 ) -> Result<GitScanResult, GitScanError> {
     scanner_engine::perf_counters::reset();
+    if abort.load(Ordering::Relaxed) {
+        return Err(TreeDiffError::Aborted.into());
+    }
 
     let start_set_id = config.start_set.id();
     let mut repo = repo_open(
@@ -989,6 +1001,9 @@ pub fn run_git_scan(
     if let Some(ref interner) = identity_interner {
         emit_identity_dictionary(&*event_sink, interner);
     }
+    if abort.load(Ordering::Relaxed) {
+        return Err(TreeDiffError::Aborted.into());
+    }
 
     // Dispatch to mode-specific pipeline.
     let mk_commit_meta = || CommitMetaContext {
@@ -1012,6 +1027,7 @@ pub fn run_git_scan(
             &cg_index,
             &plan,
             config,
+            abort,
             mk_commit_meta(),
         )?,
         GitScanMode::DiffHistory => super::runner_diff_history::run_diff_history(
@@ -1022,6 +1038,7 @@ pub fn run_git_scan(
             &cg,
             &plan,
             config,
+            abort,
             mk_commit_meta(),
         )?,
     };
@@ -1030,6 +1047,9 @@ pub fn run_git_scan(
     // Post-execution artifact stability check.
     if !repo.artifacts_unchanged()? {
         return Err(GitScanError::ConcurrentMaintenance);
+    }
+    if abort.load(Ordering::Relaxed) {
+        return Err(TreeDiffError::Aborted.into());
     }
 
     // Finalize + persist.
