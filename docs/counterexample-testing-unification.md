@@ -139,19 +139,21 @@ post-startup allocation behavior and unfilterable rule analysis. Gated behind
 
 ### 2.1 Encoding/Mutation Capabilities
 
-| Capability                  | Scanner Sim            | Git Sim  | Property | Real-Rules      | Offline Validators | Fuzz                 |
-| --------------------------- | ---------------------- | -------- | -------- | --------------- | ------------------ | -------------------- |
-| Base64 encode               | `generator.rs` | —        | —        | Manual fixtures | Static vectors     | `fuzz_b64_gate_*`    |
-| URL percent encode          | `generator.rs` | —        | —        | —               | —                  | —                    |
-| UTF-16 LE/BE encode         | `generator.rs` | —        | —        | —               | —                  | —                    |
-| Nested (alternating layers) | `generator.rs` | —        | —        | —               | —                  | —                    |
-| Near-miss mutation          | **NONE**               | **NONE** | **NONE** | **NONE**        | **NONE**           | Coverage-guided only |
-| Representation selection    | `generator.rs` | —        | —        | —               | —                  | —                    |
-| Token generation            | `generator.rs` | —        | —        | —               | —                  | —                    |
+| Capability                  | Scanner Sim                          | Git Sim  | Property | Real-Rules      | Offline Validators | Fuzz                 |
+| --------------------------- | ------------------------------------ | -------- | -------- | --------------- | ------------------ | -------------------- |
+| Base64 encode               | `sim/mutation/encode.rs`             | —        | —        | Manual fixtures | Static vectors     | `fuzz_b64_gate_*`    |
+| URL percent encode          | `sim/mutation/encode.rs`             | —        | —        | —               | —                  | —                    |
+| UTF-16 LE/BE encode         | `sim/mutation/encode.rs`             | —        | —        | —               | —                  | —                    |
+| Nested (alternating layers) | `sim/mutation/encode.rs`             | —        | —        | —               | —                  | —                    |
+| Near-miss mutation          | `sim/mutation/op.rs`                 | —        | —        | —               | —                  | Coverage-guided only |
+| Representation selection    | `sim/mutation/plan_gen.rs`           | —        | —        | —               | —                  | —                    |
+| Token generation            | `sim/mutation/family.rs`             | —        | —        | —               | —                  | —                    |
 
-**Key finding**: encoding functions in `crates/scanner-scheduler/src/sim_scanner/generator.rs` are the ONLY place systematic secret transforms happen. No near-miss
-mutation operators exist anywhere in the codebase. Fuzz targets apply
-coverage-guided byte mutation but without semantic awareness of token structure.
+**Key finding**: systematic secret transforms now live in the shared mutation
+core under `crates/scanner-scheduler/src/sim/mutation/`, and near-miss mutation
+operators are implemented in `crates/scanner-scheduler/src/sim/mutation/op.rs`.
+Fuzz targets still apply coverage-guided byte mutation without semantic
+awareness of token structure.
 
 ### 2.2 Infrastructure Components
 
@@ -239,13 +241,13 @@ fixtures are ever introduced:
 
 | Current Component       | Location                                                          | Purpose                      | Action             | Target                                                  | Rationale                                              |
 | ----------------------- | ----------------------------------------------------------------- | ---------------------------- | ------------------ | ------------------------------------------------------- | ------------------------------------------------------ |
-| `encode_secret()`       | `generator.rs`                                            | Dispatch raw→representation  | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent; reusable by git sim and real-rules |
-| `base64_encode_std()`   | `generator.rs`                                            | Base64 standard encoding     | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `percent_encode_all()`  | `generator.rs`                                            | URL percent encoding         | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `encode_utf16()`        | `generator.rs`                                            | UTF-16 LE/BE widening        | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `encode_nested()`       | `generator.rs`                                            | Alternating layer nesting    | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
-| `hex_nibble()`          | `generator.rs`                                            | Nibble→hex helper            | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Dependency of `percent_encode_all`                     |
-| `SecretRepr`            | `scenario.rs`                                              | Encoding representation enum | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent type                                |
+| `encode_secret()`       | `crates/scanner-scheduler/src/sim/mutation/encode.rs`     | Dispatch raw→representation  | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent; reusable by git sim and real-rules |
+| `base64_encode_std()`   | `crates/scanner-scheduler/src/sim/mutation/encode.rs`     | Base64 standard encoding     | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `percent_encode_all()`  | `crates/scanner-scheduler/src/sim/mutation/encode.rs`     | URL percent encoding         | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_utf16()`        | `crates/scanner-scheduler/src/sim/mutation/encode.rs`     | UTF-16 LE/BE widening        | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_nested()`       | `crates/scanner-scheduler/src/sim/mutation/encode.rs`     | Alternating layer nesting    | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `hex_nibble()`          | `crates/scanner-scheduler/src/sim/mutation/encode.rs`     | Nibble→hex helper            | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Dependency of `percent_encode_all`                     |
+| `SecretRepr`            | `crates/scanner-scheduler/src/sim/mutation/encode.rs`     | Encoding representation enum | **Done** | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent type                                |
 | `make_token()`          | `generator.rs`                                            | Rule prefix + random tail    | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Scanner-specific format (SIM{id}_...)                  |
 | `generate_scenario()`   | `sim_scanner/generator.rs`                                        | Full scanner scenario        | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Domain-specific orchestration                          |
 | `generate_scenario()`   | `sim_git_scan/generator.rs`                                       | Full git scenario            | **Keep**           | `crates/scanner-git/src/sim_git_scan/generator.rs`      | Domain-specific orchestration                          |
@@ -566,8 +568,9 @@ Record pass counts as the baseline for later regression checks.
 
 | File                                                    | Relevance                                                            |
 | ------------------------------------------------------- | -------------------------------------------------------------------- |
-| `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Encoding functions, token generation |
-| `crates/scanner-scheduler/src/sim_scanner/scenario.rs`  | `SecretRepr` enum, `ExpectedDisposition`              |
+| `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Scanner token generation |
+| `crates/scanner-scheduler/src/sim_scanner/scenario.rs`  | `ExpectedDisposition`, scenario schema              |
+| `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Encoding functions, `SecretRepr` enum               |
 | `crates/scanner-scheduler/src/sim_scanner/runner.rs`    | Scanner oracles (7), chunked scanning event loop                     |
 | `crates/scanner-git/src/sim_git_scan/runner.rs`         | Git stage pipeline, output-shape validation                          |
 | `crates/scanner-git/src/sim_git_scan/fault.rs`          | `GitFaultPlan`, `GitResourceId` (resource-keyed)                     |
