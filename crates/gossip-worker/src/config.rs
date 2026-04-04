@@ -441,7 +441,7 @@ impl GitDistributedSourceSettings {
     #[must_use]
     pub fn new(git: GitSourceSettings, mirror_root: impl Into<PathBuf>) -> Self {
         let mirror_root: PathBuf = mirror_root.into();
-        debug_assert!(
+        assert!(
             !mirror_root.as_os_str().is_empty(),
             "mirror_root must not be empty"
         );

@@ -671,8 +671,8 @@ enum Op {
 
 struct OpenOp {
     file_slot: usize,             // FileState index (for completion lookup)
-    path: CString,                // NUL-terminated path (lifetime to CQE)
-    open_how: Option<Box<types::OpenHow>>,
+    _path: CString,               // NUL-terminated path (lifetime to CQE)
+    _open_how: Option<Box<types::OpenHow>>,
 }
 
 struct StatOp {
@@ -1042,8 +1042,8 @@ enum Op {
 
 struct OpenOp {
     file_slot: usize,               // FileState index
-    path: CString,                  // NUL-terminated path
-    open_how: Option<Box<types::OpenHow>>,
+    _path: CString,                 // NUL-terminated path
+    _open_how: Option<Box<types::OpenHow>>,
 }
 
 struct StatOp {
