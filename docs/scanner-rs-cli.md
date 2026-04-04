@@ -100,7 +100,7 @@ scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
 | `--event-format` | `jsonl`, `text`, `json`, `sarif` | `jsonl` | Output format |
 | `--null-sink` | flag | off | Drop all events (benchmarking) |
 | `--verbose` | flag | off | Verbose text output |
-| `--summary-debug` | flag | off | Include extended debug/timing fields in the stderr summary |
+| `--debug` | flag | off | Include extended debug/timing fields in the stderr summary |
 
 ### FS-specific flags
 
