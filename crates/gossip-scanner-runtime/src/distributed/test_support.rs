@@ -317,8 +317,8 @@ impl OrderedContentSource for MultiStepScriptedSource {
             .expect("MultiStepScriptedSource: unexpected extra fill_page call")
     }
 
-    /// Scripted suffix tests do not care about file bytes; they only
-    /// need a stable clean payload when the scan runtime opens an item.
+    /// Returns a fixed empty byte slice; the scripted page loop only
+    /// exercises enumeration and commit ordering, not content reads.
     fn open(
         &mut self,
         _item_ref: &ItemRef,
@@ -765,10 +765,11 @@ pub(super) fn suffix_test_item(name: &[u8], size: u64) -> ScanItem {
     .with_size_hint(size)
 }
 
-/// Run the source-generic page loop with a scripted source and return
-/// the result. Uses a real engine, commit pipeline, and done-ledger
-/// so the first page can complete successfully before the second call
-/// triggers a suffix-protocol violation.
+/// Run the source-generic page loop with a scripted source.
+///
+/// Uses a real engine, commit pipeline, and done-ledger so the first
+/// page completes durable commit before subsequent pages exercise
+/// suffix-protocol edge cases.
 pub(super) fn run_suffix_protocol_test(
     pages: Vec<Result<Option<PageBuf<ScanItem>>, EnumerateError>>,
 ) -> Result<(OrderedSourceAssignmentOutcome, u64), ScanRuntimeError> {

@@ -166,9 +166,8 @@ fn distributed_run_report_default_satisfies_invariant() {
     assert_eq!(report.total_checkpoint_ms, 0);
     assert!(report.shards_scanned <= report.leases_seen);
 
-    // Non-trivial case: demonstrates the invariant holds for realistic
-    // field values and guards against field-ordering mistakes in future
-    // construction sites.
+    // Verify the invariant holds with non-zero fields and that
+    // shards_scanned ≤ leases_seen remains true.
     let nonzero = DistributedRunReport {
         leases_seen: 10,
         shards_scanned: 7,
@@ -390,9 +389,8 @@ fn resolve_filesystem_lease_results_prefers_scan_failure_over_drain_failure() {
     let submitted_error = anyhow!("submitted boom");
     let stage_error = anyhow!("drain boom");
 
-    // All three inputs fail so the test discriminates ordering: if the
-    // function ever checked `submitted` before `outcome`, the returned
-    // variant would be `Durability` instead of `Runtime`.
+    // All three inputs fail; the function must prefer scan errors over
+    // submission and drain errors to surface the root cause.
     let error = resolve_filesystem_lease_results(
         Err(scan_error),
         Err(submitted_error),
@@ -2172,6 +2170,63 @@ fn submit_git_repo_persistence_commits_findings_and_done_ledger() {
         observation.ovid_hash(),
         done.key().ovid_hash(),
         "git observations must use per-object OVIDs while done-ledger stays repo-scoped",
+    );
+}
+
+#[test]
+fn submit_git_repo_persistence_clean_scan_skips_findings_sink() {
+    let findings_sink = InMemoryFindingsSink::new();
+    let done_ledger = InMemoryDoneLedger::new();
+    let persistence = DistributedPersistence::new(findings_sink.clone(), done_ledger.clone());
+    let tmp = tempdir().expect("temp dir for repo key");
+    let repo_key = git_repo_key(tmp.path());
+    let commit_oid_map = HashMap::new();
+    let input = GitRepoPersistenceInput {
+        write_context: write_context(),
+        shard_id: &ToxicDigest::of_bytes(b"clean-scan-shard"),
+        repo_key: &repo_key,
+        repo_id: 99,
+        bytes_scanned: 512,
+        findings: &[],
+        commit_oid_map: &commit_oid_map,
+        tenant_secret_key: tenant_secret_key(),
+        rule_fingerprint: &test_rule_fingerprint,
+        claim_time: LogicalTime::from_raw(100),
+        complete_time: LogicalTime::from_raw(200),
+    };
+
+    let (findings_receipt, done_ledger_receipt) = submit_git_repo_persistence(&persistence, &input)
+        .expect("clean-scan persistence should succeed");
+
+    // Findings receipt must be zero-count — the findings sink is never called.
+    assert_eq!(findings_receipt.finding_count(), 0);
+    assert_eq!(findings_receipt.occurrence_count(), 0);
+    assert_eq!(findings_receipt.observation_count(), 0);
+
+    // Done-ledger must still receive its row.
+    assert_eq!(done_ledger_receipt.record_count(), 1);
+    let rows = done_ledger.snapshot().expect("done-ledger snapshot");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status(), DoneLedgerStatus::ScannedClean,);
+
+    // Findings sink must remain completely untouched.
+    assert!(
+        findings_sink
+            .findings_snapshot()
+            .expect("findings snapshot")
+            .is_empty(),
+    );
+    assert!(
+        findings_sink
+            .occurrences_snapshot()
+            .expect("occurrences snapshot")
+            .is_empty(),
+    );
+    assert!(
+        findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot")
+            .is_empty(),
     );
 }
 
