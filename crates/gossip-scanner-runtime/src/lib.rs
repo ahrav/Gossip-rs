@@ -1645,8 +1645,6 @@ pub enum OwnedCoreEvent {
         object_path: Vec<u8>,
         start: u64,
         end: u64,
-        match_start: u64,
-        match_end: u64,
         rule_id: u32,
         /// Heap-allocated because `FindingEvent.rule_name` is `&'a str`
         /// (lifetime-bound to the engine), not `&'static str`. Changing the
@@ -1689,8 +1687,6 @@ impl fmt::Debug for OwnedCoreEvent {
                 object_path,
                 start,
                 end,
-                match_start,
-                match_end,
                 rule_id,
                 rule_name,
                 norm_hash: _norm_hash,
@@ -1703,8 +1699,6 @@ impl fmt::Debug for OwnedCoreEvent {
                 .field("object_path", object_path)
                 .field("start", start)
                 .field("end", end)
-                .field("match_start", match_start)
-                .field("match_end", match_end)
                 .field("rule_id", rule_id)
                 .field("rule_name", rule_name)
                 // Secret-derived digests are redacted to keep debug output safe.
@@ -1764,8 +1758,6 @@ impl OwnedCoreEvent {
                 object_path: finding.object_path.to_vec(),
                 start: finding.start,
                 end: finding.end,
-                match_start: finding.match_start,
-                match_end: finding.match_end,
                 rule_id: finding.rule_id,
                 rule_name: finding.rule_name.to_owned(),
                 norm_hash: finding.norm_hash,
@@ -1808,8 +1800,6 @@ impl OwnedCoreEvent {
                 object_path,
                 start,
                 end,
-                match_start,
-                match_end,
                 rule_id,
                 rule_name,
                 norm_hash,
@@ -1821,8 +1811,6 @@ impl OwnedCoreEvent {
                 object_path,
                 start: *start,
                 end: *end,
-                match_start: *match_start,
-                match_end: *match_end,
                 rule_id: *rule_id,
                 rule_name,
                 norm_hash: *norm_hash,
@@ -1876,8 +1864,6 @@ impl PartialEq for OwnedCoreEvent {
                     object_path: p1,
                     start: st1,
                     end: e1,
-                    match_start: ms1,
-                    match_end: me1,
                     rule_id: r1,
                     rule_name: rn1,
                     norm_hash: nh1,
@@ -1890,8 +1876,6 @@ impl PartialEq for OwnedCoreEvent {
                     object_path: p2,
                     start: st2,
                     end: e2,
-                    match_start: ms2,
-                    match_end: me2,
                     rule_id: r2,
                     rule_name: rn2,
                     norm_hash: nh2,
@@ -1904,8 +1888,6 @@ impl PartialEq for OwnedCoreEvent {
                     && p1 == p2
                     && st1 == st2
                     && e1 == e2
-                    && ms1 == ms2
-                    && me1 == me2
                     && r1 == r2
                     && rn1 == rn2
                     && nh1 == nh2

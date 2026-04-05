@@ -1514,8 +1514,6 @@ fn emit_ordered_item_findings(
             object_path: execution.item().item_key().as_bytes(),
             start: finding.root_hint_start,
             end: finding.root_hint_end,
-            match_start: finding.span_start,
-            match_end: finding.span_end,
             rule_id: finding.rule_id,
             rule_name: engine.rule_name(finding.rule_id),
             norm_hash: finding.norm_hash,

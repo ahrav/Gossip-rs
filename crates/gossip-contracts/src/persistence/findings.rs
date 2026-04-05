@@ -61,16 +61,33 @@ use super::{
 /// - `span_start`
 /// - `span_end`
 ///
-/// Root-hint offsets, object paths, commit metadata, and confidence scores stay
-/// on the discovery or telemetry path unless they become part of persistence
-/// identity in the future.
+/// Object paths, commit metadata, and confidence scores stay on the discovery
+/// or telemetry path unless they become part of persistence identity in the
+/// future.
+///
+/// # Coordinate Space
+///
+/// `span_start` and `span_end` **must be blob-absolute** — expressed in
+/// root-file (blob) coordinates, not in the engine's per-chunk scan buffer.
+/// `OccurrenceId` derivation hashes these values; if they vary with chunker
+/// alignment, the same secret in the same blob produces different identities
+/// depending on how the scanner happened to split the input.
+///
+/// Implementors sourced from the engine's `FindingRec` **must not** return
+/// `FindingRec.span_start/span_end` directly — those are current-buffer
+/// offsets and are not blob-absolute in the multi-chunk scan path. Use
+/// `FindingRec.root_hint_start/root_hint_end` (or an equivalently mapped
+/// value) instead, because the engine populates those with blob-absolute
+/// coordinates via `base_offset + match_span.start` (root findings) or
+/// `RootSpanMapCtx::map_span(decoded_span)` (transform findings).
 ///
 /// # Invariants
 ///
 /// - `span_end() >= span_start()` — zero-length spans are permitted (the
 ///   translation layer rejects them when inappropriate for identity
 ///   derivation, but the trait itself allows them).
-/// - `norm_hash()` returns the canonical redacted [`NormHash`] newtype
+/// - `norm_hash()` returns the canonical redacted [`NormHash`] newtype.
+/// - Both offsets are blob-absolute as described above.
 pub trait PersistenceFinding: Send + Sync {
     /// Engine rule identifier that matched.
     fn rule_id(&self) -> u32;
@@ -78,10 +95,10 @@ pub trait PersistenceFinding: Send + Sync {
     /// Canonical digest of the normalized secret content.
     fn norm_hash(&self) -> NormHash;
 
-    /// Inclusive byte offset where the match starts.
+    /// Inclusive blob-absolute byte offset where the match starts.
     fn span_start(&self) -> u64;
 
-    /// Exclusive byte offset where the match ends.
+    /// Exclusive blob-absolute byte offset where the match ends.
     fn span_end(&self) -> u64;
 
     /// Length of the matched byte span.

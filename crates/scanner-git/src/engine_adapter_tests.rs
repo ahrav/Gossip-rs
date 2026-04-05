@@ -176,8 +176,6 @@ struct CapturingFindingSink {
 struct CapturedFindingEvent {
     start: u64,
     end: u64,
-    match_start: u64,
-    match_end: u64,
     norm_hash: [u8; 32],
 }
 
@@ -196,8 +194,6 @@ impl EventSink for CapturingFindingSink {
                 .push(CapturedFindingEvent {
                     start: finding.start,
                     end: finding.end,
-                    match_start: finding.match_start,
-                    match_end: finding.match_end,
                     norm_hash: finding.norm_hash,
                 });
         }
@@ -210,9 +206,17 @@ fn test_adapter_with_capturing_sink<'a>(
     engine: &'a Engine,
     sink: Arc<CapturingFindingSink>,
 ) -> EngineAdapter<'a> {
+    test_adapter_with_capturing_sink_cfg(engine, sink, EngineAdapterConfig::default())
+}
+
+fn test_adapter_with_capturing_sink_cfg<'a>(
+    engine: &'a Engine,
+    sink: Arc<CapturingFindingSink>,
+    config: EngineAdapterConfig,
+) -> EngineAdapter<'a> {
     EngineAdapter::new_with_event_sink(
         engine,
-        EngineAdapterConfig::default(),
+        config,
         CommitMetaContext {
             event_sink: sink,
             commit_graph_index: Arc::new(CommitGraphIndex::empty()),
@@ -479,7 +483,7 @@ fn git_finding_events_propagate_norm_hash() {
 }
 
 #[test]
-fn git_finding_events_preserve_exact_match_spans_when_root_hints_diverge() {
+fn git_finding_events_carry_blob_absolute_root_hints() {
     let engine = test_engine_with_tok_rule();
     let sink = Arc::new(CapturingFindingSink::default());
     let mut adapter = test_adapter_with_capturing_sink(&engine, Arc::clone(&sink));
@@ -494,26 +498,84 @@ fn git_finding_events_preserve_exact_match_spans_when_root_hints_diverge() {
     assert_eq!(captured.len(), 1, "expected exactly one captured finding");
 
     let finding = captured[0];
-    assert_ne!(
-        (finding.start, finding.end),
-        (finding.match_start, finding.match_end),
-        "transform-derived finding should preserve a distinct exact match span",
-    );
     assert_eq!(
         (finding.start as u32, finding.end as u32),
         (
             adapter.findings_arena()[0].key.start,
             adapter.findings_arena()[0].key.end,
         ),
-        "event root hints must still match the dedupe key",
+        "event root-hint coordinates must match the adapter dedupe key (blob-absolute)",
+    );
+}
+
+/// Scanning the same blob with single-chunk vs multi-chunk configurations
+/// must produce identical identity-bearing coordinates. The engine chunker
+/// must not leak its alignment into the persistence identity — otherwise
+/// the same secret in the same blob produces different OccurrenceIds
+/// depending on which chunker was used.
+#[test]
+fn multi_chunk_scan_match_spans_equal_single_chunk_scan() {
+    let engine = test_engine_with_tok_rule();
+
+    // Place the secret far enough into the blob that it lands past the
+    // first chunk boundary when chunk_bytes is small. The secret bytes
+    // "ABCDEFGH" in "TOK_ABCDEFGH" sit at absolute blob offset ~87.
+    let mut blob = Vec::with_capacity(256);
+    blob.extend_from_slice(&[b'.'; 80]);
+    blob.extend_from_slice(b"prefix TOK_ABCDEFGH suffix");
+    blob.extend_from_slice(&[b'.'; 80]);
+
+    // Scan #1: single chunk — chunk_bytes exceeds blob length so the
+    // adapter fast path runs with view.base == 0 and buffer-local
+    // coordinates coincide with blob-absolute coordinates.
+    let sink_single = Arc::new(CapturingFindingSink::default());
+    let cfg_single = EngineAdapterConfig {
+        chunk_bytes: blob.len() + 1024,
+        scan_binary: true,
+    };
+    let mut adapter_single =
+        test_adapter_with_capturing_sink_cfg(&engine, Arc::clone(&sink_single), cfg_single);
+    let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+    adapter_single
+        .emit_loose(&candidate, b"secret.txt", &blob)
+        .expect("single-chunk scan");
+    let findings_single = sink_single.take_findings();
+
+    // Scan #2: multi-chunk — force the slow path by setting a chunk size
+    // smaller than the blob. The RingChunker will emit a view.base > 0
+    // for the window that contains the secret.
+    let sink_multi = Arc::new(CapturingFindingSink::default());
+    let cfg_multi = EngineAdapterConfig {
+        chunk_bytes: 64,
+        scan_binary: true,
+    };
+    let mut adapter_multi =
+        test_adapter_with_capturing_sink_cfg(&engine, Arc::clone(&sink_multi), cfg_multi);
+    adapter_multi
+        .emit_loose(&candidate, b"secret.txt", &blob)
+        .expect("multi-chunk scan");
+    let findings_multi = sink_multi.take_findings();
+
+    assert_eq!(
+        findings_single.len(),
+        1,
+        "expected one finding from single-chunk scan",
     );
     assert_eq!(
-        (finding.match_start as u32, finding.match_end as u32),
-        (
-            adapter.findings_arena()[0].match_start,
-            adapter.findings_arena()[0].match_end,
-        ),
-        "event exact spans must match the adapter's stored match coordinates",
+        findings_multi.len(),
+        1,
+        "expected one finding from multi-chunk scan",
+    );
+
+    // The identity-bearing coordinates (`start`/`end`) are the persistence
+    // identity inputs used by `PersistenceFinding::span_start/span_end`.
+    // They must be chunker-invariant so the same secret in the same blob
+    // produces the same OccurrenceId regardless of how the scanner split
+    // the input.
+    assert_eq!(
+        (findings_single[0].start, findings_single[0].end),
+        (findings_multi[0].start, findings_multi[0].end),
+        "root-hint coordinates must be chunker-independent (blob-absolute)",
     );
 }
 
@@ -527,8 +589,6 @@ fn sort_and_dedupe_findings_prefers_higher_confidence() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
-            match_start: 10,
-            match_end: 20,
             confidence_score: 1,
         },
         ScoredFinding {
@@ -538,8 +598,6 @@ fn sort_and_dedupe_findings_prefers_higher_confidence() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
-            match_start: 10,
-            match_end: 20,
             confidence_score: 5,
         },
         ScoredFinding {
@@ -549,8 +607,6 @@ fn sort_and_dedupe_findings_prefers_higher_confidence() {
                 rule_id: 7,
                 norm_hash: [0x22; 32],
             },
-            match_start: 30,
-            match_end: 40,
             confidence_score: 0,
         },
     ];
@@ -578,8 +634,6 @@ fn sort_and_dedupe_findings_prefers_higher_confidence_reverse_input() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
-            match_start: 10,
-            match_end: 20,
             confidence_score: 5,
         },
         ScoredFinding {
@@ -589,8 +643,6 @@ fn sort_and_dedupe_findings_prefers_higher_confidence_reverse_input() {
                 rule_id: 7,
                 norm_hash: [0x11; 32],
             },
-            match_start: 10,
-            match_end: 20,
             confidence_score: 1,
         },
     ];
@@ -687,8 +739,6 @@ fn sort_and_dedupe_single_element() {
             rule_id: 1,
             norm_hash: [0xaa; 32],
         },
-        match_start: 5,
-        match_end: 15,
         confidence_score: 3,
     };
     let mut findings = vec![original];
@@ -707,8 +757,6 @@ fn sort_and_dedupe_negative_confidence_keeps_higher() {
                 rule_id: 2,
                 norm_hash: [0xbb; 32],
             },
-            match_start: 0,
-            match_end: 10,
             confidence_score: -10,
         },
         ScoredFinding {
@@ -718,8 +766,6 @@ fn sort_and_dedupe_negative_confidence_keeps_higher() {
                 rule_id: 2,
                 norm_hash: [0xbb; 32],
             },
-            match_start: 0,
-            match_end: 10,
             confidence_score: -5,
         },
     ];
@@ -745,8 +791,6 @@ fn sort_and_dedupe_three_duplicates_keeps_highest() {
                 rule_id: 4,
                 norm_hash: [0xcc; 32],
             },
-            match_start: 0,
-            match_end: 8,
             confidence_score: 2,
         },
         ScoredFinding {
@@ -756,8 +800,6 @@ fn sort_and_dedupe_three_duplicates_keeps_highest() {
                 rule_id: 4,
                 norm_hash: [0xcc; 32],
             },
-            match_start: 0,
-            match_end: 8,
             confidence_score: 7,
         },
         ScoredFinding {
@@ -767,8 +809,6 @@ fn sort_and_dedupe_three_duplicates_keeps_highest() {
                 rule_id: 4,
                 norm_hash: [0xcc; 32],
             },
-            match_start: 0,
-            match_end: 8,
             confidence_score: 3,
         },
     ];
@@ -790,8 +830,6 @@ fn sort_and_dedupe_all_identical_including_confidence() {
             rule_id: 9,
             norm_hash: [0xdd; 32],
         },
-        match_start: 1,
-        match_end: 2,
         confidence_score: 4,
     };
     let mut findings = vec![f, f, f];
@@ -815,8 +853,6 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 1,
                 norm_hash: [0x11; 32],
             },
-            match_start: 10,
-            match_end: 20,
             confidence_score: 2,
         },
         ScoredFinding {
@@ -826,8 +862,6 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 1,
                 norm_hash: [0x11; 32],
             },
-            match_start: 10,
-            match_end: 20,
             confidence_score: 8,
         },
         // Group B: unique finding.
@@ -838,8 +872,6 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 2,
                 norm_hash: [0x22; 32],
             },
-            match_start: 30,
-            match_end: 40,
             confidence_score: 0,
         },
         // Group C: three duplicates.
@@ -850,8 +882,6 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 3,
                 norm_hash: [0x33; 32],
             },
-            match_start: 50,
-            match_end: 60,
             confidence_score: 1,
         },
         ScoredFinding {
@@ -861,8 +891,6 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 3,
                 norm_hash: [0x33; 32],
             },
-            match_start: 50,
-            match_end: 60,
             confidence_score: 6,
         },
         ScoredFinding {
@@ -872,8 +900,6 @@ fn sort_and_dedupe_mixed_duplicates_and_unique() {
                 rule_id: 3,
                 norm_hash: [0x33; 32],
             },
-            match_start: 50,
-            match_end: 60,
             confidence_score: 3,
         },
     ];

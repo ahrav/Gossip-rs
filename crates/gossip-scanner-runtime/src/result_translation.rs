@@ -146,14 +146,26 @@ impl PersistenceFinding for FsFindingRef<'_> {
         NormHash::from_digest(self.0.norm_hash)
     }
 
+    /// Returns the blob-absolute root-hint start. `FsFindingRecord` carries
+    /// two offset pairs: `span_start/span_end` from the engine's current
+    /// scan buffer (window-local, chunker-dependent) and
+    /// `root_hint_start/end` mapped to root-file coordinates (blob-absolute).
+    /// The `PersistenceFinding::span_start` trait method is the identity
+    /// coordinate and must be blob-absolute, so this impl deliberately
+    /// returns `root_hint_start` — the clippy `misnamed_getters` lint fires
+    /// because the method name and field name appear to mismatch, but the
+    /// naming is load-bearing: renaming either the trait method or the
+    /// `FsFindingRecord` field would cross a crate boundary.
     #[inline]
+    #[allow(clippy::misnamed_getters)]
     fn span_start(&self) -> u64 {
-        self.0.span_start
+        self.0.root_hint_start
     }
 
     #[inline]
+    #[allow(clippy::misnamed_getters)]
     fn span_end(&self) -> u64 {
-        self.0.span_end
+        self.0.root_hint_end
     }
 }
 
@@ -768,7 +780,8 @@ mod tests {
         root_hint_end: u64,
         span_start: u64,
         span_end: u64,
-        hash_seed: u8,
+        norm_hash: [u8; 32],
+        confidence_score: i8,
     ) -> FsFindingRecord {
         FsFindingRecord {
             rule_id,
@@ -776,8 +789,8 @@ mod tests {
             root_hint_end,
             span_start,
             span_end,
-            norm_hash: [hash_seed; 32],
-            confidence_score: 7,
+            norm_hash,
+            confidence_score,
         }
     }
 
@@ -965,9 +978,16 @@ mod tests {
     }
 
     #[test]
-    fn divergent_root_hint_and_exact_match_spans_still_converge_across_source_types() {
-        let fs = fs_finding_with_root_hint(7, 100, 124, 10, 22, 0xAB);
-        let git = git_finding(7, 10, 22, 0xAB);
+    fn matching_root_hints_converge_across_source_types_even_when_inner_spans_differ() {
+        // Persistence identity derives from blob-absolute root-hint coordinates
+        // (the full regex match span in root-file coordinates), not from the
+        // engine's buffer-local span. Two findings with identical rule, hash,
+        // and root_hint must produce the same OccurrenceId regardless of
+        // whatever buffer-local `span_start/span_end` each scan path recorded.
+        let fs = fs_finding_with_root_hint(7, 100, 124, 10, 22, [0xAB; 32], 7);
+        // Git's GitFindingForPersistence.span_start/span_end carry the
+        // blob-absolute root-hint offsets (see coordination_sink.rs doc).
+        let git = git_finding(7, 100, 124, 0xAB);
         let fs_translation = translate_item_result(
             write_context(),
             &tenant_secret_key(),
@@ -988,7 +1008,7 @@ mod tests {
         assert_eq!(
             fs_translation.occurrences()[0].occurrence_id(),
             git_translation.occurrences()[0].occurrence_id(),
-            "Git occurrence identity must use exact match spans, not root hints",
+            "matching root-hint identity must derive the same OccurrenceId",
         );
         assert_eq!(
             fs_translation.observations()[0].observation_id(),
@@ -1375,20 +1395,24 @@ mod tests {
         );
     }
 
-    /// Module-level invariant: root_hint_start and root_hint_end are
-    /// scanner-local metadata and never participate in persistence identity
-    /// derivation.
+    /// Module-level invariant: persistence identity derives from blob-absolute
+    /// `root_hint_start/root_hint_end`. The engine's buffer-local
+    /// `span_start/span_end` is chunker-dependent and must not participate in
+    /// identity derivation.
     #[test]
-    fn root_hint_fields_do_not_affect_persistence_identity() {
-        let mut a = finding(7, 100, 110, 0xAA);
-        let mut b = finding(7, 100, 110, 0xAA);
-
-        // Diverge only the root-hint fields; span and all other fields stay
-        // identical.
-        a.root_hint_start = 50;
-        a.root_hint_end = 200;
-        b.root_hint_start = 0;
-        b.root_hint_end = 500;
+    fn root_hint_fields_determine_persistence_identity() {
+        // Same root_hint, divergent span — identities must match.
+        let mut a = finding(7, 10, 22, 0xAA);
+        let mut b = finding(7, 10, 22, 0xAA);
+        a.root_hint_start = 100;
+        a.root_hint_end = 124;
+        b.root_hint_start = 100;
+        b.root_hint_end = 124;
+        // Diverge the buffer-local span fields only.
+        a.span_start = 10;
+        a.span_end = 22;
+        b.span_start = 40;
+        b.span_end = 52;
 
         let translated_a = translate_scanned(&[a]);
         let translated_b = translate_scanned(&[b]);
@@ -1396,17 +1420,38 @@ mod tests {
         assert_eq!(
             translated_a.findings()[0].finding_id(),
             translated_b.findings()[0].finding_id(),
-            "root_hint fields must not participate in FindingId derivation",
+            "matching rule/hash must derive the same FindingId regardless of span",
         );
         assert_eq!(
             translated_a.occurrences()[0].occurrence_id(),
             translated_b.occurrences()[0].occurrence_id(),
-            "root_hint fields must not participate in OccurrenceId derivation",
+            "matching root_hint must derive the same OccurrenceId regardless of span",
         );
+    }
+
+    #[test]
+    fn diverging_root_hint_fields_produce_distinct_occurrence_ids() {
+        // Different root_hint — OccurrenceId must diverge even when the
+        // buffer-local span fields happen to match.
+        let mut a = finding(7, 10, 22, 0xAA);
+        let mut b = finding(7, 10, 22, 0xAA);
+        a.root_hint_start = 100;
+        a.root_hint_end = 124;
+        b.root_hint_start = 200;
+        b.root_hint_end = 224;
+
+        let translated_a = translate_scanned(&[a]);
+        let translated_b = translate_scanned(&[b]);
+
         assert_eq!(
-            translated_a.observations()[0].observation_id(),
-            translated_b.observations()[0].observation_id(),
-            "root_hint fields must not participate in ObservationId derivation",
+            translated_a.findings()[0].finding_id(),
+            translated_b.findings()[0].finding_id(),
+            "FindingId is independent of span coordinates",
+        );
+        assert_ne!(
+            translated_a.occurrences()[0].occurrence_id(),
+            translated_b.occurrences()[0].occurrence_id(),
+            "divergent root_hint must produce distinct OccurrenceIds",
         );
     }
 
@@ -1488,41 +1533,42 @@ mod tests {
             .. ProptestConfig::default()
         })]
 
-        /// For any valid identity quadruple (rule_id, norm_hash, span_start,
-        /// span_end), the FS and Git translation paths must produce identical
-        /// FindingId, OccurrenceId, and ObservationId values.
+        /// For any valid identity quadruple (rule_id, norm_hash, root_hint_start,
+        /// root_hint_end), the FS and Git translation paths must produce identical
+        /// FindingId, OccurrenceId, and ObservationId values. The FS path has a
+        /// distinct buffer-local `span_start/span_end` that must NOT affect the
+        /// derived identity — scanner-side divergence in buffer coordinates
+        /// must be invisible to persistence identity.
         #[test]
         fn proptest_translate_findings_identity_equivalence(
             rule_id in 1..100u32,
             hash_seed in proptest::array::uniform32(0u8..),
-            start in 0..1_000_000u64,
-            len in 1..1000u64,
-            root_hint_prefix in 1..1000u64,
-            root_hint_suffix in 0..1000u64,
+            root_hint_start in 0..(u64::MAX - 10_000),
+            root_hint_len in 1..1000u64,
+            fs_span_offset in 0..1000u64,
         ) {
-            let end = start.saturating_add(len).max(start + 1);
-            let root_hint_start = start.saturating_add(root_hint_prefix);
-            let root_hint_end = root_hint_start
-                .saturating_add(len)
-                .saturating_add(root_hint_suffix)
-                .max(root_hint_start.saturating_add(1));
+            let root_hint_end = root_hint_start.saturating_add(root_hint_len);
+            // FS records carry an independent buffer-local span. Derive one
+            // from the proptest-generated offset so cases include both
+            // span == root_hint and span != root_hint.
+            let fs_span_start = fs_span_offset;
+            let fs_span_end = fs_span_start.saturating_add(root_hint_len);
             let fs_rec = fs_finding_with_root_hint(
                 rule_id,
                 root_hint_start,
                 root_hint_end,
-                start,
-                end,
-                hash_seed[0],
+                fs_span_start,
+                fs_span_end,
+                hash_seed,
+                5,
             );
-            let fs_rec = FsFindingRecord {
-                norm_hash: hash_seed,
-                confidence_score: 5,
-                ..fs_rec
-            };
+            // Git's GitFindingForPersistence.span_start/span_end carry the
+            // blob-absolute root-hint offsets.
             let git_rec = GitFindingForPersistence {
                 rule_id,
                 norm_hash: NormHash::from_digest(hash_seed),
-                span_start: start, span_end: end,
+                span_start: root_hint_start,
+                span_end: root_hint_end,
             };
 
             let identity = git_repo_ovid_inputs(42);

@@ -135,14 +135,20 @@ impl Default for EngineAdapterConfig {
 /// All identity traits (`PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd`)
 /// are derived over the full field tuple.
 ///
-/// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
-/// a *best-effort root match span* in blob coordinates. For transform-derived
-/// findings, these spans map back to the encoded bytes that produced the match.
+/// `start` and `end` are **blob-absolute** offsets sourced from
+/// `FindingRec.root_hint_start/root_hint_end` — the full regex match span
+/// (group 0) mapped to root-file coordinates. The engine populates
+/// `root_hint_*` via `base_offset + match_span.start` (root findings) or
+/// `RootSpanMapCtx::map_span(decoded_span)` (transform findings), so these
+/// offsets are stable across chunker alignment changes and drive
+/// cross-source persistence identity convergence between Git and FS scans
+/// (see `GitFindingForPersistence` in
+/// `gossip_scanner_runtime::coordination_sink`).
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FindingKey {
-    /// Inclusive start offset within the blob.
+    /// Inclusive blob-absolute start offset of the full match.
     pub start: u32,
-    /// Exclusive end offset within the blob.
+    /// Exclusive blob-absolute end offset of the full match.
     pub end: u32,
     /// Stable rule identifier.
     pub rule_id: u32,
@@ -171,14 +177,8 @@ impl fmt::Debug for FindingKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScoredFinding {
     pub key: FindingKey,
-    /// Exact match start offset within the scanned buffer.
-    pub match_start: u32,
-    /// Exact match end offset within the scanned buffer.
-    pub match_end: u32,
     pub confidence_score: i8,
 }
-
-const _: () = assert!(std::mem::size_of::<ScoredFinding>() <= 64);
 
 impl Ord for ScoredFinding {
     /// Primary: identity key ascending. Secondary: confidence descending.
@@ -573,8 +573,6 @@ impl<'a> EngineAdapter<'a> {
                 object_path: path,
                 start: u64::from(f.key.start),
                 end: u64::from(f.key.end),
-                match_start: u64::from(f.match_start),
-                match_end: u64::from(f.match_end),
                 rule_id: f.key.rule_id,
                 rule_name: self.engine.rule_name(f.key.rule_id),
                 norm_hash: f.key.norm_hash,
@@ -1015,8 +1013,6 @@ fn scan_chunk(
                 rule_id: rec.rule_id,
                 norm_hash: *hash,
             },
-            match_start: rec.span_start,
-            match_end: rec.span_end,
             confidence_score: rec.confidence_score,
         });
     }

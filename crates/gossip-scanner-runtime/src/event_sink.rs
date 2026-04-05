@@ -83,6 +83,10 @@ impl<W: Write + Send> EventOutput for TextEventSink<W> {
         let mut line = Vec::with_capacity(256);
         match event {
             CoreEvent::Finding(finding) => {
+                // Text output renders `start`/`end` (blob-absolute root-hint
+                // span — the full regex match in root-file coordinates) as the
+                // user-facing display range. These same offsets also feed
+                // persistence identity derivation downstream.
                 if self.verbose {
                     line.extend_from_slice(b"--- finding ---\n");
                     line.extend_from_slice(b"  rule:   ");
@@ -315,6 +319,11 @@ fn encode_core_event(event: CoreEvent<'_>, line: &mut Vec<u8>) {
     match event {
         CoreEvent::Finding(finding) => {
             // Keep the record shape aligned with scanner-rs golden fixtures.
+            //
+            // The JSON finding record exposes `start`/`end` — blob-absolute
+            // root-hint offsets covering the full regex match in root-file
+            // coordinates. These same offsets feed persistence identity
+            // derivation downstream.
             line.push(b'{');
             push_key(line, b"path");
             write_json_bytes(line, finding.object_path);
@@ -467,6 +476,9 @@ fn encode_git_event(event: GitEvent<'_>, line: &mut Vec<u8>) {
 }
 
 fn encode_sarif_result(finding: &scanner_scheduler::events::FindingEvent<'_>, line: &mut Vec<u8>) {
+    // The SARIF region is derived from `start`/`end` — blob-absolute root-hint
+    // offsets covering the full regex match in root-file coordinates. These
+    // same offsets participate in persistence identity derivation.
     line.extend_from_slice(b"{\"ruleId\":");
     write_json_str(line, finding.rule_name);
     line.extend_from_slice(b",\"message\":{\"text\":");
@@ -592,8 +604,6 @@ mod tests {
             object_path: b"src/main.rs",
             start: 10,
             end: 40,
-            match_start: 12,
-            match_end: 28,
             rule_id: 7,
             rule_name: "aws-access-key",
             norm_hash: [0xAB; 32],
@@ -629,8 +639,6 @@ mod tests {
             object_path: b"config/.env",
             start: 0,
             end: 32,
-            match_start: 4,
-            match_end: 20,
             rule_id: 9,
             rule_name: "generic-secret",
             norm_hash: [0xCD; 32],
@@ -666,8 +674,6 @@ mod tests {
             object_path: b"src/main.rs",
             start: 5,
             end: 12,
-            match_start: 6,
-            match_end: 11,
             rule_id: 1,
             rule_name: "rule",
             norm_hash: [0x11; 32],
@@ -695,8 +701,6 @@ mod tests {
             object_path: b"src/main.rs",
             start: 1,
             end: 2,
-            match_start: 1,
-            match_end: 2,
             rule_id: 1,
             rule_name: "rule",
             norm_hash: [0x21; 32],
@@ -725,8 +729,6 @@ mod tests {
             object_path: b"src/main.rs",
             start: 1,
             end: 2,
-            match_start: 1,
-            match_end: 2,
             rule_id: 1,
             rule_name: "rule",
             norm_hash: [0x22; 32],
@@ -759,8 +761,6 @@ mod tests {
             object_path: b"src/main.rs",
             start: 10,
             end: 20,
-            match_start: 10,
-            match_end: 20,
             rule_id: 2,
             rule_name: "aws-access-key",
             norm_hash: [0x23; 32],
@@ -793,8 +793,6 @@ mod tests {
             object_path: b"src/main.rs",
             start: 10,
             end: 20,
-            match_start: 10,
-            match_end: 20,
             rule_id: 2,
             rule_name: "aws-access-key",
             norm_hash: [0x24; 32],

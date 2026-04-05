@@ -1092,6 +1092,73 @@ fn file_exactly_chunk_size() {
     );
 }
 
+/// Multi-chunk scans must emit findings whose persistence identity
+/// coordinates are blob-absolute. `FsFindingRecord.root_hint_start` is the
+/// coordinate consumed by `PersistenceFinding::span_start` for `OccurrenceId`
+/// derivation — if it were window-local, a finding found in chunk N would
+/// report an offset relative to the Nth chunk buffer instead of the file.
+#[test]
+fn multi_chunk_fs_scan_root_hint_offsets_are_file_absolute() {
+    use crate::store::InMemoryStoreProducer;
+
+    let engine = Arc::new(Engine::new(
+        vec![real_simple_rule()],
+        Vec::<TransformConfig>::new(),
+        real_test_tuning(64),
+    ));
+    let sink = Arc::new(VecEventOutput::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+
+    // chunk_size=64, overlap=32 for real engine. Place SECRET at absolute
+    // file offset 100 so it lands past the first chunk boundary, making
+    // chunk-local vs file-absolute distinguishable. The rule's regex is
+    // `SECRET[A-Z0-9]{8}`, so we follow SECRET with 8 'B' characters and
+    // the full match is "SECRETBBBBBBBB" at file-absolute 100..114.
+    let mut data = vec![b'A'; 100];
+    data.extend_from_slice(b"SECRET"); // abs offset 100..106
+    data.resize(200, b'B');
+
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(&data).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_path_buf();
+    let size = tmp.as_file().metadata().unwrap().len();
+
+    let source = VecFileSource::new(vec![LocalFile { path, size }]);
+    let mut cfg = small_config_with_sink(sink);
+    cfg.store_producer = Some(producer.clone());
+    let report = scan_local(engine, source, cfg);
+
+    assert!(
+        report.metrics.chunks_scanned >= 2,
+        "test must exercise multi-chunk path; chunks_scanned = {}",
+        report.metrics.chunks_scanned
+    );
+    assert_eq!(
+        report.metrics.findings_emitted, 1,
+        "expected exactly one SECRET finding"
+    );
+
+    let batches = producer.batches();
+    let records: Vec<_> = batches.iter().flat_map(|b| b.findings.iter()).collect();
+    assert_eq!(records.len(), 1, "expected one persisted finding record");
+    let rec = &records[0];
+
+    // The identity-bearing `root_hint_start/end` must be the absolute file
+    // offset of the full "SECRETBBBBBBBB" match (100..114), not a
+    // window-local offset relative to the chunk buffer containing the secret.
+    assert_eq!(
+        rec.root_hint_start, 100,
+        "root_hint_start must be file-absolute (got {})",
+        rec.root_hint_start
+    );
+    assert_eq!(
+        rec.root_hint_end, 114,
+        "root_hint_end must be file-absolute (got {})",
+        rec.root_hint_end
+    );
+}
+
 #[test]
 fn multiple_secrets_across_chunks_in_one_file() {
     // One file spanning 3+ chunks, each containing a SECRET well away

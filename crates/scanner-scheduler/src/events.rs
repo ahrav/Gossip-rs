@@ -25,35 +25,24 @@ pub enum CoreEvent<'a> {
 }
 
 /// Structured finding payload written by scheduler event sinks.
+///
+/// `start` and `end` carry blob-absolute root-hint coordinates — the full
+/// regex match span (group 0) mapped to root-file coordinates. Both scan
+/// paths populate them from the engine's `FindingRec::root_hint_start` and
+/// `root_hint_end`, which the engine computes via `base_offset +
+/// match_span.start` (root findings) or `RootSpanMapCtx::map_span` (transform
+/// findings). These offsets feed both user-facing event output and
+/// persistence identity derivation, so Git and FS scans of the same content
+/// converge on the same `OccurrenceId` regardless of chunker alignment.
 pub struct FindingEvent<'a> {
     /// Source family that emitted this finding.
     pub source: SourceKind,
     /// Source-relative object path for the scanned payload.
     pub object_path: &'a [u8],
-    /// Byte offset marking the start of the finding region (inclusive).
-    ///
-    /// Both scan paths populate this from root-hint offsets (`root_hint_start`),
-    /// which delimit the broader context region containing the match in root
-    /// file coordinates. These fields are useful for user-facing event output
-    /// and debugging, but they do not participate in persistence identity.
+    /// Inclusive blob-absolute byte offset marking the start of the finding.
     pub start: u64,
-    /// Byte offset marking the end of the finding region (exclusive).
-    ///
-    /// Same source semantics as [`start`](Self::start): populated from
-    /// `root_hint_end` in both scan paths. Not used for persistence identity.
+    /// Exclusive blob-absolute byte offset marking the end of the finding.
     pub end: u64,
-    /// Exact match start offset (inclusive).
-    ///
-    /// The FS path populates this from `span_start`, and the Git path
-    /// populates it from the exact match span captured alongside the finding
-    /// key during adapter deduplication. Persistence identity derivation uses
-    /// this field together with [`match_end`](Self::match_end).
-    pub match_start: u64,
-    /// Exact match end offset (exclusive).
-    ///
-    /// Same source semantics as [`match_start`](Self::match_start): populated
-    /// from the engine's exact match span, not the root-hint context window.
-    pub match_end: u64,
     /// Numeric identifier of the matching detection rule.
     pub rule_id: u32,
     /// Human-readable rule name resolved from `rule_id`.
@@ -88,8 +77,6 @@ impl fmt::Debug for FindingEvent<'_> {
             .field("object_path", &self.object_path)
             .field("start", &self.start)
             .field("end", &self.end)
-            .field("match_start", &self.match_start)
-            .field("match_end", &self.match_end)
             .field("rule_id", &self.rule_id)
             .field("rule_name", &self.rule_name)
             // Secret-derived digests are redacted to keep debug output safe.
@@ -406,8 +393,6 @@ mod tests {
             object_path: b"dir/file.txt",
             start: 10,
             end: 20,
-            match_start: 12,
-            match_end: 18,
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xAB; 32],
@@ -430,8 +415,6 @@ mod tests {
             object_path: b"dir/file.txt",
             start: 10,
             end: 20,
-            match_start: 12,
-            match_end: 18,
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xDE; 32],

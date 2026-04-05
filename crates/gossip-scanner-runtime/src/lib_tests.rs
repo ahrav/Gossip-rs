@@ -1088,8 +1088,6 @@ fn owned_core_event_finding_with_norm_hash_round_trips() {
         object_path: b"/tmp/secret.txt",
         start: 10,
         end: 42,
-        match_start: 12,
-        match_end: 24,
         rule_id: 7,
         rule_name: "test-rule",
         norm_hash: [0xAB; 32],
@@ -1100,17 +1098,11 @@ fn owned_core_event_finding_with_norm_hash_round_trips() {
 
     let owned = OwnedCoreEvent::from_core(original);
     match &owned {
-        OwnedCoreEvent::Finding {
-            norm_hash,
-            match_start,
-            match_end,
-            ..
-        } => {
+        OwnedCoreEvent::Finding { norm_hash, .. } => {
             assert_eq!(
                 *norm_hash, [0xAB; 32],
                 "from_core must preserve norm_hash in memory"
             );
-            assert_eq!((*match_start, *match_end), (12, 24));
         }
         other => panic!("expected Finding, got {other:?}"),
     }
@@ -1141,8 +1133,6 @@ fn owned_core_event_finding_round_trips_with_distinct_norm_hash() {
         object_path: b"/tmp/secret.txt",
         start: 10,
         end: 42,
-        match_start: 12,
-        match_end: 24,
         rule_id: 7,
         rule_name: "test-rule",
         norm_hash: [0xCD; 32],
@@ -1153,17 +1143,11 @@ fn owned_core_event_finding_round_trips_with_distinct_norm_hash() {
 
     let owned = OwnedCoreEvent::from_core(original);
     match &owned {
-        OwnedCoreEvent::Finding {
-            norm_hash,
-            match_start,
-            match_end,
-            ..
-        } => {
+        OwnedCoreEvent::Finding { norm_hash, .. } => {
             assert_eq!(
                 *norm_hash, [0xCD; 32],
                 "from_core must preserve norm_hash in memory"
             );
-            assert_eq!((*match_start, *match_end), (12, 24));
         }
         other => panic!("expected Finding, got {other:?}"),
     }
@@ -1194,8 +1178,6 @@ fn owned_core_event_finding_partial_eq_includes_norm_hash() {
         object_path: b"/tmp/secret.txt".to_vec(),
         start: 10,
         end: 42,
-        match_start: 12,
-        match_end: 24,
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
         norm_hash: [0xAA; 32],
@@ -1208,8 +1190,6 @@ fn owned_core_event_finding_partial_eq_includes_norm_hash() {
         object_path: b"/tmp/secret.txt".to_vec(),
         start: 10,
         end: 42,
-        match_start: 12,
-        match_end: 24,
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
         norm_hash: [0xBB; 32],
@@ -1228,8 +1208,6 @@ fn owned_core_event_debug_redacts_norm_hash() {
         object_path: b"/tmp/secret.txt".to_vec(),
         start: 10,
         end: 42,
-        match_start: 12,
-        match_end: 24,
         rule_id: 7,
         rule_name: "test-rule".to_owned(),
         norm_hash: [0xDE; 32],

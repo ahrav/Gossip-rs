@@ -171,11 +171,14 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// Persistence-ready representation of one Git finding observed during scan
 /// execution.
 ///
-/// `span_start` and `span_end` are exact match offsets captured from
-/// `FindingEvent::match_start/match_end`. Root-hint event coordinates remain
-/// available on `FindingEvent::start/end` for logs and UI surfaces, but
-/// persistence identity must use the exact match span so Git and FS scans of
-/// the same content converge on the same occurrence identity.
+/// `span_start` and `span_end` are blob-absolute root-hint offsets captured
+/// from `FindingEvent::start/end`. These map to the full regex match span
+/// (group 0) in root-file coordinates and participate in `OccurrenceId`
+/// derivation. The engine produces blob-absolute root-hint offsets for both
+/// root and transform findings — for root findings via `base_offset +
+/// match_span.start`, for transform findings via
+/// `RootSpanMapCtx::map_span(decoded_span)` — so Git and FS scans of the
+/// same content converge on the same occurrence identity.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {
     pub(crate) span_start: u64,
@@ -184,6 +187,10 @@ pub(crate) struct GitFindingForPersistence {
     pub(crate) rule_id: u32,
 }
 
+// Compile-time guard: `GitFindingForPersistence` must stay compact because
+// the Git adapter pushes one instance per finding into a vector that is held
+// under a mutex until drained. Each field is load-bearing for persistence
+// identity — growth beyond 56 bytes should be a deliberate decision.
 const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 56);
 
 impl fmt::Debug for GitFindingForPersistence {
@@ -465,8 +472,8 @@ impl EventOutput for FindingsCaptureSink {
             // section means any future work (validation, hashing) added to
             // the constructor won't widen the lock window.
             let record = GitFindingForPersistence {
-                span_start: finding.match_start,
-                span_end: finding.match_end,
+                span_start: finding.start,
+                span_end: finding.end,
                 norm_hash: NormHash::from_digest(finding.norm_hash),
                 rule_id: finding.rule_id,
             };
@@ -580,8 +587,6 @@ mod tests {
             object_path: b"/tmp/secret.txt",
             start: 100,
             end: 142,
-            match_start: 10,
-            match_end: 42,
             rule_id: 7,
             rule_name: "test-rule",
             norm_hash: [0xAA; 32],
@@ -652,14 +657,8 @@ mod tests {
             "inner sink should also receive the finding"
         );
         match &forwarded[0] {
-            OwnedCoreEvent::Finding {
-                norm_hash,
-                match_start,
-                match_end,
-                ..
-            } => {
+            OwnedCoreEvent::Finding { norm_hash, .. } => {
                 assert_eq!(*norm_hash, [0xAA; 32]);
-                assert_eq!((*match_start, *match_end), (10, 42));
             }
             other => panic!("expected finding event, got: {other:?}"),
         }
@@ -711,8 +710,11 @@ mod tests {
         let captured = sink.take_captured_findings();
         assert_eq!(captured.len(), 1, "finding payload should be captured");
         assert_eq!(captured[0].rule_id(), 7);
-        assert_eq!(captured[0].span_start(), 10);
-        assert_eq!(captured[0].span_end(), 42);
+        // `GitFindingForPersistence.span_start/span_end` carry the blob-absolute
+        // root-hint offsets from `FindingEvent.start/end` — these feed
+        // persistence identity derivation.
+        assert_eq!(captured[0].span_start(), 100);
+        assert_eq!(captured[0].span_end(), 142);
         assert_eq!(captured[0].norm_hash(), NormHash::from_digest([0xAA; 32]));
     }
 

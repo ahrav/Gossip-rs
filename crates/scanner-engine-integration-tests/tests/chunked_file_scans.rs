@@ -129,3 +129,44 @@ fn scan_file_chunked_drops_prefix_duplicates() -> io::Result<()> {
 
     Ok(())
 }
+
+/// Realistic 1+ MiB blob with a secret past the first-chunk boundary of the
+/// production `DEFAULT_CHUNK_BYTES = 1 << 20`. This test exercises the same
+/// slow-path code as production scans of large files (lockfiles, bundled JS,
+/// minified assets) and asserts that `root_span_hint` remains file-absolute
+/// regardless of how the multi-chunk scanner split the input.
+///
+/// Root-hint offsets feed persistence identity derivation via
+/// `PersistenceFinding::span_start/span_end`, so this is the end-to-end
+/// guarantee that OccurrenceId is stable across chunker alignment changes.
+#[test]
+fn scan_file_chunked_realistic_multi_chunk_root_hint_is_file_absolute() -> io::Result<()> {
+    // Use a permissive single-char rule so the secret match is independent
+    // of surrounding content — the padding is a random byte that cannot
+    // trigger the rule.
+    let engine = Engine::new(vec![toy_rule_x()], Vec::new(), demo_tuning());
+
+    // 2 MiB file with the secret byte 'X' at an absolute offset past the
+    // first 1 MiB chunk boundary. `DEFAULT_CHUNK_BYTES = 1 << 20` in
+    // scanner-git; the integration test uses an explicit chunk size below
+    // matching that value so the test exercises the same boundary logic.
+    const BLOB_SIZE: usize = 2 * 1024 * 1024;
+    const SECRET_OFFSET: usize = 1_500_000;
+    const CHUNK_SIZE: usize = 1 << 20;
+
+    let mut buf = vec![b'A'; BLOB_SIZE];
+    buf[SECRET_OFFSET] = b'X';
+
+    let tmp = write_temp_file(&buf)?;
+    let findings = scan_file_chunked_materialized(&engine, tmp.path(), CHUNK_SIZE)?;
+
+    let x_hits: Vec<&Finding> = findings.iter().filter(|f| f.rule == "toy-token").collect();
+    assert_eq!(x_hits.len(), 1, "expected exactly one toy-token hit");
+    assert_eq!(
+        x_hits[0].root_span_hint,
+        SECRET_OFFSET..(SECRET_OFFSET + 1),
+        "root_span_hint must be file-absolute for findings past the first chunk boundary",
+    );
+
+    Ok(())
+}

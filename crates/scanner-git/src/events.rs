@@ -129,6 +129,10 @@ impl EventOutput for VecEventSink {
         let mut line = Vec::with_capacity(256);
         match event {
             CoreEvent::Finding(f) => {
+                // The JSON finding record exposes `start`/`end` — blob-absolute
+                // root-hint offsets covering the full regex match in root-file
+                // coordinates. These same offsets feed persistence identity
+                // derivation downstream.
                 line.extend_from_slice(b"{\"type\":\"finding\"");
 
                 line.extend_from_slice(b",\"source\":");
@@ -305,8 +309,6 @@ mod tests {
             object_path: b"secret.txt",
             start: 10,
             end: 20,
-            match_start: 12,
-            match_end: 18,
             rule_id: 7,
             rule_name: "rule",
             norm_hash: [0xAB; 32],
