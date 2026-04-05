@@ -95,9 +95,10 @@
 //! [`CoordinationFacade`]: gossip_coordination::CoordinationFacade
 //! [`CommitPipeline`]: crate::commit_pipeline::CommitPipeline
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -119,8 +120,8 @@ use gossip_contracts::{
         finalize_64,
     },
     persistence::{
-        CheckpointCommitReceipt, DoneLedger, DoneLedgerCommitReceipt, FindingsCommitReceipt,
-        FindingsSink, WriteContext,
+        CheckpointBoundary, CheckpointCommitReceipt, CommitScope, DoneLedger,
+        DoneLedgerCommitReceipt, FindingsCommitReceipt, FindingsSink, PageCommit, WriteContext,
     },
 };
 use gossip_coordination::{
@@ -161,7 +162,6 @@ use crate::{
         OrderedContentExecutionOutcome, OrderedContentItemExecution, OrderedContentItemOutcome,
         OrderedContentReadStop, OrderedContentRuntime, OrderedContentRuntimeInput,
     },
-    result_committer::ResultCommitter,
     result_translation::{
         ItemResult, ScanTiming, translate_git_item_result, translate_item_result,
     },
@@ -2838,6 +2838,7 @@ struct GitRepoPersistenceInput<'a> {
     repo_id: u64,
     bytes_scanned: u64,
     findings: &'a [GitFindingForPersistence],
+    commit_oid_map: &'a HashMap<u32, scanner_git::OidBytes>,
     tenant_secret_key: TenantSecretKey,
     rule_fingerprint: &'a dyn Fn(u32) -> RuleFingerprint,
     claim_time: LogicalTime,
@@ -2856,6 +2857,7 @@ impl fmt::Debug for GitRepoPersistenceInput<'_> {
             .field("repo_id", &self.repo_id)
             .field("bytes_scanned", &self.bytes_scanned)
             .field("findings", &self.findings)
+            .field("commit_oid_map_len", &self.commit_oid_map.len())
             .field("tenant_secret_key", &self.tenant_secret_key)
             .field("rule_fingerprint", &"<fn>")
             .field("claim_time", &self.claim_time)
@@ -2903,10 +2905,12 @@ where
     let translation = translate_git_item_result(
         input.write_context,
         &input.tenant_secret_key,
+        input.repo_key,
         input.repo_id,
         input.bytes_scanned,
         timing,
         input.findings,
+        input.commit_oid_map,
         input.rule_fingerprint,
     )
     .map_err(|error| {
@@ -2917,29 +2921,77 @@ where
             ),
         )))
     })?;
-    // CompletedUnit satisfies the ResultCommitter::commit_translation signature.
-    // Only the durable receipts are used — the unit itself is discarded. The real
-    // checkpoint input is built separately by repo_frontier_checkpoint_input.
-    let completed_unit = CompletedUnit::repo_frontier(
-        0,
-        Cursor::with_last_key(input.repo_key.clone().into_item_key()),
+    let findings_batch = translation.findings_batch();
+    findings_batch
+        .validate_observation_identity()
+        .map_err(|error| {
+            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                AnyError::new(error).context(format!(
+                    "git repo-frontier shard '{}' produced an invalid findings batch",
+                    input.shard_id,
+                )),
+            ))
+        })?;
+    findings_batch
+        .validate_referential_integrity()
+        .map_err(|error| {
+            DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
+                AnyError::new(error).context(format!(
+                    "git repo-frontier shard '{}' produced a broken findings graph",
+                    input.shard_id,
+                )),
+            ))
+        })?;
+    translation.done_ledger().validate().map_err(|error| {
+        DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(AnyError::new(error).context(
+            format!(
+                "git repo-frontier shard '{}' produced an invalid done-ledger row",
+                input.shard_id,
+            ),
+        )))
+    })?;
+
+    let scope = CommitScope::from_write_context(
+        input.write_context,
+        NonZeroU64::MIN,
+        CheckpointBoundary::repo_frontier(Cursor::with_last_key(
+            input.repo_key.clone().into_item_key(),
+        )),
     );
-    let receipt = ResultCommitter::new(
-        persistence.findings_sink.clone(),
-        persistence.done_ledger.clone(),
-    )
-    .commit_translation(input.write_context, &completed_unit, &translation)
-    .map_err(|error| {
+    let page = PageCommit::new(scope);
+    let findings_handle = persistence
+        .findings_sink
+        .upsert_batch(findings_batch)
+        .map_err(|error| {
+            DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+                "git repo-frontier shard '{}' findings submission failed",
+                input.shard_id,
+            )))
+        })?;
+    let page = page.wait_findings(findings_handle).map_err(|error| {
+        DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+            "git repo-frontier shard '{}' findings durability failed",
+            input.shard_id,
+        )))
+    })?;
+    let done_handle = persistence
+        .done_ledger
+        .batch_upsert(std::slice::from_ref(translation.done_ledger()))
+        .map_err(|error| {
+            DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
+                "git repo-frontier shard '{}' done-ledger submission failed",
+                input.shard_id,
+            )))
+        })?;
+    let receipt = page.wait_done_ledger(done_handle).map_err(|error| {
         DistributedRuntimeError::Durability(AnyError::new(error).context(format!(
             "git repo-frontier shard '{}' durable persistence commit failed",
             input.shard_id,
         )))
     })?;
+    let receipt = receipt.into_item_commit_receipt();
 
-    Ok((
-        receipt.durable().findings(),
-        receipt.durable().done_ledger(),
-    ))
+    Ok((receipt.findings(), receipt.done_ledger()))
 }
 
 /// Execute one Git repo-frontier lease under the durable repo-receipt model.
@@ -3161,10 +3213,9 @@ where
     // → findings persistence → watermark commit.
     let captured_findings = capture_sink.take_captured_findings();
     // Drain the sparse commit-OID map alongside captured findings so the
-    // allocation is freed after scan. The map is infrastructure for future
-    // commit-level occurrence identity derivation; current Git findings
-    // persistence derives identities from the captured finding payloads.
-    let _commit_oid_map = capture_sink.drain_commit_oid_map();
+    // translation step can derive per-object version identity from stable
+    // commit OIDs instead of the lossy ordinal alone.
+    let commit_oid_map = capture_sink.drain_commit_oid_map();
     let detected_count = capture_sink.detected_finding_count();
     if detected_count != captured_findings.len() as u64 {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
@@ -3185,6 +3236,7 @@ where
         repo_id: lease.payload().repo_id(),
         bytes_scanned: execution.report.bytes_scanned,
         findings: &captured_findings,
+        commit_oid_map: &commit_oid_map,
         tenant_secret_key: identity.tenant_secret_key,
         rule_fingerprint: &*execution.rule_fingerprint,
         claim_time: lease.claim_wall_clock(),
@@ -9492,11 +9544,14 @@ mod tests {
         let tmp = tempdir().expect("temp dir for repo key");
         let repo_key = git_repo_key(tmp.path());
         let findings = [GitFindingForPersistence {
+            object_path: b"src/lib.rs".to_vec().into_boxed_slice(),
+            commit_id: Some(7),
             span_start: 10,
             span_end: 42,
             norm_hash: gossip_contracts::identity::NormHash::from_digest([0xAB; 32]),
             rule_id: 7,
         }];
+        let commit_oid_map = HashMap::from([(7, scanner_git::OidBytes::sha1([0x11; 20]))]);
         let input = GitRepoPersistenceInput {
             write_context: write_context(),
             shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -9504,6 +9559,7 @@ mod tests {
             repo_id: 42,
             bytes_scanned: 1024,
             findings: &findings,
+            commit_oid_map: &commit_oid_map,
             tenant_secret_key: tenant_secret_key(),
             rule_fingerprint: &test_rule_fingerprint,
             claim_time: LogicalTime::from_raw(100),
@@ -9529,6 +9585,28 @@ mod tests {
                 .len(),
             1,
         );
+        assert_eq!(
+            findings_sink
+                .occurrences_snapshot()
+                .expect("occurrences snapshot")
+                .len(),
+            1,
+        );
+        let observation = findings_sink
+            .observations_snapshot()
+            .expect("observations snapshot")
+            .pop()
+            .expect("observation");
+        let done = done_ledger
+            .snapshot()
+            .expect("done-ledger snapshot")
+            .pop()
+            .expect("done-ledger row");
+        assert_ne!(
+            observation.ovid_hash(),
+            done.key().ovid_hash(),
+            "git observations must use per-object OVIDs while done-ledger stays repo-scoped",
+        );
     }
 
     #[test]
@@ -9538,6 +9616,7 @@ mod tests {
         let persistence = DistributedPersistence::new(findings_sink, done_ledger);
         let tmp = tempdir().expect("temp dir for repo key");
         let repo_key = git_repo_key(tmp.path());
+        let commit_oid_map = HashMap::new();
         let input = GitRepoPersistenceInput {
             write_context: write_context(),
             shard_id: &ToxicDigest::of_bytes(b"test-shard"),
@@ -9545,6 +9624,7 @@ mod tests {
             repo_id: 42,
             bytes_scanned: 1024,
             findings: &[],
+            commit_oid_map: &commit_oid_map,
             tenant_secret_key: tenant_secret_key(),
             rule_fingerprint: &test_rule_fingerprint,
             claim_time: LogicalTime::from_raw(200),

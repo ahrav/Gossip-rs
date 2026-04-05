@@ -179,17 +179,27 @@ fn sentinel_to_option(id: u32) -> Option<u32> {
 /// findings (the common case).
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitFindingForPersistence {
+    /// Repository-relative object path used as the stable per-object identity input.
+    pub(crate) object_path: Box<[u8]>,
+    /// Sparse ordinal pointing to the scanned commit that produced this finding.
+    pub(crate) commit_id: Option<u32>,
+    /// Half-open span start offset within the object content.
     pub(crate) span_start: u64,
+    /// Half-open span end offset within the object content.
     pub(crate) span_end: u64,
+    /// Content-derived normalization hash for finding identity.
     pub(crate) norm_hash: NormHash,
+    /// Rule identifier emitted by the scanner.
     pub(crate) rule_id: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 56);
+const _: () = assert!(std::mem::size_of::<GitFindingForPersistence>() <= 88);
 
 impl fmt::Debug for GitFindingForPersistence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GitFindingForPersistence")
+            .field("object_path_len", &self.object_path.len())
+            .field("commit_id", &self.commit_id)
             .field("span_start", &self.span_start)
             .field("span_end", &self.span_end)
             .field("norm_hash", &"[redacted]")
@@ -466,6 +476,8 @@ impl EventOutput for FindingsCaptureSink {
             // section means any future work (validation, hashing) added to
             // the constructor won't widen the lock window.
             let record = GitFindingForPersistence {
+                object_path: finding.object_path.into(),
+                commit_id: finding.commit_id,
                 span_start: finding.start,
                 span_end: finding.end,
                 norm_hash: NormHash::from_digest(finding.norm_hash),
@@ -703,6 +715,8 @@ mod tests {
 
         let captured = sink.take_captured_findings();
         assert_eq!(captured.len(), 1, "finding payload should be captured");
+        assert_eq!(captured[0].object_path.as_ref(), b"/tmp/secret.txt");
+        assert_eq!(captured[0].commit_id, None);
         assert_eq!(captured[0].rule_id(), 7);
         assert_eq!(captured[0].span_start(), 10);
         assert_eq!(captured[0].span_end(), 42);
@@ -712,6 +726,8 @@ mod tests {
     #[test]
     fn git_finding_for_persistence_debug_redacts_norm_hash() {
         let finding = GitFindingForPersistence {
+            object_path: b"src/lib.rs".to_vec().into_boxed_slice(),
+            commit_id: Some(11),
             span_start: 1,
             span_end: 9,
             norm_hash: NormHash::from_digest([0xFF; 32]),

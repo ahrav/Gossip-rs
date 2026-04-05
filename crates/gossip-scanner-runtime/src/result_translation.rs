@@ -21,16 +21,17 @@
 //! participate in persistence identity derivation.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::{BuildHasher, Hasher},
     sync::Arc,
 };
 
 use gossip_contracts::{
-    connector::{Location, ScanItem, VersionId},
+    connector::{GIT_CONNECTOR_TAG, Location, ScanItem, VersionId, git::RepoKey},
     identity::{
-        LogicalTime, NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
-        key_secret_hash,
+        CanonicalBytes, ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime,
+        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, domain,
+        domain_hasher, finalize_32, key_secret_hash,
     },
     persistence::{
         DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
@@ -39,8 +40,11 @@ use gossip_contracts::{
         derive_ovid_hash,
     },
 };
+use scanner_git::OidBytes;
 use scanner_scheduler::store::FsFindingRecord;
 
+use crate::coordination_sink::GitFindingForPersistence;
+use crate::event_sink::sanitize_path;
 use crate::git_persistence::git_repo_ovid_inputs;
 
 // ---------------------------------------------------------------------------
@@ -105,7 +109,7 @@ type FindingsLayers = (
 struct TranslationItem<'a> {
     stable_item_id: StableItemId,
     version: VersionId,
-    location: Option<&'a Location>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> TranslationItem<'a> {
@@ -114,7 +118,7 @@ impl<'a> TranslationItem<'a> {
         Self {
             stable_item_id: item.stable_item_id(),
             version: item.version(),
-            location: item.location(),
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -286,7 +290,7 @@ impl<'a, F> ItemResult<'a, F> {
 /// Owned persistence rows derived from one completed item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistenceTranslation {
-    ovid_hash: OvidHash,
+    done_ledger_ovid_hash: OvidHash,
     findings: Vec<FindingRecord>,
     occurrences: Vec<OccurrenceRecord>,
     observations: Vec<ObservationRecord>,
@@ -301,14 +305,14 @@ impl PersistenceTranslation {
     /// and referential-integrity checks after building the bundle.
     #[must_use]
     pub(crate) fn new(
-        ovid_hash: OvidHash,
+        done_ledger_ovid_hash: OvidHash,
         findings: Vec<FindingRecord>,
         occurrences: Vec<OccurrenceRecord>,
         observations: Vec<ObservationRecord>,
         done_ledger: DoneLedgerRecord,
     ) -> Self {
         Self {
-            ovid_hash,
+            done_ledger_ovid_hash,
             findings,
             occurrences,
             observations,
@@ -316,11 +320,11 @@ impl PersistenceTranslation {
         }
     }
 
-    /// Object-version identity shared by observations and the done ledger.
+    /// Done-ledger object-version identity for the translated item.
     #[inline]
     #[must_use]
     pub const fn ovid_hash(&self) -> OvidHash {
-        self.ovid_hash
+        self.done_ledger_ovid_hash
     }
 
     /// Stable finding rows in this translation.
@@ -392,6 +396,18 @@ pub enum ResultTranslationError {
     /// Scan timing was inverted: `started_at` exceeded `finished_at`.
     #[error("scan timing inverted: started_at ({started_at}) > finished_at ({finished_at})")]
     InvalidScanTiming { started_at: u64, finished_at: u64 },
+    /// Git finding payload omitted the commit ordinal required for object identity.
+    #[error("git finding at index {index} is missing commit identity")]
+    MissingGitCommitId { index: usize },
+    /// Git finding referenced a commit ordinal absent from the sparse OID map.
+    #[error("git finding at index {index} references unknown commit_id {commit_id}")]
+    MissingGitCommitOid { index: usize, commit_id: u32 },
+    /// Git finding could not derive a stable per-object item identity.
+    #[error("git finding at index {index} has invalid object identity: {source}")]
+    GitItemIdentity {
+        index: usize,
+        source: IdentityInputError,
+    },
     /// A persistence constructor or validator rejected the translated rows.
     #[error("persistence translation error: {0}")]
     Persistence(#[source] PersistenceInputError),
@@ -428,6 +444,7 @@ pub fn translate_item_result(
     result: ItemResult<'_>,
     rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
 ) -> Result<PersistenceTranslation, ResultTranslationError> {
+    let location = item.location().cloned().map(Arc::new);
     let item = TranslationItem::from_scan_item(item);
     match result {
         ItemResult::Scanned { findings } => {
@@ -437,6 +454,7 @@ pub fn translate_item_result(
                 write_context,
                 tenant_secret_key,
                 item,
+                location,
                 bytes_scanned,
                 timing,
                 ItemResult::Scanned {
@@ -453,6 +471,7 @@ pub fn translate_item_result(
             write_context,
             tenant_secret_key,
             item,
+            location,
             bytes_scanned,
             timing,
             ItemResult::FailedRetryable { error_code },
@@ -462,6 +481,7 @@ pub fn translate_item_result(
             write_context,
             tenant_secret_key,
             item,
+            location,
             bytes_scanned,
             timing,
             ItemResult::FailedPermanent { error_code },
@@ -471,6 +491,7 @@ pub fn translate_item_result(
             write_context,
             tenant_secret_key,
             item,
+            location,
             bytes_scanned,
             timing,
             ItemResult::Skipped { error_code },
@@ -486,40 +507,49 @@ pub fn translate_item_result(
 /// function. The FS path handles all four `ItemResult` variants via
 /// `translate_item_result`.
 ///
-/// Git repo-frontier scans treat the repository itself as the logical item and
-/// therefore use a fixed synthetic version identity derived from `repo_id`.
-pub(crate) fn translate_git_item_result<F>(
+/// Git repo-frontier scans keep the done-ledger row repo-scoped via `repo_id`,
+/// while each observation derives its stable item identity from the connector
+/// instance plus the repository-relative object path and its strong version
+/// identity from the scanned commit OID for that path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn translate_git_item_result(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
+    repo_key: &RepoKey,
     repo_id: u64,
     bytes_scanned: u64,
     timing: ScanTiming,
-    findings: &[F],
+    findings: &[GitFindingForPersistence],
+    commit_oid_map: &HashMap<u32, OidBytes>,
     rule_fingerprint: &dyn Fn(u32) -> RuleFingerprint,
-) -> Result<PersistenceTranslation, ResultTranslationError>
-where
-    F: PersistenceFinding,
-{
-    let identity = git_repo_ovid_inputs(repo_id);
-    translate_result(
+) -> Result<PersistenceTranslation, ResultTranslationError> {
+    let done_ledger_item = git_repo_ovid_inputs(repo_id);
+    let result = ItemResult::Scanned { findings };
+    let findings_layers = translate_git_findings(
         write_context,
         tenant_secret_key,
-        TranslationItem {
-            stable_item_id: identity.stable_item_id,
-            version: identity.version,
-            location: None,
-        },
+        repo_key,
+        commit_oid_map,
+        timing.finished_at(),
+        findings,
+        rule_fingerprint,
+    )?;
+    build_translation(
+        write_context,
         bytes_scanned,
         timing,
-        ItemResult::Scanned { findings },
-        rule_fingerprint,
+        &result,
+        derive_ovid_hash(&done_ledger_item),
+        findings_layers,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_result<F, R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
     item: TranslationItem<'_>,
+    location: Option<Arc<Location>>,
     bytes_scanned: u64,
     timing: ScanTiming,
     result: ItemResult<'_, F>,
@@ -529,24 +559,14 @@ where
     F: PersistenceFinding,
     R: Fn(u32) -> RuleFingerprint + ?Sized,
 {
-    let ovid_hash = item.ovid_hash();
-    let done_ledger_key = DoneLedgerKey::new(
-        write_context.tenant_id(),
-        write_context.policy_hash(),
-        ovid_hash,
-    );
-    let provenance = DoneLedgerProvenance::from_write_context(
-        write_context,
-        timing.started_at(),
-        timing.finished_at(),
-    );
-
-    let (findings, occurrences, observations) = match &result {
+    let done_ledger_ovid_hash = item.ovid_hash();
+    let findings_layers = match &result {
         ItemResult::Scanned { findings } => translate_findings(
             write_context,
             tenant_secret_key,
             item,
-            ovid_hash,
+            done_ledger_ovid_hash,
+            location,
             timing.finished_at(),
             findings,
             rule_fingerprint,
@@ -555,42 +575,23 @@ where
         | ItemResult::FailedPermanent { .. }
         | ItemResult::Skipped { .. } => (Vec::new(), Vec::new(), Vec::new()),
     };
-
-    let distinct_findings = findings.len();
-    let findings_count = u32::try_from(distinct_findings).map_err(|_| {
-        ResultTranslationError::TooManyDistinctFindings {
-            count: distinct_findings,
-        }
-    })?;
-
-    let done_ledger = DoneLedgerRecord::try_new(
-        done_ledger_key,
-        result.done_ledger_status(),
+    build_translation(
+        write_context,
         bytes_scanned,
-        findings_count,
-        provenance,
-        result.error_code().cloned(),
-    )?;
-    // `try_new` checks findings_count vs status; `validate` additionally
-    // enforces error_code consistency (failure/skip require a code, clean
-    // scans forbid one). Both passes are intentional.
-    done_ledger.validate()?;
-
-    let translation =
-        PersistenceTranslation::new(ovid_hash, findings, occurrences, observations, done_ledger);
-
-    let batch = translation.findings_batch();
-    batch.validate_observation_identity()?;
-    batch.validate_referential_integrity()?;
-
-    Ok(translation)
+        timing,
+        &result,
+        done_ledger_ovid_hash,
+        findings_layers,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_findings<F, R>(
     write_context: WriteContext,
     tenant_secret_key: &TenantSecretKey,
     item: TranslationItem<'_>,
-    ovid_hash: OvidHash,
+    observation_ovid_hash: OvidHash,
+    location: Option<Arc<Location>>,
     seen_at: LogicalTime,
     findings_input: &[F],
     rule_fingerprint: &R,
@@ -614,74 +615,254 @@ where
         HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
     let mut seen_observations =
         HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
-    // Wrap in Arc once so repeated observations share the same allocation
-    // instead of cloning the underlying String fields per iteration.
-    let location: Option<Arc<_>> = item.location.map(|l| Arc::new(l.clone()));
 
     for (index, finding) in findings_input.iter().enumerate() {
-        // confidence_score is intentionally omitted: the persistence schema does not
-        // carry confidence.
-
-        if finding.span_end() <= finding.span_start() {
-            return Err(ResultTranslationError::InvalidFindingSpan {
-                index,
-                start: finding.span_start(),
-                end: finding.span_end(),
-            });
-        }
-
-        // --- Phase 1: derive finding identity (needed for dedup check) ---
-        let norm_hash = finding.norm_hash();
-        let secret_hash = key_secret_hash(tenant_secret_key, &norm_hash);
-        let finding_record = FindingRecord::new(
-            write_context.tenant_id(),
-            item.stable_item_id,
-            rule_fingerprint(finding.rule_id()),
-            secret_hash,
-        );
-        let finding_id = finding_record.finding_id();
-
-        if seen_findings.insert(finding_id) {
-            findings.push(finding_record);
-        }
-
-        // --- Phase 2: derive occurrence identity only after finding dedup ---
-        let occurrence_record = OccurrenceRecord::try_new(
-            write_context.tenant_id(),
-            finding_id,
-            item.object_version_id(),
-            finding.span_start(),
-            finding.span_len(),
-        )
-        .map_err(|e| ResultTranslationError::PersistenceAtIndex { index, source: e })?;
-        let occurrence_id = occurrence_record.occurrence_id();
-
-        if seen_occurrences.insert(occurrence_id) {
-            occurrences.push(occurrence_record);
-        }
-
-        // --- Phase 3: derive observation identity only after occurrence dedup ---
-        let mut observation_record =
-            ObservationRecord::from_write_context(write_context, occurrence_id, ovid_hash, seen_at);
-
-        if seen_observations.insert(observation_record.observation_id()) {
-            if let Some(location) = location.clone() {
-                observation_record = observation_record.with_location(location);
-            }
-            observations.push(observation_record);
-        }
+        push_finding_layers(
+            write_context,
+            tenant_secret_key,
+            item,
+            observation_ovid_hash,
+            location.clone(),
+            seen_at,
+            finding,
+            rule_fingerprint,
+            index,
+            &mut findings,
+            &mut occurrences,
+            &mut observations,
+            &mut seen_findings,
+            &mut seen_occurrences,
+            &mut seen_observations,
+        )?;
     }
 
     Ok((findings, occurrences, observations))
 }
 
+fn translate_git_findings<R>(
+    write_context: WriteContext,
+    tenant_secret_key: &TenantSecretKey,
+    repo_key: &RepoKey,
+    commit_oid_map: &HashMap<u32, OidBytes>,
+    seen_at: LogicalTime,
+    findings_input: &[GitFindingForPersistence],
+    rule_fingerprint: &R,
+) -> Result<FindingsLayers, ResultTranslationError>
+where
+    R: Fn(u32) -> RuleFingerprint + ?Sized,
+{
+    if findings_input.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    let mut findings = Vec::with_capacity(findings_input.len());
+    let mut occurrences = Vec::with_capacity(findings_input.len());
+    let mut observations = Vec::with_capacity(findings_input.len());
+    let mut seen_findings =
+        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
+    let mut seen_occurrences =
+        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
+    let mut seen_observations =
+        HashSet::with_capacity_and_hasher(findings_input.len(), PreHashedBuildHasher);
+    let connector_instance = ConnectorInstanceIdHash::from_instance_id_bytes(repo_key.as_bytes());
+
+    for (index, finding) in findings_input.iter().enumerate() {
+        let commit_id = finding
+            .commit_id
+            .ok_or(ResultTranslationError::MissingGitCommitId { index })?;
+        let commit_oid = commit_oid_map
+            .get(&commit_id)
+            .ok_or(ResultTranslationError::MissingGitCommitOid { index, commit_id })?;
+        let identity = ItemIdentityKey::try_new(
+            GIT_CONNECTOR_TAG,
+            connector_instance,
+            finding.object_path.as_ref(),
+        )
+        .map_err(|source| ResultTranslationError::GitItemIdentity { index, source })?;
+        let item = TranslationItem {
+            stable_item_id: identity.stable_id(),
+            version: VersionId::Strong(git_object_version_id(
+                commit_oid,
+                finding.object_path.as_ref(),
+            )),
+            _marker: std::marker::PhantomData,
+        };
+        let observation_ovid_hash = item.ovid_hash();
+        let location = git_observation_location(finding.object_path.as_ref());
+        push_finding_layers(
+            write_context,
+            tenant_secret_key,
+            item,
+            observation_ovid_hash,
+            location,
+            seen_at,
+            finding,
+            rule_fingerprint,
+            index,
+            &mut findings,
+            &mut occurrences,
+            &mut observations,
+            &mut seen_findings,
+            &mut seen_occurrences,
+            &mut seen_observations,
+        )?;
+    }
+
+    Ok((findings, occurrences, observations))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_finding_layers<F, R>(
+    write_context: WriteContext,
+    tenant_secret_key: &TenantSecretKey,
+    item: TranslationItem<'_>,
+    observation_ovid_hash: OvidHash,
+    location: Option<Arc<Location>>,
+    seen_at: LogicalTime,
+    finding: &F,
+    rule_fingerprint: &R,
+    index: usize,
+    findings: &mut Vec<FindingRecord>,
+    occurrences: &mut Vec<OccurrenceRecord>,
+    observations: &mut Vec<ObservationRecord>,
+    seen_findings: &mut HashSet<gossip_contracts::identity::FindingId, PreHashedBuildHasher>,
+    seen_occurrences: &mut HashSet<gossip_contracts::identity::OccurrenceId, PreHashedBuildHasher>,
+    seen_observations: &mut HashSet<
+        gossip_contracts::identity::ObservationId,
+        PreHashedBuildHasher,
+    >,
+) -> Result<(), ResultTranslationError>
+where
+    F: PersistenceFinding,
+    R: Fn(u32) -> RuleFingerprint + ?Sized,
+{
+    if finding.span_end() <= finding.span_start() {
+        return Err(ResultTranslationError::InvalidFindingSpan {
+            index,
+            start: finding.span_start(),
+            end: finding.span_end(),
+        });
+    }
+
+    let norm_hash = finding.norm_hash();
+    let secret_hash = key_secret_hash(tenant_secret_key, &norm_hash);
+    let finding_record = FindingRecord::new(
+        write_context.tenant_id(),
+        item.stable_item_id,
+        rule_fingerprint(finding.rule_id()),
+        secret_hash,
+    );
+    let finding_id = finding_record.finding_id();
+
+    if seen_findings.insert(finding_id) {
+        findings.push(finding_record);
+    }
+
+    let occurrence_record = OccurrenceRecord::try_new(
+        write_context.tenant_id(),
+        finding_id,
+        item.object_version_id(),
+        finding.span_start(),
+        finding.span_len(),
+    )
+    .map_err(|source| ResultTranslationError::PersistenceAtIndex { index, source })?;
+    let occurrence_id = occurrence_record.occurrence_id();
+
+    if seen_occurrences.insert(occurrence_id) {
+        occurrences.push(occurrence_record);
+    }
+
+    let mut observation_record = ObservationRecord::from_write_context(
+        write_context,
+        occurrence_id,
+        observation_ovid_hash,
+        seen_at,
+    );
+
+    if seen_observations.insert(observation_record.observation_id()) {
+        if let Some(location) = location {
+            observation_record = observation_record.with_location(location);
+        }
+        observations.push(observation_record);
+    }
+
+    Ok(())
+}
+
+fn build_translation<F>(
+    write_context: WriteContext,
+    bytes_scanned: u64,
+    timing: ScanTiming,
+    result: &ItemResult<'_, F>,
+    done_ledger_ovid_hash: OvidHash,
+    findings_layers: FindingsLayers,
+) -> Result<PersistenceTranslation, ResultTranslationError> {
+    let (findings, occurrences, observations) = findings_layers;
+    let distinct_findings = findings.len();
+    let findings_count = u32::try_from(distinct_findings).map_err(|_| {
+        ResultTranslationError::TooManyDistinctFindings {
+            count: distinct_findings,
+        }
+    })?;
+    let done_ledger_key = DoneLedgerKey::new(
+        write_context.tenant_id(),
+        write_context.policy_hash(),
+        done_ledger_ovid_hash,
+    );
+    let provenance = DoneLedgerProvenance::from_write_context(
+        write_context,
+        timing.started_at(),
+        timing.finished_at(),
+    );
+    let done_ledger = DoneLedgerRecord::try_new(
+        done_ledger_key,
+        result.done_ledger_status(),
+        bytes_scanned,
+        findings_count,
+        provenance,
+        result.error_code().cloned(),
+    )?;
+    done_ledger.validate()?;
+
+    let translation = PersistenceTranslation::new(
+        done_ledger_ovid_hash,
+        findings,
+        occurrences,
+        observations,
+        done_ledger,
+    );
+    let batch = translation.findings_batch();
+    batch.validate_observation_identity()?;
+    batch.validate_referential_integrity()?;
+    Ok(translation)
+}
+
+fn git_object_version_id(commit_oid: &OidBytes, object_path: &[u8]) -> ObjectVersionId {
+    let mut hasher = domain_hasher(domain::OBJECT_VERSION_V1);
+    commit_oid.as_slice().write_canonical(&mut hasher);
+    object_path.write_canonical(&mut hasher);
+    ObjectVersionId::from_bytes(finalize_32(&hasher))
+}
+
+fn git_observation_location(object_path: &[u8]) -> Option<Arc<Location>> {
+    Location::try_new(sanitize_path(object_path), None)
+        .ok()
+        .map(Arc::new)
+}
+
 #[cfg(test)]
 mod tests {
     use gossip_contracts::{
-        connector::{ItemKey, ItemRef, Location, ScanItem, VersionId},
-        identity::{LogicalTime, NormHash, ObjectVersionId, StableItemId},
+        connector::{
+            GIT_CONNECTOR_TAG, ItemKey, ItemRef, Location, ScanItem, VersionId, git::RepoKey,
+        },
+        identity::{
+            CanonicalBytes, ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, NormHash,
+            ObjectVersionId, StableItemId, domain, domain_hasher, finalize_32,
+        },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, PersistenceFinding},
     };
+    use scanner_git::OidBytes;
     use scanner_scheduler::store::FsFindingRecord;
 
     use proptest::prelude::*;
@@ -690,8 +871,10 @@ mod tests {
         FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
         translate_git_item_result, translate_item_result,
     };
+    use std::collections::HashMap;
+
     use crate::coordination_sink::GitFindingForPersistence;
-    use crate::git_persistence::git_repo_ovid_inputs;
+    use crate::event_sink::sanitize_path;
     use crate::test_fixtures::{
         finding, tenant_secret_key, test_rule_fingerprint, timing, write_context,
     };
@@ -725,14 +908,42 @@ mod tests {
         )
     }
 
-    fn git_identity_scan_item(repo_id: u64) -> ScanItem {
-        let identity = git_repo_ovid_inputs(repo_id);
+    fn git_repo_key() -> RepoKey {
+        RepoKey::for_local_path(b"/tmp/runtime-git-identity").expect("repo key")
+    }
+
+    fn git_commit_oid() -> OidBytes {
+        OidBytes::sha1([0x11; 20])
+    }
+
+    fn git_commit_oid_map() -> HashMap<u32, OidBytes> {
+        HashMap::from([(7, git_commit_oid())])
+    }
+
+    fn boxed_path(path: &[u8]) -> Box<[u8]> {
+        path.to_vec().into_boxed_slice()
+    }
+
+    fn git_object_scan_item(
+        repo_key: &RepoKey,
+        object_path: &[u8],
+        commit_oid: OidBytes,
+    ) -> ScanItem {
+        let connector_instance =
+            ConnectorInstanceIdHash::from_instance_id_bytes(repo_key.as_bytes());
+        let identity = ItemIdentityKey::try_new(GIT_CONNECTOR_TAG, connector_instance, object_path)
+            .expect("git item identity");
+        let mut hasher = domain_hasher(domain::OBJECT_VERSION_V1);
+        commit_oid.as_slice().write_canonical(&mut hasher);
+        object_path.write_canonical(&mut hasher);
+        let version = VersionId::Strong(ObjectVersionId::from_bytes(finalize_32(&hasher)));
         ScanItem::new(
-            ItemKey::try_from_slice(b"tenant/repo/git").expect("item key"),
+            ItemKey::try_from_slice(b"tenant/repo/git/object").expect("item key"),
             ItemRef::try_from_vec(b"git-item-ref".to_vec()).expect("item ref"),
-            identity.stable_item_id,
-            identity.version,
+            identity.stable_id(),
+            version,
         )
+        .with_location(Location::try_new(sanitize_path(object_path), None).expect("location"))
     }
 
     fn translate_scanned(findings: &[FsFindingRecord]) -> PersistenceTranslation {
@@ -755,6 +966,8 @@ mod tests {
         hash_seed: u8,
     ) -> GitFindingForPersistence {
         GitFindingForPersistence {
+            object_path: boxed_path(b"src/lib.rs"),
+            commit_id: Some(7),
             span_start,
             span_end,
             norm_hash: NormHash::from_digest([hash_seed; 32]),
@@ -763,13 +976,17 @@ mod tests {
     }
 
     fn translate_git_scanned(findings: &[GitFindingForPersistence]) -> PersistenceTranslation {
+        let repo_key = git_repo_key();
+        let commit_oid_map = git_commit_oid_map();
         translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
+            &repo_key,
             42,
             4_096,
             timing(),
             findings,
+            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect("git translation should succeed")
@@ -910,16 +1127,22 @@ mod tests {
             .findings_batch()
             .validate_referential_integrity()
             .expect("git translation must produce a closed referential graph");
+        assert_ne!(
+            translated.observations()[0].ovid_hash(),
+            translated.done_ledger().key().ovid_hash(),
+            "git repo completion must stay repo-scoped while observations are per-object",
+        );
     }
 
     #[test]
     fn identical_identity_fields_produce_identical_persistence_ids_across_source_types() {
         let fs = finding(7, 10, 50, 0xAB);
         let git = git_finding(7, 10, 50, 0xAB);
+        let repo_key = git_repo_key();
         let fs_translation = translate_item_result(
             write_context(),
             &tenant_secret_key(),
-            &git_identity_scan_item(42),
+            &git_object_scan_item(&repo_key, git.object_path.as_ref(), git_commit_oid()),
             4_096,
             timing(),
             ItemResult::Scanned { findings: &[fs] },
@@ -1030,18 +1253,24 @@ mod tests {
     #[test]
     fn translate_git_item_result_rejects_inverted_spans() {
         let finding = GitFindingForPersistence {
+            object_path: boxed_path(b"src/lib.rs"),
+            commit_id: Some(7),
             rule_id: 1,
             norm_hash: NormHash::from_digest([0xAA; 32]),
             span_start: 50,
             span_end: 10,
         };
+        let repo_key = git_repo_key();
+        let commit_oid_map = git_commit_oid_map();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
+            &repo_key,
             42,
             4096,
             timing(),
             &[finding],
+            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("inverted spans must be rejected");
@@ -1401,18 +1630,24 @@ mod tests {
     fn no_finding_data_in_error_context_strings() {
         let hash_bytes = [0xDE; 32];
         let bad_finding = GitFindingForPersistence {
+            object_path: boxed_path(b"src/lib.rs"),
+            commit_id: Some(7),
             rule_id: 7,
             norm_hash: NormHash::from_digest(hash_bytes),
             span_start: 50,
             span_end: 10, // inverted span triggers InvalidFindingSpan
         };
+        let repo_key = git_repo_key();
+        let commit_oid_map = git_commit_oid_map();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
+            &repo_key,
             42,
             4096,
             timing(),
             &[bad_finding],
+            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("inverted span must fail");
@@ -1453,26 +1688,24 @@ mod tests {
                 root_hint_start: 0, root_hint_end: 0, confidence_score: 5,
             };
             let git_rec = GitFindingForPersistence {
+                object_path: boxed_path(b"src/lib.rs"),
+                commit_id: Some(7),
                 rule_id,
                 norm_hash: NormHash::from_digest(hash_seed),
                 span_start: start, span_end: end,
             };
 
-            let identity = git_repo_ovid_inputs(42);
-            let item = ScanItem::new(
-                ItemKey::try_from_slice(b"tenant/repo/git").expect("item key"),
-                ItemRef::try_from_vec(b"ref".to_vec()).expect("item ref"),
-                identity.stable_item_id,
-                identity.version,
-            );
+            let repo_key = git_repo_key();
+            let item = git_object_scan_item(&repo_key, git_rec.object_path.as_ref(), git_commit_oid());
+            let commit_oid_map = git_commit_oid_map();
 
             let fs_t = translate_item_result(
                 write_context(), &tenant_secret_key(), &item, 4096, timing(),
                 ItemResult::Scanned { findings: &[fs_rec] }, &test_rule_fingerprint,
             ).expect("fs translation");
             let git_t = translate_git_item_result(
-                write_context(), &tenant_secret_key(), 42, 4096, timing(),
-                &[git_rec], &test_rule_fingerprint,
+                write_context(), &tenant_secret_key(), &repo_key, 42, 4096, timing(),
+                &[git_rec], &commit_oid_map, &test_rule_fingerprint,
             ).expect("git translation");
 
             prop_assert_eq!(
@@ -1507,13 +1740,17 @@ mod tests {
     #[test]
     fn translate_git_item_result_rejects_inverted_span() {
         let bad = git_finding(1, 50, 10, 0xDD);
+        let repo_key = git_repo_key();
+        let commit_oid_map = git_commit_oid_map();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
+            &repo_key,
             42,
             4_096,
             timing(),
             &[bad],
+            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("inverted git span must fail");
@@ -1524,15 +1761,111 @@ mod tests {
     }
 
     #[test]
-    fn translate_git_item_result_rejects_zero_length_span() {
-        let bad = git_finding(1, 30, 30, 0xAA);
+    fn translate_git_item_result_rejects_missing_commit_id() {
+        let repo_key = git_repo_key();
         let err = translate_git_item_result(
             write_context(),
             &tenant_secret_key(),
+            &repo_key,
+            42,
+            4_096,
+            timing(),
+            &[GitFindingForPersistence {
+                object_path: boxed_path(b"src/lib.rs"),
+                commit_id: None,
+                span_start: 10,
+                span_end: 20,
+                norm_hash: NormHash::from_digest([0xAA; 32]),
+                rule_id: 7,
+            }],
+            &git_commit_oid_map(),
+            &test_rule_fingerprint,
+        )
+        .expect_err("missing commit identity must be rejected");
+        assert!(matches!(
+            err,
+            ResultTranslationError::MissingGitCommitId { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn translate_git_item_result_rejects_unknown_commit_oid() {
+        let repo_key = git_repo_key();
+        let err = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            &repo_key,
+            42,
+            4_096,
+            timing(),
+            &[GitFindingForPersistence {
+                object_path: boxed_path(b"src/lib.rs"),
+                commit_id: Some(99),
+                span_start: 10,
+                span_end: 20,
+                norm_hash: NormHash::from_digest([0xAA; 32]),
+                rule_id: 7,
+            }],
+            &git_commit_oid_map(),
+            &test_rule_fingerprint,
+        )
+        .expect_err("unknown commit OID must be rejected");
+        assert!(matches!(
+            err,
+            ResultTranslationError::MissingGitCommitOid {
+                index: 0,
+                commit_id: 99
+            }
+        ));
+    }
+
+    #[test]
+    fn translate_git_item_result_uses_distinct_observation_ovids_for_distinct_objects() {
+        let translated = translate_git_scanned(&[
+            GitFindingForPersistence {
+                object_path: boxed_path(b"src/lib.rs"),
+                commit_id: Some(7),
+                span_start: 10,
+                span_end: 20,
+                norm_hash: NormHash::from_digest([0xAA; 32]),
+                rule_id: 7,
+            },
+            GitFindingForPersistence {
+                object_path: boxed_path(b"src/main.rs"),
+                commit_id: Some(7),
+                span_start: 10,
+                span_end: 20,
+                norm_hash: NormHash::from_digest([0xBB; 32]),
+                rule_id: 7,
+            },
+        ]);
+        assert_eq!(translated.observation_count(), 2);
+        assert_ne!(
+            translated.observations()[0].ovid_hash(),
+            translated.observations()[1].ovid_hash(),
+            "distinct git objects must not share observation OVIDs",
+        );
+        assert_eq!(
+            translated.done_ledger().key().ovid_hash(),
+            translated.ovid_hash(),
+            "translation accessor should expose the repo-level done-ledger OVID",
+        );
+    }
+
+    #[test]
+    fn translate_git_item_result_rejects_zero_length_span() {
+        let bad = git_finding(1, 30, 30, 0xAA);
+        let repo_key = git_repo_key();
+        let commit_oid_map = git_commit_oid_map();
+        let err = translate_git_item_result(
+            write_context(),
+            &tenant_secret_key(),
+            &repo_key,
             42,
             64,
             timing(),
             &[bad],
+            &commit_oid_map,
             &test_rule_fingerprint,
         )
         .expect_err("zero-length git span must fail");
