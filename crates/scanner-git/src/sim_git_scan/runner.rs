@@ -5,7 +5,7 @@
 //! shape (sorted/disjoint sets) and stability across schedule seeds.
 //!
 //! Stage pipeline:
-//! `RepoOpen -> CommitWalk -> TreeDiff -> PackExec -> Finalize`
+//! `RepoOpen -> CommitWalk -> TreeDiff -> SpillDedupe -> PackExec -> Finalize`
 //!
 //! Each stage is executed exactly once per run. Stage outputs are carried in
 //! `RunState` and validated at the end of the run before a `RunReport` is
@@ -17,13 +17,15 @@ use std::sync::atomic::AtomicBool;
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
+use tempfile::tempdir;
 
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, StepResult};
 use crate::{
-    build_pack_plans, ByteArena, BytesView, CandidateBuffer, CommitGraph, CommitPlanIter,
-    CommitWalkLimits, FinalizeOutcome, OidBytes, PackCache, PackDecodeLimits, PackExecError,
-    PackExecReport, PackPlanConfig, PackReadError, PackReader, PlannedCommit, RefWatermark,
-    StartSetRef, TreeDiffLimits, TreeDiffWalker,
+    build_pack_plans, ByteArena, BytesView, CandidateBuffer, CollectingUniqueBlobSink, CommitGraph,
+    CommitPlanIter, CommitWalkLimits, FinalizeOutcome, NeverSeenStore, OidBytes, PackCache,
+    PackDecodeLimits, PackExecError, PackExecReport, PackPlanConfig, PackReadError, PackReader,
+    PlannedCommit, RefWatermark, SpillLimits, SpillStats, Spiller, StartSetRef, TreeDiffLimits,
+    TreeDiffWalker,
 };
 
 use super::commit_graph::SimCommitGraph;
@@ -34,6 +36,7 @@ use super::fault::{
 };
 use super::pack_bytes::SimPackBytes;
 use super::pack_io::SimPackIo;
+use super::persist::SimPersistStore;
 use super::scenario::{GitRunConfig, GitScenario};
 use super::start_set::SimStartSet;
 use super::trace::{GitTraceEvent, GitTraceRing};
@@ -258,6 +261,7 @@ impl GitSimRunner {
                         StageKind::RepoOpen => stage_repo_open(&mut state),
                         StageKind::CommitWalk => stage_commit_walk(&mut state),
                         StageKind::TreeDiff => stage_tree_diff(&mut state),
+                        StageKind::SpillDedupe => stage_spill_dedupe(&mut state),
                         StageKind::PackExec => stage_pack_exec(&mut state),
                         StageKind::Finalize => stage_finalize(&mut state),
                     };
@@ -278,6 +282,9 @@ impl GitSimRunner {
                                     spawn_stage(&mut executor, &mut tasks, StageKind::TreeDiff);
                                 }
                                 StageKind::TreeDiff => {
+                                    spawn_stage(&mut executor, &mut tasks, StageKind::SpillDedupe);
+                                }
+                                StageKind::SpillDedupe => {
                                     spawn_stage(&mut executor, &mut tasks, StageKind::PackExec);
                                 }
                                 StageKind::PackExec => {
@@ -325,8 +332,9 @@ enum StageKind {
     RepoOpen = 1,
     CommitWalk = 2,
     TreeDiff = 3,
-    PackExec = 4,
-    Finalize = 5,
+    SpillDedupe = 4,
+    PackExec = 5,
+    Finalize = 6,
 }
 
 /// Mutable per-run state threaded through stage execution.
@@ -343,6 +351,9 @@ struct RunState<'a> {
     tree_source: Option<SimTreeSource>,
     plan: Vec<PlannedCommit>,
     candidates: Option<CandidateBuffer>,
+    persist_store: SimPersistStore,
+    spill_stats: Option<SpillStats>,
+    unique_oids: Option<Vec<OidBytes>>,
     scanned: Vec<OidBytes>,
     skipped: Vec<OidBytes>,
     outcome: Option<FinalizeOutcome>,
@@ -350,6 +361,7 @@ struct RunState<'a> {
 
 impl<'a> RunState<'a> {
     fn new(scenario: &'a GitScenario, trace_capacity: u32, fault_plan: GitFaultPlan) -> Self {
+        let persist_plan = fault_plan.clone();
         Self {
             scenario,
             trace: GitTraceRing::new(trace_capacity as usize),
@@ -360,6 +372,9 @@ impl<'a> RunState<'a> {
             tree_source: None,
             plan: Vec::new(),
             candidates: None,
+            persist_store: SimPersistStore::new(persist_plan),
+            spill_stats: None,
+            unique_oids: None,
             scanned: Vec::new(),
             skipped: Vec::new(),
             outcome: None,
@@ -557,7 +572,47 @@ fn stage_tree_diff(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(count)
 }
 
-/// Stage 4: execute pack plans and partition candidates into scanned/skipped.
+/// Stage 4: spill/dedupe tree-diff candidates and persist seen-bitmap deltas.
+fn stage_spill_dedupe(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
+    let (stats, unique_oids) = {
+        let candidates = state
+            .candidates
+            .as_ref()
+            .ok_or_else(|| failure_inv(27, "candidates missing"))?;
+        let oid_len = to_object_format(state.scenario.repo.object_format).oid_len();
+        let spill_dir = tempdir().map_err(|err| failure_inv(28, err))?;
+        let mut spiller = Spiller::new(SpillLimits::RESTRICTIVE, oid_len, spill_dir.path())
+            .map_err(|err| failure_inv(28, err))?;
+
+        for cand in candidates.iter_resolved() {
+            spiller
+                .push(
+                    cand.oid,
+                    cand.path,
+                    cand.commit_id,
+                    cand.parent_idx,
+                    cand.change_kind,
+                    cand.ctx_flags,
+                    cand.cand_flags,
+                )
+                .map_err(|err| failure_inv(29, err))?;
+        }
+
+        let mut sink = CollectingUniqueBlobSink::default();
+        let stats = spiller
+            .finalize(&NeverSeenStore, &state.persist_store, &mut sink)
+            .map_err(|err| failure_inv(42, err))?;
+        let unique_oids = dedupe_sorted(sink.blobs.into_iter().map(|blob| blob.oid).collect());
+        (stats, unique_oids)
+    };
+
+    let item_count = unique_oids.len() as u32;
+    state.spill_stats = Some(stats);
+    state.unique_oids = Some(unique_oids);
+    Ok(item_count)
+}
+
+/// Stage 5: execute pack plans and partition candidates into scanned/skipped.
 ///
 /// Fallback behavior is intentionally deterministic:
 /// - no artifacts => treat semantic candidates as scanned
@@ -567,6 +622,15 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let Some(candidates) = state.candidates.as_ref() else {
         return Err(failure_inv(30, "candidates missing"));
     };
+    let Some(unique_oids) = state.unique_oids.as_ref() else {
+        return Err(failure_inv(43, "spill dedupe output missing"));
+    };
+    let candidate_oids = collect_unique_candidate_oids(candidates);
+    if candidate_oids != *unique_oids {
+        return Err(failure_oracle(
+            "spill dedupe unique OIDs differ from tree-diff candidate OIDs",
+        ));
+    }
 
     let mut scanned: Vec<OidBytes> = Vec::new();
     let mut skipped: Vec<OidBytes> = Vec::new();
@@ -708,7 +772,7 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(state.scanned.len() as u32)
 }
 
-/// Stage 5: derive finalize outcome from collected scanned/skipped sets.
+/// Stage 6: derive finalize outcome from collected scanned/skipped sets.
 fn stage_finalize(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let skipped_count = state.skipped.len();
     let outcome = if skipped_count == 0 {
@@ -790,6 +854,13 @@ fn collect_semantic_candidates(candidates: &CandidateBuffer, out: &mut Vec<OidBy
     for cand in candidates.iter_resolved() {
         out.push(cand.oid);
     }
+}
+
+/// Collect the unique candidate OIDs from a semantic candidate buffer.
+fn collect_unique_candidate_oids(candidates: &CandidateBuffer) -> Vec<OidBytes> {
+    let mut oids = Vec::with_capacity(candidates.len());
+    collect_semantic_candidates(candidates, &mut oids);
+    dedupe_sorted(oids)
 }
 
 /// Sort and deduplicate OIDs to normalize set-like outputs.
@@ -1073,6 +1144,10 @@ fn validate_outputs(state: &RunState<'_>) -> Result<FinalizeOutcome, FailureRepo
     let outcome = state
         .outcome
         .ok_or_else(|| failure_inv(60, "missing finalize outcome"))?;
+    let unique_oids = state
+        .unique_oids
+        .as_ref()
+        .ok_or_else(|| failure_inv(64, "missing spill dedupe output"))?;
 
     // Enforce set semantics: sorted, unique, and disjoint.
     if !is_sorted_unique(&state.scanned) {
@@ -1104,6 +1179,15 @@ fn validate_outputs(state: &RunState<'_>) -> Result<FinalizeOutcome, FailureRepo
                 return Err(failure_oracle("partial outcome with zero skips"));
             }
         }
+    }
+
+    let mut accounted_oids = state.scanned.clone();
+    accounted_oids.extend_from_slice(&state.skipped);
+    let accounted_oids = dedupe_sorted(accounted_oids);
+    if accounted_oids != *unique_oids {
+        return Err(failure_oracle(
+            "spill dedupe OIDs do not match the final scanned/skipped partition",
+        ));
     }
 
     Ok(outcome)
@@ -1151,10 +1235,12 @@ fn failure_oracle<T: std::fmt::Display>(err: T) -> FailureReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim_git_scan::fault::GitResourceFaults;
     use crate::sim_git_scan::scenario::{
         GitBlobSpec, GitCommitSpec, GitObjectFormat, GitOid, GitRefSpec, GitRepoModel, GitScenario,
         GitTreeEntryKind, GitTreeEntrySpec, GitTreeSpec,
     };
+    use crate::sim_git_scan::PersistPhase;
 
     fn oid(val: u8) -> GitOid {
         GitOid {
@@ -1240,6 +1326,14 @@ mod tests {
             },
             decision.clone(),
             GitTraceEvent::StageEnter {
+                stage_id: StageKind::SpillDedupe as u16,
+            },
+            GitTraceEvent::StageExit {
+                stage_id: StageKind::SpillDedupe as u16,
+                items: 1,
+            },
+            decision.clone(),
+            GitTraceEvent::StageEnter {
                 stage_id: StageKind::PackExec as u16,
             },
             GitTraceEvent::StageExit {
@@ -1262,6 +1356,67 @@ mod tests {
         assert_eq!(report.candidate_count, 1);
         assert_eq!(report.skipped_count, 0);
         assert_eq!(report.outcome, SimFinalizeOutcome::Complete);
+    }
+
+    #[test]
+    fn spill_dedupe_persists_seen_delta_ops() {
+        let scenario = simple_scenario();
+        let mut state = RunState::new(&scenario, 64, GitFaultPlan::default());
+
+        assert_eq!(stage_repo_open(&mut state).unwrap(), 1);
+        assert_eq!(stage_commit_walk(&mut state).unwrap(), 1);
+        assert_eq!(stage_tree_diff(&mut state).unwrap(), 1);
+        assert_eq!(stage_spill_dedupe(&mut state).unwrap(), 1);
+
+        let seen_ops: Vec<_> = state
+            .persist_store
+            .log()
+            .into_iter()
+            .filter(|op| op.phase == PersistPhase::SeenDelta)
+            .collect();
+        assert_eq!(seen_ops.len(), 1);
+        assert_eq!(seen_ops[0].key, vec![3; 20]);
+
+        let spill_stats = state.spill_stats.as_ref().expect("spill stats");
+        assert_eq!(spill_stats.spill_runs, 0);
+        assert_eq!(spill_stats.spill_bytes, 0);
+        assert_eq!(
+            state.unique_oids.as_deref(),
+            Some(&[OidBytes::sha1([3; 20])][..])
+        );
+    }
+
+    #[test]
+    fn runner_fails_when_seen_persist_fault_is_injected() {
+        let scenario = simple_scenario();
+        let plan = GitFaultPlan {
+            resources: vec![GitResourceFaults {
+                resource: GitResourceId::SeenPersist,
+                reads: vec![super::super::fault::GitReadFault {
+                    fault: Some(GitIoFault::ErrKind { kind: 1 }),
+                    latency_ticks: 0,
+                    corruption: None,
+                }],
+            }],
+        };
+        let cfg = GitRunConfig {
+            workers: 1,
+            max_steps: 0,
+            stability_runs: 1,
+            trace_capacity: 64,
+        };
+        let runner = GitSimRunner::new(cfg, 11);
+        let outcome = runner.run(&scenario, &plan);
+        let failure = match outcome {
+            RunOutcome::Failed(fail) => fail,
+            RunOutcome::Ok { report } => panic!("expected failure, got {report:?}"),
+        };
+
+        assert!(matches!(
+            failure.kind,
+            FailureKind::InvariantViolation { code: 42 }
+        ));
+        assert!(failure.message.contains("seen-persist"));
     }
 
     #[test]
