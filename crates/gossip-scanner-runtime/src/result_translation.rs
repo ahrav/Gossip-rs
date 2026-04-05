@@ -28,17 +28,17 @@ use std::{
 };
 
 use gossip_contracts::{
-    connector::{git::RepoKey, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG},
+    connector::{GIT_CONNECTOR_TAG, Location, ScanItem, VersionId, git::RepoKey},
     identity::{
-        domain, domain_hasher, finalize_32, key_secret_hash, CanonicalBytes,
-        ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime, NormHash,
-        ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey,
+        CanonicalBytes, ConnectorInstanceIdHash, IdentityInputError, ItemIdentityKey, LogicalTime,
+        NormHash, ObjectVersionId, RuleFingerprint, StableItemId, TenantSecretKey, domain,
+        domain_hasher, finalize_32, key_secret_hash,
     },
     persistence::{
-        derive_ovid_hash, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,
-        DoneLedgerRecord, DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord,
-        OccurrenceRecord, OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError,
-        WriteContext,
+        DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
+        DoneLedgerStatus, FindingRecord, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
+        OvidHash, OvidHashInputs, PersistenceFinding, PersistenceInputError, WriteContext,
+        derive_ovid_hash,
     },
 };
 use scanner_git::OidBytes;
@@ -891,11 +891,11 @@ fn git_observation_location(object_path: &[u8]) -> Option<Arc<Location>> {
 mod tests {
     use gossip_contracts::{
         connector::{
-            git::RepoKey, ItemKey, ItemRef, Location, ScanItem, VersionId, GIT_CONNECTOR_TAG,
+            GIT_CONNECTOR_TAG, ItemKey, ItemRef, Location, ScanItem, VersionId, git::RepoKey,
         },
         identity::{
-            domain, domain_hasher, finalize_32, CanonicalBytes, ConnectorInstanceIdHash,
-            ItemIdentityKey, LogicalTime, NormHash, ObjectVersionId, StableItemId,
+            CanonicalBytes, ConnectorInstanceIdHash, ItemIdentityKey, LogicalTime, NormHash,
+            ObjectVersionId, StableItemId, domain, domain_hasher, finalize_32,
         },
         persistence::{DoneLedgerErrorCode, DoneLedgerStatus, PersistenceFinding},
     };
@@ -905,8 +905,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        translate_git_item_result, translate_item_result, FsFindingRef, ItemResult,
-        PersistenceTranslation, ResultTranslationError, ScanTiming,
+        FsFindingRef, ItemResult, PersistenceTranslation, ResultTranslationError, ScanTiming,
+        translate_git_item_result, translate_item_result,
     };
     use std::collections::HashMap;
 
