@@ -364,11 +364,48 @@ pub(crate) struct FindingsCaptureSink {
     /// For high-finding-density repos, consider per-adapter local collection
     /// merged post-join.
     captured_findings: Mutex<Vec<GitFindingForPersistence>>,
+    /// Sparse mapping from finding `commit_id` ordinals to stable commit OIDs.
+    ///
+    /// Populated from `GitEvent::CommitMeta` and drained after the scan joins.
+    /// A `Mutex` keeps the capture path aligned with the crate's poisoning
+    /// recovery conventions; contention stays low because scanner-git guarantees
+    /// at most one `CommitMeta` event per `commit_id` (gated by `AtomicBitSet`
+    /// in `CommitMetaContext`).
+    commit_oid_map: Mutex<HashMap<u32, OidBytes>>,
 }
 
 impl FindingsCaptureSink {
+    /// Defense-in-depth ceiling for the sparse commit-OID lookup.
+    ///
+    /// At roughly 50 bytes per entry (u32 key + 33-byte OidBytes + hashbrown
+    /// control and alignment overhead), 500K entries consume ~25 MB — well
+    /// above any realistic scan but prevents a pathological repository from
+    /// exhausting worker memory.
+    #[cfg(not(test))]
+    const MAX_COMMIT_OID_MAP_ENTRIES: usize = 500_000;
+
+    /// Test-only ceiling small enough to exercise the capacity guard without
+    /// inserting hundreds of thousands of entries.
+    #[cfg(test)]
+    const MAX_COMMIT_OID_MAP_ENTRIES: usize = 8;
+
+    /// Sensible default when no caller-supplied hint is available.
+    ///
+    /// `CommitMeta` events fire only for finding-bearing commits (gated by a
+    /// non-empty `findings_buf` in `EngineAdapter::stream_findings`), so the
+    /// map typically holds a few dozen entries. 64 avoids early reallocations
+    /// without over-reserving for the common case.
+    pub(crate) const DEFAULT_COMMIT_OID_CAPACITY: usize = 64;
+
     /// Wrap an existing coordination event sink with findings capture state.
-    pub(crate) fn new(inner: Arc<CoordinationEventSink>) -> Self {
+    ///
+    /// `commit_oid_capacity_hint` sizes the internal `commit_id → OidBytes`
+    /// lookup. Pass [`DEFAULT_COMMIT_OID_CAPACITY`](Self::DEFAULT_COMMIT_OID_CAPACITY)
+    /// when no better estimate is available. The hint is clamped to
+    /// [`MAX_COMMIT_OID_MAP_ENTRIES`](Self::MAX_COMMIT_OID_MAP_ENTRIES) so
+    /// callers need not bounds-check.
+    pub(crate) fn new(inner: Arc<CoordinationEventSink>, commit_oid_capacity_hint: usize) -> Self {
+        let capped = commit_oid_capacity_hint.min(Self::MAX_COMMIT_OID_MAP_ENTRIES);
         Self {
             inner,
             finding_count: AtomicU64::new(0),
@@ -376,6 +413,7 @@ impl FindingsCaptureSink {
             // (0 -> 1 -> 2 -> 4 -> 8) under the lock. Most repos produce zero
             // findings, but when findings do occur they tend to cluster.
             captured_findings: Mutex::new(Vec::with_capacity(8)),
+            commit_oid_map: Mutex::new(HashMap::with_capacity(capped)),
         }
     }
 
@@ -401,6 +439,21 @@ impl FindingsCaptureSink {
             }
         };
         std::mem::take(&mut *guard)
+    }
+
+    /// Drain the captured sparse mapping from commit ordinals to stable OIDs.
+    ///
+    /// Intended to be called after the scan thread has joined, when no more
+    /// git events can append entries. Returns the owned map and leaves the
+    /// internal map empty via `std::mem::take`. Poisoned locks are recovered
+    /// so the caller can still translate Git findings deterministically.
+    pub(crate) fn drain_commit_oid_map(&self) -> HashMap<u32, OidBytes> {
+        std::mem::take(
+            &mut *self
+                .commit_oid_map
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
     }
 }
 
@@ -443,7 +496,26 @@ impl EventOutput for FindingsCaptureSink {
 
 impl GitEventOutput for FindingsCaptureSink {
     fn emit_git(&self, event: GitEvent<'_>) {
-        self.inner.emit_git(event);
+        // Only commit metadata contributes to Git finding identity. Capture the
+        // ordinal-to-OID pair under the mutex, then drop the guard before
+        // forwarding so the recorder path never runs while holding the lock.
+        if let GitEvent::CommitMeta(ref meta) = event {
+            let mut map = self
+                .commit_oid_map
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let below_cap = map.len() < Self::MAX_COMMIT_OID_MAP_ENTRIES;
+            if below_cap || map.contains_key(&meta.commit_id) {
+                map.insert(meta.commit_id, meta.commit_oid);
+                // Warn exactly once when a new key pushes us to the ceiling.
+                if below_cap && map.len() == Self::MAX_COMMIT_OID_MAP_ENTRIES {
+                    tracing::warn!(
+                        max = Self::MAX_COMMIT_OID_MAP_ENTRIES,
+                        "commit OID map reached capacity; new keys will be dropped"
+                    );
+                }
+            }
+        }
         self.inner.emit_git(event);
     }
 }
@@ -498,7 +570,8 @@ mod tests {
             Arc::clone(&recorder) as Arc<dyn CoordinationEventRecorder>,
             Arc::from("test-shard"),
         ));
-        let sink = FindingsCaptureSink::new(inner);
+        let sink =
+            FindingsCaptureSink::new(inner, FindingsCaptureSink::DEFAULT_COMMIT_OID_CAPACITY);
         (sink, recorder)
     }
 
@@ -675,8 +748,14 @@ mod tests {
             "inner sink should receive the git event"
         );
         assert!(matches!(forwarded[0], StoredGitEvent::CommitMeta { .. }));
+
+        let commit_oid_map = sink.drain_commit_oid_map();
+        assert_eq!(
+            commit_oid_map.get(&1),
+            Some(&oid),
+            "commit metadata should populate the sparse commit OID map"
+        );
     }
-}
 
     #[test]
     fn findings_capture_sink_commit_oid_map_skips_non_commit_meta_events() {
