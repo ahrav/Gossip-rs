@@ -790,11 +790,28 @@ impl DistributedRunReport {
 }
 
 /// Per-lease Git stage timings aggregated into [`DistributedRunReport`].
+///
+/// Covers only the stages measured inside `run_git_repo_lease`. Claim and
+/// checkpoint timings are measured by the outer worker loop and added to
+/// the report directly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GitRunStageMetrics {
     mirror_sync_ms: u64,
     scan_ms: u64,
     durable_receipt_ms: u64,
+}
+
+impl GitRunStageMetrics {
+    /// Folds these per-lease timings into the aggregate report.
+    fn accumulate_into(self, report: &mut DistributedRunReport) {
+        report.total_mirror_sync_ms = report
+            .total_mirror_sync_ms
+            .saturating_add(self.mirror_sync_ms);
+        report.total_scan_ms = report.total_scan_ms.saturating_add(self.scan_ms);
+        report.total_durable_receipt_ms = report
+            .total_durable_receipt_ms
+            .saturating_add(self.durable_receipt_ms);
+    }
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -2928,7 +2945,7 @@ where
         DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow::Error::from(e).context(
             format!(
                 "budget validation failed for git repo-frontier shard '{}'",
-                lease.shard_id()
+                stage_sink.redacted_shard_id()
             ),
         )))
     })?;
@@ -2936,7 +2953,7 @@ where
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
                 "git repo-frontier shard '{}' requires CursorSemantics::Completed, got {:?}",
-                lease.shard_id(),
+                stage_sink.redacted_shard_id(),
                 lease.cursor_semantics()
             ),
         )));
@@ -2974,9 +2991,8 @@ where
         {
             return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
                 anyhow!(
-                    "git repo-frontier shard '{}' payload repo key {:?} is outside shard bounds",
-                    lease.shard_id(),
-                    lease.payload().repo_key()
+                    "git repo-frontier shard '{}' payload repo key is outside shard bounds",
+                    stage_sink.redacted_shard_id(),
                 ),
             )));
         }
@@ -2993,10 +3009,8 @@ where
     if target.repo_key() != lease.payload().repo_key() {
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
-                "git repo-frontier shard '{}' discovered repo key {:?}, expected {:?}",
-                lease.shard_id(),
-                target.repo_key(),
-                lease.payload().repo_key()
+                "git repo-frontier shard '{}' discovered a repo key that does not match the payload",
+                stage_sink.redacted_shard_id(),
             ),
         )));
     }
@@ -3036,9 +3050,8 @@ where
                     });
                     DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
                         anyhow::Error::from(error).context(format!(
-                            "git mirror sync failed for shard '{}' and repo key {:?}",
-                            lease.shard_id(),
-                            lease.payload().repo_key()
+                            "git mirror sync failed for shard '{}'",
+                            stage_sink.redacted_shard_id(),
                         )),
                     ))
                 })?;
@@ -3065,16 +3078,16 @@ where
             .map_err(|error| {
                 stage_sink.emit_stage_signal(StageSignal::ScanCompleted {
                     latency_ms: elapsed_ms(scan_started_at),
-                    items_scanned: 0,
-                    bytes_scanned: 0,
+                    items_scanned: None,
+                    bytes_scanned: None,
                 });
                 DistributedRuntimeError::Runtime(error)
             })?;
             stage_metrics.scan_ms = elapsed_ms(scan_started_at);
             stage_sink.emit_stage_signal(StageSignal::ScanCompleted {
                 latency_ms: stage_metrics.scan_ms,
-                items_scanned: execution.report.items_scanned,
-                bytes_scanned: execution.report.bytes_scanned,
+                items_scanned: Some(execution.report.items_scanned),
+                bytes_scanned: Some(execution.report.bytes_scanned),
             });
             Ok((execution, stage_metrics))
         })();
@@ -3110,7 +3123,7 @@ where
         return Err(DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
             anyhow!(
                 "git repo-frontier shard '{}' finalized partially; outer repo-frontier progress requires a complete durable repo receipt",
-                lease.shard_id()
+                stage_sink.redacted_shard_id()
             ),
         )));
     }
@@ -3133,7 +3146,7 @@ where
                 "git repo-frontier shard '{}' detected {detected_count} finding(s), \
                  but durable Git finding translation is unavailable; \
                  refusing to checkpoint as clean",
-                lease.shard_id(),
+                stage_sink.redacted_shard_id(),
             ),
         )));
     }
@@ -3162,7 +3175,7 @@ where
     });
 
     tracing::debug!(
-        shard_id = %lease.shard_id(),
+        shard_id = %stage_sink.redacted_shard_id(),
         detected_findings = detected_count,
         "git repo lease persistence complete"
     );
@@ -3182,7 +3195,7 @@ where
             DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(
                 anyhow::Error::new(error).context(format!(
                     "git repo durability checkpoint synthesis failed for shard '{}'",
-                    lease.shard_id()
+                    stage_sink.redacted_shard_id()
                 )),
             ))
         })?;
@@ -3197,7 +3210,7 @@ where
         .ok_or_else(|| {
             DistributedRuntimeError::Runtime(ScanRuntimeError::Driver(anyhow!(
                 "git repo-frontier shard '{}' completed without a durable repo receipt-backed checkpoint",
-                lease.shard_id()
+                stage_sink.redacted_shard_id()
             )))
         })?
         .receipt()
@@ -3229,7 +3242,7 @@ where
         .is_some()
     {
         tracing::warn!(
-            shard_id = %lease.shard_id(),
+            shard_id = %stage_sink.redacted_shard_id(),
             "git repo-frontier singleton shard checkpoint did not cover the target; \
              shard will be re-claimed"
         );
@@ -3422,22 +3435,16 @@ where
                     error = %error,
                     leases_seen = report.leases_seen,
                     shards_scanned = report.shards_scanned,
-                    shard_id = %lease.shard_id(),
+                    shard_id = %stage_sink.redacted_shard_id(),
                     "git repo worker loop terminating: lease execution failed",
                 );
                 return Err(error);
             }
         };
-        report.total_mirror_sync_ms = report
-            .total_mirror_sync_ms
-            .saturating_add(stage_metrics.mirror_sync_ms);
-        report.total_scan_ms = report.total_scan_ms.saturating_add(stage_metrics.scan_ms);
-        report.total_durable_receipt_ms = report
-            .total_durable_receipt_ms
-            .saturating_add(stage_metrics.durable_receipt_ms);
+        stage_metrics.accumulate_into(&mut report);
 
         tracing::debug!(
-            shard_id = %lease.shard_id(),
+            shard_id = %stage_sink.redacted_shard_id(),
             items_scanned = scan_report.items_scanned,
             bytes_scanned = scan_report.bytes_scanned,
             findings_emitted = scan_report.findings_emitted,
@@ -3456,7 +3463,7 @@ where
                 error = %error,
                 leases_seen = report.leases_seen,
                 shards_scanned = report.shards_scanned,
-                shard_id = %lease.shard_id(),
+                shard_id = %stage_sink.redacted_shard_id(),
                 "git repo worker loop terminating: shard completion failed",
             );
             return Err(error);
@@ -6737,17 +6744,10 @@ mod tests {
         assert_eq!(report.shards_scanned, 1);
         // Timing fields are populated by the worker loop. Individual stages
         // may complete in sub-millisecond on fast machines (as_millis
-        // truncates), so assert the aggregate is at least non-panicking and
-        // structurally consistent rather than demanding > 0.
-        let timing_sum = report.total_claim_ms
-            + report.total_mirror_sync_ms
-            + report.total_scan_ms
-            + report.total_durable_receipt_ms
-            + report.total_checkpoint_ms;
-        assert!(
-            timing_sum > 0,
-            "aggregate stage timings should be nonzero for a real scan"
-        );
+        // truncates to zero), so asserting the aggregate is > 0 would be
+        // non-deterministic. Instead, verify each report field matches the
+        // latency emitted in the corresponding stage signal — this catches
+        // wiring bugs without depending on wall-clock granularity.
 
         let signals = test_recorder
             .stage_signals
@@ -6758,32 +6758,76 @@ mod tests {
             5,
             "successful path should emit five stage signals"
         );
-        assert!(matches!(signals[0], StageSignal::ShardClaimed { .. }));
-        let StageSignal::MirrorSyncCompleted { error_class, .. } = signals[1] else {
+
+        // Extract per-signal latencies and verify report fields match.
+        let StageSignal::ShardClaimed {
+            latency_ms: claim_ms,
+        } = signals[0]
+        else {
+            panic!("expected ShardClaimed, got {:?}", signals[0]);
+        };
+        assert_eq!(
+            report.total_claim_ms, claim_ms,
+            "report claim_ms must match signal"
+        );
+
+        let StageSignal::MirrorSyncCompleted {
+            latency_ms: mirror_ms,
+            error_class,
+        } = signals[1]
+        else {
             panic!("expected MirrorSyncCompleted, got {:?}", signals[1]);
         };
         assert!(error_class.is_none(), "success path should have no error");
+        assert_eq!(
+            report.total_mirror_sync_ms, mirror_ms,
+            "report mirror_sync_ms must match signal"
+        );
+
         let StageSignal::ScanCompleted {
-            items_scanned,
-            bytes_scanned,
-            ..
+            latency_ms: scan_ms,
+            items_scanned: Some(items_scanned),
+            bytes_scanned: Some(bytes_scanned),
         } = signals[2]
         else {
-            panic!("expected ScanCompleted, got {:?}", signals[2]);
+            panic!(
+                "expected ScanCompleted with Some counters, got {:?}",
+                signals[2]
+            );
         };
         assert!(
             items_scanned > 0,
             "fixture should contain at least one scannable item"
         );
         assert!(bytes_scanned > 0, "fixture should have nonzero bytes");
-        assert!(matches!(
-            signals[3],
-            StageSignal::DurableReceiptCompleted {
-                receipts: GIT_REPO_RECEIPT_FAMILIES,
-                ..
-            }
-        ));
-        assert!(matches!(signals[4], StageSignal::CheckpointAdvanced { .. }));
+        assert_eq!(
+            report.total_scan_ms, scan_ms,
+            "report scan_ms must match signal"
+        );
+
+        let StageSignal::DurableReceiptCompleted {
+            latency_ms: receipt_ms,
+            receipts,
+        } = signals[3]
+        else {
+            panic!("expected DurableReceiptCompleted, got {:?}", signals[3]);
+        };
+        assert_eq!(receipts, GIT_REPO_RECEIPT_FAMILIES);
+        assert_eq!(
+            report.total_durable_receipt_ms, receipt_ms,
+            "report durable_receipt_ms must match signal"
+        );
+
+        let StageSignal::CheckpointAdvanced {
+            latency_ms: checkpoint_ms,
+        } = signals[4]
+        else {
+            panic!("expected CheckpointAdvanced, got {:?}", signals[4]);
+        };
+        assert_eq!(
+            report.total_checkpoint_ms, checkpoint_ms,
+            "report checkpoint_ms must match signal"
+        );
     }
 
     #[test]
@@ -9078,8 +9122,8 @@ mod tests {
         );
     }
 
-    /// Budget validation errors must include the shard ID so operators can
-    /// correlate the failure with a specific shard assignment.
+    /// Budget validation errors must include a redacted shard identifier so
+    /// operators can correlate the failure without leaking raw shard data.
     #[test]
     fn run_git_repo_worker_budget_validation_includes_shard_context() {
         let repo = create_git_repo_fixture_with_secrets();
@@ -9108,8 +9152,8 @@ mod tests {
 
         let msg = format!("{err}");
         assert!(
-            msg.contains("ShardId(1)"),
-            "budget validation error should include shard context: {msg}"
+            msg.contains("len=") && msg.contains("hash="),
+            "budget validation error should include redacted shard context: {msg}"
         );
     }
 

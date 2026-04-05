@@ -123,10 +123,12 @@ pub enum StageSignal {
     ///
     /// `latency_ms` is the wall-clock duration of the execution step.
     /// `items_scanned` and `bytes_scanned` are passthrough aggregate counters.
+    /// `None` means the scan failed before counters were available (partial
+    /// progress unknown); `Some(0)` means the scan completed with zero items.
     ScanCompleted {
         latency_ms: u64,
-        items_scanned: u64,
-        bytes_scanned: u64,
+        items_scanned: Option<u64>,
+        bytes_scanned: Option<u64>,
     },
     /// Durable findings + done-ledger receipt submission finished.
     ///
@@ -217,6 +219,13 @@ impl CoordinationEventSink {
                 "recorder failed to persist stage signal; subsequent failures suppressed",
             );
         }
+    }
+
+    /// Returns the pre-computed digest of the shard identifier for log-safe
+    /// error messages. Raw shard identifiers may contain repository-identifying
+    /// data and must not appear in log output.
+    pub(crate) fn redacted_shard_id(&self) -> &ToxicDigest {
+        &self.redacted_shard_id
     }
 }
 

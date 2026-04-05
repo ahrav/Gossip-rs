@@ -399,8 +399,8 @@ impl CoordinationTelemetrySink for TracingCoordinationTelemetrySink {
                     shard_id = %shard_id,
                     stage_kind = "scan",
                     latency_ms,
-                    items_scanned,
-                    bytes_scanned,
+                    items_scanned = %OptionalField::new(items_scanned),
+                    bytes_scanned = %OptionalField::new(bytes_scanned),
                     "coordination stage scan",
                 );
             }
@@ -696,8 +696,8 @@ pub(crate) enum SanitizedCoordinationRecord {
     StageScanCompleted {
         shard_id: RedactedDigest,
         latency_ms: u64,
-        items_scanned: u64,
-        bytes_scanned: u64,
+        items_scanned: Option<u64>,
+        bytes_scanned: Option<u64>,
     },
     StageDurableReceiptCompleted {
         shard_id: RedactedDigest,
@@ -1134,8 +1134,8 @@ mod tests {
                 format!("scan-stage-shard-{canary}"),
                 StageSignal::ScanCompleted {
                     latency_ms: 7,
-                    items_scanned: 11,
-                    bytes_scanned: 13,
+                    items_scanned: Some(11),
+                    bytes_scanned: Some(13),
                 },
             ),
             (
